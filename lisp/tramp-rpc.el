@@ -444,9 +444,11 @@ TYPE is the file type string."
 (defun tramp-rpc-handle-file-name-all-completions (filename directory)
   "Like `file-name-all-completions' for TRAMP-RPC files."
   (with-parsed-tramp-file-name (expand-file-name directory) nil
-    (tramp-rpc--call v "dir.completions"
-                     `((directory . ,localname)
-                       (prefix . ,filename)))))
+    (let ((result (tramp-rpc--call v "dir.completions"
+                                   `((directory . ,localname)
+                                     (prefix . ,filename)))))
+      ;; Convert vector to list - completion expects a list, not a vector
+      (if (vectorp result) (append result nil) result))))
 
 (defun tramp-rpc-handle-make-directory (dir &optional parents)
   "Like `make-directory' for TRAMP-RPC files."
