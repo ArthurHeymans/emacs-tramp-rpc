@@ -1038,8 +1038,8 @@ Returns plist with :stdout, :stderr, :exited, :exit-code."
 (defun tramp-rpc-handle-make-process (&rest args)
   "Create an async process on the remote host.
 ARGS are keyword arguments as per `make-process'.
-Note: This implementation runs the process synchronously and simulates
-async behavior, which works well for short-lived processes like VC commands."
+This implementation starts the process asynchronously and polls for output
+using a timer, allowing Emacs to remain responsive during long-running commands."
   (let* ((name (plist-get args :name))
          (buffer (plist-get args :buffer))
          (command (plist-get args :command))
@@ -1048,7 +1048,8 @@ async behavior, which works well for short-lived processes like VC commands."
          (filter (plist-get args :filter))
          (sentinel (plist-get args :sentinel))
          (stderr (plist-get args :stderr))
-         (file-handler (plist-get args :file-handler))
+         ;; file-handler is accepted but not used (we ARE the file handler)
+         (_file-handler (plist-get args :file-handler))
          (program (car command))
          (program-args (cdr command)))
     
@@ -1063,59 +1064,44 @@ async behavior, which works well for short-lived processes like VC commands."
                                ;; Search for program in remote PATH
                                (or (tramp-rpc--find-executable v program)
                                    program)))
-             ;; Run the process synchronously
-             (result (tramp-rpc--call v "process.run"
-                                      `((cmd . ,remote-program)
-                                        (args . ,(vconcat program-args))
-                                        (cwd . ,localname))))
-             (exit-code (alist-get 'exit_code result))
-             (stdout (tramp-rpc--decode-output
-                      (alist-get 'stdout result)
-                      (alist-get 'stdout_encoding result)))
-             (stderr-output (tramp-rpc--decode-output
-                             (alist-get 'stderr result)
-                             (alist-get 'stderr_encoding result)))
-             ;; Create a pipe process that we'll immediately close
+             ;; Start the process asynchronously
+             (remote-pid (tramp-rpc--start-remote-process
+                          v remote-program program-args localname))
+             ;; Create a local pipe process as a relay for Emacs process semantics
              (local-process (make-pipe-process
                              :name (or name "tramp-rpc-async")
                              :buffer buffer
                              :coding (or coding 'utf-8)
-                             :noquery t)))
+                             :noquery (if noquery t nil)))
+             ;; Resolve stderr buffer
+             (stderr-buffer (cond
+                             ((bufferp stderr) stderr)
+                             ((stringp stderr) (get-buffer-create stderr))
+                             (t nil)))
+             ;; Create timer for polling
+             (timer (run-with-timer
+                     tramp-rpc--process-poll-interval
+                     tramp-rpc--process-poll-interval
+                     #'tramp-rpc--poll-process
+                     local-process)))
         
-        ;; Store exit info
-        (process-put local-process :tramp-rpc-exit-code exit-code)
-        (process-put local-process :tramp-rpc-exited t)
+        ;; Store remote process info for advice functions
+        (process-put local-process :tramp-rpc-vec v)
+        (process-put local-process :tramp-rpc-pid remote-pid)
         
-        ;; Deliver stdout via filter or buffer
-        (when (and stdout (> (length stdout) 0))
-          (if filter
-              (funcall filter local-process stdout)
-            (when (and buffer (buffer-live-p (get-buffer buffer)))
-              (with-current-buffer buffer
-                (goto-char (point-max))
-                (insert stdout)))))
-        
-        ;; Deliver stderr
-        (when (and stderr-output (> (length stderr-output) 0))
-          (cond
-           ((bufferp stderr)
-            (with-current-buffer stderr
-              (goto-char (point-max))
-              (insert stderr-output)))
-           ((stringp stderr)
-            (with-current-buffer (get-buffer-create stderr)
-              (goto-char (point-max))
-              (insert stderr-output)))))
-        
-        ;; Delete the process (marks it as exited)
-        (delete-process local-process)
-        
-        ;; Call sentinel if provided
+        ;; Set up filter and sentinel
+        (when filter
+          (set-process-filter local-process filter))
         (when sentinel
-          (funcall sentinel local-process
-                   (if (= exit-code 0)
-                       "finished\n"
-                     (format "exited abnormally with code %d\n" exit-code))))
+          (set-process-sentinel local-process sentinel))
+        
+        ;; Track this async process
+        (puthash local-process
+                 (list :vec v
+                       :pid remote-pid
+                       :timer timer
+                       :stderr-buffer stderr-buffer)
+                 tramp-rpc--async-processes)
         
         local-process))))
 
