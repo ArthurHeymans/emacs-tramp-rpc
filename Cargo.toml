@@ -1,0 +1,22 @@
+[workspace]
+resolver = "2"
+members = ["server"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "GPL-3.0-or-later"
+authors = ["Arthur"]
+
+[workspace.dependencies]
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+base64 = "0.22"
+thiserror = "1.0"
+
+[profile.release]
+opt-level = "z"     # Optimize for size
+lto = true          # Link-time optimization
+codegen-units = 1   # Better optimization
+panic = "abort"     # Smaller binary
+strip = true        # Strip symbols

@@ -1,0 +1,20 @@
+[package]
+name = "tramp-rpc-server"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "RPC server for TRAMP remote file access"
+
+[[bin]]
+name = "tramp-rpc-server"
+path = "src/main.rs"
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+base64.workspace = true
+thiserror.workspace = true
+
+# For file operations
+libc = "0.2"
