@@ -1,7 +1,7 @@
 //! Request handlers for TRAMP-RPC operations
 
-pub mod file;
 pub mod dir;
+pub mod file;
 pub mod io;
 pub mod process;
 
@@ -41,6 +41,7 @@ pub fn dispatch(request: &Request) -> Response {
         "process.start" => process::start(&request.params),
         "process.write" => process::write(&request.params),
         "process.read" => process::read(&request.params),
+        "process.close_stdin" => process::close_stdin(&request.params),
         "process.kill" => process::kill(&request.params),
         "process.list" => process::list(&request.params),
 

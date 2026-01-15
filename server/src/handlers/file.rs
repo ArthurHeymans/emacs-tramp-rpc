@@ -171,8 +171,8 @@ pub fn newer_than(params: &serde_json::Value) -> HandlerResult {
             let t2 = m2.modified().unwrap_or(UNIX_EPOCH);
             t1 > t2
         }
-        (Ok(_), Err(_)) => true,  // file1 exists, file2 doesn't
-        (Err(_), _) => false,     // file1 doesn't exist
+        (Ok(_), Err(_)) => true, // file1 exists, file2 doesn't
+        (Err(_), _) => false,    // file1 doesn't exist
     };
 
     Ok(serde_json::json!(result))
@@ -195,7 +195,9 @@ pub fn get_file_attributes(path: &str, lstat: bool) -> Result<FileAttributes, Rp
     let file_type = get_file_type(&metadata);
 
     let link_target = if file_type == FileType::Symlink {
-        fs::read_link(path_obj).ok().map(|p| p.to_string_lossy().to_string())
+        fs::read_link(path_obj)
+            .ok()
+            .map(|p| p.to_string_lossy().to_string())
     } else {
         None
     };

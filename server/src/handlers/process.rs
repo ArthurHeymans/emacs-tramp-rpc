@@ -4,7 +4,8 @@ use crate::protocol::{ProcessResult, RpcError};
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
 use serde::Deserialize;
 use std::collections::HashMap;
-use std::io::{Read, Write};
+use std::io::{ErrorKind, Read, Write};
+use std::os::unix::io::AsRawFd;
 use std::process::{Child, Command, Stdio};
 use std::sync::Mutex;
 
@@ -35,6 +36,37 @@ struct ManagedProcess {
     child: Child,
     #[allow(dead_code)]
     cmd: String,
+    /// Whether stdout has been set to non-blocking
+    stdout_nonblocking: bool,
+    /// Whether stderr has been set to non-blocking  
+    stderr_nonblocking: bool,
+}
+
+/// Set a file descriptor to non-blocking mode
+fn set_nonblocking(fd: i32) -> std::io::Result<()> {
+    let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+    if flags < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    let result = unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) };
+    if result < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+/// Read from a non-blocking file descriptor, returning empty vec on WouldBlock
+fn try_read_nonblocking<R: Read>(reader: &mut R, max_bytes: usize) -> Vec<u8> {
+    let mut buf = vec![0u8; max_bytes];
+    match reader.read(&mut buf) {
+        Ok(0) => vec![], // EOF
+        Ok(n) => {
+            buf.truncate(n);
+            buf
+        }
+        Err(e) if e.kind() == ErrorKind::WouldBlock => vec![],
+        Err(_) => vec![],
+    }
 }
 
 // ============================================================================
@@ -179,6 +211,8 @@ pub fn start(params: &serde_json::Value) -> HandlerResult {
     let managed = ManagedProcess {
         child,
         cmd: params.cmd.clone(),
+        stdout_nonblocking: false,
+        stderr_nonblocking: false,
     };
 
     get_process_map().lock().unwrap().insert(pid, managed);
@@ -248,44 +282,68 @@ pub fn read(params: &serde_json::Value) -> HandlerResult {
         data: None,
     })?;
 
-    // Try to read stdout
-    let mut stdout_buf = vec![0u8; params.max_bytes];
-    let stdout_read = if let Some(stdout) = managed.child.stdout.as_mut() {
-        // Use non-blocking read if possible
-        match stdout.read(&mut stdout_buf) {
-            Ok(n) => {
-                stdout_buf.truncate(n);
-                Some(BASE64.encode(&stdout_buf))
-            }
-            Err(_) => None,
+    // Ensure stdout is non-blocking
+    if !managed.stdout_nonblocking {
+        if let Some(stdout) = managed.child.stdout.as_ref() {
+            let _ = set_nonblocking(stdout.as_raw_fd());
+            managed.stdout_nonblocking = true;
         }
+    }
+
+    // Ensure stderr is non-blocking
+    if !managed.stderr_nonblocking {
+        if let Some(stderr) = managed.child.stderr.as_ref() {
+            let _ = set_nonblocking(stderr.as_raw_fd());
+            managed.stderr_nonblocking = true;
+        }
+    }
+
+    // Try to read stdout (non-blocking)
+    let stdout_data = if let Some(stdout) = managed.child.stdout.as_mut() {
+        try_read_nonblocking(stdout, params.max_bytes)
     } else {
-        None
+        vec![]
     };
 
-    // Try to read stderr
-    let mut stderr_buf = vec![0u8; params.max_bytes];
-    let stderr_read = if let Some(stderr) = managed.child.stderr.as_mut() {
-        match stderr.read(&mut stderr_buf) {
-            Ok(n) => {
-                stderr_buf.truncate(n);
-                Some(BASE64.encode(&stderr_buf))
-            }
-            Err(_) => None,
-        }
+    // Try to read stderr (non-blocking)
+    let stderr_data = if let Some(stderr) = managed.child.stderr.as_mut() {
+        try_read_nonblocking(stderr, params.max_bytes)
     } else {
-        None
+        vec![]
     };
 
     // Check if process has exited
     let exit_status = managed.child.try_wait().ok().flatten();
 
     Ok(serde_json::json!({
-        "stdout": stdout_read,
-        "stderr": stderr_read,
+        "stdout": if stdout_data.is_empty() { serde_json::Value::Null } else { serde_json::Value::String(BASE64.encode(&stdout_data)) },
+        "stderr": if stderr_data.is_empty() { serde_json::Value::Null } else { serde_json::Value::String(BASE64.encode(&stderr_data)) },
         "exited": exit_status.is_some(),
         "exit_code": exit_status.and_then(|s| s.code())
     }))
+}
+
+/// Close the stdin of an async process (signals EOF)
+pub fn close_stdin(params: &serde_json::Value) -> HandlerResult {
+    #[derive(Deserialize)]
+    struct Params {
+        pid: u32,
+    }
+
+    let params: Params = serde_json::from_value(params.clone())
+        .map_err(|e| RpcError::invalid_params(e.to_string()))?;
+
+    let mut processes = get_process_map().lock().unwrap();
+    let managed = processes.get_mut(&params.pid).ok_or_else(|| RpcError {
+        code: RpcError::PROCESS_ERROR,
+        message: format!("Process not found: {}", params.pid),
+        data: None,
+    })?;
+
+    // Drop stdin to close it
+    managed.child.stdin.take();
+
+    Ok(serde_json::json!(true))
 }
 
 /// Kill an async process

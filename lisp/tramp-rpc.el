@@ -26,19 +26,19 @@
 ;; Then access files using the "rpc" method:
 ;;   /rpc:user@host:/path/to/file
 ;;
-;; LIMITATIONS:
-;; - Async processes (make-process, start-file-process) are not supported.
-;;   Use `process-file' for synchronous process execution instead.
-;; - Version control integration (vc-mode) will not work because it requires
-;;   async processes.
+;; FEATURES:
+;; - Fast file operations via binary RPC protocol
+;; - Async process support (make-process, start-file-process)
+;; - VC mode integration works (git, etc.)
 ;;
-;; RECOMMENDED CONFIGURATION:
-;; To avoid errors from VC-related packages in dired, add to your init.el:
-;;   (setq diff-hl-disable-on-remote t)  ; Disable diff-hl for remote files
-;;   (setq vc-ignore-dir-regexp          ; Tell VC to ignore tramp files
-;;         (format "%s\\|%s"
-;;                 vc-ignore-dir-regexp
-;;                 tramp-file-name-regexp))
+;; HOW ASYNC PROCESSES WORK:
+;; Remote processes are started via RPC and polled periodically for output.
+;; A local pipe process serves as a relay to provide Emacs process semantics.
+;; Process filters, sentinels, and signals all work as expected.
+;;
+;; OPTIONAL CONFIGURATION:
+;; If you experience issues with diff-hl in dired, you can disable it:
+;;   (setq diff-hl-disable-on-remote t)
 
 ;;; Code:
 
@@ -61,6 +61,10 @@
 (defvar tramp-rpc--connections (make-hash-table :test 'equal)
   "Hash table mapping connection keys to RPC process info.
 Key is (host user port), value is a plist with :process and :buffer.")
+
+(defvar tramp-rpc--async-processes (make-hash-table :test 'eq)
+  "Hash table mapping local relay processes to their remote process info.
+Value is a plist with :vec, :pid, :timer, :stderr-buffer.")
 
 (defun tramp-rpc--connection-key (vec)
   "Generate a connection key for VEC."
@@ -137,12 +141,31 @@ Returns the connection plist."
 
 (defun tramp-rpc--disconnect (vec)
   "Disconnect the RPC connection to VEC."
+  ;; First, clean up any async processes for this connection
+  (tramp-rpc--cleanup-async-processes vec)
   (let ((conn (tramp-rpc--get-connection vec)))
     (when conn
       (let ((process (plist-get conn :process)))
         (when (process-live-p process)
           (delete-process process)))
       (tramp-rpc--remove-connection vec))))
+
+(defun tramp-rpc--cleanup-async-processes (&optional vec)
+  "Clean up async processes, optionally only those for VEC."
+  (maphash
+   (lambda (local-process info)
+     (when (or (null vec)
+               (equal (tramp-rpc--connection-key (plist-get info :vec))
+                      (tramp-rpc--connection-key vec)))
+       ;; Cancel timer
+       (when-let ((timer (plist-get info :timer)))
+         (cancel-timer timer))
+       ;; Kill local process
+       (when (process-live-p local-process)
+         (delete-process local-process))
+       ;; Remove from tracking
+       (remhash local-process tramp-rpc--async-processes)))
+   tramp-rpc--async-processes))
 
 ;; ============================================================================
 ;; RPC communication
@@ -681,6 +704,21 @@ Produces ls-like output for dired."
 
       exit-code)))
 
+(defun tramp-rpc-handle-vc-registered (file)
+  "Like `vc-registered' for TRAMP-RPC files.
+Since tramp-rpc supports `process-file', VC backends can run their
+commands (git, svn, hg) directly via RPC.
+
+We set `default-directory' to the file's directory to ensure that
+process-file calls from VC backends are routed through our tramp handler."
+  (when vc-handled-backends
+    (with-parsed-tramp-file-name file nil
+      ;; Set default-directory to the file's remote directory so that
+      ;; process-file calls from VC are handled by our tramp handler.
+      (let ((default-directory (file-name-directory file))
+            process-file-side-effects)
+        (tramp-run-real-handler #'vc-registered (list file))))))
+
 (defun tramp-rpc-handle-expand-file-name (name &optional dir)
   "Like `expand-file-name' for TRAMP-RPC files."
   (let ((dir (or dir default-directory)))
@@ -738,19 +776,315 @@ Produces ls-like output for dired."
           gid
         (number-to-string gid)))))
 
+;; ============================================================================
+;; Async Process Support
+;; ============================================================================
+
+(defvar tramp-rpc--process-poll-interval 0.1
+  "Interval in seconds between polling remote process for output.")
+
+(defvar tramp-rpc--poll-in-progress nil
+  "Non-nil while a poll is in progress (prevents reentrancy).")
+
+(defun tramp-rpc--start-remote-process (vec program args cwd)
+  "Start PROGRAM with ARGS in CWD on remote host VEC.
+Returns the remote process PID."
+  (let ((result (tramp-rpc--call vec "process.start"
+                                 `((cmd . ,program)
+                                   (args . ,(vconcat args))
+                                   (cwd . ,cwd)))))
+    (alist-get 'pid result)))
+
+(defun tramp-rpc--read-remote-process (vec pid)
+  "Read output from remote process PID on VEC.
+Returns plist with :stdout, :stderr, :exited, :exit-code."
+  (let ((result (tramp-rpc--call vec "process.read" `((pid . ,pid)))))
+    (list :stdout (when-let ((s (alist-get 'stdout result)))
+                    (base64-decode-string s))
+          :stderr (when-let ((s (alist-get 'stderr result)))
+                    (base64-decode-string s))
+          :exited (alist-get 'exited result)
+          :exit-code (alist-get 'exit_code result))))
+
+(defun tramp-rpc--write-remote-process (vec pid data)
+  "Write DATA to stdin of remote process PID on VEC."
+  (tramp-rpc--call vec "process.write"
+                   `((pid . ,pid)
+                     (data . ,(base64-encode-string data t)))))
+
+(defun tramp-rpc--close-remote-stdin (vec pid)
+  "Close stdin of remote process PID on VEC."
+  (tramp-rpc--call vec "process.close_stdin" `((pid . ,pid))))
+
+(defun tramp-rpc--kill-remote-process (vec pid &optional signal)
+  "Send SIGNAL to remote process PID on VEC."
+  (tramp-rpc--call vec "process.kill"
+                   `((pid . ,pid)
+                     (signal . ,(or signal 15))))) ; SIGTERM
+
+(defun tramp-rpc--poll-process (local-process)
+  "Poll for output from the remote process associated with LOCAL-PROCESS."
+  ;; Guard against reentrancy (can happen during accept-process-output)
+  (unless tramp-rpc--poll-in-progress
+    (let ((tramp-rpc--poll-in-progress t))
+      (when (process-live-p local-process)
+        (let ((info (gethash local-process tramp-rpc--async-processes)))
+          (when info
+            (let* ((vec (plist-get info :vec))
+                   (pid (plist-get info :pid))
+                   (stderr-buffer (plist-get info :stderr-buffer))
+                   (result (condition-case err
+                               (tramp-rpc--read-remote-process vec pid)
+                             (error
+                              (message "tramp-rpc: Error polling process: %s" err)
+                              nil))))
+          (when result
+            ;; Handle stdout - send to process filter/buffer
+            (when-let ((stdout (plist-get result :stdout)))
+              (when (> (length stdout) 0)
+                (if-let ((filter (process-filter local-process)))
+                    (funcall filter local-process stdout)
+                  (when-let ((buf (process-buffer local-process)))
+                    (when (buffer-live-p buf)
+                      (with-current-buffer buf
+                        (goto-char (point-max))
+                        (insert stdout)))))))
+            
+            ;; Handle stderr - send to stderr buffer if specified
+            (when-let ((stderr (plist-get result :stderr)))
+              (when (> (length stderr) 0)
+                (cond
+                 ((bufferp stderr-buffer)
+                  (when (buffer-live-p stderr-buffer)
+                    (with-current-buffer stderr-buffer
+                      (goto-char (point-max))
+                      (insert stderr))))
+                 ;; If no stderr buffer, mix with stdout
+                 (t
+                  (if-let ((filter (process-filter local-process)))
+                      (funcall filter local-process stderr)
+                    (when-let ((buf (process-buffer local-process)))
+                      (when (buffer-live-p buf)
+                        (with-current-buffer buf
+                          (goto-char (point-max))
+                          (insert stderr)))))))))
+            
+            ;; Check if process exited
+            (when (plist-get result :exited)
+              (tramp-rpc--handle-process-exit
+               local-process (plist-get result :exit-code)))))))))))
+
+(defun tramp-rpc--handle-process-exit (local-process exit-code)
+  "Handle exit of remote process associated with LOCAL-PROCESS."
+  (let ((info (gethash local-process tramp-rpc--async-processes)))
+    (when info
+      ;; Cancel the timer
+      (when-let ((timer (plist-get info :timer)))
+        (cancel-timer timer))
+      ;; Remove from tracking
+      (remhash local-process tramp-rpc--async-processes)
+      ;; Store exit code and mark as exited
+      (process-put local-process :tramp-rpc-exit-code exit-code)
+      (process-put local-process :tramp-rpc-exited t)
+      ;; Get sentinel before we modify anything
+      (let ((sentinel (process-sentinel local-process))
+            (event (if (= exit-code 0)
+                       "finished\n"
+                     (format "exited abnormally with code %d\n" exit-code))))
+        ;; Remove sentinel temporarily to prevent double-call
+        (set-process-sentinel local-process nil)
+        ;; Delete the process (changes status)
+        (when (process-live-p local-process)
+          (delete-process local-process))
+        ;; Call sentinel with our custom event
+        (when sentinel
+          (funcall sentinel local-process event))))))
+
 (defun tramp-rpc-handle-make-process (&rest args)
-  "Signal that async processes are not supported for TRAMP-RPC.
-ARGS are ignored."
-  (signal 'file-error
-          (list "Async processes not supported"
-                "TRAMP-RPC does not support async processes; use process-file instead")))
+  "Create an async process on the remote host.
+ARGS are keyword arguments as per `make-process'."
+  (let* ((name (plist-get args :name))
+         (buffer (plist-get args :buffer))
+         (command (plist-get args :command))
+         (coding (plist-get args :coding))
+         (noquery (plist-get args :noquery))
+         (filter (plist-get args :filter))
+         (sentinel (plist-get args :sentinel))
+         (stderr (plist-get args :stderr))
+         (file-handler (plist-get args :file-handler))
+         (program (car command))
+         (program-args (cdr command)))
+    
+    ;; Ensure we're in a remote directory
+    (unless (tramp-tramp-file-p default-directory)
+      (error "tramp-rpc-handle-make-process called without remote default-directory"))
+    
+    (with-parsed-tramp-file-name default-directory nil
+      ;; Find the actual program path on remote
+      (let* ((remote-program (if (file-name-absolute-p program)
+                                 program
+                               ;; Search for program in remote PATH
+                               (or (tramp-rpc--find-executable v program)
+                                   program)))
+             ;; Start the remote process
+             (remote-pid (tramp-rpc--start-remote-process
+                          v remote-program program-args localname))
+             ;; Create local relay process using pipe
+             (local-process (make-pipe-process
+                             :name (or name "tramp-rpc-async")
+                             :buffer buffer
+                             :coding (or coding 'utf-8)
+                             :noquery noquery
+                             :filter filter
+                             :sentinel sentinel)))
+        
+        ;; Store remote info as process properties
+        (process-put local-process :tramp-rpc-vec v)
+        (process-put local-process :tramp-rpc-pid remote-pid)
+        (process-put local-process :tramp-rpc-command command)
+        
+        ;; Set up stderr buffer
+        (let ((stderr-buffer (cond
+                              ((bufferp stderr) stderr)
+                              ((stringp stderr) (get-buffer-create stderr))
+                              (t nil))))
+          
+          ;; Start polling timer
+          (let ((timer (run-with-timer
+                        tramp-rpc--process-poll-interval
+                        tramp-rpc--process-poll-interval
+                        #'tramp-rpc--poll-process
+                        local-process)))
+            
+            ;; Store tracking info
+            (puthash local-process
+                     (list :vec v
+                           :pid remote-pid
+                           :timer timer
+                           :stderr-buffer stderr-buffer)
+                     tramp-rpc--async-processes)))
+        
+        local-process))))
+
+(defun tramp-rpc--find-executable (vec program)
+  "Find PROGRAM in the remote PATH on VEC.
+Returns the absolute path or nil."
+  (let ((dirs '("/usr/local/bin" "/usr/bin" "/bin"
+                "/usr/local/sbin" "/usr/sbin" "/sbin")))
+    (cl-loop for dir in dirs
+             for path = (concat dir "/" program)
+             when (condition-case nil
+                      (tramp-rpc--call vec "file.executable" `((path . ,path)))
+                    (error nil))
+             return path)))
 
 (defun tramp-rpc-handle-start-file-process (name buffer program &rest args)
-  "Signal that async processes are not supported for TRAMP-RPC.
-NAME, BUFFER, PROGRAM and ARGS are ignored."
-  (signal 'file-error
-          (list "Async processes not supported"
-                "TRAMP-RPC does not support async processes; use process-file instead")))
+  "Start async process on remote host.
+NAME is the process name, BUFFER is the output buffer,
+PROGRAM is the command to run, ARGS are its arguments."
+  (tramp-rpc-handle-make-process
+   :name name
+   :buffer buffer
+   :command (cons program args)))
+
+;; ============================================================================
+;; Advice for process operations
+;; ============================================================================
+
+(defun tramp-rpc--process-send-string-advice (orig-fun process string)
+  "Advice for `process-send-string' to handle TRAMP-RPC processes."
+  ;; process-send-string can receive a buffer/buffer-name instead of process
+  (let ((proc (cond
+               ((processp process) process)
+               ((or (bufferp process) (stringp process))
+                (get-buffer-process (get-buffer process)))
+               (t nil))))
+    (if (and proc
+             (process-get proc :tramp-rpc-pid)
+             (process-get proc :tramp-rpc-vec))
+        (condition-case err
+            (tramp-rpc--write-remote-process
+             (process-get proc :tramp-rpc-vec)
+             (process-get proc :tramp-rpc-pid)
+             string)
+          (error
+           (message "tramp-rpc: Error writing to process: %s" err)))
+      (funcall orig-fun process string))))
+
+(defun tramp-rpc--process-send-eof-advice (orig-fun &optional process)
+  "Advice for `process-send-eof' to handle TRAMP-RPC processes."
+  (let ((proc (or process (get-buffer-process (current-buffer)))))
+    (if-let ((pid (process-get proc :tramp-rpc-pid))
+             (vec (process-get proc :tramp-rpc-vec)))
+        (condition-case err
+            (tramp-rpc--close-remote-stdin vec pid)
+          (error
+           (message "tramp-rpc: Error closing stdin: %s" err)))
+      (funcall orig-fun process))))
+
+(defun tramp-rpc--signal-process-advice (orig-fun process sigcode &optional remote)
+  "Advice for `signal-process' to handle TRAMP-RPC processes."
+  (if-let ((pid (and (processp process)
+                     (process-get process :tramp-rpc-pid)))
+           (vec (process-get process :tramp-rpc-vec)))
+      (condition-case err
+          (progn
+            (tramp-rpc--kill-remote-process vec pid sigcode)
+            0) ; Return 0 for success
+        (error
+         (message "tramp-rpc: Error signaling process: %s" err)
+         -1))
+    (funcall orig-fun process sigcode remote)))
+
+(defun tramp-rpc--process-status-advice (orig-fun process)
+  "Advice for `process-status' to handle TRAMP-RPC processes."
+  (if (process-get process :tramp-rpc-pid)
+      (cond
+       ((process-get process :tramp-rpc-exited) 'exit)
+       ;; Use orig-fun to check live status, not process-live-p (which would recurse)
+       ((memq (funcall orig-fun process) '(run open listen connect)) 'run)
+       (t 'exit))
+    (funcall orig-fun process)))
+
+(defun tramp-rpc--process-exit-status-advice (orig-fun process)
+  "Advice for `process-exit-status' to handle TRAMP-RPC processes."
+  (if (process-get process :tramp-rpc-pid)
+      (or (process-get process :tramp-rpc-exit-code) 0)
+    (funcall orig-fun process)))
+
+;; Install advice
+(advice-add 'process-send-string :around #'tramp-rpc--process-send-string-advice)
+(advice-add 'process-send-eof :around #'tramp-rpc--process-send-eof-advice)
+(advice-add 'signal-process :around #'tramp-rpc--signal-process-advice)
+(advice-add 'process-status :around #'tramp-rpc--process-status-advice)
+(advice-add 'process-exit-status :around #'tramp-rpc--process-exit-status-advice)
+
+;; ============================================================================
+;; VC integration advice
+;; ============================================================================
+
+;; VC backends like vc-git-state use process-file internally, but they don't
+;; set default-directory to the remote file's directory. This means process-file
+;; runs locally instead of going through our tramp handler. We fix this by
+;; advising vc-call-backend to set default-directory when the file is remote.
+
+(defun tramp-rpc--vc-call-backend-advice (orig-fun backend op file &rest args)
+  "Advice for `vc-call-backend' to handle TRAMP files correctly.
+When OP is an operation that takes a FILE argument and FILE is a TRAMP path,
+ensure `default-directory' is set to the file's directory so that process-file
+calls are routed through the TRAMP handler."
+  (if (and file
+           (stringp file)
+           (tramp-tramp-file-p file)
+           ;; Operations that take a file and may call process-file
+           (memq op '(state state-heuristic dir-status-files
+                      working-revision previous-revision next-revision
+                      responsible-p)))
+      (let ((default-directory (file-name-directory file)))
+        (apply orig-fun backend op file args))
+    (apply orig-fun backend op file args)))
+
+(advice-add 'vc-call-backend :around #'tramp-rpc--vc-call-backend-advice)
 
 ;; ============================================================================
 ;; File name handler registration
@@ -842,7 +1176,7 @@ NAME, BUFFER, PROGRAM and ARGS are ignored."
     (tramp-set-file-uid-gid . ignore)
     (unhandled-file-name-directory . ignore)
     (unlock-file . tramp-handle-unlock-file)
-    (vc-registered . ignore)
+    (vc-registered . tramp-rpc-handle-vc-registered)
     (verify-visited-file-modtime . tramp-handle-verify-visited-file-modtime)
     (write-region . tramp-rpc-handle-write-region))
   "Alist of handler functions for TRAMP-RPC method.")
@@ -879,6 +1213,25 @@ VEC-OR-FILENAME can be either a tramp-file-name struct or a filename string."
                ;; Minimal method entry - no shell setup needed
                ;; The foreign file name handler handles everything
                ))
+
+;; ============================================================================
+;; Unload support
+;; ============================================================================
+
+(defun tramp-rpc-unload-function ()
+  "Unload function for tramp-rpc.
+Removes advice and cleans up async processes."
+  ;; Remove advice
+  (advice-remove 'process-send-string #'tramp-rpc--process-send-string-advice)
+  (advice-remove 'process-send-eof #'tramp-rpc--process-send-eof-advice)
+  (advice-remove 'signal-process #'tramp-rpc--signal-process-advice)
+  (advice-remove 'process-status #'tramp-rpc--process-status-advice)
+  (advice-remove 'process-exit-status #'tramp-rpc--process-exit-status-advice)
+  (advice-remove 'vc-call-backend #'tramp-rpc--vc-call-backend-advice)
+  ;; Clean up all async processes
+  (tramp-rpc--cleanup-async-processes)
+  ;; Return nil to allow normal unload to proceed
+  nil)
 
 (provide 'tramp-rpc)
 ;;; tramp-rpc.el ends here

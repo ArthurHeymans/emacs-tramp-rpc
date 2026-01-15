@@ -150,8 +150,7 @@ pub fn create(params: &serde_json::Value) -> HandlerResult {
     {
         use std::os::unix::fs::PermissionsExt;
         let perms = fs::Permissions::from_mode(params.mode);
-        fs::set_permissions(path, perms)
-            .map_err(|e| super::file::map_io_error(e, &params.path))?;
+        fs::set_permissions(path, perms).map_err(|e| super::file::map_io_error(e, &params.path))?;
     }
 
     Ok(serde_json::json!(true))

@@ -39,7 +39,9 @@ pub fn read(params: &serde_json::Value) -> HandlerResult {
     // Read the content
     let content = if let Some(length) = params.length {
         let mut buf = vec![0u8; length];
-        let bytes_read = file.read(&mut buf).map_err(|e| map_io_error(e, &params.path))?;
+        let bytes_read = file
+            .read(&mut buf)
+            .map_err(|e| map_io_error(e, &params.path))?;
         buf.truncate(bytes_read);
         buf
     } else {
@@ -112,8 +114,7 @@ pub fn write(params: &serde_json::Value) -> HandlerResult {
     // Set permissions if specified
     if let Some(mode) = params.mode {
         let perms = fs::Permissions::from_mode(mode);
-        fs::set_permissions(&params.path, perms)
-            .map_err(|e| map_io_error(e, &params.path))?;
+        fs::set_permissions(&params.path, perms).map_err(|e| map_io_error(e, &params.path))?;
     }
 
     Ok(serde_json::json!({
