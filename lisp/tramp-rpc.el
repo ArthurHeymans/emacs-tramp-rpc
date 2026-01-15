@@ -191,13 +191,22 @@ Returns the result or signals an error."
         (while (and (not response-line)
                     (> timeout 0)
                     (process-live-p process))
-          (with-local-quit
-            (accept-process-output process 0.1))
-          (goto-char start)
-          (when (search-forward "\n" nil t)
-            (setq response-line (buffer-substring start (1- (point))))
-            ;; Clear processed data
-            (delete-region (point-min) (point)))
+          ;; Use same pattern as tramp-accept-process-output:
+          ;; - 0.1 second timeout to avoid spinning
+          ;; - JUST-THIS-ONE=t to only accept from this process (Bug#12145)
+          ;; - with-local-quit to allow C-g, returns t on success
+          ;; - Propagate quit if user pressed C-g
+          (if (with-local-quit
+                (accept-process-output process 0.1 nil t)
+                t)
+              (progn
+                (goto-char start)
+                (when (search-forward "\n" nil t)
+                  (setq response-line (buffer-substring start (1- (point))))
+                  ;; Clear processed data
+                  (delete-region (point-min) (point))))
+            ;; User quit - propagate it
+            (keyboard-quit))
           (cl-decf timeout 0.1))
 
         (unless response-line
@@ -828,8 +837,10 @@ Returns plist with :stdout, :stderr, :exited, :exit-code."
 (defun tramp-rpc--poll-process (local-process)
   "Poll for output from the remote process associated with LOCAL-PROCESS."
   ;; Guard against reentrancy (can happen during accept-process-output)
+  ;; Also ensure quitting is allowed since timers run with inhibit-quit=t
   (unless tramp-rpc--poll-in-progress
-    (let ((tramp-rpc--poll-in-progress t))
+    (let ((tramp-rpc--poll-in-progress t)
+          (inhibit-quit nil))
       (when (process-live-p local-process)
         (let ((info (gethash local-process tramp-rpc--async-processes)))
           (when info
