@@ -4,10 +4,11 @@ use crate::protocol::{OutputEncoding, ProcessResult, RpcError};
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
 use serde::Deserialize;
 use std::collections::HashMap;
-use std::io::{ErrorKind, Read, Write};
-use std::os::unix::io::AsRawFd;
-use std::process::{Child, Command, Stdio};
-use std::sync::Mutex;
+use std::io::ErrorKind;
+use std::process::Stdio;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::process::{Child, Command};
+use tokio::sync::Mutex;
 
 type HandlerResult = Result<serde_json::Value, RpcError>;
 
@@ -40,9 +41,9 @@ fn get_process_map() -> &'static Mutex<HashMap<u32, ManagedProcess>> {
     PROCESS_MAP.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-fn get_next_pid() -> u32 {
+async fn get_next_pid() -> u32 {
     let counter = PID_COUNTER.get_or_init(|| Mutex::new(1));
-    let mut pid = counter.lock().unwrap();
+    let mut pid = counter.lock().await;
     let current = *pid;
     *pid += 1;
     current
@@ -52,45 +53,14 @@ struct ManagedProcess {
     child: Child,
     #[allow(dead_code)]
     cmd: String,
-    /// Whether stdout has been set to non-blocking
-    stdout_nonblocking: bool,
-    /// Whether stderr has been set to non-blocking  
-    stderr_nonblocking: bool,
-}
-
-/// Set a file descriptor to non-blocking mode
-fn set_nonblocking(fd: i32) -> std::io::Result<()> {
-    let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
-    if flags < 0 {
-        return Err(std::io::Error::last_os_error());
-    }
-    let result = unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) };
-    if result < 0 {
-        return Err(std::io::Error::last_os_error());
-    }
-    Ok(())
-}
-
-/// Read from a non-blocking file descriptor, returning empty vec on WouldBlock
-fn try_read_nonblocking<R: Read>(reader: &mut R, max_bytes: usize) -> Vec<u8> {
-    let mut buf = vec![0u8; max_bytes];
-    match reader.read(&mut buf) {
-        Ok(0) => vec![], // EOF
-        Ok(n) => {
-            buf.truncate(n);
-            buf
-        }
-        Err(e) if e.kind() == ErrorKind::WouldBlock => vec![],
-        Err(_) => vec![],
-    }
 }
 
 // ============================================================================
-// Synchronous process execution
+// Synchronous process execution (but async-friendly)
 // ============================================================================
 
 /// Run a command and wait for it to complete
-pub fn run(params: &serde_json::Value) -> HandlerResult {
+pub async fn run(params: &serde_json::Value) -> HandlerResult {
     #[derive(Deserialize)]
     struct Params {
         /// Command to run
@@ -153,12 +123,12 @@ pub fn run(params: &serde_json::Value) -> HandlerResult {
             .map_err(|e| RpcError::invalid_params(format!("Invalid base64 stdin: {}", e)))?;
 
         if let Some(mut stdin) = child.stdin.take() {
-            let _ = stdin.write_all(&decoded);
+            let _ = stdin.write_all(&decoded).await;
         }
     }
 
-    // Wait for process to complete
-    let output = child.wait_with_output().map_err(|e| RpcError {
+    // Wait for process to complete (async!)
+    let output = child.wait_with_output().await.map_err(|e| RpcError {
         code: RpcError::PROCESS_ERROR,
         message: format!("Failed to wait for process: {}", e),
         data: None,
@@ -184,7 +154,7 @@ pub fn run(params: &serde_json::Value) -> HandlerResult {
 // ============================================================================
 
 /// Start an async process
-pub fn start(params: &serde_json::Value) -> HandlerResult {
+pub async fn start(params: &serde_json::Value) -> HandlerResult {
     #[derive(Deserialize)]
     struct Params {
         cmd: String,
@@ -228,16 +198,14 @@ pub fn start(params: &serde_json::Value) -> HandlerResult {
         data: None,
     })?;
 
-    let pid = get_next_pid();
+    let pid = get_next_pid().await;
 
     let managed = ManagedProcess {
         child,
         cmd: params.cmd.clone(),
-        stdout_nonblocking: false,
-        stderr_nonblocking: false,
     };
 
-    get_process_map().lock().unwrap().insert(pid, managed);
+    get_process_map().lock().await.insert(pid, managed);
 
     Ok(serde_json::json!({
         "pid": pid
@@ -245,7 +213,7 @@ pub fn start(params: &serde_json::Value) -> HandlerResult {
 }
 
 /// Write to an async process's stdin
-pub fn write(params: &serde_json::Value) -> HandlerResult {
+pub async fn write(params: &serde_json::Value) -> HandlerResult {
     #[derive(Deserialize)]
     struct Params {
         pid: u32,
@@ -260,7 +228,7 @@ pub fn write(params: &serde_json::Value) -> HandlerResult {
         .decode(&params.data)
         .map_err(|e| RpcError::invalid_params(format!("Invalid base64: {}", e)))?;
 
-    let mut processes = get_process_map().lock().unwrap();
+    let mut processes = get_process_map().lock().await;
     let managed = processes.get_mut(&params.pid).ok_or_else(|| RpcError {
         code: RpcError::PROCESS_ERROR,
         message: format!("Process not found: {}", params.pid),
@@ -268,7 +236,7 @@ pub fn write(params: &serde_json::Value) -> HandlerResult {
     })?;
 
     if let Some(stdin) = managed.child.stdin.as_mut() {
-        stdin.write_all(&decoded).map_err(|e| RpcError {
+        stdin.write_all(&decoded).await.map_err(|e| RpcError {
             code: RpcError::PROCESS_ERROR,
             message: format!("Failed to write to stdin: {}", e),
             data: None,
@@ -281,7 +249,7 @@ pub fn write(params: &serde_json::Value) -> HandlerResult {
 }
 
 /// Read from an async process's stdout/stderr
-pub fn read(params: &serde_json::Value) -> HandlerResult {
+pub async fn read(params: &serde_json::Value) -> HandlerResult {
     #[derive(Deserialize)]
     struct Params {
         pid: u32,
@@ -297,39 +265,23 @@ pub fn read(params: &serde_json::Value) -> HandlerResult {
     let params: Params = serde_json::from_value(params.clone())
         .map_err(|e| RpcError::invalid_params(e.to_string()))?;
 
-    let mut processes = get_process_map().lock().unwrap();
+    let mut processes = get_process_map().lock().await;
     let managed = processes.get_mut(&params.pid).ok_or_else(|| RpcError {
         code: RpcError::PROCESS_ERROR,
         message: format!("Process not found: {}", params.pid),
         data: None,
     })?;
 
-    // Ensure stdout is non-blocking
-    if !managed.stdout_nonblocking {
-        if let Some(stdout) = managed.child.stdout.as_ref() {
-            let _ = set_nonblocking(stdout.as_raw_fd());
-            managed.stdout_nonblocking = true;
-        }
-    }
-
-    // Ensure stderr is non-blocking
-    if !managed.stderr_nonblocking {
-        if let Some(stderr) = managed.child.stderr.as_ref() {
-            let _ = set_nonblocking(stderr.as_raw_fd());
-            managed.stderr_nonblocking = true;
-        }
-    }
-
-    // Try to read stdout (non-blocking)
+    // Try to read stdout (non-blocking with timeout)
     let stdout_data = if let Some(stdout) = managed.child.stdout.as_mut() {
-        try_read_nonblocking(stdout, params.max_bytes)
+        try_read_async(stdout, params.max_bytes).await
     } else {
         vec![]
     };
 
-    // Try to read stderr (non-blocking)
+    // Try to read stderr (non-blocking with timeout)
     let stderr_data = if let Some(stderr) = managed.child.stderr.as_mut() {
-        try_read_nonblocking(stderr, params.max_bytes)
+        try_read_async(stderr, params.max_bytes).await
     } else {
         vec![]
     };
@@ -362,8 +314,28 @@ pub fn read(params: &serde_json::Value) -> HandlerResult {
     }))
 }
 
+/// Try to read from an async reader with a very short timeout
+async fn try_read_async<R: tokio::io::AsyncRead + Unpin>(
+    reader: &mut R,
+    max_bytes: usize,
+) -> Vec<u8> {
+    let mut buf = vec![0u8; max_bytes];
+
+    // Use a very short timeout to make this effectively non-blocking
+    match tokio::time::timeout(std::time::Duration::from_millis(1), reader.read(&mut buf)).await {
+        Ok(Ok(0)) => vec![], // EOF
+        Ok(Ok(n)) => {
+            buf.truncate(n);
+            buf
+        }
+        Ok(Err(e)) if e.kind() == ErrorKind::WouldBlock => vec![],
+        Ok(Err(_)) => vec![],
+        Err(_) => vec![], // Timeout - no data available
+    }
+}
+
 /// Close the stdin of an async process (signals EOF)
-pub fn close_stdin(params: &serde_json::Value) -> HandlerResult {
+pub async fn close_stdin(params: &serde_json::Value) -> HandlerResult {
     #[derive(Deserialize)]
     struct Params {
         pid: u32,
@@ -372,7 +344,7 @@ pub fn close_stdin(params: &serde_json::Value) -> HandlerResult {
     let params: Params = serde_json::from_value(params.clone())
         .map_err(|e| RpcError::invalid_params(e.to_string()))?;
 
-    let mut processes = get_process_map().lock().unwrap();
+    let mut processes = get_process_map().lock().await;
     let managed = processes.get_mut(&params.pid).ok_or_else(|| RpcError {
         code: RpcError::PROCESS_ERROR,
         message: format!("Process not found: {}", params.pid),
@@ -386,7 +358,7 @@ pub fn close_stdin(params: &serde_json::Value) -> HandlerResult {
 }
 
 /// Kill an async process
-pub fn kill(params: &serde_json::Value) -> HandlerResult {
+pub async fn kill(params: &serde_json::Value) -> HandlerResult {
     #[derive(Deserialize)]
     struct Params {
         pid: u32,
@@ -402,7 +374,7 @@ pub fn kill(params: &serde_json::Value) -> HandlerResult {
     let params: Params = serde_json::from_value(params.clone())
         .map_err(|e| RpcError::invalid_params(e.to_string()))?;
 
-    let mut processes = get_process_map().lock().unwrap();
+    let mut processes = get_process_map().lock().await;
     let managed = processes.get_mut(&params.pid).ok_or_else(|| RpcError {
         code: RpcError::PROCESS_ERROR,
         message: format!("Process not found: {}", params.pid),
@@ -410,7 +382,11 @@ pub fn kill(params: &serde_json::Value) -> HandlerResult {
     })?;
 
     // Get the actual OS PID
-    let os_pid = managed.child.id();
+    let os_pid = managed.child.id().ok_or_else(|| RpcError {
+        code: RpcError::PROCESS_ERROR,
+        message: "Process has no PID (already exited?)".to_string(),
+        data: None,
+    })?;
 
     // Send the signal
     let result = unsafe { libc::kill(os_pid as i32, params.signal) };
@@ -432,8 +408,8 @@ pub fn kill(params: &serde_json::Value) -> HandlerResult {
 }
 
 /// List all managed async processes
-pub fn list(_params: &serde_json::Value) -> HandlerResult {
-    let mut processes = get_process_map().lock().unwrap();
+pub async fn list(_params: &serde_json::Value) -> HandlerResult {
+    let mut processes = get_process_map().lock().await;
 
     let list: Vec<serde_json::Value> = processes
         .iter_mut()

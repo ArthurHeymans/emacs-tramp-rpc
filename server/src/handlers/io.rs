@@ -3,17 +3,18 @@
 use crate::protocol::RpcError;
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
 use serde::Deserialize;
-use std::fs::{self, File, OpenOptions};
-use std::io::{Read, Seek, SeekFrom, Write};
+use std::io::SeekFrom;
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
+use tokio::fs::{self, File, OpenOptions};
+use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 
 use super::file::map_io_error;
 
 type HandlerResult = Result<serde_json::Value, RpcError>;
 
 /// Read file contents
-pub fn read(params: &serde_json::Value) -> HandlerResult {
+pub async fn read(params: &serde_json::Value) -> HandlerResult {
     #[derive(Deserialize)]
     struct Params {
         path: String,
@@ -28,11 +29,14 @@ pub fn read(params: &serde_json::Value) -> HandlerResult {
     let params: Params = serde_json::from_value(params.clone())
         .map_err(|e| RpcError::invalid_params(e.to_string()))?;
 
-    let mut file = File::open(&params.path).map_err(|e| map_io_error(e, &params.path))?;
+    let mut file = File::open(&params.path)
+        .await
+        .map_err(|e| map_io_error(e, &params.path))?;
 
     // Seek to offset if specified
     if let Some(offset) = params.offset {
         file.seek(SeekFrom::Start(offset))
+            .await
             .map_err(|e| map_io_error(e, &params.path))?;
     }
 
@@ -41,12 +45,14 @@ pub fn read(params: &serde_json::Value) -> HandlerResult {
         let mut buf = vec![0u8; length];
         let bytes_read = file
             .read(&mut buf)
+            .await
             .map_err(|e| map_io_error(e, &params.path))?;
         buf.truncate(bytes_read);
         buf
     } else {
         let mut buf = Vec::new();
         file.read_to_end(&mut buf)
+            .await
             .map_err(|e| map_io_error(e, &params.path))?;
         buf
     };
@@ -61,7 +67,7 @@ pub fn read(params: &serde_json::Value) -> HandlerResult {
 }
 
 /// Write file contents
-pub fn write(params: &serde_json::Value) -> HandlerResult {
+pub async fn write(params: &serde_json::Value) -> HandlerResult {
     #[derive(Deserialize)]
     struct Params {
         path: String,
@@ -99,22 +105,27 @@ pub fn write(params: &serde_json::Value) -> HandlerResult {
 
     let mut file = options
         .open(&params.path)
+        .await
         .map_err(|e| map_io_error(e, &params.path))?;
 
     // Seek to offset if specified
     if let Some(offset) = params.offset {
         file.seek(SeekFrom::Start(offset))
+            .await
             .map_err(|e| map_io_error(e, &params.path))?;
     }
 
     // Write the content
     file.write_all(&content)
+        .await
         .map_err(|e| map_io_error(e, &params.path))?;
 
     // Set permissions if specified
     if let Some(mode) = params.mode {
-        let perms = fs::Permissions::from_mode(mode);
-        fs::set_permissions(&params.path, perms).map_err(|e| map_io_error(e, &params.path))?;
+        let perms = std::fs::Permissions::from_mode(mode);
+        fs::set_permissions(&params.path, perms)
+            .await
+            .map_err(|e| map_io_error(e, &params.path))?;
     }
 
     Ok(serde_json::json!({
@@ -123,7 +134,7 @@ pub fn write(params: &serde_json::Value) -> HandlerResult {
 }
 
 /// Copy a file
-pub fn copy(params: &serde_json::Value) -> HandlerResult {
+pub async fn copy(params: &serde_json::Value) -> HandlerResult {
     #[derive(Deserialize)]
     struct Params {
         src: String,
@@ -137,20 +148,26 @@ pub fn copy(params: &serde_json::Value) -> HandlerResult {
         .map_err(|e| RpcError::invalid_params(e.to_string()))?;
 
     // Copy the file
-    let bytes_copied =
-        fs::copy(&params.src, &params.dest).map_err(|e| map_io_error(e, &params.src))?;
+    let bytes_copied = fs::copy(&params.src, &params.dest)
+        .await
+        .map_err(|e| map_io_error(e, &params.src))?;
 
     // Preserve attributes if requested
     if params.preserve {
-        if let Ok(metadata) = fs::metadata(&params.src) {
+        if let Ok(metadata) = fs::metadata(&params.src).await {
             // Preserve permissions
-            let _ = fs::set_permissions(&params.dest, metadata.permissions());
+            let _ = fs::set_permissions(&params.dest, metadata.permissions()).await;
 
             // Preserve timestamps
             #[cfg(unix)]
             {
                 use std::os::unix::fs::MetadataExt;
-                let _ = set_file_times(&params.dest, metadata.atime(), metadata.mtime());
+                let atime = metadata.atime();
+                let mtime = metadata.mtime();
+                let dest = params.dest.clone();
+                let _ =
+                    tokio::task::spawn_blocking(move || set_file_times_sync(&dest, atime, mtime))
+                        .await;
             }
         }
     }
@@ -161,7 +178,7 @@ pub fn copy(params: &serde_json::Value) -> HandlerResult {
 }
 
 /// Rename/move a file
-pub fn rename(params: &serde_json::Value) -> HandlerResult {
+pub async fn rename(params: &serde_json::Value) -> HandlerResult {
     #[derive(Deserialize)]
     struct Params {
         src: String,
@@ -183,13 +200,15 @@ pub fn rename(params: &serde_json::Value) -> HandlerResult {
         });
     }
 
-    fs::rename(&params.src, &params.dest).map_err(|e| map_io_error(e, &params.src))?;
+    fs::rename(&params.src, &params.dest)
+        .await
+        .map_err(|e| map_io_error(e, &params.src))?;
 
     Ok(serde_json::json!(true))
 }
 
 /// Delete a file
-pub fn delete(params: &serde_json::Value) -> HandlerResult {
+pub async fn delete(params: &serde_json::Value) -> HandlerResult {
     #[derive(Deserialize)]
     struct Params {
         path: String,
@@ -201,7 +220,7 @@ pub fn delete(params: &serde_json::Value) -> HandlerResult {
     let params: Params = serde_json::from_value(params.clone())
         .map_err(|e| RpcError::invalid_params(e.to_string()))?;
 
-    match fs::remove_file(&params.path) {
+    match fs::remove_file(&params.path).await {
         Ok(()) => Ok(serde_json::json!(true)),
         Err(e) if params.force && e.kind() == std::io::ErrorKind::NotFound => {
             Ok(serde_json::json!(false))
@@ -211,7 +230,7 @@ pub fn delete(params: &serde_json::Value) -> HandlerResult {
 }
 
 /// Set file permissions
-pub fn set_modes(params: &serde_json::Value) -> HandlerResult {
+pub async fn set_modes(params: &serde_json::Value) -> HandlerResult {
     #[derive(Deserialize)]
     struct Params {
         path: String,
@@ -221,14 +240,16 @@ pub fn set_modes(params: &serde_json::Value) -> HandlerResult {
     let params: Params = serde_json::from_value(params.clone())
         .map_err(|e| RpcError::invalid_params(e.to_string()))?;
 
-    let perms = fs::Permissions::from_mode(params.mode);
-    fs::set_permissions(&params.path, perms).map_err(|e| map_io_error(e, &params.path))?;
+    let perms = std::fs::Permissions::from_mode(params.mode);
+    fs::set_permissions(&params.path, perms)
+        .await
+        .map_err(|e| map_io_error(e, &params.path))?;
 
     Ok(serde_json::json!(true))
 }
 
 /// Set file timestamps
-pub fn set_times(params: &serde_json::Value) -> HandlerResult {
+pub async fn set_times(params: &serde_json::Value) -> HandlerResult {
     #[derive(Deserialize)]
     struct Params {
         path: String,
@@ -243,14 +264,19 @@ pub fn set_times(params: &serde_json::Value) -> HandlerResult {
         .map_err(|e| RpcError::invalid_params(e.to_string()))?;
 
     let atime = params.atime.unwrap_or(params.mtime);
+    let path = params.path.clone();
+    let mtime = params.mtime;
 
-    set_file_times(&params.path, atime, params.mtime)?;
+    // Use spawn_blocking for the libc syscall
+    tokio::task::spawn_blocking(move || set_file_times_sync(&path, atime, mtime))
+        .await
+        .map_err(|e| RpcError::internal_error(e.to_string()))??;
 
     Ok(serde_json::json!(true))
 }
 
 /// Create a symbolic link
-pub fn make_symlink(params: &serde_json::Value) -> HandlerResult {
+pub async fn make_symlink(params: &serde_json::Value) -> HandlerResult {
     #[derive(Deserialize)]
     struct Params {
         target: String,
@@ -262,7 +288,8 @@ pub fn make_symlink(params: &serde_json::Value) -> HandlerResult {
 
     #[cfg(unix)]
     {
-        std::os::unix::fs::symlink(&params.target, &params.link_path)
+        fs::symlink(&params.target, &params.link_path)
+            .await
             .map_err(|e| map_io_error(e, &params.link_path))?;
     }
 
@@ -274,7 +301,7 @@ pub fn make_symlink(params: &serde_json::Value) -> HandlerResult {
 // ============================================================================
 
 #[cfg(unix)]
-fn set_file_times(path: &str, atime: i64, mtime: i64) -> Result<(), RpcError> {
+fn set_file_times_sync(path: &str, atime: i64, mtime: i64) -> Result<(), RpcError> {
     use std::ffi::CString;
 
     let path_cstr = CString::new(path).map_err(|_| RpcError::invalid_params("Invalid path"))?;

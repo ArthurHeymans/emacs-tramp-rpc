@@ -8,10 +8,10 @@ pub mod process;
 use crate::protocol::{Request, RequestId, Response, RpcError};
 
 /// Dispatch a request to the appropriate handler
-pub fn dispatch(request: &Request) -> Response {
+pub async fn dispatch(request: &Request) -> Response {
     // Handle batch separately (it needs special handling and can't recurse)
     if request.method == "batch" {
-        let result = batch_execute(&request.params);
+        let result = batch_execute(&request.params).await;
         return match result {
             Ok(value) => Response::success(request.id.clone(), value),
             Err(error) => Response::error(Some(request.id.clone()), error),
@@ -19,7 +19,7 @@ pub fn dispatch(request: &Request) -> Response {
     }
 
     // All other methods go through dispatch_inner
-    dispatch_inner(request)
+    dispatch_inner(request).await
 }
 
 type HandlerResult = Result<serde_json::Value, RpcError>;
@@ -119,7 +119,7 @@ fn expand_tilde(path: &str) -> String {
 ///   ]
 /// }
 /// ```
-fn batch_execute(params: &serde_json::Value) -> HandlerResult {
+async fn batch_execute(params: &serde_json::Value) -> HandlerResult {
     #[derive(serde::Deserialize)]
     struct BatchParams {
         requests: Vec<BatchRequest>,
@@ -135,10 +135,11 @@ fn batch_execute(params: &serde_json::Value) -> HandlerResult {
     let batch_params: BatchParams = serde_json::from_value(params.clone())
         .map_err(|e| RpcError::invalid_params(e.to_string()))?;
 
-    let results: Vec<serde_json::Value> = batch_params
+    // Execute all requests concurrently using tokio::join_all
+    let futures: Vec<_> = batch_params
         .requests
         .into_iter()
-        .map(|req| {
+        .map(|req| async move {
             // Create a fake Request to reuse dispatch logic
             let fake_request = Request {
                 jsonrpc: "2.0".to_string(),
@@ -148,7 +149,7 @@ fn batch_execute(params: &serde_json::Value) -> HandlerResult {
             };
 
             // Get the result by calling the handler directly (not full dispatch)
-            let response = dispatch_inner(&fake_request);
+            let response = dispatch_inner(&fake_request).await;
 
             // Convert Response to a result object
             match (response.result, response.error) {
@@ -164,47 +165,50 @@ fn batch_execute(params: &serde_json::Value) -> HandlerResult {
         })
         .collect();
 
+    // Run all batch requests concurrently
+    let results = futures::future::join_all(futures).await;
+
     Ok(serde_json::json!({ "results": results }))
 }
 
 /// Inner dispatch that handles the actual method routing
 /// Used by both single requests and batch requests
-fn dispatch_inner(request: &Request) -> Response {
+async fn dispatch_inner(request: &Request) -> Response {
     let result = match request.method.as_str() {
         // File metadata operations
-        "file.stat" => file::stat(&request.params),
-        "file.stat_batch" => file::stat_batch(&request.params),
-        "file.exists" => file::exists(&request.params),
-        "file.readable" => file::readable(&request.params),
-        "file.writable" => file::writable(&request.params),
-        "file.executable" => file::executable(&request.params),
-        "file.truename" => file::truename(&request.params),
-        "file.newer_than" => file::newer_than(&request.params),
+        "file.stat" => file::stat(&request.params).await,
+        "file.stat_batch" => file::stat_batch(&request.params).await,
+        "file.exists" => file::exists(&request.params).await,
+        "file.readable" => file::readable(&request.params).await,
+        "file.writable" => file::writable(&request.params).await,
+        "file.executable" => file::executable(&request.params).await,
+        "file.truename" => file::truename(&request.params).await,
+        "file.newer_than" => file::newer_than(&request.params).await,
 
         // Directory operations
-        "dir.list" => dir::list(&request.params),
-        "dir.create" => dir::create(&request.params),
-        "dir.remove" => dir::remove(&request.params),
-        "dir.completions" => dir::completions(&request.params),
+        "dir.list" => dir::list(&request.params).await,
+        "dir.create" => dir::create(&request.params).await,
+        "dir.remove" => dir::remove(&request.params).await,
+        "dir.completions" => dir::completions(&request.params).await,
 
         // File I/O operations
-        "file.read" => io::read(&request.params),
-        "file.write" => io::write(&request.params),
-        "file.copy" => io::copy(&request.params),
-        "file.rename" => io::rename(&request.params),
-        "file.delete" => io::delete(&request.params),
-        "file.set_modes" => io::set_modes(&request.params),
-        "file.set_times" => io::set_times(&request.params),
-        "file.make_symlink" => io::make_symlink(&request.params),
+        "file.read" => io::read(&request.params).await,
+        "file.write" => io::write(&request.params).await,
+        "file.copy" => io::copy(&request.params).await,
+        "file.rename" => io::rename(&request.params).await,
+        "file.delete" => io::delete(&request.params).await,
+        "file.set_modes" => io::set_modes(&request.params).await,
+        "file.set_times" => io::set_times(&request.params).await,
+        "file.make_symlink" => io::make_symlink(&request.params).await,
 
         // Process operations
-        "process.run" => process::run(&request.params),
-        "process.start" => process::start(&request.params),
-        "process.write" => process::write(&request.params),
-        "process.read" => process::read(&request.params),
-        "process.close_stdin" => process::close_stdin(&request.params),
-        "process.kill" => process::kill(&request.params),
-        "process.list" => process::list(&request.params),
+        "process.run" => process::run(&request.params).await,
+        "process.start" => process::start(&request.params).await,
+        "process.write" => process::write(&request.params).await,
+        "process.read" => process::read(&request.params).await,
+        "process.close_stdin" => process::close_stdin(&request.params).await,
+        "process.kill" => process::kill(&request.params).await,
+        "process.list" => process::list(&request.params).await,
 
         // System info
         "system.info" => system_info(),

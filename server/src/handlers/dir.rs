@@ -2,16 +2,16 @@
 
 use crate::protocol::{DirEntry, FileType, RpcError};
 use serde::Deserialize;
-use std::fs;
 use std::os::unix::fs::FileTypeExt;
 use std::path::Path;
+use tokio::fs;
 
 use super::file::get_file_attributes;
 
 type HandlerResult = Result<serde_json::Value, RpcError>;
 
 /// List directory contents
-pub fn list(params: &serde_json::Value) -> HandlerResult {
+pub async fn list(params: &serde_json::Value) -> HandlerResult {
     #[derive(Deserialize)]
     struct Params {
         path: String,
@@ -32,7 +32,9 @@ pub fn list(params: &serde_json::Value) -> HandlerResult {
 
     let path = Path::new(&params.path);
 
-    let entries = fs::read_dir(path).map_err(|e| super::file::map_io_error(e, &params.path))?;
+    let mut entries = fs::read_dir(path)
+        .await
+        .map_err(|e| super::file::map_io_error(e, &params.path))?;
 
     let mut results: Vec<DirEntry> = Vec::new();
 
@@ -42,7 +44,7 @@ pub fn list(params: &serde_json::Value) -> HandlerResult {
             name: ".".to_string(),
             file_type: FileType::Directory,
             attrs: if params.include_attrs {
-                get_file_attributes(&params.path, false).ok()
+                get_file_attributes(&params.path, false).await.ok()
             } else {
                 None
             },
@@ -53,19 +55,16 @@ pub fn list(params: &serde_json::Value) -> HandlerResult {
             name: "..".to_string(),
             file_type: FileType::Directory,
             attrs: if params.include_attrs {
-                get_file_attributes(&parent.to_string_lossy(), false).ok()
+                get_file_attributes(&parent.to_string_lossy(), false)
+                    .await
+                    .ok()
             } else {
                 None
             },
         });
     }
 
-    for entry in entries {
-        let entry = match entry {
-            Ok(e) => e,
-            Err(_) => continue,
-        };
-
+    while let Ok(Some(entry)) = entries.next_entry().await {
         let name = entry.file_name().to_string_lossy().to_string();
 
         // Skip hidden files if not requested
@@ -73,7 +72,7 @@ pub fn list(params: &serde_json::Value) -> HandlerResult {
             continue;
         }
 
-        let file_type = match entry.file_type() {
+        let file_type = match entry.file_type().await {
             Ok(ft) => {
                 if ft.is_file() {
                     FileType::File
@@ -97,7 +96,9 @@ pub fn list(params: &serde_json::Value) -> HandlerResult {
         };
 
         let attrs = if params.include_attrs {
-            get_file_attributes(&entry.path().to_string_lossy(), true).ok()
+            get_file_attributes(&entry.path().to_string_lossy(), true)
+                .await
+                .ok()
         } else {
             None
         };
@@ -116,7 +117,7 @@ pub fn list(params: &serde_json::Value) -> HandlerResult {
 }
 
 /// Create a directory
-pub fn create(params: &serde_json::Value) -> HandlerResult {
+pub async fn create(params: &serde_json::Value) -> HandlerResult {
     #[derive(Deserialize)]
     struct Params {
         path: String,
@@ -138,9 +139,9 @@ pub fn create(params: &serde_json::Value) -> HandlerResult {
     let path = Path::new(&params.path);
 
     let result = if params.parents {
-        fs::create_dir_all(path)
+        fs::create_dir_all(path).await
     } else {
-        fs::create_dir(path)
+        fs::create_dir(path).await
     };
 
     result.map_err(|e| super::file::map_io_error(e, &params.path))?;
@@ -149,15 +150,17 @@ pub fn create(params: &serde_json::Value) -> HandlerResult {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        let perms = fs::Permissions::from_mode(params.mode);
-        fs::set_permissions(path, perms).map_err(|e| super::file::map_io_error(e, &params.path))?;
+        let perms = std::fs::Permissions::from_mode(params.mode);
+        fs::set_permissions(path, perms)
+            .await
+            .map_err(|e| super::file::map_io_error(e, &params.path))?;
     }
 
     Ok(serde_json::json!(true))
 }
 
 /// Remove a directory
-pub fn remove(params: &serde_json::Value) -> HandlerResult {
+pub async fn remove(params: &serde_json::Value) -> HandlerResult {
     #[derive(Deserialize)]
     struct Params {
         path: String,
@@ -172,9 +175,9 @@ pub fn remove(params: &serde_json::Value) -> HandlerResult {
     let path = Path::new(&params.path);
 
     let result = if params.recursive {
-        fs::remove_dir_all(path)
+        fs::remove_dir_all(path).await
     } else {
-        fs::remove_dir(path)
+        fs::remove_dir(path).await
     };
 
     result.map_err(|e| super::file::map_io_error(e, &params.path))?;
@@ -183,7 +186,7 @@ pub fn remove(params: &serde_json::Value) -> HandlerResult {
 }
 
 /// Get completions for a path prefix
-pub fn completions(params: &serde_json::Value) -> HandlerResult {
+pub async fn completions(params: &serde_json::Value) -> HandlerResult {
     #[derive(Deserialize)]
     struct Params {
         /// Directory to search in
@@ -197,23 +200,24 @@ pub fn completions(params: &serde_json::Value) -> HandlerResult {
 
     let dir_path = Path::new(&params.directory);
 
-    let entries =
-        fs::read_dir(dir_path).map_err(|e| super::file::map_io_error(e, &params.directory))?;
+    let mut entries = fs::read_dir(dir_path)
+        .await
+        .map_err(|e| super::file::map_io_error(e, &params.directory))?;
 
     let mut completions: Vec<String> = Vec::new();
 
-    for entry in entries {
-        let entry = match entry {
-            Ok(e) => e,
-            Err(_) => continue,
-        };
-
+    while let Ok(Some(entry)) = entries.next_entry().await {
         let name = entry.file_name().to_string_lossy().to_string();
 
         // Check if name starts with prefix
         if name.starts_with(&params.prefix) {
             // Append / for directories
-            let suffix = if entry.file_type().map(|ft| ft.is_dir()).unwrap_or(false) {
+            let suffix = if entry
+                .file_type()
+                .await
+                .map(|ft| ft.is_dir())
+                .unwrap_or(false)
+            {
                 "/"
             } else {
                 ""

@@ -2,15 +2,15 @@
 
 use crate::protocol::{FileAttributes, FileType, RpcError, StatResult};
 use serde::Deserialize;
-use std::fs;
 use std::os::unix::fs::{FileTypeExt, MetadataExt};
 use std::path::Path;
 use std::time::UNIX_EPOCH;
+use tokio::fs;
 
 type HandlerResult = Result<serde_json::Value, RpcError>;
 
 /// Get file attributes
-pub fn stat(params: &serde_json::Value) -> HandlerResult {
+pub async fn stat(params: &serde_json::Value) -> HandlerResult {
     #[derive(Deserialize)]
     struct Params {
         path: String,
@@ -22,12 +22,12 @@ pub fn stat(params: &serde_json::Value) -> HandlerResult {
     let params: Params = serde_json::from_value(params.clone())
         .map_err(|e| RpcError::invalid_params(e.to_string()))?;
 
-    let attrs = get_file_attributes(&params.path, params.lstat)?;
+    let attrs = get_file_attributes(&params.path, params.lstat).await?;
     Ok(serde_json::to_value(attrs).unwrap())
 }
 
-/// Batch stat operation - returns results for multiple paths
-pub fn stat_batch(params: &serde_json::Value) -> HandlerResult {
+/// Batch stat operation - returns results for multiple paths concurrently
+pub async fn stat_batch(params: &serde_json::Value) -> HandlerResult {
     #[derive(Deserialize)]
     struct Params {
         paths: Vec<String>,
@@ -38,22 +38,30 @@ pub fn stat_batch(params: &serde_json::Value) -> HandlerResult {
     let params: Params = serde_json::from_value(params.clone())
         .map_err(|e| RpcError::invalid_params(e.to_string()))?;
 
-    let results: Vec<StatResult> = params
+    // Run all stat operations concurrently
+    let futures: Vec<_> = params
         .paths
         .iter()
-        .map(|path| match get_file_attributes(path, params.lstat) {
-            Ok(attrs) => StatResult::Ok(attrs),
-            Err(e) => StatResult::Err {
-                error: e.message.clone(),
-            },
+        .map(|path| {
+            let path = path.clone();
+            let lstat = params.lstat;
+            async move {
+                match get_file_attributes(&path, lstat).await {
+                    Ok(attrs) => StatResult::Ok(attrs),
+                    Err(e) => StatResult::Err {
+                        error: e.message.clone(),
+                    },
+                }
+            }
         })
         .collect();
 
+    let results = futures::future::join_all(futures).await;
     Ok(serde_json::to_value(results).unwrap())
 }
 
 /// Check if file exists
-pub fn exists(params: &serde_json::Value) -> HandlerResult {
+pub async fn exists(params: &serde_json::Value) -> HandlerResult {
     #[derive(Deserialize)]
     struct Params {
         path: String,
@@ -62,12 +70,13 @@ pub fn exists(params: &serde_json::Value) -> HandlerResult {
     let params: Params = serde_json::from_value(params.clone())
         .map_err(|e| RpcError::invalid_params(e.to_string()))?;
 
-    let exists = Path::new(&params.path).exists();
+    // tokio::fs doesn't have exists(), so we try metadata
+    let exists = fs::metadata(&params.path).await.is_ok();
     Ok(serde_json::json!(exists))
 }
 
 /// Check if file is readable
-pub fn readable(params: &serde_json::Value) -> HandlerResult {
+pub async fn readable(params: &serde_json::Value) -> HandlerResult {
     #[derive(Deserialize)]
     struct Params {
         path: String,
@@ -77,20 +86,22 @@ pub fn readable(params: &serde_json::Value) -> HandlerResult {
         .map_err(|e| RpcError::invalid_params(e.to_string()))?;
 
     // Use access() syscall to check read permission
-    let readable = unsafe {
+    // This is a fast syscall, no need for spawn_blocking
+    let path = params.path;
+    let readable = tokio::task::spawn_blocking(move || unsafe {
         libc::access(
-            std::ffi::CString::new(params.path.as_str())
-                .unwrap()
-                .as_ptr(),
+            std::ffi::CString::new(path.as_str()).unwrap().as_ptr(),
             libc::R_OK,
         ) == 0
-    };
+    })
+    .await
+    .unwrap_or(false);
 
     Ok(serde_json::json!(readable))
 }
 
 /// Check if file is writable
-pub fn writable(params: &serde_json::Value) -> HandlerResult {
+pub async fn writable(params: &serde_json::Value) -> HandlerResult {
     #[derive(Deserialize)]
     struct Params {
         path: String,
@@ -99,20 +110,21 @@ pub fn writable(params: &serde_json::Value) -> HandlerResult {
     let params: Params = serde_json::from_value(params.clone())
         .map_err(|e| RpcError::invalid_params(e.to_string()))?;
 
-    let writable = unsafe {
+    let path = params.path;
+    let writable = tokio::task::spawn_blocking(move || unsafe {
         libc::access(
-            std::ffi::CString::new(params.path.as_str())
-                .unwrap()
-                .as_ptr(),
+            std::ffi::CString::new(path.as_str()).unwrap().as_ptr(),
             libc::W_OK,
         ) == 0
-    };
+    })
+    .await
+    .unwrap_or(false);
 
     Ok(serde_json::json!(writable))
 }
 
 /// Check if file is executable
-pub fn executable(params: &serde_json::Value) -> HandlerResult {
+pub async fn executable(params: &serde_json::Value) -> HandlerResult {
     #[derive(Deserialize)]
     struct Params {
         path: String,
@@ -121,20 +133,21 @@ pub fn executable(params: &serde_json::Value) -> HandlerResult {
     let params: Params = serde_json::from_value(params.clone())
         .map_err(|e| RpcError::invalid_params(e.to_string()))?;
 
-    let executable = unsafe {
+    let path = params.path;
+    let executable = tokio::task::spawn_blocking(move || unsafe {
         libc::access(
-            std::ffi::CString::new(params.path.as_str())
-                .unwrap()
-                .as_ptr(),
+            std::ffi::CString::new(path.as_str()).unwrap().as_ptr(),
             libc::X_OK,
         ) == 0
-    };
+    })
+    .await
+    .unwrap_or(false);
 
     Ok(serde_json::json!(executable))
 }
 
 /// Get the true name of a file (resolve symlinks)
-pub fn truename(params: &serde_json::Value) -> HandlerResult {
+pub async fn truename(params: &serde_json::Value) -> HandlerResult {
     #[derive(Deserialize)]
     struct Params {
         path: String,
@@ -143,16 +156,18 @@ pub fn truename(params: &serde_json::Value) -> HandlerResult {
     let params: Params = serde_json::from_value(params.clone())
         .map_err(|e| RpcError::invalid_params(e.to_string()))?;
 
-    let path = Path::new(&params.path);
+    let path = params.path.clone();
 
-    // First canonicalize to resolve symlinks and get absolute path
-    let canonical = fs::canonicalize(path).map_err(|e| map_io_error(e, &params.path))?;
+    // Use tokio's async canonicalize
+    let canonical = fs::canonicalize(&path)
+        .await
+        .map_err(|e| map_io_error(e, &params.path))?;
 
     Ok(serde_json::json!(canonical.to_string_lossy()))
 }
 
 /// Check if file1 is newer than file2
-pub fn newer_than(params: &serde_json::Value) -> HandlerResult {
+pub async fn newer_than(params: &serde_json::Value) -> HandlerResult {
     #[derive(Deserialize)]
     struct Params {
         file1: String,
@@ -162,8 +177,8 @@ pub fn newer_than(params: &serde_json::Value) -> HandlerResult {
     let params: Params = serde_json::from_value(params.clone())
         .map_err(|e| RpcError::invalid_params(e.to_string()))?;
 
-    let meta1 = fs::metadata(&params.file1);
-    let meta2 = fs::metadata(&params.file2);
+    // Get both metadata concurrently
+    let (meta1, meta2) = tokio::join!(fs::metadata(&params.file1), fs::metadata(&params.file2));
 
     let result = match (meta1, meta2) {
         (Ok(m1), Ok(m2)) => {
@@ -182,13 +197,13 @@ pub fn newer_than(params: &serde_json::Value) -> HandlerResult {
 // Helper functions
 // ============================================================================
 
-pub fn get_file_attributes(path: &str, lstat: bool) -> Result<FileAttributes, RpcError> {
+pub async fn get_file_attributes(path: &str, lstat: bool) -> Result<FileAttributes, RpcError> {
     let path_obj = Path::new(path);
 
     let metadata = if lstat {
-        fs::symlink_metadata(path_obj)
+        fs::symlink_metadata(path_obj).await
     } else {
-        fs::metadata(path_obj)
+        fs::metadata(path_obj).await
     }
     .map_err(|e| map_io_error(e, path))?;
 
@@ -196,6 +211,7 @@ pub fn get_file_attributes(path: &str, lstat: bool) -> Result<FileAttributes, Rp
 
     let link_target = if file_type == FileType::Symlink {
         fs::read_link(path_obj)
+            .await
             .ok()
             .map(|p| p.to_string_lossy().to_string())
     } else {
@@ -223,7 +239,7 @@ pub fn get_file_attributes(path: &str, lstat: bool) -> Result<FileAttributes, Rp
     })
 }
 
-fn get_file_type(metadata: &fs::Metadata) -> FileType {
+fn get_file_type(metadata: &std::fs::Metadata) -> FileType {
     let ft = metadata.file_type();
 
     if ft.is_file() {
