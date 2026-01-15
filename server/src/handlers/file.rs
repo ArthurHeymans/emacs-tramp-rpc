@@ -202,11 +202,16 @@ pub fn get_file_attributes(path: &str, lstat: bool) -> Result<FileAttributes, Rp
         None
     };
 
+    let uid = metadata.uid();
+    let gid = metadata.gid();
+
     Ok(FileAttributes {
         file_type,
         nlinks: metadata.nlink(),
-        uid: metadata.uid(),
-        gid: metadata.gid(),
+        uid,
+        gid,
+        uname: get_user_name(uid),
+        gname: get_group_name(gid),
         atime: metadata.atime(),
         mtime: metadata.mtime(),
         ctime: metadata.ctime(),
@@ -237,6 +242,30 @@ fn get_file_type(metadata: &fs::Metadata) -> FileType {
         FileType::Socket
     } else {
         FileType::Unknown
+    }
+}
+
+/// Get user name from uid
+fn get_user_name(uid: u32) -> Option<String> {
+    unsafe {
+        let passwd = libc::getpwuid(uid);
+        if passwd.is_null() {
+            return None;
+        }
+        let name = std::ffi::CStr::from_ptr((*passwd).pw_name);
+        name.to_str().ok().map(|s| s.to_string())
+    }
+}
+
+/// Get group name from gid
+fn get_group_name(gid: u32) -> Option<String> {
+    unsafe {
+        let group = libc::getgrgid(gid);
+        if group.is_null() {
+            return None;
+        }
+        let name = std::ffi::CStr::from_ptr((*group).gr_name);
+        name.to_str().ok().map(|s| s.to_string())
     }
 }
 

@@ -170,6 +170,12 @@ pub struct FileAttributes {
     pub uid: u32,
     /// Group ID
     pub gid: u32,
+    /// User name (resolved from uid)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub uname: Option<String>,
+    /// Group name (resolved from gid)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub gname: Option<String>,
     /// Last access time (seconds since epoch)
     pub atime: i64,
     /// Last modification time (seconds since epoch)

@@ -191,7 +191,8 @@ Returns the result or signals an error."
         (while (and (not response-line)
                     (> timeout 0)
                     (process-live-p process))
-          (accept-process-output process 0.1)
+          (with-local-quit
+            (accept-process-output process 0.1))
           (goto-char start)
           (when (search-forward "\n" nil t)
             (setq response-line (buffer-substring start (1- (point))))
@@ -299,6 +300,8 @@ ID-FORMAT specifies whether to use numeric or string IDs."
          (nlinks (alist-get 'nlinks stat))
          (uid (alist-get 'uid stat))
          (gid (alist-get 'gid stat))
+         (uname (alist-get 'uname stat))
+         (gname (alist-get 'gname stat))
          (atime (seconds-to-time (alist-get 'atime stat)))
          (mtime (seconds-to-time (alist-get 'mtime stat)))
          (ctime (seconds-to-time (alist-get 'ctime stat)))
@@ -308,8 +311,8 @@ ID-FORMAT specifies whether to use numeric or string IDs."
          (dev (alist-get 'dev stat)))
     ;; Return in file-attributes format
     (list type nlinks
-          (if (eq id-format 'string) (number-to-string uid) uid)
-          (if (eq id-format 'string) (number-to-string gid) gid)
+          (if (eq id-format 'string) (or uname (number-to-string uid)) uid)
+          (if (eq id-format 'string) (or gname (number-to-string gid)) gid)
           atime mtime ctime
           size mode nil inode dev)))
 
@@ -454,9 +457,7 @@ TYPE is the file type string."
 
 (defun tramp-rpc-handle-delete-directory (directory &optional recursive trash)
   "Like `delete-directory' for TRAMP-RPC files."
-  (when trash
-    (error "Trash not supported for TRAMP-RPC"))
-  (with-parsed-tramp-file-name directory nil
+  (tramp-skeleton-delete-directory directory recursive trash
     (tramp-rpc--call v "dir.remove"
                      `((path . ,localname)
                        (recursive . ,(if recursive t :json-false))))))
@@ -488,6 +489,8 @@ Produces ls-like output for dired."
                (nlinks (or (alist-get 'nlinks attrs) 1))
                (uid (or (alist-get 'uid attrs) 0))
                (gid (or (alist-get 'gid attrs) 0))
+               (uname (or (alist-get 'uname attrs) (number-to-string uid)))
+               (gname (or (alist-get 'gname attrs) (number-to-string gid)))
                (size (or (alist-get 'size attrs) 0))
                (mtime (alist-get 'mtime attrs))
                (link-target (alist-get 'link_target attrs))
@@ -498,8 +501,8 @@ Produces ls-like output for dired."
           ;; Skip . and .. unless -a is given
           (unless (and (member name '("." ".."))
                        (not (string-match-p "a" (or switches ""))))
-            (insert (format "  %s %3d %5d %5d %8d %s %s"
-                            mode-str nlinks uid gid size time-str name))
+            (insert (format "  %s %3d %-8s %-8s %8d %s %s"
+                            mode-str nlinks uname gname size time-str name))
             (when (and link-target (equal type "symlink"))
               (insert (format " -> %s" link-target)))
             (insert "\n")))))))
@@ -610,9 +613,7 @@ Produces ls-like output for dired."
 
 (defun tramp-rpc-handle-delete-file (filename &optional trash)
   "Like `delete-file' for TRAMP-RPC files."
-  (when trash
-    (error "Trash not supported for TRAMP-RPC"))
-  (with-parsed-tramp-file-name filename nil
+  (tramp-skeleton-delete-file filename trash
     (tramp-rpc--call v "file.delete" `((path . ,localname)))))
 
 (defun tramp-rpc-handle-make-symbolic-link (target linkname &optional ok-if-already-exists)
