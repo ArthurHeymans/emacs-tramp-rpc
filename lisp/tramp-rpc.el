@@ -310,6 +310,125 @@ Returns:
             (tramp-rpc-protocol-decode-batch-response response)))))))
 
 ;; ============================================================================
+;; Request pipelining support
+;; ============================================================================
+
+(defun tramp-rpc--send-requests (vec requests)
+  "Send multiple REQUESTS to the RPC server for VEC without waiting.
+REQUESTS is a list of (METHOD . PARAMS) cons cells.
+Returns a list of request IDs in the same order."
+  (let* ((conn (tramp-rpc--ensure-connection vec))
+         (process (plist-get conn :process))
+         ids)
+    (dolist (req requests)
+      (let* ((id-and-json (tramp-rpc-protocol-encode-request-with-id
+                           (car req) (cdr req)))
+             (id (car id-and-json))
+             (json (cdr id-and-json)))
+        (push id ids)
+        (process-send-string process (concat json "\n"))))
+    (nreverse ids)))
+
+(defun tramp-rpc--receive-responses (vec ids &optional timeout)
+  "Receive responses for request IDS from the RPC server for VEC.
+Returns an alist mapping each ID to its response plist.
+TIMEOUT is the maximum time to wait in seconds (default 30)."
+  (let* ((conn (tramp-rpc--ensure-connection vec))
+         (process (plist-get conn :process))
+         (buffer (plist-get conn :buffer))
+         (timeout (or timeout 30))
+         (remaining-ids (copy-sequence ids))
+         (responses (make-hash-table :test 'eql)))
+    (with-current-buffer buffer
+      (let ((start (point-max)))
+        (while (and remaining-ids
+                    (> timeout 0)
+                    (process-live-p process))
+          (if (with-local-quit
+                (accept-process-output process 0.1 nil t)
+                t)
+              (progn
+                (goto-char start)
+                ;; Try to read all complete lines
+                (while (search-forward "\n" nil t)
+                  (let* ((line (buffer-substring start (1- (point))))
+                         (response (tramp-rpc-protocol-decode-response line))
+                         (id (plist-get response :id)))
+                    ;; Store response by ID
+                    (puthash id response responses)
+                    ;; Remove from remaining
+                    (setq remaining-ids (delete id remaining-ids))
+                    ;; Update start position
+                    (setq start (point)))))
+            (keyboard-quit))
+          (cl-decf timeout 0.1))
+        ;; Clear processed data
+        (delete-region (point-min) start)))
+    ;; Convert hash table to alist in original order
+    (mapcar (lambda (id)
+              (cons id (gethash id responses)))
+            ids)))
+
+(defun tramp-rpc--call-pipelined (vec requests)
+  "Execute multiple REQUESTS in a pipelined fashion for VEC.
+REQUESTS is a list of (METHOD . PARAMS) cons cells.
+Returns a list of results in the same order as REQUESTS.
+Each result is either the actual result or an error plist.
+
+Unlike `tramp-rpc--call-batch', this sends each request as a separate
+RPC call, allowing the server to process them concurrently.
+This is more efficient when the server has async support."
+  (let* ((ids (tramp-rpc--send-requests vec requests))
+         (responses (tramp-rpc--receive-responses vec ids)))
+    ;; Process responses in order and extract results
+    (mapcar (lambda (id-response)
+              (let ((response (cdr id-response)))
+                (if (tramp-rpc-protocol-error-p response)
+                    (let ((code (tramp-rpc-protocol-error-code response))
+                          (msg (tramp-rpc-protocol-error-message response)))
+                      (list :error code :message msg))
+                  (plist-get response :result))))
+            responses)))
+
+;; ============================================================================
+;; Batch context for automatic operation batching
+;; ============================================================================
+
+(defvar tramp-rpc--batch-context nil
+  "When non-nil, a plist with :vec, :requests, :results for batch collection.")
+
+(defmacro with-tramp-rpc-batch (vec &rest body)
+  "Execute BODY with automatic batching of RPC operations for VEC.
+Operations within BODY that would normally make individual RPC calls
+are collected and executed together when the batch context ends.
+
+This is useful for optimizing code that makes many small RPC calls,
+such as iterating over files.
+
+Example:
+  (with-tramp-rpc-batch vec
+    (dolist (file files)
+      (when (file-exists-p file)
+        (push (file-attributes file) attrs))))"
+  (declare (indent 1))
+  `(let ((tramp-rpc--batch-context
+          (list :vec ,vec :requests nil :results nil)))
+     (unwind-protect
+         (progn ,@body)
+       ;; Flush any pending requests
+       (tramp-rpc--flush-batch-context))))
+
+(defun tramp-rpc--flush-batch-context ()
+  "Execute any pending requests in the current batch context."
+  (when tramp-rpc--batch-context
+    (let ((requests (plist-get tramp-rpc--batch-context :requests)))
+      (when requests
+        (let* ((vec (plist-get tramp-rpc--batch-context :vec))
+               (results (tramp-rpc--call-pipelined vec (nreverse requests))))
+          (plist-put tramp-rpc--batch-context :results results)
+          (plist-put tramp-rpc--batch-context :requests nil))))))
+
+;; ============================================================================
 ;; Output decoding helper
 ;; ============================================================================
 
@@ -337,13 +456,24 @@ If ENCODING is nil, defaults to \"base64\" for backward compatibility."
     (tramp-rpc--call v "file.readable" `((path . ,localname)))))
 
 (defun tramp-rpc-handle-file-writable-p (filename)
-  "Like `file-writable-p' for TRAMP-RPC files."
+  "Like `file-writable-p' for TRAMP-RPC files.
+Optimized to use pipelined requests for better performance."
   (with-parsed-tramp-file-name filename nil
-    (if (tramp-rpc--call v "file.exists" `((path . ,localname)))
-        (tramp-rpc--call v "file.writable" `((path . ,localname)))
-      ;; File doesn't exist, check if parent directory is writable
-      (let ((parent (file-name-directory (directory-file-name localname))))
-        (tramp-rpc--call v "file.writable" `((path . ,parent)))))))
+    (let* ((parent (file-name-directory (directory-file-name localname)))
+           ;; Send both requests in parallel
+           (results (tramp-rpc--call-pipelined
+                     v
+                     `(("file.exists" . ((path . ,localname)))
+                       ("file.writable" . ((path . ,localname)))
+                       ("file.writable" . ((path . ,parent))))))
+           (exists (nth 0 results))
+           (file-writable (nth 1 results))
+           (parent-writable (nth 2 results)))
+      (if exists
+          ;; File exists - check if it's writable
+          (and (not (plist-get file-writable :error)) file-writable)
+        ;; File doesn't exist - check if parent is writable
+        (and (not (plist-get parent-writable :error)) parent-writable)))))
 
 (defun tramp-rpc-handle-file-executable-p (filename)
   "Like `file-executable-p' for TRAMP-RPC files."
@@ -911,8 +1041,19 @@ process-file calls from VC backends are routed through our tramp handler."
 ;; Async Process Support
 ;; ============================================================================
 
-(defvar tramp-rpc--process-poll-interval 0.1
-  "Interval in seconds between polling remote process for output.")
+(defvar tramp-rpc--process-poll-interval-min 0.01
+  "Minimum interval in seconds between polling remote process for output.
+Used when process is actively producing output.")
+
+(defvar tramp-rpc--process-poll-interval-max 0.5
+  "Maximum interval in seconds between polling remote process for output.
+Used when process has been idle for a while.")
+
+(defvar tramp-rpc--process-poll-interval-initial 0.05
+  "Initial interval in seconds for polling a new process.")
+
+(defvar tramp-rpc--process-poll-backoff-factor 1.5
+  "Factor by which to increase poll interval when no output is received.")
 
 (defvar tramp-rpc--poll-in-progress nil
   "Non-nil while a poll is in progress (prevents reentrancy).")
@@ -955,6 +1096,37 @@ Returns plist with :stdout, :stderr, :exited, :exit-code."
                    `((pid . ,pid)
                      (signal . ,(or signal 15))))) ; SIGTERM
 
+(defun tramp-rpc--adjust-poll-interval (local-process had-output)
+  "Adjust the poll interval for LOCAL-PROCESS based on whether it HAD-OUTPUT.
+Returns the new interval."
+  (let* ((info (gethash local-process tramp-rpc--async-processes))
+         (current-interval (or (plist-get info :poll-interval)
+                               tramp-rpc--process-poll-interval-initial))
+         (new-interval
+          (if had-output
+              ;; Got output - use minimum interval for responsiveness
+              tramp-rpc--process-poll-interval-min
+            ;; No output - back off gradually
+            (min (* current-interval tramp-rpc--process-poll-backoff-factor)
+                 tramp-rpc--process-poll-interval-max))))
+    ;; Update stored interval
+    (when info
+      (plist-put info :poll-interval new-interval))
+    new-interval))
+
+(defun tramp-rpc--reschedule-poll-timer (local-process new-interval)
+  "Reschedule the poll timer for LOCAL-PROCESS with NEW-INTERVAL."
+  (let ((info (gethash local-process tramp-rpc--async-processes)))
+    (when info
+      (when-let ((old-timer (plist-get info :timer)))
+        (cancel-timer old-timer))
+      (let ((new-timer (run-with-timer
+                        new-interval
+                        new-interval
+                        #'tramp-rpc--poll-process
+                        local-process)))
+        (plist-put info :timer new-timer)))))
+
 (defun tramp-rpc--poll-process (local-process)
   "Poll for output from the remote process associated with LOCAL-PROCESS."
   ;; Guard against reentrancy (can happen during accept-process-output)
@@ -972,11 +1144,13 @@ Returns plist with :stdout, :stderr, :exited, :exit-code."
                                (tramp-rpc--read-remote-process vec pid)
                              (error
                               (message "tramp-rpc: Error polling process: %s" err)
-                              nil))))
+                              nil)))
+                   (had-output nil))
           (when result
             ;; Handle stdout - send to process filter/buffer
             (when-let ((stdout (plist-get result :stdout)))
               (when (> (length stdout) 0)
+                (setq had-output t)
                 (if-let ((filter (process-filter local-process)))
                     (funcall filter local-process stdout)
                   (when-let ((buf (process-buffer local-process)))
@@ -988,6 +1162,7 @@ Returns plist with :stdout, :stderr, :exited, :exit-code."
             ;; Handle stderr - send to stderr buffer if specified
             (when-let ((stderr (plist-get result :stderr)))
               (when (> (length stderr) 0)
+                (setq had-output t)
                 (cond
                  ((bufferp stderr-buffer)
                   (when (buffer-live-p stderr-buffer)
@@ -1003,6 +1178,16 @@ Returns plist with :stdout, :stderr, :exited, :exit-code."
                         (with-current-buffer buf
                           (goto-char (point-max))
                           (insert stderr)))))))))
+            
+            ;; Adaptive polling: adjust interval based on output
+            (let* ((current-interval (or (plist-get info :poll-interval)
+                                         tramp-rpc--process-poll-interval-initial))
+                   (new-interval (tramp-rpc--adjust-poll-interval
+                                  local-process had-output)))
+              ;; Only reschedule if interval changed significantly (>20%)
+              (when (> (abs (- new-interval current-interval))
+                       (* 0.2 current-interval))
+                (tramp-rpc--reschedule-poll-timer local-process new-interval)))
             
             ;; Check if process exited
             (when (plist-get result :exited)
@@ -1078,10 +1263,10 @@ using a timer, allowing Emacs to remain responsive during long-running commands.
                              ((bufferp stderr) stderr)
                              ((stringp stderr) (get-buffer-create stderr))
                              (t nil)))
-             ;; Create timer for polling
+             ;; Create timer for polling (starts with initial interval, adapts over time)
              (timer (run-with-timer
-                     tramp-rpc--process-poll-interval
-                     tramp-rpc--process-poll-interval
+                     tramp-rpc--process-poll-interval-initial
+                     tramp-rpc--process-poll-interval-initial
                      #'tramp-rpc--poll-process
                      local-process)))
         
@@ -1100,7 +1285,8 @@ using a timer, allowing Emacs to remain responsive during long-running commands.
                  (list :vec v
                        :pid remote-pid
                        :timer timer
-                       :stderr-buffer stderr-buffer)
+                       :stderr-buffer stderr-buffer
+                       :poll-interval tramp-rpc--process-poll-interval-initial)
                  tramp-rpc--async-processes)
         
         local-process))))

@@ -38,6 +38,16 @@ Returns a JSON string."
                    (params . ,params))))
     (json-encode request)))
 
+(defun tramp-rpc-protocol-encode-request-with-id (method params)
+  "Encode a JSON-RPC 2.0 request for METHOD with PARAMS.
+Returns a cons cell (ID . JSON-STRING) for pipelining support."
+  (let* ((id (tramp-rpc-protocol--next-id))
+         (request `((jsonrpc . "2.0")
+                    (id . ,id)
+                    (method . ,method)
+                    (params . ,params))))
+    (cons id (json-encode request))))
+
 (defun tramp-rpc-protocol-decode-response (json-string)
   "Decode a JSON-RPC 2.0 response from JSON-STRING.
 Returns a plist with :id, :result, and :error keys."
