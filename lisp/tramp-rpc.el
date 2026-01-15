@@ -452,12 +452,27 @@ TYPE is the file type string."
 
 (defun tramp-rpc-handle-file-name-all-completions (filename directory)
   "Like `file-name-all-completions' for TRAMP-RPC files."
-  (with-parsed-tramp-file-name (expand-file-name directory) nil
-    (let ((result (tramp-rpc--call v "dir.completions"
-                                   `((directory . ,localname)
-                                     (prefix . ,filename)))))
-      ;; Convert vector to list - completion expects a list, not a vector
-      (if (vectorp result) (append result nil) result))))
+  (tramp-skeleton-file-name-all-completions filename directory
+    (with-parsed-tramp-file-name (expand-file-name directory) nil
+      (when (and (not (string-search "/" filename))
+                 (tramp-connectable-p v))
+        (all-completions
+         filename
+         ;; Get all entries in the directory
+         (let* ((result (tramp-rpc--call v "dir.list"
+                                         `((path . ,localname)
+                                           (include_attrs . :json-false)
+                                           (include_hidden . t))))
+                ;; Convert vector to list if needed
+                (entries (if (vectorp result) (append result nil) result)))
+           ;; Build list of names with trailing / for directories
+           (mapcar (lambda (entry)
+                     (let ((name (alist-get 'name entry))
+                           (file-type (alist-get 'type entry)))
+                       (if (equal file-type "directory")
+                           (concat name "/")
+                         name)))
+                   entries)))))))
 
 (defun tramp-rpc-handle-make-directory (dir &optional parents)
   "Like `make-directory' for TRAMP-RPC files."
