@@ -217,14 +217,34 @@ pub struct DirEntry {
 // Process operation types
 // ============================================================================
 
+/// Encoding used for process output
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "lowercase")]
+pub enum OutputEncoding {
+    /// Raw text (valid UTF-8, safe for JSON)
+    Text,
+    /// Base64-encoded binary data
+    Base64,
+}
+
 /// Process execution result
 #[derive(Debug, Serialize, Deserialize)]
 pub struct ProcessResult {
     pub exit_code: i32,
-    /// Base64-encoded stdout
+    /// stdout content (encoding depends on stdout_encoding)
     pub stdout: String,
-    /// Base64-encoded stderr
+    /// stderr content (encoding depends on stderr_encoding)
     pub stderr: String,
+    /// Encoding used for stdout
+    #[serde(default = "default_encoding")]
+    pub stdout_encoding: OutputEncoding,
+    /// Encoding used for stderr
+    #[serde(default = "default_encoding")]
+    pub stderr_encoding: OutputEncoding,
+}
+
+fn default_encoding() -> OutputEncoding {
+    OutputEncoding::Base64
 }
 
 /// Environment variable

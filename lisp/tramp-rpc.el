@@ -51,6 +51,30 @@
   "TRAMP backend using RPC."
   :group 'tramp)
 
+(defcustom tramp-rpc-use-controlmaster t
+  "Whether to use SSH ControlMaster for connection sharing.
+When enabled, multiple connections to the same host share a single
+SSH connection, significantly reducing connection overhead.
+
+The control socket is stored in `tramp-rpc-controlmaster-path'."
+  :type 'boolean
+  :group 'tramp-rpc)
+
+(defcustom tramp-rpc-controlmaster-path "~/.ssh/tramp-rpc-%%r@%%h:%%p"
+  "Path template for SSH ControlMaster socket.
+Use SSH escape sequences: %%r=remote user, %%h=host, %%p=port.
+The directory must exist and be writable."
+  :type 'string
+  :group 'tramp-rpc)
+
+(defcustom tramp-rpc-controlmaster-persist 600
+  "How long (in seconds) to keep ControlMaster connections alive.
+Set to 0 to close immediately when last connection exits.
+Set to \"yes\" to keep alive indefinitely."
+  :type '(choice (integer :tag "Seconds")
+                 (const :tag "Indefinitely" "yes"))
+  :group 'tramp-rpc)
+
 (defconst tramp-rpc-method "rpc"
   "TRAMP method for RPC-based remote access.")
 
@@ -110,6 +134,13 @@ Returns the connection plist."
                     (when port (list "-p" (number-to-string port)))
                     (list "-o" "BatchMode=yes")
                     (list "-o" "StrictHostKeyChecking=accept-new")
+                    ;; ControlMaster options for connection sharing
+                    (when tramp-rpc-use-controlmaster
+                      (list "-o" "ControlMaster=auto"
+                            "-o" (format "ControlPath=%s"
+                                         tramp-rpc-controlmaster-path)
+                            "-o" (format "ControlPersist=%s"
+                                         tramp-rpc-controlmaster-persist)))
                     (list host binary-path)))
          (process-name (format "tramp-rpc<%s>" host))
          (buffer-name (format " *tramp-rpc %s*" host))
@@ -225,6 +256,71 @@ Returns the result or signals an error."
                  (t
                   (error "RPC error: %s" msg))))
             (plist-get response :result)))))))
+
+(defun tramp-rpc--call-batch (vec requests)
+  "Execute multiple RPC REQUESTS in a single round-trip for VEC.
+REQUESTS is a list of (METHOD . PARAMS) cons cells.
+Returns a list of results (or error plists) in the same order.
+
+Example:
+  (tramp-rpc--call-batch vec
+    \\='((\"file.exists\" . ((path . \"/foo\")))
+      (\"file.stat\" . ((path . \"/bar\")))
+      (\"process.run\" . ((cmd . \"git\") (args . [\"status\"])))))
+
+Returns:
+  (t                          ; file.exists result
+   ((type . \"file\") ...)    ; file.stat result  
+   (:error -32001 :message \"...\"))  ; or error plist"
+  (let* ((conn (tramp-rpc--ensure-connection vec))
+         (process (plist-get conn :process))
+         (buffer (plist-get conn :buffer))
+         (request (tramp-rpc-protocol-encode-batch-request requests)))
+
+    ;; Send batch request
+    (process-send-string process (concat request "\n"))
+
+    ;; Wait for response (same logic as tramp-rpc--call)
+    (with-current-buffer buffer
+      (let ((start (point-max))
+            (timeout 30)
+            response-line)
+        (while (and (not response-line)
+                    (> timeout 0)
+                    (process-live-p process))
+          (if (with-local-quit
+                (accept-process-output process 0.1 nil t)
+                t)
+              (progn
+                (goto-char start)
+                (when (search-forward "\n" nil t)
+                  (setq response-line (buffer-substring start (1- (point))))
+                  (delete-region (point-min) (point))))
+            (keyboard-quit))
+          (cl-decf timeout 0.1))
+
+        (unless response-line
+          (error "Timeout waiting for batch RPC response from %s"
+                 (tramp-file-name-host vec)))
+
+        (let ((response (tramp-rpc-protocol-decode-response response-line)))
+          (if (tramp-rpc-protocol-error-p response)
+              (error "Batch RPC error: %s"
+                     (tramp-rpc-protocol-error-message response))
+            (tramp-rpc-protocol-decode-batch-response response)))))))
+
+;; ============================================================================
+;; Output decoding helper
+;; ============================================================================
+
+(defun tramp-rpc--decode-output (data encoding)
+  "Decode DATA according to ENCODING.
+ENCODING is either \"text\" (raw UTF-8) or \"base64\" (base64-encoded).
+If ENCODING is nil, defaults to \"base64\" for backward compatibility."
+  (cond
+   ((null data) "")
+   ((equal encoding "text") data)
+   (t (base64-decode-string data))))
 
 ;; ============================================================================
 ;; File name handler operations
@@ -675,8 +771,12 @@ Produces ls-like output for dired."
                                       ,@(when stdin-content
                                           `((stdin . ,stdin-content))))))
            (exit-code (alist-get 'exit_code result))
-           (stdout (base64-decode-string (alist-get 'stdout result)))
-           (stderr (base64-decode-string (alist-get 'stderr result))))
+           (stdout (tramp-rpc--decode-output
+                    (alist-get 'stdout result)
+                    (alist-get 'stdout_encoding result)))
+           (stderr (tramp-rpc--decode-output
+                    (alist-get 'stderr result)
+                    (alist-get 'stderr_encoding result))))
 
       ;; Handle destination
       (cond
@@ -716,8 +816,12 @@ Produces ls-like output for dired."
                                       (args . ["-c" ,command])
                                       (cwd . ,localname))))
            (exit-code (alist-get 'exit_code result))
-           (stdout (base64-decode-string (alist-get 'stdout result)))
-           (stderr (base64-decode-string (alist-get 'stderr result))))
+           (stdout (tramp-rpc--decode-output
+                    (alist-get 'stdout result)
+                    (alist-get 'stdout_encoding result)))
+           (stderr (tramp-rpc--decode-output
+                    (alist-get 'stderr result)
+                    (alist-get 'stderr_encoding result))))
 
       (when output-buffer
         (with-current-buffer (get-buffer-create output-buffer)
@@ -827,9 +931,11 @@ Returns the remote process PID."
 Returns plist with :stdout, :stderr, :exited, :exit-code."
   (let ((result (tramp-rpc--call vec "process.read" `((pid . ,pid)))))
     (list :stdout (when-let ((s (alist-get 'stdout result)))
-                    (base64-decode-string s))
+                    (tramp-rpc--decode-output
+                     s (alist-get 'stdout_encoding result)))
           :stderr (when-let ((s (alist-get 'stderr result)))
-                    (base64-decode-string s))
+                    (tramp-rpc--decode-output
+                     s (alist-get 'stderr_encoding result)))
           :exited (alist-get 'exited result)
           :exit-code (alist-get 'exit_code result))))
 
@@ -963,10 +1069,12 @@ async behavior, which works well for short-lived processes like VC commands."
                                         (args . ,(vconcat program-args))
                                         (cwd . ,localname))))
              (exit-code (alist-get 'exit_code result))
-             (stdout (when-let ((s (alist-get 'stdout result)))
-                       (base64-decode-string s)))
-             (stderr-output (when-let ((s (alist-get 'stderr result)))
-                              (base64-decode-string s)))
+             (stdout (tramp-rpc--decode-output
+                      (alist-get 'stdout result)
+                      (alist-get 'stdout_encoding result)))
+             (stderr-output (tramp-rpc--decode-output
+                             (alist-get 'stderr result)
+                             (alist-get 'stderr_encoding result)))
              ;; Create a pipe process that we'll immediately close
              (local-process (make-pipe-process
                              :name (or name "tramp-rpc-async")

@@ -1,6 +1,6 @@
 //! Process execution operations
 
-use crate::protocol::{ProcessResult, RpcError};
+use crate::protocol::{OutputEncoding, ProcessResult, RpcError};
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
 use serde::Deserialize;
 use std::collections::HashMap;
@@ -10,6 +10,22 @@ use std::process::{Child, Command, Stdio};
 use std::sync::Mutex;
 
 type HandlerResult = Result<serde_json::Value, RpcError>;
+
+/// Encode bytes smartly: use raw text if valid UTF-8, otherwise base64.
+/// Returns (encoded_string, encoding_type).
+fn smart_encode(data: &[u8]) -> (String, OutputEncoding) {
+    // Try to interpret as UTF-8
+    match std::str::from_utf8(data) {
+        Ok(text) => {
+            // Valid UTF-8 - use raw text (serde_json will escape as needed)
+            (text.to_string(), OutputEncoding::Text)
+        }
+        Err(_) => {
+            // Not valid UTF-8 - use base64
+            (BASE64.encode(data), OutputEncoding::Base64)
+        }
+    }
+}
 
 // ============================================================================
 // Process management for async processes
@@ -148,10 +164,16 @@ pub fn run(params: &serde_json::Value) -> HandlerResult {
         data: None,
     })?;
 
+    // Smart encode: use text if valid UTF-8, base64 otherwise
+    let (stdout, stdout_encoding) = smart_encode(&output.stdout);
+    let (stderr, stderr_encoding) = smart_encode(&output.stderr);
+
     let result = ProcessResult {
         exit_code: output.status.code().unwrap_or(-1),
-        stdout: BASE64.encode(&output.stdout),
-        stderr: BASE64.encode(&output.stderr),
+        stdout,
+        stderr,
+        stdout_encoding,
+        stderr_encoding,
     };
 
     Ok(serde_json::to_value(result).unwrap())
@@ -315,9 +337,26 @@ pub fn read(params: &serde_json::Value) -> HandlerResult {
     // Check if process has exited
     let exit_status = managed.child.try_wait().ok().flatten();
 
+    // Smart encode stdout and stderr
+    let (stdout_val, stdout_enc) = if stdout_data.is_empty() {
+        (serde_json::Value::Null, None)
+    } else {
+        let (s, enc) = smart_encode(&stdout_data);
+        (serde_json::Value::String(s), Some(enc))
+    };
+
+    let (stderr_val, stderr_enc) = if stderr_data.is_empty() {
+        (serde_json::Value::Null, None)
+    } else {
+        let (s, enc) = smart_encode(&stderr_data);
+        (serde_json::Value::String(s), Some(enc))
+    };
+
     Ok(serde_json::json!({
-        "stdout": if stdout_data.is_empty() { serde_json::Value::Null } else { serde_json::Value::String(BASE64.encode(&stdout_data)) },
-        "stderr": if stderr_data.is_empty() { serde_json::Value::Null } else { serde_json::Value::String(BASE64.encode(&stderr_data)) },
+        "stdout": stdout_val,
+        "stderr": stderr_val,
+        "stdout_encoding": stdout_enc,
+        "stderr_encoding": stderr_enc,
         "exited": exit_status.is_some(),
         "exit_code": exit_status.and_then(|s| s.code())
     }))

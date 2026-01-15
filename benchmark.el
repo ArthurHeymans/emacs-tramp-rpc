@@ -72,7 +72,7 @@
          (sum (apply #'+ times))
          (mean (/ sum n))
          (sorted (sort (copy-sequence times) #'<))
-         (median (if (oddp n)
+         (median (if (cl-oddp n)
                      (nth (/ n 2) sorted)
                    (/ (+ (nth (/ n 2) sorted)
                          (nth (1- (/ n 2)) sorted))
@@ -201,6 +201,55 @@
      (file-attributes
       (tramp-rpc-benchmark--make-path method (format "file%d.txt" i))))))
 
+(defun tramp-rpc-benchmark--multiple-stats-batched (method)
+  "Benchmark batched file-attributes calls for METHOD (RPC only).
+This uses the batch RPC endpoint to get all stats in one round-trip."
+  (unless (string= method "rpc")
+    ;; For non-RPC methods, just return nil (not applicable)
+    (error "Batch stats only available for RPC method"))
+  ;; Flush cache for all files first
+  (dotimes (i 10)
+    (tramp-rpc-benchmark--flush-cache
+     (tramp-rpc-benchmark--make-path method (format "file%d.txt" i))))
+  (let ((dir (tramp-rpc-benchmark--make-path method)))
+    (with-parsed-tramp-file-name dir nil
+      (let ((paths (cl-loop for i from 0 below 10
+                            collect (format "%s/file%d.txt"
+                                            tramp-rpc-benchmark-test-dir i))))
+        (tramp-rpc-benchmark--time
+         (tramp-rpc--call-batch v
+           (mapcar (lambda (path)
+                     (cons "file.stat" `((path . ,path) (lstat . t))))
+                   paths)))))))
+
+(defun tramp-rpc-benchmark--batch-mixed-ops (method)
+  "Benchmark batched mixed operations for METHOD (RPC only).
+Simulates what magit does: multiple different git commands in one batch."
+  (unless (string= method "rpc")
+    (error "Batch operations only available for RPC method"))
+  (let ((dir (tramp-rpc-benchmark--make-path method)))
+    (with-parsed-tramp-file-name dir nil
+      (tramp-rpc-benchmark--time
+       (tramp-rpc--call-batch v
+         `(("file.exists" . ((path . ,localname)))
+           ("file.stat" . ((path . ,localname)))
+           ("file.readable" . ((path . ,localname)))
+           ("file.writable" . ((path . ,localname)))
+           ("dir.list" . ((path . ,localname) (include_attrs . :json-false)))))))))
+
+(defun tramp-rpc-benchmark--sequential-mixed-ops (method)
+  "Benchmark sequential mixed operations for METHOD.
+Same operations as batch-mixed-ops but done one at a time."
+  (let ((dir (tramp-rpc-benchmark--make-path method)))
+    (tramp-rpc-benchmark--flush-cache dir)
+    (tramp-rpc-benchmark--time
+     (progn
+       (file-exists-p dir)
+       (file-attributes dir)
+       (file-readable-p dir)
+       (file-writable-p dir)
+       (directory-files dir)))))
+
 (defun tramp-rpc-benchmark--connection-setup (method)
   "Benchmark initial connection setup for METHOD."
   (tramp-cleanup-all-connections)
@@ -221,8 +270,14 @@
     ("process-file-ls"    . tramp-rpc-benchmark--process-file)
     ("process-file-cat"   . tramp-rpc-benchmark--process-file-cat)
     ("copy-file"          . tramp-rpc-benchmark--copy-file)
-    ("multi-stat"         . tramp-rpc-benchmark--multiple-stats))
+    ("multi-stat"         . tramp-rpc-benchmark--multiple-stats)
+    ("seq-mixed-ops"      . tramp-rpc-benchmark--sequential-mixed-ops))
   "Alist of benchmark tests (name . function).")
+
+(defconst tramp-rpc-benchmark--rpc-only-tests
+  '(("batch-stat"         . tramp-rpc-benchmark--multiple-stats-batched)
+    ("batch-mixed-ops"    . tramp-rpc-benchmark--batch-mixed-ops))
+  "Alist of RPC-only benchmark tests for batch operations.")
 
 (defun tramp-rpc-benchmark--run-method (method)
   "Run all benchmarks for METHOD."
@@ -233,6 +288,7 @@
   (message "Warming up connection for %s..." method)
   (file-exists-p (tramp-rpc-benchmark--make-path method "file0.txt"))
   
+  ;; Run common tests
   (dolist (test tramp-rpc-benchmark--tests)
     (let* ((name (car test))
            (func (cdr test))
@@ -249,6 +305,22 @@
             (tramp-rpc-benchmark--record name method times))
         (error
          (message "    ERROR in %s/%s: %s" method name err)))))
+  
+  ;; Run RPC-only batch tests
+  (when (string= method "rpc")
+    (message "  Running RPC-only batch tests...")
+    (dolist (test tramp-rpc-benchmark--rpc-only-tests)
+      (let* ((name (car test))
+             (func (cdr test)))
+        (message "  Running %s for %s (%d iterations)..."
+                 name method tramp-rpc-benchmark-iterations)
+        (condition-case err
+            (let ((times (tramp-rpc-benchmark--run-n-times
+                          tramp-rpc-benchmark-iterations
+                          (lambda () (funcall func method)))))
+              (tramp-rpc-benchmark--record name method times))
+          (error
+           (message "    ERROR in %s/%s: %s" method name err))))))
   
   (message "Cleaning up for %s..." method)
   (tramp-rpc-benchmark--teardown method))
@@ -291,23 +363,62 @@
                             (tramp-rpc-benchmark--format-time ssh-median)
                             speedup))))))
     
+    ;; Batch operation comparison (RPC-only)
+    (insert "\n\nBatch vs Sequential (RPC only)\n")
+    (insert "------------------------------\n")
+    (insert "Shows the benefit of batching multiple operations into one round-trip.\n\n")
+    
+    ;; Compare multi-stat (sequential) vs batch-stat
+    (let* ((seq-results (cdr (assoc "multi-stat" tramp-rpc-benchmark-results)))
+           (batch-results (cdr (assoc "batch-stat" tramp-rpc-benchmark-results)))
+           (seq-times (cdr (assoc "rpc" seq-results)))
+           (batch-times (cdr (assoc "rpc" batch-results)))
+           (seq-stats (when seq-times (tramp-rpc-benchmark--stats seq-times)))
+           (batch-stats (when batch-times (tramp-rpc-benchmark--stats batch-times))))
+      (when (and seq-stats batch-stats)
+        (let* ((seq-median (plist-get seq-stats :median))
+               (batch-median (plist-get batch-stats :median))
+               (speedup (/ seq-median batch-median)))
+          (insert (format "10x file.stat:  sequential=%s  batched=%s  speedup=%.2fx\n"
+                          (tramp-rpc-benchmark--format-time seq-median)
+                          (tramp-rpc-benchmark--format-time batch-median)
+                          speedup)))))
+    
+    ;; Compare seq-mixed-ops vs batch-mixed-ops
+    (let* ((seq-results (cdr (assoc "seq-mixed-ops" tramp-rpc-benchmark-results)))
+           (batch-results (cdr (assoc "batch-mixed-ops" tramp-rpc-benchmark-results)))
+           (seq-times (cdr (assoc "rpc" seq-results)))
+           (batch-times (cdr (assoc "rpc" batch-results)))
+           (seq-stats (when seq-times (tramp-rpc-benchmark--stats seq-times)))
+           (batch-stats (when batch-times (tramp-rpc-benchmark--stats batch-times))))
+      (when (and seq-stats batch-stats)
+        (let* ((seq-median (plist-get seq-stats :median))
+               (batch-median (plist-get batch-stats :median))
+               (speedup (/ seq-median batch-median)))
+          (insert (format "5x mixed ops:   sequential=%s  batched=%s  speedup=%.2fx\n"
+                          (tramp-rpc-benchmark--format-time seq-median)
+                          (tramp-rpc-benchmark--format-time batch-median)
+                          speedup)))))
+    
     (insert "\n\nDetailed Statistics\n")
     (insert "-------------------\n\n")
     
-    (dolist (test tramp-rpc-benchmark--tests)
+    (dolist (test (append tramp-rpc-benchmark--tests
+                          tramp-rpc-benchmark--rpc-only-tests))
       (let* ((name (car test))
              (results (cdr (assoc name tramp-rpc-benchmark-results))))
-        (insert (format "\n%s:\n" name))
-        (dolist (method-result results)
-          (let* ((method (car method-result))
-                 (times (cdr method-result))
-                 (stats (tramp-rpc-benchmark--stats times)))
-            (insert (format "  %s: mean=%s median=%s min=%s max=%s\n"
-                            method
-                            (tramp-rpc-benchmark--format-time (plist-get stats :mean))
-                            (tramp-rpc-benchmark--format-time (plist-get stats :median))
-                            (tramp-rpc-benchmark--format-time (plist-get stats :min))
-                            (tramp-rpc-benchmark--format-time (plist-get stats :max))))))))
+        (when results
+          (insert (format "\n%s:\n" name))
+          (dolist (method-result results)
+            (let* ((method (car method-result))
+                   (times (cdr method-result))
+                   (stats (tramp-rpc-benchmark--stats times)))
+              (insert (format "  %s: mean=%s median=%s min=%s max=%s\n"
+                              method
+                              (tramp-rpc-benchmark--format-time (plist-get stats :mean))
+                              (tramp-rpc-benchmark--format-time (plist-get stats :median))
+                              (tramp-rpc-benchmark--format-time (plist-get stats :min))
+                              (tramp-rpc-benchmark--format-time (plist-get stats :max)))))))))
     
     (goto-char (point-min))
     (display-buffer (current-buffer))))

@@ -78,5 +78,36 @@ Returns a plist with :id, :result, and :error keys."
 (defconst tramp-rpc-protocol-error-io -32003)
 (defconst tramp-rpc-protocol-error-process -32004)
 
+;; ============================================================================
+;; Batch request support
+;; ============================================================================
+
+(defun tramp-rpc-protocol-encode-batch-request (requests)
+  "Encode a batch request containing multiple REQUESTS.
+REQUESTS is a list of (METHOD . PARAMS) cons cells.
+Returns a JSON string for a single RPC call to the batch method."
+  (let ((batch-requests
+         (mapcar (lambda (req)
+                   `((method . ,(car req))
+                     (params . ,(cdr req))))
+                 requests)))
+    (tramp-rpc-protocol-encode-request
+     "batch"
+     `((requests . ,(vconcat batch-requests))))))
+
+(defun tramp-rpc-protocol-decode-batch-response (response)
+  "Decode a batch response into a list of individual results.
+RESPONSE is the decoded response plist from `tramp-rpc-protocol-decode-response'.
+Returns a list where each element is either:
+  - The result value (if successful)
+  - A plist (:error CODE :message MSG) if that sub-request failed."
+  (let ((results-array (alist-get 'results (plist-get response :result))))
+    (mapcar (lambda (result-obj)
+              (if-let ((error-obj (alist-get 'error result-obj)))
+                  (list :error (alist-get 'code error-obj)
+                        :message (alist-get 'message error-obj))
+                (alist-get 'result result-obj)))
+            results-array)))
+
 (provide 'tramp-rpc-protocol)
 ;;; tramp-rpc-protocol.el ends here

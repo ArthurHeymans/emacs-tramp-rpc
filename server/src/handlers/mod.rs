@@ -5,58 +5,21 @@ pub mod file;
 pub mod io;
 pub mod process;
 
-use crate::protocol::{Request, Response, RpcError};
+use crate::protocol::{Request, RequestId, Response, RpcError};
 
 /// Dispatch a request to the appropriate handler
 pub fn dispatch(request: &Request) -> Response {
-    let result = match request.method.as_str() {
-        // File metadata operations
-        "file.stat" => file::stat(&request.params),
-        "file.stat_batch" => file::stat_batch(&request.params),
-        "file.exists" => file::exists(&request.params),
-        "file.readable" => file::readable(&request.params),
-        "file.writable" => file::writable(&request.params),
-        "file.executable" => file::executable(&request.params),
-        "file.truename" => file::truename(&request.params),
-        "file.newer_than" => file::newer_than(&request.params),
-
-        // Directory operations
-        "dir.list" => dir::list(&request.params),
-        "dir.create" => dir::create(&request.params),
-        "dir.remove" => dir::remove(&request.params),
-        "dir.completions" => dir::completions(&request.params),
-
-        // File I/O operations
-        "file.read" => io::read(&request.params),
-        "file.write" => io::write(&request.params),
-        "file.copy" => io::copy(&request.params),
-        "file.rename" => io::rename(&request.params),
-        "file.delete" => io::delete(&request.params),
-        "file.set_modes" => io::set_modes(&request.params),
-        "file.set_times" => io::set_times(&request.params),
-        "file.make_symlink" => io::make_symlink(&request.params),
-
-        // Process operations
-        "process.run" => process::run(&request.params),
-        "process.start" => process::start(&request.params),
-        "process.write" => process::write(&request.params),
-        "process.read" => process::read(&request.params),
-        "process.close_stdin" => process::close_stdin(&request.params),
-        "process.kill" => process::kill(&request.params),
-        "process.list" => process::list(&request.params),
-
-        // System info
-        "system.info" => system_info(),
-        "system.getenv" => system_getenv(&request.params),
-        "system.expand_path" => system_expand_path(&request.params),
-
-        _ => Err(RpcError::method_not_found(&request.method)),
-    };
-
-    match result {
-        Ok(value) => Response::success(request.id.clone(), value),
-        Err(error) => Response::error(Some(request.id.clone()), error),
+    // Handle batch separately (it needs special handling and can't recurse)
+    if request.method == "batch" {
+        let result = batch_execute(&request.params);
+        return match result {
+            Ok(value) => Response::success(request.id.clone(), value),
+            Err(error) => Response::error(Some(request.id.clone()), error),
+        };
     }
+
+    // All other methods go through dispatch_inner
+    dispatch_inner(request)
 }
 
 type HandlerResult = Result<serde_json::Value, RpcError>;
@@ -130,4 +93,130 @@ fn expand_tilde(path: &str) -> String {
         }
     }
     path.to_string()
+}
+
+/// Execute multiple RPC requests in a single batch
+/// This saves round-trip time when multiple independent operations are needed.
+///
+/// Request format:
+/// ```json
+/// {
+///   "requests": [
+///     {"method": "file.exists", "params": {"path": "/foo"}},
+///     {"method": "file.stat", "params": {"path": "/bar"}},
+///     {"method": "process.run", "params": {"cmd": "git", "args": ["status"]}}
+///   ]
+/// }
+/// ```
+///
+/// Response format:
+/// ```json
+/// {
+///   "results": [
+///     {"result": true},
+///     {"result": {...file attrs...}},
+///     {"error": {"code": -32001, "message": "..."}}
+///   ]
+/// }
+/// ```
+fn batch_execute(params: &serde_json::Value) -> HandlerResult {
+    #[derive(serde::Deserialize)]
+    struct BatchParams {
+        requests: Vec<BatchRequest>,
+    }
+
+    #[derive(serde::Deserialize)]
+    struct BatchRequest {
+        method: String,
+        #[serde(default)]
+        params: serde_json::Value,
+    }
+
+    let batch_params: BatchParams = serde_json::from_value(params.clone())
+        .map_err(|e| RpcError::invalid_params(e.to_string()))?;
+
+    let results: Vec<serde_json::Value> = batch_params
+        .requests
+        .into_iter()
+        .map(|req| {
+            // Create a fake Request to reuse dispatch logic
+            let fake_request = Request {
+                jsonrpc: "2.0".to_string(),
+                id: RequestId::Number(0), // Dummy ID, not used in batch
+                method: req.method,
+                params: req.params,
+            };
+
+            // Get the result by calling the handler directly (not full dispatch)
+            let response = dispatch_inner(&fake_request);
+
+            // Convert Response to a result object
+            match (response.result, response.error) {
+                (Some(result), None) => serde_json::json!({"result": result}),
+                (None, Some(error)) => serde_json::json!({
+                    "error": {
+                        "code": error.code,
+                        "message": error.message
+                    }
+                }),
+                _ => serde_json::json!({"result": null}),
+            }
+        })
+        .collect();
+
+    Ok(serde_json::json!({ "results": results }))
+}
+
+/// Inner dispatch that handles the actual method routing
+/// Used by both single requests and batch requests
+fn dispatch_inner(request: &Request) -> Response {
+    let result = match request.method.as_str() {
+        // File metadata operations
+        "file.stat" => file::stat(&request.params),
+        "file.stat_batch" => file::stat_batch(&request.params),
+        "file.exists" => file::exists(&request.params),
+        "file.readable" => file::readable(&request.params),
+        "file.writable" => file::writable(&request.params),
+        "file.executable" => file::executable(&request.params),
+        "file.truename" => file::truename(&request.params),
+        "file.newer_than" => file::newer_than(&request.params),
+
+        // Directory operations
+        "dir.list" => dir::list(&request.params),
+        "dir.create" => dir::create(&request.params),
+        "dir.remove" => dir::remove(&request.params),
+        "dir.completions" => dir::completions(&request.params),
+
+        // File I/O operations
+        "file.read" => io::read(&request.params),
+        "file.write" => io::write(&request.params),
+        "file.copy" => io::copy(&request.params),
+        "file.rename" => io::rename(&request.params),
+        "file.delete" => io::delete(&request.params),
+        "file.set_modes" => io::set_modes(&request.params),
+        "file.set_times" => io::set_times(&request.params),
+        "file.make_symlink" => io::make_symlink(&request.params),
+
+        // Process operations
+        "process.run" => process::run(&request.params),
+        "process.start" => process::start(&request.params),
+        "process.write" => process::write(&request.params),
+        "process.read" => process::read(&request.params),
+        "process.close_stdin" => process::close_stdin(&request.params),
+        "process.kill" => process::kill(&request.params),
+        "process.list" => process::list(&request.params),
+
+        // System info
+        "system.info" => system_info(),
+        "system.getenv" => system_getenv(&request.params),
+        "system.expand_path" => system_expand_path(&request.params),
+
+        // Note: "batch" is NOT allowed in batch (no recursion)
+        _ => Err(RpcError::method_not_found(&request.method)),
+    };
+
+    match result {
+        Ok(value) => Response::success(request.id.clone(), value),
+        Err(error) => Response::error(Some(request.id.clone()), error),
+    }
 }

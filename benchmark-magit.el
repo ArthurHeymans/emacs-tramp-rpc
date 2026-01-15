@@ -327,5 +327,40 @@
   (tramp-rpc-magit--report)
   (message "\nBenchmarks complete! See *TRAMP Magit Benchmark* buffer."))
 
+;;;###autoload  
+(defun tramp-rpc-magit-test-encoding ()
+  "Test that text encoding optimization is working.
+This shows the output size and encoding used for common git commands."
+  (interactive)
+  (let ((default-directory (tramp-rpc-magit--make-path "rpc")))
+    (with-parsed-tramp-file-name default-directory nil
+      (with-current-buffer (get-buffer-create "*TRAMP Encoding Test*")
+        (erase-buffer)
+        (insert "Testing output encoding optimization\n")
+        (insert "=====================================\n\n")
+        
+        ;; Test a few commands and show encoding
+        (dolist (cmd '(("git" "rev-parse" "HEAD")
+                       ("git" "status" "--porcelain")
+                       ("git" "log" "--oneline" "-5")
+                       ("echo" "hello world")))
+          (let* ((start (current-time))
+                 (result (tramp-rpc--call v "process.run"
+                           `((cmd . ,(car cmd))
+                             (args . ,(vconcat (cdr cmd)))
+                             (cwd . ,localname))))
+                 (elapsed (float-time (time-subtract (current-time) start)))
+                 (stdout (alist-get 'stdout result))
+                 (encoding (alist-get 'stdout_encoding result))
+                 (exit-code (alist-get 'exit_code result)))
+            (insert (format "Command: %s\n" (string-join cmd " ")))
+            (insert (format "  Encoding: %s\n" encoding))
+            (insert (format "  Output size: %d bytes\n" (length stdout)))
+            (insert (format "  Exit code: %d\n" exit-code))
+            (insert (format "  Time: %.2f ms\n\n" (* elapsed 1000)))))
+        
+        (goto-char (point-min))
+        (display-buffer (current-buffer))))))
+
 (provide 'benchmark-magit)
 ;;; benchmark-magit.el ends here
