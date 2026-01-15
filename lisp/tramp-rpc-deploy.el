@@ -120,11 +120,36 @@ Returns a string like \"x86_64-linux\" or \"aarch64-darwin\"."
               (tramp-make-tramp-file-name vec tramp-rpc-deploy-remote-directory))))
     (tramp-send-command vec (format "mkdir -p %s" (tramp-shell-quote-argument dir)))))
 
+(defcustom tramp-rpc-deploy-max-retries 3
+  "Maximum number of retries for binary transfer."
+  :type 'integer
+  :group 'tramp-rpc-deploy)
+
+(defun tramp-rpc-deploy--compute-checksum (file)
+  "Compute SHA256 checksum of local FILE."
+  (with-temp-buffer
+    (set-buffer-multibyte nil)
+    (insert-file-contents-literally file)
+    (secure-hash 'sha256 (current-buffer))))
+
+(defun tramp-rpc-deploy--remote-checksum (vec path)
+  "Get SHA256 checksum of remote PATH on VEC."
+  (tramp-send-command vec
+   (format "sha256sum %s 2>/dev/null | cut -d' ' -f1"
+           (tramp-shell-quote-argument path)))
+  (with-current-buffer (tramp-get-connection-buffer vec)
+    (goto-char (point-min))
+    (when (looking-at "\\([a-f0-9]+\\)")
+      (match-string 1))))
+
 (defun tramp-rpc-deploy--transfer-binary (vec arch)
-  "Transfer the binary for ARCH to the remote host VEC."
+  "Transfer the binary for ARCH to the remote host VEC.
+Uses atomic write with checksum verification for reliability."
   (let* ((local-path (tramp-rpc-deploy--local-binary-path arch))
          (remote-path (tramp-rpc-deploy--remote-binary-path vec))
-         (remote-local (tramp-file-local-name remote-path)))
+         (remote-local (tramp-file-local-name remote-path))
+         (remote-tmp (concat remote-local ".tmp." (format "%d" (random 100000))))
+         (local-checksum (tramp-rpc-deploy--compute-checksum local-path)))
     
     (unless (file-exists-p local-path)
       (error "No binary found for architecture %s at %s" arch local-path))
@@ -137,18 +162,55 @@ Returns a string like \"x86_64-linux\" or \"aarch64-darwin\"."
                          (set-buffer-multibyte nil)
                          (insert-file-contents-literally local-path)
                          (base64-encode-region (point-min) (point-max))
-                         (buffer-string))))
-      ;; Write to remote using base64 decode
-      (tramp-send-command
-       vec
-       (format "base64 -d > %s << 'TRAMP_RPC_EOF'\n%s\nTRAMP_RPC_EOF"
-               (tramp-shell-quote-argument remote-local)
-               binary-data))
+                         (buffer-string)))
+          (retries 0)
+          (success nil))
       
-      ;; Make executable
-      (tramp-send-command
-       vec
-       (format "chmod +x %s" (tramp-shell-quote-argument remote-local))))
+      ;; Retry loop for reliability
+      (while (and (not success) (< retries tramp-rpc-deploy-max-retries))
+        (condition-case err
+            (progn
+              ;; Write to temp file using base64 decode
+              (tramp-send-command
+               vec
+               (format "base64 -d > %s << 'TRAMP_RPC_EOF'\n%s\nTRAMP_RPC_EOF"
+                       (tramp-shell-quote-argument remote-tmp)
+                       binary-data))
+              
+              ;; Verify checksum
+              (let ((remote-checksum (tramp-rpc-deploy--remote-checksum vec remote-tmp)))
+                (if (string= local-checksum remote-checksum)
+                    (progn
+                      ;; Checksum matches - make executable and atomically move
+                      (tramp-send-command
+                       vec
+                       (format "chmod +x %s && mv -f %s %s"
+                               (tramp-shell-quote-argument remote-tmp)
+                               (tramp-shell-quote-argument remote-tmp)
+                               (tramp-shell-quote-argument remote-local)))
+                      (setq success t))
+                  ;; Checksum mismatch - clean up and retry
+                  (tramp-send-command
+                   vec
+                   (format "rm -f %s" (tramp-shell-quote-argument remote-tmp)))
+                  (setq retries (1+ retries))
+                  (when (< retries tramp-rpc-deploy-max-retries)
+                    (message "Checksum mismatch, retrying (%d/%d)..."
+                             retries tramp-rpc-deploy-max-retries)))))
+          (error
+           ;; Clean up on error and retry
+           (ignore-errors
+             (tramp-send-command
+              vec
+              (format "rm -f %s" (tramp-shell-quote-argument remote-tmp))))
+           (setq retries (1+ retries))
+           (when (< retries tramp-rpc-deploy-max-retries)
+             (message "Transfer failed (%s), retrying (%d/%d)..."
+                      (error-message-string err)
+                      retries tramp-rpc-deploy-max-retries)))))
+      
+      (unless success
+        (error "Failed to transfer binary after %d attempts" tramp-rpc-deploy-max-retries)))
     
     remote-path))
 
