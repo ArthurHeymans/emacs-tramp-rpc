@@ -1,0 +1,162 @@
+#+TITLE: TRAMP-RPC
+#+AUTHOR: Arthur
+#+OPTIONS: toc:2
+
+A high-performance TRAMP backend for Emacs that uses a binary RPC server instead of parsing shell command output.
+
+* Overview
+
+Traditional TRAMP works by piping shell commands over SSH and parsing their output. This approach is robust but slow, especially for operations that require many round-trips (like directory listings or VC operations).
+
+TRAMP-RPC replaces this with a lightweight Rust server that runs on the remote host. Emacs communicates with it using JSON-RPC 2.0 over SSH, resulting in significantly faster file operations.
+
+* Features
+
+- Fast file operations via binary RPC protocol
+- Async process support (~make-process~, ~start-file-process~)
+- Full VC mode integration (git, etc.)
+- Automatic deployment of pre-compiled server binaries
+- Support for x86_64 and aarch64 Linux
+
+* Requirements
+
+- Emacs 30.1 or later
+- SSH access to remote hosts
+- Remote host running Linux (x86_64 or aarch64)
+
+* Installation
+
+1. Clone this repository:
+   #+begin_src bash
+   git clone https://github.com/your-username/tramp-rpc.git
+   #+end_src
+
+2. Add to your Emacs init file:
+   #+begin_src elisp
+   (add-to-list 'load-path "/path/to/tramp-rpc/lisp")
+   (require 'tramp-rpc)
+   #+end_src
+
+* Usage
+
+Access remote files using the ~rpc~ method:
+
+#+begin_example
+/rpc:user@host:/path/to/file
+#+end_example
+
+The server binary will be automatically deployed to =~/.cache/tramp-rpc/= on first connection.
+
+* Architecture
+
+#+begin_example
+┌─────────────┐     SSH/JSON-RPC     ┌──────────────────┐
+│   Emacs     │ ◄──────────────────► │ tramp-rpc-server │
+│ (tramp-rpc) │                      │     (Rust)       │
+└─────────────┘                      └──────────────────┘
+#+end_example
+
+The server exposes RPC methods for:
+
+| Category  | Methods                                                  |
+|-----------+----------------------------------------------------------|
+| File      | ~file.stat~, ~file.read~, ~file.write~, ~file.copy~, ... |
+| Directory | ~dir.list~, ~dir.create~, ~dir.remove~                   |
+| Process   | ~process.run~, ~process.start~, ~process.read~, ...      |
+| System    | ~system.info~, ~system.getenv~                           |
+
+* Building from Source
+
+** Using Nix (recommended)
+
+#+begin_src bash
+# Build for current platform
+nix build
+
+# Build static binaries for all supported platforms
+nix run .#copy-binaries
+
+# Development shell with all tools
+nix develop
+#+end_src
+
+** Using Cargo
+
+#+begin_src bash
+cd server
+cargo build --release
+#+end_src
+
+The binary will be at =target/release/tramp-rpc-server=.
+
+** Cross-compilation
+
+For cross-compiling to different architectures:
+
+#+begin_src bash
+# x86_64 Linux (static, portable)
+nix build .#tramp-rpc-server-x86_64-musl
+
+# aarch64 Linux (static, portable)
+nix build .#tramp-rpc-server-aarch64-musl
+#+end_src
+
+* Configuration
+
+#+begin_src elisp
+;; Directory containing pre-compiled binaries (default: lisp/binaries/)
+(setq tramp-rpc-deploy-binary-directory "/path/to/binaries")
+
+;; Remote installation directory (default: ~/.cache/tramp-rpc)
+(setq tramp-rpc-deploy-remote-directory "~/.local/bin/tramp-rpc")
+
+;; Disable automatic deployment (default: t)
+(setq tramp-rpc-deploy-auto-deploy nil)
+#+end_src
+
+* Troubleshooting
+
+** diff-hl issues in dired
+
+If you experience issues with ~diff-hl~ in dired buffers on remote hosts:
+
+#+begin_src elisp
+(setq diff-hl-disable-on-remote t)
+#+end_src
+
+** Connection issues
+
+The server binary is deployed using standard SSH (~sshx~ method). Ensure you can connect to the remote host with:
+
+#+begin_src bash
+ssh -o BatchMode=yes user@host echo success
+#+end_src
+
+* How It Works
+
+1. On first connection, TRAMP-RPC detects the remote architecture and deploys the appropriate pre-compiled binary
+2. The binary is transferred via base64 encoding over the SSH connection
+3. Emacs spawns the server via SSH and communicates using newline-delimited JSON-RPC
+4. File operations are handled natively by the Rust server, avoiding shell parsing overhead
+
+* Protocol
+
+TRAMP-RPC uses JSON-RPC 2.0 over stdin/stdout.
+
+Example request:
+#+begin_src json
+{"jsonrpc":"2.0","id":1,"method":"file.stat","params":{"path":"/etc/passwd"}}
+#+end_src
+
+Example response:
+#+begin_src json
+{"jsonrpc":"2.0","id":1,"result":{"type":"file","size":2847,"mode":420}}
+#+end_src
+
+* License
+
+GPL-3.0-or-later
+
+* Contributing
+
+Contributions welcome! Please ensure code passes ~cargo clippy~ and ~cargo test~ before submitting.
