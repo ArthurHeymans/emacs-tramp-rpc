@@ -12,3 +12,5 @@
 # Don't ignore binary artifacts - we want to commit them for distribution
 # But do ignore local debug builds
 /target/debug/
+
+/lisp/binaries
