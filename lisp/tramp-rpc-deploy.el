@@ -450,13 +450,17 @@ Returns the path to the local binary."
     (secure-hash 'sha256 (current-buffer))))
 
 (defun tramp-rpc-deploy--remote-checksum (vec path)
-  "Get SHA256 checksum of remote PATH on VEC."
+  "Get SHA256 checksum of remote PATH on VEC.
+Tries sha256sum first, then shasum -a 256 for macOS compatibility."
+  ;; Try sha256sum first (Linux), then shasum -a 256 (macOS)
   (tramp-send-command vec
-   (format "sha256sum %s 2>/dev/null | cut -d' ' -f1"
+   (format "{ sha256sum %s 2>/dev/null || shasum -a 256 %s 2>/dev/null; } | cut -d' ' -f1"
+           (tramp-shell-quote-argument path)
            (tramp-shell-quote-argument path)))
   (with-current-buffer (tramp-get-connection-buffer vec)
     (goto-char (point-min))
-    (when (looking-at "\\([a-f0-9]+\\)")
+    ;; Match exactly 64 hex chars to avoid false positives from error messages
+    (when (looking-at "\\([a-f0-9]\\{64\\}\\)")
       (match-string 1))))
 
 (defun tramp-rpc-deploy--transfer-binary (vec local-path)
