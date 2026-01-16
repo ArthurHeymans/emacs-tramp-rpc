@@ -1798,6 +1798,7 @@ the local relay process (we handle resizing via RPC to the remote)."
     (when-let ((vec (process-get process :tramp-rpc-vec))
                (pid (process-get process :tramp-rpc-pid)))
       (let ((size (tramp-rpc--get-terminal-size (process-buffer process))))
+        ;; Resize the remote PTY
         (ignore-errors
           (tramp-rpc--call-fast vec "process.resize_pty"
                                 `((pid . ,pid)
@@ -1806,6 +1807,87 @@ the local relay process (we handle resizing via RPC to the remote)."
   ;; Return nil - we handle resizing ourselves, Emacs shouldn't try to
   ;; set-process-window-size on our local relay process
   nil)
+
+(defun tramp-rpc--vterm-window-adjust-process-window-size-advice (orig-fun process windows)
+  "Advice for vterm's window adjust function to handle TRAMP-RPC PTY processes.
+For tramp-rpc processes, resize the remote PTY and update vterm's display."
+  (if (and (processp process)
+           (process-get process :tramp-rpc-pty))
+      ;; This is a tramp-rpc PTY process
+      (unless vterm-copy-mode
+        (when (process-live-p process)
+          (when-let ((vec (process-get process :tramp-rpc-vec))
+                     (pid (process-get process :tramp-rpc-pid))
+                     (buf (process-buffer process)))
+            (when (buffer-live-p buf)
+              (with-current-buffer buf
+                ;; Use same size calculation as vterm
+                (let* ((size (funcall window-adjust-process-window-size-function
+                                      process windows))
+                       (width (car size))
+                       (height (cdr size))
+                       (inhibit-read-only t))
+                  ;; Adjust for margins like vterm does
+                  (when (fboundp 'vterm--get-margin-width)
+                    (setq width (- width (vterm--get-margin-width))))
+                  (setq width (max width vterm-min-window-width))
+                  (when (and (> width 0) (> height 0))
+                    ;; Resize remote PTY
+                    (ignore-errors
+                      (tramp-rpc--call-fast vec "process.resize_pty"
+                                            `((pid . ,pid)
+                                              (cols . ,width)
+                                              (rows . ,height))))
+                    ;; Update vterm's internal display (3 args: term, height, width)
+                    (when (and (boundp 'vterm--term) vterm--term
+                               (fboundp 'vterm--set-size))
+                      (vterm--set-size vterm--term height width))
+                    ;; Return size like vterm does
+                    (cons width height))))))))
+    ;; Not our process, call original
+    (funcall orig-fun process windows)))
+
+(defun tramp-rpc--eat-adjust-process-window-size-advice (orig-fun process windows)
+  "Advice for eat's window adjust function to handle TRAMP-RPC PTY processes.
+For tramp-rpc processes, resize the remote PTY and update eat's display."
+  (if (and (processp process)
+           (process-get process :tramp-rpc-pty))
+      ;; This is a tramp-rpc PTY process
+      (when (process-live-p process)
+        (when-let ((vec (process-get process :tramp-rpc-vec))
+                   (pid (process-get process :tramp-rpc-pid))
+                   (buf (process-buffer process)))
+          (when (buffer-live-p buf)
+            (with-current-buffer buf
+              ;; Use same size calculation as eat
+              (let ((size (funcall window-adjust-process-window-size-function
+                                   process windows)))
+                (when size
+                  (let ((width (max (car size) 1))
+                        (height (max (cdr size) 1))
+                        (inhibit-read-only t))
+                    ;; Resize remote PTY
+                    (ignore-errors
+                      (tramp-rpc--call-fast vec "process.resize_pty"
+                                            `((pid . ,pid)
+                                              (cols . ,width)
+                                              (rows . ,height))))
+                    ;; Update eat's terminal display
+                    (when (and (boundp 'eat-terminal) eat-terminal
+                               (fboundp 'eat-term-resize)
+                               (fboundp 'eat-term-redisplay))
+                      (eat-term-resize eat-terminal width height)
+                      (eat-term-redisplay eat-terminal))
+                    ;; Run hooks like eat does
+                    (pcase major-mode
+                      ('eat-mode
+                       (run-hooks 'eat-update-hook))
+                      ('eshell-mode
+                       (run-hooks 'eat-eshell-update-hook)))))
+                ;; Return size
+                size)))))
+    ;; Not our process, call original
+    (funcall orig-fun process windows)))
 
 ;; ============================================================================
 ;; Advice for process operations
@@ -1911,6 +1993,16 @@ For TRAMP-RPC PTY processes, return the remote TTY name stored during creation."
 (advice-add 'process-exit-status :around #'tramp-rpc--process-exit-status-advice)
 (advice-add 'process-command :around #'tramp-rpc--process-command-advice)
 (advice-add 'process-tty-name :around #'tramp-rpc--process-tty-name-advice)
+
+;; Advice vterm's window resize function for tramp-rpc PTY support
+(with-eval-after-load 'vterm
+  (advice-add 'vterm--window-adjust-process-window-size :around
+              #'tramp-rpc--vterm-window-adjust-process-window-size-advice))
+
+;; Advice eat's window resize function for tramp-rpc PTY support
+(with-eval-after-load 'eat
+  (advice-add 'eat--adjust-process-window-size :around
+              #'tramp-rpc--eat-adjust-process-window-size-advice))
 
 ;; ============================================================================
 ;; VC integration advice

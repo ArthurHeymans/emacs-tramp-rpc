@@ -6,12 +6,12 @@ use nix::fcntl::{fcntl, FcntlArg, OFlag};
 use nix::pty::{openpty, OpenptyResult};
 use nix::sys::signal::Signal;
 use nix::sys::wait::{waitpid, WaitPidFlag, WaitStatus};
-use nix::unistd::{close, dup2, execvp, fork, setsid, ForkResult, Pid};
+use nix::unistd::{close, dup2, execvp, fork, setsid, tcgetpgrp, ForkResult, Pid};
 use serde::Deserialize;
 use std::collections::HashMap;
 use std::ffi::CString;
 use std::io::ErrorKind;
-use std::os::fd::{AsRawFd, RawFd};
+use std::os::fd::{AsRawFd, BorrowedFd, RawFd};
 use std::process::Stdio;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::process::{Child, Command};
@@ -737,19 +737,31 @@ pub async fn resize_pty(params: &serde_json::Value) -> HandlerResult {
         data: None,
     })?;
 
-    set_window_size(
-        managed.async_fd.get_ref().as_raw_fd(),
-        params.rows,
-        params.cols,
-    )
-    .map_err(|e| RpcError {
+    let fd = managed.async_fd.get_ref().as_raw_fd();
+
+    set_window_size(fd, params.rows, params.cols).map_err(|e| RpcError {
         code: RpcError::PROCESS_ERROR,
         message: format!("Failed to resize PTY: {}", e),
         data: None,
     })?;
 
-    // Send SIGWINCH to the process group
-    let _ = nix::sys::signal::kill(Pid::from_raw(-managed.child_pid.as_raw()), Signal::SIGWINCH);
+    // Get the foreground process group and send SIGWINCH to it
+    // This ensures the signal reaches the currently active process (e.g., bash at prompt)
+    // rather than just the shell's process group
+    // SAFETY: fd is valid for the duration of this call as we hold the lock on the process map
+    match tcgetpgrp(unsafe { BorrowedFd::borrow_raw(fd) }) {
+        Ok(fg_pgrp) => {
+            // Send to the foreground process group (negative PID = process group)
+            let _ = nix::sys::signal::kill(Pid::from_raw(-fg_pgrp.as_raw()), Signal::SIGWINCH);
+        }
+        Err(_) => {
+            // Fallback: send to the original child's process group
+            let _ = nix::sys::signal::kill(
+                Pid::from_raw(-managed.child_pid.as_raw()),
+                Signal::SIGWINCH,
+            );
+        }
+    }
 
     Ok(serde_json::json!(true))
 }
