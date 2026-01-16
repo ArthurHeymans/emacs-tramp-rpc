@@ -1,6 +1,6 @@
 ;;; benchmark.el --- Benchmark TRAMP RPC vs TRAMP SSH -*- lexical-binding: t; -*-
 
-;; Copyright (C) 2025 Arthur
+;; Copyright (C) 2026 Arthur Heymans <arthur@aheymans.xyz>
 
 ;;; Commentary:
 

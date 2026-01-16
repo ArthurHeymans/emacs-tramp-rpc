@@ -1,8 +1,8 @@
 ;;; tramp-rpc-protocol.el --- JSON-RPC protocol for TRAMP-RPC -*- lexical-binding: t; -*-
 
-;; Copyright (C) 2025 Arthur
+;; Copyright (C) 2026 Arthur Heymans <arthur@aheymans.xyz>
 
-;; Author: Arthur
+;; Author: Arthur Heymans <arthur@aheymans.xyz>
 ;; Keywords: comm, processes
 ;; Package-Requires: ((emacs "30.1"))
 

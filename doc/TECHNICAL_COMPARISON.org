@@ -1,5 +1,5 @@
 #+TITLE: TRAMP-RPC Technical Comparison
-#+AUTHOR: Arthur
+#+AUTHOR: Arthur Heymans <arthur@aheymans.xyz>
 #+DATE: January 2026
 #+OPTIONS: toc:3 num:t
 

@@ -1,5 +1,5 @@
 #+TITLE: TRAMP-RPC
-#+AUTHOR: Arthur
+#+AUTHOR: Arthur Heymans <arthur@aheymans.xyz>
 #+OPTIONS: toc:2
 
 A high-performance TRAMP backend for Emacs that uses a binary RPC server instead of parsing shell command output.
@@ -40,7 +40,7 @@ TRAMP-RPC replaces this with a lightweight Rust server that runs on the remote h
 
 1. Clone this repository:
    #+begin_src bash
-   git clone https://github.com/your-username/tramp-rpc.git
+   git clone https://github.com/ArthurHeymans/tramp-rpc.git
    #+end_src
 
 2. Add to your Emacs init file:
@@ -73,9 +73,10 @@ The server exposes RPC methods for:
 | Category  | Methods                                                  |
 |-----------+----------------------------------------------------------|
 | File      | ~file.stat~, ~file.read~, ~file.write~, ~file.copy~, ... |
-| Directory | ~dir.list~, ~dir.create~, ~dir.remove~                   |
+| Directory | ~dir.list~, ~dir.create~, ~dir.remove~, ~dir.completions~|
 | Process   | ~process.run~, ~process.start~, ~process.read~, ...      |
-| System    | ~system.info~, ~system.getenv~                           |
+| PTY       | ~process.start_pty~, ~process.read_pty~, ~process.resize_pty~, ... |
+| System    | ~system.info~, ~system.getenv~, ~system.statvfs~         |
 
 * Building from Source
 
@@ -183,7 +184,7 @@ For detailed benchmarks and an in-depth technical comparison with original TRAMP
 
 * License
 
-GPL-3.0-or-later
+This project is licensed under the GNU General Public License v3.0 or later - see the [[file:LICENSE][LICENSE]] file for details.
 
 * Contributing
 

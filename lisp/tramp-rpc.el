@@ -1,8 +1,8 @@
 ;;; tramp-rpc.el --- TRAMP backend using RPC -*- lexical-binding: t; -*-
 
-;; Copyright (C) 2025 Arthur
+;; Copyright (C) 2026 Arthur Heymans <arthur@aheymans.xyz>
 
-;; Author: Arthur
+;; Author: Arthur Heymans <arthur@aheymans.xyz>
 ;; Version: 0.1.0
 ;; Keywords: comm, processes, files
 ;; Package-Requires: ((emacs "30.1"))
