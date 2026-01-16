@@ -795,7 +795,10 @@ Produces ls-like output for dired."
     (start end filename &optional append visit lockname mustbenew)
   "Like `write-region' for TRAMP-RPC files."
   (with-parsed-tramp-file-name filename nil
-    (let* ((content (buffer-substring-no-properties start end))
+    ;; If START is a string, write it directly; otherwise extract from buffer
+    (let* ((content (if (stringp start)
+                        start
+                      (buffer-substring-no-properties start end)))
            (encoded (base64-encode-string content t))
            (params `((path . ,localname)
                      (content . ,encoded)
