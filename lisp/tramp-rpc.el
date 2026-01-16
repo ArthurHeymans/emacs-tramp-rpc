@@ -1613,11 +1613,19 @@ Returns the new interval."
         ;; Delete the process (changes status)
         (when (process-live-p local-process)
           (delete-process local-process))
-        ;; Call sentinel asynchronously to prevent blocking
-        ;; This is important because sentinels like vc-exec-after may do
-        ;; blocking operations that would hang the polling loop
+        ;; Call sentinel in a separate thread to prevent blocking
+        ;; This is critical because sentinels like vc-exec-after may do
+        ;; blocking operations (accept-process-output) that would hang Emacs.
+        ;; Using a thread allows the sentinel to block without freezing the UI,
+        ;; since threads yield the global lock during I/O operations.
         (when sentinel
-          (run-at-time 0 nil sentinel local-process event))))))
+          (make-thread
+           (lambda ()
+             (condition-case err
+                 (funcall sentinel local-process event)
+               (error
+                (tramp-rpc--debug "SENTINEL-ERROR: %S" err))))
+           "tramp-rpc-sentinel"))))))
 
 (defun tramp-rpc-handle-make-process (&rest args)
   "Create an async process on the remote host.
