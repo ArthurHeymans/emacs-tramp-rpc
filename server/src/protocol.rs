@@ -246,10 +246,3 @@ pub struct ProcessResult {
 fn default_encoding() -> OutputEncoding {
     OutputEncoding::Base64
 }
-
-/// Environment variable
-#[derive(Debug, Deserialize)]
-pub struct EnvVar {
-    pub name: String,
-    pub value: String,
-}
