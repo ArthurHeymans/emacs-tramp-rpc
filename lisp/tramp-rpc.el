@@ -1454,20 +1454,58 @@ process-file calls from VC backends are routed through our tramp handler."
         (tramp-run-real-handler #'vc-registered (list file))))))
 
 (defun tramp-rpc-handle-expand-file-name (name &optional dir)
-  "Like `expand-file-name' for TRAMP-RPC files."
+  "Like `expand-file-name' for TRAMP-RPC files.
+Handles tilde expansion by looking up the remote home directory."
   (let ((dir (or dir default-directory)))
     (cond
-     ;; Absolute path
+     ;; Absolute path with tramp prefix - parse and expand
+     ((tramp-tramp-file-p name)
+      (with-parsed-tramp-file-name name nil
+        ;; Make sure localname is absolute
+        (unless (tramp-run-real-handler #'file-name-absolute-p (list localname))
+          (setq localname (concat "/" localname)))
+        ;; Handle tilde expansion
+        (when (string-prefix-p "~" localname)
+          (setq localname (tramp-rpc--expand-tilde v localname)))
+        ;; Do normal expand-file-name for "./" and "../"
+        (let ((default-directory tramp-compat-temporary-file-directory))
+          (tramp-make-tramp-file-name
+           v (tramp-drop-volume-letter
+              (tramp-run-real-handler #'expand-file-name (list localname)))))))
+     ;; Absolute local path - make it remote
      ((file-name-absolute-p name)
-      (if (tramp-tramp-file-p name)
-          name
-        (with-parsed-tramp-file-name dir nil
-          (tramp-make-tramp-file-name v name))))
+      (with-parsed-tramp-file-name dir nil
+        (tramp-make-tramp-file-name v name)))
+     ;; Tilde path - expand relative to remote home
+     ((string-prefix-p "~" name)
+      (with-parsed-tramp-file-name dir nil
+        (let ((expanded (tramp-rpc--expand-tilde v name)))
+          (let ((default-directory tramp-compat-temporary-file-directory))
+            (tramp-make-tramp-file-name
+             v (tramp-drop-volume-letter
+                (tramp-run-real-handler #'expand-file-name (list expanded))))))))
      ;; Relative path
      (t
       (tramp-make-tramp-file-name
        (tramp-dissect-file-name dir)
        (expand-file-name name (tramp-file-local-name dir)))))))
+
+(defun tramp-rpc--expand-tilde (vec localname)
+  "Expand tilde in LOCALNAME for remote connection VEC.
+Returns the expanded path, or LOCALNAME unchanged if expansion fails."
+  (if (string-match (rx bos "~" (group (* (not "/"))) (group (* nonl)) eos) localname)
+      (let ((uname (match-string 1 localname))
+            (fname (match-string 2 localname))
+            hname)
+        ;; Empty username means current user
+        (when (string-empty-p uname)
+          (setq uname (tramp-file-name-user vec)))
+        ;; Get home directory
+        (if (setq hname (tramp-get-home-directory vec uname))
+            (concat hname fname)
+          ;; Can't expand - return as-is (will error later)
+          localname))
+    localname))
 
 ;; ============================================================================
 ;; Additional handlers to avoid shell dependency
@@ -1517,10 +1555,34 @@ Caches the result per connection."
         (insert content))
       tmpfile)))
 
-(defun tramp-rpc-handle-get-home-directory (vec &optional _user)
-  "Return home directory for USER on remote host VEC using RPC."
-  (let ((result (tramp-rpc--call vec "system.info" nil)))
-    (or (alist-get 'home result) "~")))
+(defun tramp-rpc-handle-get-home-directory (vec &optional user)
+  "Return home directory for USER on remote host VEC using RPC.
+If USER is nil or matches the connection user, returns the current user's
+home directory from system.info.  For other users, looks up via getent."
+  (let* ((conn-user (tramp-file-name-user vec))
+         (target-user (or user conn-user)))
+    (if (or (null target-user)
+            (string-empty-p target-user)
+            (equal target-user conn-user))
+        ;; Current user - use system.info
+        (let ((result (tramp-rpc--call vec "system.info" nil)))
+          (alist-get 'home result))
+      ;; Different user - look up via getent passwd
+      (condition-case nil
+          (let* ((result (tramp-rpc--call vec "process.run"
+                                          `((cmd . "getent")
+                                            (args . ["passwd" ,target-user])
+                                            (cwd . "/"))))
+                 (exit-code (alist-get 'exit_code result))
+                 (stdout (tramp-rpc--decode-output
+                          (alist-get 'stdout result)
+                          (alist-get 'stdout_encoding result))))
+            (when (and (eq exit-code 0) (> (length stdout) 0))
+              ;; getent passwd format: name:x:uid:gid:gecos:home:shell
+              (let ((fields (split-string (string-trim stdout) ":")))
+                (when (>= (length fields) 6)
+                  (nth 5 fields)))))
+        (error nil)))))
 
 (defun tramp-rpc-handle-get-remote-uid (vec id-format)
   "Return remote UID using RPC."
