@@ -42,7 +42,7 @@
 (defconst tramp-rpc-deploy-binary-name "tramp-rpc-server"
   "Name of the server binary.")
 
-(defcustom tramp-rpc-deploy-github-repo "arthurheymans/tramp-rpc"
+(defcustom tramp-rpc-deploy-github-repo "ArthurHeymans/emacs-tramp-rpc"
   "GitHub repository for downloading pre-compiled binaries.
 Format: \"owner/repo\"."
   :type 'string
@@ -260,7 +260,7 @@ Returns the path to the extracted binary, or nil on failure."
 
 (defun tramp-rpc-deploy--download-binary (arch)
   "Download pre-compiled binary for ARCH from GitHub releases.
-Returns the path to the binary on success, nil on failure."
+Returns the path to the binary on success, signals error on failure."
   (let* ((cache-path (tramp-rpc-deploy--local-cache-path arch))
          (cache-dir (file-name-directory cache-path))
          (tarball-url (tramp-rpc-deploy--download-url arch))
@@ -275,24 +275,22 @@ Returns the path to the binary on success, nil on failure."
           (let ((checksum-ok (tramp-rpc-deploy--download-file checksum-url checksum-path)))
             ;; Download tarball
             (message "Downloading tramp-rpc-server for %s..." arch)
-            (if (tramp-rpc-deploy--download-file tarball-url tarball-path)
-                (progn
-                  ;; Verify checksum if we got one
-                  (when checksum-ok
-                    (let ((expected (with-temp-buffer
-                                      (insert-file-contents checksum-path)
-                                      (buffer-string))))
-                      (unless (tramp-rpc-deploy--verify-checksum tarball-path expected)
-                        (error "Checksum verification failed"))))
-                  ;; Extract
-                  (message "Extracting binary...")
-                  (make-directory cache-dir t)
-                  (if (tramp-rpc-deploy--extract-tarball tarball-path cache-dir)
-                      (progn
-                        (message "Downloaded tramp-rpc-server for %s" arch)
-                        cache-path)
-                    (error "Failed to extract tarball")))
-              nil)))
+            (unless (tramp-rpc-deploy--download-file tarball-url tarball-path)
+              (error "Download failed from %s (release may not exist)" tarball-url))
+            ;; Verify checksum if we got one
+            (when checksum-ok
+              (let ((expected (with-temp-buffer
+                                (insert-file-contents checksum-path)
+                                (buffer-string))))
+                (unless (tramp-rpc-deploy--verify-checksum tarball-path expected)
+                  (error "Checksum verification failed"))))
+            ;; Extract
+            (message "Extracting binary...")
+            (make-directory cache-dir t)
+            (unless (tramp-rpc-deploy--extract-tarball tarball-path cache-dir)
+              (error "Failed to extract tarball"))
+            (message "Downloaded tramp-rpc-server for %s" arch)
+            cache-path))
       ;; Cleanup temp dir
       (delete-directory temp-dir t))))
 
