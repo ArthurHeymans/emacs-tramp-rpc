@@ -524,8 +524,13 @@ fn do_fork_exec(params: PtyStartParams) -> Result<ForkResult2, RpcError> {
     // Get the tty name from the slave fd before forking
     let tty_name = {
         let mut buf = vec![0u8; 256];
-        let ret =
-            unsafe { libc::ttyname_r(slave.as_raw_fd(), buf.as_mut_ptr() as *mut i8, buf.len()) };
+        let ret = unsafe {
+            libc::ttyname_r(
+                slave.as_raw_fd(),
+                buf.as_mut_ptr() as *mut libc::c_char,
+                buf.len(),
+            )
+        };
         if ret != 0 {
             return Err(RpcError {
                 code: RpcError::PROCESS_ERROR,
