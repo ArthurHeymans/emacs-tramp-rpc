@@ -182,9 +182,11 @@ E.g., \"x86_64-linux\" -> \"x86_64-unknown-linux-gnu\"."
   "Return the remote path where the binary should be installed for VEC."
   (tramp-make-tramp-file-name
    vec
-   (expand-file-name
-    (format "%s-%s" tramp-rpc-deploy-binary-name tramp-rpc-deploy-version)
-    tramp-rpc-deploy-remote-directory)))
+   ;; Use concat instead of expand-file-name to preserve ~ for remote expansion.
+   ;; expand-file-name would expand ~ to the LOCAL user's home directory,
+   ;; causing failures when local and remote usernames differ.
+   (concat (file-name-as-directory tramp-rpc-deploy-remote-directory)
+           (format "%s-%s" tramp-rpc-deploy-binary-name tramp-rpc-deploy-version))))
 
 ;;; ============================================================================
 ;;; Download from GitHub Releases
