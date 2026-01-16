@@ -32,11 +32,11 @@ jobs:
             cross: true
             
           - target: x86_64-apple-darwin
-            os: macos-13  # Intel Mac
+            os: macos-latest  # Cross-compile for Intel
             arch: x86_64-darwin
             
           - target: aarch64-apple-darwin
-            os: macos-14  # M1 Mac
+            os: macos-latest  # Apple Silicon (native)
             arch: aarch64-darwin
 
     steps:
@@ -168,8 +168,8 @@ jobs:
         include:
           - target: x86_64-unknown-linux-gnu
             os: ubuntu-latest
-          - target: x86_64-apple-darwin
-            os: macos-13
+          - target: aarch64-apple-darwin
+            os: macos-latest
 
     steps:
       - name: Checkout

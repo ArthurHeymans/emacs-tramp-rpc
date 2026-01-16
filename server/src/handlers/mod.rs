@@ -103,9 +103,14 @@ fn system_statvfs(params: &serde_json::Value) -> HandlerResult {
     }
 
     // Return values in bytes (multiply by block size)
+    // Allow unnecessary casts for cross-platform compatibility (types differ between Linux/macOS)
+    #[allow(clippy::unnecessary_cast)]
     let block_size = stat.f_frsize as u64;
+    #[allow(clippy::unnecessary_cast)]
     let total = stat.f_blocks as u64 * block_size;
+    #[allow(clippy::unnecessary_cast)]
     let free = stat.f_bfree as u64 * block_size;
+    #[allow(clippy::unnecessary_cast)]
     let available = stat.f_bavail as u64 * block_size;
 
     Ok(serde_json::json!({
