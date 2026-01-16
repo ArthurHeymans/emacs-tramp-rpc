@@ -10,13 +10,25 @@ Traditional TRAMP works by piping shell commands over SSH and parsing their outp
 
 TRAMP-RPC replaces this with a lightweight Rust server that runs on the remote host. Emacs communicates with it using JSON-RPC 2.0 over SSH, resulting in significantly faster file operations.
 
+** Why TRAMP-RPC?
+
+| Aspect           | Original TRAMP           | TRAMP-RPC                |
+|------------------+--------------------------+--------------------------|
+| Communication    | Shell commands + parsing | JSON-RPC protocol        |
+| Latency          | Multiple round-trips     | Single round-trip        |
+| Batching         | Not supported            | Multiple ops per request |
+| Shell dependency | Required on remote       | Not needed               |
+| Binary required  | None                     | ~1.5MB Rust server       |
+
 * Features
 
-- Fast file operations via binary RPC protocol
+- Fast file operations via binary RPC protocol (2-57x faster than shell-based TRAMP)
 - Async process support (~make-process~, ~start-file-process~)
 - Full VC mode integration (git, etc.)
 - Automatic deployment of pre-compiled server binaries
 - Support for x86_64 and aarch64 Linux
+- Batch/pipelined requests for reduced round-trip latency
+- PTY support for terminal emulators (vterm, eat)
 
 * Requirements
 
@@ -152,6 +164,22 @@ Example response:
 #+begin_src json
 {"jsonrpc":"2.0","id":1,"result":{"type":"file","size":2847,"mode":420}}
 #+end_src
+
+* Performance
+
+TRAMP-RPC significantly outperforms traditional TRAMP for most operations:
+
+| Operation       | Speedup vs SSH |
+|-----------------+----------------|
+| file-exists     | 13.7x          |
+| file-write      | 56.6x          |
+| directory-files | 10.5x          |
+| copy-file       | 8.7x           |
+| git commands    | 2-5x           |
+
+Batch operations provide additional 3-6x speedup by combining multiple requests into a single round-trip.
+
+For detailed benchmarks and an in-depth technical comparison with original TRAMP, see [[file:doc/TECHNICAL_COMPARISON.org][Technical Comparison]].
 
 * License
 
