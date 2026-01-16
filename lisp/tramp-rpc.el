@@ -83,6 +83,22 @@ Set to \"yes\" to keep alive indefinitely."
                  (const :tag "Indefinitely" "yes"))
   :group 'tramp-rpc)
 
+(defcustom tramp-rpc-debug nil
+  "When non-nil, log debug messages to *tramp-rpc-debug* buffer.
+Set to t to enable debugging for hang diagnosis."
+  :type 'boolean
+  :group 'tramp-rpc)
+
+(defun tramp-rpc--debug (format-string &rest args)
+  "Log a debug message to *tramp-rpc-debug* buffer if debugging is enabled.
+FORMAT-STRING and ARGS are passed to `format'."
+  (when tramp-rpc-debug
+    (with-current-buffer (get-buffer-create "*tramp-rpc-debug*")
+      (goto-char (point-max))
+      (insert (format-time-string "[%Y-%m-%d %H:%M:%S.%3N] ")
+              (apply #'format format-string args)
+              "\n"))))
+
 (defconst tramp-rpc-method "rpc"
   "TRAMP method for RPC-based remote access.")
 
@@ -233,6 +249,8 @@ Handles async responses by dispatching to registered callbacks."
         ;; Append output to buffer
         (goto-char (point-max))
         (insert output)
+        (tramp-rpc--debug "FILTER received %d bytes, buffer-size=%d"
+                         (length output) (buffer-size))
         ;; Process complete lines for async callbacks
         (goto-char (point-min))
         (while (search-forward "\n" nil t)
@@ -243,18 +261,23 @@ Handles async responses by dispatching to registered callbacks."
                                (line-beginning-position)))
                  (line (buffer-substring line-start (1- line-end))))
             (when (> (length line) 0)
-              (condition-case nil
+              (condition-case err
                   (let* ((response (tramp-rpc-protocol-decode-response line))
                          (id (plist-get response :id))
                          (callback (gethash id tramp-rpc--async-callbacks)))
-                    (when callback
-                      ;; Remove this line from buffer - it's handled async
-                      (delete-region line-start line-end)
-                      (goto-char (point-min))
-                      ;; Remove callback and call it
-                      (remhash id tramp-rpc--async-callbacks)
-                      (funcall callback response)))
-                (error nil)))))))))
+                    (if callback
+                        (progn
+                          (tramp-rpc--debug "FILTER dispatching async id=%s" id)
+                          ;; Remove this line from buffer - it's handled async
+                          (delete-region line-start line-end)
+                          (goto-char (point-min))
+                          ;; Remove callback and call it
+                          (remhash id tramp-rpc--async-callbacks)
+                          (funcall callback response))
+                      ;; Not an async response - leave for sync code
+                      (tramp-rpc--debug "FILTER leaving sync response id=%s in buffer" id)))
+                (error
+                 (tramp-rpc--debug "FILTER parse error: %S line=%S" err line))))))))))
 
 (defun tramp-rpc--call-async (vec method params callback)
   "Call METHOD with PARAMS asynchronously on the RPC server for VEC.
@@ -265,6 +288,7 @@ Returns the request ID."
          (id-and-request (tramp-rpc-protocol-encode-request-with-id method params))
          (id (car id-and-request))
          (request (cdr id-and-request)))
+    (tramp-rpc--debug "SEND-ASYNC id=%s method=%s" id method)
     ;; Register callback
     (puthash id callback tramp-rpc--async-callbacks)
     ;; Send request
@@ -282,6 +306,28 @@ Returns the result or signals an error.
 Uses 5s total timeout with 10ms polling."
   (tramp-rpc--call-with-timeout vec method params 5 0.01))
 
+(defun tramp-rpc--find-response-by-id (expected-id)
+  "Search current buffer for a JSON-RPC response with EXPECTED-ID.
+Returns (LINE-START . LINE-END) if found, nil otherwise.
+Does not modify the buffer."
+  (save-excursion
+    (goto-char (point-min))
+    (catch 'found
+      (while (search-forward "\n" nil t)
+        (let* ((line-end (point))
+               (line-start (save-excursion
+                             (goto-char (1- line-end))
+                             (line-beginning-position)))
+               (line (buffer-substring line-start (1- line-end))))
+          (when (> (length line) 0)
+            (condition-case nil
+                (let* ((response (tramp-rpc-protocol-decode-response line))
+                       (id (plist-get response :id)))
+                  (when (equal id expected-id)
+                    (throw 'found (cons line-start line-end))))
+              (error nil)))))
+      nil)))
+
 (defun tramp-rpc--call-with-timeout (vec method params total-timeout poll-interval)
   "Call METHOD with PARAMS on the RPC server for VEC.
 TOTAL-TIMEOUT is maximum seconds to wait.
@@ -290,17 +336,21 @@ Returns the result or signals an error."
   (let* ((conn (tramp-rpc--ensure-connection vec))
          (process (plist-get conn :process))
          (buffer (plist-get conn :buffer))
-         (request (tramp-rpc-protocol-encode-request method params)))
+         (id-and-request (tramp-rpc-protocol-encode-request-with-id method params))
+         (expected-id (car id-and-request))
+         (request (cdr id-and-request)))
+
+    (tramp-rpc--debug "SEND id=%s method=%s" expected-id method)
 
     ;; Send request
     (process-send-string process (concat request "\n"))
 
-    ;; Wait for response
+    ;; Wait for response with matching ID
     (with-current-buffer buffer
-      (let ((start (point-max))
-            (timeout total-timeout)
-            response-line)
-        ;; Wait for a complete line
+      (let ((timeout total-timeout)
+            response-line
+            response-bounds)
+        ;; Wait for a response with the correct ID
         (while (and (not response-line)
                     (> timeout 0)
                     (process-live-p process))
@@ -312,24 +362,30 @@ Returns the result or signals an error."
           (if (with-local-quit
                 (accept-process-output process poll-interval nil t)
                 t)
-              (progn
-                (goto-char start)
-                (when (search-forward "\n" nil t)
-                  (setq response-line (buffer-substring start (1- (point))))
-                  ;; Clear processed data
-                  (delete-region (point-min) (point))))
+              ;; Check if our response arrived (search by ID)
+              (when (setq response-bounds (tramp-rpc--find-response-by-id expected-id))
+                (setq response-line (buffer-substring
+                                     (car response-bounds)
+                                     (1- (cdr response-bounds))))
+                ;; Clear only our response from the buffer
+                (delete-region (car response-bounds) (cdr response-bounds))
+                (tramp-rpc--debug "RECV id=%s (found)" expected-id))
             ;; User quit - propagate it
+            (tramp-rpc--debug "QUIT id=%s (user interrupted)" expected-id)
             (keyboard-quit))
           (cl-decf timeout poll-interval))
 
         (unless response-line
-          (error "Timeout waiting for RPC response from %s"
-                 (tramp-file-name-host vec)))
+          (tramp-rpc--debug "TIMEOUT id=%s method=%s buffer-contents=%S"
+                           expected-id method (buffer-string))
+          (error "Timeout waiting for RPC response from %s (id=%s, method=%s)"
+                 (tramp-file-name-host vec) expected-id method))
 
         (let ((response (tramp-rpc-protocol-decode-response response-line)))
           (if (tramp-rpc-protocol-error-p response)
               (let ((code (tramp-rpc-protocol-error-code response))
                     (msg (tramp-rpc-protocol-error-message response)))
+                (tramp-rpc--debug "ERROR id=%s code=%s msg=%s" expected-id code msg)
                 (cond
                  ((= code tramp-rpc-protocol-error-file-not-found)
                   (signal 'file-missing (list "RPC" "No such file" msg)))
@@ -357,38 +413,50 @@ Returns:
   (let* ((conn (tramp-rpc--ensure-connection vec))
          (process (plist-get conn :process))
          (buffer (plist-get conn :buffer))
-         (request (tramp-rpc-protocol-encode-batch-request requests)))
+         (id-and-request (tramp-rpc-protocol-encode-batch-request-with-id requests))
+         (expected-id (car id-and-request))
+         (request (cdr id-and-request)))
+
+    (tramp-rpc--debug "SEND-BATCH id=%s count=%d" expected-id (length requests))
 
     ;; Send batch request
     (process-send-string process (concat request "\n"))
 
-    ;; Wait for response (same logic as tramp-rpc--call)
+    ;; Wait for response with matching ID
     (with-current-buffer buffer
-      (let ((start (point-max))
-            (timeout 30)
-            response-line)
+      (let ((timeout 30)
+            response-line
+            response-bounds)
         (while (and (not response-line)
                     (> timeout 0)
                     (process-live-p process))
           (if (with-local-quit
                 (accept-process-output process 0.1 nil t)
                 t)
-              (progn
-                (goto-char start)
-                (when (search-forward "\n" nil t)
-                  (setq response-line (buffer-substring start (1- (point))))
-                  (delete-region (point-min) (point))))
+              ;; Check if our response arrived (search by ID)
+              (when (setq response-bounds (tramp-rpc--find-response-by-id expected-id))
+                (setq response-line (buffer-substring
+                                     (car response-bounds)
+                                     (1- (cdr response-bounds))))
+                (delete-region (car response-bounds) (cdr response-bounds))
+                (tramp-rpc--debug "RECV-BATCH id=%s (found)" expected-id))
+            (tramp-rpc--debug "QUIT-BATCH id=%s (user interrupted)" expected-id)
             (keyboard-quit))
           (cl-decf timeout 0.1))
 
         (unless response-line
-          (error "Timeout waiting for batch RPC response from %s"
-                 (tramp-file-name-host vec)))
+          (tramp-rpc--debug "TIMEOUT-BATCH id=%s buffer-contents=%S"
+                           expected-id (buffer-string))
+          (error "Timeout waiting for batch RPC response from %s (id=%s)"
+                 (tramp-file-name-host vec) expected-id))
 
         (let ((response (tramp-rpc-protocol-decode-response response-line)))
           (if (tramp-rpc-protocol-error-p response)
-              (error "Batch RPC error: %s"
-                     (tramp-rpc-protocol-error-message response))
+              (progn
+                (tramp-rpc--debug "ERROR-BATCH id=%s msg=%s"
+                                 expected-id (tramp-rpc-protocol-error-message response))
+                (error "Batch RPC error: %s"
+                       (tramp-rpc-protocol-error-message response)))
             (tramp-rpc-protocol-decode-batch-response response)))))))
 
 ;; ============================================================================
@@ -407,6 +475,7 @@ Returns a list of request IDs in the same order."
                            (car req) (cdr req)))
              (id (car id-and-json))
              (json (cdr id-and-json)))
+        (tramp-rpc--debug "SEND-PIPE id=%s method=%s" id (car req))
         (push id ids)
         (process-send-string process (concat json "\n"))))
     (nreverse ids)))
@@ -421,31 +490,32 @@ TIMEOUT is the maximum time to wait in seconds (default 30)."
          (timeout (or timeout 30))
          (remaining-ids (copy-sequence ids))
          (responses (make-hash-table :test 'eql)))
+    (tramp-rpc--debug "RECV-PIPE waiting for %d responses: %S" (length ids) ids)
     (with-current-buffer buffer
-      (let ((start (point-max)))
-        (while (and remaining-ids
-                    (> timeout 0)
-                    (process-live-p process))
-          (if (with-local-quit
-                (accept-process-output process 0.1 nil t)
-                t)
-              (progn
-                (goto-char start)
-                ;; Try to read all complete lines
-                (while (search-forward "\n" nil t)
-                  (let* ((line (buffer-substring start (1- (point))))
-                         (response (tramp-rpc-protocol-decode-response line))
-                         (id (plist-get response :id)))
+      (while (and remaining-ids
+                  (> timeout 0)
+                  (process-live-p process))
+        (if (with-local-quit
+              (accept-process-output process 0.1 nil t)
+              t)
+            ;; Check for each remaining ID
+            (dolist (id remaining-ids)
+              (let ((bounds (tramp-rpc--find-response-by-id id)))
+                (when bounds
+                  (let* ((line (buffer-substring (car bounds) (1- (cdr bounds))))
+                         (response (tramp-rpc-protocol-decode-response line)))
+                    (tramp-rpc--debug "RECV-PIPE found id=%s" id)
                     ;; Store response by ID
                     (puthash id response responses)
                     ;; Remove from remaining
                     (setq remaining-ids (delete id remaining-ids))
-                    ;; Update start position
-                    (setq start (point)))))
-            (keyboard-quit))
-          (cl-decf timeout 0.1))
-        ;; Clear processed data
-        (delete-region (point-min) start)))
+                    ;; Remove from buffer
+                    (delete-region (car bounds) (cdr bounds))))))
+          (tramp-rpc--debug "RECV-PIPE quit (user interrupted)")
+          (keyboard-quit))
+        (cl-decf timeout 0.1)))
+    (when remaining-ids
+      (tramp-rpc--debug "RECV-PIPE timeout, missing ids: %S" remaining-ids))
     ;; Convert hash table to alist in original order
     (mapcar (lambda (id)
               (cons id (gethash id responses)))
@@ -1319,6 +1389,40 @@ If GROUP is non-nil, also check that group would be preserved."
                (= (file-attribute-group-id attributes)
                   (tramp-rpc-handle-get-remote-gid v 'integer))))))))
 
+(defun tramp-rpc-handle-access-file (filename string)
+  "Like `access-file' for TRAMP-RPC files.
+Check if FILENAME is accessible, signaling an error if not.
+STRING is used in error messages."
+  (setq filename (file-truename filename))
+  (if (file-exists-p filename)
+      (unless (funcall
+               (if (file-directory-p filename)
+                   #'file-accessible-directory-p #'file-readable-p)
+               filename)
+        (tramp-error
+         (tramp-dissect-file-name filename)
+         'file-error
+         (format "%s: Permission denied, %s" string filename)))
+    (tramp-error
+     (tramp-dissect-file-name filename)
+     'file-missing
+     (format "%s: No such file or directory, %s" string filename))))
+
+(defun tramp-rpc-handle-file-name-case-insensitive-p (filename)
+  "Like `file-name-case-insensitive-p' for TRAMP-RPC files.
+Returns nil since most remote systems (Linux) are case-sensitive."
+  ;; For simplicity, assume case-sensitive (most common for remote servers).
+  ;; A more thorough implementation would check the remote filesystem type.
+  nil)
+
+(defun tramp-rpc-handle-file-name-as-directory (file)
+  "Like `file-name-as-directory' for TRAMP-RPC files."
+  (with-parsed-tramp-file-name file nil
+    (tramp-make-tramp-file-name
+     v (if (tramp-string-empty-or-nil-p localname)
+           "/"
+         (file-name-as-directory localname)))))
+
 ;; ============================================================================
 ;; Async Process Support
 ;; ============================================================================
@@ -1422,13 +1526,24 @@ Returns the new interval."
             (let* ((vec (plist-get info :vec))
                    (pid (plist-get info :pid))
                    (stderr-buffer (plist-get info :stderr-buffer))
+                   (process-gone nil)
                    (result (condition-case err
                                (tramp-rpc--read-remote-process vec pid)
                              (error
-                              (message "tramp-rpc: Error polling process: %s" err)
-                              nil)))
+                              ;; Check if this is a "process not found" error
+                              ;; which means the remote process died unexpectedly
+                              (if (string-match-p "Process not found" (error-message-string err))
+                                  (progn
+                                    (tramp-rpc--debug "POLL process %s gone (pid=%s)" local-process pid)
+                                    (setq process-gone t)
+                                    nil)
+                                (message "tramp-rpc: Error polling process: %s" err)
+                                nil))))
                    (had-output nil))
-          (when result
+              ;; If the remote process disappeared, clean up and stop
+              (when process-gone
+                (tramp-rpc--handle-process-exit local-process -1))
+              (when (and result (not process-gone))
             ;; Handle stdout - send to process filter/buffer
             (when-let ((stdout (plist-get result :stdout)))
               (when (> (length stdout) 0)
@@ -1498,9 +1613,11 @@ Returns the new interval."
         ;; Delete the process (changes status)
         (when (process-live-p local-process)
           (delete-process local-process))
-        ;; Call sentinel with our custom event
+        ;; Call sentinel asynchronously to prevent blocking
+        ;; This is important because sentinels like vc-exec-after may do
+        ;; blocking operations that would hang the polling loop
         (when sentinel
-          (funcall sentinel local-process event))))))
+          (run-at-time 0 nil sentinel local-process event))))))
 
 (defun tramp-rpc-handle-make-process (&rest args)
   "Create an async process on the remote host.
@@ -2130,14 +2247,14 @@ process-file calls are routed through the TRAMP handler."
     ;; These use tramp-handle-* functions that operate on cached data or
     ;; delegate to our RPC handlers internally.
     ;; =========================================================================
-    (access-file . tramp-handle-access-file)
+    (access-file . tramp-rpc-handle-access-file)
     (directory-file-name . tramp-handle-directory-file-name)
     (dired-uncache . tramp-handle-dired-uncache)
     (file-accessible-directory-p . tramp-handle-file-accessible-directory-p)
     (file-equal-p . tramp-handle-file-equal-p)
     (file-in-directory-p . tramp-handle-file-in-directory-p)
-    (file-name-as-directory . tramp-handle-file-name-as-directory)
-    (file-name-case-insensitive-p . tramp-handle-file-name-case-insensitive-p)
+    (file-name-as-directory . tramp-rpc-handle-file-name-as-directory)
+    (file-name-case-insensitive-p . tramp-rpc-handle-file-name-case-insensitive-p)
     (file-name-completion . tramp-handle-file-name-completion)
     (file-name-directory . tramp-handle-file-name-directory)
     (file-name-nondirectory . tramp-handle-file-name-nondirectory)

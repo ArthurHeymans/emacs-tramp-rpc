@@ -105,6 +105,19 @@ Returns a JSON string for a single RPC call to the batch method."
      "batch"
      `((requests . ,(vconcat batch-requests))))))
 
+(defun tramp-rpc-protocol-encode-batch-request-with-id (requests)
+  "Encode a batch request containing multiple REQUESTS.
+REQUESTS is a list of (METHOD . PARAMS) cons cells.
+Returns a cons cell (ID . JSON-STRING) for ID tracking."
+  (let ((batch-requests
+         (mapcar (lambda (req)
+                   `((method . ,(car req))
+                     (params . ,(cdr req))))
+                 requests)))
+    (tramp-rpc-protocol-encode-request-with-id
+     "batch"
+     `((requests . ,(vconcat batch-requests))))))
+
 (defun tramp-rpc-protocol-decode-batch-response (response)
   "Decode a batch response into a list of individual results.
 RESPONSE is the decoded response plist from
