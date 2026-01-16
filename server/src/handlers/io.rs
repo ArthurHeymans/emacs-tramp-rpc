@@ -296,6 +296,64 @@ pub async fn make_symlink(params: &serde_json::Value) -> HandlerResult {
     Ok(serde_json::json!(true))
 }
 
+/// Create a hard link
+pub async fn make_hardlink(params: &serde_json::Value) -> HandlerResult {
+    #[derive(Deserialize)]
+    struct Params {
+        /// The existing file to link to
+        src: String,
+        /// The new hard link path
+        dest: String,
+    }
+
+    let params: Params = serde_json::from_value(params.clone())
+        .map_err(|e| RpcError::invalid_params(e.to_string()))?;
+
+    fs::hard_link(&params.src, &params.dest)
+        .await
+        .map_err(|e| map_io_error(e, &params.dest))?;
+
+    Ok(serde_json::json!(true))
+}
+
+/// Change file ownership (chown)
+pub async fn chown(params: &serde_json::Value) -> HandlerResult {
+    #[derive(Deserialize)]
+    struct Params {
+        path: String,
+        /// New user ID (-1 to leave unchanged)
+        uid: i32,
+        /// New group ID (-1 to leave unchanged)
+        gid: i32,
+    }
+
+    let params: Params = serde_json::from_value(params.clone())
+        .map_err(|e| RpcError::invalid_params(e.to_string()))?;
+
+    let path = params.path.clone();
+    let uid = params.uid;
+    let gid = params.gid;
+
+    // Use spawn_blocking for the libc syscall
+    tokio::task::spawn_blocking(move || {
+        use std::ffi::CString;
+        let path_cstr =
+            CString::new(path.as_str()).map_err(|_| RpcError::invalid_params("Invalid path"))?;
+
+        let result =
+            unsafe { libc::chown(path_cstr.as_ptr(), uid as libc::uid_t, gid as libc::gid_t) };
+
+        if result != 0 {
+            return Err(RpcError::io_error(std::io::Error::last_os_error()));
+        }
+        Ok(())
+    })
+    .await
+    .map_err(|e| RpcError::internal_error(e.to_string()))??;
+
+    Ok(serde_json::json!(true))
+}
+
 // ============================================================================
 // Helper functions
 // ============================================================================

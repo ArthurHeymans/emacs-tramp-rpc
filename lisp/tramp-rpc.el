@@ -882,6 +882,181 @@ Produces ls-like output for dired."
                                     target))
                        (link_path . ,localname)))))
 
+(defun tramp-rpc-handle-add-name-to-file (filename newname &optional ok-if-already-exists)
+  "Like `add-name-to-file' for TRAMP-RPC files.
+Creates a hard link from NEWNAME to FILENAME."
+  (unless (tramp-equal-remote filename newname)
+    (with-parsed-tramp-file-name
+        (if (tramp-tramp-file-p filename) filename newname) nil
+      (tramp-error
+       v 'file-error
+       "add-name-to-file: %s"
+       "only implemented for same method, same user, same host")))
+  (with-parsed-tramp-file-name (expand-file-name filename) v1
+    (with-parsed-tramp-file-name (expand-file-name newname) v2
+      ;; Handle the 'confirm if exists' thing
+      (when (file-exists-p newname)
+        (if (or (null ok-if-already-exists)
+                (and (numberp ok-if-already-exists)
+                     (not (yes-or-no-p
+                           (format "File %s already exists; make it a link anyway?"
+                                   v2-localname)))))
+            (tramp-error v2 'file-already-exists newname)
+          (delete-file newname)))
+      (tramp-rpc--call v1 "file.make_hardlink"
+                       `((src . ,v1-localname)
+                         (dest . ,v2-localname))))))
+
+(defun tramp-rpc-handle-set-file-uid-gid (filename &optional uid gid)
+  "Like `tramp-set-file-uid-gid' for TRAMP-RPC files.
+Set the ownership of FILENAME to UID and GID.
+Either UID or GID can be nil or -1 to leave that unchanged."
+  (with-parsed-tramp-file-name filename nil
+    (let ((uid (or (and (natnump uid) uid)
+                   (tramp-rpc-handle-get-remote-uid v 'integer)))
+          (gid (or (and (natnump gid) gid)
+                   (tramp-rpc-handle-get-remote-gid v 'integer))))
+      (tramp-rpc--call v "file.chown"
+                       `((path . ,localname)
+                         (uid . ,uid)
+                         (gid . ,gid))))))
+
+(defun tramp-rpc-handle-file-system-info (filename)
+  "Like `file-system-info' for TRAMP-RPC files.
+Returns a list of (TOTAL FREE AVAILABLE) bytes for the filesystem containing FILENAME."
+  (with-parsed-tramp-file-name (expand-file-name filename) nil
+    (condition-case nil
+        (let ((result (tramp-rpc--call v "system.statvfs" `((path . ,localname)))))
+          (list (alist-get 'total result)
+                (alist-get 'free result)
+                (alist-get 'available result)))
+      (error nil))))
+
+(defun tramp-rpc-handle-get-remote-groups (vec id-format)
+  "Return remote groups using RPC.
+ID-FORMAT specifies whether to return integer GIDs or string names."
+  (condition-case nil
+      (let ((result (tramp-rpc--call vec "system.groups" nil)))
+        (mapcar (lambda (g)
+                  (if (eq id-format 'integer)
+                      (alist-get 'gid g)
+                    (or (alist-get 'name g)
+                        (number-to-string (alist-get 'gid g)))))
+                result))
+    (error nil)))
+
+;; ============================================================================
+;; ACL Support
+;; ============================================================================
+
+(defun tramp-rpc--acl-enabled-p (vec)
+  "Check if ACL is available on the remote host VEC.
+Caches the result for efficiency."
+  ;; Check if getfacl exists and works
+  (condition-case nil
+      (let ((result (tramp-rpc--call vec "process.run"
+                                     `((cmd . "getfacl")
+                                       (args . ["--version"])
+                                       (cwd . "/")))))
+        (zerop (alist-get 'exit_code result)))
+    (error nil)))
+
+(defun tramp-rpc-handle-file-acl (filename)
+  "Like `file-acl' for TRAMP-RPC files.
+Returns the ACL string for FILENAME, or nil if ACLs are not supported."
+  (with-parsed-tramp-file-name (expand-file-name filename) nil
+    (when (tramp-rpc--acl-enabled-p v)
+      (let ((result (tramp-rpc--call v "process.run"
+                                     `((cmd . "getfacl")
+                                       (args . ["-ac" ,localname])
+                                       (cwd . "/")))))
+        (when (zerop (alist-get 'exit_code result))
+          (let ((output (tramp-rpc--decode-output
+                         (alist-get 'stdout result)
+                         (alist-get 'stdout_encoding result))))
+            ;; Return nil if output is empty or only whitespace
+            (when (string-match-p "[^ \t\n]" output)
+              (string-trim output))))))))
+
+(defun tramp-rpc-handle-set-file-acl (filename acl-string)
+  "Like `set-file-acl' for TRAMP-RPC files.
+Set the ACL of FILENAME to ACL-STRING.
+Returns t on success, nil on failure."
+  (with-parsed-tramp-file-name (expand-file-name filename) nil
+    (when (and (stringp acl-string)
+               (tramp-rpc--acl-enabled-p v))
+      ;; Use setfacl with --set-file=- to read ACL from stdin
+      (let* ((encoded-acl (base64-encode-string acl-string t))
+             (result (tramp-rpc--call v "process.run"
+                                      `((cmd . "setfacl")
+                                        (args . ["--set-file=-" ,localname])
+                                        (cwd . "/")
+                                        (stdin . ,encoded-acl)))))
+        (zerop (alist-get 'exit_code result))))))
+
+;; ============================================================================
+;; SELinux Support
+;; ============================================================================
+
+(defun tramp-rpc--selinux-enabled-p (vec)
+  "Check if SELinux is enabled on the remote host VEC."
+  (condition-case nil
+      (let ((result (tramp-rpc--call vec "process.run"
+                                     `((cmd . "selinuxenabled")
+                                       (args . [])
+                                       (cwd . "/")))))
+        (zerop (alist-get 'exit_code result)))
+    (error nil)))
+
+(defun tramp-rpc-handle-file-selinux-context (filename)
+  "Like `file-selinux-context' for TRAMP-RPC files.
+Returns a list of (USER ROLE TYPE RANGE), or (nil nil nil nil) if not available."
+  (with-parsed-tramp-file-name (expand-file-name filename) nil
+    (let ((context '(nil nil nil nil)))
+      (when (tramp-rpc--selinux-enabled-p v)
+        (let ((result (tramp-rpc--call v "process.run"
+                                       `((cmd . "ls")
+                                         (args . ["-d" "-Z" ,localname])
+                                         (cwd . "/")))))
+          (when (zerop (alist-get 'exit_code result))
+            (let ((output (tramp-rpc--decode-output
+                           (alist-get 'stdout result)
+                           (alist-get 'stdout_encoding result))))
+              ;; Parse SELinux context from ls -Z output
+              ;; Format: user:role:type:range filename
+              (when (string-match
+                     "\\([^:]+\\):\\([^:]+\\):\\([^:]+\\):\\([^ \t\n]+\\)"
+                     output)
+                (setq context (list (match-string 1 output)
+                                    (match-string 2 output)
+                                    (match-string 3 output)
+                                    (match-string 4 output))))))))
+      context)))
+
+(defun tramp-rpc-handle-set-file-selinux-context (filename context)
+  "Like `set-file-selinux-context' for TRAMP-RPC files.
+Set the SELinux context of FILENAME to CONTEXT.
+CONTEXT is a list of (USER ROLE TYPE RANGE).
+Returns t on success, nil on failure."
+  (with-parsed-tramp-file-name (expand-file-name filename) nil
+    (when (and (consp context)
+               (tramp-rpc--selinux-enabled-p v))
+      (let* ((user (and (stringp (nth 0 context)) (nth 0 context)))
+             (role (and (stringp (nth 1 context)) (nth 1 context)))
+             (type (and (stringp (nth 2 context)) (nth 2 context)))
+             (range (and (stringp (nth 3 context)) (nth 3 context)))
+             (args (append
+                    (when user (list (format "--user=%s" user)))
+                    (when role (list (format "--role=%s" role)))
+                    (when type (list (format "--type=%s" type)))
+                    (when range (list (format "--range=%s" range)))
+                    (list localname)))
+             (result (tramp-rpc--call v "process.run"
+                                      `((cmd . "chcon")
+                                        (args . ,(vconcat args))
+                                        (cwd . "/")))))
+        (zerop (alist-get 'exit_code result))))))
+
 ;; ============================================================================
 ;; Process operations
 ;; ============================================================================
@@ -1036,6 +1211,22 @@ process-file calls from VC backends are routed through our tramp handler."
       (if (eq id-format 'integer)
           gid
         (number-to-string gid)))))
+
+(defun tramp-rpc-handle-file-ownership-preserved-p (filename &optional group)
+  "Like `file-ownership-preserved-p' for TRAMP-RPC files.
+Check if file ownership would be preserved when creating FILENAME.
+If GROUP is non-nil, also check that group would be preserved."
+  (with-parsed-tramp-file-name (expand-file-name filename) nil
+    (let ((attributes (file-attributes filename 'integer)))
+      ;; Return t if the file doesn't exist, since it's true that no
+      ;; information would be lost by an (attempted) delete and create.
+      (or (null attributes)
+          (and
+           (= (file-attribute-user-id attributes)
+              (tramp-rpc-handle-get-remote-uid v 'integer))
+           (or (not group)
+               (= (file-attribute-group-id attributes)
+                  (tramp-rpc-handle-get-remote-gid v 'integer))))))))
 
 ;; ============================================================================
 ;; Async Process Support
@@ -1416,7 +1607,9 @@ calls are routed through the TRAMP handler."
 ;; ============================================================================
 
 (defconst tramp-rpc-file-name-handler-alist
-  '(;; File attributes
+  '(;; =========================================================================
+    ;; RPC-based file attribute operations
+    ;; =========================================================================
     (file-exists-p . tramp-rpc-handle-file-exists-p)
     (file-readable-p . tramp-rpc-handle-file-readable-p)
     (file-writable-p . tramp-rpc-handle-file-writable-p)
@@ -1427,83 +1620,119 @@ calls are routed through the TRAMP handler."
     (file-truename . tramp-rpc-handle-file-truename)
     (file-attributes . tramp-rpc-handle-file-attributes)
     (file-modes . tramp-rpc-handle-file-modes)
+    (file-newer-than-file-p . tramp-rpc-handle-file-newer-than-file-p)
+    (file-ownership-preserved-p . tramp-rpc-handle-file-ownership-preserved-p)
+    (file-system-info . tramp-rpc-handle-file-system-info)
+
+    ;; =========================================================================
+    ;; RPC-based file modification operations
+    ;; =========================================================================
     (set-file-modes . tramp-rpc-handle-set-file-modes)
     (set-file-times . tramp-rpc-handle-set-file-times)
-    (file-newer-than-file-p . tramp-rpc-handle-file-newer-than-file-p)
+    (tramp-set-file-uid-gid . tramp-rpc-handle-set-file-uid-gid)
 
-    ;; Directory operations
+    ;; =========================================================================
+    ;; RPC-based directory operations
+    ;; =========================================================================
     (directory-files . tramp-rpc-handle-directory-files)
     (directory-files-and-attributes . tramp-rpc-handle-directory-files-and-attributes)
     (file-name-all-completions . tramp-rpc-handle-file-name-all-completions)
     (make-directory . tramp-rpc-handle-make-directory)
     (delete-directory . tramp-rpc-handle-delete-directory)
+    (insert-directory . tramp-rpc-handle-insert-directory)
 
-    ;; File I/O
+    ;; =========================================================================
+    ;; RPC-based file I/O operations
+    ;; =========================================================================
     (insert-file-contents . tramp-rpc-handle-insert-file-contents)
     (write-region . tramp-rpc-handle-write-region)
     (copy-file . tramp-rpc-handle-copy-file)
     (rename-file . tramp-rpc-handle-rename-file)
     (delete-file . tramp-rpc-handle-delete-file)
     (make-symbolic-link . tramp-rpc-handle-make-symbolic-link)
+    (add-name-to-file . tramp-rpc-handle-add-name-to-file)
+    (file-local-copy . tramp-rpc-handle-file-local-copy)
 
-    ;; Process operations
+    ;; =========================================================================
+    ;; RPC-based process operations
+    ;; =========================================================================
     (process-file . tramp-rpc-handle-process-file)
     (shell-command . tramp-rpc-handle-shell-command)
+    (make-process . tramp-rpc-handle-make-process)
+    (start-file-process . tramp-rpc-handle-start-file-process)
 
-    ;; Path operations
+    ;; =========================================================================
+    ;; RPC-based system information
+    ;; =========================================================================
+    (tramp-get-home-directory . tramp-rpc-handle-get-home-directory)
+    (tramp-get-remote-uid . tramp-rpc-handle-get-remote-uid)
+    (tramp-get-remote-gid . tramp-rpc-handle-get-remote-gid)
+    (tramp-get-remote-groups . tramp-rpc-handle-get-remote-groups)
+    (exec-path . tramp-rpc-handle-exec-path)
+
+    ;; =========================================================================
+    ;; RPC-based extended attributes (ACL/SELinux via process.run)
+    ;; =========================================================================
+    (file-acl . tramp-rpc-handle-file-acl)
+    (set-file-acl . tramp-rpc-handle-set-file-acl)
+    (file-selinux-context . tramp-rpc-handle-file-selinux-context)
+    (set-file-selinux-context . tramp-rpc-handle-set-file-selinux-context)
+
+    ;; =========================================================================
+    ;; RPC-based path and VC operations
+    ;; =========================================================================
     (expand-file-name . tramp-rpc-handle-expand-file-name)
+    (vc-registered . tramp-rpc-handle-vc-registered)
 
-    ;; Fall back to tramp-sh for these
+    ;; =========================================================================
+    ;; Generic TRAMP handlers (work with any backend, no remote I/O needed)
+    ;; These use tramp-handle-* functions that operate on cached data or
+    ;; delegate to our RPC handlers internally.
+    ;; =========================================================================
     (access-file . tramp-handle-access-file)
-    (add-name-to-file . tramp-handle-add-name-to-file)
-    (byte-compiler-base-file-name . ignore)
-    (diff-latest-backup-file . ignore)
     (directory-file-name . tramp-handle-directory-file-name)
     (dired-uncache . tramp-handle-dired-uncache)
-    (exec-path . tramp-rpc-handle-exec-path)
     (file-accessible-directory-p . tramp-handle-file-accessible-directory-p)
-    (file-acl . ignore)
     (file-equal-p . tramp-handle-file-equal-p)
     (file-in-directory-p . tramp-handle-file-in-directory-p)
-    (file-local-copy . tramp-rpc-handle-file-local-copy)
-    (file-locked-p . tramp-handle-file-locked-p)
     (file-name-as-directory . tramp-handle-file-name-as-directory)
     (file-name-case-insensitive-p . tramp-handle-file-name-case-insensitive-p)
     (file-name-completion . tramp-handle-file-name-completion)
     (file-name-directory . tramp-handle-file-name-directory)
     (file-name-nondirectory . tramp-handle-file-name-nondirectory)
+    (file-remote-p . tramp-handle-file-remote-p)
+    (find-backup-file-name . tramp-handle-find-backup-file-name)
+    (load . tramp-handle-load)
+    (substitute-in-file-name . tramp-handle-substitute-in-file-name)
+
+    ;; =========================================================================
+    ;; Generic TRAMP handlers for local Emacs state (locking, modtime, temp files)
+    ;; =========================================================================
+    (file-locked-p . tramp-handle-file-locked-p)
+    (lock-file . tramp-handle-lock-file)
+    (unlock-file . tramp-handle-unlock-file)
+    (make-lock-file-name . tramp-handle-make-lock-file-name)
+    (set-visited-file-modtime . tramp-handle-set-visited-file-modtime)
+    (verify-visited-file-modtime . tramp-handle-verify-visited-file-modtime)
+    (make-auto-save-file-name . tramp-handle-make-auto-save-file-name)
+    (make-nearby-temp-file . tramp-handle-make-nearby-temp-file)
+    (temporary-file-directory . tramp-handle-temporary-file-directory)
+
+    ;; =========================================================================
+    ;; Generic TRAMP handlers for file notifications
+    ;; =========================================================================
     (file-notify-add-watch . tramp-handle-file-notify-add-watch)
     (file-notify-rm-watch . tramp-handle-file-notify-rm-watch)
     (file-notify-valid-p . tramp-handle-file-notify-valid-p)
-    (file-ownership-preserved-p . ignore)
-    (file-remote-p . tramp-handle-file-remote-p)
-    (file-selinux-context . ignore)
-    (file-system-info . ignore)
-    (find-backup-file-name . tramp-handle-find-backup-file-name)
-    (insert-directory . tramp-rpc-handle-insert-directory)
-    (load . tramp-handle-load)
-    (lock-file . tramp-handle-lock-file)
-    (make-auto-save-file-name . tramp-handle-make-auto-save-file-name)
-    (make-directory-internal . ignore)
-    (make-lock-file-name . tramp-handle-make-lock-file-name)
-    (make-nearby-temp-file . tramp-handle-make-nearby-temp-file)
-    (make-process . tramp-rpc-handle-make-process)
-    (set-file-acl . ignore)
-    (set-file-selinux-context . ignore)
-    (set-visited-file-modtime . tramp-handle-set-visited-file-modtime)
-    (start-file-process . tramp-rpc-handle-start-file-process)
-    (substitute-in-file-name . tramp-handle-substitute-in-file-name)
-    (temporary-file-directory . tramp-handle-temporary-file-directory)
-    (tramp-get-home-directory . tramp-rpc-handle-get-home-directory)
-    (tramp-get-remote-gid . tramp-rpc-handle-get-remote-gid)
-    (tramp-get-remote-groups . ignore)
-    (tramp-get-remote-uid . tramp-rpc-handle-get-remote-uid)
-    (tramp-set-file-uid-gid . ignore)
-    (unhandled-file-name-directory . ignore)
-    (unlock-file . tramp-handle-unlock-file)
-    (vc-registered . tramp-rpc-handle-vc-registered)
-    (verify-visited-file-modtime . tramp-handle-verify-visited-file-modtime)
-    (write-region . tramp-rpc-handle-write-region))
+
+    ;; =========================================================================
+    ;; Intentionally ignored (not applicable or handled elsewhere)
+    ;; =========================================================================
+    (byte-compiler-base-file-name . ignore)  ; Not needed for remote files
+    (diff-latest-backup-file . ignore)       ; Backup handling is local
+    (make-directory-internal . ignore)       ; We implement make-directory
+    (unhandled-file-name-directory . ignore) ; Should return nil for TRAMP
+    )
   "Alist of handler functions for TRAMP-RPC method.")
 
 (defun tramp-rpc-file-name-handler (operation &rest args)

@@ -81,6 +81,82 @@ fn system_expand_path(params: &serde_json::Value) -> HandlerResult {
     Ok(serde_json::json!(expanded))
 }
 
+/// Get filesystem information (like df)
+fn system_statvfs(params: &serde_json::Value) -> HandlerResult {
+    #[derive(serde::Deserialize)]
+    struct Params {
+        path: String,
+    }
+
+    let params: Params = serde_json::from_value(params.clone())
+        .map_err(|e| RpcError::invalid_params(e.to_string()))?;
+
+    use std::ffi::CString;
+    let path_cstr =
+        CString::new(params.path.as_str()).map_err(|_| RpcError::invalid_params("Invalid path"))?;
+
+    let mut stat: libc::statvfs = unsafe { std::mem::zeroed() };
+    let result = unsafe { libc::statvfs(path_cstr.as_ptr(), &mut stat) };
+
+    if result != 0 {
+        return Err(RpcError::io_error(std::io::Error::last_os_error()));
+    }
+
+    // Return values in bytes (multiply by block size)
+    let block_size = stat.f_frsize as u64;
+    let total = stat.f_blocks * block_size;
+    let free = stat.f_bfree * block_size;
+    let available = stat.f_bavail * block_size;
+
+    Ok(serde_json::json!({
+        "total": total,
+        "free": free,
+        "available": available,
+        "block_size": block_size
+    }))
+}
+
+/// Get groups for the current user
+fn system_groups() -> HandlerResult {
+    // Get supplementary groups (use reasonable max buffer)
+    let ngroups: libc::c_int = 64;
+    let mut groups: Vec<libc::gid_t> = vec![0; ngroups as usize];
+
+    let actual_count = unsafe { libc::getgroups(ngroups, groups.as_mut_ptr()) };
+
+    if actual_count < 0 {
+        return Err(RpcError::io_error(std::io::Error::last_os_error()));
+    }
+
+    groups.truncate(actual_count as usize);
+
+    // Convert to group info with names
+    let group_info: Vec<serde_json::Value> = groups
+        .iter()
+        .map(|&gid| {
+            let gname = get_group_name(gid);
+            serde_json::json!({
+                "gid": gid,
+                "name": gname
+            })
+        })
+        .collect();
+
+    Ok(serde_json::json!(group_info))
+}
+
+/// Get group name from gid
+fn get_group_name(gid: libc::gid_t) -> Option<String> {
+    unsafe {
+        let group = libc::getgrgid(gid);
+        if group.is_null() {
+            return None;
+        }
+        let name = std::ffi::CStr::from_ptr((*group).gr_name);
+        name.to_str().ok().map(|s| s.to_string())
+    }
+}
+
 /// Expand ~ to home directory
 fn expand_tilde(path: &str) -> String {
     if path.starts_with("~/") {
@@ -200,6 +276,8 @@ async fn dispatch_inner(request: &Request) -> Response {
         "file.set_modes" => io::set_modes(&request.params).await,
         "file.set_times" => io::set_times(&request.params).await,
         "file.make_symlink" => io::make_symlink(&request.params).await,
+        "file.make_hardlink" => io::make_hardlink(&request.params).await,
+        "file.chown" => io::chown(&request.params).await,
 
         // Process operations
         "process.run" => process::run(&request.params).await,
@@ -214,6 +292,8 @@ async fn dispatch_inner(request: &Request) -> Response {
         "system.info" => system_info(),
         "system.getenv" => system_getenv(&request.params),
         "system.expand_path" => system_expand_path(&request.params),
+        "system.statvfs" => system_statvfs(&request.params),
+        "system.groups" => system_groups(),
 
         // Note: "batch" is NOT allowed in batch (no recursion)
         _ => Err(RpcError::method_not_found(&request.method)),
