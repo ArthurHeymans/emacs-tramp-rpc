@@ -18,15 +18,15 @@ TRAMP-RPC replaces this with a lightweight Rust server that runs on the remote h
 | Latency          | Multiple round-trips     | Single round-trip        |
 | Batching         | Not supported            | Multiple ops per request |
 | Shell dependency | Required on remote       | Not needed               |
-| Binary required  | None                     | ~1.5MB Rust server       |
+| Binary required  | None                     | ~1MB Rust server         |
 
 * Features
 
 - Fast file operations via binary RPC protocol (2-57x faster than shell-based TRAMP)
 - Async process support (~make-process~, ~start-file-process~)
 - Full VC mode integration (git, etc.)
-- Automatic deployment of pre-compiled server binaries
-- Support for x86_64 and aarch64 Linux
+- Automatic binary deployment (download or build from source)
+- Support for Linux and macOS (x86_64 and aarch64)
 - Batch/pipelined requests for reduced round-trip latency
 - PTY support for terminal emulators (vterm, eat)
 
@@ -34,18 +34,27 @@ TRAMP-RPC replaces this with a lightweight Rust server that runs on the remote h
 
 - Emacs 30.1 or later
 - SSH access to remote hosts
-- Remote host running Linux (x86_64 or aarch64)
+- Remote host running Linux or macOS (x86_64 or aarch64)
 
 * Installation
 
+** From MELPA (coming soon)
+
+#+begin_src elisp
+(use-package tramp-rpc
+  :ensure t)
+#+end_src
+
+** Manual Installation
+
 1. Clone this repository:
    #+begin_src bash
-   git clone https://github.com/ArthurHeymans/tramp-rpc.git
+   git clone https://github.com/ArthurHeymans/emacs-tramp-rpc.git
    #+end_src
 
 2. Add to your Emacs init file:
    #+begin_src elisp
-   (add-to-list 'load-path "/path/to/tramp-rpc/lisp")
+   (add-to-list 'load-path "/path/to/emacs-tramp-rpc/lisp")
    (require 'tramp-rpc)
    #+end_src
 
@@ -57,7 +66,20 @@ Access remote files using the ~rpc~ method:
 /rpc:user@host:/path/to/file
 #+end_example
 
-The server binary will be automatically deployed to =~/.cache/tramp-rpc/= on first connection.
+On first connection, the server binary is automatically obtained and deployed:
+
+1. *Download* from GitHub Releases (fastest, ~1MB download)
+2. *Build from source* if Rust is installed and download fails
+
+The binary is cached locally in =~/.emacs.d/tramp-rpc/= and deployed to =~/.cache/tramp-rpc/= on the remote host.
+
+** Deployment Commands
+
+| Command                          | Description                    |
+|----------------------------------+--------------------------------|
+| ~M-x tramp-rpc-deploy-status~    | Show binary deployment status  |
+| ~M-x tramp-rpc-deploy-clear-cache~ | Clear local binary cache     |
+| ~M-x tramp-rpc-deploy-remove-binary~ | Remove binary from remote  |
 
 * Architecture
 
@@ -78,6 +100,57 @@ The server exposes RPC methods for:
 | PTY       | ~process.start_pty~, ~process.read_pty~, ~process.resize_pty~, ... |
 | System    | ~system.info~, ~system.getenv~, ~system.statvfs~         |
 
+* Binary Deployment
+
+** How It Works
+
+#+begin_example
+User connects via /rpc:host:/path
+         │
+         ▼
+Remote already has binary? ──yes──► Done
+         │ no
+         ▼
+Check local cache (~/.emacs.d/tramp-rpc/VERSION/ARCH/)
+         │
+         ├─ Found ──────────────────► Transfer to remote
+         │
+         ▼
+Download from GitHub Releases
+         │
+         ├─ Success ────────────────► Cache locally, transfer to remote
+         │
+         ▼
+Build with cargo (if Rust installed)
+         │
+         ├─ Success ────────────────► Cache locally, transfer to remote
+         │
+         ▼
+Error with helpful instructions
+#+end_example
+
+** Supported Platforms
+
+| Platform       | Architecture | Status |
+|----------------+--------------+--------|
+| Linux          | x86_64       | ✓      |
+| Linux          | aarch64      | ✓      |
+| macOS          | x86_64       | ✓      |
+| macOS (Apple Silicon) | aarch64 | ✓   |
+
+** Manual Binary Installation
+
+If automatic deployment fails, download manually from [[https://github.com/ArthurHeymans/emacs-tramp-rpc/releases][GitHub Releases]] and extract to:
+
+#+begin_example
+~/.emacs.d/tramp-rpc/VERSION/ARCH/tramp-rpc-server
+#+end_example
+
+For example:
+#+begin_example
+~/.emacs.d/tramp-rpc/0.1.0/x86_64-linux/tramp-rpc-server
+#+end_example
+
 * Building from Source
 
 ** Using Nix (recommended)
@@ -86,8 +159,9 @@ The server exposes RPC methods for:
 # Build for current platform
 nix build
 
-# Build static binaries for all supported platforms
-nix run .#copy-binaries
+# Cross-compile for specific target
+nix build .#tramp-rpc-server-x86_64-linux
+nix build .#tramp-rpc-server-aarch64-linux
 
 # Development shell with all tools
 nix develop
@@ -102,32 +176,48 @@ cargo build --release
 
 The binary will be at =target/release/tramp-rpc-server=.
 
-** Cross-compilation
-
-For cross-compiling to different architectures:
+** Cross-compilation with Cargo
 
 #+begin_src bash
-# x86_64 Linux (static, portable)
-nix build .#tramp-rpc-server-x86_64-musl
+# Install target
+rustup target add aarch64-unknown-linux-gnu
 
-# aarch64 Linux (static, portable)
-nix build .#tramp-rpc-server-aarch64-musl
+# Build (requires appropriate linker)
+cargo build --release --target aarch64-unknown-linux-gnu
 #+end_src
 
 * Configuration
 
 #+begin_src elisp
-;; Directory containing pre-compiled binaries (default: lisp/binaries/)
-(setq tramp-rpc-deploy-binary-directory "/path/to/binaries")
+;; Prefer building from source over downloading (default: nil)
+(setq tramp-rpc-deploy-prefer-build t)
+
+;; Local cache directory (default: ~/.emacs.d/tramp-rpc/)
+(setq tramp-rpc-deploy-local-cache-directory "~/.cache/tramp-rpc-binaries")
 
 ;; Remote installation directory (default: ~/.cache/tramp-rpc)
 (setq tramp-rpc-deploy-remote-directory "~/.local/bin/tramp-rpc")
 
 ;; Disable automatic deployment (default: t)
 (setq tramp-rpc-deploy-auto-deploy nil)
+
+;; Use different GitHub repo for downloads
+(setq tramp-rpc-deploy-github-repo "myuser/my-fork")
+
+;; Download timeout in seconds (default: 120)
+(setq tramp-rpc-deploy-download-timeout 60)
 #+end_src
 
 * Troubleshooting
+
+** Check deployment status
+
+Run ~M-x tramp-rpc-deploy-status~ to see:
+- Current version
+- Local architecture
+- Whether Rust/cargo is available
+- Cached binaries
+- Download URLs
 
 ** diff-hl issues in dired
 
@@ -145,12 +235,18 @@ The server binary is deployed using standard SSH (~sshx~ method). Ensure you can
 ssh -o BatchMode=yes user@host echo success
 #+end_src
 
-* How It Works
+** Download failures
 
-1. On first connection, TRAMP-RPC detects the remote architecture and deploys the appropriate pre-compiled binary
-2. The binary is transferred via base64 encoding over the SSH connection
-3. Emacs spawns the server via SSH and communicates using newline-delimited JSON-RPC
-4. File operations are handled natively by the Rust server, avoiding shell parsing overhead
+If GitHub downloads fail (corporate firewall, etc.), you can:
+
+1. Install Rust and let tramp-rpc build locally:
+   #+begin_src bash
+   curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+   #+end_src
+
+2. Download manually and place in the cache directory (see above)
+
+3. Pre-deploy to remote hosts using your own method
 
 * Protocol
 
