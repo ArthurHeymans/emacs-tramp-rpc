@@ -263,6 +263,9 @@ pub async fn read(params: &serde_json::Value) -> HandlerResult {
         /// Maximum bytes to read
         #[serde(default = "default_max_read")]
         max_bytes: usize,
+        /// Timeout in milliseconds to wait for data. If 0 or not specified, returns immediately.
+        #[serde(default)]
+        timeout_ms: Option<u64>,
     }
 
     fn default_max_read() -> usize {
@@ -272,6 +275,8 @@ pub async fn read(params: &serde_json::Value) -> HandlerResult {
     let params: Params = serde_json::from_value(params.clone())
         .map_err(|e| RpcError::invalid_params(e.to_string()))?;
 
+    let timeout = params.timeout_ms.unwrap_or(0);
+
     let mut processes = get_process_map().lock().await;
     let managed = processes.get_mut(&params.pid).ok_or_else(|| RpcError {
         code: RpcError::PROCESS_ERROR,
@@ -279,16 +284,16 @@ pub async fn read(params: &serde_json::Value) -> HandlerResult {
         data: None,
     })?;
 
-    // Try to read stdout (non-blocking with timeout)
+    // Try to read stdout (with optional blocking timeout)
     let stdout_data = if let Some(stdout) = managed.child.stdout.as_mut() {
-        try_read_async(stdout, params.max_bytes).await
+        try_read_async_with_timeout(stdout, params.max_bytes, timeout).await
     } else {
         vec![]
     };
 
-    // Try to read stderr (non-blocking with timeout)
+    // Try to read stderr (with optional blocking timeout)
     let stderr_data = if let Some(stderr) = managed.child.stderr.as_mut() {
-        try_read_async(stderr, params.max_bytes).await
+        try_read_async_with_timeout(stderr, params.max_bytes, timeout).await
     } else {
         vec![]
     };
@@ -321,15 +326,23 @@ pub async fn read(params: &serde_json::Value) -> HandlerResult {
     }))
 }
 
-/// Try to read from an async reader with a very short timeout
-async fn try_read_async<R: tokio::io::AsyncRead + Unpin>(
+/// Try to read from an async reader with configurable timeout
+/// If timeout_ms is 0, returns immediately (non-blocking).
+/// Otherwise blocks for up to timeout_ms milliseconds waiting for data.
+async fn try_read_async_with_timeout<R: tokio::io::AsyncRead + Unpin>(
     reader: &mut R,
     max_bytes: usize,
+    timeout_ms: u64,
 ) -> Vec<u8> {
     let mut buf = vec![0u8; max_bytes];
+    let timeout = if timeout_ms == 0 { 1 } else { timeout_ms };
 
-    // Use a very short timeout to make this effectively non-blocking
-    match tokio::time::timeout(std::time::Duration::from_millis(1), reader.read(&mut buf)).await {
+    match tokio::time::timeout(
+        std::time::Duration::from_millis(timeout),
+        reader.read(&mut buf),
+    )
+    .await
+    {
         Ok(Ok(0)) => vec![], // EOF
         Ok(Ok(n)) => {
             buf.truncate(n);

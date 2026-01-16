@@ -48,7 +48,6 @@
 (require 'tramp-rpc-deploy)
 
 ;; Silence byte-compiler warnings for functions defined elsewhere
-(declare-function tramp-make-temp-file "tramp" (vec &optional prefix))
 
 ;; Silence byte-compiler warnings for variables defined in vterm
 (defvar vterm-copy-mode)
@@ -121,6 +120,134 @@ Value is a plist with :vec, :pid.")
 (defvar tramp-rpc--async-callbacks (make-hash-table :test 'eql)
   "Hash table mapping request IDs to callback functions for async RPC calls.")
 
+(defvar tramp-rpc--process-write-queues (make-hash-table :test 'eql)
+  "Hash table mapping remote PIDs to write queue state.
+Value is a plist with :pending (list of pending write data) and :writing (bool).")
+
+;; ============================================================================
+;; Direnv environment caching for process execution
+;; ============================================================================
+
+(defvar tramp-rpc--direnv-cache (make-hash-table :test 'equal)
+  "Cache of direnv environments keyed by (connection-key . directory).
+Value is a plist with :env (alist) and :timestamp.")
+
+(defvar tramp-rpc--direnv-available-cache (make-hash-table :test 'equal)
+  "Cache tracking whether direnv is available on each connection.
+Value is :available, :unavailable, or nil (unknown).")
+
+(defcustom tramp-rpc-use-direnv t
+  "Whether to load direnv environment for remote processes.
+When enabled, runs `direnv export json` to get project-specific
+environment variables. Set to nil to disable for better performance."
+  :type 'boolean
+  :group 'tramp-rpc)
+
+(defcustom tramp-rpc-direnv-cache-timeout 300
+  "Seconds to cache direnv environment before re-fetching.
+Set to 0 to disable caching (not recommended)."
+  :type 'integer
+  :group 'tramp-rpc)
+
+(defun tramp-rpc--direnv-cache-key (vec directory)
+  "Generate cache key for direnv environment on VEC in DIRECTORY."
+  (cons (tramp-rpc--connection-key vec) directory))
+
+(defun tramp-rpc--get-direnv-environment (vec directory)
+  "Get direnv environment for DIRECTORY on VEC.
+Returns alist of (VAR . VALUE) pairs, or nil if direnv unavailable/disabled.
+Results are cached for `tramp-rpc-direnv-cache-timeout' seconds."
+  (when tramp-rpc-use-direnv
+    (let* ((conn-key (tramp-rpc--connection-key vec))
+           (direnv-status (gethash conn-key tramp-rpc--direnv-available-cache)))
+      ;; Skip if we already know direnv is unavailable on this host
+      (unless (eq direnv-status :unavailable)
+        (let* ((cache-key (tramp-rpc--direnv-cache-key vec directory))
+               (cached (gethash cache-key tramp-rpc--direnv-cache))
+               (now (float-time)))
+          ;; Check if cache is valid
+          (if (and cached
+                   (< (- now (plist-get cached :timestamp))
+                      tramp-rpc-direnv-cache-timeout))
+              (plist-get cached :env)
+            ;; Need to fetch fresh
+            (let ((env (tramp-rpc--fetch-direnv-environment vec directory)))
+              ;; Cache the result (even if nil, to avoid repeated failures)
+              (puthash cache-key
+                       (list :env env :timestamp now)
+                       tramp-rpc--direnv-cache)
+              env)))))))
+
+(defcustom tramp-rpc-direnv-essential-vars
+  '("PATH" "LD_LIBRARY_PATH" "LIBRARY_PATH"
+    "CARGO_HOME" "RUSTUP_HOME" "RUST_SRC_PATH"
+    "CC" "CXX" "PKG_CONFIG_PATH"
+    "NIX_CC" "NIX_CFLAGS_COMPILE" "NIX_LDFLAGS"
+    "GOPATH" "GOROOT"
+    "PYTHONPATH" "VIRTUAL_ENV"
+    "NODE_PATH" "NPM_CONFIG_PREFIX")
+  "Environment variables to extract from direnv.
+Only these variables are passed to remote processes to avoid
+performance issues with large environments."
+  :type '(repeat string)
+  :group 'tramp-rpc)
+
+(defun tramp-rpc--fetch-direnv-environment (vec directory)
+  "Fetch direnv environment for DIRECTORY on VEC.
+Returns alist of (VAR . VALUE) pairs for essential variables only.
+See `tramp-rpc-direnv-essential-vars' for the list of variables."
+  (condition-case nil
+      (let* ((result (tramp-rpc--call vec "process.run"
+                                       `((cmd . "/bin/sh")
+                                         (args . ["-l" "-c"
+                                                  ,(concat "cd " (shell-quote-argument directory)
+                                                           " && direnv export json 2>/dev/null")])
+                                         (cwd . "/"))))
+             (exit-code (alist-get 'exit_code result))
+             (stdout (tramp-rpc--decode-output
+                      (alist-get 'stdout result)
+                      (alist-get 'stdout_encoding result))))
+        (if (and (eq exit-code 0)
+                 (> (length stdout) 0))
+            ;; Parse JSON output into alist, filter to essential vars
+            (condition-case nil
+                (let* ((json-object-type 'alist)
+                       (json-key-type 'string)
+                       (full-env (json-read-from-string stdout)))
+                  ;; Filter to only essential variables
+                  (cl-loop for var in tramp-rpc-direnv-essential-vars
+                           for pair = (assoc var full-env)
+                           when pair collect pair))
+              (error nil))
+          ;; If exit code is 127 (command not found), mark direnv as unavailable
+          (when (eq exit-code 127)
+            (puthash (tramp-rpc--connection-key vec)
+                     :unavailable
+                     tramp-rpc--direnv-available-cache))
+          nil))
+    ;; If any error, return nil silently
+    (error nil)))
+
+(defvar tramp-rpc--executable-cache (make-hash-table :test 'equal)
+  "Cache of executable paths keyed by (connection-key . program).
+Value is the full path or :not-found.")
+
+(defun tramp-rpc--resolve-executable (vec program)
+  "Resolve PROGRAM to its full path on VEC.
+Returns the full path if found, otherwise the original PROGRAM.
+Results are cached per connection."
+  (if (file-name-absolute-p program)
+      program
+    (let* ((cache-key (cons (tramp-rpc--connection-key vec) program))
+           (cached (gethash cache-key tramp-rpc--executable-cache)))
+      (cond
+       ((stringp cached) cached)  ; Cached full path
+       ((eq cached :not-found) program)  ; Known not found, use original
+       (t  ; Not cached, look it up
+        (let ((found (tramp-rpc--find-executable vec program)))
+          (puthash cache-key (or found :not-found) tramp-rpc--executable-cache)
+          (or found program)))))))
+
 (defun tramp-rpc--connection-key (vec)
   "Generate a connection key for VEC."
   (list (tramp-file-name-host vec)
@@ -184,8 +311,10 @@ Returns the connection plist."
       (erase-buffer)
       (set-buffer-multibyte t))
 
-    ;; Start the process
-    (setq process (apply #'start-process process-name buffer ssh-args))
+    ;; Start the process with pipe connection (not PTY)
+    ;; PTY has line buffering and ~4KB line length limits that break large JSON-RPC requests
+    (let ((process-connection-type nil))  ; Use pipes, not PTY
+      (setq process (apply #'start-process process-name buffer ssh-args)))
 
     ;; Configure process
     (set-process-query-on-exit-flag process nil)
@@ -944,9 +1073,12 @@ Produces ls-like output for dired."
   "Like `write-region' for TRAMP-RPC files."
   (with-parsed-tramp-file-name filename nil
     ;; If START is a string, write it directly; otherwise extract from buffer
+    ;; Note: START and END can be nil (meaning entire buffer) when called from save-buffer
     (let* ((content (if (stringp start)
                         start
-                      (buffer-substring-no-properties start end)))
+                      (buffer-substring-no-properties
+                       (or start (point-min))
+                       (or end (point-max)))))
            (encoded (base64-encode-string content t))
            (params `((path . ,localname)
                      (content . ,encoded)
@@ -1219,16 +1351,21 @@ Returns t on success, nil on failure."
 
 (defun tramp-rpc-handle-process-file
     (program &optional infile destination _display &rest args)
-  "Like `process-file' for TRAMP-RPC files."
+  "Like `process-file' for TRAMP-RPC files.
+Resolves PROGRAM path and loads direnv environment from working directory."
   (with-parsed-tramp-file-name default-directory nil
-    (let* ((stdin-content (when (and infile (not (eq infile t)))
+    (let* ((resolved-program (tramp-rpc--resolve-executable v program))
+           (direnv-env (tramp-rpc--get-direnv-environment v localname))
+           (stdin-content (when (and infile (not (eq infile t)))
                             (with-temp-buffer
                               (insert-file-contents infile)
                               (base64-encode-string (buffer-string) t))))
            (result (tramp-rpc--call v "process.run"
-                                    `((cmd . ,program)
+                                    `((cmd . ,resolved-program)
                                       (args . ,(vconcat args))
                                       (cwd . ,localname)
+                                      ,@(when direnv-env
+                                          `((env . ,direnv-env)))
                                       ,@(when stdin-content
                                           `((stdin . ,stdin-content))))))
            (exit-code (alist-get 'exit_code result))
@@ -1336,17 +1473,45 @@ process-file calls from VC backends are routed through our tramp handler."
 ;; Additional handlers to avoid shell dependency
 ;; ============================================================================
 
+(defvar tramp-rpc--exec-path-cache (make-hash-table :test 'equal)
+  "Cache of remote exec-path keyed by connection-key.")
+
 (defun tramp-rpc-handle-exec-path ()
-  "Return remote exec-path using RPC."
-  ;; Return a sensible default path
-  '("/usr/local/bin" "/usr/bin" "/bin" "/usr/local/sbin" "/usr/sbin" "/sbin"))
+  "Return remote exec-path using RPC.
+Caches the result per connection."
+  (with-parsed-tramp-file-name default-directory nil
+    (let* ((key (tramp-rpc--connection-key v))
+           (cached (gethash key tramp-rpc--exec-path-cache)))
+      (or cached
+          (let ((path (tramp-rpc--fetch-remote-exec-path v)))
+            (puthash key path tramp-rpc--exec-path-cache)
+            path)))))
+
+(defun tramp-rpc--fetch-remote-exec-path (vec)
+  "Fetch the remote PATH from VEC and split into directories."
+  (condition-case nil
+      (let* ((result (tramp-rpc--call vec "process.run"
+                                       `((cmd . "/bin/sh")
+                                         (args . ["-l" "-c" "echo $PATH"])
+                                         (cwd . "/"))))
+             (exit-code (alist-get 'exit_code result))
+             (stdout (tramp-rpc--decode-output
+                      (alist-get 'stdout result)
+                      (alist-get 'stdout_encoding result))))
+        (if (and (eq exit-code 0) (> (length stdout) 0))
+            (split-string (string-trim stdout) ":" t)
+          ;; Fallback to default paths
+          '("/usr/local/bin" "/usr/bin" "/bin" "/usr/local/sbin" "/usr/sbin" "/sbin")))
+    (error
+     ;; On error, return default paths
+     '("/usr/local/bin" "/usr/bin" "/bin" "/usr/local/sbin" "/usr/sbin" "/sbin"))))
 
 (defun tramp-rpc-handle-file-local-copy (filename)
   "Create a local copy of remote FILENAME using RPC."
   (with-parsed-tramp-file-name filename nil
     (let* ((result (tramp-rpc--call v "file.read" `((path . ,localname))))
            (content (base64-decode-string (alist-get 'content result)))
-           (tmpfile (tramp-make-temp-file nil)))
+           (tmpfile (make-temp-file "tramp-rpc.")))
       (with-temp-file tmpfile
         (set-buffer-multibyte nil)
         (insert content))
@@ -1444,13 +1609,29 @@ Used when process has been idle for a while.")
 (defvar tramp-rpc--poll-in-progress nil
   "Non-nil while a poll is in progress (prevents reentrancy).")
 
-(defun tramp-rpc--start-remote-process (vec program args cwd)
+(defcustom tramp-rpc-use-async-read t
+  "Whether to use async callback-based reads for pipe processes.
+When t (default), uses fast async reads with server-side blocking.
+When nil, uses timer-based polling (slower, for debugging)."
+  :type 'boolean
+  :group 'tramp-rpc)
+
+(defcustom tramp-rpc-async-read-timeout-ms 100
+  "Timeout in milliseconds for async process reads.
+The server will block for this long waiting for data before returning.
+Lower values mean more responsive but higher CPU usage."
+  :type 'integer
+  :group 'tramp-rpc)
+
+(defun tramp-rpc--start-remote-process (vec program args cwd &optional env)
   "Start PROGRAM with ARGS in CWD on remote host VEC.
+ENV is an optional alist of environment variables.
 Returns the remote process PID."
   (let ((result (tramp-rpc--call vec "process.start"
                                  `((cmd . ,program)
                                    (args . ,(vconcat args))
-                                   (cwd . ,cwd)))))
+                                   (cwd . ,cwd)
+                                   ,@(when env `((env . ,env)))))))
     (alist-get 'pid result)))
 
 (defun tramp-rpc--read-remote-process (vec pid)
@@ -1467,10 +1648,47 @@ Returns plist with :stdout, :stderr, :exited, :exit-code."
           :exit-code (alist-get 'exit_code result))))
 
 (defun tramp-rpc--write-remote-process (vec pid data)
-  "Write DATA to stdin of remote process PID on VEC."
-  (tramp-rpc--call vec "process.write"
-                   `((pid . ,pid)
-                     (data . ,(base64-encode-string data t)))))
+  "Write DATA to stdin of remote process PID on VEC.
+Uses async RPC with queuing to ensure writes are serialized.
+This prevents race conditions where later messages arrive before earlier ones."
+  (let* ((queue-key pid)
+         (queue (gethash queue-key tramp-rpc--process-write-queues))
+         (pending (plist-get queue :pending))
+         (writing (plist-get queue :writing)))
+    ;; Add to pending queue
+    (setq pending (append pending (list (list :vec vec :pid pid :data data))))
+    (puthash queue-key (list :pending pending :writing writing)
+             tramp-rpc--process-write-queues)
+    ;; If not currently writing, start processing the queue
+    (unless writing
+      (tramp-rpc--process-write-queue queue-key))))
+
+(defun tramp-rpc--process-write-queue (queue-key)
+  "Process the next pending write for QUEUE-KEY (remote PID)."
+  (let* ((queue (gethash queue-key tramp-rpc--process-write-queues))
+         (pending (plist-get queue :pending)))
+    (when pending
+      (let* ((item (car pending))
+             (vec (plist-get item :vec))
+             (pid (plist-get item :pid))
+             (data (plist-get item :data)))
+        ;; Mark as writing and remove from pending
+        (puthash queue-key (list :pending (cdr pending) :writing t)
+                 tramp-rpc--process-write-queues)
+        ;; Send the write
+        (tramp-rpc--call-async vec "process.write"
+                               `((pid . ,pid)
+                                 (data . ,(base64-encode-string data t)))
+                               (lambda (response)
+                                 (when (plist-get response :error)
+                                   (tramp-rpc--debug "WRITE-ERROR pid=%s: %s"
+                                                    pid (plist-get response :error)))
+                                 ;; Mark as not writing and process next item
+                                 (let ((q (gethash queue-key tramp-rpc--process-write-queues)))
+                                   (puthash queue-key
+                                            (list :pending (plist-get q :pending) :writing nil)
+                                            tramp-rpc--process-write-queues))
+                                 (tramp-rpc--process-write-queue queue-key)))))))
 
 (defun tramp-rpc--close-remote-stdin (vec pid)
   "Close stdin of remote process PID on VEC."
@@ -1481,6 +1699,124 @@ Returns plist with :stdout, :stderr, :exited, :exit-code."
   (tramp-rpc--call vec "process.kill"
                    `((pid . ,pid)
                      (signal . ,(or signal 15))))) ; SIGTERM
+
+;; ============================================================================
+;; Async Callback-based Process Reading (for LSP and interactive processes)
+;; ============================================================================
+
+(defun tramp-rpc--start-async-read (local-process)
+  "Start an async read loop for LOCAL-PROCESS.
+Sends a blocking read request; when response arrives, delivers output
+and chains another read. This provides fast async I/O for LSP servers."
+  (when (and (processp local-process)
+             (process-live-p local-process)
+             (gethash local-process tramp-rpc--async-processes))
+    (let* ((info (gethash local-process tramp-rpc--async-processes))
+           (vec (plist-get info :vec))
+           (pid (plist-get info :pid)))
+      (when (and vec pid)
+        (tramp-rpc--debug "ASYNC-READ starting for pid=%s process=%s" pid local-process)
+        ;; Send async read request with blocking timeout on server
+        (tramp-rpc--call-async
+         vec "process.read"
+         `((pid . ,pid) (timeout_ms . ,tramp-rpc-async-read-timeout-ms))
+         (lambda (response)
+           (tramp-rpc--debug "ASYNC-READ callback invoked for pid=%s" pid)
+           (tramp-rpc--handle-async-read-response local-process response)))))))
+
+(defvar tramp-rpc--delivering-output nil
+  "Non-nil when we're delivering output to the local relay process.
+Used to bypass the process-send-string advice.")
+
+(defun tramp-rpc--deliver-process-output (local-process stdout stderr stderr-buffer)
+  "Deliver STDOUT and STDERR to LOCAL-PROCESS.
+Writes to the local cat relay process, which triggers proper I/O events
+that satisfy accept-process-output.
+STDERR-BUFFER is the separate stderr buffer, or nil to mix with stdout."
+  (when (and (processp local-process) (process-live-p local-process))
+    ;; Set flag to bypass our advice - we're writing TO the local process,
+    ;; not sending data to the remote process
+    (let ((tramp-rpc--delivering-output t))
+      ;; Deliver stdout by writing to the cat relay process
+      ;; This triggers actual I/O events that accept-process-output detects
+      (when (and stdout (> (length stdout) 0))
+        (tramp-rpc--debug "DELIVER stdout %d bytes to %s" (length stdout) local-process)
+        (process-send-string local-process stdout))
+      
+      ;; Deliver stderr
+      (when (and stderr (> (length stderr) 0))
+        (tramp-rpc--debug "DELIVER stderr %d bytes" (length stderr))
+        (cond
+         ((bufferp stderr-buffer)
+          (when (buffer-live-p stderr-buffer)
+            (with-current-buffer stderr-buffer
+              (let ((inhibit-read-only t))
+                (goto-char (point-max))
+                (insert stderr)))))
+         ;; Mix with stdout if no separate stderr buffer - write to cat relay
+         (t
+          (process-send-string local-process stderr)))))))
+
+(defun tramp-rpc--pipe-process-sentinel (proc event user-sentinel)
+  "Sentinel for pipe relay processes.
+PROC is the local cat process, EVENT is the event string.
+USER-SENTINEL is the user's original sentinel function."
+  ;; If cat died unexpectedly, clean up the remote process
+  (when (and (memq (process-status proc) '(exit signal))
+             (gethash proc tramp-rpc--async-processes))
+    (let* ((info (gethash proc tramp-rpc--async-processes))
+           (vec (plist-get info :vec))
+           (pid (plist-get info :pid)))
+      ;; Kill remote process if still running
+      (when (and vec pid)
+        (ignore-errors
+          (tramp-rpc--kill-remote-process vec pid 9)))
+      ;; Remove from tracking
+      (remhash proc tramp-rpc--async-processes)))
+  ;; Call user's sentinel if provided
+  (when user-sentinel
+    (funcall user-sentinel proc event)))
+
+(defun tramp-rpc--handle-async-read-response (local-process response)
+  "Handle async read response for LOCAL-PROCESS.
+RESPONSE is the decoded RPC response plist."
+  ;; Check process is still valid
+  (when (and (processp local-process)
+             (process-live-p local-process)
+             (gethash local-process tramp-rpc--async-processes))
+    (condition-case err
+        (let* ((info (gethash local-process tramp-rpc--async-processes))
+               (stderr-buffer (plist-get info :stderr-buffer))
+               (result (plist-get response :result))
+               (stdout (when-let ((s (alist-get 'stdout result)))
+                         (tramp-rpc--decode-output
+                          s (alist-get 'stdout_encoding result))))
+               (stderr (when-let ((s (alist-get 'stderr result)))
+                         (tramp-rpc--decode-output
+                          s (alist-get 'stderr_encoding result))))
+               (exited (alist-get 'exited result))
+               (exit-code (alist-get 'exit_code result)))
+          
+          (tramp-rpc--debug "ASYNC-READ response: stdout=%s stderr=%s exited=%s"
+                           (if stdout (length stdout) "nil")
+                           (if stderr (length stderr) "nil")
+                           exited)
+          
+          ;; Deliver output - use run-at-time to ensure event loop processes it
+          ;; This is critical for accept-process-output to work correctly
+          (when (or stdout stderr)
+            (run-at-time 0 nil #'tramp-rpc--deliver-process-output
+                         local-process stdout stderr stderr-buffer))
+          
+          ;; Handle process exit or chain next read
+          (if exited
+              (run-at-time 0 nil #'tramp-rpc--handle-process-exit local-process exit-code)
+            ;; Chain another read - use run-at-time to avoid stack overflow
+            (run-at-time 0 nil #'tramp-rpc--start-async-read local-process)))
+      (error
+       (tramp-rpc--debug "ASYNC-READ-ERROR: %S" err)
+       ;; On error, clean up
+       (run-at-time 0 nil #'tramp-rpc--handle-process-exit local-process -1)))))
 
 (defun tramp-rpc--adjust-poll-interval (local-process had-output)
   "Adjust the poll interval for LOCAL-PROCESS based on whether it HAD-OUTPUT.
@@ -1553,8 +1889,9 @@ Returns the new interval."
                   (when-let ((buf (process-buffer local-process)))
                     (when (buffer-live-p buf)
                       (with-current-buffer buf
-                        (goto-char (point-max))
-                        (insert stdout)))))))
+                        (let ((inhibit-read-only t))
+                          (goto-char (point-max))
+                          (insert stdout))))))))
             
             ;; Handle stderr - send to stderr buffer if specified
             (when-let ((stderr (plist-get result :stderr)))
@@ -1564,8 +1901,9 @@ Returns the new interval."
                  ((bufferp stderr-buffer)
                   (when (buffer-live-p stderr-buffer)
                     (with-current-buffer stderr-buffer
-                      (goto-char (point-max))
-                      (insert stderr))))
+                      (let ((inhibit-read-only t))
+                        (goto-char (point-max))
+                        (insert stderr)))))
                  ;; If no stderr buffer, mix with stdout
                  (t
                   (if-let ((filter (process-filter local-process)))
@@ -1573,8 +1911,9 @@ Returns the new interval."
                     (when-let ((buf (process-buffer local-process)))
                       (when (buffer-live-p buf)
                         (with-current-buffer buf
-                          (goto-char (point-max))
-                          (insert stderr)))))))))
+                          (let ((inhibit-read-only t))
+                            (goto-char (point-max))
+                            (insert stderr))))))))))
             
             ;; Adaptive polling: adjust interval based on output
             (let* ((current-interval (or (plist-get info :poll-interval)
@@ -1595,19 +1934,19 @@ Returns the new interval."
   "Handle exit of remote process associated with LOCAL-PROCESS."
   (let ((info (gethash local-process tramp-rpc--async-processes)))
     (when info
-      ;; Cancel the timer
+      ;; Cancel the timer (if using timer-based polling)
       (when-let ((timer (plist-get info :timer)))
         (cancel-timer timer))
       ;; Remove from tracking
       (remhash local-process tramp-rpc--async-processes)
       ;; Store exit code and mark as exited
-      (process-put local-process :tramp-rpc-exit-code exit-code)
+      (process-put local-process :tramp-rpc-exit-code (or exit-code 0))
       (process-put local-process :tramp-rpc-exited t)
       ;; Get sentinel before we modify anything
       (let ((sentinel (process-sentinel local-process))
-            (event (if (= exit-code 0)
+            (event (if (and exit-code (= exit-code 0))
                        "finished\n"
-                     (format "exited abnormally with code %d\n" exit-code))))
+                     (format "exited abnormally with code %d\n" (or exit-code -1)))))
         ;; Remove sentinel temporarily to prevent double-call
         (set-process-sentinel local-process nil)
         ;; Delete the process (changes status)
@@ -1632,7 +1971,8 @@ Returns the new interval."
 ARGS are keyword arguments as per `make-process'.
 Supports PTY allocation when :connection-type is \\='pty or t,
 or when `process-connection-type' is t.
-For pipe mode, uses async polling for long-running processes."
+For pipe mode, uses async polling for long-running processes.
+Resolves program path and loads direnv environment from working directory."
   (let* ((name (plist-get args :name))
          (buffer (plist-get args :buffer))
          (command (plist-get args :command))
@@ -1657,31 +1997,33 @@ For pipe mode, uses async polling for long-running processes."
       (error "tramp-rpc-handle-make-process called without remote default-directory"))
     
     (with-parsed-tramp-file-name default-directory nil
-      (if use-pty
-          ;; PTY mode - start async process with PTY
-          (tramp-rpc--make-pty-process v name buffer command coding noquery
-                                        filter sentinel localname)
-        ;; Pipe mode - existing async polling implementation
-        (let* ((remote-program (if (file-name-absolute-p program)
-                                   program
-                                 (or (tramp-rpc--find-executable v program)
-                                     program)))
-               (remote-pid (tramp-rpc--start-remote-process
-                            v remote-program program-args localname))
-               (local-process (make-pipe-process
-                               :name (or name "tramp-rpc-async")
-                               :buffer buffer
-                               :coding (or coding 'utf-8)
-                               :noquery (if noquery t nil)))
-               (stderr-buffer (cond
-                               ((bufferp stderr) stderr)
-                               ((stringp stderr) (get-buffer-create stderr))
-                               (t nil)))
-               (timer (run-with-timer
-                       tramp-rpc--process-poll-interval-initial
-                       tramp-rpc--process-poll-interval-initial
-                       #'tramp-rpc--poll-process
-                       local-process)))
+      ;; Get direnv environment for this directory
+      (let ((direnv-env (tramp-rpc--get-direnv-environment v localname)))
+        (if use-pty
+            ;; PTY mode - start async process with PTY
+            (tramp-rpc--make-pty-process v name buffer command coding noquery
+                                          filter sentinel localname direnv-env)
+          ;; Pipe mode - use a local cat process as relay for proper I/O events
+          ;; This is needed because accept-process-output waits for actual I/O,
+          ;; not just filter calls
+          (let* ((remote-program (tramp-rpc--resolve-executable v program))
+                 (remote-pid (tramp-rpc--start-remote-process
+                              v remote-program program-args localname direnv-env))
+                 ;; Use a local cat process as relay - we write output to its stdin
+                 ;; and it echoes to stdout, triggering proper I/O events
+                 (local-process (let ((process-connection-type nil)) ; Use pipes, not PTY
+                                  (start-process (or name "tramp-rpc-async")
+                                                 buffer
+                                                 "cat")))
+                 (stderr-buffer (cond
+                                 ((bufferp stderr) stderr)
+                                 ((stringp stderr) (get-buffer-create stderr))
+                                 (t nil))))
+          
+          ;; Configure the local relay process
+          (when coding
+            (set-process-coding-system local-process coding coding))
+          (set-process-query-on-exit-flag local-process (not noquery))
           
           (process-put local-process :tramp-rpc-vec v)
           (process-put local-process :tramp-rpc-pid remote-pid)
@@ -1689,29 +2031,42 @@ For pipe mode, uses async polling for long-running processes."
           (when filter
             (set-process-filter local-process filter))
           (when sentinel
-            (set-process-sentinel local-process sentinel))
+            ;; Wrap sentinel to handle our cleanup
+            (set-process-sentinel local-process
+                                  (lambda (proc event)
+                                    (tramp-rpc--pipe-process-sentinel proc event sentinel))))
           
+          ;; Store process info
           (puthash local-process
                    (list :vec v
                          :pid remote-pid
-                         :timer timer
-                         :stderr-buffer stderr-buffer
-                         :poll-interval tramp-rpc--process-poll-interval-initial)
+                         :stderr-buffer stderr-buffer)
                    tramp-rpc--async-processes)
           
-          local-process)))))
+          (tramp-rpc--debug "MAKE-PROCESS created local=%s remote-pid=%s program=%s"
+                           local-process remote-pid remote-program)
+          
+          ;; Start async read loop
+          (tramp-rpc--start-async-read local-process)
+          
+          local-process))))))
 
 (defun tramp-rpc--find-executable (vec program)
   "Find PROGRAM in the remote PATH on VEC.
-Returns the absolute path or nil."
-  (let ((dirs '("/usr/local/bin" "/usr/bin" "/bin"
-                "/usr/local/sbin" "/usr/sbin" "/sbin")))
-    (cl-loop for dir in dirs
-             for path = (concat dir "/" program)
-             when (condition-case nil
-                      (tramp-rpc--call vec "file.executable" `((path . ,path)))
-                    (error nil))
-             return path)))
+Returns the absolute path or nil.
+Uses `command -v` for efficient lookup via login shell."
+  (condition-case nil
+      (let* ((result (tramp-rpc--call vec "process.run"
+                                       `((cmd . "/bin/sh")
+                                         (args . ["-l" "-c" ,(concat "command -v " program)])
+                                         (cwd . "/"))))
+             (exit-code (alist-get 'exit_code result))
+             (stdout (tramp-rpc--decode-output
+                      (alist-get 'stdout result)
+                      (alist-get 'stdout_encoding result))))
+        (when (and (eq exit-code 0) (> (length stdout) 0))
+          (string-trim stdout)))
+    (error nil)))
 
 (defun tramp-rpc-handle-start-file-process (name buffer program &rest args)
   "Start async process on remote host.
@@ -1727,23 +2082,22 @@ PROGRAM is the command to run, ARGS are its arguments."
 ;; ============================================================================
 
 (defun tramp-rpc--make-pty-process (vec name buffer command coding noquery
-                                         filter sentinel localname)
+                                         filter sentinel localname &optional direnv-env)
   "Create a PTY-based process for terminal emulators.
 VEC is the tramp connection vector.
 NAME, BUFFER, COMMAND, CODING, NOQUERY, FILTER, SENTINEL are process params.
-LOCALNAME is the remote working directory."
+LOCALNAME is the remote working directory.
+DIRENV-ENV is an optional alist of environment variables from direnv."
   (let* ((program (car command))
          (program-args (cdr command))
-         (remote-program (if (file-name-absolute-p program)
-                             program
-                           (or (tramp-rpc--find-executable vec program)
-                               program)))
+         (remote-program (tramp-rpc--resolve-executable vec program))
          ;; Get terminal dimensions from buffer or use defaults
          (size (tramp-rpc--get-terminal-size buffer))
          (rows (cdr size))
          (cols (car size))
-         ;; Build environment - inherit TERM from process-environment or default
+         ;; Build environment - merge direnv env with TERM
          (term-env (or (getenv "TERM") "xterm-256color"))
+         (full-env (append direnv-env `(("TERM" . ,term-env))))
          ;; Start the PTY process on remote
          (result (tramp-rpc--call vec "process.start_pty"
                                    `((cmd . ,remote-program)
@@ -1751,9 +2105,9 @@ LOCALNAME is the remote working directory."
                                      (cwd . ,localname)
                                      (rows . ,rows)
                                      (cols . ,cols)
-                                     (env . ((TERM . ,term-env))))))
-          (remote-pid (alist-get 'pid result))
-          (tty-name (alist-get 'tty_name result))
+                                     (env . ,full-env))))
+         (remote-pid (alist-get 'pid result))
+         (tty-name (alist-get 'tty_name result))
          ;; Normalize buffer - it can be t, nil, a buffer, or a string
          (actual-buffer (cond
                          ((bufferp buffer) buffer)
@@ -2030,37 +2384,43 @@ For tramp-rpc processes, resize the remote PTY and update eat's display."
 
 (defun tramp-rpc--process-send-string-advice (orig-fun process string)
   "Advice for `process-send-string' to handle TRAMP-RPC processes."
-  ;; process-send-string can receive a buffer/buffer-name instead of process
-  (let ((proc (cond
-               ((processp process) process)
-               ((or (bufferp process) (stringp process))
-                (get-buffer-process (get-buffer process)))
-               (t nil))))
-    (cond
-     ;; PTY process - use PTY write (async, fire-and-forget)
-     ((and proc (process-get proc :tramp-rpc-pty))
-      (let ((vec (process-get proc :tramp-rpc-vec))
-            (pid (process-get proc :tramp-rpc-pid)))
-        ;; Send write request asynchronously - don't wait for response
-        (tramp-rpc--call-async vec "process.write_pty"
-                               `((pid . ,pid)
-                                 (data . ,(base64-encode-string string t)))
-                               #'ignore)  ; Ignore the response
-        nil))
-     ;; Regular async RPC process (pipe-based)
-     ((and proc
-           (process-get proc :tramp-rpc-pid)
-           (process-get proc :tramp-rpc-vec)
-           (not (process-get proc :tramp-rpc-pty)))
-      (condition-case err
-          (tramp-rpc--write-remote-process
+  ;; If we're delivering output to the local relay, bypass this advice
+  (if tramp-rpc--delivering-output
+      (funcall orig-fun process string)
+    ;; process-send-string can receive a buffer/buffer-name instead of process
+    (let ((proc (cond
+                 ((processp process) process)
+                 ((or (bufferp process) (stringp process))
+                  (get-buffer-process (get-buffer process)))
+                 (t nil))))
+      (cond
+       ;; PTY process - use PTY write (async, fire-and-forget)
+       ((and proc (process-get proc :tramp-rpc-pty))
+        (let ((vec (process-get proc :tramp-rpc-vec))
+              (pid (process-get proc :tramp-rpc-pid)))
+          (tramp-rpc--debug "SEND-STRING PTY pid=%s len=%d" pid (length string))
+          ;; Send write request asynchronously - don't wait for response
+          (tramp-rpc--call-async vec "process.write_pty"
+                                 `((pid . ,pid)
+                                   (data . ,(base64-encode-string string t)))
+                                 #'ignore)  ; Ignore the response
+          nil))
+       ;; Regular async RPC process (pipe-based)
+       ((and proc
+             (process-get proc :tramp-rpc-pid)
+             (process-get proc :tramp-rpc-vec)
+             (not (process-get proc :tramp-rpc-pty)))
+        (tramp-rpc--debug "SEND-STRING pipe pid=%s len=%d"
+                         (process-get proc :tramp-rpc-pid) (length string))
+        (condition-case err
+            (tramp-rpc--write-remote-process
            (process-get proc :tramp-rpc-vec)
            (process-get proc :tramp-rpc-pid)
            string)
         (error
          (message "tramp-rpc: Error writing to process: %s" err))))
-     ;; Not an RPC process, use original function
-     (t (funcall orig-fun process string)))))
+       ;; Not an RPC process, use original function
+       (t (funcall orig-fun process string))))))
 
 (defun tramp-rpc--process-send-eof-advice (orig-fun &optional process)
   "Advice for `process-send-eof' to handle TRAMP-RPC processes."
@@ -2138,6 +2498,30 @@ For TRAMP-RPC PTY processes, return the remote TTY name stored during creation."
 (with-eval-after-load 'eat
   (advice-add 'eat--adjust-process-window-size :around
               #'tramp-rpc--eat-adjust-process-window-size-advice))
+
+;; ============================================================================
+;; Eglot integration
+;; ============================================================================
+
+;; Eglot wraps remote commands with `/bin/sh -c "stty raw > /dev/null; cmd"`
+;; to disable line buffering. This doesn't work with tramp-rpc because:
+;; 1. Our pipe processes don't have a TTY, so stty fails
+;; 2. We don't need this workaround - our RPC handles binary data correctly
+;;
+;; This advice bypasses the shell wrapper for tramp-rpc connections.
+
+(defun tramp-rpc--eglot-cmd-advice (orig-fun contact)
+  "Advice for `eglot--cmd' to avoid shell wrapping for tramp-rpc.
+For tramp-rpc connections, return CONTACT directly without wrapping
+in a shell command. This is safe because tramp-rpc uses pipes (not PTYs)
+and handles binary data correctly."
+  (if (and (file-remote-p default-directory)
+           (string-match-p "^/rpc:" default-directory))
+      contact
+    (funcall orig-fun contact)))
+
+(with-eval-after-load 'eglot
+  (advice-add 'eglot--cmd :around #'tramp-rpc--eglot-cmd-advice))
 
 ;; ============================================================================
 ;; VC integration advice
