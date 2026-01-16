@@ -142,8 +142,9 @@ Returns the connection plist."
                             "-o" (format "ControlPersist=%s"
                                          tramp-rpc-controlmaster-persist)))
                     (list host binary-path)))
-         (process-name (format "tramp-rpc<%s>" host))
-         (buffer-name (format " *tramp-rpc %s*" host))
+         ;; Use TRAMP's standard naming so tramp-get-connection-process works
+         (process-name (tramp-get-connection-name vec))
+         (buffer-name (tramp-buffer-name vec))
          (buffer (get-buffer-create buffer-name))
          process)
 
@@ -167,6 +168,9 @@ Returns the connection plist."
       (unless response
         (tramp-rpc--remove-connection vec)
         (error "Failed to connect to RPC server on %s" host)))
+
+    ;; Mark as connected for TRAMP's connectivity checks (used by projectile, etc.)
+    (tramp-set-connection-property process "connected" t)
 
     (tramp-rpc--get-connection vec)))
 
@@ -1128,12 +1132,17 @@ Returns t on success, nil on failure."
                     (alist-get 'stderr result)
                     (alist-get 'stderr_encoding result))))
 
-      (when output-buffer
+      ;; Handle output-buffer: t means current buffer, buffer/string means that buffer
+      (cond
+       ((eq output-buffer t)
+        (insert stdout))
+       ((or (bufferp output-buffer) (stringp output-buffer))
         (with-current-buffer (get-buffer-create output-buffer)
           (erase-buffer)
-          (insert stdout)))
+          (insert stdout))))
 
-      (when error-buffer
+      ;; Handle error-buffer
+      (when (or (bufferp error-buffer) (stringp error-buffer))
         (with-current-buffer (get-buffer-create error-buffer)
           (erase-buffer)
           (insert stderr)))
@@ -1584,21 +1593,23 @@ PROGRAM is the command to run, ARGS are its arguments."
 ;; runs locally instead of going through our tramp handler. We fix this by
 ;; advising vc-call-backend to set default-directory when the file is remote.
 
-(defun tramp-rpc--vc-call-backend-advice (orig-fun backend op file &rest args)
+(defun tramp-rpc--vc-call-backend-advice (orig-fun backend function-name &rest args)
   "Advice for `vc-call-backend' to handle TRAMP files correctly.
-When OP is an operation that takes a FILE argument and FILE is a TRAMP path,
-ensure `default-directory' is set to the file's directory so that process-file
-calls are routed through the TRAMP handler."
-  (if (and file
-           (stringp file)
-           (tramp-tramp-file-p file)
-           ;; Operations that take a file and may call process-file
-           (memq op '(state state-heuristic dir-status-files
-                      working-revision previous-revision next-revision
-                      responsible-p)))
-      (let ((default-directory (file-name-directory file)))
-        (apply orig-fun backend op file args))
-    (apply orig-fun backend op file args)))
+When FUNCTION-NAME is an operation that takes a file argument and that file is
+a TRAMP path, ensure `default-directory' is set to the file's directory so that
+process-file calls are routed through the TRAMP handler."
+  (let* ((file (car args))
+         (should-set-dir (and file
+                              (stringp file)
+                              (tramp-tramp-file-p file)
+                              ;; Operations that take a file and may call process-file
+                              (memq function-name '(state state-heuristic dir-status-files
+                                                    working-revision previous-revision next-revision
+                                                    responsible-p)))))
+    (if should-set-dir
+        (let ((default-directory (file-name-directory file)))
+          (apply orig-fun backend function-name args))
+      (apply orig-fun backend function-name args))))
 
 (advice-add 'vc-call-backend :around #'tramp-rpc--vc-call-backend-advice)
 
