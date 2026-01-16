@@ -73,7 +73,12 @@ jobs:
           cp target/${{ matrix.target }}/release/tramp-rpc-server dist/
           cd dist
           tar -czf tramp-rpc-server-${{ matrix.arch }}-${{ steps.version.outputs.version }}.tar.gz tramp-rpc-server
-          sha256sum tramp-rpc-server-${{ matrix.arch }}-${{ steps.version.outputs.version }}.tar.gz > tramp-rpc-server-${{ matrix.arch }}-${{ steps.version.outputs.version }}.tar.gz.sha256
+          # Use shasum on macOS, sha256sum on Linux
+          if command -v sha256sum &> /dev/null; then
+            sha256sum tramp-rpc-server-${{ matrix.arch }}-${{ steps.version.outputs.version }}.tar.gz > tramp-rpc-server-${{ matrix.arch }}-${{ steps.version.outputs.version }}.tar.gz.sha256
+          else
+            shasum -a 256 tramp-rpc-server-${{ matrix.arch }}-${{ steps.version.outputs.version }}.tar.gz > tramp-rpc-server-${{ matrix.arch }}-${{ steps.version.outputs.version }}.tar.gz.sha256
+          fi
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
