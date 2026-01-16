@@ -19,6 +19,9 @@
     (add-to-list 'load-path lisp-dir)
     (require 'tramp-rpc nil t)))
 
+;; Silence byte-compiler warnings for functions from tramp-rpc
+(declare-function tramp-rpc--call "tramp-rpc")
+
 ;;; Configuration
 
 (defvar tramp-rpc-magit-benchmark-host "x220-nixos"

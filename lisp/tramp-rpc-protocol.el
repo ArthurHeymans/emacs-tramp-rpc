@@ -107,7 +107,8 @@ Returns a JSON string for a single RPC call to the batch method."
 
 (defun tramp-rpc-protocol-decode-batch-response (response)
   "Decode a batch response into a list of individual results.
-RESPONSE is the decoded response plist from `tramp-rpc-protocol-decode-response'.
+RESPONSE is the decoded response plist from
+`tramp-rpc-protocol-decode-response'.
 Returns a list where each element is either:
   - The result value (if successful)
   - A plist (:error CODE :message MSG) if that sub-request failed."

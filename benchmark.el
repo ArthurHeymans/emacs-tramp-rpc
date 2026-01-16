@@ -22,6 +22,9 @@
   (add-to-list 'load-path lisp-dir)
   (require 'tramp-rpc nil t))
 
+;; Silence byte-compiler warnings for functions from tramp-rpc
+(declare-function tramp-rpc--call-batch "tramp-rpc")
+
 ;;; Configuration
 
 (defvar tramp-rpc-benchmark-host "x220-nixos"
@@ -126,7 +129,7 @@
   (let ((file (tramp-rpc-benchmark--make-path method "file0.txt")))
     (tramp-rpc-benchmark--flush-cache file)
     (tramp-rpc-benchmark--time
-     (file-exists-p file))))
+     (ignore (file-exists-p file)))))
 
 (defun tramp-rpc-benchmark--file-attributes (method)
   "Benchmark file-attributes for METHOD."
@@ -244,18 +247,18 @@ Same operations as batch-mixed-ops but done one at a time."
     (tramp-rpc-benchmark--flush-cache dir)
     (tramp-rpc-benchmark--time
      (progn
-       (file-exists-p dir)
-       (file-attributes dir)
-       (file-readable-p dir)
-       (file-writable-p dir)
-       (directory-files dir)))))
+       (ignore (file-exists-p dir))
+       (ignore (file-attributes dir))
+       (ignore (file-readable-p dir))
+       (ignore (file-writable-p dir))
+       (ignore (directory-files dir))))))
 
 (defun tramp-rpc-benchmark--connection-setup (method)
   "Benchmark initial connection setup for METHOD."
   (tramp-cleanup-all-connections)
   (let ((file (tramp-rpc-benchmark--make-path method "file0.txt")))
     (tramp-rpc-benchmark--time
-     (file-exists-p file))))
+     (ignore (file-exists-p file)))))
 
 ;;; Main benchmark runner
 
@@ -286,7 +289,7 @@ Same operations as batch-mixed-ops but done one at a time."
   
   ;; Warm up the connection
   (message "Warming up connection for %s..." method)
-  (file-exists-p (tramp-rpc-benchmark--make-path method "file0.txt"))
+  (ignore (file-exists-p (tramp-rpc-benchmark--make-path method "file0.txt")))
   
   ;; Run common tests
   (dolist (test tramp-rpc-benchmark--tests)

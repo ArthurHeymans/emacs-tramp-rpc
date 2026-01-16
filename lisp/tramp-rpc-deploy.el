@@ -20,6 +20,11 @@
 
 (require 'tramp)
 
+;; Silence byte-compiler warnings for functions defined in tramp-sh
+(declare-function tramp-send-command "tramp-sh")
+(declare-function tramp-send-command-and-check "tramp-sh")
+(declare-function tramp-send-command-and-read "tramp-sh")
+
 (defgroup tramp-rpc-deploy nil
   "Deployment settings for TRAMP-RPC."
   :group 'tramp)

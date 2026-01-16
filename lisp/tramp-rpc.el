@@ -47,6 +47,14 @@
 (require 'tramp-rpc-protocol)
 (require 'tramp-rpc-deploy)
 
+;; Silence byte-compiler warnings for functions defined elsewhere
+(declare-function tramp-make-temp-file "tramp" (vec &optional prefix))
+
+;; Silence byte-compiler warnings for variables defined in vterm
+(defvar vterm-copy-mode)
+(defvar vterm-min-window-width)
+(defvar vterm--term)
+
 (defgroup tramp-rpc nil
   "TRAMP backend using RPC."
   :group 'tramp)
@@ -269,8 +277,9 @@ Returns the result or signals an error."
   (tramp-rpc--call-with-timeout vec method params 30 0.1))
 
 (defun tramp-rpc--call-fast (vec method params)
-  "Call METHOD with PARAMS with shorter timeout for low-latency operations.
-Returns the result or signals an error.  Uses 5s total timeout with 10ms polling."
+  "Call METHOD with PARAMS with shorter timeout for low-latency ops.
+Returns the result or signals an error.
+Uses 5s total timeout with 10ms polling."
   (tramp-rpc--call-with-timeout vec method params 5 0.01))
 
 (defun tramp-rpc--call-with-timeout (vec method params total-timeout poll-interval)
@@ -580,7 +589,8 @@ Optimized to use pipelined requests for better performance."
 
 (defun tramp-rpc-handle-file-truename (filename)
   "Like `file-truename' for TRAMP-RPC files.
-If the file doesn't exist, return the filename unchanged (like local file-truename)."
+If the file doesn't exist, return FILENAME unchanged
+\(like local `file-truename')."
   (with-parsed-tramp-file-name filename nil
     (condition-case nil
         (let ((result (tramp-rpc--call v "file.truename" `((path . ,localname)))))
@@ -654,18 +664,18 @@ TYPE is the file type string."
                 (if (> (logand mode #o001) 0) ?t ?T)
               (if (> (logand mode #o001) 0) ?x ?-)))))
 
-(defun tramp-rpc-handle-file-modes (filename &optional flag)
+(defun tramp-rpc-handle-file-modes (filename &optional _flag)
   "Like `file-modes' for TRAMP-RPC files."
   (let ((attrs (tramp-rpc-handle-file-attributes filename)))
     (when attrs
       (tramp-mode-string-to-int (nth 8 attrs)))))
 
-(defun tramp-rpc-handle-set-file-modes (filename mode &optional flag)
+(defun tramp-rpc-handle-set-file-modes (filename mode &optional _flag)
   "Like `set-file-modes' for TRAMP-RPC files."
   (with-parsed-tramp-file-name filename nil
     (tramp-rpc--call v "file.set_modes" `((path . ,localname) (mode . ,mode)))))
 
-(defun tramp-rpc-handle-set-file-times (filename &optional timestamp flag)
+(defun tramp-rpc-handle-set-file-times (filename &optional timestamp _flag)
   "Like `set-file-times' for TRAMP-RPC files."
   (with-parsed-tramp-file-name filename nil
     (let ((mtime (floor (float-time (or timestamp (current-time))))))
@@ -788,7 +798,7 @@ TYPE is the file type string."
                        (recursive . ,(if recursive t :json-false))))))
 
 (defun tramp-rpc-handle-insert-directory
-    (filename switches &optional wildcard full-directory-p)
+    (filename switches &optional _wildcard _full-directory-p)
   "Like `insert-directory' for TRAMP-RPC files.
 Produces ls-like output for dired."
   (with-parsed-tramp-file-name (expand-file-name filename) nil
@@ -851,17 +861,16 @@ Produces ls-like output for dired."
       (when replace
         (delete-region (point-min) (point-max)))
 
-      (let ((point (point)))
-        (insert content)
-        (when visit
-          (setq buffer-file-name filename)
-          (set-visited-file-modtime)
-          (set-buffer-modified-p nil)))
+      (insert content)
+      (when visit
+        (setq buffer-file-name filename)
+        (set-visited-file-modtime)
+        (set-buffer-modified-p nil))
 
       (list filename size))))
 
 (defun tramp-rpc-handle-write-region
-    (start end filename &optional append visit lockname mustbenew)
+    (start end filename &optional append visit _lockname mustbenew)
   "Like `write-region' for TRAMP-RPC files."
   (with-parsed-tramp-file-name filename nil
     ;; If START is a string, write it directly; otherwise extract from buffer
@@ -999,7 +1008,8 @@ Either UID or GID can be nil or -1 to leave that unchanged."
 
 (defun tramp-rpc-handle-file-system-info (filename)
   "Like `file-system-info' for TRAMP-RPC files.
-Returns a list of (TOTAL FREE AVAILABLE) bytes for the filesystem containing FILENAME."
+Returns a list of (TOTAL FREE AVAILABLE) bytes for the filesystem
+containing FILENAME."
   (with-parsed-tramp-file-name (expand-file-name filename) nil
     (condition-case nil
         (let ((result (tramp-rpc--call v "system.statvfs" `((path . ,localname)))))
@@ -1138,7 +1148,7 @@ Returns t on success, nil on failure."
 ;; ============================================================================
 
 (defun tramp-rpc-handle-process-file
-    (program &optional infile destination display &rest args)
+    (program &optional infile destination _display &rest args)
   "Like `process-file' for TRAMP-RPC files."
   (with-parsed-tramp-file-name default-directory nil
     (let* ((stdin-content (when (and infile (not (eq infile t)))
@@ -1272,7 +1282,7 @@ process-file calls from VC backends are routed through our tramp handler."
         (insert content))
       tmpfile)))
 
-(defun tramp-rpc-handle-get-home-directory (vec &optional user)
+(defun tramp-rpc-handle-get-home-directory (vec &optional _user)
   "Return home directory for USER on remote host VEC using RPC."
   (let ((result (tramp-rpc--call vec "system.info" nil)))
     (or (alist-get 'home result) "~")))
@@ -1716,7 +1726,7 @@ RESPONSE is the decoded RPC response plist."
   (when (and (processp local-process)
              (process-live-p local-process)
              (gethash local-process tramp-rpc--pty-processes))
-    (condition-case err
+    (condition-case nil
         (let* ((result (plist-get response :result))
                (output (when-let ((o (alist-get 'output result)))
                          (tramp-rpc--decode-output
@@ -1788,7 +1798,7 @@ PROCESS is the local relay process, EVENT is the process event."
     (when-let ((user-sentinel (process-get process :tramp-rpc-user-sentinel)))
       (funcall user-sentinel process event))))
 
-(defun tramp-rpc--adjust-pty-window-size (process windows)
+(defun tramp-rpc--adjust-pty-window-size (process _windows)
   "Adjust PTY window size when Emacs window size changes.
 PROCESS is the local relay process, WINDOWS is the list of windows.
 Returns nil to tell Emacs not to call `set-process-window-size' on
