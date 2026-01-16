@@ -20,3 +20,6 @@ futures.workspace = true
 
 # For file operations
 libc = "0.2"
+
+# For PTY support (term feature includes pty module)
+nix = { version = "0.29", features = ["term", "process", "signal", "fs"] }

@@ -288,6 +288,15 @@ async fn dispatch_inner(request: &Request) -> Response {
         "process.kill" => process::kill(&request.params).await,
         "process.list" => process::list(&request.params).await,
 
+        // PTY (pseudo-terminal) process operations
+        "process.start_pty" => process::start_pty(&request.params).await,
+        "process.read_pty" => process::read_pty(&request.params).await,
+        "process.write_pty" => process::write_pty(&request.params).await,
+        "process.resize_pty" => process::resize_pty(&request.params).await,
+        "process.kill_pty" => process::kill_pty(&request.params).await,
+        "process.close_pty" => process::close_pty(&request.params).await,
+        "process.list_pty" => process::list_pty(&request.params).await,
+
         // System info
         "system.info" => system_info(),
         "system.getenv" => system_getenv(&request.params),
