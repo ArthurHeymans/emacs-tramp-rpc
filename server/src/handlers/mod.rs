@@ -104,9 +104,9 @@ fn system_statvfs(params: &serde_json::Value) -> HandlerResult {
 
     // Return values in bytes (multiply by block size)
     let block_size = stat.f_frsize as u64;
-    let total = stat.f_blocks * block_size;
-    let free = stat.f_bfree * block_size;
-    let available = stat.f_bavail * block_size;
+    let total = stat.f_blocks as u64 * block_size;
+    let free = stat.f_bfree as u64 * block_size;
+    let available = stat.f_bavail as u64 * block_size;
 
     Ok(serde_json::json!({
         "total": total,
