@@ -46,8 +46,15 @@ jobs:
           # For aarch64 cross-compilation
           if [ "${{ matrix.arch }}" = "aarch64-linux" ]; then
             sudo apt-get install -y gcc-aarch64-linux-gnu musl-dev
-            # Install aarch64 musl cross-compiler
-            wget -q https://musl.cc/aarch64-linux-musl-cross.tgz
+            # Install aarch64 musl cross-compiler with retry
+            for i in 1 2 3; do
+              echo "Attempt $i: Downloading aarch64-linux-musl-cross.tgz..."
+              if wget --timeout=60 --tries=3 -q https://musl.cc/aarch64-linux-musl-cross.tgz; then
+                break
+              fi
+              echo "Download failed, retrying in 10s..."
+              sleep 10
+            done
             tar -xf aarch64-linux-musl-cross.tgz
             echo "$PWD/aarch64-linux-musl-cross/bin" >> $GITHUB_PATH
           fi
