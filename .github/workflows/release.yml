@@ -46,17 +46,16 @@ jobs:
           # For aarch64 cross-compilation
           if [ "${{ matrix.arch }}" = "aarch64-linux" ]; then
             sudo apt-get install -y gcc-aarch64-linux-gnu musl-dev
-            # Install aarch64 musl cross-compiler with retry
-            for i in 1 2 3; do
-              echo "Attempt $i: Downloading aarch64-linux-musl-cross.tgz..."
-              if wget --timeout=60 --tries=3 -q https://musl.cc/aarch64-linux-musl-cross.tgz; then
-                break
-              fi
-              echo "Download failed, retrying in 10s..."
-              sleep 10
-            done
-            tar -xf aarch64-linux-musl-cross.tgz
-            echo "$PWD/aarch64-linux-musl-cross/bin" >> $GITHUB_PATH
+            # Install aarch64 musl cross-compiler from Bootlin (more reliable than musl.cc)
+            curl -LO --retry 5 --retry-delay 10 https://toolchains.bootlin.com/downloads/releases/toolchains/aarch64/tarballs/aarch64--musl--stable-2021.11-1.tar.bz2
+            tar xf aarch64--musl--stable-2021.11-1.tar.bz2
+            
+            # Setup toolchain path and symlink for compatibility
+            TC_DIR="$PWD/aarch64--musl--stable-2021.11-1"
+            echo "$TC_DIR/bin" >> $GITHUB_PATH
+            
+            # Link aarch64-linux-gcc to aarch64-linux-musl-gcc as expected by the matrix config
+            ln -s "$TC_DIR/bin/aarch64-linux-gcc" "$TC_DIR/bin/aarch64-linux-musl-gcc"
           fi
 
       - name: Set cross-compilation linker
