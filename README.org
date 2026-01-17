@@ -278,6 +278,71 @@ Batch operations provide additional 3-6x speedup by combining multiple requests 
 
 For detailed benchmarks and an in-depth technical comparison with original TRAMP, see [[file:doc/TECHNICAL_COMPARISON.org][Technical Comparison]].
 
+* Testing
+
+TRAMP-RPC includes a comprehensive test suite using Emacs ERT (Emacs Lisp Regression Testing).
+
+** Test Categories
+
+| Category          | Tests | Requirements           |
+|-------------------+-------+------------------------|
+| Protocol          | 6     | None (pure Elisp)      |
+| Conversion        | 2     | None (pure Elisp)      |
+| Server Integration| 4     | RPC server binary      |
+| Remote File Ops   | 18    | SSH + RPC server       |
+
+** Running Tests
+
+*** Quick Protocol Tests (no dependencies)
+
+#+begin_src bash
+./test/run-tests.sh --protocol
+#+end_src
+
+Or directly with Emacs:
+
+#+begin_src bash
+emacs -Q --batch -l test/tramp-rpc-mock-tests.el \
+  --eval "(ert-run-tests-batch-and-exit \"^tramp-rpc-mock-test-protocol\")"
+#+end_src
+
+*** All Mock Tests (includes server integration)
+
+#+begin_src bash
+./test/run-tests.sh --mock
+#+end_src
+
+This runs protocol tests plus server integration tests that communicate directly with the RPC server (no SSH needed).
+
+*** Full Remote Tests (requires SSH)
+
+#+begin_src bash
+TRAMP_RPC_TEST_HOST=your-remote-host ./test/run-tests.sh --remote
+#+end_src
+
+Or:
+
+#+begin_src bash
+emacs -Q --batch \
+  -l test/tramp-rpc-tests.el \
+  --eval "(setq tramp-rpc-test-host \"your-remote-host\")" \
+  --eval "(ert-run-tests-batch-and-exit \"^tramp-rpc-test\")"
+#+end_src
+
+** Test Files
+
+- =test/tramp-rpc-tests.el= - Full ERT test suite for remote operations
+- =test/tramp-rpc-mock-tests.el= - CI-compatible tests (no SSH required)
+- =test/run-tests.sh= - Test runner script
+
+** CI Integration
+
+The GitHub Actions workflow runs:
+
+1. *Protocol Tests* - JSON-RPC encoding/decoding (no server)
+2. *Server Integration Tests* - Direct server communication (Rust binary)
+3. *Full Test Suite* - (main branch only) Complete tests via SSH to localhost
+
 * License
 
 This project is licensed under the GNU General Public License v3.0 or later - see the [[file:LICENSE][LICENSE]] file for details.
@@ -285,3 +350,9 @@ This project is licensed under the GNU General Public License v3.0 or later - se
 * Contributing
 
 Contributions welcome! Please ensure code passes ~cargo clippy~ and ~cargo test~ before submitting.
+
+For Emacs Lisp changes, also run the test suite:
+
+#+begin_src bash
+./test/run-tests.sh --mock
+#+end_src
