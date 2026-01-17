@@ -1,4 +1,4 @@
-;;; tramp-rpc-deploy.el --- Binary deployment for TRAMP-RPC -*- lexical-binding: t; -*-
+;;; tramp-rpc-deploy.el --- Server deployment for TRAMP-RPC -*- lexical-binding: t; -*-
 
 ;; Copyright (C) 2026 Arthur Heymans <arthur@aheymans.xyz>
 
@@ -10,8 +10,18 @@
 
 ;;; Commentary:
 
-;; This file handles deployment of the tramp-rpc-server binary to
-;; remote hosts.  It supports:
+;; This file handles deployment of the tramp-rpc-server to remote hosts.
+;; It supports two backends:
+;;
+;; - Python (recommended): Simple script deployment, requires Python 3.7+
+;; - Rust: Pre-compiled binary deployment, no runtime dependencies
+;;
+;; For Python backend:
+;; - Checks for Python 3 availability on remote
+;; - Copies a single Python script (~30KB)
+;; - No architecture detection needed
+;;
+;; For Rust backend:
 ;; - Automatic detection of remote architecture
 ;; - Downloading pre-compiled binaries from GitHub releases
 ;; - Building from source as fallback (requires Rust)
@@ -39,8 +49,26 @@
 (defconst tramp-rpc-deploy-version "0.2.0"
   "Current version of tramp-rpc-server.")
 
+(defcustom tramp-rpc-deploy-backend 'python
+  "Backend to use for the tramp-rpc server.
+
+- `python': Use the Python server (recommended).  Requires Python 3.7+
+  on the remote host.  Simpler deployment, no architecture-specific binaries.
+
+- `rust': Use the Rust server.  Pre-compiled binary, no runtime dependencies.
+  Requires downloading or building architecture-specific binaries."
+  :type '(choice (const :tag "Python (recommended)" python)
+                 (const :tag "Rust" rust))
+  :group 'tramp-rpc-deploy)
+
+(defcustom tramp-rpc-deploy-python-command "python3"
+  "Python command to use on the remote host.
+This should be Python 3.7 or later."
+  :type 'string
+  :group 'tramp-rpc-deploy)
+
 (defconst tramp-rpc-deploy-binary-name "tramp-rpc-server"
-  "Name of the server binary.")
+  "Name of the server binary/script.")
 
 (defcustom tramp-rpc-deploy-github-repo "ArthurHeymans/emacs-tramp-rpc"
   "GitHub repository for downloading pre-compiled binaries.
@@ -88,7 +116,7 @@ are placed here and used directly without needing to download or cache.")
   :group 'tramp-rpc-deploy)
 
 (defcustom tramp-rpc-deploy-prefer-build nil
-  "If non-nil, prefer building from source over downloading.
+  "If non-nil, prefer building from source over downloading (Rust backend only).
 By default, downloading is attempted first as it's faster."
   :type 'boolean
   :group 'tramp-rpc-deploy)
@@ -110,7 +138,7 @@ Use \"sshx\" to avoid PTY allocation issues, or \"ssh\" for standard SSH."
   :group 'tramp-rpc-deploy)
 
 ;;; ============================================================================
-;;; Architecture detection and path helpers
+;;; Common Helpers
 ;;; ============================================================================
 
 (defun tramp-rpc-deploy--bootstrap-vec (vec)
@@ -128,6 +156,123 @@ This allows us to use sshx for deployment even when the main method is rpc."
        :port (tramp-file-name-port vec)
        :localname (tramp-file-name-localname vec)
        :hop (tramp-file-name-hop vec)))))
+
+(defun tramp-rpc-deploy--ensure-remote-directory (vec)
+  "Ensure the remote deployment directory exists on VEC."
+  (let ((dir (tramp-file-local-name
+              (tramp-make-tramp-file-name vec tramp-rpc-deploy-remote-directory))))
+    (tramp-send-command vec (format "mkdir -p %s" (tramp-shell-quote-argument dir)))))
+
+(defun tramp-rpc-deploy--compute-checksum (file)
+  "Compute SHA256 checksum of local FILE."
+  (with-temp-buffer
+    (set-buffer-multibyte nil)
+    (insert-file-contents-literally file)
+    (secure-hash 'sha256 (current-buffer))))
+
+(defun tramp-rpc-deploy--remote-checksum (vec path)
+  "Get SHA256 checksum of remote PATH on VEC.
+Tries sha256sum first, then shasum -a 256 for macOS compatibility."
+  ;; Try sha256sum first (Linux), then shasum -a 256 (macOS)
+  (tramp-send-command vec
+   (format "{ sha256sum %s 2>/dev/null || shasum -a 256 %s 2>/dev/null; } | cut -d' ' -f1"
+           (tramp-shell-quote-argument path)
+           (tramp-shell-quote-argument path)))
+  (with-current-buffer (tramp-get-connection-buffer vec)
+    (goto-char (point-min))
+    ;; Match exactly 64 hex chars to avoid false positives from error messages
+    (when (looking-at "\\([a-f0-9]\\{64\\}\\)")
+      (match-string 1))))
+
+;;; ============================================================================
+;;; Python Backend
+;;; ============================================================================
+
+(defun tramp-rpc-deploy--python-script-path ()
+  "Return path to the Python server script."
+  (when tramp-rpc-deploy-source-directory
+    (expand-file-name "server/tramp-rpc-server.py" tramp-rpc-deploy-source-directory)))
+
+(defun tramp-rpc-deploy--python-remote-script-path (vec)
+  "Return the remote path where the Python script should be installed for VEC."
+  (tramp-make-tramp-file-name
+   vec
+   (concat (file-name-as-directory tramp-rpc-deploy-remote-directory)
+           (format "tramp-rpc-server-%s.py" tramp-rpc-deploy-version))))
+
+(defun tramp-rpc-deploy--python-available-p (vec)
+  "Check if Python 3 is available on remote VEC."
+  (tramp-send-command-and-check
+   vec
+   (format "%s --version >/dev/null 2>&1" tramp-rpc-deploy-python-command)))
+
+(defun tramp-rpc-deploy--python-remote-exists-p (vec)
+  "Check if the Python server script exists on remote VEC."
+  (let ((remote-path (tramp-rpc-deploy--python-remote-script-path vec)))
+    (tramp-send-command-and-check
+     vec
+     (format "test -f %s"
+             (tramp-shell-quote-argument
+              (tramp-file-local-name remote-path))))))
+
+(defun tramp-rpc-deploy--python-deploy (vec)
+  "Deploy the Python server script to remote VEC.
+Returns the remote path to the script."
+  (let* ((local-script (tramp-rpc-deploy--python-script-path))
+         (remote-path (tramp-rpc-deploy--python-remote-script-path vec))
+         (remote-local (tramp-file-local-name remote-path)))
+    
+    (unless local-script
+      (error "Python server script not found (source directory not configured)"))
+    (unless (file-exists-p local-script)
+      (error "Python server script not found at %s" local-script))
+    
+    ;; Check Python availability
+    (unless (tramp-rpc-deploy--python-available-p vec)
+      (error "Python 3 not available on remote host (tried: %s)"
+             tramp-rpc-deploy-python-command))
+    
+    ;; Ensure remote directory exists
+    (tramp-rpc-deploy--ensure-remote-directory vec)
+    
+    (message "Deploying Python server to %s:%s..."
+             (tramp-file-name-host vec) remote-local)
+    
+    ;; Copy the script
+    (copy-file local-script remote-path t)
+    
+    ;; Make executable
+    (tramp-send-command
+     vec
+     (format "chmod +x %s" (tramp-shell-quote-argument remote-local)))
+    
+    (message "Python server deployed successfully")
+    remote-path))
+
+(defun tramp-rpc-deploy--python-ensure-binary (vec)
+  "Ensure Python server is available on remote VEC.
+Returns the command to run the server."
+  (let ((bootstrap-vec (tramp-rpc-deploy--bootstrap-vec vec)))
+    (if (tramp-rpc-deploy--python-remote-exists-p bootstrap-vec)
+        ;; Script already exists - return command
+        (format "%s %s"
+                tramp-rpc-deploy-python-command
+                (tramp-file-local-name
+                 (tramp-rpc-deploy--python-remote-script-path bootstrap-vec)))
+      ;; Need to deploy
+      (if tramp-rpc-deploy-auto-deploy
+          (progn
+            (tramp-rpc-deploy--python-deploy bootstrap-vec)
+            (format "%s %s"
+                    tramp-rpc-deploy-python-command
+                    (tramp-file-local-name
+                     (tramp-rpc-deploy--python-remote-script-path bootstrap-vec))))
+        (error "Python server not found on %s and auto-deploy is disabled"
+               (tramp-file-name-host vec))))))
+
+;;; ============================================================================
+;;; Rust Backend - Architecture detection and path helpers
+;;; ============================================================================
 
 (defun tramp-rpc-deploy--detect-remote-arch (vec)
   "Detect the architecture of remote host specified by VEC.
@@ -176,7 +321,7 @@ Linux targets use musl for fully static binaries."
     ("aarch64-darwin" "aarch64-apple-darwin")
     (_ (error "Unknown architecture: %s" arch))))
 
-(defun tramp-rpc-deploy--local-cache-path (arch)
+(defun tramp-rpc-deploy--rust-local-cache-path (arch)
   "Return the local cache path for binary of ARCH."
   (expand-file-name
    tramp-rpc-deploy-binary-name
@@ -197,8 +342,8 @@ This is useful for development - run scripts/build-all.sh to populate."
       (when (and (file-exists-p path) (file-executable-p path))
         path))))
 
-(defun tramp-rpc-deploy--remote-binary-path (vec)
-  "Return the remote path where the binary should be installed for VEC."
+(defun tramp-rpc-deploy--rust-remote-binary-path (vec)
+  "Return the remote path where the Rust binary should be installed for VEC."
   (tramp-make-tramp-file-name
    vec
    ;; Use concat instead of expand-file-name to preserve ~ for remote expansion.
@@ -208,7 +353,7 @@ This is useful for development - run scripts/build-all.sh to populate."
            (format "%s-%s" tramp-rpc-deploy-binary-name tramp-rpc-deploy-version))))
 
 ;;; ============================================================================
-;;; Download from GitHub Releases
+;;; Rust Backend - Download from GitHub Releases
 ;;; ============================================================================
 
 (defun tramp-rpc-deploy--release-asset-name (arch)
@@ -282,7 +427,7 @@ Returns the path to the extracted binary, or nil on failure."
 (defun tramp-rpc-deploy--download-binary (arch)
   "Download pre-compiled binary for ARCH from GitHub releases.
 Returns the path to the binary on success, signals error on failure."
-  (let* ((cache-path (tramp-rpc-deploy--local-cache-path arch))
+  (let* ((cache-path (tramp-rpc-deploy--rust-local-cache-path arch))
          (cache-dir (file-name-directory cache-path))
          (tarball-url (tramp-rpc-deploy--download-url arch))
          (checksum-url (tramp-rpc-deploy--checksum-url arch))
@@ -316,7 +461,7 @@ Returns the path to the binary on success, signals error on failure."
       (delete-directory temp-dir t))))
 
 ;;; ============================================================================
-;;; Build from source
+;;; Rust Backend - Build from source
 ;;; ============================================================================
 
 (defun tramp-rpc-deploy--cargo-available-p ()
@@ -341,7 +486,7 @@ Returns the path to the binary on success, nil on failure."
   
   (let* ((default-directory tramp-rpc-deploy-source-directory)
          (target (tramp-rpc-deploy--arch-to-rust-target arch))
-         (cache-path (tramp-rpc-deploy--local-cache-path arch))
+         (cache-path (tramp-rpc-deploy--rust-local-cache-path arch))
          (cache-dir (file-name-directory cache-path))
          (build-output (expand-file-name
                         (format "target/%s/release/%s"
@@ -372,10 +517,10 @@ Returns the path to the binary on success, nil on failure."
           (error "Build failed (exit %d):\n%s" exit-code (buffer-string)))))))
 
 ;;; ============================================================================
-;;; Main logic: ensure local binary exists
+;;; Rust Backend - Main logic
 ;;; ============================================================================
 
-(defun tramp-rpc-deploy--ensure-local-binary (arch)
+(defun tramp-rpc-deploy--rust-ensure-local-binary (arch)
   "Ensure a local binary exists for ARCH.
 Tries in order:
 1. Check bundled binaries (useful for development)
@@ -385,7 +530,7 @@ Tries in order:
 
 Returns the path to the local binary."
   (let ((bundled-path (tramp-rpc-deploy--bundled-binary-path arch))
-        (cache-path (tramp-rpc-deploy--local-cache-path arch)))
+        (cache-path (tramp-rpc-deploy--rust-local-cache-path arch)))
     (cond
      ;; Check bundled binaries first (useful for development - run
      ;; scripts/build-all.sh to populate lisp/binaries/)
@@ -429,9 +574,9 @@ Returns the path to the local binary."
                                 (format "  %s: %s" (car e) (cdr e)))
                               (reverse errors)
                               "\n")
-                   (tramp-rpc-deploy--help-message arch))))))))
+                   (tramp-rpc-deploy--rust-help-message arch))))))))
 
-(defun tramp-rpc-deploy--help-message (arch)
+(defun tramp-rpc-deploy--rust-help-message (arch)
   "Return a help message for obtaining binary for ARCH."
   (let ((local-arch (tramp-rpc-deploy--detect-local-arch)))
     (concat
@@ -446,17 +591,13 @@ Returns the path to the local binary."
        (format
         "2. Build on a %s machine and copy to:\n   %s\n\n"
         arch
-        (tramp-rpc-deploy--local-cache-path arch)))
+        (tramp-rpc-deploy--rust-local-cache-path arch)))
      (format "Binary should be placed at:\n   %s"
-             (tramp-rpc-deploy--local-cache-path arch)))))
+             (tramp-rpc-deploy--rust-local-cache-path arch)))))
 
-;;; ============================================================================
-;;; Remote deployment
-;;; ============================================================================
-
-(defun tramp-rpc-deploy--remote-binary-exists-p (vec)
+(defun tramp-rpc-deploy--rust-remote-binary-exists-p (vec)
   "Check if the correct version of the binary exists on remote VEC."
-  (let ((remote-path (tramp-rpc-deploy--remote-binary-path vec)))
+  (let ((remote-path (tramp-rpc-deploy--rust-remote-binary-path vec)))
     ;; Use tramp-sh operations for checking since we're bootstrapping
     (tramp-send-command-and-check
      vec
@@ -464,37 +605,10 @@ Returns the path to the local binary."
              (tramp-shell-quote-argument
               (tramp-file-local-name remote-path))))))
 
-(defun tramp-rpc-deploy--ensure-remote-directory (vec)
-  "Ensure the remote deployment directory exists on VEC."
-  (let ((dir (tramp-file-local-name
-              (tramp-make-tramp-file-name vec tramp-rpc-deploy-remote-directory))))
-    (tramp-send-command vec (format "mkdir -p %s" (tramp-shell-quote-argument dir)))))
-
-(defun tramp-rpc-deploy--compute-checksum (file)
-  "Compute SHA256 checksum of local FILE."
-  (with-temp-buffer
-    (set-buffer-multibyte nil)
-    (insert-file-contents-literally file)
-    (secure-hash 'sha256 (current-buffer))))
-
-(defun tramp-rpc-deploy--remote-checksum (vec path)
-  "Get SHA256 checksum of remote PATH on VEC.
-Tries sha256sum first, then shasum -a 256 for macOS compatibility."
-  ;; Try sha256sum first (Linux), then shasum -a 256 (macOS)
-  (tramp-send-command vec
-   (format "{ sha256sum %s 2>/dev/null || shasum -a 256 %s 2>/dev/null; } | cut -d' ' -f1"
-           (tramp-shell-quote-argument path)
-           (tramp-shell-quote-argument path)))
-  (with-current-buffer (tramp-get-connection-buffer vec)
-    (goto-char (point-min))
-    ;; Match exactly 64 hex chars to avoid false positives from error messages
-    (when (looking-at "\\([a-f0-9]\\{64\\}\\)")
-      (match-string 1))))
-
-(defun tramp-rpc-deploy--transfer-binary (vec local-path)
+(defun tramp-rpc-deploy--rust-transfer-binary (vec local-path)
   "Transfer the binary at LOCAL-PATH to the remote host VEC.
 Uses TRAMP's copy-file for reliable binary transfer with checksum verification."
-  (let* ((remote-path (tramp-rpc-deploy--remote-binary-path vec))
+  (let* ((remote-path (tramp-rpc-deploy--rust-remote-binary-path vec))
          (remote-local (tramp-file-local-name remote-path))
          (remote-tmp-name (format "%s.tmp.%d"
                                   (file-name-nondirectory remote-local)
@@ -573,46 +687,62 @@ Uses TRAMP's copy-file for reliable binary transfer with checksum verification."
     
     remote-path))
 
+(defun tramp-rpc-deploy--rust-ensure-binary (vec)
+  "Ensure the Rust tramp-rpc-server binary is available on remote VEC.
+Returns the remote path to the binary."
+  (let ((bootstrap-vec (tramp-rpc-deploy--bootstrap-vec vec)))
+    (if (tramp-rpc-deploy--rust-remote-binary-exists-p bootstrap-vec)
+        ;; Binary already exists
+        (tramp-file-local-name (tramp-rpc-deploy--rust-remote-binary-path bootstrap-vec))
+      ;; Need to deploy
+      (if tramp-rpc-deploy-auto-deploy
+          (let* ((arch (tramp-rpc-deploy--detect-remote-arch bootstrap-vec))
+                 (local-binary (tramp-rpc-deploy--rust-ensure-local-binary arch)))
+            (message "Deploying tramp-rpc-server (%s) to %s..."
+                     arch (tramp-file-name-host vec))
+            (tramp-file-local-name
+             (tramp-rpc-deploy--rust-transfer-binary bootstrap-vec local-binary)))
+        (error "tramp-rpc-server not found on %s and auto-deploy is disabled"
+               (tramp-file-name-host vec))))))
+
 ;;; ============================================================================
 ;;; Public API
 ;;; ============================================================================
 
 (defun tramp-rpc-deploy-ensure-binary (vec)
-  "Ensure the tramp-rpc-server binary is available on remote VEC.
-Returns the remote path to the binary.
-If `tramp-rpc-deploy-auto-deploy' is nil and the binary is missing,
-signals an error."
-  (let ((bootstrap-vec (tramp-rpc-deploy--bootstrap-vec vec)))
-    (if (tramp-rpc-deploy--remote-binary-exists-p bootstrap-vec)
-        ;; Binary already exists
-        (tramp-file-local-name (tramp-rpc-deploy--remote-binary-path bootstrap-vec))
-      ;; Need to deploy
-      (if tramp-rpc-deploy-auto-deploy
-          (let* ((arch (tramp-rpc-deploy--detect-remote-arch bootstrap-vec))
-                 (local-binary (tramp-rpc-deploy--ensure-local-binary arch)))
-            (message "Deploying tramp-rpc-server (%s) to %s..."
-                     arch (tramp-file-name-host vec))
-            (tramp-file-local-name
-             (tramp-rpc-deploy--transfer-binary bootstrap-vec local-binary)))
-        (error "tramp-rpc-server not found on %s and auto-deploy is disabled"
-               (tramp-file-name-host vec))))))
+  "Ensure the tramp-rpc-server is available on remote VEC.
+Returns the command to run the server (for Python) or the path to
+the binary (for Rust).  If `tramp-rpc-deploy-auto-deploy' is nil
+and the server is missing, signals an error."
+  (pcase tramp-rpc-deploy-backend
+    ('python (tramp-rpc-deploy--python-ensure-binary vec))
+    ('rust (tramp-rpc-deploy--rust-ensure-binary vec))
+    (_ (error "Unknown backend: %s" tramp-rpc-deploy-backend))))
 
 (defun tramp-rpc-deploy-remove-binary (vec)
-  "Remove the tramp-rpc-server binary from remote VEC."
+  "Remove the tramp-rpc-server from remote VEC."
   (interactive
    (list (tramp-dissect-file-name
           (read-file-name "Remote host: " "/ssh:"))))
   (let ((bootstrap-vec (tramp-rpc-deploy--bootstrap-vec vec)))
-    (when (tramp-rpc-deploy--remote-binary-exists-p bootstrap-vec)
-      (tramp-send-command
-       bootstrap-vec
-       (format "rm -f %s"
-               (tramp-shell-quote-argument
-                (tramp-file-local-name
-                 (tramp-rpc-deploy--remote-binary-path bootstrap-vec)))))
-      (message "Removed %s from %s"
-               tramp-rpc-deploy-binary-name
-               (tramp-file-name-host vec)))))
+    (pcase tramp-rpc-deploy-backend
+      ('python
+       (when (tramp-rpc-deploy--python-remote-exists-p bootstrap-vec)
+         (let ((remote-path (tramp-rpc-deploy--python-remote-script-path bootstrap-vec)))
+           (tramp-send-command
+            bootstrap-vec
+            (format "rm -f %s"
+                    (tramp-shell-quote-argument (tramp-file-local-name remote-path))))
+           (message "Removed Python server from %s" (tramp-file-name-host vec)))))
+      ('rust
+       (when (tramp-rpc-deploy--rust-remote-binary-exists-p bootstrap-vec)
+         (tramp-send-command
+          bootstrap-vec
+          (format "rm -f %s"
+                  (tramp-shell-quote-argument
+                   (tramp-file-local-name
+                    (tramp-rpc-deploy--rust-remote-binary-path bootstrap-vec)))))
+         (message "Removed Rust binary from %s" (tramp-file-name-host vec)))))))
 
 (defun tramp-rpc-deploy-clear-cache ()
   "Clear the local binary cache."
@@ -622,7 +752,7 @@ signals an error."
     (message "Cleared tramp-rpc binary cache")))
 
 (defun tramp-rpc-deploy-status ()
-  "Show the status of tramp-rpc-server binaries."
+  "Show the status of tramp-rpc-server deployment."
   (interactive)
   (let ((buf (get-buffer-create "*tramp-rpc-deploy-status*")))
     (with-current-buffer buf
@@ -630,29 +760,44 @@ signals an error."
       (insert "TRAMP-RPC Server Deployment Status\n")
       (insert "===================================\n\n")
       (insert (format "Version: %s\n" tramp-rpc-deploy-version))
-      (insert (format "Local arch: %s\n" (tramp-rpc-deploy--detect-local-arch)))
-      (insert (format "Cargo available: %s\n"
-                      (if (tramp-rpc-deploy--cargo-available-p) "yes" "no")))
+      (insert (format "Backend: %s\n" tramp-rpc-deploy-backend))
       (insert (format "Source directory: %s\n"
                       (or tramp-rpc-deploy-source-directory "not set")))
       (insert (format "Cache directory: %s\n\n" tramp-rpc-deploy-local-cache-directory))
       
-      (insert "Cached Binaries:\n")
-      (insert "----------------\n")
-      (dolist (arch '("x86_64-linux" "aarch64-linux" "x86_64-darwin" "aarch64-darwin"))
-        (let ((path (tramp-rpc-deploy--local-cache-path arch)))
-          (insert (format "  %s: %s\n"
-                          arch
-                          (if (file-exists-p path)
-                              (format "cached (%s)"
-                                      (file-size-human-readable
-                                       (file-attribute-size (file-attributes path))))
-                            "not cached")))))
-      (insert "\n")
-      (insert "Download URLs:\n")
-      (insert "--------------\n")
-      (dolist (arch '("x86_64-linux" "aarch64-linux" "x86_64-darwin" "aarch64-darwin"))
-        (insert (format "  %s:\n    %s\n" arch (tramp-rpc-deploy--download-url arch)))))
+      (pcase tramp-rpc-deploy-backend
+        ('python
+         (insert "Python Backend Status:\n")
+         (insert "----------------------\n")
+         (let ((script-path (tramp-rpc-deploy--python-script-path)))
+           (insert (format "  Python command: %s\n" tramp-rpc-deploy-python-command))
+           (insert (format "  Script path: %s\n" (or script-path "not found")))
+           (when script-path
+             (insert (format "  Script exists: %s\n"
+                             (if (file-exists-p script-path) "yes" "no")))
+             (when (file-exists-p script-path)
+               (insert (format "  Script size: %s\n"
+                               (file-size-human-readable
+                                (file-attribute-size (file-attributes script-path)))))))))
+        ('rust
+         (insert "Rust Backend Status:\n")
+         (insert "--------------------\n")
+         (insert (format "  Local arch: %s\n" (tramp-rpc-deploy--detect-local-arch)))
+         (insert (format "  Cargo available: %s\n"
+                         (if (tramp-rpc-deploy--cargo-available-p) "yes" "no")))
+         (insert "\n  Cached Binaries:\n")
+         (dolist (arch '("x86_64-linux" "aarch64-linux" "x86_64-darwin" "aarch64-darwin"))
+           (let ((path (tramp-rpc-deploy--rust-local-cache-path arch)))
+             (insert (format "    %s: %s\n"
+                             arch
+                             (if (file-exists-p path)
+                                 (format "cached (%s)"
+                                         (file-size-human-readable
+                                          (file-attribute-size (file-attributes path))))
+                               "not cached")))))
+         (insert "\n  Download URLs:\n")
+         (dolist (arch '("x86_64-linux" "aarch64-linux" "x86_64-darwin" "aarch64-darwin"))
+           (insert (format "    %s:\n      %s\n" arch (tramp-rpc-deploy--download-url arch)))))))
     (display-buffer buf)))
 
 (provide 'tramp-rpc-deploy)
