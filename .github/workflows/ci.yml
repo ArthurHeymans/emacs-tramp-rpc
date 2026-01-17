@@ -34,6 +34,21 @@ jobs:
             os: macos-latest
             target: aarch64-apple-darwin
 
+  format:
+    name: Rust Format Check
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+
+      - name: Check formatting
+        run: cargo fmt --all --check
+
   elisp:
     name: Emacs Lisp
     runs-on: ubuntu-latest

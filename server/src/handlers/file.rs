@@ -263,7 +263,8 @@ fn get_file_type(metadata: &std::fs::Metadata) -> FileType {
     }
 }
 
-static USER_NAMES: std::sync::LazyLock<Mutex<HashMap<u32, String>>> = std::sync::LazyLock::new(|| Mutex::new(HashMap::new()));
+static USER_NAMES: std::sync::LazyLock<Mutex<HashMap<u32, String>>> =
+    std::sync::LazyLock::new(|| Mutex::new(HashMap::new()));
 
 /// Get user name from uid
 fn get_user_name(uid: u32) -> Option<String> {
@@ -288,7 +289,8 @@ fn get_user_name(uid: u32) -> Option<String> {
     }
 }
 
-static GROUP_NAMES: std::sync::LazyLock<Mutex<HashMap<u32, String>>> = std::sync::LazyLock::new(|| Mutex::new(HashMap::new()));
+static GROUP_NAMES: std::sync::LazyLock<Mutex<HashMap<u32, String>>> =
+    std::sync::LazyLock::new(|| Mutex::new(HashMap::new()));
 
 /// Get group name from gid
 fn get_group_name(gid: u32) -> Option<String> {
