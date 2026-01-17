@@ -1,0 +1,100 @@
+name: Build
+
+on:
+  workflow_call:
+    inputs:
+      target:
+        required: true
+        type: string
+      os:
+        required: true
+        type: string
+      static:
+        required: false
+        type: boolean
+        default: false
+      test:
+        required: false
+        type: boolean
+        default: false
+      upload:
+        required: false
+        type: boolean
+        default: false
+      version:
+        required: false
+        type: string
+        default: ""
+    outputs:
+      version:
+        description: "Determined version"
+        value: ${{ jobs.build.outputs.version }}
+
+jobs:
+  build:
+    name: Build ${{ inputs.target }} on ${{ inputs.os }}
+    runs-on: ${{ inputs.os }}
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Nix
+        uses: cachix/install-nix-action@v20
+        with:
+          nix_path: nixpkgs=channel:nixos-unstable
+
+      - name: Determine version
+        id: version
+        run: |
+          if [ -n "${{ inputs.version }}" ]; then
+            echo "version=${{ inputs.version }}" >> $GITHUB_OUTPUT
+          elif [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "version=${{ github.event.inputs.version }}" >> $GITHUB_OUTPUT
+          elif [[ "${{ github.ref }}" == refs/tags/v* ]]; then
+            echo "version=${GITHUB_REF#refs/tags/v}" >> $GITHUB_OUTPUT
+          else
+            echo "version=ci" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Build
+        run: |
+          nix develop --command bash -c '
+          RUSTFLAGS="-C target-feature=+crt-static -Zlocation-detail=none -Zunstable-options -Cpanic=immediate-abort" \
+          cargo build --release --target ${{ inputs.target }} \
+            --manifest-path server/Cargo.toml \
+            -Z build-std=std,panic_abort \
+            -Z build-std-features="optimize_for_size"
+          '
+        env:
+          STATIC: ${{ inputs.static }}
+
+      - name: Test
+        if: inputs.test
+        run: nix develop --command cargo test --manifest-path server/Cargo.toml
+
+      - name: Package
+        if: inputs.upload
+        run: |
+          mkdir -p dist
+          cp target/${{ inputs.target }}/release/tramp-rpc-server dist/
+          cd dist
+          ls -la tramp-rpc-server
+          file tramp-rpc-server || true
+          tar -czf tramp-rpc-server-${{ inputs.target }}-${{ steps.version.outputs.version }}.tar.gz tramp-rpc-server
+          if [ "${{ startsWith(inputs.target, 'x86_64-unknown-linux') }}" = "true" ]; then
+            sha256sum tramp-rpc-server-${{ inputs.target }}-${{ steps.version.outputs.version }}.tar.gz > tramp-rpc-server-${{ inputs.target }}-${{ steps.version.outputs.version }}.tar.gz.sha256
+          else
+            shasum -a 256 tramp-rpc-server-${{ inputs.target }}-${{ steps.version.outputs.version }}.tar.gz > tramp-rpc-server-${{ inputs.target }}-${{ steps.version.outputs.version }}.tar.gz.sha256
+          fi
+
+      - name: Upload artifacts
+        if: inputs.upload
+        uses: actions/upload-artifact@v4
+        with:
+          name: tramp-rpc-server-${{ inputs.target }}
+          path: |
+            dist/*.tar.gz
+            dist/*.sha256
