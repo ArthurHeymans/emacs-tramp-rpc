@@ -12,38 +12,27 @@ env:
 jobs:
   rust:
     name: Rust ${{ matrix.name }}
-    runs-on: ${{ matrix.os }}
+    uses: ./.github/workflows/build.yml
+    with:
+      target: ${{ matrix.target }}
+      os: ${{ matrix.os }}
+      test: true
     strategy:
       fail-fast: false
       matrix:
         include:
-          - name: Linux
+          - name: Linux x86_64
             os: ubuntu-latest
-            target: x86_64-unknown-linux-gnu
-          - name: macOS
+            target: x86_64-unknown-linux-musl
+          - name: Linux aarch64
+            os: ubuntu-latest
+            target: aarch64-unknown-linux-musl
+          - name: macOS x86_64
+            os: macos-latest
+            target: x86_64-apple-darwin
+          - name: macOS aarch64
             os: macos-latest
             target: aarch64-apple-darwin
-
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          components: clippy, rustfmt
-
-      - name: Format check
-        run: cargo fmt --all --manifest-path server/Cargo.toml -- --check
-
-      - name: Clippy
-        run: cargo clippy --all-targets --manifest-path server/Cargo.toml -- -D warnings
-
-      - name: Build
-        run: cargo build --release --manifest-path server/Cargo.toml
-
-      - name: Test
-        run: cargo test --manifest-path server/Cargo.toml
 
   elisp:
     name: Emacs Lisp

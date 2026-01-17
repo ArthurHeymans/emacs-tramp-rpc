@@ -17,145 +17,40 @@ env:
 jobs:
   build-linux:
     name: Build Linux ${{ matrix.arch }}
-    runs-on: ubuntu-latest
+    uses: ./.github/workflows/build.yml
+    with:
+      target: ${{ matrix.target }}
+      os: ubuntu-latest
+      static: true
+      upload: true
+      version: ${{ inputs.version }}
     strategy:
       fail-fast: false
       matrix:
         include:
           - target: x86_64-unknown-linux-musl
             arch: x86_64-linux
-            
+
           - target: aarch64-unknown-linux-musl
             arch: aarch64-linux
-            cross_linker: aarch64-linux-musl-gcc
-
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Install Rust nightly
-        uses: dtolnay/rust-toolchain@nightly
-        with:
-          targets: ${{ matrix.target }}
-          components: rust-src
-
-      - name: Install musl tools
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y musl-tools
-          # For aarch64 cross-compilation
-          if [ "${{ matrix.arch }}" = "aarch64-linux" ]; then
-            sudo apt-get install -y gcc-aarch64-linux-gnu musl-dev
-            # Install aarch64 musl cross-compiler from Bootlin (more reliable than musl.cc)
-            curl -LO --retry 5 --retry-delay 10 https://toolchains.bootlin.com/downloads/releases/toolchains/aarch64/tarballs/aarch64--musl--stable-2021.11-1.tar.bz2
-            tar xf aarch64--musl--stable-2021.11-1.tar.bz2
-            
-            # Setup toolchain path and symlink for compatibility
-            TC_DIR="$PWD/aarch64--musl--stable-2021.11-1"
-            echo "$TC_DIR/bin" >> $GITHUB_PATH
-            
-            # Link aarch64-linux-gcc to aarch64-linux-musl-gcc as expected by the matrix config
-            ln -s "$TC_DIR/bin/aarch64-linux-gcc" "$TC_DIR/bin/aarch64-linux-musl-gcc"
-          fi
-
-      - name: Set cross-compilation linker
-        if: matrix.cross_linker
-        run: |
-          echo "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER=${{ matrix.cross_linker }}" >> $GITHUB_ENV
-
-      - name: Build (size-optimized with build-std)
-        run: |
-          RUSTFLAGS="-C target-feature=+crt-static -Zlocation-detail=none -Zunstable-options -Cpanic=immediate-abort" \
-          cargo build --release --target ${{ matrix.target }} \
-            --manifest-path server/Cargo.toml \
-            -Z build-std=std,panic_abort \
-            -Z build-std-features="optimize_for_size"
-
-      - name: Determine version
-        id: version
-        run: |
-          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
-            echo "version=${{ github.event.inputs.version }}" >> $GITHUB_OUTPUT
-          else
-            echo "version=${GITHUB_REF#refs/tags/v}" >> $GITHUB_OUTPUT
-          fi
-
-      - name: Package
-        run: |
-          mkdir -p dist
-          cp target/${{ matrix.target }}/release/tramp-rpc-server dist/
-          cd dist
-          # Show binary info
-          ls -la tramp-rpc-server
-          file tramp-rpc-server || true
-          tar -czf tramp-rpc-server-${{ matrix.arch }}-${{ steps.version.outputs.version }}.tar.gz tramp-rpc-server
-          sha256sum tramp-rpc-server-${{ matrix.arch }}-${{ steps.version.outputs.version }}.tar.gz > tramp-rpc-server-${{ matrix.arch }}-${{ steps.version.outputs.version }}.tar.gz.sha256
-
-      - name: Upload artifacts
-        uses: actions/upload-artifact@v4
-        with:
-          name: tramp-rpc-server-${{ matrix.arch }}
-          path: |
-            dist/*.tar.gz
-            dist/*.sha256
 
   build-macos:
     name: Build macOS ${{ matrix.arch }}
-    runs-on: macos-latest
+    uses: ./.github/workflows/build.yml
+    with:
+      target: ${{ matrix.target }}
+      os: macos-latest
+      upload: true
+      version: ${{ inputs.version }}
     strategy:
       fail-fast: false
       matrix:
         include:
           - target: x86_64-apple-darwin
             arch: x86_64-darwin
-            
+
           - target: aarch64-apple-darwin
             arch: aarch64-darwin
-
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Install Rust nightly
-        uses: dtolnay/rust-toolchain@nightly
-        with:
-          targets: ${{ matrix.target }}
-          components: rust-src
-
-      - name: Build (size-optimized with build-std)
-        run: |
-          RUSTFLAGS="-Zlocation-detail=none -Zunstable-options -Cpanic=immediate-abort" \
-          cargo build --release --target ${{ matrix.target }} \
-            --manifest-path server/Cargo.toml \
-            -Z build-std=std,panic_abort \
-            -Z build-std-features="optimize_for_size"
-
-      - name: Determine version
-        id: version
-        run: |
-          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
-            echo "version=${{ github.event.inputs.version }}" >> $GITHUB_OUTPUT
-          else
-            echo "version=${GITHUB_REF#refs/tags/v}" >> $GITHUB_OUTPUT
-          fi
-
-      - name: Package
-        run: |
-          mkdir -p dist
-          cp target/${{ matrix.target }}/release/tramp-rpc-server dist/
-          cd dist
-          ls -la tramp-rpc-server
-          file tramp-rpc-server || true
-          tar -czf tramp-rpc-server-${{ matrix.arch }}-${{ steps.version.outputs.version }}.tar.gz tramp-rpc-server
-          shasum -a 256 tramp-rpc-server-${{ matrix.arch }}-${{ steps.version.outputs.version }}.tar.gz > tramp-rpc-server-${{ matrix.arch }}-${{ steps.version.outputs.version }}.tar.gz.sha256
-
-      - name: Upload artifacts
-        uses: actions/upload-artifact@v4
-        with:
-          name: tramp-rpc-server-${{ matrix.arch }}
-          path: |
-            dist/*.tar.gz
-            dist/*.sha256
 
   release:
     name: Create Release
@@ -164,7 +59,7 @@ jobs:
     if: startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch'
     permissions:
       contents: write
-      
+
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -201,34 +96,34 @@ jobs:
             artifacts/*.sha256
           body: |
             ## tramp-rpc-server ${{ steps.version.outputs.version }}
-            
+
             ### What's New
-            
+
             - **Size-optimized static binaries** - Linux binaries are now fully static (musl) and ~45% smaller
             - Built with `build-std` for maximum size reduction
-            
+
             ### Installation
-            
+
             This release is automatically downloaded by the Emacs package when needed.
-            
+
             For manual installation, download the appropriate binary for your architecture:
-            
+
             | Architecture | File | Notes |
             |-------------|------|-------|
             | Linux x86_64 | `tramp-rpc-server-x86_64-linux-${{ steps.version.outputs.version }}.tar.gz` | Static musl binary |
             | Linux aarch64 | `tramp-rpc-server-aarch64-linux-${{ steps.version.outputs.version }}.tar.gz` | Static musl binary |
             | macOS x86_64 | `tramp-rpc-server-x86_64-darwin-${{ steps.version.outputs.version }}.tar.gz` | |
             | macOS aarch64 (Apple Silicon) | `tramp-rpc-server-aarch64-darwin-${{ steps.version.outputs.version }}.tar.gz` | |
-            
+
             Linux binaries are fully statically linked and will work on any Linux distribution.
-            
+
             Extract and place the binary in:
             ```
             ~/.cache/tramp-rpc/tramp-rpc-server-${{ steps.version.outputs.version }}
             ```
-            
+
             ### Checksums
-            
+
             SHA256 checksums are provided in `.sha256` files for each binary.
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
