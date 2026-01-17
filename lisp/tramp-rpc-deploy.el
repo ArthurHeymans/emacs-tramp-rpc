@@ -36,7 +36,7 @@
   "Deployment settings for TRAMP-RPC."
   :group 'tramp)
 
-(defconst tramp-rpc-deploy-version "0.1.0"
+(defconst tramp-rpc-deploy-version "0.2.0"
   "Current version of tramp-rpc-server.")
 
 (defconst tramp-rpc-deploy-binary-name "tramp-rpc-server"
@@ -69,6 +69,13 @@ Binaries are stored as CACHE-DIR/VERSION/ARCH/tramp-rpc-server."
 Used for building from source.  Set to nil to disable source builds."
   :type '(choice directory (const nil))
   :group 'tramp-rpc-deploy)
+
+(defconst tramp-rpc-deploy-bundled-binary-directory
+  (when load-file-name
+    (expand-file-name "binaries" (file-name-directory load-file-name)))
+  "Directory containing pre-built binaries bundled with the package.
+This is useful for development - binaries built by scripts/build-all.sh
+are placed here and used directly without needing to download or cache.")
 
 (defcustom tramp-rpc-deploy-remote-directory "~/.cache/tramp-rpc"
   "Remote directory where the server binary will be installed."
@@ -160,10 +167,11 @@ Returns a string like \"x86_64-linux\" or \"aarch64-darwin\"."
 
 (defun tramp-rpc-deploy--arch-to-rust-target (arch)
   "Convert ARCH string to Rust target triple.
-E.g., \"x86_64-linux\" -> \"x86_64-unknown-linux-gnu\"."
+E.g., \"x86_64-linux\" -> \"x86_64-unknown-linux-musl\".
+Linux targets use musl for fully static binaries."
   (pcase arch
-    ("x86_64-linux" "x86_64-unknown-linux-gnu")
-    ("aarch64-linux" "aarch64-unknown-linux-gnu")
+    ("x86_64-linux" "x86_64-unknown-linux-musl")
+    ("aarch64-linux" "aarch64-unknown-linux-musl")
     ("x86_64-darwin" "x86_64-apple-darwin")
     ("aarch64-darwin" "aarch64-apple-darwin")
     (_ (error "Unknown architecture: %s" arch))))
@@ -178,13 +186,26 @@ E.g., \"x86_64-linux\" -> \"x86_64-unknown-linux-gnu\"."
      tramp-rpc-deploy-version
      tramp-rpc-deploy-local-cache-directory))))
 
+(defun tramp-rpc-deploy--bundled-binary-path (arch)
+  "Return the path to a bundled binary for ARCH, or nil if not available.
+Bundled binaries are in lisp/binaries/<arch>/tramp-rpc-server.
+This is useful for development - run scripts/build-all.sh to populate."
+  (when tramp-rpc-deploy-bundled-binary-directory
+    (let ((path (expand-file-name
+                 tramp-rpc-deploy-binary-name
+                 (expand-file-name arch tramp-rpc-deploy-bundled-binary-directory))))
+      (when (and (file-exists-p path) (file-executable-p path))
+        path))))
+
 (defun tramp-rpc-deploy--remote-binary-path (vec)
   "Return the remote path where the binary should be installed for VEC."
   (tramp-make-tramp-file-name
    vec
-   (expand-file-name
-    (format "%s-%s" tramp-rpc-deploy-binary-name tramp-rpc-deploy-version)
-    tramp-rpc-deploy-remote-directory)))
+   ;; Use concat instead of expand-file-name to preserve ~ for remote expansion.
+   ;; expand-file-name would expand ~ to the LOCAL user's home directory,
+   ;; causing failures when local and remote usernames differ.
+   (concat (file-name-as-directory tramp-rpc-deploy-remote-directory)
+           (format "%s-%s" tramp-rpc-deploy-binary-name tramp-rpc-deploy-version))))
 
 ;;; ============================================================================
 ;;; Download from GitHub Releases
@@ -357,20 +378,29 @@ Returns the path to the binary on success, nil on failure."
 (defun tramp-rpc-deploy--ensure-local-binary (arch)
   "Ensure a local binary exists for ARCH.
 Tries in order:
-1. Check local cache
-2. Download from GitHub releases
-3. Build from source (if on same architecture)
+1. Check bundled binaries (useful for development)
+2. Check local cache
+3. Download from GitHub releases
+4. Build from source (if on same architecture)
 
 Returns the path to the local binary."
-  (let ((cache-path (tramp-rpc-deploy--local-cache-path arch)))
-    ;; Check cache first
-    (if (and (file-exists-p cache-path)
-             (file-executable-p cache-path))
-        (progn
-          (message "Using cached binary for %s" arch)
-          cache-path)
-      
-      ;; Need to obtain binary
+  (let ((bundled-path (tramp-rpc-deploy--bundled-binary-path arch))
+        (cache-path (tramp-rpc-deploy--local-cache-path arch)))
+    (cond
+     ;; Check bundled binaries first (useful for development - run
+     ;; scripts/build-all.sh to populate lisp/binaries/)
+     (bundled-path
+      (message "Using bundled binary for %s" arch)
+      bundled-path)
+     
+     ;; Check cache
+     ((and (file-exists-p cache-path)
+           (file-executable-p cache-path))
+      (message "Using cached binary for %s" arch)
+      cache-path)
+     
+     ;; Need to obtain binary
+     (t
       (let ((methods (if tramp-rpc-deploy-prefer-build
                          '(build download)
                        '(download build)))
@@ -399,7 +429,7 @@ Returns the path to the local binary."
                                 (format "  %s: %s" (car e) (cdr e)))
                               (reverse errors)
                               "\n")
-                   (tramp-rpc-deploy--help-message arch)))))))
+                   (tramp-rpc-deploy--help-message arch))))))))
 
 (defun tramp-rpc-deploy--help-message (arch)
   "Return a help message for obtaining binary for ARCH."
@@ -448,80 +478,98 @@ Returns the path to the local binary."
     (secure-hash 'sha256 (current-buffer))))
 
 (defun tramp-rpc-deploy--remote-checksum (vec path)
-  "Get SHA256 checksum of remote PATH on VEC."
+  "Get SHA256 checksum of remote PATH on VEC.
+Tries sha256sum first, then shasum -a 256 for macOS compatibility."
+  ;; Try sha256sum first (Linux), then shasum -a 256 (macOS)
   (tramp-send-command vec
-   (format "sha256sum %s 2>/dev/null | cut -d' ' -f1"
+   (format "{ sha256sum %s 2>/dev/null || shasum -a 256 %s 2>/dev/null; } | cut -d' ' -f1"
+           (tramp-shell-quote-argument path)
            (tramp-shell-quote-argument path)))
   (with-current-buffer (tramp-get-connection-buffer vec)
     (goto-char (point-min))
-    (when (looking-at "\\([a-f0-9]+\\)")
+    ;; Match exactly 64 hex chars to avoid false positives from error messages
+    (when (looking-at "\\([a-f0-9]\\{64\\}\\)")
       (match-string 1))))
 
 (defun tramp-rpc-deploy--transfer-binary (vec local-path)
   "Transfer the binary at LOCAL-PATH to the remote host VEC.
-Uses atomic write with checksum verification for reliability."
+Uses TRAMP's copy-file for reliable binary transfer with checksum verification."
   (let* ((remote-path (tramp-rpc-deploy--remote-binary-path vec))
          (remote-local (tramp-file-local-name remote-path))
-         (remote-tmp (concat remote-local ".tmp." (format "%d" (random 100000))))
-         (local-checksum (tramp-rpc-deploy--compute-checksum local-path)))
+         (remote-tmp-name (format "%s.tmp.%d"
+                                  (file-name-nondirectory remote-local)
+                                  (random 100000)))
+         (remote-tmp-path (tramp-make-tramp-file-name
+                           vec
+                           ;; Use concat to preserve ~ for remote expansion
+                           (concat (file-name-as-directory tramp-rpc-deploy-remote-directory)
+                                   remote-tmp-name)))
+         (remote-tmp-local (tramp-file-local-name remote-tmp-path))
+         (local-checksum (tramp-rpc-deploy--compute-checksum local-path))
+         (retries 0)
+         (success nil)
+         (errors nil))
     
     ;; Ensure remote directory exists
     (tramp-rpc-deploy--ensure-remote-directory vec)
     
-    ;; Read local binary and encode to base64
-    (let ((binary-data (with-temp-buffer
-                         (set-buffer-multibyte nil)
-                         (insert-file-contents-literally local-path)
-                         (base64-encode-region (point-min) (point-max))
-                         (buffer-string)))
-          (retries 0)
-          (success nil))
-      
-      ;; Retry loop for reliability
-      (while (and (not success) (< retries tramp-rpc-deploy-max-retries))
+    (message "Transferring binary to %s:%s..." (tramp-file-name-host vec) remote-local)
+    
+    ;; Retry loop for reliability
+    (while (and (not success) (< retries tramp-rpc-deploy-max-retries))
+      (let ((attempt (1+ retries)))
+        (message "Transfer attempt %d/%d..." attempt tramp-rpc-deploy-max-retries)
         (condition-case err
             (progn
-              ;; Write to temp file using base64 decode
-              (tramp-send-command
-               vec
-               (format "base64 -d > %s << 'TRAMP_RPC_EOF'\n%s\nTRAMP_RPC_EOF"
-                       (tramp-shell-quote-argument remote-tmp)
-                       binary-data))
+              ;; Use TRAMP's copy-file for binary transfer (via sshx bootstrap method)
+              ;; This is much more reliable than base64 encoding through heredocs
+              (copy-file local-path remote-tmp-path t)
+              
+              ;; Verify the file was created and has content
+              (unless (tramp-send-command-and-check
+                       vec
+                       (format "test -s %s" (tramp-shell-quote-argument remote-tmp-local)))
+                (error "Temp file not created or is empty after copy"))
               
               ;; Verify checksum
-              (let ((remote-checksum (tramp-rpc-deploy--remote-checksum vec remote-tmp)))
+              (let ((remote-checksum (tramp-rpc-deploy--remote-checksum vec remote-tmp-local)))
+                (unless remote-checksum
+                  (error "Could not compute remote checksum (sha256sum/shasum not available?)"))
                 (if (string= local-checksum remote-checksum)
                     (progn
                       ;; Checksum matches - make executable and atomically move
                       (tramp-send-command
                        vec
                        (format "chmod +x %s && mv -f %s %s"
-                               (tramp-shell-quote-argument remote-tmp)
-                               (tramp-shell-quote-argument remote-tmp)
+                               (tramp-shell-quote-argument remote-tmp-local)
+                               (tramp-shell-quote-argument remote-tmp-local)
                                (tramp-shell-quote-argument remote-local)))
-                      (setq success t))
+                      (setq success t)
+                      (message "Transfer completed successfully"))
                   ;; Checksum mismatch - clean up and retry
-                  (tramp-send-command
-                   vec
-                   (format "rm -f %s" (tramp-shell-quote-argument remote-tmp)))
-                  (setq retries (1+ retries))
-                  (when (< retries tramp-rpc-deploy-max-retries)
-                    (message "Checksum mismatch, retrying (%d/%d)..."
-                             retries tramp-rpc-deploy-max-retries)))))
+                  (let ((err-msg (format "Attempt %d: Checksum mismatch (local: %s, remote: %s)"
+                                         attempt
+                                         (substring local-checksum 0 12)
+                                         (substring remote-checksum 0 12))))
+                    (push err-msg errors)
+                    (message "%s" err-msg))
+                  (ignore-errors (delete-file remote-tmp-path))
+                  (setq retries (1+ retries)))))
           (error
            ;; Clean up on error and retry
-           (ignore-errors
-             (tramp-send-command
-              vec
-              (format "rm -f %s" (tramp-shell-quote-argument remote-tmp))))
-           (setq retries (1+ retries))
-           (when (< retries tramp-rpc-deploy-max-retries)
-             (message "Transfer failed (%s), retrying (%d/%d)..."
-                      (error-message-string err)
-                      retries tramp-rpc-deploy-max-retries)))))
-      
-      (unless success
-        (error "Failed to transfer binary after %d attempts" tramp-rpc-deploy-max-retries)))
+           (let ((err-msg (format "Attempt %d: %s" attempt (error-message-string err))))
+             (push err-msg errors)
+             (message "Transfer error: %s" err-msg))
+           (ignore-errors (delete-file remote-tmp-path))
+           (setq retries (1+ retries))))))
+    
+    (unless success
+      (error "Failed to transfer binary after %d attempts.\n\nErrors:\n%s\n\nTroubleshooting:\n- Verify SSH access: ssh %s@%s echo success\n- Check write permissions to %s on remote host\n- Ensure sha256sum or shasum command is available on remote host"
+             tramp-rpc-deploy-max-retries
+             (mapconcat #'identity (nreverse errors) "\n")
+             (or (tramp-file-name-user vec) "USER")
+             (tramp-file-name-host vec)
+             tramp-rpc-deploy-remote-directory))
     
     remote-path))
 

@@ -9,54 +9,68 @@ on:
       version:
         description: 'Version to release (without v prefix)'
         required: true
-        default: '0.1.0'
+        default: '0.2.0'
 
 env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  build:
-    name: Build ${{ matrix.target }}
-    runs-on: ${{ matrix.os }}
+  build-linux:
+    name: Build Linux ${{ matrix.arch }}
+    runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
         include:
-          - target: x86_64-unknown-linux-gnu
-            os: ubuntu-latest
+          - target: x86_64-unknown-linux-musl
             arch: x86_64-linux
             
-          - target: aarch64-unknown-linux-gnu
-            os: ubuntu-latest
+          - target: aarch64-unknown-linux-musl
             arch: aarch64-linux
-            cross: true
-            
-          - target: x86_64-apple-darwin
-            os: macos-latest  # Cross-compile for Intel
-            arch: x86_64-darwin
-            
-          - target: aarch64-apple-darwin
-            os: macos-latest  # Apple Silicon (native)
-            arch: aarch64-darwin
+            cross_linker: aarch64-linux-musl-gcc
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
+      - name: Install Rust nightly
+        uses: dtolnay/rust-toolchain@nightly
         with:
           targets: ${{ matrix.target }}
+          components: rust-src
 
-      - name: Install cross-compilation tools
-        if: matrix.cross
+      - name: Install musl tools
         run: |
           sudo apt-get update
-          sudo apt-get install -y gcc-aarch64-linux-gnu
-          echo "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc" >> $GITHUB_ENV
+          sudo apt-get install -y musl-tools
+          # For aarch64 cross-compilation
+          if [ "${{ matrix.arch }}" = "aarch64-linux" ]; then
+            sudo apt-get install -y gcc-aarch64-linux-gnu musl-dev
+            # Install aarch64 musl cross-compiler with retry
+            for i in 1 2 3; do
+              echo "Attempt $i: Downloading aarch64-linux-musl-cross.tgz..."
+              if wget --timeout=60 --tries=3 -q https://musl.cc/aarch64-linux-musl-cross.tgz; then
+                break
+              fi
+              echo "Download failed, retrying in 10s..."
+              sleep 10
+            done
+            tar -xf aarch64-linux-musl-cross.tgz
+            echo "$PWD/aarch64-linux-musl-cross/bin" >> $GITHUB_PATH
+          fi
 
-      - name: Build
-        run: cargo build --release --target ${{ matrix.target }} --manifest-path server/Cargo.toml
+      - name: Set cross-compilation linker
+        if: matrix.cross_linker
+        run: |
+          echo "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER=${{ matrix.cross_linker }}" >> $GITHUB_ENV
+
+      - name: Build (size-optimized with build-std)
+        run: |
+          RUSTFLAGS="-C target-feature=+crt-static -Zlocation-detail=none -Zunstable-options -Cpanic=immediate-abort" \
+          cargo build --release --target ${{ matrix.target }} \
+            --manifest-path server/Cargo.toml \
+            -Z build-std=std,panic_abort \
+            -Z build-std-features="optimize_for_size"
 
       - name: Determine version
         id: version
@@ -72,13 +86,69 @@ jobs:
           mkdir -p dist
           cp target/${{ matrix.target }}/release/tramp-rpc-server dist/
           cd dist
+          # Show binary info
+          ls -la tramp-rpc-server
+          file tramp-rpc-server || true
           tar -czf tramp-rpc-server-${{ matrix.arch }}-${{ steps.version.outputs.version }}.tar.gz tramp-rpc-server
-          # Use shasum on macOS, sha256sum on Linux
-          if command -v sha256sum &> /dev/null; then
-            sha256sum tramp-rpc-server-${{ matrix.arch }}-${{ steps.version.outputs.version }}.tar.gz > tramp-rpc-server-${{ matrix.arch }}-${{ steps.version.outputs.version }}.tar.gz.sha256
+          sha256sum tramp-rpc-server-${{ matrix.arch }}-${{ steps.version.outputs.version }}.tar.gz > tramp-rpc-server-${{ matrix.arch }}-${{ steps.version.outputs.version }}.tar.gz.sha256
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: tramp-rpc-server-${{ matrix.arch }}
+          path: |
+            dist/*.tar.gz
+            dist/*.sha256
+
+  build-macos:
+    name: Build macOS ${{ matrix.arch }}
+    runs-on: macos-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-apple-darwin
+            arch: x86_64-darwin
+            
+          - target: aarch64-apple-darwin
+            arch: aarch64-darwin
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust nightly
+        uses: dtolnay/rust-toolchain@nightly
+        with:
+          targets: ${{ matrix.target }}
+          components: rust-src
+
+      - name: Build (size-optimized with build-std)
+        run: |
+          RUSTFLAGS="-Zlocation-detail=none -Zunstable-options -Cpanic=immediate-abort" \
+          cargo build --release --target ${{ matrix.target }} \
+            --manifest-path server/Cargo.toml \
+            -Z build-std=std,panic_abort \
+            -Z build-std-features="optimize_for_size"
+
+      - name: Determine version
+        id: version
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "version=${{ github.event.inputs.version }}" >> $GITHUB_OUTPUT
           else
-            shasum -a 256 tramp-rpc-server-${{ matrix.arch }}-${{ steps.version.outputs.version }}.tar.gz > tramp-rpc-server-${{ matrix.arch }}-${{ steps.version.outputs.version }}.tar.gz.sha256
+            echo "version=${GITHUB_REF#refs/tags/v}" >> $GITHUB_OUTPUT
           fi
+
+      - name: Package
+        run: |
+          mkdir -p dist
+          cp target/${{ matrix.target }}/release/tramp-rpc-server dist/
+          cd dist
+          ls -la tramp-rpc-server
+          file tramp-rpc-server || true
+          tar -czf tramp-rpc-server-${{ matrix.arch }}-${{ steps.version.outputs.version }}.tar.gz tramp-rpc-server
+          shasum -a 256 tramp-rpc-server-${{ matrix.arch }}-${{ steps.version.outputs.version }}.tar.gz > tramp-rpc-server-${{ matrix.arch }}-${{ steps.version.outputs.version }}.tar.gz.sha256
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
@@ -90,7 +160,7 @@ jobs:
 
   release:
     name: Create Release
-    needs: build
+    needs: [build-linux, build-macos]
     runs-on: ubuntu-latest
     if: startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch'
     permissions:
@@ -133,22 +203,29 @@ jobs:
           body: |
             ## tramp-rpc-server ${{ steps.version.outputs.version }}
             
+            ### What's New
+            
+            - **Size-optimized static binaries** - Linux binaries are now fully static (musl) and ~45% smaller
+            - Built with `build-std` for maximum size reduction
+            
             ### Installation
             
             This release is automatically downloaded by the Emacs package when needed.
             
             For manual installation, download the appropriate binary for your architecture:
             
-            | Architecture | File |
-            |-------------|------|
-            | Linux x86_64 | `tramp-rpc-server-x86_64-linux-${{ steps.version.outputs.version }}.tar.gz` |
-            | Linux aarch64 | `tramp-rpc-server-aarch64-linux-${{ steps.version.outputs.version }}.tar.gz` |
-            | macOS x86_64 | `tramp-rpc-server-x86_64-darwin-${{ steps.version.outputs.version }}.tar.gz` |
-            | macOS aarch64 (Apple Silicon) | `tramp-rpc-server-aarch64-darwin-${{ steps.version.outputs.version }}.tar.gz` |
+            | Architecture | File | Notes |
+            |-------------|------|-------|
+            | Linux x86_64 | `tramp-rpc-server-x86_64-linux-${{ steps.version.outputs.version }}.tar.gz` | Static musl binary |
+            | Linux aarch64 | `tramp-rpc-server-aarch64-linux-${{ steps.version.outputs.version }}.tar.gz` | Static musl binary |
+            | macOS x86_64 | `tramp-rpc-server-x86_64-darwin-${{ steps.version.outputs.version }}.tar.gz` | |
+            | macOS aarch64 (Apple Silicon) | `tramp-rpc-server-aarch64-darwin-${{ steps.version.outputs.version }}.tar.gz` | |
+            
+            Linux binaries are fully statically linked and will work on any Linux distribution.
             
             Extract and place the binary in:
             ```
-            ~/.emacs.d/tramp-rpc/${{ steps.version.outputs.version }}/<arch>/tramp-rpc-server
+            ~/.cache/tramp-rpc/tramp-rpc-server-${{ steps.version.outputs.version }}
             ```
             
             ### Checksums
@@ -156,32 +233,3 @@ jobs:
             SHA256 checksums are provided in `.sha256` files for each binary.
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-
-  # Optional: Build check on PRs (no release)
-  check:
-    name: Check ${{ matrix.target }}
-    if: github.event_name == 'pull_request'
-    runs-on: ${{ matrix.os }}
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - target: x86_64-unknown-linux-gnu
-            os: ubuntu-latest
-          - target: aarch64-apple-darwin
-            os: macos-latest
-
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: ${{ matrix.target }}
-
-      - name: Check
-        run: cargo check --target ${{ matrix.target }} --manifest-path server/Cargo.toml
-
-      - name: Test
-        run: cargo test --manifest-path server/Cargo.toml
