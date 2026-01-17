@@ -1109,10 +1109,12 @@ Produces ls-like output for dired."
     (filename newname &optional ok-if-already-exists keep-time
               preserve-uid-gid preserve-permissions)
   "Like `copy-file' for TRAMP-RPC files."
+  (setq filename (expand-file-name filename)
+        newname (expand-file-name newname))
   (let ((source-remote (tramp-tramp-file-p filename))
         (dest-remote (tramp-tramp-file-p newname)))
     (cond
-     ;; Both on same remote host using RPC
+     ;; Both on same remote host using RPC - use server-side copy
      ((and source-remote dest-remote
            (tramp-equal-remote filename newname))
       (with-parsed-tramp-file-name filename v1
@@ -1124,7 +1126,35 @@ Produces ls-like output for dired."
                            `((src . ,v1-localname)
                              (dest . ,v2-localname)
                              (preserve . ,(if (or keep-time preserve-permissions) t :json-false)))))))
-     ;; Different hosts or local, use default handler
+     ;; Remote source, local dest - read via RPC, write locally
+     ((and source-remote (not dest-remote))
+      (unless ok-if-already-exists
+        (when (file-exists-p newname)
+          (signal 'file-already-exists (list newname))))
+      ;; Use file-local-copy to get a temp local copy, then rename
+      (let ((tmpfile (file-local-copy filename)))
+        (unwind-protect
+            (progn
+              (rename-file tmpfile newname ok-if-already-exists)
+              (when (or keep-time preserve-permissions)
+                (set-file-times newname (file-attribute-modification-time
+                                         (file-attributes filename)))))
+          (when (file-exists-p tmpfile)
+            (delete-file tmpfile)))))
+     ;; Local source, remote dest - read locally, write via RPC
+     ((and (not source-remote) dest-remote)
+      (unless ok-if-already-exists
+        (when (file-exists-p newname)
+          (signal 'file-already-exists (list newname))))
+      ;; Read local file and write to remote
+      (with-temp-buffer
+        (set-buffer-multibyte nil)
+        (insert-file-contents-literally filename)
+        (write-region (point-min) (point-max) newname nil 'nomessage))
+      (when (or keep-time preserve-permissions)
+        (set-file-times newname (file-attribute-modification-time
+                                 (file-attributes filename)))))
+     ;; Both local or different remote hosts - use default
      (t
       (tramp-run-real-handler
        #'copy-file

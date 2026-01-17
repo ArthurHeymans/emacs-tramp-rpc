@@ -75,6 +75,13 @@ jobs:
         if: inputs.test
         run: nix develop --command cargo test --manifest-path server/Cargo.toml
 
+      - name: Upload binary for CI
+        uses: actions/upload-artifact@v4
+        with:
+          name: tramp-rpc-server-${{ inputs.target }}
+          path: target/${{ inputs.target }}/release/tramp-rpc-server
+          retention-days: 1
+
       - name: Package
         if: inputs.upload
         run: |

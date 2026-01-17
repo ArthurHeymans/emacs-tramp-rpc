@@ -62,3 +62,135 @@ jobs:
           emacs -Q --batch \
             --eval "(require 'package)" \
             --eval "(with-current-buffer (find-file-noselect \"lisp/tramp-rpc.el\") (package-buffer-info))"
+
+  test-protocol:
+    name: Protocol Tests
+    runs-on: ubuntu-latest
+    needs: elisp
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Emacs
+        uses: purcell/setup-emacs@master
+        with:
+          version: '30.1'
+
+      - name: Run protocol tests
+        run: |
+          emacs -Q --batch \
+            --eval "(setq debug-on-error t)" \
+            -l test/tramp-rpc-mock-tests.el \
+            --eval "(ert-run-tests-batch-and-exit \"^tramp-rpc-mock-test-protocol\")"
+
+  test-server:
+    name: Server Integration Tests
+    runs-on: ubuntu-latest
+    needs: [rust, elisp]
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Emacs
+        uses: purcell/setup-emacs@master
+        with:
+          version: '30.1'
+
+      - name: Download server binary
+        uses: actions/download-artifact@v4
+        with:
+          name: tramp-rpc-server-x86_64-unknown-linux-musl
+          path: target/x86_64-unknown-linux-musl/release/
+
+      - name: Make server executable
+        run: chmod +x target/x86_64-unknown-linux-musl/release/tramp-rpc-server
+
+      - name: Run server integration tests
+        run: |
+          emacs -Q --batch \
+            --eval "(setq debug-on-error t)" \
+            -l test/tramp-rpc-mock-tests.el \
+            --eval "(ert-run-tests-batch-and-exit '(tag :server))"
+
+  test-full-suite:
+    name: Full Test Suite (with SSH)
+    runs-on: ubuntu-latest
+    needs: [rust, elisp]
+    # Only run on main branch to avoid SSH setup complexity in PRs
+    if: github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master'
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Emacs
+        uses: purcell/setup-emacs@master
+        with:
+          version: '30.1'
+
+      - name: Download server binary
+        uses: actions/download-artifact@v4
+        with:
+          name: tramp-rpc-server-x86_64-unknown-linux-musl
+          path: target/x86_64-unknown-linux-musl/release/
+
+      - name: Make server executable
+        run: chmod +x target/x86_64-unknown-linux-musl/release/tramp-rpc-server
+
+      - name: Setup SSH for localhost
+        run: |
+          # Generate SSH key
+          ssh-keygen -t ed25519 -f ~/.ssh/id_ed25519 -N ""
+          # Add to authorized_keys
+          cat ~/.ssh/id_ed25519.pub >> ~/.ssh/authorized_keys
+          chmod 600 ~/.ssh/authorized_keys
+          # Configure SSH
+          echo "Host localhost" >> ~/.ssh/config
+          echo "  StrictHostKeyChecking no" >> ~/.ssh/config
+          echo "  UserKnownHostsFile /dev/null" >> ~/.ssh/config
+          chmod 600 ~/.ssh/config
+          # Start SSH server if not running
+          sudo service ssh start || true
+          # Test SSH connection
+          ssh localhost "echo 'SSH connection successful'"
+
+      - name: Deploy server to localhost
+        run: |
+          mkdir -p ~/.cache/tramp-rpc
+          cp target/x86_64-unknown-linux-musl/release/tramp-rpc-server ~/.cache/tramp-rpc/
+
+      - name: Run full test suite
+        env:
+          TRAMP_RPC_TEST_HOST: localhost
+        run: |
+          emacs -Q --batch \
+            --eval "(setq debug-on-error t)" \
+            --eval "(setq tramp-verbose 0)" \
+            -l test/tramp-rpc-tests.el \
+            --eval "(ert-run-tests-batch-and-exit \"^tramp-rpc-test\")"
+
+  summary:
+    name: Test Summary
+    runs-on: ubuntu-latest
+    needs: [rust, elisp, test-protocol, test-server]
+    if: always()
+
+    steps:
+      - name: Check results
+        run: |
+          echo "=== CI Summary ==="
+          echo "Rust: ${{ needs.rust.result }}"
+          echo "Elisp: ${{ needs.elisp.result }}"
+          echo "Protocol Tests: ${{ needs.test-protocol.result }}"
+          echo "Server Tests: ${{ needs.test-server.result }}"
+          
+          if [[ "${{ needs.rust.result }}" != "success" ]] || \
+             [[ "${{ needs.elisp.result }}" != "success" ]] || \
+             [[ "${{ needs.test-protocol.result }}" != "success" ]] || \
+             [[ "${{ needs.test-server.result }}" != "success" ]]; then
+            echo "Some tests failed!"
+            exit 1
+          fi
+          echo "All tests passed!"
