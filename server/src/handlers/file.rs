@@ -2,8 +2,10 @@
 
 use crate::protocol::{FileAttributes, FileType, RpcError, StatResult};
 use serde::Deserialize;
+use std::collections::HashMap;
 use std::os::unix::fs::{FileTypeExt, MetadataExt};
 use std::path::Path;
+use std::sync::Mutex;
 use std::time::UNIX_EPOCH;
 use tokio::fs;
 
@@ -261,27 +263,53 @@ fn get_file_type(metadata: &std::fs::Metadata) -> FileType {
     }
 }
 
+static USER_NAMES: std::sync::LazyLock<Mutex<HashMap<u32, String>>> = std::sync::LazyLock::new(|| Mutex::new(HashMap::new()));
+
 /// Get user name from uid
 fn get_user_name(uid: u32) -> Option<String> {
-    unsafe {
-        let passwd = libc::getpwuid(uid);
-        if passwd.is_null() {
-            return None;
+    let mut cache = USER_NAMES.lock().unwrap();
+
+    if let Some(result) = cache.get(&uid) {
+        Some(result.clone())
+    } else {
+        unsafe {
+            let passwd = libc::getpwuid(uid);
+            if passwd.is_null() {
+                return None;
+            }
+            let name = std::ffi::CStr::from_ptr((*passwd).pw_name);
+
+            name.to_str().ok().map(|s| {
+                let result = s.to_string();
+                cache.insert(uid, result.clone());
+                result
+            })
         }
-        let name = std::ffi::CStr::from_ptr((*passwd).pw_name);
-        name.to_str().ok().map(|s| s.to_string())
     }
 }
 
+static GROUP_NAMES: std::sync::LazyLock<Mutex<HashMap<u32, String>>> = std::sync::LazyLock::new(|| Mutex::new(HashMap::new()));
+
 /// Get group name from gid
 fn get_group_name(gid: u32) -> Option<String> {
-    unsafe {
-        let group = libc::getgrgid(gid);
-        if group.is_null() {
-            return None;
+    let mut cache = GROUP_NAMES.lock().unwrap();
+
+    if let Some(result) = cache.get(&gid) {
+        Some(result.clone())
+    } else {
+        unsafe {
+            let group = libc::getgrgid(gid);
+            if group.is_null() {
+                return None;
+            }
+            let name = std::ffi::CStr::from_ptr((*group).gr_name);
+
+            name.to_str().ok().map(|s| {
+                let result = s.to_string();
+                cache.insert(gid, result.clone());
+                result
+            })
         }
-        let name = std::ffi::CStr::from_ptr((*group).gr_name);
-        name.to_str().ok().map(|s| s.to_string())
     }
 }
 

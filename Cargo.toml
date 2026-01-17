@@ -22,3 +22,9 @@ lto = true          # Link-time optimization
 codegen-units = 1   # Better optimization
 panic = "abort"     # Smaller binary
 strip = true        # Strip symbols
+
+[profile.release-debug]
+inherits = "release"
+opt-level = 3
+strip = false
+debug = true
