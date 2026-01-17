@@ -70,6 +70,13 @@ Used for building from source.  Set to nil to disable source builds."
   :type '(choice directory (const nil))
   :group 'tramp-rpc-deploy)
 
+(defconst tramp-rpc-deploy-bundled-binary-directory
+  (when load-file-name
+    (expand-file-name "binaries" (file-name-directory load-file-name)))
+  "Directory containing pre-built binaries bundled with the package.
+This is useful for development - binaries built by scripts/build-all.sh
+are placed here and used directly without needing to download or cache.")
+
 (defcustom tramp-rpc-deploy-remote-directory "~/.cache/tramp-rpc"
   "Remote directory where the server binary will be installed."
   :type 'string
@@ -178,6 +185,17 @@ Linux targets use musl for fully static binaries."
     (expand-file-name
      tramp-rpc-deploy-version
      tramp-rpc-deploy-local-cache-directory))))
+
+(defun tramp-rpc-deploy--bundled-binary-path (arch)
+  "Return the path to a bundled binary for ARCH, or nil if not available.
+Bundled binaries are in lisp/binaries/<arch>/tramp-rpc-server.
+This is useful for development - run scripts/build-all.sh to populate."
+  (when tramp-rpc-deploy-bundled-binary-directory
+    (let ((path (expand-file-name
+                 tramp-rpc-deploy-binary-name
+                 (expand-file-name arch tramp-rpc-deploy-bundled-binary-directory))))
+      (when (and (file-exists-p path) (file-executable-p path))
+        path))))
 
 (defun tramp-rpc-deploy--remote-binary-path (vec)
   "Return the remote path where the binary should be installed for VEC."
@@ -360,20 +378,29 @@ Returns the path to the binary on success, nil on failure."
 (defun tramp-rpc-deploy--ensure-local-binary (arch)
   "Ensure a local binary exists for ARCH.
 Tries in order:
-1. Check local cache
-2. Download from GitHub releases
-3. Build from source (if on same architecture)
+1. Check bundled binaries (useful for development)
+2. Check local cache
+3. Download from GitHub releases
+4. Build from source (if on same architecture)
 
 Returns the path to the local binary."
-  (let ((cache-path (tramp-rpc-deploy--local-cache-path arch)))
-    ;; Check cache first
-    (if (and (file-exists-p cache-path)
-             (file-executable-p cache-path))
-        (progn
-          (message "Using cached binary for %s" arch)
-          cache-path)
-      
-      ;; Need to obtain binary
+  (let ((bundled-path (tramp-rpc-deploy--bundled-binary-path arch))
+        (cache-path (tramp-rpc-deploy--local-cache-path arch)))
+    (cond
+     ;; Check bundled binaries first (useful for development - run
+     ;; scripts/build-all.sh to populate lisp/binaries/)
+     (bundled-path
+      (message "Using bundled binary for %s" arch)
+      bundled-path)
+     
+     ;; Check cache
+     ((and (file-exists-p cache-path)
+           (file-executable-p cache-path))
+      (message "Using cached binary for %s" arch)
+      cache-path)
+     
+     ;; Need to obtain binary
+     (t
       (let ((methods (if tramp-rpc-deploy-prefer-build
                          '(build download)
                        '(download build)))
@@ -402,7 +429,7 @@ Returns the path to the local binary."
                                 (format "  %s: %s" (car e) (cdr e)))
                               (reverse errors)
                               "\n")
-                   (tramp-rpc-deploy--help-message arch)))))))
+                   (tramp-rpc-deploy--help-message arch)))))))))
 
 (defun tramp-rpc-deploy--help-message (arch)
   "Return a help message for obtaining binary for ARCH."
