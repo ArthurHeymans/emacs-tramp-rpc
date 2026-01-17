@@ -429,7 +429,7 @@ Returns the path to the local binary."
                                 (format "  %s: %s" (car e) (cdr e)))
                               (reverse errors)
                               "\n")
-                   (tramp-rpc-deploy--help-message arch)))))))))
+                   (tramp-rpc-deploy--help-message arch))))))))
 
 (defun tramp-rpc-deploy--help-message (arch)
   "Return a help message for obtaining binary for ARCH."

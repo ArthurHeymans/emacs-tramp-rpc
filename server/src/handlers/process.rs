@@ -498,7 +498,7 @@ fn set_window_size(fd: RawFd, rows: u16, cols: u16) -> Result<(), std::io::Error
         ws_xpixel: 0,
         ws_ypixel: 0,
     };
-    let result = unsafe { libc::ioctl(fd, libc::TIOCSWINSZ as libc::Ioctl, &ws) };
+    let result = unsafe { libc::ioctl(fd, libc::TIOCSWINSZ as libc::c_ulong, &ws) };
     if result < 0 {
         Err(std::io::Error::last_os_error())
     } else {
@@ -593,7 +593,7 @@ fn do_fork_exec(params: PtyStartParams) -> Result<ForkResult2, RpcError> {
 
             // Set the slave as controlling terminal
             unsafe {
-                libc::ioctl(slave.as_raw_fd(), libc::TIOCSCTTY as libc::Ioctl, 0);
+                libc::ioctl(slave.as_raw_fd(), libc::TIOCSCTTY as libc::c_ulong, 0);
             }
 
             // Duplicate slave to stdin, stdout, stderr

@@ -1635,7 +1635,7 @@ STRING is used in error messages."
      'file-missing
      (format "%s: No such file or directory, %s" string filename))))
 
-(defun tramp-rpc-handle-file-name-case-insensitive-p (filename)
+(defun tramp-rpc-handle-file-name-case-insensitive-p (_filename)
   "Like `file-name-case-insensitive-p' for TRAMP-RPC files.
 Returns nil since most remote systems (Linux) are case-sensitive."
   ;; For simplicity, assume case-sensitive (most common for remote servers).
