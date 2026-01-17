@@ -1,5 +1,5 @@
 #!/bin/bash
-# Build tramp-rpc-server for multiple architectures
+# Build tramp-rpc-server with size-optimized static musl linking
 
 set -e
 
@@ -7,10 +7,10 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
 OUTPUT_DIR="$PROJECT_DIR/lisp/binaries"
 
-# Targets to build
+# Supported targets
 TARGETS=(
-    "x86_64-unknown-linux-gnu"
-    "aarch64-unknown-linux-gnu"
+    "x86_64-unknown-linux-musl"
+    "aarch64-unknown-linux-musl"
     "x86_64-apple-darwin"
     "aarch64-apple-darwin"
 )
@@ -18,141 +18,150 @@ TARGETS=(
 # Map target triple to directory name
 target_to_dir() {
     case "$1" in
-        x86_64-unknown-linux-gnu) echo "x86_64-linux" ;;
-        aarch64-unknown-linux-gnu) echo "aarch64-linux" ;;
+        x86_64-unknown-linux-musl) echo "x86_64-linux" ;;
+        aarch64-unknown-linux-musl) echo "aarch64-linux" ;;
         x86_64-apple-darwin) echo "x86_64-darwin" ;;
         aarch64-apple-darwin) echo "aarch64-darwin" ;;
         *) echo "$1" ;;
     esac
 }
 
-# Check if we have the necessary tools
-check_requirements() {
-    if ! command -v cargo &> /dev/null; then
-        echo "Error: cargo not found. Please install Rust."
-        exit 1
-    fi
-
-    if ! command -v rustup &> /dev/null; then
-        echo "Error: rustup not found. Please install rustup."
-        exit 1
-    fi
-}
-
-# Install target if needed
-ensure_target() {
-    local target="$1"
-    if ! rustup target list --installed | grep -q "$target"; then
-        echo "Installing target: $target"
-        rustup target add "$target"
-    fi
-}
-
-# Build for a specific target
-build_target() {
-    local target="$1"
-    local dir_name=$(target_to_dir "$target")
+# Build size-optimized static musl binary (requires nightly + rust-src)
+build() {
+    local target="${1:-x86_64-unknown-linux-musl}"
+    local dir_name="$(target_to_dir "$target")"
     local output_subdir="$OUTPUT_DIR/$dir_name"
 
-    echo "Building for $target..."
+    echo "Building size-optimized static binary for $target..."
 
-    # Ensure target is installed
-    ensure_target "$target"
+    # Determine if we're using rustup-managed cargo or standalone (nix)
+    local cargo_cmd="cargo"
 
-    # Create output directory
+    # Check if current cargo is nightly
+    if cargo --version 2>&1 | grep -q nightly || rustc --version 2>&1 | grep -q nightly; then
+        echo "  Using nightly toolchain"
+        cargo_cmd="cargo"
+    elif command -v rustup &> /dev/null; then
+        echo "  Using rustup toolchain management"
+
+        # Check for nightly
+        if ! rustup run nightly rustc --version &> /dev/null; then
+            echo "Error: nightly toolchain not installed. Run: rustup toolchain install nightly"
+            exit 1
+        fi
+
+        # Check for rust-src
+        if ! rustup +nightly component list --installed | grep -q rust-src; then
+            echo "Installing rust-src component..."
+            rustup +nightly component add rust-src
+        fi
+
+        # Ensure target is installed for nightly
+        if ! rustup +nightly target list --installed | grep -q "$target"; then
+            echo "Installing target $target for nightly..."
+            rustup +nightly target add "$target"
+        fi
+
+        cargo_cmd="cargo +nightly"
+    else
+        echo "Error: nightly toolchain required for build-std"
+        echo "  Use: nix develop  or  rustup toolchain install nightly"
+        exit 1
+    fi
+
+    cd "$PROJECT_DIR"
     mkdir -p "$output_subdir"
 
-    # Build
-    cd "$PROJECT_DIR"
-
-    # Set linker for cross-compilation if needed
+    # Set up linker and RUSTFLAGS based on target
+    local rustflags="-Zlocation-detail=none -Zunstable-options -Cpanic=immediate-abort"
+    
     case "$target" in
-        aarch64-unknown-linux-gnu)
-            if command -v aarch64-linux-gnu-gcc &> /dev/null; then
-                export CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc
+        x86_64-unknown-linux-musl)
+            rustflags="-C target-feature=+crt-static $rustflags"
+            if command -v x86_64-unknown-linux-musl-gcc &> /dev/null; then
+                export CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER=x86_64-unknown-linux-musl-gcc
+            elif command -v musl-gcc &> /dev/null; then
+                export CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER=musl-gcc
             fi
             ;;
-        x86_64-apple-darwin|aarch64-apple-darwin)
-            # Darwin targets typically need special setup
-            echo "Note: Building for Darwin requires macOS or cross-compilation setup"
+        aarch64-unknown-linux-musl)
+            rustflags="-C target-feature=+crt-static $rustflags"
+            if command -v aarch64-unknown-linux-musl-gcc &> /dev/null; then
+                export CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER=aarch64-unknown-linux-musl-gcc
+            elif command -v aarch64-linux-musl-gcc &> /dev/null; then
+                export CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER=aarch64-linux-musl-gcc
+            fi
+            ;;
+        *-apple-darwin)
+            # Darwin doesn't use musl, but still benefits from build-std
             ;;
     esac
 
-    # Build release
-    if cargo build --release --target "$target" 2>/dev/null; then
-        # Copy binary
+    # Build with build-std for maximum size optimization
+    if RUSTFLAGS="$rustflags" \
+       $cargo_cmd build --release --target "$target" \
+         -Z build-std=std,panic_abort \
+         -Z build-std-features="optimize_for_size"; then
+
         cp "target/$target/release/tramp-rpc-server" "$output_subdir/"
         echo "  Built: $output_subdir/tramp-rpc-server"
 
-        # Show size
         local size=$(du -h "$output_subdir/tramp-rpc-server" | cut -f1)
-        echo "  Size: $size"
+        
+        case "$target" in
+            *-linux-musl)
+                echo "  Size: $size (static musl, size-optimized)"
+                # Verify it's static
+                if ldd "$output_subdir/tramp-rpc-server" 2>&1 | grep -q "statically linked"; then
+                    echo "  Status: Fully statically linked"
+                fi
+                ;;
+            *-apple-darwin)
+                echo "  Size: $size (size-optimized)"
+                ;;
+        esac
     else
-        echo "  Warning: Failed to build for $target (may need cross-compilation toolchain)"
+        echo "  Error: Build failed"
+        echo "  For rustup: rustup +nightly component add rust-src"
+        echo "  For nix: nix develop"
+        exit 1
     fi
-}
-
-# Build for current host
-build_native() {
-    echo "Building native release..."
-
-    cd "$PROJECT_DIR"
-    cargo build --release
-
-    # Determine native target
-    local native_target=$(rustc -vV | grep host | cut -d' ' -f2)
-    local dir_name=$(target_to_dir "$native_target")
-    local output_subdir="$OUTPUT_DIR/$dir_name"
-
-    mkdir -p "$output_subdir"
-    cp "target/release/tramp-rpc-server" "$output_subdir/"
-
-    echo "  Built: $output_subdir/tramp-rpc-server"
-    local size=$(du -h "$output_subdir/tramp-rpc-server" | cut -f1)
-    echo "  Size: $size"
 }
 
 # Main
 main() {
-    check_requirements
-
     echo "TRAMP-RPC Server Build Script"
     echo "=============================="
     echo ""
 
     case "${1:-}" in
-        --native)
-            build_native
-            ;;
         --all)
             for target in "${TARGETS[@]}"; do
-                build_target "$target"
+                build "$target"
                 echo ""
             done
             ;;
-        --target)
-            if [ -z "${2:-}" ]; then
-                echo "Usage: $0 --target <target>"
-                echo "Available targets: ${TARGETS[*]}"
-                exit 1
-            fi
-            build_target "$2"
+        --help|-h)
+            echo "Usage: $0 [target]"
+            echo ""
+            echo "Builds size-optimized binaries using nightly + build-std."
+            echo "Linux targets use static musl linking."
+            echo ""
+            echo "Arguments:"
+            echo "  (none)                       Build for x86_64-unknown-linux-musl"
+            echo "  x86_64-unknown-linux-musl    Build for x86_64 Linux (static)"
+            echo "  aarch64-unknown-linux-musl   Build for aarch64 Linux (static)"
+            echo "  x86_64-apple-darwin          Build for x86_64 macOS"
+            echo "  aarch64-apple-darwin         Build for aarch64 macOS (Apple Silicon)"
+            echo "  --all                        Build for all targets"
+            echo ""
+            echo "Requirements:"
+            echo "  - nix develop (recommended), or"
+            echo "  - rustup with nightly + rust-src"
+            exit 0
             ;;
         *)
-            echo "Usage: $0 [--native|--all|--target <target>]"
-            echo ""
-            echo "Options:"
-            echo "  --native        Build for the current host only"
-            echo "  --all           Build for all supported targets"
-            echo "  --target <t>    Build for a specific target"
-            echo ""
-            echo "Supported targets:"
-            for target in "${TARGETS[@]}"; do
-                echo "  - $target"
-            done
-            echo ""
-            echo "Example: $0 --native"
-            exit 0
+            build "${1:-x86_64-unknown-linux-musl}"
             ;;
     esac
 

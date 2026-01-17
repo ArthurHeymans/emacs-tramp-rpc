@@ -36,7 +36,7 @@
   "Deployment settings for TRAMP-RPC."
   :group 'tramp)
 
-(defconst tramp-rpc-deploy-version "0.1.0"
+(defconst tramp-rpc-deploy-version "0.2.0"
   "Current version of tramp-rpc-server.")
 
 (defconst tramp-rpc-deploy-binary-name "tramp-rpc-server"
@@ -160,10 +160,11 @@ Returns a string like \"x86_64-linux\" or \"aarch64-darwin\"."
 
 (defun tramp-rpc-deploy--arch-to-rust-target (arch)
   "Convert ARCH string to Rust target triple.
-E.g., \"x86_64-linux\" -> \"x86_64-unknown-linux-gnu\"."
+E.g., \"x86_64-linux\" -> \"x86_64-unknown-linux-musl\".
+Linux targets use musl for fully static binaries."
   (pcase arch
-    ("x86_64-linux" "x86_64-unknown-linux-gnu")
-    ("aarch64-linux" "aarch64-unknown-linux-gnu")
+    ("x86_64-linux" "x86_64-unknown-linux-musl")
+    ("aarch64-linux" "aarch64-unknown-linux-musl")
     ("x86_64-darwin" "x86_64-apple-darwin")
     ("aarch64-darwin" "aarch64-apple-darwin")
     (_ (error "Unknown architecture: %s" arch))))
