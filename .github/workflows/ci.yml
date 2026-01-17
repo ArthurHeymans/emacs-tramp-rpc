@@ -19,7 +19,7 @@ jobs:
         include:
           - name: Linux
             os: ubuntu-latest
-            target: x86_64-unknown-linux-gnu
+            target: x86_64-unknown-linux-musl
           - name: macOS
             os: macos-latest
             target: aarch64-apple-darwin
@@ -28,22 +28,16 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
+      - name: Install Nix
+        uses: cachix/install-nix-action@v20
         with:
-          components: clippy, rustfmt
-
-      - name: Format check
-        run: cargo fmt --all --manifest-path server/Cargo.toml -- --check
-
-      - name: Clippy
-        run: cargo clippy --all-targets --manifest-path server/Cargo.toml -- -D warnings
+          nix_path: nixpkgs=channel:nixos-unstable
 
       - name: Build
-        run: cargo build --release --manifest-path server/Cargo.toml
+        run: nix develop --command cargo build --release --target ${{ matrix.target }} --manifest-path server/Cargo.toml
 
       - name: Test
-        run: cargo test --manifest-path server/Cargo.toml
+        run: nix develop --command cargo test --manifest-path server/Cargo.toml
 
   elisp:
     name: Emacs Lisp

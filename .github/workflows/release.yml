@@ -24,52 +24,28 @@ jobs:
         include:
           - target: x86_64-unknown-linux-musl
             arch: x86_64-linux
-            
+
           - target: aarch64-unknown-linux-musl
             arch: aarch64-linux
-            cross_linker: aarch64-linux-musl-gcc
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Install Rust nightly
-        uses: dtolnay/rust-toolchain@nightly
+      - name: Install Nix
+        uses: cachix/install-nix-action@v20
         with:
-          targets: ${{ matrix.target }}
-          components: rust-src
-
-      - name: Install musl tools
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y musl-tools
-          # For aarch64 cross-compilation
-          if [ "${{ matrix.arch }}" = "aarch64-linux" ]; then
-            sudo apt-get install -y gcc-aarch64-linux-gnu musl-dev
-            # Install aarch64 musl cross-compiler from Bootlin (more reliable than musl.cc)
-            curl -LO --retry 5 --retry-delay 10 https://toolchains.bootlin.com/downloads/releases/toolchains/aarch64/tarballs/aarch64--musl--stable-2021.11-1.tar.bz2
-            tar xf aarch64--musl--stable-2021.11-1.tar.bz2
-            
-            # Setup toolchain path and symlink for compatibility
-            TC_DIR="$PWD/aarch64--musl--stable-2021.11-1"
-            echo "$TC_DIR/bin" >> $GITHUB_PATH
-            
-            # Link aarch64-linux-gcc to aarch64-linux-musl-gcc as expected by the matrix config
-            ln -s "$TC_DIR/bin/aarch64-linux-gcc" "$TC_DIR/bin/aarch64-linux-musl-gcc"
-          fi
-
-      - name: Set cross-compilation linker
-        if: matrix.cross_linker
-        run: |
-          echo "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER=${{ matrix.cross_linker }}" >> $GITHUB_ENV
+          nix_path: nixpkgs=channel:nixos-unstable
 
       - name: Build (size-optimized with build-std)
         run: |
+          nix develop --command bash -c '
           RUSTFLAGS="-C target-feature=+crt-static -Zlocation-detail=none -Zunstable-options -Cpanic=immediate-abort" \
           cargo build --release --target ${{ matrix.target }} \
             --manifest-path server/Cargo.toml \
             -Z build-std=std,panic_abort \
             -Z build-std-features="optimize_for_size"
+          '
 
       - name: Determine version
         id: version
@@ -116,19 +92,20 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Install Rust nightly
-        uses: dtolnay/rust-toolchain@nightly
+      - name: Install Nix
+        uses: cachix/install-nix-action@v20
         with:
-          targets: ${{ matrix.target }}
-          components: rust-src
+          nix_path: nixpkgs=channel:nixos-unstable
 
       - name: Build (size-optimized with build-std)
         run: |
+          nix develop --command bash -c '
           RUSTFLAGS="-Zlocation-detail=none -Zunstable-options -Cpanic=immediate-abort" \
           cargo build --release --target ${{ matrix.target }} \
             --manifest-path server/Cargo.toml \
             -Z build-std=std,panic_abort \
             -Z build-std-features="optimize_for_size"
+          '
 
       - name: Determine version
         id: version
