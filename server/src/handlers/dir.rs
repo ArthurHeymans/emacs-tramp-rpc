@@ -1,12 +1,29 @@
 //! Directory operations
 
-use crate::protocol::{DirEntry, FileType, RpcError};
+use crate::protocol::{DirEntry, FileType, OutputEncoding, RpcError};
+use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
 use serde::Deserialize;
+use std::ffi::OsStr;
+use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::FileTypeExt;
 use std::path::Path;
 use tokio::fs;
 
-use super::file::get_file_attributes;
+use super::file::{decode_path, get_file_attributes};
+
+/// Encode a filename for JSON transport.
+/// Returns (encoded_name, encoding) where encoding is Text if valid UTF-8,
+/// or Base64 if the filename contains non-UTF8 bytes.
+fn encode_filename(name: &OsStr) -> (String, OutputEncoding) {
+    // Try to convert to UTF-8 first
+    if let Some(s) = name.to_str() {
+        (s.to_string(), OutputEncoding::Text)
+    } else {
+        // Contains non-UTF8 bytes, use base64
+        let bytes = name.as_bytes();
+        (BASE64.encode(bytes), OutputEncoding::Base64)
+    }
+}
 
 type HandlerResult = Result<serde_json::Value, RpcError>;
 
@@ -15,6 +32,7 @@ pub async fn list(params: &serde_json::Value) -> HandlerResult {
     #[derive(Deserialize)]
     struct Params {
         path: String,
+        path_encoding: Option<String>,
         /// Include file attributes for each entry
         #[serde(default)]
         include_attrs: bool,
@@ -30,9 +48,9 @@ pub async fn list(params: &serde_json::Value) -> HandlerResult {
     let params: Params = serde_json::from_value(params.clone())
         .map_err(|e| RpcError::invalid_params(e.to_string()))?;
 
-    let path = Path::new(&params.path);
+    let path = decode_path(&params.path, params.path_encoding.as_deref())?;
 
-    let mut entries = fs::read_dir(path)
+    let mut entries = fs::read_dir(&path)
         .await
         .map_err(|e| super::file::map_io_error(e, &params.path))?;
 
@@ -42,22 +60,22 @@ pub async fn list(params: &serde_json::Value) -> HandlerResult {
     if params.include_hidden {
         results.push(DirEntry {
             name: ".".to_string(),
+            name_encoding: OutputEncoding::Text,
             file_type: FileType::Directory,
             attrs: if params.include_attrs {
-                get_file_attributes(&params.path, false).await.ok()
+                get_file_attributes(&path, false).await.ok()
             } else {
                 None
             },
         });
 
-        let parent = path.parent().unwrap_or(path);
+        let parent = path.parent().unwrap_or(&path);
         results.push(DirEntry {
             name: "..".to_string(),
+            name_encoding: OutputEncoding::Text,
             file_type: FileType::Directory,
             attrs: if params.include_attrs {
-                get_file_attributes(&parent.to_string_lossy(), false)
-                    .await
-                    .ok()
+                get_file_attributes(parent, false).await.ok()
             } else {
                 None
             },
@@ -65,10 +83,15 @@ pub async fn list(params: &serde_json::Value) -> HandlerResult {
     }
 
     while let Ok(Some(entry)) = entries.next_entry().await {
-        let name = entry.file_name().to_string_lossy().to_string();
+        let (name, name_encoding) = encode_filename(&entry.file_name());
 
         // Skip hidden files if not requested
-        if !params.include_hidden && name.starts_with('.') {
+        // Note: for base64-encoded names, we check the original bytes
+        let is_hidden = match name_encoding {
+            OutputEncoding::Text => name.starts_with('.'),
+            OutputEncoding::Base64 => entry.file_name().as_bytes().first() == Some(&b'.'),
+        };
+        if !params.include_hidden && is_hidden {
             continue;
         }
 
@@ -96,15 +119,14 @@ pub async fn list(params: &serde_json::Value) -> HandlerResult {
         };
 
         let attrs = if params.include_attrs {
-            get_file_attributes(&entry.path().to_string_lossy(), true)
-                .await
-                .ok()
+            get_file_attributes(&entry.path(), true).await.ok()
         } else {
             None
         };
 
         results.push(DirEntry {
             name,
+            name_encoding,
             file_type,
             attrs,
         });
@@ -121,6 +143,7 @@ pub async fn create(params: &serde_json::Value) -> HandlerResult {
     #[derive(Deserialize)]
     struct Params {
         path: String,
+        path_encoding: Option<String>,
         /// Create parent directories if they don't exist
         #[serde(default)]
         parents: bool,
@@ -136,12 +159,12 @@ pub async fn create(params: &serde_json::Value) -> HandlerResult {
     let params: Params = serde_json::from_value(params.clone())
         .map_err(|e| RpcError::invalid_params(e.to_string()))?;
 
-    let path = Path::new(&params.path);
+    let path = decode_path(&params.path, params.path_encoding.as_deref())?;
 
     let result = if params.parents {
-        fs::create_dir_all(path).await
+        fs::create_dir_all(&path).await
     } else {
-        fs::create_dir(path).await
+        fs::create_dir(&path).await
     };
 
     result.map_err(|e| super::file::map_io_error(e, &params.path))?;
@@ -151,7 +174,7 @@ pub async fn create(params: &serde_json::Value) -> HandlerResult {
     {
         use std::os::unix::fs::PermissionsExt;
         let perms = std::fs::Permissions::from_mode(params.mode);
-        fs::set_permissions(path, perms)
+        fs::set_permissions(&path, perms)
             .await
             .map_err(|e| super::file::map_io_error(e, &params.path))?;
     }
@@ -164,6 +187,7 @@ pub async fn remove(params: &serde_json::Value) -> HandlerResult {
     #[derive(Deserialize)]
     struct Params {
         path: String,
+        path_encoding: Option<String>,
         /// Remove recursively
         #[serde(default)]
         recursive: bool,
@@ -172,12 +196,12 @@ pub async fn remove(params: &serde_json::Value) -> HandlerResult {
     let params: Params = serde_json::from_value(params.clone())
         .map_err(|e| RpcError::invalid_params(e.to_string()))?;
 
-    let path = Path::new(&params.path);
+    let path = decode_path(&params.path, params.path_encoding.as_deref())?;
 
     let result = if params.recursive {
-        fs::remove_dir_all(path).await
+        fs::remove_dir_all(&path).await
     } else {
-        fs::remove_dir(path).await
+        fs::remove_dir(&path).await
     };
 
     result.map_err(|e| super::file::map_io_error(e, &params.path))?;
