@@ -281,8 +281,21 @@ Returns the connection plist."
       ;; Need to establish connection
       (tramp-rpc--connect vec))))
 
+(defun tramp-rpc--ensure-controlmaster-directory ()
+  "Ensure the ControlMaster socket directory exists.
+Creates the directory from `tramp-rpc-controlmaster-path' if needed."
+  (when tramp-rpc-use-controlmaster
+    (let* ((path (expand-file-name tramp-rpc-controlmaster-path))
+           (dir (file-name-directory path)))
+      (when (and dir (not (file-directory-p dir)))
+        (make-directory dir t)
+        ;; Set restrictive permissions for security
+        (set-file-modes dir #o700)))))
+
 (defun tramp-rpc--connect (vec)
   "Establish an RPC connection to VEC."
+  ;; Ensure ControlMaster directory exists
+  (tramp-rpc--ensure-controlmaster-directory)
   ;; First, ensure the binary is deployed using shell-based tramp
   (let* ((binary-path (tramp-rpc-deploy-ensure-binary vec))
          (host (tramp-file-name-host vec))
