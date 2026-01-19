@@ -12,7 +12,7 @@
 ;; It tests the RPC server directly via a local pipe connection.
 ;;
 ;; These tests focus on:
-;; - Protocol correctness
+;; - Protocol correctness (MessagePack encoding/decoding)
 ;; - Server response handling
 ;; - Error handling
 ;;
@@ -22,7 +22,6 @@
 ;;; Code:
 
 (require 'ert)
-(require 'json)
 (require 'cl-lib)
 
 ;; Compute project root at load time
@@ -36,69 +35,118 @@
 (let ((lisp-dir (expand-file-name "lisp" tramp-rpc-mock-test--project-root)))
   (add-to-list 'load-path lisp-dir))
 
-(require 'tramp-rpc-protocol)
+;; Install msgpack from MELPA if not available
+(defvar tramp-rpc-mock-test--msgpack-available
+  (or (require 'msgpack nil t)
+      ;; Try to install from MELPA
+      (condition-case err
+          (progn
+            (require 'package)
+            (unless (assoc 'msgpack package-alist)
+              ;; Add MELPA if not present
+              (add-to-list 'package-archives
+                           '("melpa" . "https://melpa.org/packages/") t)
+              (package-initialize)
+              (unless package-archive-contents
+                (package-refresh-contents))
+              (package-install 'msgpack))
+            (require 'msgpack)
+            t)
+        (error
+         (message "Could not install msgpack: %s" err)
+         nil)))
+  "Non-nil if msgpack.el is available.")
+
+(when tramp-rpc-mock-test--msgpack-available
+  (require 'tramp-rpc-protocol))
 
 ;;; ============================================================================
 ;;; Protocol Tests (No server required)
 ;;; ============================================================================
 
 (ert-deftest tramp-rpc-mock-test-protocol-encode-request ()
-  "Test JSON-RPC request encoding."
+  "Test MessagePack-RPC request encoding."
+  (skip-unless tramp-rpc-mock-test--msgpack-available)
   (let* ((result (tramp-rpc-protocol-encode-request-with-id "file.exists" '((path . "/test"))))
          (id (car result))
-         (json-str (cdr result))
-         (parsed (json-read-from-string json-str)))
-    ;; Check structure
-    (should (assoc 'jsonrpc parsed))
-    (should (equal (cdr (assoc 'jsonrpc parsed)) "2.0"))
-    (should (assoc 'method parsed))
-    (should (equal (cdr (assoc 'method parsed)) "file.exists"))
-    (should (assoc 'params parsed))
-    (should (equal (cdr (assoc 'path (cdr (assoc 'params parsed)))) "/test"))
-    (should (assoc 'id parsed))
-    ;; ID should match returned ID
-    (should (equal (cdr (assoc 'id parsed)) id))))
+         (bytes (cdr result)))
+    ;; Should be a unibyte string with length prefix
+    (should (stringp bytes))
+    (should (not (multibyte-string-p bytes)))
+    (should (>= (length bytes) 4))
+    ;; Read length prefix
+    (let* ((len (msgpack-bytes-to-unsigned (substring bytes 0 4)))
+           (payload (substring bytes 4))
+           ;; Decode the MessagePack payload
+           (msgpack-map-type 'alist)
+           (msgpack-key-type 'symbol)
+           (parsed (msgpack-read-from-string payload)))
+      ;; Length should match payload
+      (should (= len (length payload)))
+      ;; Check structure
+      (should (assoc 'version parsed))
+      (should (equal (cdr (assoc 'version parsed)) "2.0"))
+      (should (assoc 'method parsed))
+      (should (equal (cdr (assoc 'method parsed)) "file.exists"))
+      (should (assoc 'params parsed))
+      (should (equal (cdr (assoc 'path (cdr (assoc 'params parsed)))) "/test"))
+      (should (assoc 'id parsed))
+      ;; ID should match returned ID
+      (should (equal (cdr (assoc 'id parsed)) id)))))
 
 (ert-deftest tramp-rpc-mock-test-protocol-decode-success ()
-  "Test JSON-RPC success response decoding."
-  (let* ((response-json "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"exists\":true}}")
-         (response (tramp-rpc-protocol-decode-response response-json)))
+  "Test MessagePack-RPC success response decoding."
+  (skip-unless tramp-rpc-mock-test--msgpack-available)
+  (let* ((response-data '((version . "2.0") (id . 1) (result . ((exists . t)))))
+         (response-bytes (msgpack-encode response-data))
+         (response (tramp-rpc-protocol-decode-response response-bytes)))
     (should (plist-get response :id))
     (should (equal (plist-get response :id) 1))
     (should (plist-get response :result))
     (should-not (tramp-rpc-protocol-error-p response))))
 
 (ert-deftest tramp-rpc-mock-test-protocol-decode-error ()
-  "Test JSON-RPC error response decoding."
-  (let* ((response-json "{\"jsonrpc\":\"2.0\",\"id\":1,\"error\":{\"code\":-32001,\"message\":\"File not found\"}}")
-         (response (tramp-rpc-protocol-decode-response response-json)))
+  "Test MessagePack-RPC error response decoding."
+  (skip-unless tramp-rpc-mock-test--msgpack-available)
+  (let* ((response-data '((version . "2.0")
+                          (id . 1)
+                          (error . ((code . -32001) (message . "File not found")))))
+         (response-bytes (msgpack-encode response-data))
+         (response (tramp-rpc-protocol-decode-response response-bytes)))
     (should (tramp-rpc-protocol-error-p response))
     (should (= (tramp-rpc-protocol-error-code response) -32001))
     (should (equal (tramp-rpc-protocol-error-message response) "File not found"))))
 
 (ert-deftest tramp-rpc-mock-test-protocol-batch-encode ()
-  "Test JSON-RPC batch request encoding."
+  "Test MessagePack-RPC batch request encoding."
+  (skip-unless tramp-rpc-mock-test--msgpack-available)
   (let* ((requests '(("file.exists" . ((path . "/a")))
                      ("file.stat" . ((path . "/b")))))
          (result (tramp-rpc-protocol-encode-batch-request-with-id requests))
          (id (car result))
-         (json-str (cdr result))
-         (parsed (json-read-from-string json-str)))
-    ;; Should be a single request with batch method
-    (should (assoc 'method parsed))
-    (should (equal (cdr (assoc 'method parsed)) "batch"))
-    (should (assoc 'params parsed))
-    (let ((params (cdr (assoc 'params parsed))))
-      (should (assoc 'requests params))
-      (let ((reqs (cdr (assoc 'requests params))))
-        (should (= (length reqs) 2))))))
+         (bytes (cdr result)))
+    ;; Skip length prefix and decode
+    (let* ((payload (substring bytes 4))
+           (msgpack-map-type 'alist)
+           (msgpack-key-type 'symbol)
+           (msgpack-array-type 'list)
+           (parsed (msgpack-read-from-string payload)))
+      ;; Should be a single request with batch method
+      (should (assoc 'method parsed))
+      (should (equal (cdr (assoc 'method parsed)) "batch"))
+      (should (assoc 'params parsed))
+      (let ((params (cdr (assoc 'params parsed))))
+        (should (assoc 'requests params))
+        (let ((reqs (cdr (assoc 'requests params))))
+          (should (= (length reqs) 2)))))))
 
 (ert-deftest tramp-rpc-mock-test-protocol-batch-decode ()
-  "Test JSON-RPC batch response decoding."
+  "Test MessagePack-RPC batch response decoding."
+  (skip-unless tramp-rpc-mock-test--msgpack-available)
   (let* ((response-plist '(:id 1
-                           :result ((results . [((result . t))
+                           :result ((results . (((result . t))
                                                 ((error (code . -32001)
-                                                        (message . "Error")))]))))
+                                                        (message . "Error"))))))))
          (decoded (tramp-rpc-protocol-decode-batch-response response-plist)))
     (should (listp decoded))
     (should (= (length decoded) 2))
@@ -107,12 +155,42 @@
     ;; Second is error
     (should (plist-get (cadr decoded) :error))))
 
+(ert-deftest tramp-rpc-mock-test-protocol-length-framing ()
+  "Test length-prefixed framing functions."
+  (skip-unless tramp-rpc-mock-test--msgpack-available)
+  (let* ((test-data '((foo . "bar")))
+         (payload (msgpack-encode test-data))
+         (framed (tramp-rpc-protocol--length-prefix payload)))
+    ;; Length should be encoded in first 4 bytes
+    (should (= (length framed) (+ 4 (length payload))))
+    (should (= (tramp-rpc-protocol-read-length framed) (length payload)))
+    ;; Try reading a complete message
+    (let* ((response '((version . "2.0") (id . 42) (result . t)))
+           (response-payload (msgpack-encode response))
+           (response-framed (tramp-rpc-protocol--length-prefix response-payload))
+           (read-result (tramp-rpc-protocol-try-read-message response-framed)))
+      (should read-result)
+      (should (consp read-result))
+      (should (= (plist-get (car read-result) :id) 42))
+      (should (equal (cdr read-result) "")))))
+
+(ert-deftest tramp-rpc-mock-test-protocol-incomplete-message ()
+  "Test handling of incomplete messages."
+  (skip-unless tramp-rpc-mock-test--msgpack-available)
+  (let* ((response '((version . "2.0") (id . 1) (result . t)))
+         (payload (msgpack-encode response))
+         (framed (tramp-rpc-protocol--length-prefix payload)))
+    ;; Truncate the message
+    (should-not (tramp-rpc-protocol-try-read-message (substring framed 0 3)))
+    (should-not (tramp-rpc-protocol-try-read-message (substring framed 0 5)))))
+
 ;;; ============================================================================
-;;; JSON-RPC ID Generation Tests
+;;; MessagePack-RPC ID Generation Tests
 ;;; ============================================================================
 
 (ert-deftest tramp-rpc-mock-test-protocol-id-uniqueness ()
   "Test that request IDs are unique."
+  (skip-unless tramp-rpc-mock-test--msgpack-available)
   (let ((ids (make-hash-table :test 'equal)))
     (dotimes (_ 100)
       (let* ((result (tramp-rpc-protocol-encode-request-with-id "test" nil))
@@ -192,34 +270,31 @@
          (rust-debug (expand-file-name "target/debug/tramp-rpc-server"
                                         tramp-rpc-mock-test--project-root))
          (rust-debug-server (expand-file-name "server/target/debug/tramp-rpc-server"
-                                               tramp-rpc-mock-test--project-root))
-         (python-script (expand-file-name "server/tramp-rpc-server.py"
-                                          tramp-rpc-mock-test--project-root)))
+                                               tramp-rpc-mock-test--project-root)))
     (cond
      ((file-executable-p rust-binary) rust-binary)
      ((file-executable-p rust-binary-server) rust-binary-server)
      ((file-executable-p rust-binary-musl) rust-binary-musl)
      ((file-executable-p rust-debug) rust-debug)
      ((file-executable-p rust-debug-server) rust-debug-server)
-     ((file-exists-p python-script) python-script)
      (t nil))))
 
 (defun tramp-rpc-mock-test--start-server ()
   "Start a local RPC server for testing."
   (let ((server (tramp-rpc-mock-test--find-server)))
     (unless server
-      (error "No RPC server found. Build with 'cargo build --release' or use Python server"))
+      (error "No RPC server found. Build with 'cargo build --release'"))
     (setq tramp-rpc-mock-test-temp-dir (make-temp-file "tramp-rpc-test" t))
     (setq tramp-rpc-mock-test-server-buffer (generate-new-buffer "*tramp-rpc-test-server*"))
+    ;; Set buffer to unibyte for binary protocol
+    (with-current-buffer tramp-rpc-mock-test-server-buffer
+      (set-buffer-multibyte nil))
     (setq tramp-rpc-mock-test-server-process
           (let ((process-connection-type nil))  ; Use pipes
-            (if (string-suffix-p ".py" server)
-                (start-process "test-server" tramp-rpc-mock-test-server-buffer
-                               "python3" server)
-              (start-process "test-server" tramp-rpc-mock-test-server-buffer
-                             server))))
+            (start-process "test-server" tramp-rpc-mock-test-server-buffer server)))
     (set-process-query-on-exit-flag tramp-rpc-mock-test-server-process nil)
-    (set-process-coding-system tramp-rpc-mock-test-server-process 'utf-8 'utf-8)
+    ;; Use binary coding for MessagePack protocol
+    (set-process-coding-system tramp-rpc-mock-test-server-process 'binary 'binary)
     ;; Wait for server to be ready
     (sleep-for 0.1)
     tramp-rpc-mock-test-server-process))
@@ -239,36 +314,43 @@
         tramp-rpc-mock-test-temp-dir nil))
 
 (defun tramp-rpc-mock-test--rpc-call (method params)
-  "Send an RPC call to the local test server."
+  "Send an RPC call to the local test server.
+Returns the result or signals an error."
   (unless (and tramp-rpc-mock-test-server-process
                (process-live-p tramp-rpc-mock-test-server-process))
     (error "Server not running"))
   (let* ((id-and-request (tramp-rpc-protocol-encode-request-with-id method params))
+         (expected-id (car id-and-request))
          (request (cdr id-and-request)))
-    ;; Send request
-    (process-send-string tramp-rpc-mock-test-server-process (concat request "\n"))
-    ;; Read response
+    ;; Send request (binary with length prefix, no newline)
+    (process-send-string tramp-rpc-mock-test-server-process request)
+    ;; Read response using length-prefixed framing
     (with-current-buffer tramp-rpc-mock-test-server-buffer
       (let ((timeout 5.0)
-            response-line)
-        (while (and (not response-line) (> timeout 0))
+            response)
+        (while (and (not response) (> timeout 0))
           (accept-process-output tramp-rpc-mock-test-server-process 0.1)
-          (goto-char (point-min))
-          (when (search-forward "\n" nil t)
-            (setq response-line (buffer-substring (point-min) (1- (point))))
-            (delete-region (point-min) (point)))
+          ;; Try to read a complete message
+          (let ((result (tramp-rpc-protocol-try-read-message
+                         (buffer-substring (point-min) (point-max)))))
+            (when result
+              (setq response (car result))
+              ;; Replace buffer contents with remaining data
+              (erase-buffer)
+              (insert (cdr result))))
           (cl-decf timeout 0.1))
-        (when response-line
-          (let ((response (tramp-rpc-protocol-decode-response response-line)))
-            (if (tramp-rpc-protocol-error-p response)
-                (list :error (tramp-rpc-protocol-error-message response))
-              (plist-get response :result))))))))
+        (unless response
+          (error "Timeout waiting for RPC response"))
+        (if (tramp-rpc-protocol-error-p response)
+            (list :error (tramp-rpc-protocol-error-message response))
+          (plist-get response :result))))))
 
 ;;; Server tests (require server to be available)
 
 (ert-deftest tramp-rpc-mock-test-server-system-info ()
   "Test system.info RPC call."
   :tags '(:server)
+  (skip-unless tramp-rpc-mock-test--msgpack-available)
   (skip-unless (tramp-rpc-mock-test--find-server))
   (unwind-protect
       (progn
@@ -285,52 +367,54 @@
 (ert-deftest tramp-rpc-mock-test-server-file-operations ()
   "Test basic file operations via RPC."
   :tags '(:server)
+  (skip-unless tramp-rpc-mock-test--msgpack-available)
   (skip-unless (tramp-rpc-mock-test--find-server))
   (unwind-protect
       (progn
         (tramp-rpc-mock-test--start-server)
         (let ((test-file (expand-file-name "test.txt" tramp-rpc-mock-test-temp-dir)))
-          ;; File shouldn't exist yet (false becomes nil in Emacs JSON)
+          ;; File shouldn't exist yet (false becomes nil in Emacs)
           (let ((result (tramp-rpc-mock-test--rpc-call
-                         "file.exists" `((path . ,test-file)))))
+                         "file.exists" `((path . ,(encode-coding-string test-file 'utf-8))))))
             (should (not result)))
 
-          ;; Write a file
-          (let ((content (base64-encode-string "hello world" t)))
-            (tramp-rpc-mock-test--rpc-call
-             "file.write" `((path . ,test-file)
-                            (content . ,content)
-                            (append . :json-false))))
+          ;; Write a file - content is now raw binary, not base64
+          (tramp-rpc-mock-test--rpc-call
+           "file.write" `((path . ,(encode-coding-string test-file 'utf-8))
+                          (content . "hello world")
+                          (append . :msgpack-false)))
 
           ;; File should exist now
           (let ((result (tramp-rpc-mock-test--rpc-call
-                         "file.exists" `((path . ,test-file)))))
+                         "file.exists" `((path . ,(encode-coding-string test-file 'utf-8))))))
             (should result))
 
-          ;; Read the file
+          ;; Read the file - content comes back as raw binary
           (let ((result (tramp-rpc-mock-test--rpc-call
-                         "file.read" `((path . ,test-file)))))
+                         "file.read" `((path . ,(encode-coding-string test-file 'utf-8))))))
             (should result)
-            (let ((content (base64-decode-string (alist-get 'content result))))
+            (let ((content (alist-get 'content result)))
               (should (equal content "hello world"))))
 
           ;; Get file stats
           (let ((result (tramp-rpc-mock-test--rpc-call
-                         "file.stat" `((path . ,test-file)))))
+                         "file.stat" `((path . ,(encode-coding-string test-file 'utf-8))))))
             (should result)
             (should (equal (alist-get 'type result) "file"))
             (should (= (alist-get 'size result) 11)))  ; "hello world" = 11 bytes
 
           ;; Delete the file
-          (tramp-rpc-mock-test--rpc-call "file.delete" `((path . ,test-file)))
+          (tramp-rpc-mock-test--rpc-call "file.delete"
+                                          `((path . ,(encode-coding-string test-file 'utf-8))))
           (let ((result (tramp-rpc-mock-test--rpc-call
-                         "file.exists" `((path . ,test-file)))))
+                         "file.exists" `((path . ,(encode-coding-string test-file 'utf-8))))))
             (should (not result)))))
     (tramp-rpc-mock-test--stop-server)))
 
 (ert-deftest tramp-rpc-mock-test-server-directory-operations ()
   "Test directory operations via RPC."
   :tags '(:server)
+  (skip-unless tramp-rpc-mock-test--msgpack-available)
   (skip-unless (tramp-rpc-mock-test--find-server))
   (unwind-protect
       (progn
@@ -338,28 +422,29 @@
         (let ((test-dir (expand-file-name "subdir" tramp-rpc-mock-test-temp-dir)))
           ;; Create directory
           (tramp-rpc-mock-test--rpc-call
-           "dir.create" `((path . ,test-dir) (parents . :json-false)))
+           "dir.create" `((path . ,(encode-coding-string test-dir 'utf-8))
+                          (parents . :msgpack-false)))
 
           ;; Check it exists
           (let ((result (tramp-rpc-mock-test--rpc-call
-                         "file.stat" `((path . ,test-dir)))))
+                         "file.stat" `((path . ,(encode-coding-string test-dir 'utf-8))))))
             (should result)
             (should (equal (alist-get 'type result) "directory")))
 
-          ;; Create files in directory
+          ;; Create files in directory - content is raw binary
           (tramp-rpc-mock-test--rpc-call
-           "file.write" `((path . ,(expand-file-name "file1.txt" test-dir))
-                          (content . ,(base64-encode-string "a" t))
-                          (append . :json-false)))
+           "file.write" `((path . ,(encode-coding-string (expand-file-name "file1.txt" test-dir) 'utf-8))
+                          (content . "a")
+                          (append . :msgpack-false)))
           (tramp-rpc-mock-test--rpc-call
-           "file.write" `((path . ,(expand-file-name "file2.txt" test-dir))
-                          (content . ,(base64-encode-string "b" t))
-                          (append . :json-false)))
+           "file.write" `((path . ,(encode-coding-string (expand-file-name "file2.txt" test-dir) 'utf-8))
+                          (content . "b")
+                          (append . :msgpack-false)))
 
           ;; List directory
           (let ((result (tramp-rpc-mock-test--rpc-call
-                         "dir.list" `((path . ,test-dir)
-                                      (include_attrs . :json-false)
+                         "dir.list" `((path . ,(encode-coding-string test-dir 'utf-8))
+                                      (include_attrs . :msgpack-false)
                                       (include_hidden . t)))))
             (should result)
             (let ((names (mapcar (lambda (e) (alist-get 'name e)) result)))
@@ -368,24 +453,19 @@
 
           ;; Remove directory recursively
           (tramp-rpc-mock-test--rpc-call
-           "dir.remove" `((path . ,test-dir) (recursive . t)))
+           "dir.remove" `((path . ,(encode-coding-string test-dir 'utf-8))
+                          (recursive . t)))
 
-          ;; Should be gone (false becomes nil in JSON parsing)
+          ;; Should be gone
           (let ((result (tramp-rpc-mock-test--rpc-call
-                         "file.exists" `((path . ,test-dir)))))
+                         "file.exists" `((path . ,(encode-coding-string test-dir 'utf-8))))))
             (should (not result)))))
     (tramp-rpc-mock-test--stop-server)))
-
-(defun tramp-rpc-mock-test--decode-output (data encoding)
-  "Decode DATA according to ENCODING (text or base64)."
-  (cond
-   ((null data) "")
-   ((equal encoding "text") data)
-   (t (base64-decode-string data))))
 
 (ert-deftest tramp-rpc-mock-test-server-process-run ()
   "Test process.run RPC call."
   :tags '(:server :process)
+  (skip-unless tramp-rpc-mock-test--msgpack-available)
   (skip-unless (tramp-rpc-mock-test--find-server))
   (unwind-protect
       (progn
@@ -397,9 +477,8 @@
                                        (cwd . "/tmp")))))
           (should result)
           (should (= (alist-get 'exit_code result) 0))
-          (let ((stdout (tramp-rpc-mock-test--decode-output
-                         (alist-get 'stdout result)
-                         (alist-get 'stdout_encoding result))))
+          ;; stdout is now raw binary
+          (let ((stdout (alist-get 'stdout result)))
             (should (string-match-p "hello world" stdout)))))
     (tramp-rpc-mock-test--stop-server)))
 
