@@ -1,7 +1,10 @@
 //! TRAMP-RPC Server
 //!
-//! A JSON-RPC 2.0 server for TRAMP remote file access.
-//! Communicates over stdin/stdout using newline-delimited JSON.
+//! A MessagePack-RPC server for TRAMP remote file access.
+//! Communicates over stdin/stdout using length-prefixed MessagePack messages.
+//!
+//! Protocol framing:
+//!   <4-byte big-endian length><msgpack payload>
 //!
 //! Uses tokio for async concurrent request processing - multiple requests
 //! can be processed in parallel while waiting on I/O.
@@ -11,40 +14,54 @@ mod protocol;
 
 use protocol::{Request, Response, RpcError};
 use std::sync::Arc;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, BufWriter};
+use tokio::io::{AsyncReadExt, AsyncWriteExt, BufWriter};
 use tokio::sync::Mutex;
 use tokio::task::JoinSet;
 
 #[tokio::main]
 async fn main() {
-    let stdin = tokio::io::stdin();
-    let stdout = tokio::io::stdout();
+    let mut stdin = tokio::io::stdin();
+    let stdout = Arc::new(Mutex::new(BufWriter::new(tokio::io::stdout())));
 
-    let reader = BufReader::new(stdin);
-    let writer = Arc::new(Mutex::new(BufWriter::new(stdout)));
-
-    let mut lines = reader.lines();
     let mut tasks: JoinSet<()> = JoinSet::new();
 
     // Process requests concurrently
-    while let Ok(Some(line)) = lines.next_line().await {
-        // Skip empty lines
-        if line.trim().is_empty() {
+    loop {
+        // Read 4-byte length prefix (big-endian)
+        let mut len_buf = [0u8; 4];
+        if stdin.read_exact(&mut len_buf).await.is_err() {
+            break; // EOF or error
+        }
+        let len = u32::from_be_bytes(len_buf) as usize;
+
+        // Sanity check - reject obviously invalid lengths
+        if len > 100 * 1024 * 1024 {
+            // 100MB max message size
+            eprintln!("Message too large: {} bytes", len);
             continue;
         }
 
+        // Read payload
+        let mut payload = vec![0u8; len];
+        if stdin.read_exact(&mut payload).await.is_err() {
+            break; // EOF or error
+        }
+
         // Clone writer for this task
-        let writer = Arc::clone(&writer);
+        let writer = Arc::clone(&stdout);
 
         // Spawn a task for each request - allows concurrent processing
         tasks.spawn(async move {
-            let response = process_request(&line).await;
+            let response = process_request(&payload).await;
 
-            // Serialize and send response
-            if let Ok(json) = serde_json::to_string(&response) {
+            // Serialize response with MessagePack
+            if let Ok(msgpack_bytes) = rmp_serde::to_vec_named(&response) {
                 let mut writer = writer.lock().await;
-                let _ = writer.write_all(json.as_bytes()).await;
-                let _ = writer.write_all(b"\n").await;
+                // Write length prefix
+                let len_bytes = (msgpack_bytes.len() as u32).to_be_bytes();
+                let _ = writer.write_all(&len_bytes).await;
+                // Write payload
+                let _ = writer.write_all(&msgpack_bytes).await;
                 let _ = writer.flush().await;
             }
         });
@@ -54,20 +71,20 @@ async fn main() {
     while tasks.join_next().await.is_some() {}
 }
 
-async fn process_request(line: &str) -> Response {
-    // Parse the request
-    let request: Request = match serde_json::from_str(line) {
+async fn process_request(payload: &[u8]) -> Response {
+    // Parse the request from MessagePack
+    let request: Request = match rmp_serde::from_slice(payload) {
         Ok(r) => r,
         Err(e) => {
             return Response::error(None, RpcError::parse_error(e.to_string()));
         }
     };
 
-    // Validate JSON-RPC version
-    if request.jsonrpc != "2.0" {
+    // Validate RPC version
+    if request.version != "2.0" {
         return Response::error(
             Some(request.id),
-            RpcError::invalid_request("Invalid JSON-RPC version"),
+            RpcError::invalid_request("Invalid RPC version"),
         );
     }
 
@@ -78,25 +95,41 @@ async fn process_request(line: &str) -> Response {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rmpv::Value;
+
+    fn make_request(method: &str, params: Value) -> Vec<u8> {
+        let request = rmpv::Value::Map(vec![
+            (Value::String("version".into()), Value::String("2.0".into())),
+            (Value::String("id".into()), Value::Integer(1.into())),
+            (Value::String("method".into()), Value::String(method.into())),
+            (Value::String("params".into()), params),
+        ]);
+        rmp_serde::to_vec_named(&request).unwrap()
+    }
 
     #[tokio::test]
     async fn test_parse_request() {
-        let json = r#"{"jsonrpc":"2.0","id":1,"method":"file.exists","params":{"path":"/tmp"}}"#;
-        let response = process_request(json).await;
+        let params = Value::Map(vec![(
+            Value::String("path".into()),
+            Value::String("/tmp".into()),
+        )]);
+        let payload = make_request("file.exists", params);
+        let response = process_request(&payload).await;
         assert!(response.error.is_none());
     }
 
     #[tokio::test]
-    async fn test_invalid_json() {
-        let response = process_request("not json").await;
+    async fn test_invalid_msgpack() {
+        let response = process_request(b"not msgpack").await;
         assert!(response.error.is_some());
         assert_eq!(response.error.unwrap().code, RpcError::PARSE_ERROR);
     }
 
     #[tokio::test]
     async fn test_method_not_found() {
-        let json = r#"{"jsonrpc":"2.0","id":1,"method":"nonexistent.method","params":{}}"#;
-        let response = process_request(json).await;
+        let params = Value::Map(vec![]);
+        let payload = make_request("nonexistent.method", params);
+        let response = process_request(&payload).await;
         assert!(response.error.is_some());
         assert_eq!(response.error.unwrap().code, RpcError::METHOD_NOT_FOUND);
     }

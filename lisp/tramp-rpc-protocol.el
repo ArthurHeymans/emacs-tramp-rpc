@@ -1,10 +1,10 @@
-;;; tramp-rpc-protocol.el --- JSON-RPC protocol for TRAMP-RPC -*- lexical-binding: t; -*-
+;;; tramp-rpc-protocol.el --- MessagePack-RPC protocol for TRAMP-RPC -*- lexical-binding: t; -*-
 
 ;; Copyright (C) 2026 Arthur Heymans <arthur@aheymans.xyz>
 
 ;; Author: Arthur Heymans <arthur@aheymans.xyz>
 ;; Keywords: comm, processes
-;; Package-Requires: ((emacs "30.1"))
+;; Package-Requires: ((emacs "30.1") (msgpack "0"))
 
 ;; This file is part of tramp-rpc.
 
@@ -15,12 +15,14 @@
 
 ;;; Commentary:
 
-;; This file provides the JSON-RPC 2.0 protocol implementation for
+;; This file provides the MessagePack-RPC protocol implementation for
 ;; communicating with the tramp-rpc-server binary.
+;;
+;; Protocol framing: <4-byte big-endian length><msgpack payload>
 
 ;;; Code:
 
-(require 'json)
+(require 'msgpack)
 
 (defvar tramp-rpc-protocol--request-id 0
   "Counter for generating unique request IDs.")
@@ -29,32 +31,39 @@
   "Generate the next request ID."
   (cl-incf tramp-rpc-protocol--request-id))
 
+(defun tramp-rpc-protocol--length-prefix (payload)
+  "Add 4-byte big-endian length prefix to PAYLOAD (unibyte string)."
+  (let ((len (length payload)))
+    (concat (msgpack-unsigned-to-bytes len 4) payload)))
+
 (defun tramp-rpc-protocol-encode-request (method params)
-  "Encode a JSON-RPC 2.0 request for METHOD with PARAMS.
-Returns a JSON string."
-  (let ((request `((jsonrpc . "2.0")
-                   (id . ,(tramp-rpc-protocol--next-id))
-                   (method . ,method)
-                   (params . ,params))))
-    (json-encode request)))
+  "Encode a MessagePack-RPC request for METHOD with PARAMS.
+Returns a length-prefixed unibyte string ready for transmission."
+  (let* ((request `((version . "2.0")
+                    (id . ,(tramp-rpc-protocol--next-id))
+                    (method . ,method)
+                    (params . ,params)))
+         (payload (msgpack-encode request)))
+    (tramp-rpc-protocol--length-prefix payload)))
 
 (defun tramp-rpc-protocol-encode-request-with-id (method params)
-  "Encode a JSON-RPC 2.0 request for METHOD with PARAMS.
-Returns a cons cell (ID . JSON-STRING) for pipelining support."
+  "Encode a MessagePack-RPC request for METHOD with PARAMS.
+Returns a cons cell (ID . BYTES) for pipelining support."
   (let* ((id (tramp-rpc-protocol--next-id))
-         (request `((jsonrpc . "2.0")
+         (request `((version . "2.0")
                     (id . ,id)
                     (method . ,method)
-                    (params . ,params))))
-    (cons id (json-encode request))))
+                    (params . ,params)))
+         (payload (msgpack-encode request)))
+    (cons id (tramp-rpc-protocol--length-prefix payload))))
 
-(defun tramp-rpc-protocol-decode-response (json-string)
-  "Decode a JSON-RPC 2.0 response from JSON-STRING.
+(defun tramp-rpc-protocol-decode-response (bytes)
+  "Decode a MessagePack-RPC response from BYTES (unibyte string).
 Returns a plist with :id, :result, and :error keys."
-  (let* ((response (json-parse-string json-string
-                                      :object-type 'alist
-                                      :false-object nil
-                                      :null-object nil))
+  (let* ((msgpack-map-type 'alist)
+         (msgpack-key-type 'symbol)
+         (msgpack-array-type 'list)
+         (response (msgpack-read-from-string bytes))
          (id (alist-get 'id response))
          (result (alist-get 'result response))
          (error-obj (alist-get 'error response)))
@@ -89,13 +98,37 @@ Returns a plist with :id, :result, and :error keys."
 (defconst tramp-rpc-protocol-error-process -32004)
 
 ;; ============================================================================
+;; Length-prefixed framing support
+;; ============================================================================
+
+(defun tramp-rpc-protocol-read-length (bytes)
+  "Read the 4-byte big-endian length from BYTES.
+Returns the length as an integer, or nil if BYTES is too short."
+  (when (>= (length bytes) 4)
+    (msgpack-bytes-to-unsigned (substring bytes 0 4))))
+
+(defun tramp-rpc-protocol-try-read-message (buffer)
+  "Try to read a complete message from BUFFER.
+BUFFER should be a unibyte string containing received data.
+Returns (MESSAGE . REMAINING) if a complete message is available,
+where MESSAGE is the decoded response plist and REMAINING is
+the leftover bytes.  Returns nil if no complete message yet."
+  (when (>= (length buffer) 4)
+    (let ((len (tramp-rpc-protocol-read-length buffer)))
+      (when (and len (>= (length buffer) (+ 4 len)))
+        (let* ((payload (substring buffer 4 (+ 4 len)))
+               (remaining (substring buffer (+ 4 len)))
+               (response (tramp-rpc-protocol-decode-response payload)))
+          (cons response remaining))))))
+
+;; ============================================================================
 ;; Batch request support
 ;; ============================================================================
 
 (defun tramp-rpc-protocol-encode-batch-request (requests)
   "Encode a batch request containing multiple REQUESTS.
 REQUESTS is a list of (METHOD . PARAMS) cons cells.
-Returns a JSON string for a single RPC call to the batch method."
+Returns length-prefixed bytes for a single RPC call to the batch method."
   (let ((batch-requests
          (mapcar (lambda (req)
                    `((method . ,(car req))
@@ -108,7 +141,7 @@ Returns a JSON string for a single RPC call to the batch method."
 (defun tramp-rpc-protocol-encode-batch-request-with-id (requests)
   "Encode a batch request containing multiple REQUESTS.
 REQUESTS is a list of (METHOD . PARAMS) cons cells.
-Returns a cons cell (ID . JSON-STRING) for ID tracking."
+Returns a cons cell (ID . BYTES) for ID tracking."
   (let ((batch-requests
          (mapcar (lambda (req)
                    `((method . ,(car req))

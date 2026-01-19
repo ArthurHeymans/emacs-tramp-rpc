@@ -156,6 +156,15 @@ Value is a plist with :vec, :pid.")
 (defvar tramp-rpc--async-callbacks (make-hash-table :test 'eql)
   "Hash table mapping request IDs to callback functions for async RPC calls.")
 
+(defvar tramp-rpc--pending-responses (make-hash-table :test 'eq)
+  "Hash table mapping buffers to their pending response hash tables.
+Each buffer has its own hash table mapping request IDs to response plists.")
+
+(defun tramp-rpc--get-pending-responses (buffer)
+  "Get the pending responses hash table for BUFFER, creating if needed."
+  (or (gethash buffer tramp-rpc--pending-responses)
+      (puthash buffer (make-hash-table :test 'eql) tramp-rpc--pending-responses)))
+
 (defvar tramp-rpc--process-write-queues (make-hash-table :test 'eql)
   "Hash table mapping remote PIDs to write queue state.
 Value is a plist with :pending (list of pending write data) and :writing (bool).")
@@ -477,10 +486,10 @@ Returns non-nil on success."
          (buffer (get-buffer-create buffer-name))
          process)
 
-    ;; Clear buffer - use multibyte to handle UTF-8 JSON properly
+    ;; Clear buffer - use unibyte for binary MessagePack framing
     (with-current-buffer buffer
       (erase-buffer)
-      (set-buffer-multibyte t))
+      (set-buffer-multibyte nil))
 
     ;; Start the process with pipe connection (not PTY)
     ;; PTY has line buffering and ~4KB line length limits that break large JSON-RPC requests
@@ -489,7 +498,7 @@ Returns non-nil on success."
 
     ;; Configure process
     (set-process-query-on-exit-flag process nil)
-    (set-process-coding-system process 'utf-8 'utf-8)
+    (set-process-coding-system process 'binary 'binary)
     
     ;; Set up filter for async response handling
     (set-process-filter process #'tramp-rpc--connection-filter)
@@ -542,7 +551,8 @@ Returns non-nil on success."
 
 (defun tramp-rpc--connection-filter (process output)
   "Filter for RPC connection PROCESS receiving OUTPUT.
-Handles async responses by dispatching to registered callbacks."
+Handles async responses by dispatching to registered callbacks.
+Uses length-prefixed binary framing: <4-byte BE length><msgpack payload>."
   (let ((buffer (process-buffer process)))
     (when (buffer-live-p buffer)
       (with-current-buffer buffer
@@ -551,33 +561,30 @@ Handles async responses by dispatching to registered callbacks."
         (insert output)
         (tramp-rpc--debug "FILTER received %d bytes, buffer-size=%d"
                          (length output) (buffer-size))
-        ;; Process complete lines for async callbacks
+        ;; Process complete messages
         (goto-char (point-min))
-        (while (search-forward "\n" nil t)
-          (let* ((line-end (point))
-                 ;; Point is after \n, so go back to get start of the line we just passed
-                 (line-start (save-excursion
-                               (goto-char (1- line-end))
-                               (line-beginning-position)))
-                 (line (buffer-substring line-start (1- line-end))))
-            (when (> (length line) 0)
-              (condition-case err
-                  (let* ((response (tramp-rpc-protocol-decode-response line))
-                         (id (plist-get response :id))
-                         (callback (gethash id tramp-rpc--async-callbacks)))
-                    (if callback
-                        (progn
-                          (tramp-rpc--debug "FILTER dispatching async id=%s" id)
-                          ;; Remove this line from buffer - it's handled async
-                          (delete-region line-start line-end)
-                          (goto-char (point-min))
-                          ;; Remove callback and call it
-                          (remhash id tramp-rpc--async-callbacks)
-                          (funcall callback response))
-                      ;; Not an async response - leave for sync code
-                      (tramp-rpc--debug "FILTER leaving sync response id=%s in buffer" id)))
-                (error
-                 (tramp-rpc--debug "FILTER parse error: %S line=%S" err line))))))))))
+        (let ((result t))
+          (while result
+            (setq result (tramp-rpc-protocol-try-read-message
+                          (buffer-substring (point-min) (point-max))))
+            (when result
+              (let ((response (car result))
+                    (remaining (cdr result)))
+                ;; Replace buffer contents with remaining data
+                (erase-buffer)
+                (insert remaining)
+                (goto-char (point-min))
+                ;; Handle the response
+                (let* ((id (plist-get response :id))
+                       (callback (gethash id tramp-rpc--async-callbacks)))
+                  (if callback
+                      (progn
+                        (tramp-rpc--debug "FILTER dispatching async id=%s" id)
+                        (remhash id tramp-rpc--async-callbacks)
+                        (funcall callback response))
+                    ;; Not an async response - store for sync code
+                    (tramp-rpc--debug "FILTER storing sync response id=%s" id)
+                    (puthash id response (tramp-rpc--get-pending-responses buffer))))))))))))
 
 (defun tramp-rpc--call-async (vec method params callback)
   "Call METHOD with PARAMS asynchronously on the RPC server for VEC.
@@ -591,8 +598,8 @@ Returns the request ID."
     (tramp-rpc--debug "SEND-ASYNC id=%s method=%s" id method)
     ;; Register callback
     (puthash id callback tramp-rpc--async-callbacks)
-    ;; Send request
-    (process-send-string process (concat request "\n"))
+    ;; Send request (binary data with length prefix, no newline)
+    (process-send-string process request)
     id))
 
 (defun tramp-rpc--call (vec method params)
@@ -607,26 +614,13 @@ Uses 5s total timeout with 10ms polling."
   (tramp-rpc--call-with-timeout vec method params 5 0.01))
 
 (defun tramp-rpc--find-response-by-id (expected-id)
-  "Search current buffer for a JSON-RPC response with EXPECTED-ID.
-Returns (LINE-START . LINE-END) if found, nil otherwise.
-Does not modify the buffer."
-  (save-excursion
-    (goto-char (point-min))
-    (catch 'found
-      (while (search-forward "\n" nil t)
-        (let* ((line-end (point))
-               (line-start (save-excursion
-                             (goto-char (1- line-end))
-                             (line-beginning-position)))
-               (line (buffer-substring line-start (1- line-end))))
-          (when (> (length line) 0)
-            (condition-case nil
-                (let* ((response (tramp-rpc-protocol-decode-response line))
-                       (id (plist-get response :id)))
-                  (when (equal id expected-id)
-                    (throw 'found (cons line-start line-end))))
-              (error nil)))))
-      nil)))
+  "Check pending responses for EXPECTED-ID.
+Returns the response plist if found and removes it from pending, nil otherwise."
+  (let* ((pending (tramp-rpc--get-pending-responses (current-buffer)))
+         (response (gethash expected-id pending)))
+    (when response
+      (remhash expected-id pending)
+      response)))
 
 (defun tramp-rpc--call-with-timeout (vec method params total-timeout poll-interval)
   "Call METHOD with PARAMS on the RPC server for VEC.
@@ -642,16 +636,15 @@ Returns the result or signals an error."
 
     (tramp-rpc--debug "SEND id=%s method=%s" expected-id method)
 
-    ;; Send request
-    (process-send-string process (concat request "\n"))
+    ;; Send request (binary data with length prefix, no newline)
+    (process-send-string process request)
 
     ;; Wait for response with matching ID
     (with-current-buffer buffer
       (let ((timeout total-timeout)
-            response-line
-            response-bounds)
+            response)
         ;; Wait for a response with the correct ID
-        (while (and (not response-line)
+        (while (and (not response)
                     (> timeout 0)
                     (process-live-p process))
           ;; Use same pattern as tramp-accept-process-output:
@@ -662,38 +655,32 @@ Returns the result or signals an error."
           (if (with-local-quit
                 (accept-process-output process poll-interval nil t)
                 t)
-              ;; Check if our response arrived (search by ID)
-              (when (setq response-bounds (tramp-rpc--find-response-by-id expected-id))
-                (setq response-line (buffer-substring
-                                     (car response-bounds)
-                                     (1- (cdr response-bounds))))
-                ;; Clear only our response from the buffer
-                (delete-region (car response-bounds) (cdr response-bounds))
-                (tramp-rpc--debug "RECV id=%s (found)" expected-id))
+              ;; Check if our response arrived in pending responses
+              (setq response (tramp-rpc--find-response-by-id expected-id))
             ;; User quit - propagate it
             (tramp-rpc--debug "QUIT id=%s (user interrupted)" expected-id)
             (keyboard-quit))
           (cl-decf timeout poll-interval))
 
-        (unless response-line
-          (tramp-rpc--debug "TIMEOUT id=%s method=%s buffer-contents=%S"
-                           expected-id method (buffer-string))
+        (unless response
+          (tramp-rpc--debug "TIMEOUT id=%s method=%s buffer-size=%d"
+                           expected-id method (buffer-size))
           (error "Timeout waiting for RPC response from %s (id=%s, method=%s)"
                  (tramp-file-name-host vec) expected-id method))
 
-        (let ((response (tramp-rpc-protocol-decode-response response-line)))
-          (if (tramp-rpc-protocol-error-p response)
-              (let ((code (tramp-rpc-protocol-error-code response))
-                    (msg (tramp-rpc-protocol-error-message response)))
-                (tramp-rpc--debug "ERROR id=%s code=%s msg=%s" expected-id code msg)
-                (cond
-                 ((= code tramp-rpc-protocol-error-file-not-found)
-                  (signal 'file-missing (list "RPC" "No such file" msg)))
-                 ((= code tramp-rpc-protocol-error-permission-denied)
-                  (signal 'file-error (list "RPC" "Permission denied" msg)))
-                 (t
-                  (error "RPC error: %s" msg))))
-            (plist-get response :result)))))))
+        (tramp-rpc--debug "RECV id=%s (found)" expected-id)
+        (if (tramp-rpc-protocol-error-p response)
+            (let ((code (tramp-rpc-protocol-error-code response))
+                  (msg (tramp-rpc-protocol-error-message response)))
+              (tramp-rpc--debug "ERROR id=%s code=%s msg=%s" expected-id code msg)
+              (cond
+               ((= code tramp-rpc-protocol-error-file-not-found)
+                (signal 'file-missing (list "RPC" "No such file" msg)))
+               ((= code tramp-rpc-protocol-error-permission-denied)
+                (signal 'file-error (list "RPC" "Permission denied" msg)))
+               (t
+                (error "RPC error: %s" msg))))
+          (plist-get response :result))))))
 
 (defun tramp-rpc--call-batch (vec requests)
   "Execute multiple RPC REQUESTS in a single round-trip for VEC.
@@ -719,45 +706,39 @@ Returns:
 
     (tramp-rpc--debug "SEND-BATCH id=%s count=%d" expected-id (length requests))
 
-    ;; Send batch request
-    (process-send-string process (concat request "\n"))
+    ;; Send batch request (binary data with length prefix, no newline)
+    (process-send-string process request)
 
     ;; Wait for response with matching ID
     (with-current-buffer buffer
       (let ((timeout 30)
-            response-line
-            response-bounds)
-        (while (and (not response-line)
+            response)
+        (while (and (not response)
                     (> timeout 0)
                     (process-live-p process))
           (if (with-local-quit
                 (accept-process-output process 0.1 nil t)
                 t)
-              ;; Check if our response arrived (search by ID)
-              (when (setq response-bounds (tramp-rpc--find-response-by-id expected-id))
-                (setq response-line (buffer-substring
-                                     (car response-bounds)
-                                     (1- (cdr response-bounds))))
-                (delete-region (car response-bounds) (cdr response-bounds))
-                (tramp-rpc--debug "RECV-BATCH id=%s (found)" expected-id))
+              ;; Check if our response arrived in pending responses
+              (setq response (tramp-rpc--find-response-by-id expected-id))
             (tramp-rpc--debug "QUIT-BATCH id=%s (user interrupted)" expected-id)
             (keyboard-quit))
           (cl-decf timeout 0.1))
 
-        (unless response-line
-          (tramp-rpc--debug "TIMEOUT-BATCH id=%s buffer-contents=%S"
-                           expected-id (buffer-string))
+        (unless response
+          (tramp-rpc--debug "TIMEOUT-BATCH id=%s buffer-size=%d"
+                           expected-id (buffer-size))
           (error "Timeout waiting for batch RPC response from %s (id=%s)"
                  (tramp-file-name-host vec) expected-id))
 
-        (let ((response (tramp-rpc-protocol-decode-response response-line)))
-          (if (tramp-rpc-protocol-error-p response)
-              (progn
-                (tramp-rpc--debug "ERROR-BATCH id=%s msg=%s"
-                                 expected-id (tramp-rpc-protocol-error-message response))
-                (error "Batch RPC error: %s"
-                       (tramp-rpc-protocol-error-message response)))
-            (tramp-rpc-protocol-decode-batch-response response)))))))
+        (tramp-rpc--debug "RECV-BATCH id=%s (found)" expected-id)
+        (if (tramp-rpc-protocol-error-p response)
+            (progn
+              (tramp-rpc--debug "ERROR-BATCH id=%s msg=%s"
+                               expected-id (tramp-rpc-protocol-error-message response))
+              (error "Batch RPC error: %s"
+                     (tramp-rpc-protocol-error-message response)))
+          (tramp-rpc-protocol-decode-batch-response response))))))
 
 ;; ============================================================================
 ;; Request pipelining support
@@ -771,13 +752,14 @@ Returns a list of request IDs in the same order."
          (process (plist-get conn :process))
          ids)
     (dolist (req requests)
-      (let* ((id-and-json (tramp-rpc-protocol-encode-request-with-id
-                           (car req) (cdr req)))
-             (id (car id-and-json))
-             (json (cdr id-and-json)))
+      (let* ((id-and-bytes (tramp-rpc-protocol-encode-request-with-id
+                            (car req) (cdr req)))
+             (id (car id-and-bytes))
+             (bytes (cdr id-and-bytes)))
         (tramp-rpc--debug "SEND-PIPE id=%s method=%s" id (car req))
         (push id ids)
-        (process-send-string process (concat json "\n"))))
+        ;; Send binary data with length prefix, no newline
+        (process-send-string process bytes)))
     (nreverse ids)))
 
 (defun tramp-rpc--receive-responses (vec ids &optional timeout)
@@ -798,19 +780,15 @@ TIMEOUT is the maximum time to wait in seconds (default 30)."
         (if (with-local-quit
               (accept-process-output process 0.1 nil t)
               t)
-            ;; Check for each remaining ID
+            ;; Check for each remaining ID in pending responses
             (dolist (id remaining-ids)
-              (let ((bounds (tramp-rpc--find-response-by-id id)))
-                (when bounds
-                  (let* ((line (buffer-substring (car bounds) (1- (cdr bounds))))
-                         (response (tramp-rpc-protocol-decode-response line)))
-                    (tramp-rpc--debug "RECV-PIPE found id=%s" id)
-                    ;; Store response by ID
-                    (puthash id response responses)
-                    ;; Remove from remaining
-                    (setq remaining-ids (delete id remaining-ids))
-                    ;; Remove from buffer
-                    (delete-region (car bounds) (cdr bounds))))))
+              (let ((response (tramp-rpc--find-response-by-id id)))
+                (when response
+                  (tramp-rpc--debug "RECV-PIPE found id=%s" id)
+                  ;; Store response by ID
+                  (puthash id response responses)
+                  ;; Remove from remaining
+                  (setq remaining-ids (delete id remaining-ids)))))
           (tramp-rpc--debug "RECV-PIPE quit (user interrupted)")
           (keyboard-quit))
         (cl-decf timeout 0.1)))
@@ -884,60 +862,41 @@ Example:
 ;; Output decoding helper
 ;; ============================================================================
 
-(defun tramp-rpc--decode-output (data encoding)
-  "Decode DATA according to ENCODING.
-ENCODING is either \"text\" (raw UTF-8) or \"base64\" (base64-encoded).
-If ENCODING is nil, defaults to \"base64\" for backward compatibility."
+(defun tramp-rpc--decode-string (data)
+  "Decode DATA from raw bytes to multibyte UTF-8 string.
+With MessagePack, strings come as raw bytes (unibyte string).
+We decode them as UTF-8 to get proper multibyte strings.
+Returns nil if DATA is nil, empty string if DATA is empty."
   (cond
-   ((null data) "")
-   ((equal encoding "text") data)
-   (t (base64-decode-string data))))
+   ((null data) nil)
+   ((and (stringp data) (> (length data) 0))
+    (decode-coding-string data 'utf-8-unix))
+   (t data)))
+
+(defun tramp-rpc--decode-output (data _encoding)
+  "Decode DATA from raw bytes to multibyte UTF-8 string.
+With MessagePack, data comes as raw bytes (unibyte string).
+We decode it as UTF-8 to get a proper multibyte string.
+ENCODING is ignored (kept for API compatibility)."
+  (or (tramp-rpc--decode-string data) ""))
 
 (defun tramp-rpc--decode-filename (entry)
-  "Decode filename from directory ENTRY.
-Handles both text and base64-encoded filenames.
-Returns the filename as a unibyte string (for non-UTF8 names) or
-a multibyte string (for UTF-8 names)."
-  (let ((name (alist-get 'name entry))
-        (encoding (alist-get 'name_encoding entry)))
-    (if (equal encoding "base64")
-        ;; Base64-encoded filename (contains non-UTF8 bytes)
-        ;; Return as unibyte string to preserve raw bytes
-        (base64-decode-string name)
-      ;; Normal UTF-8 filename
-      name)))
+  "Get filename from directory ENTRY.
+With MessagePack, filenames come as raw bytes - decode to UTF-8."
+  (tramp-rpc--decode-string (alist-get 'name entry)))
 
-(defun tramp-rpc--path-needs-encoding-p (path)
-  "Return non-nil if PATH contains bytes that can't be sent as UTF-8.
-This includes:
-- Unibyte strings with bytes > 127
-- Multibyte strings with raw-byte characters (codepoints >= #x3fff80)"
-  (or
-   ;; Unibyte string with high bytes
-   (and (not (multibyte-string-p path))
-        (string-match-p "[^\x00-\x7f]" path))
-   ;; Multibyte string with raw-byte characters (eight-bit characters)
-   ;; These have codepoints in the range #x3fff80 to #x3fffff
-   (and (multibyte-string-p path)
-        (let ((dominated nil))
-          (dotimes (i (length path))
-            (let ((char (aref path i)))
-              (when (>= char #x3fff80)
-                (setq dominated t))))
-          dominated))))
+(defun tramp-rpc--path-to-bytes (path)
+  "Convert PATH to a unibyte string for MessagePack transmission.
+Handles both multibyte UTF-8 strings and unibyte byte strings."
+  (if (multibyte-string-p path)
+      (encode-coding-string path 'utf-8-unix)
+    path))
 
 (defun tramp-rpc--encode-path (path)
   "Encode PATH for transmission to the server.
-If PATH contains non-UTF8 bytes, encode it as base64.
-Returns an alist with path and optionally path_encoding."
-  (if (tramp-rpc--path-needs-encoding-p path)
-      ;; Path contains raw bytes - encode as base64
-      ;; Use 'raw-text to get the actual bytes
-      (let ((raw-bytes (encode-coding-string path 'raw-text)))
-        `((path . ,(base64-encode-string raw-bytes t))
-          (path_encoding . "base64")))
-    ;; Normal UTF-8 path
-    `((path . ,path))))
+With MessagePack, paths are sent directly as strings/binary.
+Returns an alist with path."
+  `((path . ,(tramp-rpc--path-to-bytes path))))
 
 ;; ============================================================================
 ;; File name handler operations
@@ -1004,7 +963,7 @@ Optimized to use pipelined requests for better performance."
                                        (append (tramp-rpc--encode-path localname)
                                                '((lstat . t))))))
           (when (equal (alist-get 'type result) "symlink")
-            (alist-get 'link_target result)))
+            (tramp-rpc--decode-string (alist-get 'link_target result))))
       (file-missing nil))))
 
 (defun tramp-rpc-handle-file-truename (filename)
@@ -1014,12 +973,12 @@ If the file doesn't exist, return FILENAME unchanged
   (with-parsed-tramp-file-name filename nil
     (condition-case nil
         (let* ((result (tramp-rpc--call v "file.truename" (tramp-rpc--encode-path localname)))
-               (path (alist-get 'path result))
-               (encoding (alist-get 'path_encoding result))
-               (decoded-path (if (equal encoding "base64")
-                                 (base64-decode-string path)
-                               path)))
-          (tramp-make-tramp-file-name v decoded-path))
+               ;; With MessagePack, path comes as raw bytes - decode to UTF-8
+               (path (tramp-rpc--decode-string
+                      (if (stringp result)
+                          result  ; Direct binary result
+                        (alist-get 'path result)))))  ; Or in result object
+          (tramp-make-tramp-file-name v path))
       ;; If file doesn't exist, return the filename unchanged
       (file-missing filename))))
 
@@ -1040,13 +999,13 @@ ID-FORMAT specifies whether to use numeric or string IDs."
          (type (pcase type-str
                  ("file" nil)
                  ("directory" t)
-                 ("symlink" (alist-get 'link_target stat))
+                 ("symlink" (tramp-rpc--decode-string (alist-get 'link_target stat)))
                  (_ nil)))
          (nlinks (alist-get 'nlinks stat))
          (uid (alist-get 'uid stat))
          (gid (alist-get 'gid stat))
-         (uname (alist-get 'uname stat))
-         (gname (alist-get 'gname stat))
+         (uname (tramp-rpc--decode-string (alist-get 'uname stat)))
+         (gname (tramp-rpc--decode-string (alist-get 'gname stat)))
          (atime (seconds-to-time (alist-get 'atime stat)))
          (mtime (seconds-to-time (alist-get 'mtime stat)))
          (ctime (seconds-to-time (alist-get 'ctime stat)))
@@ -1134,7 +1093,7 @@ TYPE is the file type string."
   (with-parsed-tramp-file-name (expand-file-name directory) nil
     (let* ((result (tramp-rpc--call v "dir.list"
                                     (append (tramp-rpc--encode-path localname)
-                                            '((include_attrs . :json-false)
+                                            '((include_attrs . :msgpack-false)
                                               (include_hidden . t)))))
            (files (mapcar #'tramp-rpc--decode-filename result)))
       ;; Filter by match pattern
@@ -1199,10 +1158,10 @@ TYPE is the file type string."
         (all-completions
          filename
          ;; Get all entries in the directory
-         (let* ((result (tramp-rpc--call v "dir.list"
-                                         (append (tramp-rpc--encode-path localname)
-                                                 '((include_attrs . :json-false)
-                                                   (include_hidden . t)))))
+(let* ((result (tramp-rpc--call v "dir.list"
+                                          (append (tramp-rpc--encode-path localname)
+                                                  '((include_attrs . :msgpack-false)
+                                                    (include_hidden . t)))))
                 ;; Convert vector to list if needed
                 (entries (if (vectorp result) (append result nil) result)))
            ;; Build list of names with trailing / for directories
@@ -1219,14 +1178,14 @@ TYPE is the file type string."
   (with-parsed-tramp-file-name dir nil
     (tramp-rpc--call v "dir.create"
                      (append (tramp-rpc--encode-path localname)
-                             `((parents . ,(if parents t :json-false)))))))
+                             `((parents . ,(if parents t :msgpack-false)))))))
 
 (defun tramp-rpc-handle-delete-directory (directory &optional recursive trash)
   "Like `delete-directory' for TRAMP-RPC files."
   (tramp-skeleton-delete-directory directory recursive trash
     (tramp-rpc--call v "dir.remove"
                      (append (tramp-rpc--encode-path localname)
-                             `((recursive . ,(if recursive t :json-false)))))))
+                             `((recursive . ,(if recursive t :msgpack-false)))))))
 
 (defun tramp-rpc--parse-dired-switches (switches)
   "Parse SWITCHES string into a plist of options.
@@ -1267,7 +1226,7 @@ Supported switches: -a -t -S -r -h --group-directories-first."
            (result (tramp-rpc--call v "dir.list"
                                     (append (tramp-rpc--encode-path localname)
                                             `((include_attrs . t)
-                                              (include_hidden . ,(if (plist-get opts :show-hidden) t :json-false))))))
+                                              (include_hidden . ,(if (plist-get opts :show-hidden) t :msgpack-false))))))
            ;; Convert vector to list if needed
            (result-list (if (vectorp result) (append result nil) result))
            ;; Pre-decode names and extract sort keys
@@ -1320,11 +1279,13 @@ Supported switches: -a -t -S -r -h --group-directories-first."
                (nlinks (or (alist-get 'nlinks attrs) 1))
                (uid (or (alist-get 'uid attrs) 0))
                (gid (or (alist-get 'gid attrs) 0))
-               (uname (or (alist-get 'uname attrs) (number-to-string uid)))
-               (gname (or (alist-get 'gname attrs) (number-to-string gid)))
+               (uname (or (tramp-rpc--decode-string (alist-get 'uname attrs))
+                          (number-to-string uid)))
+               (gname (or (tramp-rpc--decode-string (alist-get 'gname attrs))
+                          (number-to-string gid)))
                (size (plist-get entry-data :size))
                (mtime (alist-get 'mtime attrs))
-               (link-target (alist-get 'link_target attrs))
+               (link-target (tramp-rpc--decode-string (alist-get 'link_target attrs)))
                (mode-str (tramp-rpc--mode-to-string (or mode 0) (or type "file")))
                (size-str (tramp-rpc--format-size size (plist-get opts :human-readable)))
                (time-str (if mtime
@@ -1352,8 +1313,8 @@ Supported switches: -a -t -S -r -h --group-directories-first."
            (_ (when beg (push `(offset . ,beg) params)))
            (_ (when end (push `(length . ,(- end (or beg 0))) params)))
            (result (tramp-rpc--call v "file.read" params))
-           ;; Get raw bytes from base64
-           (content (base64-decode-string (alist-get 'content result)))
+           ;; With MessagePack, content is already raw bytes (unibyte string)
+           (content (alist-get 'content result))
            (size (length content))
            (point-before (point)))
 
@@ -1387,10 +1348,11 @@ Supported switches: -a -t -S -r -h --group-directories-first."
                       (buffer-substring-no-properties
                        (or start (point-min))
                        (or end (point-max)))))
-           (encoded (base64-encode-string (encode-coding-string content 'utf-8-unix) t))
+           ;; With MessagePack, send content as binary directly
+           (content-bytes (encode-coding-string content 'utf-8-unix))
            (params (append (tramp-rpc--encode-path localname)
-                           `((content . ,encoded)
-                             (append . ,(if append t :json-false))))))
+                           `((content . ,(msgpack-bin-make content-bytes))
+                             (append . ,(if append t :msgpack-false))))))
 
       ;; Check mustbenew
       (when mustbenew
@@ -1433,7 +1395,7 @@ Supported switches: -a -t -S -r -h --group-directories-first."
           (tramp-rpc--call v1 "file.copy"
                            `((src . ,v1-localname)
                              (dest . ,v2-localname)
-                             (preserve . ,(if (or keep-time preserve-permissions) t :json-false)))))))
+                             (preserve . ,(if (or keep-time preserve-permissions) t :msgpack-false)))))))
      ;; Remote source, local dest - read via RPC, write locally
      ((and source-remote (not dest-remote))
       (unless ok-if-already-exists
@@ -1482,7 +1444,7 @@ Supported switches: -a -t -S -r -h --group-directories-first."
           (tramp-rpc--call v1 "file.rename"
                            `((src . ,v1-localname)
                              (dest . ,v2-localname)
-                             (overwrite . ,(if ok-if-already-exists t :json-false)))))))
+                             (overwrite . ,(if ok-if-already-exists t :msgpack-false)))))))
      ;; Different hosts, copy then delete
      (t
       (copy-file filename newname ok-if-already-exists t t t)
@@ -1575,7 +1537,7 @@ ID-FORMAT specifies whether to return integer GIDs or string names."
         (mapcar (lambda (g)
                   (if (eq id-format 'integer)
                       (alist-get 'gid g)
-                    (or (alist-get 'name g)
+                    (or (tramp-rpc--decode-string (alist-get 'name g))
                         (number-to-string (alist-get 'gid g)))))
                 result))
     (error nil)))
@@ -1621,12 +1583,13 @@ Returns t on success, nil on failure."
     (when (and (stringp acl-string)
                (tramp-rpc--acl-enabled-p v))
       ;; Use setfacl with --set-file=- to read ACL from stdin
-      (let* ((encoded-acl (base64-encode-string acl-string t))
+      ;; stdin must be binary for MessagePack
+      (let* ((acl-bytes (encode-coding-string acl-string 'utf-8-unix))
              (result (tramp-rpc--call v "process.run"
                                       `((cmd . "setfacl")
                                         (args . ["--set-file=-" ,localname])
                                         (cwd . "/")
-                                        (stdin . ,encoded-acl)))))
+                                        (stdin . ,(msgpack-bin-make acl-bytes))))))
         (zerop (alist-get 'exit_code result))))))
 
 ;; ============================================================================
@@ -1705,8 +1668,9 @@ Resolves PROGRAM path and loads direnv environment from working directory."
            (direnv-env (tramp-rpc--get-direnv-environment v localname))
            (stdin-content (when (and infile (not (eq infile t)))
                             (with-temp-buffer
-                              (insert-file-contents infile)
-                              (base64-encode-string (buffer-string) t))))
+                              (set-buffer-multibyte nil)
+                              (insert-file-contents-literally infile)
+                              (buffer-string))))
            (result (tramp-rpc--call v "process.run"
                                     `((cmd . ,resolved-program)
                                       (args . ,(vconcat args))
@@ -1895,7 +1859,8 @@ Caches the result per connection."
   "Create a local copy of remote FILENAME using RPC."
   (with-parsed-tramp-file-name filename nil
     (let* ((result (tramp-rpc--call v "file.read" (tramp-rpc--encode-path localname)))
-           (content (base64-decode-string (alist-get 'content result)))
+           ;; With MessagePack, content is already raw bytes
+           (content (alist-get 'content result))
            (tmpfile (make-temp-file "tramp-rpc.")))
       (with-temp-file tmpfile
         (set-buffer-multibyte nil)
@@ -1913,7 +1878,7 @@ home directory from system.info.  For other users, looks up via getent."
             (equal target-user conn-user))
         ;; Current user - use system.info
         (let ((result (tramp-rpc--call vec "system.info" nil)))
-          (alist-get 'home result))
+          (tramp-rpc--decode-string (alist-get 'home result)))
       ;; Different user - look up via getent passwd
       (condition-case nil
           (let* ((result (tramp-rpc--call vec "process.run"
@@ -2084,10 +2049,13 @@ This prevents race conditions where later messages arrive before earlier ones."
         ;; Mark as writing and remove from pending
         (puthash queue-key (list :pending (cdr pending) :writing t)
                  tramp-rpc--process-write-queues)
-        ;; Send the write
-        (tramp-rpc--call-async vec "process.write"
-                               `((pid . ,pid)
-                                 (data . ,(base64-encode-string data t)))
+        ;; Send the write - data must be binary for MessagePack
+        (let ((data-bytes (if (multibyte-string-p data)
+                              (encode-coding-string data 'utf-8-unix)
+                            data)))
+          (tramp-rpc--call-async vec "process.write"
+                                 `((pid . ,pid)
+                                   (data . ,(msgpack-bin-make data-bytes)))
                                (lambda (response)
                                  (when (plist-get response :error)
                                    (tramp-rpc--debug "WRITE-ERROR pid=%s: %s"
@@ -2097,7 +2065,7 @@ This prevents race conditions where later messages arrive before earlier ones."
                                    (puthash queue-key
                                             (list :pending (plist-get q :pending) :writing nil)
                                             tramp-rpc--process-write-queues))
-                                 (tramp-rpc--process-write-queue queue-key)))))))
+                                 (tramp-rpc--process-write-queue queue-key))))))))
 
 (defun tramp-rpc--close-remote-stdin (vec pid)
   "Close stdin of remote process PID on VEC."
@@ -2808,11 +2776,14 @@ For tramp-rpc processes, resize the remote PTY and update eat's display."
         (let ((vec (process-get proc :tramp-rpc-vec))
               (pid (process-get proc :tramp-rpc-pid)))
           (tramp-rpc--debug "SEND-STRING PTY pid=%s len=%d" pid (length string))
-          ;; Send write request asynchronously - don't wait for response
-          (tramp-rpc--call-async vec "process.write_pty"
-                                 `((pid . ,pid)
-                                   (data . ,(base64-encode-string string t)))
-                                 #'ignore)  ; Ignore the response
+          ;; Send write request asynchronously - data must be binary for MessagePack
+          (let ((data-bytes (if (multibyte-string-p string)
+                                (encode-coding-string string 'utf-8-unix)
+                              string)))
+            (tramp-rpc--call-async vec "process.write_pty"
+                                   `((pid . ,pid)
+                                     (data . ,(msgpack-bin-make data-bytes)))
+                                   #'ignore))  ; Ignore the response
           nil))
        ;; Regular async RPC process (pipe-based)
        ((and proc

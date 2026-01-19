@@ -66,9 +66,21 @@ jobs:
         with:
           version: ${{ matrix.emacs_version }}
 
+      - name: Install dependencies
+        run: |
+          emacs -Q --batch \
+            --eval "(require 'package)" \
+            --eval "(add-to-list 'package-archives '(\"melpa\" . \"https://melpa.org/packages/\") t)" \
+            --eval "(package-initialize)" \
+            --eval "(package-refresh-contents)" \
+            --eval "(package-install 'msgpack)"
+
       - name: Byte-compile
         run: |
           emacs -Q --batch \
+            --eval "(require 'package)" \
+            --eval "(add-to-list 'package-archives '(\"melpa\" . \"https://melpa.org/packages/\") t)" \
+            --eval "(package-initialize)" \
             --eval "(setq byte-compile-error-on-warn t)" \
             --eval "(push \"$(pwd)/lisp\" load-path)" \
             -f batch-byte-compile lisp/*.el
@@ -93,9 +105,21 @@ jobs:
         with:
           version: '30.1'
 
+      - name: Install dependencies
+        run: |
+          emacs -Q --batch \
+            --eval "(require 'package)" \
+            --eval "(add-to-list 'package-archives '(\"melpa\" . \"https://melpa.org/packages/\") t)" \
+            --eval "(package-initialize)" \
+            --eval "(package-refresh-contents)" \
+            --eval "(package-install 'msgpack)"
+
       - name: Run protocol tests
         run: |
           emacs -Q --batch \
+            --eval "(require 'package)" \
+            --eval "(add-to-list 'package-archives '(\"melpa\" . \"https://melpa.org/packages/\") t)" \
+            --eval "(package-initialize)" \
             --eval "(setq debug-on-error t)" \
             -l test/tramp-rpc-mock-tests.el \
             --eval "(ert-run-tests-batch-and-exit \"^tramp-rpc-mock-test-protocol\")"
@@ -123,9 +147,21 @@ jobs:
       - name: Make server executable
         run: chmod +x target/x86_64-unknown-linux-musl/release/tramp-rpc-server
 
+      - name: Install dependencies
+        run: |
+          emacs -Q --batch \
+            --eval "(require 'package)" \
+            --eval "(add-to-list 'package-archives '(\"melpa\" . \"https://melpa.org/packages/\") t)" \
+            --eval "(package-initialize)" \
+            --eval "(package-refresh-contents)" \
+            --eval "(package-install 'msgpack)"
+
       - name: Run server integration tests
         run: |
           emacs -Q --batch \
+            --eval "(require 'package)" \
+            --eval "(add-to-list 'package-archives '(\"melpa\" . \"https://melpa.org/packages/\") t)" \
+            --eval "(package-initialize)" \
             --eval "(setq debug-on-error t)" \
             -l test/tramp-rpc-mock-tests.el \
             --eval "(ert-run-tests-batch-and-exit '(tag :server))"
@@ -180,11 +216,23 @@ jobs:
           mkdir -p ~/.cache/tramp-rpc
           cp target/x86_64-unknown-linux-musl/release/tramp-rpc-server ~/.cache/tramp-rpc/tramp-rpc-server-${VERSION}
 
+      - name: Install dependencies
+        run: |
+          emacs -Q --batch \
+            --eval "(require 'package)" \
+            --eval "(add-to-list 'package-archives '(\"melpa\" . \"https://melpa.org/packages/\") t)" \
+            --eval "(package-initialize)" \
+            --eval "(package-refresh-contents)" \
+            --eval "(package-install 'msgpack)"
+
       - name: Run full test suite
         env:
           TRAMP_RPC_TEST_HOST: localhost
         run: |
           emacs -Q --batch \
+            --eval "(require 'package)" \
+            --eval "(add-to-list 'package-archives '(\"melpa\" . \"https://melpa.org/packages/\") t)" \
+            --eval "(package-initialize)" \
             --eval "(setq debug-on-error t)" \
             --eval "(setq tramp-verbose 0)" \
             -l test/tramp-rpc-tests.el \

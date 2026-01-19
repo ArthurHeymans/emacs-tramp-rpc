@@ -5,7 +5,7 @@
 
 * Executive Summary
 
-TRAMP-RPC is a high-performance alternative TRAMP backend that replaces shell command parsing with a binary JSON-RPC server. This document provides an in-depth technical comparison between TRAMP-RPC and the original TRAMP implementation (tramp-sh).
+TRAMP-RPC is a high-performance alternative TRAMP backend that replaces shell command parsing with a binary MessagePack-RPC server. This document provides an in-depth technical comparison between TRAMP-RPC and the original TRAMP implementation (tramp-sh).
 
 Key findings:
 - *2-14x faster* for most file operations
@@ -71,8 +71,8 @@ TRAMP-RPC uses a binary RPC server architecture:
 │   Emacs     │      │              Remote Host                      │
 │ (tramp-rpc) │◄────►│  tramp-rpc-server (Rust binary)               │
 │             │      │       │                                       │
-│  JSON-RPC   │      │       ├─► Native syscalls (stat, read, ...)   │
-│  Protocol   │      │       └─► Process spawning (tokio)            │
+│ MessagePack │      │       ├─► Native syscalls (stat, read, ...)   │
+│ RPC Protocol│      │       └─► Process spawning (tokio)            │
 └─────────────┘      └───────────────────────────────────────────────┘
 #+end_example
 
@@ -81,18 +81,18 @@ TRAMP-RPC uses a binary RPC server architecture:
 1. *Binary Deployment*: On first connection, deploys a pre-compiled binary
 2. *Single Process*: The server handles all operations via RPC
 3. *Native Operations*: Uses direct syscalls instead of shell commands
-4. *Structured Data*: Returns JSON responses, no parsing needed
+4. *Structured Data*: Returns MessagePack responses, no parsing needed
 
-For example, to get file attributes, TRAMP-RPC sends:
+For example, to get file attributes, TRAMP-RPC sends (MessagePack-encoded):
 
-#+begin_src json
-{"jsonrpc":"2.0","id":1,"method":"file.stat","params":{"path":"/path/to/file"}}
+#+begin_src elisp
+((version . "2.0") (id . 1) (method . "file.stat") (params . ((path . "/path/to/file"))))
 #+end_src
 
-And receives:
+And receives (MessagePack-encoded):
 
-#+begin_src json
-{"jsonrpc":"2.0","id":1,"result":{"type":"file","size":1234,"mode":420,...}}
+#+begin_src elisp
+((version . "2.0") (id . 1) (result . ((type . "file") (size . 1234) (mode . 420) ...)))
 #+end_src
 
 *** TRAMP-RPC Source Structure
@@ -100,7 +100,7 @@ And receives:
 | Component                  | Lines  | Purpose                            |
 |----------------------------+--------+------------------------------------|
 | lisp/tramp-rpc.el          | ~2200  | Main Emacs integration             |
-| lisp/tramp-rpc-protocol.el | ~125   | JSON-RPC protocol handling         |
+| lisp/tramp-rpc-protocol.el | ~125   | MessagePack-RPC protocol handling  |
 | lisp/tramp-rpc-deploy.el   | ~260   | Binary deployment                  |
 | server/src/main.rs         | ~100   | Server entry point (Rust)          |
 | server/src/handlers/       | ~1200  | RPC method implementations         |
@@ -133,18 +133,18 @@ Challenges:
 
 ** TRAMP-RPC Protocol
 
-TRAMP-RPC uses JSON-RPC 2.0 over stdin/stdout:
+TRAMP-RPC uses MessagePack-RPC over stdin/stdout with length-prefixed binary framing:
 
 #+begin_src
 Emacs → SSH → tramp-rpc-server stdin
-Request: {"jsonrpc":"2.0","id":1,"method":"file.exists","params":{"path":"/path"}}
-Response: {"jsonrpc":"2.0","id":1,"result":true}
+Request: <length-prefix><msgpack: {version:"2.0",id:1,method:"file.exists",params:{path:"/path"}}>
+Response: <length-prefix><msgpack: {version:"2.0",id:1,result:true}>
 #+end_src
 
 Advantages:
-- Deterministic protocol
+- Deterministic binary protocol
 - No shell quoting issues
-- Strongly typed parameters and responses
+- Native binary data support (no base64 overhead)
 - Support for concurrent/pipelined requests
 
 *** RPC Methods
@@ -254,7 +254,7 @@ Tests performed on WiFi network between two Linux hosts (x220-nixos target).
 
 1. *Reduced Protocol Overhead*
    - Original: prompt wait → send command → wait for output → parse
-   - RPC: send JSON → receive JSON (single round-trip)
+   - RPC: send request → receive response (single round-trip)
 
 2. *Native Syscalls*
    - Original: ~stat --format='...' file~ → parse text
@@ -262,7 +262,7 @@ Tests performed on WiFi network between two Linux hosts (x220-nixos target).
 
 3. *No Shell Quoting*
    - Original: Must escape paths with special characters
-   - RPC: Paths are JSON strings, no escaping needed
+   - RPC: Paths are binary data, no escaping needed
 
 4. *Batch Operations*
    - Original: N operations = N round-trips

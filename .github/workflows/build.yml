@@ -62,7 +62,7 @@ jobs:
       - name: Build
         run: |
           nix develop --command bash -c '
-          RUSTFLAGS="-C target-feature=+crt-static -Zlocation-detail=none -Zunstable-options -Cpanic=immediate-abort" \
+          RUSTFLAGS="-D warnings -C target-feature=+crt-static -Zlocation-detail=none -Zunstable-options -Cpanic=immediate-abort" \
           cargo build --release --target ${{ inputs.target }} \
             --manifest-path server/Cargo.toml \
             -Z build-std=std,panic_abort \
@@ -74,6 +74,8 @@ jobs:
       - name: Test
         if: inputs.test
         run: nix develop --command cargo test --manifest-path server/Cargo.toml
+        env:
+          RUSTFLAGS: "-D warnings"
 
       - name: Upload binary for CI
         if: ${{ !inputs.upload }}
