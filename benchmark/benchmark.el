@@ -238,7 +238,7 @@ Simulates what magit does: multiple different git commands in one batch."
            ("file.stat" . ((path . ,localname)))
            ("file.readable" . ((path . ,localname)))
            ("file.writable" . ((path . ,localname)))
-           ("dir.list" . ((path . ,localname) (include_attrs . :json-false)))))))))
+           ("dir.list" . ((path . ,localname) (include_attrs . :msgpack-false)))))))))
 
 (defun tramp-rpc-benchmark--sequential-mixed-ops (method)
   "Benchmark sequential mixed operations for METHOD.
