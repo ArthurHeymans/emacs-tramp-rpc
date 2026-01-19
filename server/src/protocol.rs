@@ -206,11 +206,19 @@ pub enum StatResult {
 /// Directory entry
 #[derive(Debug, Serialize, Deserialize)]
 pub struct DirEntry {
+    /// Filename (may be base64-encoded if name_encoding is "base64")
     pub name: String,
+    /// Encoding of the name field: "text" for valid UTF-8, "base64" for non-UTF8
+    #[serde(default = "default_name_encoding")]
+    pub name_encoding: OutputEncoding,
     #[serde(rename = "type")]
     pub file_type: FileType,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub attrs: Option<FileAttributes>,
+}
+
+fn default_name_encoding() -> OutputEncoding {
+    OutputEncoding::Text
 }
 
 // ============================================================================
