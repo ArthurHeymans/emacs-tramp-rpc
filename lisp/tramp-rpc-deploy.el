@@ -109,6 +109,22 @@ Use \"sshx\" to avoid PTY allocation issues, or \"ssh\" for standard SSH."
   :type 'integer
   :group 'tramp-rpc-deploy)
 
+(defcustom tramp-rpc-deploy-debug nil
+  "When non-nil, log verbose debug messages during deployment.
+Messages are logged to *tramp-rpc-deploy* buffer."
+  :type 'boolean
+  :group 'tramp-rpc-deploy)
+
+(defun tramp-rpc-deploy--log (format-string &rest args)
+  "Log a debug message if `tramp-rpc-deploy-debug' is non-nil.
+FORMAT-STRING and ARGS are passed to `format'."
+  (when tramp-rpc-deploy-debug
+    (with-current-buffer (get-buffer-create "*tramp-rpc-deploy*")
+      (goto-char (point-max))
+      (insert (format-time-string "[%Y-%m-%d %H:%M:%S] ")
+              (apply #'format format-string args)
+              "\n"))))
+
 ;;; ============================================================================
 ;;; Architecture detection and path helpers
 ;;; ============================================================================
@@ -514,6 +530,11 @@ Uses TRAMP's copy-file for reliable binary transfer with checksum verification."
          (success nil)
          (errors nil))
     
+    (tramp-rpc-deploy--log "Transfer starting: local=%s remote=%s" local-path remote-local)
+    (tramp-rpc-deploy--log "Local binary size: %d bytes, checksum: %s..."
+                           (file-attribute-size (file-attributes local-path))
+                           (substring local-checksum 0 16))
+    
     ;; Ensure remote directory exists
     (tramp-rpc-deploy--ensure-remote-directory vec)
     
@@ -657,6 +678,96 @@ signals an error."
       (insert "--------------\n")
       (dolist (arch '("x86_64-linux" "aarch64-linux" "x86_64-darwin" "aarch64-darwin"))
         (insert (format "  %s:\n    %s\n" arch (tramp-rpc-deploy--download-url arch)))))
+    (display-buffer buf)))
+
+(defun tramp-rpc-deploy-diagnose (host &optional user)
+  "Run diagnostics for deploying to HOST.
+Optional USER specifies the SSH user.
+This helps troubleshoot deployment issues."
+  (interactive "sHost: \nsUser (leave empty for default): ")
+  (when (string-empty-p user)
+    (setq user nil))
+  (let ((buf (get-buffer-create "*tramp-rpc-diagnose*")))
+    (with-current-buffer buf
+      (erase-buffer)
+      (insert (format "TRAMP-RPC Deployment Diagnostics for %s%s\n"
+                      (if user (concat user "@") "") host))
+      (insert "=" (make-string 50 ?=) "\n\n")
+      
+      ;; Test 1: SSH connectivity
+      (insert "1. Testing SSH connectivity...\n")
+      (let* ((ssh-cmd (append
+                       (list "ssh" "-o" "BatchMode=yes" "-o" "ConnectTimeout=10")
+                       (when user (list "-l" user))
+                       (list host "echo 'SSH_OK'")))
+             (output (with-temp-buffer
+                       (apply #'call-process (car ssh-cmd) nil t nil (cdr ssh-cmd))
+                       (buffer-string))))
+        (if (string-match-p "SSH_OK" output)
+            (insert "   [OK] SSH connection successful\n")
+          (insert "   [FAIL] SSH connection failed\n")
+          (insert (format "   Output: %s\n" (string-trim output)))))
+      
+      ;; Test 2: Remote architecture
+      (insert "\n2. Detecting remote architecture...\n")
+      (let* ((ssh-cmd (append
+                       (list "ssh" "-o" "BatchMode=yes")
+                       (when user (list "-l" user))
+                       (list host "uname -m && uname -s")))
+             (output (with-temp-buffer
+                       (if (zerop (apply #'call-process (car ssh-cmd) nil t nil (cdr ssh-cmd)))
+                           (buffer-string)
+                         "FAILED"))))
+        (if (string-match-p "FAILED" output)
+            (insert "   [FAIL] Could not detect architecture\n")
+          (insert (format "   [OK] Architecture: %s\n" (string-trim output)))))
+      
+      ;; Test 3: Remote directory writable
+      (insert "\n3. Testing remote directory access...\n")
+      (let* ((dir tramp-rpc-deploy-remote-directory)
+             (ssh-cmd (append
+                       (list "ssh" "-o" "BatchMode=yes")
+                       (when user (list "-l" user))
+                       (list host (format "mkdir -p %s && test -w %s && echo 'WRITABLE'"
+                                          (shell-quote-argument dir)
+                                          (shell-quote-argument dir)))))
+             (output (with-temp-buffer
+                       (apply #'call-process (car ssh-cmd) nil t nil (cdr ssh-cmd))
+                       (buffer-string))))
+        (if (string-match-p "WRITABLE" output)
+            (insert (format "   [OK] Directory %s is writable\n" dir))
+          (insert (format "   [FAIL] Directory %s not writable\n" dir))))
+      
+      ;; Test 4: Checksum command
+      (insert "\n4. Testing checksum command availability...\n")
+      (let* ((ssh-cmd (append
+                       (list "ssh" "-o" "BatchMode=yes")
+                       (when user (list "-l" user))
+                       (list host "which sha256sum || which shasum || echo 'NONE'")))
+             (output (with-temp-buffer
+                       (apply #'call-process (car ssh-cmd) nil t nil (cdr ssh-cmd))
+                       (string-trim (buffer-string)))))
+        (if (string-match-p "NONE" output)
+            (insert "   [FAIL] No checksum command found (need sha256sum or shasum)\n")
+          (insert (format "   [OK] Found: %s\n" output))))
+      
+      ;; Test 5: Local binary availability
+      (insert "\n5. Checking local binary cache...\n")
+      (dolist (arch '("x86_64-linux" "aarch64-linux" "x86_64-darwin" "aarch64-darwin"))
+        (let ((path (tramp-rpc-deploy--local-cache-path arch))
+              (bundled (tramp-rpc-deploy--bundled-binary-path arch)))
+          (cond
+           ((and bundled (file-exists-p bundled))
+            (insert (format "   [OK] %s: bundled binary available\n" arch)))
+           ((file-exists-p path)
+            (insert (format "   [OK] %s: cached at %s\n" arch path)))
+           (t
+            (insert (format "   [ ] %s: not available locally\n" arch))))))
+      
+      (insert "\n\nIf deployment fails, try:\n")
+      (insert "  1. Enable debug logging: (setq tramp-rpc-deploy-debug t)\n")
+      (insert "  2. Retry the connection and check *tramp-rpc-deploy* buffer\n")
+      (insert "  3. Manually test: ssh " (if user (concat user "@") "") host " echo success\n"))
     (display-buffer buf)))
 
 (provide 'tramp-rpc-deploy)
