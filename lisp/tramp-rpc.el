@@ -67,9 +67,12 @@ The control socket is stored in `tramp-rpc-controlmaster-path'."
   :type 'boolean
   :group 'tramp-rpc)
 
-(defcustom tramp-rpc-controlmaster-path "~/.ssh/tramp-rpc-%%r@%%h:%%p"
+(defcustom tramp-rpc-controlmaster-path "~/.ssh/tramp-rpc/%C"
   "Path template for SSH ControlMaster socket.
-Use SSH escape sequences: %%r=remote user, %%h=host, %%p=port.
+Use SSH escape sequences: %r=remote user, %h=host, %p=port, %C=connection hash.
+The %C token (available in OpenSSH 6.7+) creates a unique hash from
+%l%h%p%r (local host, remote host, port, user), avoiding path length issues.
+For older OpenSSH versions, use: ~/.ssh/tramp-rpc-%r@%h:%p
 The directory must exist and be writable."
   :type 'string
   :group 'tramp-rpc)
