@@ -1105,31 +1105,92 @@ TYPE is the file type string."
                      (append (tramp-rpc--encode-path localname)
                              `((recursive . ,(if recursive t :json-false)))))))
 
+(defun tramp-rpc--parse-dired-switches (switches)
+  "Parse SWITCHES string into a plist of options.
+Supported switches:
+  -a: show hidden files
+  -t: sort by modification time
+  -S: sort by size
+  -r: reverse sort order
+  -h: human-readable sizes
+  --group-directories-first: directories before files"
+  (let ((sw (or switches "")))
+    (list
+     :show-hidden (string-match-p "a" sw)
+     :sort-by-time (string-match-p "t" sw)
+     :sort-by-size (string-match-p "S" sw)
+     :reverse (string-match-p "r" sw)
+     :human-readable (string-match-p "h" sw)
+     :group-directories-first (string-match-p "group-directories-first" sw))))
+
+(defun tramp-rpc--format-size (size human-readable)
+  "Format SIZE for display.
+If HUMAN-READABLE is non-nil, use human-readable format (K, M, G)."
+  (if human-readable
+      (cond
+       ((>= size 1073741824) (format "%5.1fG" (/ size 1073741824.0)))
+       ((>= size 1048576) (format "%5.1fM" (/ size 1048576.0)))
+       ((>= size 1024) (format "%5.1fK" (/ size 1024.0)))
+       (t (format "%6d" size)))
+    (format "%8d" size)))
+
 (defun tramp-rpc-handle-insert-directory
     (filename switches &optional _wildcard _full-directory-p)
   "Like `insert-directory' for TRAMP-RPC files.
-Produces ls-like output for dired."
+Produces ls-like output for dired.
+Supported switches: -a -t -S -r -h --group-directories-first."
   (with-parsed-tramp-file-name (expand-file-name filename) nil
-    (let* ((result (tramp-rpc--call v "dir.list"
+    (let* ((opts (tramp-rpc--parse-dired-switches switches))
+           (result (tramp-rpc--call v "dir.list"
                                     (append (tramp-rpc--encode-path localname)
                                             `((include_attrs . t)
-                                              (include_hidden . ,(if (string-match-p "a" (or switches "")) t :json-false))))))
+                                              (include_hidden . ,(if (plist-get opts :show-hidden) t :json-false))))))
            ;; Convert vector to list if needed
            (result-list (if (vectorp result) (append result nil) result))
-           ;; Pre-decode names for sorting and display
-           (entries-with-names (mapcar (lambda (entry)
-                                         (cons (tramp-rpc--decode-filename entry) entry))
-                                       result-list))
-           (sorted-entries (sort entries-with-names
-                                 (lambda (a b) (string< (car a) (car b))))))
+           ;; Pre-decode names and extract sort keys
+           (entries-with-data
+            (mapcar (lambda (entry)
+                      (let* ((name (tramp-rpc--decode-filename entry))
+                             (attrs (alist-get 'attrs entry))
+                             (type (alist-get 'type attrs))
+                             (size (or (alist-get 'size attrs) 0))
+                             (mtime (or (alist-get 'mtime attrs) 0))
+                             (is-dir (equal type "directory")))
+                        (list :name name :entry entry :size size
+                              :mtime mtime :is-dir is-dir)))
+                    result-list))
+           ;; Sort entries based on switches
+           (sorted-entries
+            (let* ((sort-fn
+                    (cond
+                     ((plist-get opts :sort-by-time)
+                      (lambda (a b) (> (plist-get a :mtime) (plist-get b :mtime))))
+                     ((plist-get opts :sort-by-size)
+                      (lambda (a b) (> (plist-get a :size) (plist-get b :size))))
+                     (t
+                      (lambda (a b) (string< (plist-get a :name) (plist-get b :name))))))
+                   ;; Apply --group-directories-first
+                   (sorted (if (plist-get opts :group-directories-first)
+                               (append
+                                (sort (cl-remove-if-not (lambda (e) (plist-get e :is-dir))
+                                                        entries-with-data)
+                                      sort-fn)
+                                (sort (cl-remove-if (lambda (e) (plist-get e :is-dir))
+                                                    entries-with-data)
+                                      sort-fn))
+                             (sort entries-with-data sort-fn))))
+              ;; Apply reverse if requested
+              (if (plist-get opts :reverse)
+                  (nreverse sorted)
+                sorted))))
       ;; Insert header
       (insert (format "  %s:\n" filename))
       (insert "  total 0\n")  ; We don't calculate total blocks
 
       ;; Insert each entry
-      (dolist (name-entry sorted-entries)
-        (let* ((name (car name-entry))
-               (entry (cdr name-entry))
+      (dolist (entry-data sorted-entries)
+        (let* ((name (plist-get entry-data :name))
+               (entry (plist-get entry-data :entry))
                (attrs (alist-get 'attrs entry))
                (type (alist-get 'type attrs))
                (mode (alist-get 'mode attrs))
@@ -1138,18 +1199,19 @@ Produces ls-like output for dired."
                (gid (or (alist-get 'gid attrs) 0))
                (uname (or (alist-get 'uname attrs) (number-to-string uid)))
                (gname (or (alist-get 'gname attrs) (number-to-string gid)))
-               (size (or (alist-get 'size attrs) 0))
+               (size (plist-get entry-data :size))
                (mtime (alist-get 'mtime attrs))
                (link-target (alist-get 'link_target attrs))
                (mode-str (tramp-rpc--mode-to-string (or mode 0) (or type "file")))
+               (size-str (tramp-rpc--format-size size (plist-get opts :human-readable)))
                (time-str (if mtime
                              (format-time-string "%b %e %H:%M" (seconds-to-time mtime))
                            "Jan  1 00:00")))
           ;; Skip . and .. unless -a is given
           (unless (and (member name '("." ".."))
-                       (not (string-match-p "a" (or switches ""))))
-            (insert (format "  %s %3d %-8s %-8s %8d %s %s"
-                            mode-str nlinks uname gname size time-str name))
+                       (not (plist-get opts :show-hidden)))
+            (insert (format "  %s %3d %-8s %-8s %s %s %s"
+                            mode-str nlinks uname gname size-str time-str name))
             (when (and link-target (equal type "symlink"))
               (insert (format " -> %s" link-target)))
             (insert "\n")))))))
