@@ -441,6 +441,42 @@ The directory is deleted after BODY completes."
                                    (buffer-string)))))
       (ignore-errors (delete-file file)))))
 
+(ert-deftest tramp-rpc-test05-write-region-chinese ()
+  "Test `write-region' with Chinese characters.
+This tests Issue #13: Chinese characters decode incorrectly."
+  :expected-result (if (tramp-rpc-test-enabled) :passed :failed)
+  (skip-unless (tramp-rpc-test-enabled))
+
+  (let ((file (tramp-rpc-test--make-temp-name))
+        ;; Test various Chinese characters including common and less common ones
+        (content "中文测试\n你好世界\n繁體中文\n日本語テスト"))
+    (unwind-protect
+        (progn
+          (write-region content nil file)
+          (should (file-exists-p file))
+          ;; Verify content is read back correctly
+          (let ((read-content (with-temp-buffer
+                                (insert-file-contents file)
+                                (buffer-string))))
+            (should (equal content read-content))))
+      (ignore-errors (delete-file file)))))
+
+(ert-deftest tramp-rpc-test05-write-region-mixed-unicode ()
+  "Test `write-region' with mixed Unicode content."
+  :expected-result (if (tramp-rpc-test-enabled) :passed :failed)
+  (skip-unless (tramp-rpc-test-enabled))
+
+  (let ((file (tramp-rpc-test--make-temp-name))
+        ;; Mix of ASCII, Chinese, Japanese, Korean, and emoji
+        (content "Hello 你好 こんにちは 안녕하세요"))
+    (unwind-protect
+        (progn
+          (write-region content nil file)
+          (should (equal content (with-temp-buffer
+                                   (insert-file-contents file)
+                                   (buffer-string)))))
+      (ignore-errors (delete-file file)))))
+
 (ert-deftest tramp-rpc-test05-write-region-append ()
   "Test `write-region' with append."
   :expected-result (if (tramp-rpc-test-enabled) :passed :failed)
