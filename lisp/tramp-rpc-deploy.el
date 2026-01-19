@@ -213,7 +213,9 @@ This is useful for development - run scripts/build-all.sh to populate."
 
 (defun tramp-rpc-deploy--release-asset-name (arch)
   "Return the release asset filename for ARCH."
-  (format "tramp-rpc-server-%s-%s.tar.gz" arch tramp-rpc-deploy-version))
+  (format "tramp-rpc-server-%s-%s.tar.gz"
+          (tramp-rpc-deploy--arch-to-rust-target arch)
+          tramp-rpc-deploy-version))
 
 (defun tramp-rpc-deploy--download-url (arch)
   "Return the download URL for binary of ARCH."
@@ -227,7 +229,9 @@ This is useful for development - run scripts/build-all.sh to populate."
   (format tramp-rpc-deploy-release-url-format
           tramp-rpc-deploy-github-repo
           tramp-rpc-deploy-version
-          (format "tramp-rpc-server-%s-%s.tar.gz.sha256" arch tramp-rpc-deploy-version)))
+          (format "tramp-rpc-server-%s-%s.tar.gz.sha256"
+                  (tramp-rpc-deploy--arch-to-rust-target arch)
+                  tramp-rpc-deploy-version)))
 
 (defun tramp-rpc-deploy--download-file (url dest)
   "Download URL to DEST synchronously.
