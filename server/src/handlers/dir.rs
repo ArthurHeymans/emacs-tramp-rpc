@@ -1,20 +1,45 @@
 //! Directory operations
 
-use crate::protocol::{DirEntry, FileType, RpcError};
+use crate::protocol::{from_value, to_value, DirEntry, FileType, RpcError};
+use rmpv::Value;
 use serde::Deserialize;
+use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::FileTypeExt;
 use std::path::Path;
 use tokio::fs;
 
-use super::file::get_file_attributes;
+use super::file::{bytes_to_path, get_file_attributes};
+use super::HandlerResult;
 
-type HandlerResult = Result<serde_json::Value, RpcError>;
+/// Custom deserializer that accepts either a string or binary for paths
+mod path_or_bytes {
+    use serde::{self, Deserialize, Deserializer};
+
+    pub fn deserialize<'de, D>(deserializer: D) -> Result<Vec<u8>, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum StringOrBytes {
+            String(String),
+            #[serde(with = "serde_bytes")]
+            Bytes(Vec<u8>),
+        }
+
+        match StringOrBytes::deserialize(deserializer)? {
+            StringOrBytes::String(s) => Ok(s.into_bytes()),
+            StringOrBytes::Bytes(b) => Ok(b),
+        }
+    }
+}
 
 /// List directory contents
-pub async fn list(params: &serde_json::Value) -> HandlerResult {
+pub async fn list(params: &Value) -> HandlerResult {
     #[derive(Deserialize)]
     struct Params {
-        path: String,
+        #[serde(with = "path_or_bytes")]
+        path: Vec<u8>,
         /// Include file attributes for each entry
         #[serde(default)]
         include_attrs: bool,
@@ -27,37 +52,36 @@ pub async fn list(params: &serde_json::Value) -> HandlerResult {
         true
     }
 
-    let params: Params = serde_json::from_value(params.clone())
-        .map_err(|e| RpcError::invalid_params(e.to_string()))?;
+    let params: Params =
+        from_value(params.clone()).map_err(|e| RpcError::invalid_params(e.to_string()))?;
 
-    let path = Path::new(&params.path);
+    let path = bytes_to_path(&params.path);
+    let path_str = path.to_string_lossy().to_string();
 
-    let mut entries = fs::read_dir(path)
+    let mut entries = fs::read_dir(&path)
         .await
-        .map_err(|e| super::file::map_io_error(e, &params.path))?;
+        .map_err(|e| super::file::map_io_error(e, &path_str))?;
 
     let mut results: Vec<DirEntry> = Vec::new();
 
     // Add . and .. entries
     if params.include_hidden {
         results.push(DirEntry {
-            name: ".".to_string(),
+            name: b".".to_vec(),
             file_type: FileType::Directory,
             attrs: if params.include_attrs {
-                get_file_attributes(&params.path, false).await.ok()
+                get_file_attributes(&path, false).await.ok()
             } else {
                 None
             },
         });
 
-        let parent = path.parent().unwrap_or(path);
+        let parent = path.parent().unwrap_or(&path);
         results.push(DirEntry {
-            name: "..".to_string(),
+            name: b"..".to_vec(),
             file_type: FileType::Directory,
             attrs: if params.include_attrs {
-                get_file_attributes(&parent.to_string_lossy(), false)
-                    .await
-                    .ok()
+                get_file_attributes(parent, false).await.ok()
             } else {
                 None
             },
@@ -65,10 +89,12 @@ pub async fn list(params: &serde_json::Value) -> HandlerResult {
     }
 
     while let Ok(Some(entry)) = entries.next_entry().await {
-        let name = entry.file_name().to_string_lossy().to_string();
+        // Get filename as raw bytes (no encoding needed!)
+        let name_bytes = entry.file_name().as_bytes().to_vec();
 
         // Skip hidden files if not requested
-        if !params.include_hidden && name.starts_with('.') {
+        let is_hidden = name_bytes.first() == Some(&b'.');
+        if !params.include_hidden && is_hidden {
             continue;
         }
 
@@ -96,15 +122,13 @@ pub async fn list(params: &serde_json::Value) -> HandlerResult {
         };
 
         let attrs = if params.include_attrs {
-            get_file_attributes(&entry.path().to_string_lossy(), true)
-                .await
-                .ok()
+            get_file_attributes(&entry.path(), true).await.ok()
         } else {
             None
         };
 
         results.push(DirEntry {
-            name,
+            name: name_bytes,
             file_type,
             attrs,
         });
@@ -113,14 +137,17 @@ pub async fn list(params: &serde_json::Value) -> HandlerResult {
     // Sort by name
     results.sort_by(|a, b| a.name.cmp(&b.name));
 
-    Ok(serde_json::to_value(results).unwrap())
+    // Convert to array of map values with named fields
+    let values: Vec<Value> = results.iter().map(|e| e.to_value()).collect();
+    Ok(Value::Array(values))
 }
 
 /// Create a directory
-pub async fn create(params: &serde_json::Value) -> HandlerResult {
+pub async fn create(params: &Value) -> HandlerResult {
     #[derive(Deserialize)]
     struct Params {
-        path: String,
+        #[serde(with = "path_or_bytes")]
+        path: Vec<u8>,
         /// Create parent directories if they don't exist
         #[serde(default)]
         parents: bool,
@@ -133,60 +160,63 @@ pub async fn create(params: &serde_json::Value) -> HandlerResult {
         0o755
     }
 
-    let params: Params = serde_json::from_value(params.clone())
-        .map_err(|e| RpcError::invalid_params(e.to_string()))?;
+    let params: Params =
+        from_value(params.clone()).map_err(|e| RpcError::invalid_params(e.to_string()))?;
 
-    let path = Path::new(&params.path);
+    let path = bytes_to_path(&params.path);
+    let path_str = path.to_string_lossy().to_string();
 
     let result = if params.parents {
-        fs::create_dir_all(path).await
+        fs::create_dir_all(&path).await
     } else {
-        fs::create_dir(path).await
+        fs::create_dir(&path).await
     };
 
-    result.map_err(|e| super::file::map_io_error(e, &params.path))?;
+    result.map_err(|e| super::file::map_io_error(e, &path_str))?;
 
     // Set permissions
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
         let perms = std::fs::Permissions::from_mode(params.mode);
-        fs::set_permissions(path, perms)
+        fs::set_permissions(&path, perms)
             .await
-            .map_err(|e| super::file::map_io_error(e, &params.path))?;
+            .map_err(|e| super::file::map_io_error(e, &path_str))?;
     }
 
-    Ok(serde_json::json!(true))
+    Ok(Value::Boolean(true))
 }
 
 /// Remove a directory
-pub async fn remove(params: &serde_json::Value) -> HandlerResult {
+pub async fn remove(params: &Value) -> HandlerResult {
     #[derive(Deserialize)]
     struct Params {
-        path: String,
+        #[serde(with = "path_or_bytes")]
+        path: Vec<u8>,
         /// Remove recursively
         #[serde(default)]
         recursive: bool,
     }
 
-    let params: Params = serde_json::from_value(params.clone())
-        .map_err(|e| RpcError::invalid_params(e.to_string()))?;
+    let params: Params =
+        from_value(params.clone()).map_err(|e| RpcError::invalid_params(e.to_string()))?;
 
-    let path = Path::new(&params.path);
+    let path = bytes_to_path(&params.path);
+    let path_str = path.to_string_lossy().to_string();
 
     let result = if params.recursive {
-        fs::remove_dir_all(path).await
+        fs::remove_dir_all(&path).await
     } else {
-        fs::remove_dir(path).await
+        fs::remove_dir(&path).await
     };
 
-    result.map_err(|e| super::file::map_io_error(e, &params.path))?;
+    result.map_err(|e| super::file::map_io_error(e, &path_str))?;
 
-    Ok(serde_json::json!(true))
+    Ok(Value::Boolean(true))
 }
 
 /// Get completions for a path prefix
-pub async fn completions(params: &serde_json::Value) -> HandlerResult {
+pub async fn completions(params: &Value) -> HandlerResult {
     #[derive(Deserialize)]
     struct Params {
         /// Directory to search in
@@ -195,8 +225,8 @@ pub async fn completions(params: &serde_json::Value) -> HandlerResult {
         prefix: String,
     }
 
-    let params: Params = serde_json::from_value(params.clone())
-        .map_err(|e| RpcError::invalid_params(e.to_string()))?;
+    let params: Params =
+        from_value(params.clone()).map_err(|e| RpcError::invalid_params(e.to_string()))?;
 
     let dir_path = Path::new(&params.directory);
 
@@ -228,5 +258,5 @@ pub async fn completions(params: &serde_json::Value) -> HandlerResult {
 
     completions.sort();
 
-    Ok(serde_json::to_value(completions).unwrap())
+    to_value(&completions).map_err(|e| RpcError::internal_error(e.to_string()))
 }

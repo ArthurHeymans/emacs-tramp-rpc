@@ -1,6 +1,7 @@
 //! File metadata operations
 
-use crate::protocol::{FileAttributes, FileType, RpcError, StatResult};
+use crate::protocol::{from_value, FileAttributes, FileType, RpcError, StatResult};
+use rmpv::Value;
 use serde::Deserialize;
 use std::collections::HashMap;
 use std::os::unix::fs::{FileTypeExt, MetadataExt};
@@ -9,27 +10,30 @@ use std::sync::Mutex;
 use std::time::UNIX_EPOCH;
 use tokio::fs;
 
-type HandlerResult = Result<serde_json::Value, RpcError>;
+use super::HandlerResult;
 
 /// Get file attributes
-pub async fn stat(params: &serde_json::Value) -> HandlerResult {
+pub async fn stat(params: &Value) -> HandlerResult {
     #[derive(Deserialize)]
     struct Params {
-        path: String,
+        /// Path as string (UTF-8) or bytes (non-UTF8)
+        #[serde(with = "path_or_bytes")]
+        path: Vec<u8>,
         /// If true, don't follow symlinks
         #[serde(default)]
         lstat: bool,
     }
 
-    let params: Params = serde_json::from_value(params.clone())
-        .map_err(|e| RpcError::invalid_params(e.to_string()))?;
+    let params: Params =
+        from_value(params.clone()).map_err(|e| RpcError::invalid_params(e.to_string()))?;
 
-    let attrs = get_file_attributes(&params.path, params.lstat).await?;
-    Ok(serde_json::to_value(attrs).unwrap())
+    let path = bytes_to_path(&params.path);
+    let attrs = get_file_attributes(&path, params.lstat).await?;
+    Ok(attrs.to_value())
 }
 
 /// Batch stat operation - returns results for multiple paths concurrently
-pub async fn stat_batch(params: &serde_json::Value) -> HandlerResult {
+pub async fn stat_batch(params: &Value) -> HandlerResult {
     #[derive(Deserialize)]
     struct Params {
         paths: Vec<String>,
@@ -37,8 +41,8 @@ pub async fn stat_batch(params: &serde_json::Value) -> HandlerResult {
         lstat: bool,
     }
 
-    let params: Params = serde_json::from_value(params.clone())
-        .map_err(|e| RpcError::invalid_params(e.to_string()))?;
+    let params: Params =
+        from_value(params.clone()).map_err(|e| RpcError::invalid_params(e.to_string()))?;
 
     // Run all stat operations concurrently
     let futures: Vec<_> = params
@@ -48,7 +52,7 @@ pub async fn stat_batch(params: &serde_json::Value) -> HandlerResult {
             let path = path.clone();
             let lstat = params.lstat;
             async move {
-                match get_file_attributes(&path, lstat).await {
+                match get_file_attributes(Path::new(&path), lstat).await {
                     Ok(attrs) => StatResult::Ok(attrs),
                     Err(e) => StatResult::Err {
                         error: e.message.clone(),
@@ -59,125 +63,140 @@ pub async fn stat_batch(params: &serde_json::Value) -> HandlerResult {
         .collect();
 
     let results = futures::future::join_all(futures).await;
-    Ok(serde_json::to_value(results).unwrap())
+    // Convert to array of map values with named fields
+    let values: Vec<Value> = results.iter().map(|r| r.to_value()).collect();
+    Ok(Value::Array(values))
 }
 
 /// Check if file exists
-pub async fn exists(params: &serde_json::Value) -> HandlerResult {
+pub async fn exists(params: &Value) -> HandlerResult {
     #[derive(Deserialize)]
     struct Params {
-        path: String,
+        #[serde(with = "path_or_bytes")]
+        path: Vec<u8>,
     }
 
-    let params: Params = serde_json::from_value(params.clone())
-        .map_err(|e| RpcError::invalid_params(e.to_string()))?;
+    let params: Params =
+        from_value(params.clone()).map_err(|e| RpcError::invalid_params(e.to_string()))?;
 
+    let path = bytes_to_path(&params.path);
     // tokio::fs doesn't have exists(), so we try metadata
-    let exists = fs::metadata(&params.path).await.is_ok();
-    Ok(serde_json::json!(exists))
+    let exists = fs::metadata(&path).await.is_ok();
+    Ok(Value::Boolean(exists))
 }
 
 /// Check if file is readable
-pub async fn readable(params: &serde_json::Value) -> HandlerResult {
+pub async fn readable(params: &Value) -> HandlerResult {
     #[derive(Deserialize)]
     struct Params {
-        path: String,
+        #[serde(with = "path_or_bytes")]
+        path: Vec<u8>,
     }
 
-    let params: Params = serde_json::from_value(params.clone())
-        .map_err(|e| RpcError::invalid_params(e.to_string()))?;
+    let params: Params =
+        from_value(params.clone()).map_err(|e| RpcError::invalid_params(e.to_string()))?;
 
+    let path = bytes_to_path(&params.path);
     // Use access() syscall to check read permission
-    // This is a fast syscall, no need for spawn_blocking
-    let path = params.path;
-    let readable = tokio::task::spawn_blocking(move || unsafe {
-        libc::access(
-            std::ffi::CString::new(path.as_str()).unwrap().as_ptr(),
-            libc::R_OK,
-        ) == 0
+    let readable = tokio::task::spawn_blocking(move || {
+        use std::os::unix::ffi::OsStrExt;
+        let path_bytes = path.as_os_str().as_bytes();
+        // Create null-terminated path
+        let mut path_cstr = path_bytes.to_vec();
+        path_cstr.push(0);
+        unsafe { libc::access(path_cstr.as_ptr() as *const libc::c_char, libc::R_OK) == 0 }
     })
     .await
     .unwrap_or(false);
 
-    Ok(serde_json::json!(readable))
+    Ok(Value::Boolean(readable))
 }
 
 /// Check if file is writable
-pub async fn writable(params: &serde_json::Value) -> HandlerResult {
+pub async fn writable(params: &Value) -> HandlerResult {
     #[derive(Deserialize)]
     struct Params {
-        path: String,
+        #[serde(with = "path_or_bytes")]
+        path: Vec<u8>,
     }
 
-    let params: Params = serde_json::from_value(params.clone())
-        .map_err(|e| RpcError::invalid_params(e.to_string()))?;
+    let params: Params =
+        from_value(params.clone()).map_err(|e| RpcError::invalid_params(e.to_string()))?;
 
-    let path = params.path;
-    let writable = tokio::task::spawn_blocking(move || unsafe {
-        libc::access(
-            std::ffi::CString::new(path.as_str()).unwrap().as_ptr(),
-            libc::W_OK,
-        ) == 0
+    let path = bytes_to_path(&params.path);
+    let writable = tokio::task::spawn_blocking(move || {
+        use std::os::unix::ffi::OsStrExt;
+        let path_bytes = path.as_os_str().as_bytes();
+        let mut path_cstr = path_bytes.to_vec();
+        path_cstr.push(0);
+        unsafe { libc::access(path_cstr.as_ptr() as *const libc::c_char, libc::W_OK) == 0 }
     })
     .await
     .unwrap_or(false);
 
-    Ok(serde_json::json!(writable))
+    Ok(Value::Boolean(writable))
 }
 
 /// Check if file is executable
-pub async fn executable(params: &serde_json::Value) -> HandlerResult {
+pub async fn executable(params: &Value) -> HandlerResult {
     #[derive(Deserialize)]
     struct Params {
-        path: String,
+        #[serde(with = "path_or_bytes")]
+        path: Vec<u8>,
     }
 
-    let params: Params = serde_json::from_value(params.clone())
-        .map_err(|e| RpcError::invalid_params(e.to_string()))?;
+    let params: Params =
+        from_value(params.clone()).map_err(|e| RpcError::invalid_params(e.to_string()))?;
 
-    let path = params.path;
-    let executable = tokio::task::spawn_blocking(move || unsafe {
-        libc::access(
-            std::ffi::CString::new(path.as_str()).unwrap().as_ptr(),
-            libc::X_OK,
-        ) == 0
+    let path = bytes_to_path(&params.path);
+    let executable = tokio::task::spawn_blocking(move || {
+        use std::os::unix::ffi::OsStrExt;
+        let path_bytes = path.as_os_str().as_bytes();
+        let mut path_cstr = path_bytes.to_vec();
+        path_cstr.push(0);
+        unsafe { libc::access(path_cstr.as_ptr() as *const libc::c_char, libc::X_OK) == 0 }
     })
     .await
     .unwrap_or(false);
 
-    Ok(serde_json::json!(executable))
+    Ok(Value::Boolean(executable))
 }
 
 /// Get the true name of a file (resolve symlinks)
-pub async fn truename(params: &serde_json::Value) -> HandlerResult {
+pub async fn truename(params: &Value) -> HandlerResult {
     #[derive(Deserialize)]
     struct Params {
-        path: String,
+        #[serde(with = "path_or_bytes")]
+        path: Vec<u8>,
     }
 
-    let params: Params = serde_json::from_value(params.clone())
-        .map_err(|e| RpcError::invalid_params(e.to_string()))?;
+    let params: Params =
+        from_value(params.clone()).map_err(|e| RpcError::invalid_params(e.to_string()))?;
 
-    let path = params.path.clone();
+    let path = bytes_to_path(&params.path);
+    let path_str = path.to_string_lossy().to_string();
 
     // Use tokio's async canonicalize
     let canonical = fs::canonicalize(&path)
         .await
-        .map_err(|e| map_io_error(e, &params.path))?;
+        .map_err(|e| map_io_error(e, &path_str))?;
 
-    Ok(serde_json::json!(canonical.to_string_lossy()))
+    // Return path as binary (MessagePack handles encoding)
+    use std::os::unix::ffi::OsStrExt;
+    let bytes = canonical.as_os_str().as_bytes();
+    Ok(Value::Binary(bytes.to_vec()))
 }
 
 /// Check if file1 is newer than file2
-pub async fn newer_than(params: &serde_json::Value) -> HandlerResult {
+pub async fn newer_than(params: &Value) -> HandlerResult {
     #[derive(Deserialize)]
     struct Params {
         file1: String,
         file2: String,
     }
 
-    let params: Params = serde_json::from_value(params.clone())
-        .map_err(|e| RpcError::invalid_params(e.to_string()))?;
+    let params: Params =
+        from_value(params.clone()).map_err(|e| RpcError::invalid_params(e.to_string()))?;
 
     // Get both metadata concurrently
     let (meta1, meta2) = tokio::join!(fs::metadata(&params.file1), fs::metadata(&params.file2));
@@ -192,27 +211,25 @@ pub async fn newer_than(params: &serde_json::Value) -> HandlerResult {
         (Err(_), _) => false,    // file1 doesn't exist
     };
 
-    Ok(serde_json::json!(result))
+    Ok(Value::Boolean(result))
 }
 
 // ============================================================================
 // Helper functions
 // ============================================================================
 
-pub async fn get_file_attributes(path: &str, lstat: bool) -> Result<FileAttributes, RpcError> {
-    let path_obj = Path::new(path);
-
+pub async fn get_file_attributes(path: &Path, lstat: bool) -> Result<FileAttributes, RpcError> {
     let metadata = if lstat {
-        fs::symlink_metadata(path_obj).await
+        fs::symlink_metadata(path).await
     } else {
-        fs::metadata(path_obj).await
+        fs::metadata(path).await
     }
-    .map_err(|e| map_io_error(e, path))?;
+    .map_err(|e| map_io_error(e, &path.to_string_lossy()))?;
 
     let file_type = get_file_type(&metadata);
 
     let link_target = if file_type == FileType::Symlink {
-        fs::read_link(path_obj)
+        fs::read_link(path)
             .await
             .ok()
             .map(|p| p.to_string_lossy().to_string())
@@ -322,5 +339,38 @@ pub fn map_io_error(err: std::io::Error, path: &str) -> RpcError {
         ErrorKind::NotFound => RpcError::file_not_found(path),
         ErrorKind::PermissionDenied => RpcError::permission_denied(path),
         _ => RpcError::io_error(err),
+    }
+}
+
+use std::ffi::OsStr;
+use std::os::unix::ffi::OsStrExt;
+use std::path::PathBuf;
+
+/// Convert raw bytes to a PathBuf
+pub fn bytes_to_path(bytes: &[u8]) -> PathBuf {
+    PathBuf::from(OsStr::from_bytes(bytes))
+}
+
+/// Custom deserializer that accepts either a string or binary for paths
+mod path_or_bytes {
+    use serde::{self, Deserialize, Deserializer};
+
+    pub fn deserialize<'de, D>(deserializer: D) -> Result<Vec<u8>, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        // Try to deserialize as either string or bytes
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum StringOrBytes {
+            String(String),
+            #[serde(with = "serde_bytes")]
+            Bytes(Vec<u8>),
+        }
+
+        match StringOrBytes::deserialize(deserializer)? {
+            StringOrBytes::String(s) => Ok(s.into_bytes()),
+            StringOrBytes::Bytes(b) => Ok(b),
+        }
     }
 }

@@ -1,7 +1,8 @@
 //! File I/O operations
 
-use crate::protocol::RpcError;
-use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
+use crate::msgpack_map;
+use crate::protocol::{from_value, RpcError};
+use rmpv::Value;
 use serde::Deserialize;
 use std::io::SeekFrom;
 use std::os::unix::fs::PermissionsExt;
@@ -9,15 +10,38 @@ use std::path::Path;
 use tokio::fs::{self, File, OpenOptions};
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 
-use super::file::map_io_error;
+use super::file::{bytes_to_path, map_io_error};
+use super::HandlerResult;
 
-type HandlerResult = Result<serde_json::Value, RpcError>;
+/// Custom deserializer that accepts either a string or binary for paths
+mod path_or_bytes {
+    use serde::{self, Deserialize, Deserializer};
+
+    pub fn deserialize<'de, D>(deserializer: D) -> Result<Vec<u8>, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum StringOrBytes {
+            String(String),
+            #[serde(with = "serde_bytes")]
+            Bytes(Vec<u8>),
+        }
+
+        match StringOrBytes::deserialize(deserializer)? {
+            StringOrBytes::String(s) => Ok(s.into_bytes()),
+            StringOrBytes::Bytes(b) => Ok(b),
+        }
+    }
+}
 
 /// Read file contents
-pub async fn read(params: &serde_json::Value) -> HandlerResult {
+pub async fn read(params: &Value) -> HandlerResult {
     #[derive(Deserialize)]
     struct Params {
-        path: String,
+        #[serde(with = "path_or_bytes")]
+        path: Vec<u8>,
         /// Byte offset to start reading from
         #[serde(default)]
         offset: Option<u64>,
@@ -26,18 +50,21 @@ pub async fn read(params: &serde_json::Value) -> HandlerResult {
         length: Option<usize>,
     }
 
-    let params: Params = serde_json::from_value(params.clone())
-        .map_err(|e| RpcError::invalid_params(e.to_string()))?;
+    let params: Params =
+        from_value(params.clone()).map_err(|e| RpcError::invalid_params(e.to_string()))?;
 
-    let mut file = File::open(&params.path)
+    let path = bytes_to_path(&params.path);
+    let path_str = path.to_string_lossy().to_string();
+
+    let mut file = File::open(&path)
         .await
-        .map_err(|e| map_io_error(e, &params.path))?;
+        .map_err(|e| map_io_error(e, &path_str))?;
 
     // Seek to offset if specified
     if let Some(offset) = params.offset {
         file.seek(SeekFrom::Start(offset))
             .await
-            .map_err(|e| map_io_error(e, &params.path))?;
+            .map_err(|e| map_io_error(e, &path_str))?;
     }
 
     // Read the content
@@ -46,33 +73,34 @@ pub async fn read(params: &serde_json::Value) -> HandlerResult {
         let bytes_read = file
             .read(&mut buf)
             .await
-            .map_err(|e| map_io_error(e, &params.path))?;
+            .map_err(|e| map_io_error(e, &path_str))?;
         buf.truncate(bytes_read);
         buf
     } else {
         let mut buf = Vec::new();
         file.read_to_end(&mut buf)
             .await
-            .map_err(|e| map_io_error(e, &params.path))?;
+            .map_err(|e| map_io_error(e, &path_str))?;
         buf
     };
 
-    // Return base64-encoded content
-    let encoded = BASE64.encode(&content);
-
-    Ok(serde_json::json!({
-        "content": encoded,
-        "size": content.len()
-    }))
+    // Return binary content directly (no base64!)
+    let size = content.len();
+    Ok(msgpack_map! {
+        "content" => Value::Binary(content),
+        "size" => size
+    })
 }
 
 /// Write file contents
-pub async fn write(params: &serde_json::Value) -> HandlerResult {
+pub async fn write(params: &Value) -> HandlerResult {
     #[derive(Deserialize)]
     struct Params {
-        path: String,
-        /// Base64-encoded content to write
-        content: String,
+        #[serde(with = "path_or_bytes")]
+        path: Vec<u8>,
+        /// Content to write as binary
+        #[serde(with = "serde_bytes")]
+        content: Vec<u8>,
         /// File mode (permissions) - only applied to new files
         #[serde(default)]
         mode: Option<u32>,
@@ -84,13 +112,14 @@ pub async fn write(params: &serde_json::Value) -> HandlerResult {
         offset: Option<u64>,
     }
 
-    let params: Params = serde_json::from_value(params.clone())
-        .map_err(|e| RpcError::invalid_params(e.to_string()))?;
+    let params: Params =
+        from_value(params.clone()).map_err(|e| RpcError::invalid_params(e.to_string()))?;
 
-    // Decode the content
-    let content = BASE64
-        .decode(&params.content)
-        .map_err(|e| RpcError::invalid_params(format!("Invalid base64: {}", e)))?;
+    let path = bytes_to_path(&params.path);
+    let path_str = path.to_string_lossy().to_string();
+
+    // Content is already binary, no decoding needed!
+    let content = params.content;
 
     // Open the file with appropriate options
     let mut options = OpenOptions::new();
@@ -104,37 +133,37 @@ pub async fn write(params: &serde_json::Value) -> HandlerResult {
     }
 
     let mut file = options
-        .open(&params.path)
+        .open(&path)
         .await
-        .map_err(|e| map_io_error(e, &params.path))?;
+        .map_err(|e| map_io_error(e, &path_str))?;
 
     // Seek to offset if specified
     if let Some(offset) = params.offset {
         file.seek(SeekFrom::Start(offset))
             .await
-            .map_err(|e| map_io_error(e, &params.path))?;
+            .map_err(|e| map_io_error(e, &path_str))?;
     }
 
     // Write the content
     file.write_all(&content)
         .await
-        .map_err(|e| map_io_error(e, &params.path))?;
+        .map_err(|e| map_io_error(e, &path_str))?;
 
     // Set permissions if specified
     if let Some(mode) = params.mode {
         let perms = std::fs::Permissions::from_mode(mode);
-        fs::set_permissions(&params.path, perms)
+        fs::set_permissions(&path, perms)
             .await
-            .map_err(|e| map_io_error(e, &params.path))?;
+            .map_err(|e| map_io_error(e, &path_str))?;
     }
 
-    Ok(serde_json::json!({
-        "written": content.len()
-    }))
+    Ok(msgpack_map! {
+        "written" => content.len()
+    })
 }
 
 /// Copy a file
-pub async fn copy(params: &serde_json::Value) -> HandlerResult {
+pub async fn copy(params: &Value) -> HandlerResult {
     #[derive(Deserialize)]
     struct Params {
         src: String,
@@ -144,8 +173,8 @@ pub async fn copy(params: &serde_json::Value) -> HandlerResult {
         preserve: bool,
     }
 
-    let params: Params = serde_json::from_value(params.clone())
-        .map_err(|e| RpcError::invalid_params(e.to_string()))?;
+    let params: Params =
+        from_value(params.clone()).map_err(|e| RpcError::invalid_params(e.to_string()))?;
 
     // Copy the file
     let bytes_copied = fs::copy(&params.src, &params.dest)
@@ -172,13 +201,13 @@ pub async fn copy(params: &serde_json::Value) -> HandlerResult {
         }
     }
 
-    Ok(serde_json::json!({
-        "copied": bytes_copied
-    }))
+    Ok(msgpack_map! {
+        "copied" => bytes_copied
+    })
 }
 
 /// Rename/move a file
-pub async fn rename(params: &serde_json::Value) -> HandlerResult {
+pub async fn rename(params: &Value) -> HandlerResult {
     #[derive(Deserialize)]
     struct Params {
         src: String,
@@ -188,8 +217,8 @@ pub async fn rename(params: &serde_json::Value) -> HandlerResult {
         overwrite: bool,
     }
 
-    let params: Params = serde_json::from_value(params.clone())
-        .map_err(|e| RpcError::invalid_params(e.to_string()))?;
+    let params: Params =
+        from_value(params.clone()).map_err(|e| RpcError::invalid_params(e.to_string()))?;
 
     // Check if destination exists and overwrite is false
     if !params.overwrite && Path::new(&params.dest).exists() {
@@ -204,55 +233,64 @@ pub async fn rename(params: &serde_json::Value) -> HandlerResult {
         .await
         .map_err(|e| map_io_error(e, &params.src))?;
 
-    Ok(serde_json::json!(true))
+    Ok(Value::Boolean(true))
 }
 
 /// Delete a file
-pub async fn delete(params: &serde_json::Value) -> HandlerResult {
+pub async fn delete(params: &Value) -> HandlerResult {
     #[derive(Deserialize)]
     struct Params {
-        path: String,
+        #[serde(with = "path_or_bytes")]
+        path: Vec<u8>,
         /// If true, don't error if file doesn't exist
         #[serde(default)]
         force: bool,
     }
 
-    let params: Params = serde_json::from_value(params.clone())
-        .map_err(|e| RpcError::invalid_params(e.to_string()))?;
+    let params: Params =
+        from_value(params.clone()).map_err(|e| RpcError::invalid_params(e.to_string()))?;
 
-    match fs::remove_file(&params.path).await {
-        Ok(()) => Ok(serde_json::json!(true)),
+    let path = bytes_to_path(&params.path);
+    let path_str = path.to_string_lossy().to_string();
+
+    match fs::remove_file(&path).await {
+        Ok(()) => Ok(Value::Boolean(true)),
         Err(e) if params.force && e.kind() == std::io::ErrorKind::NotFound => {
-            Ok(serde_json::json!(false))
+            Ok(Value::Boolean(false))
         }
-        Err(e) => Err(map_io_error(e, &params.path)),
+        Err(e) => Err(map_io_error(e, &path_str)),
     }
 }
 
 /// Set file permissions
-pub async fn set_modes(params: &serde_json::Value) -> HandlerResult {
+pub async fn set_modes(params: &Value) -> HandlerResult {
     #[derive(Deserialize)]
     struct Params {
-        path: String,
+        #[serde(with = "path_or_bytes")]
+        path: Vec<u8>,
         mode: u32,
     }
 
-    let params: Params = serde_json::from_value(params.clone())
-        .map_err(|e| RpcError::invalid_params(e.to_string()))?;
+    let params: Params =
+        from_value(params.clone()).map_err(|e| RpcError::invalid_params(e.to_string()))?;
+
+    let path = bytes_to_path(&params.path);
+    let path_str = path.to_string_lossy().to_string();
 
     let perms = std::fs::Permissions::from_mode(params.mode);
-    fs::set_permissions(&params.path, perms)
+    fs::set_permissions(&path, perms)
         .await
-        .map_err(|e| map_io_error(e, &params.path))?;
+        .map_err(|e| map_io_error(e, &path_str))?;
 
-    Ok(serde_json::json!(true))
+    Ok(Value::Boolean(true))
 }
 
 /// Set file timestamps
-pub async fn set_times(params: &serde_json::Value) -> HandlerResult {
+pub async fn set_times(params: &Value) -> HandlerResult {
     #[derive(Deserialize)]
     struct Params {
-        path: String,
+        #[serde(with = "path_or_bytes")]
+        path: Vec<u8>,
         /// Modification time (seconds since epoch)
         mtime: i64,
         /// Access time (seconds since epoch, defaults to mtime)
@@ -260,31 +298,31 @@ pub async fn set_times(params: &serde_json::Value) -> HandlerResult {
         atime: Option<i64>,
     }
 
-    let params: Params = serde_json::from_value(params.clone())
-        .map_err(|e| RpcError::invalid_params(e.to_string()))?;
+    let params: Params =
+        from_value(params.clone()).map_err(|e| RpcError::invalid_params(e.to_string()))?;
 
+    let path = bytes_to_path(&params.path);
     let atime = params.atime.unwrap_or(params.mtime);
-    let path = params.path.clone();
     let mtime = params.mtime;
 
     // Use spawn_blocking for the libc syscall
-    tokio::task::spawn_blocking(move || set_file_times_sync(&path, atime, mtime))
+    tokio::task::spawn_blocking(move || set_file_times_sync_path(&path, atime, mtime))
         .await
         .map_err(|e| RpcError::internal_error(e.to_string()))??;
 
-    Ok(serde_json::json!(true))
+    Ok(Value::Boolean(true))
 }
 
 /// Create a symbolic link
-pub async fn make_symlink(params: &serde_json::Value) -> HandlerResult {
+pub async fn make_symlink(params: &Value) -> HandlerResult {
     #[derive(Deserialize)]
     struct Params {
         target: String,
         link_path: String,
     }
 
-    let params: Params = serde_json::from_value(params.clone())
-        .map_err(|e| RpcError::invalid_params(e.to_string()))?;
+    let params: Params =
+        from_value(params.clone()).map_err(|e| RpcError::invalid_params(e.to_string()))?;
 
     #[cfg(unix)]
     {
@@ -293,11 +331,11 @@ pub async fn make_symlink(params: &serde_json::Value) -> HandlerResult {
             .map_err(|e| map_io_error(e, &params.link_path))?;
     }
 
-    Ok(serde_json::json!(true))
+    Ok(Value::Boolean(true))
 }
 
 /// Create a hard link
-pub async fn make_hardlink(params: &serde_json::Value) -> HandlerResult {
+pub async fn make_hardlink(params: &Value) -> HandlerResult {
     #[derive(Deserialize)]
     struct Params {
         /// The existing file to link to
@@ -306,42 +344,49 @@ pub async fn make_hardlink(params: &serde_json::Value) -> HandlerResult {
         dest: String,
     }
 
-    let params: Params = serde_json::from_value(params.clone())
-        .map_err(|e| RpcError::invalid_params(e.to_string()))?;
+    let params: Params =
+        from_value(params.clone()).map_err(|e| RpcError::invalid_params(e.to_string()))?;
 
     fs::hard_link(&params.src, &params.dest)
         .await
         .map_err(|e| map_io_error(e, &params.dest))?;
 
-    Ok(serde_json::json!(true))
+    Ok(Value::Boolean(true))
 }
 
 /// Change file ownership (chown)
-pub async fn chown(params: &serde_json::Value) -> HandlerResult {
+pub async fn chown(params: &Value) -> HandlerResult {
     #[derive(Deserialize)]
     struct Params {
-        path: String,
+        #[serde(with = "path_or_bytes")]
+        path: Vec<u8>,
         /// New user ID (-1 to leave unchanged)
         uid: i32,
         /// New group ID (-1 to leave unchanged)
         gid: i32,
     }
 
-    let params: Params = serde_json::from_value(params.clone())
-        .map_err(|e| RpcError::invalid_params(e.to_string()))?;
+    let params: Params =
+        from_value(params.clone()).map_err(|e| RpcError::invalid_params(e.to_string()))?;
 
-    let path = params.path.clone();
+    let path = bytes_to_path(&params.path);
     let uid = params.uid;
     let gid = params.gid;
 
     // Use spawn_blocking for the libc syscall
     tokio::task::spawn_blocking(move || {
-        use std::ffi::CString;
-        let path_cstr =
-            CString::new(path.as_str()).map_err(|_| RpcError::invalid_params("Invalid path"))?;
+        use std::os::unix::ffi::OsStrExt;
+        let path_bytes = path.as_os_str().as_bytes();
+        let mut path_cstr = path_bytes.to_vec();
+        path_cstr.push(0);
 
-        let result =
-            unsafe { libc::chown(path_cstr.as_ptr(), uid as libc::uid_t, gid as libc::gid_t) };
+        let result = unsafe {
+            libc::chown(
+                path_cstr.as_ptr() as *const libc::c_char,
+                uid as libc::uid_t,
+                gid as libc::gid_t,
+            )
+        };
 
         if result != 0 {
             return Err(RpcError::io_error(std::io::Error::last_os_error()));
@@ -351,7 +396,7 @@ pub async fn chown(params: &serde_json::Value) -> HandlerResult {
     .await
     .map_err(|e| RpcError::internal_error(e.to_string()))??;
 
-    Ok(serde_json::json!(true))
+    Ok(Value::Boolean(true))
 }
 
 // ============================================================================
@@ -376,6 +421,45 @@ fn set_file_times_sync(path: &str, atime: i64, mtime: i64) -> Result<(), RpcErro
     ];
 
     let result = unsafe { libc::utimensat(libc::AT_FDCWD, path_cstr.as_ptr(), times.as_ptr(), 0) };
+
+    if result != 0 {
+        return Err(RpcError::io_error(std::io::Error::last_os_error()));
+    }
+
+    Ok(())
+}
+
+#[cfg(unix)]
+fn set_file_times_sync_path(
+    path: &std::path::Path,
+    atime: i64,
+    mtime: i64,
+) -> Result<(), RpcError> {
+    use std::os::unix::ffi::OsStrExt;
+
+    let path_bytes = path.as_os_str().as_bytes();
+    let mut path_cstr = path_bytes.to_vec();
+    path_cstr.push(0); // Null terminate
+
+    let times = [
+        libc::timespec {
+            tv_sec: atime,
+            tv_nsec: 0,
+        },
+        libc::timespec {
+            tv_sec: mtime,
+            tv_nsec: 0,
+        },
+    ];
+
+    let result = unsafe {
+        libc::utimensat(
+            libc::AT_FDCWD,
+            path_cstr.as_ptr() as *const libc::c_char,
+            times.as_ptr(),
+            0,
+        )
+    };
 
     if result != 0 {
         return Err(RpcError::io_error(std::io::Error::last_os_error()));

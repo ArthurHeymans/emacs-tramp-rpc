@@ -65,6 +65,17 @@
 (let ((lisp-dir (expand-file-name "lisp" tramp-rpc-test--project-root)))
   (add-to-list 'load-path lisp-dir))
 
+;; Install msgpack from MELPA if not available (required by tramp-rpc-protocol)
+(unless (require 'msgpack nil t)
+  (require 'package)
+  (add-to-list 'package-archives
+               '("melpa" . "https://melpa.org/packages/") t)
+  (package-initialize)
+  (unless package-archive-contents
+    (package-refresh-contents))
+  (package-install 'msgpack)
+  (require 'msgpack))
+
 (require 'tramp-rpc)
 
 ;;; ============================================================================
@@ -190,7 +201,6 @@ The directory is deleted after BODY completes."
 
 (ert-deftest tramp-rpc-test00-availability ()
   "Test availability of TRAMP RPC functions."
-  :expected-result (if (tramp-rpc-test-enabled) :passed :failed)
   (skip-unless (tramp-rpc-test-enabled))
   (let ((dir (tramp-rpc-test--remote-directory)))
     (should (file-remote-p dir))
@@ -231,7 +241,6 @@ The directory is deleted after BODY completes."
 
 (ert-deftest tramp-rpc-test02-file-exists-p ()
   "Test `file-exists-p' for TRAMP RPC files."
-  :expected-result (if (tramp-rpc-test-enabled) :passed :failed)
   (skip-unless (tramp-rpc-test-enabled))
 
   ;; Test directory exists
@@ -247,7 +256,6 @@ The directory is deleted after BODY completes."
 
 (ert-deftest tramp-rpc-test02-file-readable-p ()
   "Test `file-readable-p' for TRAMP RPC files."
-  :expected-result (if (tramp-rpc-test-enabled) :passed :failed)
   (skip-unless (tramp-rpc-test-enabled))
 
   (tramp-rpc-test--with-temp-file tmp "test content"
@@ -255,7 +263,6 @@ The directory is deleted after BODY completes."
 
 (ert-deftest tramp-rpc-test02-file-writable-p ()
   "Test `file-writable-p' for TRAMP RPC files."
-  :expected-result (if (tramp-rpc-test-enabled) :passed :failed)
   (skip-unless (tramp-rpc-test-enabled))
 
   ;; Existing file
@@ -272,7 +279,6 @@ The directory is deleted after BODY completes."
 
 (ert-deftest tramp-rpc-test03-file-directory-p ()
   "Test `file-directory-p' for TRAMP RPC files."
-  :expected-result (if (tramp-rpc-test-enabled) :passed :failed)
   (skip-unless (tramp-rpc-test-enabled))
 
   ;; Test directory
@@ -288,7 +294,6 @@ The directory is deleted after BODY completes."
 
 (ert-deftest tramp-rpc-test03-file-regular-p ()
   "Test `file-regular-p' for TRAMP RPC files."
-  :expected-result (if (tramp-rpc-test-enabled) :passed :failed)
   (skip-unless (tramp-rpc-test-enabled))
 
   ;; Regular file
@@ -300,7 +305,6 @@ The directory is deleted after BODY completes."
 
 (ert-deftest tramp-rpc-test03-file-symlink-p ()
   "Test `file-symlink-p' for TRAMP RPC files."
-  :expected-result (if (tramp-rpc-test-enabled) :passed :failed)
   (skip-unless (tramp-rpc-test-enabled))
 
   (tramp-rpc-test--with-temp-file target "target content"
@@ -323,7 +327,6 @@ The directory is deleted after BODY completes."
 
 (ert-deftest tramp-rpc-test04-file-attributes ()
   "Test `file-attributes' for TRAMP RPC files."
-  :expected-result (if (tramp-rpc-test-enabled) :passed :failed)
   (skip-unless (tramp-rpc-test-enabled))
 
   (tramp-rpc-test--with-temp-file tmp "test content"
@@ -345,7 +348,6 @@ The directory is deleted after BODY completes."
 
 (ert-deftest tramp-rpc-test04-file-attributes-directory ()
   "Test `file-attributes' for TRAMP RPC directories."
-  :expected-result (if (tramp-rpc-test-enabled) :passed :failed)
   (skip-unless (tramp-rpc-test-enabled))
 
   (tramp-rpc-test--with-temp-dir subdir
@@ -356,7 +358,6 @@ The directory is deleted after BODY completes."
 
 (ert-deftest tramp-rpc-test04-file-modes ()
   "Test `file-modes' and `set-file-modes' for TRAMP RPC files."
-  :expected-result (if (tramp-rpc-test-enabled) :passed :failed)
   (skip-unless (tramp-rpc-test-enabled))
 
   (tramp-rpc-test--with-temp-file tmp "test content"
@@ -375,7 +376,6 @@ The directory is deleted after BODY completes."
 
 (ert-deftest tramp-rpc-test05-write-region ()
   "Test `write-region' for TRAMP RPC files."
-  :expected-result (if (tramp-rpc-test-enabled) :passed :failed)
   (skip-unless (tramp-rpc-test-enabled))
 
   ;; Simple write
@@ -392,7 +392,6 @@ The directory is deleted after BODY completes."
 
 (ert-deftest tramp-rpc-test05-write-region-multiline ()
   "Test `write-region' with multiline content."
-  :expected-result (if (tramp-rpc-test-enabled) :passed :failed)
   (skip-unless (tramp-rpc-test-enabled))
 
   (let ((file (tramp-rpc-test--make-temp-name))
@@ -407,7 +406,6 @@ The directory is deleted after BODY completes."
 
 (ert-deftest tramp-rpc-test05-write-region-binary ()
   "Test `write-region' with binary content."
-  :expected-result (if (tramp-rpc-test-enabled) :passed :failed)
   (skip-unless (tramp-rpc-test-enabled))
 
   (let ((file (tramp-rpc-test--make-temp-name))
@@ -428,7 +426,6 @@ The directory is deleted after BODY completes."
 
 (ert-deftest tramp-rpc-test05-write-region-utf8 ()
   "Test `write-region' with UTF-8 content."
-  :expected-result (if (tramp-rpc-test-enabled) :passed :failed)
   (skip-unless (tramp-rpc-test-enabled))
 
   (let ((file (tramp-rpc-test--make-temp-name))
@@ -441,9 +438,42 @@ The directory is deleted after BODY completes."
                                    (buffer-string)))))
       (ignore-errors (delete-file file)))))
 
+(ert-deftest tramp-rpc-test05-write-region-chinese ()
+  "Test `write-region' with Chinese characters.
+This tests Issue #13: Chinese characters decode incorrectly."
+  (skip-unless (tramp-rpc-test-enabled))
+
+  (let ((file (tramp-rpc-test--make-temp-name))
+        ;; Test various Chinese characters including common and less common ones
+        (content "中文测试\n你好世界\n繁體中文\n日本語テスト"))
+    (unwind-protect
+        (progn
+          (write-region content nil file)
+          (should (file-exists-p file))
+          ;; Verify content is read back correctly
+          (let ((read-content (with-temp-buffer
+                                (insert-file-contents file)
+                                (buffer-string))))
+            (should (equal content read-content))))
+      (ignore-errors (delete-file file)))))
+
+(ert-deftest tramp-rpc-test05-write-region-mixed-unicode ()
+  "Test `write-region' with mixed Unicode content."
+  (skip-unless (tramp-rpc-test-enabled))
+
+  (let ((file (tramp-rpc-test--make-temp-name))
+        ;; Mix of ASCII, Chinese, Japanese, Korean, and emoji
+        (content "Hello 你好 こんにちは 안녕하세요"))
+    (unwind-protect
+        (progn
+          (write-region content nil file)
+          (should (equal content (with-temp-buffer
+                                   (insert-file-contents file)
+                                   (buffer-string)))))
+      (ignore-errors (delete-file file)))))
+
 (ert-deftest tramp-rpc-test05-write-region-append ()
   "Test `write-region' with append."
-  :expected-result (if (tramp-rpc-test-enabled) :passed :failed)
   (skip-unless (tramp-rpc-test-enabled))
 
   (let ((file (tramp-rpc-test--make-temp-name))
@@ -462,7 +492,6 @@ The directory is deleted after BODY completes."
 (ert-deftest tramp-rpc-test05-write-region-large ()
   "Test `write-region' with large file."
   :tags '(:expensive-test)
-  :expected-result (if (tramp-rpc-test-enabled) :passed :failed)
   (skip-unless (tramp-rpc-test-enabled))
 
   (let ((file (tramp-rpc-test--make-temp-name))
@@ -479,7 +508,6 @@ The directory is deleted after BODY completes."
 
 (ert-deftest tramp-rpc-test05-insert-file-contents ()
   "Test `insert-file-contents' for TRAMP RPC files."
-  :expected-result (if (tramp-rpc-test-enabled) :passed :failed)
   (skip-unless (tramp-rpc-test-enabled))
 
   (tramp-rpc-test--with-temp-file tmp "test content"
@@ -489,7 +517,6 @@ The directory is deleted after BODY completes."
 
 (ert-deftest tramp-rpc-test05-insert-file-contents-partial ()
   "Test partial `insert-file-contents' for TRAMP RPC files."
-  :expected-result (if (tramp-rpc-test-enabled) :passed :failed)
   (skip-unless (tramp-rpc-test-enabled))
 
   (tramp-rpc-test--with-temp-file tmp "0123456789"
@@ -504,7 +531,6 @@ The directory is deleted after BODY completes."
 
 (ert-deftest tramp-rpc-test06-copy-file ()
   "Test `copy-file' for TRAMP RPC files."
-  :expected-result (if (tramp-rpc-test-enabled) :passed :failed)
   (skip-unless (tramp-rpc-test-enabled))
 
   (tramp-rpc-test--with-temp-file src "source content"
@@ -523,7 +549,6 @@ The directory is deleted after BODY completes."
 
 (ert-deftest tramp-rpc-test06-rename-file ()
   "Test `rename-file' for TRAMP RPC files."
-  :expected-result (if (tramp-rpc-test-enabled) :passed :failed)
   (skip-unless (tramp-rpc-test-enabled))
 
   (let ((src (tramp-rpc-test--make-temp-name))
@@ -543,7 +568,6 @@ The directory is deleted after BODY completes."
 
 (ert-deftest tramp-rpc-test06-delete-file ()
   "Test `delete-file' for TRAMP RPC files."
-  :expected-result (if (tramp-rpc-test-enabled) :passed :failed)
   (skip-unless (tramp-rpc-test-enabled))
 
   (let ((file (tramp-rpc-test--make-temp-name)))
@@ -558,7 +582,6 @@ The directory is deleted after BODY completes."
 
 (ert-deftest tramp-rpc-test07-make-directory ()
   "Test `make-directory' for TRAMP RPC files."
-  :expected-result (if (tramp-rpc-test-enabled) :passed :failed)
   (skip-unless (tramp-rpc-test-enabled))
 
   (let ((dir (tramp-rpc-test--make-temp-name)))
@@ -570,7 +593,6 @@ The directory is deleted after BODY completes."
 
 (ert-deftest tramp-rpc-test07-make-directory-parents ()
   "Test `make-directory' with parents for TRAMP RPC files."
-  :expected-result (if (tramp-rpc-test-enabled) :passed :failed)
   (skip-unless (tramp-rpc-test-enabled))
 
   (let ((dir (concat (tramp-rpc-test--make-temp-name) "/nested/path")))
@@ -583,7 +605,6 @@ The directory is deleted after BODY completes."
 
 (ert-deftest tramp-rpc-test07-delete-directory ()
   "Test `delete-directory' for TRAMP RPC files."
-  :expected-result (if (tramp-rpc-test-enabled) :passed :failed)
   (skip-unless (tramp-rpc-test-enabled))
 
   (let ((dir (tramp-rpc-test--make-temp-name)))
@@ -594,7 +615,6 @@ The directory is deleted after BODY completes."
 
 (ert-deftest tramp-rpc-test07-delete-directory-recursive ()
   "Test recursive `delete-directory' for TRAMP RPC files."
-  :expected-result (if (tramp-rpc-test-enabled) :passed :failed)
   (skip-unless (tramp-rpc-test-enabled))
 
   (let ((dir (tramp-rpc-test--make-temp-name)))
@@ -608,7 +628,6 @@ The directory is deleted after BODY completes."
 
 (ert-deftest tramp-rpc-test07-directory-files ()
   "Test `directory-files' for TRAMP RPC files."
-  :expected-result (if (tramp-rpc-test-enabled) :passed :failed)
   (skip-unless (tramp-rpc-test-enabled))
 
   (tramp-rpc-test--with-temp-dir dir
@@ -632,7 +651,6 @@ The directory is deleted after BODY completes."
 
 (ert-deftest tramp-rpc-test07-directory-files-and-attributes ()
   "Test `directory-files-and-attributes' for TRAMP RPC files."
-  :expected-result (if (tramp-rpc-test-enabled) :passed :failed)
   (skip-unless (tramp-rpc-test-enabled))
 
   (tramp-rpc-test--with-temp-dir dir
@@ -656,7 +674,6 @@ The directory is deleted after BODY completes."
 
 (ert-deftest tramp-rpc-test08-make-symbolic-link ()
   "Test `make-symbolic-link' for TRAMP RPC files."
-  :expected-result (if (tramp-rpc-test-enabled) :passed :failed)
   (skip-unless (tramp-rpc-test-enabled))
 
   (tramp-rpc-test--with-temp-file target "target content"
@@ -675,7 +692,6 @@ The directory is deleted after BODY completes."
 
 (ert-deftest tramp-rpc-test08-file-truename ()
   "Test `file-truename' for TRAMP RPC files."
-  :expected-result (if (tramp-rpc-test-enabled) :passed :failed)
   (skip-unless (tramp-rpc-test-enabled))
 
   (tramp-rpc-test--with-temp-file target "content"
@@ -697,7 +713,6 @@ The directory is deleted after BODY completes."
 
 (ert-deftest tramp-rpc-test09-set-file-times ()
   "Test `set-file-times' for TRAMP RPC files."
-  :expected-result (if (tramp-rpc-test-enabled) :passed :failed)
   (skip-unless (tramp-rpc-test-enabled))
 
   (tramp-rpc-test--with-temp-file tmp "content"
@@ -714,7 +729,6 @@ The directory is deleted after BODY completes."
 (ert-deftest tramp-rpc-test10-process-file ()
   "Test `process-file' for TRAMP RPC files."
   :tags '(:process)
-  :expected-result (if (tramp-rpc-test-enabled) :passed :failed)
   (skip-unless (tramp-rpc-test-enabled))
 
   (let ((default-directory (tramp-rpc-test--remote-directory)))
@@ -735,7 +749,6 @@ The directory is deleted after BODY completes."
 (ert-deftest tramp-rpc-test10-process-file-with-stdin ()
   "Test `process-file' with stdin input."
   :tags '(:process)
-  :expected-result (if (tramp-rpc-test-enabled) :passed :failed)
   (skip-unless (tramp-rpc-test-enabled))
 
   (let ((default-directory (tramp-rpc-test--remote-directory)))
@@ -754,7 +767,6 @@ The directory is deleted after BODY completes."
 (ert-deftest tramp-rpc-test10-shell-command ()
   "Test shell command execution."
   :tags '(:process)
-  :expected-result (if (tramp-rpc-test-enabled) :passed :failed)
   (skip-unless (tramp-rpc-test-enabled))
 
   (let ((default-directory (tramp-rpc-test--remote-directory)))
@@ -768,7 +780,6 @@ The directory is deleted after BODY completes."
 
 (ert-deftest tramp-rpc-test11-expand-file-name ()
   "Test `expand-file-name' for TRAMP RPC files."
-  :expected-result (if (tramp-rpc-test-enabled) :passed :failed)
   (skip-unless (tramp-rpc-test-enabled))
 
   (let ((dir (tramp-rpc-test--remote-directory)))
@@ -797,7 +808,6 @@ The directory is deleted after BODY completes."
 
 (ert-deftest tramp-rpc-test12-file-name-completion ()
   "Test file name completion for TRAMP RPC files."
-  :expected-result (if (tramp-rpc-test-enabled) :passed :failed)
   (skip-unless (tramp-rpc-test-enabled))
 
   (tramp-rpc-test--with-temp-dir dir
@@ -816,7 +826,6 @@ The directory is deleted after BODY completes."
 
 (ert-deftest tramp-rpc-test13-file-system-info ()
   "Test `file-system-info' for TRAMP RPC files."
-  :expected-result (if (tramp-rpc-test-enabled) :passed :failed)
   (skip-unless (tramp-rpc-test-enabled))
 
   (let ((info (file-system-info (tramp-rpc-test--remote-directory))))
@@ -835,7 +844,6 @@ The directory is deleted after BODY completes."
 (ert-deftest tramp-rpc-test14-start-file-process ()
   "Test `start-file-process' for TRAMP RPC files."
   :tags '(:process :expensive-test)
-  :expected-result (if (tramp-rpc-test-enabled) :passed :failed)
   (skip-unless (tramp-rpc-test-enabled))
 
   (let* ((default-directory (tramp-rpc-test--remote-directory))
@@ -855,7 +863,6 @@ The directory is deleted after BODY completes."
 (ert-deftest tramp-rpc-test14-make-process ()
   "Test `make-process' for TRAMP RPC files."
   :tags '(:process :expensive-test)
-  :expected-result (if (tramp-rpc-test-enabled) :passed :failed)
   (skip-unless (tramp-rpc-test-enabled))
 
   (let* ((default-directory (tramp-rpc-test--remote-directory))
@@ -882,7 +889,6 @@ The directory is deleted after BODY completes."
 
 (ert-deftest tramp-rpc-test15-copy-local-to-remote ()
   "Test copying from local to remote."
-  :expected-result (if (tramp-rpc-test-enabled) :passed :failed)
   (skip-unless (tramp-rpc-test-enabled))
 
   (let ((local-file (make-temp-file "local-test"))
@@ -901,7 +907,6 @@ The directory is deleted after BODY completes."
 
 (ert-deftest tramp-rpc-test15-copy-remote-to-local ()
   "Test copying from remote to local."
-  :expected-result (if (tramp-rpc-test-enabled) :passed :failed)
   (skip-unless (tramp-rpc-test-enabled))
 
   (let ((local-file (make-temp-file "local-test"))
@@ -921,7 +926,6 @@ The directory is deleted after BODY completes."
 (ert-deftest tramp-rpc-test16-vc-registered ()
   "Test VC registration detection."
   :tags '(:expensive-test)
-  :expected-result (if (tramp-rpc-test-enabled) :passed :failed)
   (skip-unless (tramp-rpc-test-enabled))
 
   ;; Create a git repo in temp dir
@@ -940,7 +944,6 @@ The directory is deleted after BODY completes."
 
 (ert-deftest tramp-rpc-test17-write-region-overwrite ()
   "Test overwriting existing file."
-  :expected-result (if (tramp-rpc-test-enabled) :passed :failed)
   (skip-unless (tramp-rpc-test-enabled))
 
   (let ((file (tramp-rpc-test--make-temp-name)))
@@ -962,7 +965,6 @@ The directory is deleted after BODY completes."
 
 (ert-deftest tramp-rpc-test18-empty-file ()
   "Test handling of empty files."
-  :expected-result (if (tramp-rpc-test-enabled) :passed :failed)
   (skip-unless (tramp-rpc-test-enabled))
 
   (let ((file (tramp-rpc-test--make-temp-name)))

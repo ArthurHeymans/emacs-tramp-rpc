@@ -5,7 +5,9 @@ pub mod file;
 pub mod io;
 pub mod process;
 
-use crate::protocol::{Request, RequestId, Response, RpcError};
+use crate::msgpack_map;
+use crate::protocol::{from_value, Request, RequestId, Response, RpcError};
+use rmpv::Value;
 
 /// Dispatch a request to the appropriate handler
 pub async fn dispatch(request: &Request) -> Response {
@@ -22,25 +24,25 @@ pub async fn dispatch(request: &Request) -> Response {
     dispatch_inner(request).await
 }
 
-type HandlerResult = Result<serde_json::Value, RpcError>;
+pub type HandlerResult = Result<Value, RpcError>;
 
 /// Get system information
 fn system_info() -> HandlerResult {
     use std::env;
 
-    let info = serde_json::json!({
-        "version": env!("CARGO_PKG_VERSION"),
-        "os": std::env::consts::OS,
-        "arch": std::env::consts::ARCH,
-        "hostname": hostname(),
-        "uid": unsafe { libc::getuid() },
-        "gid": unsafe { libc::getgid() },
-        "home": env::var("HOME").ok(),
-        "user": env::var("USER").ok(),
-    });
-
-    Ok(info)
+    Ok(msgpack_map! {
+        "version" => env!("CARGO_PKG_VERSION"),
+        "os" => std::env::consts::OS,
+        "arch" => std::env::consts::ARCH,
+        "hostname" => hostname(),
+        "uid" => unsafe { libc::getuid() },
+        "gid" => unsafe { libc::getgid() },
+        "home" => env::var("HOME").ok().into_value(),
+        "user" => env::var("USER").ok().into_value()
+    })
 }
+
+use crate::protocol::IntoValue;
 
 fn hostname() -> String {
     let mut buf = [0u8; 256];
@@ -55,41 +57,41 @@ fn hostname() -> String {
 }
 
 /// Get environment variable
-fn system_getenv(params: &serde_json::Value) -> HandlerResult {
+fn system_getenv(params: &Value) -> HandlerResult {
     #[derive(serde::Deserialize)]
     struct Params {
         name: String,
     }
 
-    let params: Params = serde_json::from_value(params.clone())
-        .map_err(|e| RpcError::invalid_params(e.to_string()))?;
+    let params: Params =
+        from_value(params.clone()).map_err(|e| RpcError::invalid_params(e.to_string()))?;
 
-    Ok(serde_json::json!(std::env::var(&params.name).ok()))
+    Ok(std::env::var(&params.name).ok().into_value())
 }
 
 /// Expand path with tilde and environment variables
-fn system_expand_path(params: &serde_json::Value) -> HandlerResult {
+fn system_expand_path(params: &Value) -> HandlerResult {
     #[derive(serde::Deserialize)]
     struct Params {
         path: String,
     }
 
-    let params: Params = serde_json::from_value(params.clone())
-        .map_err(|e| RpcError::invalid_params(e.to_string()))?;
+    let params: Params =
+        from_value(params.clone()).map_err(|e| RpcError::invalid_params(e.to_string()))?;
 
     let expanded = expand_tilde(&params.path);
-    Ok(serde_json::json!(expanded))
+    Ok(expanded.into_value())
 }
 
 /// Get filesystem information (like df)
-fn system_statvfs(params: &serde_json::Value) -> HandlerResult {
+fn system_statvfs(params: &Value) -> HandlerResult {
     #[derive(serde::Deserialize)]
     struct Params {
         path: String,
     }
 
-    let params: Params = serde_json::from_value(params.clone())
-        .map_err(|e| RpcError::invalid_params(e.to_string()))?;
+    let params: Params =
+        from_value(params.clone()).map_err(|e| RpcError::invalid_params(e.to_string()))?;
 
     use std::ffi::CString;
     let path_cstr =
@@ -113,12 +115,12 @@ fn system_statvfs(params: &serde_json::Value) -> HandlerResult {
     #[allow(clippy::unnecessary_cast)]
     let available = stat.f_bavail as u64 * block_size;
 
-    Ok(serde_json::json!({
-        "total": total,
-        "free": free,
-        "available": available,
-        "block_size": block_size
-    }))
+    Ok(msgpack_map! {
+        "total" => total,
+        "free" => free,
+        "available" => available,
+        "block_size" => block_size
+    })
 }
 
 /// Get groups for the current user
@@ -136,18 +138,18 @@ fn system_groups() -> HandlerResult {
     groups.truncate(actual_count as usize);
 
     // Convert to group info with names
-    let group_info: Vec<serde_json::Value> = groups
+    let group_info: Vec<Value> = groups
         .iter()
         .map(|&gid| {
             let gname = get_group_name(gid);
-            serde_json::json!({
-                "gid": gid,
-                "name": gname
-            })
+            msgpack_map! {
+                "gid" => gid,
+                "name" => gname.into_value()
+            }
         })
         .collect();
 
-    Ok(serde_json::json!(group_info))
+    Ok(Value::Array(group_info))
 }
 
 /// Get group name from gid
@@ -177,44 +179,25 @@ fn expand_tilde(path: &str) -> String {
 }
 
 /// Execute multiple RPC requests in a single batch
-/// This saves round-trip time when multiple independent operations are needed.
-///
-/// Request format:
-/// ```json
-/// {
-///   "requests": [
-///     {"method": "file.exists", "params": {"path": "/foo"}},
-///     {"method": "file.stat", "params": {"path": "/bar"}},
-///     {"method": "process.run", "params": {"cmd": "git", "args": ["status"]}}
-///   ]
-/// }
-/// ```
-///
-/// Response format:
-/// ```json
-/// {
-///   "results": [
-///     {"result": true},
-///     {"result": {...file attrs...}},
-///     {"error": {"code": -32001, "message": "..."}}
-///   ]
-/// }
-/// ```
-async fn batch_execute(params: &serde_json::Value) -> HandlerResult {
+async fn batch_execute(params: &Value) -> HandlerResult {
     #[derive(serde::Deserialize)]
     struct BatchParams {
         requests: Vec<BatchRequest>,
     }
 
+    fn default_params() -> Value {
+        Value::Nil
+    }
+
     #[derive(serde::Deserialize)]
     struct BatchRequest {
         method: String,
-        #[serde(default)]
-        params: serde_json::Value,
+        #[serde(default = "default_params")]
+        params: Value,
     }
 
-    let batch_params: BatchParams = serde_json::from_value(params.clone())
-        .map_err(|e| RpcError::invalid_params(e.to_string()))?;
+    let batch_params: BatchParams =
+        from_value(params.clone()).map_err(|e| RpcError::invalid_params(e.to_string()))?;
 
     // Execute all requests concurrently using tokio::join_all
     let futures: Vec<_> = batch_params
@@ -223,7 +206,7 @@ async fn batch_execute(params: &serde_json::Value) -> HandlerResult {
         .map(|req| async move {
             // Create a fake Request to reuse dispatch logic
             let fake_request = Request {
-                jsonrpc: "2.0".to_string(),
+                version: "2.0".to_string(),
                 id: RequestId::Number(0), // Dummy ID, not used in batch
                 method: req.method,
                 params: req.params,
@@ -234,14 +217,14 @@ async fn batch_execute(params: &serde_json::Value) -> HandlerResult {
 
             // Convert Response to a result object
             match (response.result, response.error) {
-                (Some(result), None) => serde_json::json!({"result": result}),
-                (None, Some(error)) => serde_json::json!({
-                    "error": {
-                        "code": error.code,
-                        "message": error.message
+                (Some(result), None) => msgpack_map! { "result" => result },
+                (None, Some(error)) => msgpack_map! {
+                    "error" => msgpack_map! {
+                        "code" => error.code,
+                        "message" => error.message
                     }
-                }),
-                _ => serde_json::json!({"result": null}),
+                },
+                _ => msgpack_map! { "result" => Value::Nil },
             }
         })
         .collect();
@@ -249,7 +232,7 @@ async fn batch_execute(params: &serde_json::Value) -> HandlerResult {
     // Run all batch requests concurrently
     let results = futures::future::join_all(futures).await;
 
-    Ok(serde_json::json!({ "results": results }))
+    Ok(msgpack_map! { "results" => Value::Array(results) })
 }
 
 /// Inner dispatch that handles the actual method routing
