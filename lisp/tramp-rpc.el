@@ -770,6 +770,52 @@ If ENCODING is nil, defaults to \"base64\" for backward compatibility."
    ((equal encoding "text") data)
    (t (base64-decode-string data))))
 
+(defun tramp-rpc--decode-filename (entry)
+  "Decode filename from directory ENTRY.
+Handles both text and base64-encoded filenames.
+Returns the filename as a unibyte string (for non-UTF8 names) or
+a multibyte string (for UTF-8 names)."
+  (let ((name (alist-get 'name entry))
+        (encoding (alist-get 'name_encoding entry)))
+    (if (equal encoding "base64")
+        ;; Base64-encoded filename (contains non-UTF8 bytes)
+        ;; Return as unibyte string to preserve raw bytes
+        (base64-decode-string name)
+      ;; Normal UTF-8 filename
+      name)))
+
+(defun tramp-rpc--path-needs-encoding-p (path)
+  "Return non-nil if PATH contains bytes that can't be sent as UTF-8.
+This includes:
+- Unibyte strings with bytes > 127
+- Multibyte strings with raw-byte characters (codepoints >= #x3fff80)"
+  (or
+   ;; Unibyte string with high bytes
+   (and (not (multibyte-string-p path))
+        (string-match-p "[^\x00-\x7f]" path))
+   ;; Multibyte string with raw-byte characters (eight-bit characters)
+   ;; These have codepoints in the range #x3fff80 to #x3fffff
+   (and (multibyte-string-p path)
+        (let ((dominated nil))
+          (dotimes (i (length path))
+            (let ((char (aref path i)))
+              (when (>= char #x3fff80)
+                (setq dominated t))))
+          dominated))))
+
+(defun tramp-rpc--encode-path (path)
+  "Encode PATH for transmission to the server.
+If PATH contains non-UTF8 bytes, encode it as base64.
+Returns an alist with path and optionally path_encoding."
+  (if (tramp-rpc--path-needs-encoding-p path)
+      ;; Path contains raw bytes - encode as base64
+      ;; Use 'raw-text to get the actual bytes
+      (let ((raw-bytes (encode-coding-string path 'raw-text)))
+        `((path . ,(base64-encode-string raw-bytes t))
+          (path_encoding . "base64")))
+    ;; Normal UTF-8 path
+    `((path . ,path))))
+
 ;; ============================================================================
 ;; File name handler operations
 ;; ============================================================================
@@ -777,24 +823,26 @@ If ENCODING is nil, defaults to \"base64\" for backward compatibility."
 (defun tramp-rpc-handle-file-exists-p (filename)
   "Like `file-exists-p' for TRAMP-RPC files."
   (with-parsed-tramp-file-name filename nil
-    (tramp-rpc--call v "file.exists" `((path . ,localname)))))
+    (tramp-rpc--call v "file.exists" (tramp-rpc--encode-path localname))))
 
 (defun tramp-rpc-handle-file-readable-p (filename)
   "Like `file-readable-p' for TRAMP-RPC files."
   (with-parsed-tramp-file-name filename nil
-    (tramp-rpc--call v "file.readable" `((path . ,localname)))))
+    (tramp-rpc--call v "file.readable" (tramp-rpc--encode-path localname))))
 
 (defun tramp-rpc-handle-file-writable-p (filename)
   "Like `file-writable-p' for TRAMP-RPC files.
 Optimized to use pipelined requests for better performance."
   (with-parsed-tramp-file-name filename nil
     (let* ((parent (file-name-directory (directory-file-name localname)))
+           (localname-encoded (tramp-rpc--encode-path localname))
+           (parent-encoded (tramp-rpc--encode-path parent))
            ;; Send both requests in parallel
            (results (tramp-rpc--call-pipelined
                      v
-                     `(("file.exists" . ((path . ,localname)))
-                       ("file.writable" . ((path . ,localname)))
-                       ("file.writable" . ((path . ,parent))))))
+                     `(("file.exists" . ,localname-encoded)
+                       ("file.writable" . ,localname-encoded)
+                       ("file.writable" . ,parent-encoded))))
            (exists (nth 0 results))
            (file-writable (nth 1 results))
            (parent-writable (nth 2 results)))
@@ -807,13 +855,13 @@ Optimized to use pipelined requests for better performance."
 (defun tramp-rpc-handle-file-executable-p (filename)
   "Like `file-executable-p' for TRAMP-RPC files."
   (with-parsed-tramp-file-name filename nil
-    (tramp-rpc--call v "file.executable" `((path . ,localname)))))
+    (tramp-rpc--call v "file.executable" (tramp-rpc--encode-path localname))))
 
 (defun tramp-rpc-handle-file-directory-p (filename)
   "Like `file-directory-p' for TRAMP-RPC files."
   (with-parsed-tramp-file-name filename nil
     (condition-case nil
-        (let ((result (tramp-rpc--call v "file.stat" `((path . ,localname)))))
+        (let ((result (tramp-rpc--call v "file.stat" (tramp-rpc--encode-path localname))))
           (equal (alist-get 'type result) "directory"))
       (file-missing nil))))
 
@@ -821,7 +869,7 @@ Optimized to use pipelined requests for better performance."
   "Like `file-regular-p' for TRAMP-RPC files."
   (with-parsed-tramp-file-name filename nil
     (condition-case nil
-        (let ((result (tramp-rpc--call v "file.stat" `((path . ,localname)))))
+        (let ((result (tramp-rpc--call v "file.stat" (tramp-rpc--encode-path localname))))
           (equal (alist-get 'type result) "file"))
       (file-missing nil))))
 
@@ -829,7 +877,9 @@ Optimized to use pipelined requests for better performance."
   "Like `file-symlink-p' for TRAMP-RPC files."
   (with-parsed-tramp-file-name filename nil
     (condition-case nil
-        (let ((result (tramp-rpc--call v "file.stat" `((path . ,localname) (lstat . t)))))
+        (let ((result (tramp-rpc--call v "file.stat"
+                                       (append (tramp-rpc--encode-path localname)
+                                               '((lstat . t))))))
           (when (equal (alist-get 'type result) "symlink")
             (alist-get 'link_target result)))
       (file-missing nil))))
@@ -840,8 +890,13 @@ If the file doesn't exist, return FILENAME unchanged
 \(like local `file-truename')."
   (with-parsed-tramp-file-name filename nil
     (condition-case nil
-        (let ((result (tramp-rpc--call v "file.truename" `((path . ,localname)))))
-          (tramp-make-tramp-file-name v result))
+        (let* ((result (tramp-rpc--call v "file.truename" (tramp-rpc--encode-path localname)))
+               (path (alist-get 'path result))
+               (encoding (alist-get 'path_encoding result))
+               (decoded-path (if (equal encoding "base64")
+                                 (base64-decode-string path)
+                               path)))
+          (tramp-make-tramp-file-name v decoded-path))
       ;; If file doesn't exist, return the filename unchanged
       (file-missing filename))))
 
@@ -849,7 +904,9 @@ If the file doesn't exist, return FILENAME unchanged
   "Like `file-attributes' for TRAMP-RPC files."
   (with-parsed-tramp-file-name filename nil
     (condition-case nil
-        (let ((result (tramp-rpc--call v "file.stat" `((path . ,localname) (lstat . t)))))
+        (let ((result (tramp-rpc--call v "file.stat"
+                                       (append (tramp-rpc--encode-path localname)
+                                               '((lstat . t))))))
           (tramp-rpc--convert-file-attributes result id-format))
       (file-missing nil))))
 
@@ -920,13 +977,17 @@ TYPE is the file type string."
 (defun tramp-rpc-handle-set-file-modes (filename mode &optional _flag)
   "Like `set-file-modes' for TRAMP-RPC files."
   (with-parsed-tramp-file-name filename nil
-    (tramp-rpc--call v "file.set_modes" `((path . ,localname) (mode . ,mode)))))
+    (tramp-rpc--call v "file.set_modes"
+                     (append (tramp-rpc--encode-path localname)
+                             `((mode . ,mode))))))
 
 (defun tramp-rpc-handle-set-file-times (filename &optional timestamp _flag)
   "Like `set-file-times' for TRAMP-RPC files."
   (with-parsed-tramp-file-name filename nil
     (let ((mtime (floor (float-time (or timestamp (current-time))))))
-      (tramp-rpc--call v "file.set_times" `((path . ,localname) (mtime . ,mtime))))))
+      (tramp-rpc--call v "file.set_times"
+                       (append (tramp-rpc--encode-path localname)
+                               `((mtime . ,mtime)))))))
 
 (defun tramp-rpc-handle-file-newer-than-file-p (file1 file2)
   "Like `file-newer-than-file-p' for TRAMP-RPC files."
@@ -949,10 +1010,10 @@ TYPE is the file type string."
   "Like `directory-files' for TRAMP-RPC files."
   (with-parsed-tramp-file-name (expand-file-name directory) nil
     (let* ((result (tramp-rpc--call v "dir.list"
-                                    `((path . ,localname)
-                                      (include_attrs . :json-false)
-                                      (include_hidden . t))))
-           (files (mapcar (lambda (entry) (alist-get 'name entry)) result)))
+                                    (append (tramp-rpc--encode-path localname)
+                                            '((include_attrs . :json-false)
+                                              (include_hidden . t)))))
+           (files (mapcar #'tramp-rpc--decode-filename result)))
       ;; Filter by match pattern
       (when match
         (setq files (cl-remove-if-not
@@ -978,12 +1039,12 @@ TYPE is the file type string."
   "Like `directory-files-and-attributes' for TRAMP-RPC files."
   (with-parsed-tramp-file-name (expand-file-name directory) nil
     (let* ((result (tramp-rpc--call v "dir.list"
-                                    `((path . ,localname)
-                                      (include_attrs . t)
-                                      (include_hidden . t))))
+                                    (append (tramp-rpc--encode-path localname)
+                                            '((include_attrs . t)
+                                              (include_hidden . t)))))
            (entries (mapcar
                      (lambda (entry)
-                       (let* ((name (alist-get 'name entry))
+                       (let* ((name (tramp-rpc--decode-filename entry))
                               (attrs (alist-get 'attrs entry))
                               (full-name (if full
                                              (tramp-make-tramp-file-name
@@ -1016,14 +1077,14 @@ TYPE is the file type string."
          filename
          ;; Get all entries in the directory
          (let* ((result (tramp-rpc--call v "dir.list"
-                                         `((path . ,localname)
-                                           (include_attrs . :json-false)
-                                           (include_hidden . t))))
+                                         (append (tramp-rpc--encode-path localname)
+                                                 '((include_attrs . :json-false)
+                                                   (include_hidden . t)))))
                 ;; Convert vector to list if needed
                 (entries (if (vectorp result) (append result nil) result)))
            ;; Build list of names with trailing / for directories
            (mapcar (lambda (entry)
-                     (let ((name (alist-get 'name entry))
+                     (let ((name (tramp-rpc--decode-filename entry))
                            (file-type (alist-get 'type entry)))
                        (if (equal file-type "directory")
                            (concat name "/")
@@ -1034,15 +1095,15 @@ TYPE is the file type string."
   "Like `make-directory' for TRAMP-RPC files."
   (with-parsed-tramp-file-name dir nil
     (tramp-rpc--call v "dir.create"
-                     `((path . ,localname)
-                       (parents . ,(if parents t :json-false))))))
+                     (append (tramp-rpc--encode-path localname)
+                             `((parents . ,(if parents t :json-false)))))))
 
 (defun tramp-rpc-handle-delete-directory (directory &optional recursive trash)
   "Like `delete-directory' for TRAMP-RPC files."
   (tramp-skeleton-delete-directory directory recursive trash
     (tramp-rpc--call v "dir.remove"
-                     `((path . ,localname)
-                       (recursive . ,(if recursive t :json-false))))))
+                     (append (tramp-rpc--encode-path localname)
+                             `((recursive . ,(if recursive t :json-false)))))))
 
 (defun tramp-rpc-handle-insert-directory
     (filename switches &optional _wildcard _full-directory-p)
@@ -1050,21 +1111,25 @@ TYPE is the file type string."
 Produces ls-like output for dired."
   (with-parsed-tramp-file-name (expand-file-name filename) nil
     (let* ((result (tramp-rpc--call v "dir.list"
-                                    `((path . ,localname)
-                                      (include_attrs . t)
-                                      (include_hidden . ,(if (string-match-p "a" (or switches "")) t :json-false)))))
+                                    (append (tramp-rpc--encode-path localname)
+                                            `((include_attrs . t)
+                                              (include_hidden . ,(if (string-match-p "a" (or switches "")) t :json-false))))))
            ;; Convert vector to list if needed
            (result-list (if (vectorp result) (append result nil) result))
-           (entries (sort result-list (lambda (a b)
-                                        (string< (alist-get 'name a)
-                                                 (alist-get 'name b))))))
+           ;; Pre-decode names for sorting and display
+           (entries-with-names (mapcar (lambda (entry)
+                                         (cons (tramp-rpc--decode-filename entry) entry))
+                                       result-list))
+           (sorted-entries (sort entries-with-names
+                                 (lambda (a b) (string< (car a) (car b))))))
       ;; Insert header
       (insert (format "  %s:\n" filename))
       (insert "  total 0\n")  ; We don't calculate total blocks
 
       ;; Insert each entry
-      (dolist (entry entries)
-        (let* ((name (alist-get 'name entry))
+      (dolist (name-entry sorted-entries)
+        (let* ((name (car name-entry))
+               (entry (cdr name-entry))
                (attrs (alist-get 'attrs entry))
                (type (alist-get 'type attrs))
                (mode (alist-get 'mode attrs))
@@ -1098,17 +1163,27 @@ Produces ls-like output for dired."
   "Like `insert-file-contents' for TRAMP-RPC files."
   (barf-if-buffer-read-only)
   (with-parsed-tramp-file-name filename nil
-    (let* ((params `((path . ,localname)))
+    (let* ((params (tramp-rpc--encode-path localname))
            (_ (when beg (push `(offset . ,beg) params)))
            (_ (when end (push `(length . ,(- end (or beg 0))) params)))
            (result (tramp-rpc--call v "file.read" params))
+           ;; Get raw bytes from base64
            (content (base64-decode-string (alist-get 'content result)))
-           (size (length content)))
+           (size (length content))
+           (point-before (point)))
 
       (when replace
-        (delete-region (point-min) (point-max)))
+        (delete-region (point-min) (point-max))
+        (setq point-before (point-min)))
 
-      (insert content)
+      ;; Insert raw bytes and let Emacs detect/decode the encoding
+      ;; This matches what standard TRAMP does for proper encoding handling
+      (let ((coding-system-for-read 'undecided))
+        (insert content)
+        ;; Decode the inserted region using Emacs' coding system detection
+        ;; This properly handles UTF-8, Chinese, and other encodings
+        (decode-coding-inserted-region point-before (point) filename visit beg end replace))
+
       (when visit
         (setq buffer-file-name filename)
         (set-visited-file-modtime)
@@ -1127,10 +1202,10 @@ Produces ls-like output for dired."
                       (buffer-substring-no-properties
                        (or start (point-min))
                        (or end (point-max)))))
-           (encoded (base64-encode-string content t))
-           (params `((path . ,localname)
-                     (content . ,encoded)
-                     (append . ,(if append t :json-false)))))
+           (encoded (base64-encode-string (encode-coding-string content 'utf-8-unix) t))
+           (params (append (tramp-rpc--encode-path localname)
+                           `((content . ,encoded)
+                             (append . ,(if append t :json-false))))))
 
       ;; Check mustbenew
       (when mustbenew
@@ -1231,7 +1306,7 @@ Produces ls-like output for dired."
 (defun tramp-rpc-handle-delete-file (filename &optional trash)
   "Like `delete-file' for TRAMP-RPC files."
   (tramp-skeleton-delete-file filename trash
-    (tramp-rpc--call v "file.delete" `((path . ,localname)))))
+    (tramp-rpc--call v "file.delete" (tramp-rpc--encode-path localname))))
 
 (defun tramp-rpc-handle-make-symbolic-link (target linkname &optional ok-if-already-exists)
   "Like `make-symbolic-link' for TRAMP-RPC files."
@@ -1241,11 +1316,20 @@ Produces ls-like output for dired."
         (signal 'file-already-exists (list linkname))))
     (when (file-exists-p linkname)
       (delete-file linkname))
-    (tramp-rpc--call v "file.make_symlink"
-                     `((target . ,(if (tramp-tramp-file-p target)
-                                      (tramp-file-local-name target)
-                                    target))
-                       (link_path . ,localname)))))
+    (let* ((target-path (if (tramp-tramp-file-p target)
+                            (tramp-file-local-name target)
+                          target))
+           (link-path-params (tramp-rpc--encode-path localname))
+           ;; Rename 'path' to 'link_path' in the encoded params
+           (params (mapcar (lambda (p)
+                             (if (eq (car p) 'path)
+                                 (cons 'link_path (cdr p))
+                               (if (eq (car p) 'path_encoding)
+                                   (cons 'link_path_encoding (cdr p))
+                                 p)))
+                           link-path-params)))
+      (tramp-rpc--call v "file.make_symlink"
+                       (append `((target . ,target-path)) params)))))
 
 (defun tramp-rpc-handle-add-name-to-file (filename newname &optional ok-if-already-exists)
   "Like `add-name-to-file' for TRAMP-RPC files.
@@ -1282,9 +1366,9 @@ Either UID or GID can be nil or -1 to leave that unchanged."
           (gid (or (and (natnump gid) gid)
                    (tramp-rpc-handle-get-remote-gid v 'integer))))
       (tramp-rpc--call v "file.chown"
-                       `((path . ,localname)
-                         (uid . ,uid)
-                         (gid . ,gid))))))
+                       (append (tramp-rpc--encode-path localname)
+                               `((uid . ,uid)
+                                 (gid . ,gid)))))))
 
 (defun tramp-rpc-handle-file-system-info (filename)
   "Like `file-system-info' for TRAMP-RPC files.
@@ -1292,7 +1376,7 @@ Returns a list of (TOTAL FREE AVAILABLE) bytes for the filesystem
 containing FILENAME."
   (with-parsed-tramp-file-name (expand-file-name filename) nil
     (condition-case nil
-        (let ((result (tramp-rpc--call v "system.statvfs" `((path . ,localname)))))
+        (let ((result (tramp-rpc--call v "system.statvfs" (tramp-rpc--encode-path localname))))
           (list (alist-get 'total result)
                 (alist-get 'free result)
                 (alist-get 'available result)))
@@ -1625,7 +1709,7 @@ Caches the result per connection."
 (defun tramp-rpc-handle-file-local-copy (filename)
   "Create a local copy of remote FILENAME using RPC."
   (with-parsed-tramp-file-name filename nil
-    (let* ((result (tramp-rpc--call v "file.read" `((path . ,localname))))
+    (let* ((result (tramp-rpc--call v "file.read" (tramp-rpc--encode-path localname)))
            (content (base64-decode-string (alist-get 'content result)))
            (tmpfile (make-temp-file "tramp-rpc.")))
       (with-temp-file tmpfile

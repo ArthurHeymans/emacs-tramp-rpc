@@ -16,6 +16,8 @@ pub async fn stat(params: &serde_json::Value) -> HandlerResult {
     #[derive(Deserialize)]
     struct Params {
         path: String,
+        /// Encoding for path: "text" (default) or "base64" for non-UTF8 paths
+        path_encoding: Option<String>,
         /// If true, don't follow symlinks
         #[serde(default)]
         lstat: bool,
@@ -24,7 +26,8 @@ pub async fn stat(params: &serde_json::Value) -> HandlerResult {
     let params: Params = serde_json::from_value(params.clone())
         .map_err(|e| RpcError::invalid_params(e.to_string()))?;
 
-    let attrs = get_file_attributes(&params.path, params.lstat).await?;
+    let path = decode_path(&params.path, params.path_encoding.as_deref())?;
+    let attrs = get_file_attributes(&path, params.lstat).await?;
     Ok(serde_json::to_value(attrs).unwrap())
 }
 
@@ -48,7 +51,7 @@ pub async fn stat_batch(params: &serde_json::Value) -> HandlerResult {
             let path = path.clone();
             let lstat = params.lstat;
             async move {
-                match get_file_attributes(&path, lstat).await {
+                match get_file_attributes(Path::new(&path), lstat).await {
                     Ok(attrs) => StatResult::Ok(attrs),
                     Err(e) => StatResult::Err {
                         error: e.message.clone(),
@@ -67,13 +70,15 @@ pub async fn exists(params: &serde_json::Value) -> HandlerResult {
     #[derive(Deserialize)]
     struct Params {
         path: String,
+        path_encoding: Option<String>,
     }
 
     let params: Params = serde_json::from_value(params.clone())
         .map_err(|e| RpcError::invalid_params(e.to_string()))?;
 
+    let path = decode_path(&params.path, params.path_encoding.as_deref())?;
     // tokio::fs doesn't have exists(), so we try metadata
-    let exists = fs::metadata(&params.path).await.is_ok();
+    let exists = fs::metadata(&path).await.is_ok();
     Ok(serde_json::json!(exists))
 }
 
@@ -82,19 +87,21 @@ pub async fn readable(params: &serde_json::Value) -> HandlerResult {
     #[derive(Deserialize)]
     struct Params {
         path: String,
+        path_encoding: Option<String>,
     }
 
     let params: Params = serde_json::from_value(params.clone())
         .map_err(|e| RpcError::invalid_params(e.to_string()))?;
 
+    let path = decode_path(&params.path, params.path_encoding.as_deref())?;
     // Use access() syscall to check read permission
-    // This is a fast syscall, no need for spawn_blocking
-    let path = params.path;
-    let readable = tokio::task::spawn_blocking(move || unsafe {
-        libc::access(
-            std::ffi::CString::new(path.as_str()).unwrap().as_ptr(),
-            libc::R_OK,
-        ) == 0
+    let readable = tokio::task::spawn_blocking(move || {
+        use std::os::unix::ffi::OsStrExt;
+        let path_bytes = path.as_os_str().as_bytes();
+        // Create null-terminated path
+        let mut path_cstr = path_bytes.to_vec();
+        path_cstr.push(0);
+        unsafe { libc::access(path_cstr.as_ptr() as *const libc::c_char, libc::R_OK) == 0 }
     })
     .await
     .unwrap_or(false);
@@ -107,17 +114,19 @@ pub async fn writable(params: &serde_json::Value) -> HandlerResult {
     #[derive(Deserialize)]
     struct Params {
         path: String,
+        path_encoding: Option<String>,
     }
 
     let params: Params = serde_json::from_value(params.clone())
         .map_err(|e| RpcError::invalid_params(e.to_string()))?;
 
-    let path = params.path;
-    let writable = tokio::task::spawn_blocking(move || unsafe {
-        libc::access(
-            std::ffi::CString::new(path.as_str()).unwrap().as_ptr(),
-            libc::W_OK,
-        ) == 0
+    let path = decode_path(&params.path, params.path_encoding.as_deref())?;
+    let writable = tokio::task::spawn_blocking(move || {
+        use std::os::unix::ffi::OsStrExt;
+        let path_bytes = path.as_os_str().as_bytes();
+        let mut path_cstr = path_bytes.to_vec();
+        path_cstr.push(0);
+        unsafe { libc::access(path_cstr.as_ptr() as *const libc::c_char, libc::W_OK) == 0 }
     })
     .await
     .unwrap_or(false);
@@ -130,17 +139,19 @@ pub async fn executable(params: &serde_json::Value) -> HandlerResult {
     #[derive(Deserialize)]
     struct Params {
         path: String,
+        path_encoding: Option<String>,
     }
 
     let params: Params = serde_json::from_value(params.clone())
         .map_err(|e| RpcError::invalid_params(e.to_string()))?;
 
-    let path = params.path;
-    let executable = tokio::task::spawn_blocking(move || unsafe {
-        libc::access(
-            std::ffi::CString::new(path.as_str()).unwrap().as_ptr(),
-            libc::X_OK,
-        ) == 0
+    let path = decode_path(&params.path, params.path_encoding.as_deref())?;
+    let executable = tokio::task::spawn_blocking(move || {
+        use std::os::unix::ffi::OsStrExt;
+        let path_bytes = path.as_os_str().as_bytes();
+        let mut path_cstr = path_bytes.to_vec();
+        path_cstr.push(0);
+        unsafe { libc::access(path_cstr.as_ptr() as *const libc::c_char, libc::X_OK) == 0 }
     })
     .await
     .unwrap_or(false);
@@ -153,19 +164,35 @@ pub async fn truename(params: &serde_json::Value) -> HandlerResult {
     #[derive(Deserialize)]
     struct Params {
         path: String,
+        path_encoding: Option<String>,
     }
 
     let params: Params = serde_json::from_value(params.clone())
         .map_err(|e| RpcError::invalid_params(e.to_string()))?;
 
-    let path = params.path.clone();
+    let path = decode_path(&params.path, params.path_encoding.as_deref())?;
 
     // Use tokio's async canonicalize
     let canonical = fs::canonicalize(&path)
         .await
         .map_err(|e| map_io_error(e, &params.path))?;
 
-    Ok(serde_json::json!(canonical.to_string_lossy()))
+    // Check if the path is valid UTF-8
+    if let Some(s) = canonical.to_str() {
+        // Valid UTF-8 path
+        Ok(serde_json::json!({
+            "path": s,
+            "path_encoding": "text"
+        }))
+    } else {
+        // Non-UTF8 path - encode as base64
+        use std::os::unix::ffi::OsStrExt;
+        let bytes = canonical.as_os_str().as_bytes();
+        Ok(serde_json::json!({
+            "path": BASE64.encode(bytes),
+            "path_encoding": "base64"
+        }))
+    }
 }
 
 /// Check if file1 is newer than file2
@@ -199,20 +226,18 @@ pub async fn newer_than(params: &serde_json::Value) -> HandlerResult {
 // Helper functions
 // ============================================================================
 
-pub async fn get_file_attributes(path: &str, lstat: bool) -> Result<FileAttributes, RpcError> {
-    let path_obj = Path::new(path);
-
+pub async fn get_file_attributes(path: &Path, lstat: bool) -> Result<FileAttributes, RpcError> {
     let metadata = if lstat {
-        fs::symlink_metadata(path_obj).await
+        fs::symlink_metadata(path).await
     } else {
-        fs::metadata(path_obj).await
+        fs::metadata(path).await
     }
-    .map_err(|e| map_io_error(e, path))?;
+    .map_err(|e| map_io_error(e, &path.to_string_lossy()))?;
 
     let file_type = get_file_type(&metadata);
 
     let link_target = if file_type == FileType::Symlink {
-        fs::read_link(path_obj)
+        fs::read_link(path)
             .await
             .ok()
             .map(|p| p.to_string_lossy().to_string())
@@ -322,5 +347,25 @@ pub fn map_io_error(err: std::io::Error, path: &str) -> RpcError {
         ErrorKind::NotFound => RpcError::file_not_found(path),
         ErrorKind::PermissionDenied => RpcError::permission_denied(path),
         _ => RpcError::io_error(err),
+    }
+}
+
+use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
+use std::ffi::OsStr;
+use std::os::unix::ffi::OsStrExt;
+use std::path::PathBuf;
+
+/// Decode a path that may be base64-encoded (for non-UTF8 filenames).
+/// If path_encoding is "base64", decode the path from base64.
+/// Otherwise, use the path as-is (UTF-8 string).
+pub fn decode_path(path: &str, path_encoding: Option<&str>) -> Result<PathBuf, RpcError> {
+    match path_encoding {
+        Some("base64") => {
+            let bytes = BASE64
+                .decode(path)
+                .map_err(|e| RpcError::invalid_params(format!("Invalid base64 path: {}", e)))?;
+            Ok(PathBuf::from(OsStr::from_bytes(&bytes)))
+        }
+        _ => Ok(PathBuf::from(path)),
     }
 }
