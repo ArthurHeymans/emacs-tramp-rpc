@@ -85,6 +85,32 @@ Set to \"yes\" to keep alive indefinitely."
                  (const :tag "Indefinitely" "yes"))
   :group 'tramp-rpc)
 
+(defcustom tramp-rpc-ssh-options nil
+  "Additional SSH options to pass when connecting.
+This is a list of strings, each of which is passed as an SSH -o option.
+For example, to disable strict host key checking:
+  (setq tramp-rpc-ssh-options \\='(\"StrictHostKeyChecking=no\"
+                                 \"UserKnownHostsFile=/dev/null\"))
+
+Note: The following options are always passed by default:
+  - BatchMode=yes (disable password prompts)
+  - StrictHostKeyChecking=accept-new (accept new keys, reject changed)
+  - ControlMaster/ControlPath/ControlPersist (if `tramp-rpc-use-controlmaster')
+
+Set this variable to override or supplement these defaults."
+  :type '(repeat string)
+  :group 'tramp-rpc)
+
+(defcustom tramp-rpc-ssh-args nil
+  "Raw SSH arguments to pass when connecting.
+This is a list of strings that are passed directly to SSH.
+For example: \\='(\"-v\" \"-F\" \"/path/to/config\")
+
+Unlike `tramp-rpc-ssh-options' which adds -o options, this allows
+passing any SSH command-line arguments."
+  :type '(repeat string)
+  :group 'tramp-rpc)
+
 (defcustom tramp-rpc-debug nil
   "When non-nil, log debug messages to *tramp-rpc-debug* buffer.
 Set to t to enable debugging for hang diagnosis."
@@ -304,10 +330,16 @@ Creates the directory from `tramp-rpc-controlmaster-path' if needed."
          ;; Build SSH command to run the RPC server
          (ssh-args (append
                     (list "ssh")
+                    ;; Raw SSH arguments (e.g., -v, -F config)
+                    tramp-rpc-ssh-args
                     (when user (list "-l" user))
                     (when port (list "-p" (number-to-string port)))
+                    ;; Default options
                     (list "-o" "BatchMode=yes")
                     (list "-o" "StrictHostKeyChecking=accept-new")
+                    ;; User-specified SSH options
+                    (mapcan (lambda (opt) (list "-o" opt))
+                            tramp-rpc-ssh-options)
                     ;; ControlMaster options for connection sharing
                     (when tramp-rpc-use-controlmaster
                       (list "-o" "ControlMaster=auto"
