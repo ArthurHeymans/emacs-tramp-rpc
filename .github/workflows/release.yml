@@ -9,7 +9,7 @@ on:
       version:
         description: 'Version to release (without v prefix)'
         required: true
-        default: '0.2.0'
+        default: '0.3.0'
 
 env:
   CARGO_TERM_COLOR: always
@@ -80,6 +80,19 @@ jobs:
             echo "version=${GITHUB_REF#refs/tags/v}" >> $GITHUB_OUTPUT
             echo "tag=${GITHUB_REF#refs/tags/}" >> $GITHUB_OUTPUT
           fi
+
+      - name: Verify version matches elisp
+        run: |
+          ELISP_VERSION=$(grep -oP 'tramp-rpc-deploy-version "\K[^"]+' lisp/tramp-rpc-deploy.el)
+          TAG_VERSION=${{ steps.version.outputs.version }}
+          echo "Elisp version: $ELISP_VERSION"
+          echo "Tag version: $TAG_VERSION"
+          if [ "$ELISP_VERSION" != "$TAG_VERSION" ]; then
+            echo "::error::Version mismatch! Tag is v${TAG_VERSION} but lisp/tramp-rpc-deploy.el has version ${ELISP_VERSION}"
+            echo "Please update tramp-rpc-deploy-version in lisp/tramp-rpc-deploy.el to match the release tag."
+            exit 1
+          fi
+          echo "Version check passed!"
 
       - name: List artifacts
         run: ls -la artifacts/

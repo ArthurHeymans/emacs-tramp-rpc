@@ -174,8 +174,11 @@ jobs:
 
       - name: Deploy server to localhost
         run: |
+          # Extract version from elisp source (single source of truth)
+          VERSION=$(grep -oP 'tramp-rpc-deploy-version "\K[^"]+' lisp/tramp-rpc-deploy.el)
+          echo "Deploying version: $VERSION"
           mkdir -p ~/.cache/tramp-rpc
-          cp target/x86_64-unknown-linux-musl/release/tramp-rpc-server ~/.cache/tramp-rpc/
+          cp target/x86_64-unknown-linux-musl/release/tramp-rpc-server ~/.cache/tramp-rpc/tramp-rpc-server-${VERSION}
 
       - name: Run full test suite
         env:
