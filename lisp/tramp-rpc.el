@@ -39,9 +39,16 @@
 ;; OPTIONAL CONFIGURATION:
 ;; If you experience issues with diff-hl in dired, you can disable it:
 ;;   (setq diff-hl-disable-on-remote t)
+;;
+;; AUTHENTICATION:
+;; When ControlMaster is enabled (default), tramp-rpc establishes the SSH
+;; ControlMaster connection first, which supports both key-based and password
+;; authentication.  If your SSH key isn't available, you'll be prompted for
+;; a password.  Subsequent operations reuse this connection without prompting.
 
 ;;; Code:
 
+(require 'cl-lib)
 (require 'tramp)
 (require 'tramp-sh)
 (require 'tramp-rpc-protocol)
@@ -93,7 +100,7 @@ For example, to disable strict host key checking:
                                  \"UserKnownHostsFile=/dev/null\"))
 
 Note: The following options are always passed by default:
-  - BatchMode=yes (disable password prompts)
+  - BatchMode=yes (for RPC connection; ControlMaster handles auth first)
   - StrictHostKeyChecking=accept-new (accept new keys, reject changed)
   - ControlMaster/ControlPath/ControlPersist (if `tramp-rpc-use-controlmaster')
 
@@ -318,11 +325,126 @@ Creates the directory from `tramp-rpc-controlmaster-path' if needed."
         ;; Set restrictive permissions for security
         (set-file-modes dir #o700)))))
 
+(defvar tramp-rpc--password-prompt-regexp
+  (rx (or "password:" "Password:" "Password for" "passphrase"
+          (seq "Enter passphrase for")))
+  "Regexp matching SSH password/passphrase prompts.")
+
+(defun tramp-rpc--controlmaster-socket-path (vec)
+  "Return the ControlMaster socket path for VEC.
+Expands SSH escape sequences in `tramp-rpc-controlmaster-path'."
+  (let* ((host (tramp-file-name-host vec))
+         (user (or (tramp-file-name-user vec) (user-login-name)))
+         (port (or (tramp-file-name-port vec) 22))
+         (path tramp-rpc-controlmaster-path))
+    ;; Expand common SSH escape sequences
+    ;; %h = host, %r = remote user, %p = port
+    ;; %C = hash of %l%h%p%r (we approximate this)
+    (setq path (replace-regexp-in-string "%h" host path t t))
+    (setq path (replace-regexp-in-string "%r" user path t t))
+    (setq path (replace-regexp-in-string "%p" (number-to-string port) path t t))
+    ;; For %C, use a simple hash approximation
+    (setq path (replace-regexp-in-string
+                "%C"
+                (md5 (format "%s%s%s%s" (system-name) host port user))
+                path t t))
+    (expand-file-name path)))
+
+(defun tramp-rpc--controlmaster-active-p (vec)
+  "Return non-nil if a ControlMaster connection is active for VEC."
+  (let ((socket-path (tramp-rpc--controlmaster-socket-path vec))
+        (host (tramp-file-name-host vec))
+        (user (tramp-file-name-user vec))
+        (port (tramp-file-name-port vec)))
+    (and (file-exists-p socket-path)
+         ;; Check if the socket is actually usable via ssh -O check
+         (zerop (apply #'call-process "ssh" nil nil nil
+                       (append
+                        (when user (list "-l" user))
+                        (when port (list "-p" (number-to-string port)))
+                        (list "-o" (format "ControlPath=%s" socket-path)
+                              "-O" "check"
+                              host)))))))
+
+(cl-defun tramp-rpc--establish-controlmaster (vec)
+  "Establish a ControlMaster connection for VEC.
+This creates an interactive SSH connection (without BatchMode) that can
+prompt for passwords if needed, then keeps it running as a ControlMaster.
+Subsequent BatchMode connections reuse this socket.
+Returns non-nil on success."
+  ;; Check if already connected
+  (when (tramp-rpc--controlmaster-active-p vec)
+    (tramp-rpc--debug "ControlMaster already active for %s" (tramp-file-name-host vec))
+    (cl-return-from tramp-rpc--establish-controlmaster t))
+  (tramp-rpc--ensure-controlmaster-directory)
+  (let* ((host (tramp-file-name-host vec))
+         (user (tramp-file-name-user vec))
+         (port (tramp-file-name-port vec))
+         (socket-path (tramp-rpc--controlmaster-socket-path vec))
+         (process-name (format "*tramp-rpc-auth %s*" host))
+         (buffer (get-buffer-create (format " *tramp-rpc-auth %s*" host)))
+         (ssh-args (append
+                    (list "ssh")
+                    tramp-rpc-ssh-args
+                    (when user (list "-l" user))
+                    (when port (list "-p" (number-to-string port)))
+                    ;; NO BatchMode - allow password prompts
+                    (list "-o" "StrictHostKeyChecking=accept-new")
+                    ;; ControlMaster options
+                    (list "-o" "ControlMaster=yes"
+                          "-o" (format "ControlPath=%s" socket-path)
+                          "-o" (format "ControlPersist=%s"
+                                       tramp-rpc-controlmaster-persist))
+                    ;; Connect and immediately exit, leaving ControlMaster running
+                    (list "-N" host)))
+         process)
+    (with-current-buffer buffer
+      (erase-buffer))
+    ;; Start SSH with PTY for interactive password prompt
+    (let ((process-connection-type t))  ; Use PTY for password prompts
+      (setq process (apply #'start-process process-name buffer ssh-args)))
+    (set-process-query-on-exit-flag process nil)
+    ;; Handle password prompts and wait for connection
+    (let ((start-time (current-time))
+          (timeout 60))  ; 60 second timeout for authentication
+      (while (and (process-live-p process)
+                  (not (file-exists-p socket-path))
+                  (< (float-time (time-subtract (current-time) start-time)) timeout))
+        (accept-process-output process 0.1)
+        (with-current-buffer buffer
+          (goto-char (point-min))
+          (when (re-search-forward tramp-rpc--password-prompt-regexp nil t)
+            ;; Password prompt detected - ask user
+            (let ((password (read-passwd
+                             (format "Password for %s@%s: "
+                                     (or user (user-login-name)) host))))
+              (when password
+                (process-send-string process (concat password "\n"))
+                ;; Clear the buffer to avoid re-matching the same prompt
+                (erase-buffer)))))))
+    ;; Check if authentication succeeded (socket was created)
+    (if (file-exists-p socket-path)
+        (progn
+          ;; Give it a moment to stabilize
+          (sleep-for 0.1)
+          t)
+      ;; Authentication failed
+      (when (process-live-p process)
+        (delete-process process))
+      (let ((output (with-current-buffer buffer (buffer-string))))
+        (error "Failed to establish SSH connection to %s: %s" host output)))))
+
 (defun tramp-rpc--connect (vec)
   "Establish an RPC connection to VEC."
   ;; Ensure ControlMaster directory exists
   (tramp-rpc--ensure-controlmaster-directory)
-  ;; First, ensure the binary is deployed using shell-based tramp
+  ;; When ControlMaster is enabled, establish it first.
+  ;; This handles both key-based and password authentication:
+  ;; - Key-based: connects silently
+  ;; - Password: prompts user, then subsequent connections reuse it
+  (when tramp-rpc-use-controlmaster
+    (tramp-rpc--establish-controlmaster vec))
+  ;; Ensure the binary is deployed using shell-based tramp
   (let* ((binary-path (tramp-rpc-deploy-ensure-binary vec))
          (host (tramp-file-name-host vec))
          (user (tramp-file-name-user vec))
@@ -341,10 +463,11 @@ Creates the directory from `tramp-rpc-controlmaster-path' if needed."
                     (mapcan (lambda (opt) (list "-o" opt))
                             tramp-rpc-ssh-options)
                     ;; ControlMaster options for connection sharing
+                    ;; Use the expanded socket path to match what establish-controlmaster created
                     (when tramp-rpc-use-controlmaster
                       (list "-o" "ControlMaster=auto"
                             "-o" (format "ControlPath=%s"
-                                         tramp-rpc-controlmaster-path)
+                                         (tramp-rpc--controlmaster-socket-path vec))
                             "-o" (format "ControlPersist=%s"
                                          tramp-rpc-controlmaster-persist)))
                     (list host binary-path)))
