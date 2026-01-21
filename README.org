@@ -45,6 +45,37 @@ TRAMP-RPC replaces this with a lightweight Rust server that runs on the remote h
   :ensure t)
 #+end_src
 
+** Using use-package with vc
+
+#+begin_src elisp
+(use-package tramp-rpc
+  :vc (:url "https://github.com/ArthurHeymans/emacs-tramp-rpc"
+       :rev :newest
+       :lisp-dir "lisp"))
+#+end_src
+
+*Important*: The ~:lisp-dir "lisp"~ option is required because the Emacs Lisp files are located in the =lisp/= subdirectory, not the repository root. Without this, Emacs won't find the package files and the ~/rpc~ method won't be available.
+
+** Doom Emacs
+
+Add to your =packages.el=:
+
+#+begin_src elisp
+(package! tramp-rpc
+  :recipe (:host github
+           :repo "ArthurHeymans/emacs-tramp-rpc"
+           :files ("lisp/*.el")))
+#+end_src
+
+Then add to your =config.el=:
+
+#+begin_src elisp
+(use-package! tramp-rpc
+  :after tramp)
+#+end_src
+
+After adding, run ~doom sync~ to install the package.
+
 ** Manual Installation
 
 1. Clone this repository:
