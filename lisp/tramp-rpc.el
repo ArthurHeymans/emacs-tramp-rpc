@@ -134,6 +134,7 @@ FORMAT-STRING and ARGS are passed to `format'."
               (apply #'format format-string args)
               "\n"))))
 
+;;;###autoload
 (defconst tramp-rpc-method "rpc"
   "TRAMP method for RPC-based remote access.")
 
@@ -3087,6 +3088,7 @@ process-file calls are routed through the TRAMP handler."
 ;; File name handler registration
 ;; ============================================================================
 
+;;;###autoload
 (defconst tramp-rpc-file-name-handler-alist
   '(;; =========================================================================
     ;; RPC-based file attribute operations
@@ -3216,6 +3218,7 @@ process-file calls are routed through the TRAMP handler."
     )
   "Alist of handler functions for TRAMP-RPC method.")
 
+;;;###autoload
 (defun tramp-rpc-file-name-handler (operation &rest args)
   "Invoke TRAMP-RPC file name handler for OPERATION with ARGS."
   (if-let ((handler (assq operation tramp-rpc-file-name-handler-alist)))
@@ -3226,28 +3229,38 @@ process-file calls are routed through the TRAMP handler."
 ;; Method registration
 ;; ============================================================================
 
+;; It must be a `defsubst' in order to push the whole code into
+;; the autoloads file.  Otherwise, there would be recursive autoloading.
 ;;;###autoload
-(tramp-register-foreign-file-name-handler
- #'tramp-rpc-file-name-p #'tramp-rpc-file-name-handler)
-
-(defun tramp-rpc-file-name-p (vec-or-filename)
+(defsubst tramp-rpc-file-name-p (vec-or-filename)
   "Check if VEC-OR-FILENAME is handled by TRAMP-RPC.
 VEC-OR-FILENAME can be either a tramp-file-name struct or a filename string."
-  (let ((method (cond
-                 ((tramp-file-name-p vec-or-filename)
-                  (tramp-file-name-method vec-or-filename))
-                 ((stringp vec-or-filename)
-                  (and (tramp-tramp-file-p vec-or-filename)
-                       (tramp-file-name-method (tramp-dissect-file-name vec-or-filename))))
-                 (t nil))))
-    (string= method tramp-rpc-method)))
+  (and-let* ((vec (tramp-ensure-dissected-file-name vec-or-filename)))
+    (string= (tramp-file-name-method vec) tramp-rpc-method)))
 
+;; Register the RPC method with TRAMP.
+;; This is wrapped in eval-after-load and marked as autoload so that:
+;; 1. The method is registered when tramp loads (if autoloads are processed first)
+;; 2. The method is registered immediately when this file is required
+;; The unless check prevents double registration.
 ;;;###autoload
-(add-to-list 'tramp-methods
-             `(,tramp-rpc-method
-               ;; Minimal method entry - no shell setup needed
-               ;; The foreign file name handler handles everything
-               ))
+(with-eval-after-load 'tramp
+  (unless (assoc "rpc" tramp-methods)
+    (add-to-list 'tramp-methods
+                 `(,"rpc"
+                   ;; Minimal method entry - no shell setup needed
+                   ;; The foreign file name handler handles everything
+                   ))))
+
+;; Register the file name handler.
+;; Marked as autoload so it's included in autoloads and runs when tramp loads.
+;; Wrapped in with-eval-after-load because tramp-register-foreign-file-name-handler
+;; is only available after tramp is loaded.
+;; tramp-register-foreign-file-name-handler is idempotent (uses add-to-list).
+;;;###autoload
+(with-eval-after-load 'tramp
+  (tramp-register-foreign-file-name-handler
+   #'tramp-rpc-file-name-p #'tramp-rpc-file-name-handler))
 
 ;; ============================================================================
 ;; Unload support
