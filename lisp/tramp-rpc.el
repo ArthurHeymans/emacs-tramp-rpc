@@ -2982,8 +2982,9 @@ process-file calls are routed through the TRAMP handler."
 ;; ============================================================================
 
 ;;;###autoload
-(tramp-register-foreign-file-name-handler
- #'tramp-rpc-file-name-p #'tramp-rpc-file-name-handler)
+(with-eval-after-load 'tramp
+  (tramp-register-foreign-file-name-handler
+   #'tramp-rpc-file-name-p #'tramp-rpc-file-name-handler))
 
 (defun tramp-rpc-file-name-p (vec-or-filename)
   "Check if VEC-OR-FILENAME is handled by TRAMP-RPC.
