@@ -124,8 +124,8 @@ jobs:
             -l test/tramp-rpc-mock-tests.el \
             --eval "(ert-run-tests-batch-and-exit \"^tramp-rpc-mock-test-protocol\")"
 
-  test-server:
-    name: Server Integration Tests
+  test-server-rust:
+    name: Server Integration Tests (Rust)
     runs-on: ubuntu-latest
     needs: [rust, elisp]
 
@@ -157,6 +157,46 @@ jobs:
             --eval "(package-install 'msgpack)"
 
       - name: Run server integration tests
+        env:
+          TRAMP_RPC_TEST_BACKEND: rust
+        run: |
+          emacs -Q --batch \
+            --eval "(require 'package)" \
+            --eval "(add-to-list 'package-archives '(\"melpa\" . \"https://melpa.org/packages/\") t)" \
+            --eval "(package-initialize)" \
+            --eval "(setq debug-on-error t)" \
+            -l test/tramp-rpc-mock-tests.el \
+            --eval "(ert-run-tests-batch-and-exit '(tag :server))"
+
+  test-server-python:
+    name: Server Integration Tests (Python)
+    runs-on: ubuntu-latest
+    needs: elisp
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Emacs
+        uses: purcell/setup-emacs@master
+        with:
+          version: '30.1'
+
+      - name: Install Python msgpack
+        run: pip install msgpack
+
+      - name: Install Emacs dependencies
+        run: |
+          emacs -Q --batch \
+            --eval "(require 'package)" \
+            --eval "(add-to-list 'package-archives '(\"melpa\" . \"https://melpa.org/packages/\") t)" \
+            --eval "(package-initialize)" \
+            --eval "(package-refresh-contents)" \
+            --eval "(package-install 'msgpack)"
+
+      - name: Run server integration tests
+        env:
+          TRAMP_RPC_TEST_BACKEND: python
         run: |
           emacs -Q --batch \
             --eval "(require 'package)" \
@@ -241,22 +281,24 @@ jobs:
   summary:
     name: Test Summary
     runs-on: ubuntu-latest
-    needs: [rust, elisp, test-protocol, test-server]
+    needs: [rust, elisp, test-protocol, test-server-rust, test-server-python]
     if: always()
 
     steps:
       - name: Check results
         run: |
           echo "=== CI Summary ==="
-          echo "Rust: ${{ needs.rust.result }}"
+          echo "Rust Build: ${{ needs.rust.result }}"
           echo "Elisp: ${{ needs.elisp.result }}"
           echo "Protocol Tests: ${{ needs.test-protocol.result }}"
-          echo "Server Tests: ${{ needs.test-server.result }}"
+          echo "Server Tests (Rust): ${{ needs.test-server-rust.result }}"
+          echo "Server Tests (Python): ${{ needs.test-server-python.result }}"
           
           if [[ "${{ needs.rust.result }}" != "success" ]] || \
              [[ "${{ needs.elisp.result }}" != "success" ]] || \
              [[ "${{ needs.test-protocol.result }}" != "success" ]] || \
-             [[ "${{ needs.test-server.result }}" != "success" ]]; then
+             [[ "${{ needs.test-server-rust.result }}" != "success" ]] || \
+             [[ "${{ needs.test-server-python.result }}" != "success" ]]; then
             echo "Some tests failed!"
             exit 1
           fi

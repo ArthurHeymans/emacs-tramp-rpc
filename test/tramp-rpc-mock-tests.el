@@ -258,8 +258,18 @@
 (defvar tramp-rpc-mock-test-temp-dir nil
   "Temporary directory for tests.")
 
-(defun tramp-rpc-mock-test--find-server ()
-  "Find the RPC server executable or Python script."
+(defvar tramp-rpc-mock-test-python-command "python3"
+  "Python command for running the Python server.")
+
+(defun tramp-rpc-mock-test--find-python-server ()
+  "Find the Python RPC server script."
+  (let ((script (expand-file-name "server/tramp-rpc-server.py"
+                                   tramp-rpc-mock-test--project-root)))
+    (when (file-exists-p script)
+      (list tramp-rpc-mock-test-python-command script))))
+
+(defun tramp-rpc-mock-test--find-rust-server ()
+  "Find the Rust RPC server binary."
   (let* ((rust-binary (expand-file-name "target/release/tramp-rpc-server"
                                          tramp-rpc-mock-test--project-root))
          (rust-binary-server (expand-file-name "server/target/release/tramp-rpc-server"
@@ -279,11 +289,26 @@
      ((file-executable-p rust-debug-server) rust-debug-server)
      (t nil))))
 
+(defun tramp-rpc-mock-test--find-server ()
+  "Find the RPC server executable or Python script.
+Checks environment variable TRAMP_RPC_TEST_BACKEND to prefer
+python or rust backend. Default is to try Rust first, then Python."
+  (let ((backend (getenv "TRAMP_RPC_TEST_BACKEND")))
+    (cond
+     ((equal backend "python")
+      (tramp-rpc-mock-test--find-python-server))
+     ((equal backend "rust")
+      (tramp-rpc-mock-test--find-rust-server))
+     (t
+      ;; Default: try Rust first, then Python
+      (or (tramp-rpc-mock-test--find-rust-server)
+          (tramp-rpc-mock-test--find-python-server))))))
+
 (defun tramp-rpc-mock-test--start-server ()
   "Start a local RPC server for testing."
   (let ((server (tramp-rpc-mock-test--find-server)))
     (unless server
-      (error "No RPC server found. Build with 'cargo build --release'"))
+      (error "No RPC server found. Build with 'cargo build --release' or ensure Python 3 is available"))
     (setq tramp-rpc-mock-test-temp-dir (make-temp-file "tramp-rpc-test" t))
     (setq tramp-rpc-mock-test-server-buffer (generate-new-buffer "*tramp-rpc-test-server*"))
     ;; Set buffer to unibyte for binary protocol
@@ -291,7 +316,10 @@
       (set-buffer-multibyte nil))
     (setq tramp-rpc-mock-test-server-process
           (let ((process-connection-type nil))  ; Use pipes
-            (start-process "test-server" tramp-rpc-mock-test-server-buffer server)))
+            ;; server can be a string (Rust binary) or list (Python command + script)
+            (if (listp server)
+                (apply #'start-process "test-server" tramp-rpc-mock-test-server-buffer server)
+              (start-process "test-server" tramp-rpc-mock-test-server-buffer server))))
     (set-process-query-on-exit-flag tramp-rpc-mock-test-server-process nil)
     ;; Use binary coding for MessagePack protocol
     (set-process-coding-system tramp-rpc-mock-test-server-process 'binary 'binary)
