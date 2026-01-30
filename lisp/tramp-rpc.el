@@ -1297,14 +1297,33 @@ Supported switches:
 
 (defun tramp-rpc--format-size (size human-readable)
   "Format SIZE for display.
-If HUMAN-READABLE is non-nil, use human-readable format (K, M, G)."
+If HUMAN-READABLE is non-nil, use human-readable format (K, M, G).
+Uses a width sufficient for large files (up to petabytes)."
   (if human-readable
       (cond
        ((>= size 1073741824) (format "%5.1fG" (/ size 1073741824.0)))
        ((>= size 1048576) (format "%5.1fM" (/ size 1048576.0)))
        ((>= size 1024) (format "%5.1fK" (/ size 1024.0)))
        (t (format "%6d" size)))
-    (format "%8d" size)))
+    (format "%13d" size)))
+
+(defun tramp-rpc--format-time (mtime)
+  "Format MTIME (Unix timestamp) for ls-like display.
+Uses the standard ls -l convention:
+- Files modified within the last 6 months: \"Mon DD HH:MM\"
+- Files modified more than 6 months ago: \"Mon DD  YYYY\"
+Returns a fixed-width 12-character string."
+  (if (null mtime)
+      "Jan  1  1970"
+    (let* ((time (seconds-to-time mtime))
+           (now (current-time))
+           ;; 6 months in seconds (approximately 182.5 days)
+           (six-months-ago (time-subtract now (days-to-time 182))))
+      (if (time-less-p time six-months-ago)
+          ;; Old file: show year instead of time
+          (format-time-string "%b %e  %Y" time)
+        ;; Recent file: show time
+        (format-time-string "%b %e %H:%M" time)))))
 
 (defun tramp-rpc-handle-insert-directory
     (filename switches &optional _wildcard _full-directory-p)
@@ -1378,9 +1397,7 @@ Supported switches: -a -t -S -r -h --group-directories-first."
                (link-target (tramp-rpc--decode-string (alist-get 'link_target attrs)))
                (mode-str (tramp-rpc--mode-to-string (or mode 0) (or type "file")))
                (size-str (tramp-rpc--format-size size (plist-get opts :human-readable)))
-               (time-str (if mtime
-                             (format-time-string "%b %e %H:%M" (seconds-to-time mtime))
-                           "Jan  1 00:00")))
+               (time-str (tramp-rpc--format-time mtime)))
           ;; Skip . and .. unless -a is given
           (unless (and (member name '("." ".."))
                        (not (plist-get opts :show-hidden)))
