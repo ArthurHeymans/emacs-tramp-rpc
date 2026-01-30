@@ -2892,15 +2892,75 @@ For tramp-rpc processes, resize the remote PTY and update eat's display."
        ;; Not an RPC process, use original function
        (t (funcall orig-fun process string))))))
 
+(defun tramp-rpc--process-send-region-advice (orig-fun process start end)
+  "Advice for `process-send-region' to handle TRAMP-RPC processes."
+  ;; If we're delivering output to the local relay, bypass this advice
+  (if tramp-rpc--delivering-output
+      (funcall orig-fun process start end)
+    (let ((proc (cond
+                 ((processp process) process)
+                 ((or (bufferp process) (stringp process))
+                  (get-buffer-process (get-buffer process)))
+                 (t nil))))
+      (cond
+       ;; PTY process - use PTY write
+       ((and proc (process-get proc :tramp-rpc-pty))
+        (let ((vec (process-get proc :tramp-rpc-vec))
+              (pid (process-get proc :tramp-rpc-pid))
+              (string (buffer-substring-no-properties start end)))
+          (tramp-rpc--debug "SEND-REGION PTY pid=%s len=%d" pid (length string))
+          (let ((data-bytes (if (multibyte-string-p string)
+                                (encode-coding-string string 'utf-8-unix)
+                              string)))
+            (tramp-rpc--call-async vec "process.write_pty"
+                                   `((pid . ,pid)
+                                     (data . ,(msgpack-bin-make data-bytes)))
+                                   #'ignore))
+          nil))
+       ;; Regular async RPC process (pipe-based)
+       ((and proc
+             (process-get proc :tramp-rpc-pid)
+             (process-get proc :tramp-rpc-vec)
+             (not (process-get proc :tramp-rpc-pty)))
+        (let ((string (buffer-substring-no-properties start end)))
+          (tramp-rpc--debug "SEND-REGION pipe pid=%s len=%d"
+                           (process-get proc :tramp-rpc-pid) (length string))
+          (condition-case err
+              (tramp-rpc--write-remote-process
+               (process-get proc :tramp-rpc-vec)
+               (process-get proc :tramp-rpc-pid)
+               string)
+            (error
+             (message "tramp-rpc: Error writing to process: %s" err)))))
+       ;; Not an RPC process, use original function
+       (t (funcall orig-fun process start end))))))
+
 (defun tramp-rpc--process-send-eof-advice (orig-fun &optional process)
   "Advice for `process-send-eof' to handle TRAMP-RPC processes."
   (let ((proc (or process (get-buffer-process (current-buffer)))))
     (if-let ((pid (process-get proc :tramp-rpc-pid))
              (vec (process-get proc :tramp-rpc-vec)))
-        (condition-case err
-            (tramp-rpc--close-remote-stdin vec pid)
-          (error
-           (message "tramp-rpc: Error closing stdin: %s" err)))
+        ;; Only try to send EOF if the process hasn't already exited.
+        ;; Short-lived processes (like git apply) may exit before we call
+        ;; process-send-eof, which is fine - stdin was already closed on exit.
+        (unless (or (process-get proc :tramp-rpc-exited)
+                    (not (process-live-p proc)))
+          (condition-case err
+              (if (process-get proc :tramp-rpc-pty)
+                  ;; PTY processes: send Ctrl-D (EOF character) via the PTY
+                  (let ((eof-char (string 4))) ; ASCII 4 = Ctrl-D
+                    (tramp-rpc--call-async vec "process.write_pty"
+                                           `((pid . ,pid)
+                                             (data . ,(msgpack-bin-make eof-char)))
+                                           #'ignore))
+                ;; Pipe processes: close the stdin pipe
+                (tramp-rpc--close-remote-stdin vec pid))
+            (error
+             ;; Ignore "Process not found" errors - they just mean the process
+             ;; exited before we could close stdin, which is expected for
+             ;; short-lived processes like git apply in magit hunk staging.
+             (unless (string-match-p "Process not found" (error-message-string err))
+               (message "tramp-rpc: Error closing stdin: %s" err)))))
       (funcall orig-fun process))))
 
 (defun tramp-rpc--signal-process-advice (orig-fun process sigcode &optional remote)
@@ -2952,6 +3012,7 @@ For TRAMP-RPC PTY processes, return the remote TTY name stored during creation."
 
 ;; Install advice
 (advice-add 'process-send-string :around #'tramp-rpc--process-send-string-advice)
+(advice-add 'process-send-region :around #'tramp-rpc--process-send-region-advice)
 (advice-add 'process-send-eof :around #'tramp-rpc--process-send-eof-advice)
 (advice-add 'signal-process :around #'tramp-rpc--signal-process-advice)
 (advice-add 'process-status :around #'tramp-rpc--process-status-advice)
@@ -3197,6 +3258,7 @@ VEC-OR-FILENAME can be either a tramp-file-name struct or a filename string."
 Removes advice and cleans up async processes."
   ;; Remove advice
   (advice-remove 'process-send-string #'tramp-rpc--process-send-string-advice)
+  (advice-remove 'process-send-region #'tramp-rpc--process-send-region-advice)
   (advice-remove 'process-send-eof #'tramp-rpc--process-send-eof-advice)
   (advice-remove 'signal-process #'tramp-rpc--signal-process-advice)
   (advice-remove 'process-status #'tramp-rpc--process-status-advice)
