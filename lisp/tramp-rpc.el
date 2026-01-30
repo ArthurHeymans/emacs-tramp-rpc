@@ -134,6 +134,7 @@ FORMAT-STRING and ARGS are passed to `format'."
               (apply #'format format-string args)
               "\n"))))
 
+;;;###autoload
 (defconst tramp-rpc-method "rpc"
   "TRAMP method for RPC-based remote access.")
 
@@ -3233,6 +3234,7 @@ process-file calls are routed through the TRAMP handler."
     )
   "Alist of handler functions for TRAMP-RPC method.")
 
+;;;###autoload
 (defun tramp-rpc-file-name-handler (operation &rest args)
   "Invoke TRAMP-RPC file name handler for OPERATION with ARGS."
   (if-let ((handler (assq operation tramp-rpc-file-name-handler-alist)))
@@ -3243,28 +3245,31 @@ process-file calls are routed through the TRAMP handler."
 ;; Method registration
 ;; ============================================================================
 
+;; Predicate to check if a filename should be handled by tramp-rpc.
+;; Defined with autoload cookie so it's available before full package load.
+;; Uses tramp functions, but that's fine since tramp is loaded when this is called.
 ;;;###autoload
-(tramp-register-foreign-file-name-handler
- #'tramp-rpc-file-name-p #'tramp-rpc-file-name-handler)
-
 (defun tramp-rpc-file-name-p (vec-or-filename)
   "Check if VEC-OR-FILENAME is handled by TRAMP-RPC.
 VEC-OR-FILENAME can be either a tramp-file-name struct or a filename string."
-  (let ((method (cond
-                 ((tramp-file-name-p vec-or-filename)
-                  (tramp-file-name-method vec-or-filename))
-                 ((stringp vec-or-filename)
-                  (and (tramp-tramp-file-p vec-or-filename)
-                       (tramp-file-name-method (tramp-dissect-file-name vec-or-filename))))
-                 (t nil))))
-    (string= method tramp-rpc-method)))
+  (and-let* ((vec (tramp-ensure-dissected-file-name vec-or-filename)))
+    (string= (tramp-file-name-method vec) tramp-rpc-method)))
 
+;; Register method and handler when tramp loads.
+;; The handler is autoloaded, so accessing /rpc:host:/path will:
+;; 1. Load tramp (via tramp's own autoload)
+;; 2. Trigger this with-eval-after-load, registering the method
+;; 3. When handler is called, load tramp-rpc.el fully
+;;
+;; We check fboundp because during package build (doom sync), autoloads
+;; may be loaded in a minimal environment where tramp isn't fully available.
 ;;;###autoload
-(add-to-list 'tramp-methods
-             `(,tramp-rpc-method
-               ;; Minimal method entry - no shell setup needed
-               ;; The foreign file name handler handles everything
-               ))
+(with-eval-after-load 'tramp
+  (when (fboundp 'tramp-register-foreign-file-name-handler)
+    (unless (assoc tramp-rpc-method tramp-methods)
+      (add-to-list 'tramp-methods `(,tramp-rpc-method)))
+    (tramp-register-foreign-file-name-handler
+     #'tramp-rpc-file-name-p #'tramp-rpc-file-name-handler)))
 
 ;; ============================================================================
 ;; Unload support
