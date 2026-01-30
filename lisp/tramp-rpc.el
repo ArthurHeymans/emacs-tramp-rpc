@@ -622,6 +622,13 @@ Returns the response plist if found and removes it from pending, nil otherwise."
       (remhash expected-id pending)
       response)))
 
+(defun tramp-rpc--process-accessible-p (process)
+  "Return t if PROCESS can be accessed from the current thread.
+Returns nil if the process is locked to a different thread."
+  (let ((locked-thread (process-thread process)))
+    (or (null locked-thread)
+        (eq locked-thread (current-thread)))))
+
 (defun tramp-rpc--call-with-timeout (vec method params total-timeout poll-interval)
   "Call METHOD with PARAMS on the RPC server for VEC.
 TOTAL-TIMEOUT is maximum seconds to wait.
@@ -647,19 +654,33 @@ Returns the result or signals an error."
         (while (and (not response)
                     (> timeout 0)
                     (process-live-p process))
-          ;; Use same pattern as tramp-accept-process-output:
-          ;; - poll-interval timeout to avoid spinning
-          ;; - JUST-THIS-ONE=t to only accept from this process (Bug#12145)
-          ;; - with-local-quit to allow C-g, returns t on success
-          ;; - Propagate quit if user pressed C-g
-          (if (with-local-quit
-                (accept-process-output process poll-interval nil t)
-                t)
-              ;; Check if our response arrived in pending responses
-              (setq response (tramp-rpc--find-response-by-id expected-id))
-            ;; User quit - propagate it
-            (tramp-rpc--debug "QUIT id=%s (user interrupted)" expected-id)
-            (keyboard-quit))
+          ;; Check if process is locked to another thread before trying to accept
+          (if (not (tramp-rpc--process-accessible-p process))
+              (progn
+                ;; Process locked - if non-essential, bail out; otherwise sleep and retry
+                (if non-essential
+                    (progn
+                      (tramp-rpc--debug "LOCKED id=%s method=%s (non-essential, bailing)"
+                                       expected-id method)
+                      (throw 'non-essential 'non-essential))
+                  ;; Sleep briefly - other thread may receive our response
+                  (sleep-for poll-interval)
+                  ;; Check if other thread already got our response
+                  (setq response (tramp-rpc--find-response-by-id expected-id))))
+            ;; Process is accessible - proceed with accept-process-output
+            ;; Use same pattern as tramp-accept-process-output:
+            ;; - poll-interval timeout to avoid spinning
+            ;; - JUST-THIS-ONE=t to only accept from this process (Bug#12145)
+            ;; - with-local-quit to allow C-g, returns t on success
+            ;; - Propagate quit if user pressed C-g
+            (if (with-local-quit
+                  (accept-process-output process poll-interval nil t)
+                  t)
+                ;; Check if our response arrived in pending responses
+                (setq response (tramp-rpc--find-response-by-id expected-id))
+              ;; User quit - propagate it
+              (tramp-rpc--debug "QUIT id=%s (user interrupted)" expected-id)
+              (keyboard-quit)))
           (cl-decf timeout poll-interval))
 
         (unless response
@@ -716,13 +737,25 @@ Returns:
         (while (and (not response)
                     (> timeout 0)
                     (process-live-p process))
-          (if (with-local-quit
-                (accept-process-output process 0.1 nil t)
-                t)
-              ;; Check if our response arrived in pending responses
-              (setq response (tramp-rpc--find-response-by-id expected-id))
-            (tramp-rpc--debug "QUIT-BATCH id=%s (user interrupted)" expected-id)
-            (keyboard-quit))
+          ;; Check if process is locked to another thread before trying to accept
+          (if (not (tramp-rpc--process-accessible-p process))
+              ;; Process locked - if non-essential, bail out; otherwise sleep and retry
+              (if non-essential
+                  (progn
+                    (tramp-rpc--debug "LOCKED-BATCH id=%s (non-essential, bailing)" expected-id)
+                    (throw 'non-essential 'non-essential))
+                ;; Sleep briefly - other thread may receive our response
+                (sleep-for 0.1)
+                ;; Check if other thread already got our response
+                (setq response (tramp-rpc--find-response-by-id expected-id)))
+            ;; Process is accessible
+            (if (with-local-quit
+                  (accept-process-output process 0.1 nil t)
+                  t)
+                ;; Check if our response arrived in pending responses
+                (setq response (tramp-rpc--find-response-by-id expected-id))
+              (tramp-rpc--debug "QUIT-BATCH id=%s (user interrupted)" expected-id)
+              (keyboard-quit)))
           (cl-decf timeout 0.1))
 
         (unless response
@@ -777,20 +810,37 @@ TIMEOUT is the maximum time to wait in seconds (default 30)."
       (while (and remaining-ids
                   (> timeout 0)
                   (process-live-p process))
-        (if (with-local-quit
-              (accept-process-output process 0.1 nil t)
-              t)
-            ;; Check for each remaining ID in pending responses
-            (dolist (id remaining-ids)
-              (let ((response (tramp-rpc--find-response-by-id id)))
-                (when response
-                  (tramp-rpc--debug "RECV-PIPE found id=%s" id)
-                  ;; Store response by ID
-                  (puthash id response responses)
-                  ;; Remove from remaining
-                  (setq remaining-ids (delete id remaining-ids)))))
-          (tramp-rpc--debug "RECV-PIPE quit (user interrupted)")
-          (keyboard-quit))
+        ;; Check if process is locked to another thread before trying to accept
+        (if (not (tramp-rpc--process-accessible-p process))
+            ;; Process locked - if non-essential, bail out; otherwise sleep and retry
+            (if non-essential
+                (progn
+                  (tramp-rpc--debug "LOCKED-PIPE (non-essential, bailing)")
+                  (throw 'non-essential 'non-essential))
+              ;; Sleep briefly - other thread may receive our responses
+              (sleep-for 0.1)
+              ;; Check if other thread already got any of our responses
+              (dolist (id remaining-ids)
+                (let ((response (tramp-rpc--find-response-by-id id)))
+                  (when response
+                    (tramp-rpc--debug "RECV-PIPE found id=%s (after sleep)" id)
+                    (puthash id response responses)
+                    (setq remaining-ids (delete id remaining-ids))))))
+          ;; Process is accessible
+          (if (with-local-quit
+                (accept-process-output process 0.1 nil t)
+                t)
+              ;; Check for each remaining ID in pending responses
+              (dolist (id remaining-ids)
+                (let ((response (tramp-rpc--find-response-by-id id)))
+                  (when response
+                    (tramp-rpc--debug "RECV-PIPE found id=%s" id)
+                    ;; Store response by ID
+                    (puthash id response responses)
+                    ;; Remove from remaining
+                    (setq remaining-ids (delete id remaining-ids)))))
+            (tramp-rpc--debug "RECV-PIPE quit (user interrupted)")
+            (keyboard-quit)))
         (cl-decf timeout 0.1)))
     (when remaining-ids
       (tramp-rpc--debug "RECV-PIPE timeout, missing ids: %S" remaining-ids))
@@ -939,32 +989,75 @@ Optimized to use pipelined requests for better performance."
   (with-parsed-tramp-file-name filename nil
     (tramp-rpc--call v "file.executable" (tramp-rpc--encode-path localname))))
 
+(defun tramp-rpc--call-file-stat (vec localname &optional lstat)
+  "Call file.stat for LOCALNAME on VEC, returning nil if file doesn't exist.
+If LSTAT is non-nil, don't follow symlinks."
+  (let* ((conn (tramp-rpc--ensure-connection vec))
+         (process (plist-get conn :process))
+         (buffer (plist-get conn :buffer))
+         (params (append (tramp-rpc--encode-path localname)
+                         (when lstat '((lstat . t)))))
+         (id-and-request (tramp-rpc-protocol-encode-request-with-id "file.stat" params))
+         (expected-id (car id-and-request))
+         (request (cdr id-and-request)))
+    (tramp-rpc--debug "SEND id=%s method=file.stat" expected-id)
+    (process-send-string process request)
+    (with-current-buffer buffer
+      (let ((timeout 30)
+            response)
+        (while (and (not response)
+                    (> timeout 0)
+                    (process-live-p process))
+          ;; Check if process is locked to another thread before trying to accept
+          (if (not (tramp-rpc--process-accessible-p process))
+              ;; Process locked - if non-essential, bail out; otherwise sleep and retry
+              (if non-essential
+                  (progn
+                    (tramp-rpc--debug "LOCKED file.stat (non-essential, bailing)")
+                    (throw 'non-essential 'non-essential))
+                ;; Sleep briefly - other thread may receive our response
+                (sleep-for 0.1)
+                ;; Check if other thread already got our response
+                (setq response (tramp-rpc--find-response-by-id expected-id)))
+            ;; Process is accessible
+            (if (with-local-quit
+                  (accept-process-output process 0.1 nil t)
+                  t)
+                (setq response (tramp-rpc--find-response-by-id expected-id))
+              (keyboard-quit)))
+          (cl-decf timeout 0.1))
+        (unless response
+          (error "Timeout waiting for file.stat response"))
+        (tramp-rpc--debug "RECV id=%s (found)" expected-id)
+        (if (tramp-rpc-protocol-error-p response)
+            (let ((code (tramp-rpc-protocol-error-code response)))
+              ;; Return nil for file-not-found, signal for other errors
+              (if (= code tramp-rpc-protocol-error-file-not-found)
+                  nil
+                (let ((msg (tramp-rpc-protocol-error-message response)))
+                  (if (= code tramp-rpc-protocol-error-permission-denied)
+                      (signal 'file-error (list "RPC" "Permission denied" msg))
+                    (error "RPC error: %s" msg)))))
+          (plist-get response :result))))))
+
 (defun tramp-rpc-handle-file-directory-p (filename)
   "Like `file-directory-p' for TRAMP-RPC files."
   (with-parsed-tramp-file-name filename nil
-    (condition-case nil
-        (let ((result (tramp-rpc--call v "file.stat" (tramp-rpc--encode-path localname))))
-          (equal (alist-get 'type result) "directory"))
-      (file-missing nil))))
+    (let ((result (tramp-rpc--call-file-stat v localname)))
+      (and result (equal (alist-get 'type result) "directory")))))
 
 (defun tramp-rpc-handle-file-regular-p (filename)
   "Like `file-regular-p' for TRAMP-RPC files."
   (with-parsed-tramp-file-name filename nil
-    (condition-case nil
-        (let ((result (tramp-rpc--call v "file.stat" (tramp-rpc--encode-path localname))))
-          (equal (alist-get 'type result) "file"))
-      (file-missing nil))))
+    (let ((result (tramp-rpc--call-file-stat v localname)))
+      (and result (equal (alist-get 'type result) "file")))))
 
 (defun tramp-rpc-handle-file-symlink-p (filename)
   "Like `file-symlink-p' for TRAMP-RPC files."
   (with-parsed-tramp-file-name filename nil
-    (condition-case nil
-        (let ((result (tramp-rpc--call v "file.stat"
-                                       (append (tramp-rpc--encode-path localname)
-                                               '((lstat . t))))))
-          (when (equal (alist-get 'type result) "symlink")
-            (tramp-rpc--decode-string (alist-get 'link_target result))))
-      (file-missing nil))))
+    (let ((result (tramp-rpc--call-file-stat v localname t)))  ; lstat=t
+      (when (and result (equal (alist-get 'type result) "symlink"))
+        (tramp-rpc--decode-string (alist-get 'link_target result))))))
 
 (defun tramp-rpc-handle-file-truename (filename)
   "Like `file-truename' for TRAMP-RPC files.
@@ -985,12 +1078,9 @@ If the file doesn't exist, return FILENAME unchanged
 (defun tramp-rpc-handle-file-attributes (filename &optional id-format)
   "Like `file-attributes' for TRAMP-RPC files."
   (with-parsed-tramp-file-name filename nil
-    (condition-case nil
-        (let ((result (tramp-rpc--call v "file.stat"
-                                       (append (tramp-rpc--encode-path localname)
-                                               '((lstat . t))))))
-          (tramp-rpc--convert-file-attributes result id-format))
-      (file-missing nil))))
+    (let ((result (tramp-rpc--call-file-stat v localname t)))  ; lstat=t
+      (when result
+        (tramp-rpc--convert-file-attributes result id-format)))))
 
 (defun tramp-rpc--convert-file-attributes (stat id-format)
   "Convert STAT result to Emacs file-attributes format.
