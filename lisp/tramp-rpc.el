@@ -1862,14 +1862,23 @@ Since tramp-rpc supports `process-file', VC backends can run their
 commands (git, svn, hg) directly via RPC.
 
 We set `default-directory' to the file's directory to ensure that
-process-file calls from VC backends are routed through our tramp handler."
+process-file calls from VC backends are routed through our tramp handler.
+
+Errors are demoted to log messages (like tramp-sh does) because some VC
+backends may check for files with incorrectly constructed paths, which
+would otherwise cause spurious error messages to be displayed."
   (when vc-handled-backends
     (with-parsed-tramp-file-name file nil
       ;; Set default-directory to the file's remote directory so that
       ;; process-file calls from VC are handled by our tramp handler.
+      ;; Use inhibit-message and tramp-with-demoted-errors to suppress
+      ;; errors from non-existent files (matching tramp-sh behavior).
       (let ((default-directory (file-name-directory file))
+            (inhibit-message t)
             process-file-side-effects)
-        (tramp-run-real-handler #'vc-registered (list file))))))
+        (tramp-with-demoted-errors
+            v "Error in `vc-registered' for tramp-rpc: %s"
+          (tramp-run-real-handler #'vc-registered (list file)))))))
 
 (defun tramp-rpc-handle-expand-file-name (name &optional dir)
   "Like `expand-file-name' for TRAMP-RPC files.
@@ -3084,7 +3093,11 @@ and handles binary data correctly."
   "Advice for `vc-call-backend' to handle TRAMP files correctly.
 When FUNCTION-NAME is an operation that takes a file argument and that file is
 a TRAMP path, ensure `default-directory' is set to the file's directory so that
-process-file calls are routed through the TRAMP handler."
+process-file calls are routed through the TRAMP handler.
+
+Errors are demoted to log messages (like tramp-sh does) because some VC
+backends may check for files with incorrectly constructed paths, which
+would otherwise cause spurious error messages to be displayed."
   (let* ((file (car args))
          (should-set-dir (and file
                               (stringp file)
@@ -3094,8 +3107,12 @@ process-file calls are routed through the TRAMP handler."
                                                     working-revision previous-revision next-revision
                                                     responsible-p)))))
     (if should-set-dir
-        (let ((default-directory (file-name-directory file)))
-          (apply orig-fun backend function-name args))
+        (with-parsed-tramp-file-name file nil
+          (let ((default-directory (file-name-directory file))
+                (inhibit-message t))
+            (tramp-with-demoted-errors
+                v (format "Error in `vc-call-backend' %s for tramp-rpc: %%s" function-name)
+              (apply orig-fun backend function-name args))))
       (apply orig-fun backend function-name args))))
 
 (advice-add 'vc-call-backend :around #'tramp-rpc--vc-call-backend-advice)
