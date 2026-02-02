@@ -1585,6 +1585,9 @@ Supported switches: -a -t -S -r -h --group-directories-first."
   "Like `copy-file' for TRAMP-RPC files."
   (setq filename (expand-file-name filename)
         newname (expand-file-name newname))
+  ;; If newname is a directory, copy the file INTO it
+  (when (file-directory-p newname)
+    (setq newname (expand-file-name (file-name-nondirectory filename) newname)))
   (let ((source-remote (tramp-tramp-file-p filename))
         (dest-remote (tramp-tramp-file-p newname)))
     (cond

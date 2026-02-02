@@ -547,6 +547,31 @@ This tests Issue #13: Chinese characters decode incorrectly."
                              (buffer-string)))))
         (ignore-errors (delete-file dest))))))
 
+(ert-deftest tramp-rpc-test06-copy-file-to-directory ()
+  "Test `copy-file' to a directory destination (issue #45)."
+  (skip-unless (tramp-rpc-test-enabled))
+
+  (tramp-rpc-test--with-temp-file src "source content for dir copy"
+    (let ((dest-dir (tramp-rpc-test--make-temp-name)))
+      (unwind-protect
+          (progn
+            ;; Create destination directory
+            (make-directory dest-dir)
+            (should (file-directory-p dest-dir))
+            ;; Copy file to directory - should copy INTO the directory
+            (copy-file src dest-dir)
+            ;; File should now exist inside the directory with original name
+            (let ((expected-dest (expand-file-name
+                                  (file-name-nondirectory src) dest-dir)))
+              (should (file-exists-p expected-dest))
+              (should (equal (with-temp-buffer
+                               (insert-file-contents src)
+                               (buffer-string))
+                             (with-temp-buffer
+                               (insert-file-contents expected-dest)
+                               (buffer-string))))))
+        (ignore-errors (delete-directory dest-dir t))))))
+
 (ert-deftest tramp-rpc-test06-rename-file ()
   "Test `rename-file' for TRAMP RPC files."
   (skip-unless (tramp-rpc-test-enabled))
