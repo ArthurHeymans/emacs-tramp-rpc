@@ -707,6 +707,90 @@ This tests Issue #13: Chinese characters decode incorrectly."
                                       (file-local-name true-name)))))
         (ignore-errors (delete-file link))))))
 
+(ert-deftest tramp-rpc-test08b-file-truename-nonexisting ()
+  "Test `file-truename' for non-existing TRAMP RPC files.
+This tests the fix for GitHub issue #37: file-truename should return
+the filename unchanged for non-existing files, not signal an error."
+  (skip-unless (tramp-rpc-test-enabled))
+
+  (let* ((remote-dir (tramp-rpc-test--remote-directory))
+         (nonexisting (expand-file-name "nonexisting-file-for-truename-test" remote-dir)))
+    ;; Ensure the file doesn't exist
+    (should-not (file-exists-p nonexisting))
+    ;; file-truename should return the path unchanged (not error)
+    (let ((truename (file-truename nonexisting)))
+      (should (stringp truename))
+      ;; The truename should contain the same localname
+      (should (string-match-p (regexp-quote "nonexisting-file-for-truename-test")
+                              truename))
+      ;; It should still be a tramp path
+      (should (tramp-tramp-file-p truename)))))
+
+(ert-deftest tramp-rpc-test08c-find-file-nonexisting ()
+  "Test `find-file' for non-existing TRAMP RPC files.
+This tests creating new files via find-file, which was broken in issue #37."
+  (skip-unless (tramp-rpc-test-enabled))
+
+  (let* ((remote-dir (tramp-rpc-test--remote-directory))
+         (newfile (expand-file-name
+                   (format "new-file-%s" (format-time-string "%s%N"))
+                   remote-dir)))
+    (unwind-protect
+        (progn
+          ;; Ensure the file doesn't exist
+          (should-not (file-exists-p newfile))
+          ;; find-file-noselect should work without error
+          (let ((buf (find-file-noselect newfile)))
+            (should (bufferp buf))
+            (unwind-protect
+                (with-current-buffer buf
+                  ;; Buffer should be set up correctly
+                  (should (equal buffer-file-name newfile))
+                  (should (stringp buffer-file-truename))
+                  ;; Write some content and save
+                  (insert "test content for new file")
+                  (save-buffer)
+                  ;; File should now exist
+                  (should (file-exists-p newfile))
+                  ;; Content should be correct
+                  (should (equal (with-temp-buffer
+                                   (insert-file-contents newfile)
+                                   (buffer-string))
+                                 "test content for new file")))
+              (kill-buffer buf))))
+      ;; Cleanup
+      (ignore-errors (delete-file newfile)))))
+
+(ert-deftest tramp-rpc-test08d-file-truename-nonexisting-in-symlink-dir ()
+  "Test `file-truename' for non-existing file in a symlinked directory.
+Note: Unlike SSH tramp (which uses `readlink --canonicalize-missing'),
+tramp-rpc currently does not resolve symlinks in parent directories
+for non-existing files.  This test verifies the function doesn't error
+and returns a valid path."
+  (skip-unless (tramp-rpc-test-enabled))
+
+  (let* ((remote-dir (tramp-rpc-test--remote-directory))
+         (real-subdir (expand-file-name "real-subdir-for-truename" remote-dir))
+         (link-subdir (expand-file-name "link-subdir-for-truename" remote-dir))
+         (nonexisting-via-link (expand-file-name "nonexisting.txt" link-subdir)))
+    (unwind-protect
+        (progn
+          ;; Create a real directory
+          (make-directory real-subdir t)
+          ;; Create a symlink to it
+          (condition-case nil
+              (make-symbolic-link real-subdir link-subdir)
+            (file-error (ert-skip "Symlinks not supported")))
+          ;; file-truename on non-existing file via symlink should not error
+          (let ((truename (file-truename nonexisting-via-link)))
+            (should (stringp truename))
+            ;; It should be a valid tramp path containing the filename
+            (should (tramp-tramp-file-p truename))
+            (should (string-match-p "nonexisting\\.txt" truename))))
+      ;; Cleanup
+      (ignore-errors (delete-file link-subdir))
+      (ignore-errors (delete-directory real-subdir t)))))
+
 ;;; ============================================================================
 ;;; Test 09: File Times
 ;;; ============================================================================

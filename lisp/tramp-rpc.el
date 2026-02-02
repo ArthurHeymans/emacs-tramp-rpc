@@ -1061,19 +1061,47 @@ If LSTAT is non-nil, don't follow symlinks."
 
 (defun tramp-rpc-handle-file-truename (filename)
   "Like `file-truename' for TRAMP-RPC files.
-If the file doesn't exist, return FILENAME unchanged
-\(like local `file-truename')."
-  (with-parsed-tramp-file-name filename nil
+Resolves symlinks in the path.  For non-existing files, returns the
+path unchanged (after resolving any symlinks in parent directories)."
+  ;; Use tramp-skeleton-file-truename which handles:
+  ;; - Caching via with-tramp-file-property
+  ;; - Proper filename expansion and unquoting
+  ;; - Preserving trailing "/" and requoting
+  ;; The BODY must return a localname, which the skeleton wraps with
+  ;; tramp-make-tramp-file-name.
+  (tramp-skeleton-file-truename filename
+    ;; Try RPC first for existing files (fast path)
     (condition-case nil
-        (let* ((result (tramp-rpc--call v "file.truename" (tramp-rpc--encode-path localname)))
+        (let* ((result (tramp-rpc--call v "file.truename"
+                                        (tramp-rpc--encode-path localname)))
                ;; With MessagePack, path comes as raw bytes - decode to UTF-8
                (path (tramp-rpc--decode-string
                       (if (stringp result)
-                          result  ; Direct binary result
-                        (alist-get 'path result)))))  ; Or in result object
-          (tramp-make-tramp-file-name v path))
-      ;; If file doesn't exist, return the filename unchanged
-      (file-missing filename))))
+                          result
+                        (alist-get 'path result)))))
+          (or path localname))
+      ;; If file doesn't exist, fall back to symlink-chasing approach
+      ;; (same as tramp-handle-file-truename)
+      (file-missing
+       (let ((result (directory-file-name localname))
+             (numchase 0)
+             (numchase-limit 20)
+             symlink-target)
+         (while (and (setq symlink-target
+                           (file-symlink-p (tramp-make-tramp-file-name v result)))
+                     (< numchase numchase-limit))
+           (setq numchase (1+ numchase)
+                 result
+                 (if (tramp-tramp-file-p symlink-target)
+                     (file-name-quote symlink-target 'top)
+                   (tramp-drop-volume-letter
+                    (expand-file-name
+                     symlink-target (file-name-directory result)))))
+           (when (>= numchase numchase-limit)
+             (tramp-error
+              v 'file-error
+              "Maximum number (%d) of symlinks exceeded" numchase-limit)))
+         (directory-file-name result))))))
 
 (defun tramp-rpc-handle-file-attributes (filename &optional id-format)
   "Like `file-attributes' for TRAMP-RPC files."
@@ -1415,34 +1443,46 @@ Supported switches: -a -t -S -r -h --group-directories-first."
     (filename &optional visit beg end replace)
   "Like `insert-file-contents' for TRAMP-RPC files."
   (barf-if-buffer-read-only)
-  (with-parsed-tramp-file-name filename nil
-    (let* ((params (tramp-rpc--encode-path localname))
-           (_ (when beg (push `(offset . ,beg) params)))
-           (_ (when end (push `(length . ,(- end (or beg 0))) params)))
-           (result (tramp-rpc--call v "file.read" params))
-           ;; With MessagePack, content is already raw bytes (unibyte string)
-           (content (alist-get 'content result))
-           (size (length content))
-           (point-before (point)))
+  (setq filename (expand-file-name filename))
+  (let (result)
+    (with-parsed-tramp-file-name filename nil
+      (unwind-protect
+          (let* ((params (tramp-rpc--encode-path localname))
+                 (_ (when beg (push `(offset . ,beg) params)))
+                 (_ (when end (push `(length . ,(- end (or beg 0))) params)))
+                 (rpc-result (tramp-rpc--call v "file.read" params))
+                 ;; With MessagePack, content is already raw bytes (unibyte string)
+                 (content (alist-get 'content rpc-result))
+                 (size (length content))
+                 (point-before (point)))
 
-      (when replace
-        (delete-region (point-min) (point-max))
-        (setq point-before (point-min)))
+            (when replace
+              (delete-region (point-min) (point-max))
+              (setq point-before (point-min)))
 
-      ;; Insert raw bytes and let Emacs detect/decode the encoding
-      ;; This matches what standard TRAMP does for proper encoding handling
-      (let ((coding-system-for-read 'undecided))
-        (insert content)
-        ;; Decode the inserted region using Emacs' coding system detection
-        ;; This properly handles UTF-8, Chinese, and other encodings
-        (decode-coding-inserted-region point-before (point) filename visit beg end replace))
+            ;; Insert raw bytes and let Emacs detect/decode the encoding
+            ;; This matches what standard TRAMP does for proper encoding handling
+            (let ((coding-system-for-read 'undecided))
+              (insert content)
+              ;; Decode the inserted region using Emacs' coding system detection
+              ;; This properly handles UTF-8, Chinese, and other encodings
+              (decode-coding-inserted-region point-before (point) filename visit beg end replace))
 
-      (when visit
-        (setq buffer-file-name filename)
-        (set-visited-file-modtime)
-        (set-buffer-modified-p nil))
+            (setq result (list filename size)))
 
-      (list filename size))))
+        ;; Cleanup/exit - runs even if an error was signaled.
+        ;; This ensures buffer-file-name is set when VISIT is non-nil,
+        ;; which is required by find-file-noselect-1 for proper buffer setup.
+        ;; Without this, find-file on non-existing files fails with
+        ;; "wrong-type-argument arrayp nil" (GitHub issue #37).
+        (when visit
+          (setq buffer-file-name filename
+                buffer-read-only (not (file-writable-p filename)))
+          (set-visited-file-modtime)
+          (set-buffer-modified-p nil))))
+
+    ;; Return result (or nil if file didn't exist)
+    (or result (list filename 0))))
 
 (defun tramp-rpc-handle-write-region
     (start end filename &optional append visit _lockname mustbenew)
