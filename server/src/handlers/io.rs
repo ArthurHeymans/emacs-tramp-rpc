@@ -176,8 +176,18 @@ pub async fn copy(params: &Value) -> HandlerResult {
     let params: Params =
         from_value(params.clone()).map_err(|e| RpcError::invalid_params(e.to_string()))?;
 
+    let src_path = Path::new(&params.src);
+    let mut dest_path = std::path::PathBuf::from(&params.dest);
+
+    // If destination is a directory, append the source filename
+    if dest_path.is_dir() {
+        if let Some(filename) = src_path.file_name() {
+            dest_path.push(filename);
+        }
+    }
+
     // Copy the file
-    let bytes_copied = fs::copy(&params.src, &params.dest)
+    let bytes_copied = fs::copy(&params.src, &dest_path)
         .await
         .map_err(|e| map_io_error(e, &params.src))?;
 
@@ -185,7 +195,7 @@ pub async fn copy(params: &Value) -> HandlerResult {
     if params.preserve {
         if let Ok(metadata) = fs::metadata(&params.src).await {
             // Preserve permissions
-            let _ = fs::set_permissions(&params.dest, metadata.permissions()).await;
+            let _ = fs::set_permissions(&dest_path, metadata.permissions()).await;
 
             // Preserve timestamps
             #[cfg(unix)]
@@ -193,7 +203,7 @@ pub async fn copy(params: &Value) -> HandlerResult {
                 use std::os::unix::fs::MetadataExt;
                 let atime = metadata.atime();
                 let mtime = metadata.mtime();
-                let dest = params.dest.clone();
+                let dest = dest_path.to_string_lossy().to_string();
                 let _ =
                     tokio::task::spawn_blocking(move || set_file_times_sync(&dest, atime, mtime))
                         .await;
