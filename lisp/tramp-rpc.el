@@ -1414,35 +1414,50 @@ Supported switches:
      :human-readable (string-match-p "h" sw)
      :group-directories-first (string-match-p "group-directories-first" sw))))
 
-(defun tramp-rpc--format-size (size human-readable)
+(defun tramp-rpc--format-size (size human-readable &optional width)
   "Format SIZE for display.
-If HUMAN-READABLE is non-nil, use human-readable format (K, M, G).
-Uses a width sufficient for large files (up to petabytes)."
+If HUMAN-READABLE is non-nil, use human-readable format (K, M, G, T, P).
+WIDTH is the minimum field width for right-alignment (default varies by mode).
+Returns right-aligned string."
   (if human-readable
-      (cond
-       ((>= size 1073741824) (format "%5.1fG" (/ size 1073741824.0)))
-       ((>= size 1048576) (format "%5.1fM" (/ size 1048576.0)))
-       ((>= size 1024) (format "%5.1fK" (/ size 1024.0)))
-       (t (format "%6d" size)))
-    (format "%13d" size)))
+      (let* ((formatted
+              (cond
+               ((>= size 1125899906842624) (format "%.1fP" (/ size 1125899906842624.0)))  ; >= 1 PiB
+               ((>= size 1099511627776) (format "%.1fT" (/ size 1099511627776.0)))        ; >= 1 TiB
+               ((>= size 1073741824) (format "%.1fG" (/ size 1073741824.0)))              ; >= 1 GiB
+               ((>= size 1048576) (format "%.1fM" (/ size 1048576.0)))                    ; >= 1 MiB
+               ((>= size 1024) (format "%.1fK" (/ size 1024.0)))                          ; >= 1 KiB
+               (t (number-to-string size))))
+             (w (or width (max 6 (length formatted)))))
+        (format (format "%%%ds" w) formatted))
+    (let ((w (or width 13)))
+      (format (format "%%%dd" w) size))))
 
 (defun tramp-rpc--format-time (mtime)
   "Format MTIME (Unix timestamp) for ls-like display.
-Uses the standard ls -l convention:
+Uses the standard ls -l convention (matching ls-lisp.el):
 - Files modified within the last 6 months: \"Mon DD HH:MM\"
 - Files modified more than 6 months ago: \"Mon DD  YYYY\"
-Returns a fixed-width 12-character string."
+Returns a fixed-width 12-character string.
+Note: Uses the C locale for month names to ensure consistent width."
   (if (null mtime)
       "Jan  1  1970"
     (let* ((time (seconds-to-time mtime))
-           (now (current-time))
-           ;; 6 months in seconds (approximately 182.5 days)
-           (six-months-ago (time-subtract now (days-to-time 182))))
-      (if (time-less-p time six-months-ago)
-          ;; Old file: show year instead of time
-          (format-time-string "%b %e  %Y" time)
-        ;; Recent file: show time
-        (format-time-string "%b %e %H:%M" time)))))
+           (diff (time-subtract time nil))
+           ;; Consider a time to be recent if it is within the past six
+           ;; months.  A Gregorian year has 365.2425 * 24 * 60 * 60 ==
+           ;; 31556952 seconds on the average, and half of that is 15778476.
+           ;; Write the constant explicitly to avoid roundoff error.
+           ;; (This matches ls-lisp.el exactly)
+           (past-cutoff -15778476)
+           ;; Use C locale for consistent 3-char month abbreviations
+           (system-time-locale "C"))
+      (if (and (not (time-less-p diff past-cutoff))  ; not older than 6 months
+               (not (time-less-p 0 diff)))           ; not in the future
+          ;; Recent file: show time
+          (format-time-string "%b %e %H:%M" time)
+        ;; Old file or future: show year instead of time
+        (format-time-string "%b %e  %Y" time)))))
 
 (defun tramp-rpc-handle-insert-directory
     (filename switches &optional _wildcard _full-directory-p)
@@ -1451,24 +1466,70 @@ Produces ls-like output for dired.
 Supported switches: -a -t -S -r -h --group-directories-first."
   (with-parsed-tramp-file-name (expand-file-name filename) nil
     (let* ((opts (tramp-rpc--parse-dired-switches switches))
+           (human-readable (plist-get opts :human-readable))
            (result (tramp-rpc--call v "dir.list"
                                     (append (tramp-rpc--encode-path localname)
                                             `((include_attrs . t)
                                               (include_hidden . ,(if (plist-get opts :show-hidden) t :msgpack-false))))))
            ;; Convert vector to list if needed
            (result-list (if (vectorp result) (append result nil) result))
-           ;; Pre-decode names and extract sort keys
+           ;; Pre-decode names and extract all data needed for formatting
            (entries-with-data
             (mapcar (lambda (entry)
                       (let* ((name (tramp-rpc--decode-filename entry))
                              (attrs (alist-get 'attrs entry))
                              (type (alist-get 'type attrs))
                              (size (or (alist-get 'size attrs) 0))
+                             (nlinks (or (alist-get 'nlinks attrs) 1))
+                             (uid (or (alist-get 'uid attrs) 0))
+                             (gid (or (alist-get 'gid attrs) 0))
+                             (uname (or (tramp-rpc--decode-string (alist-get 'uname attrs))
+                                        (number-to-string uid)))
+                             (gname (or (tramp-rpc--decode-string (alist-get 'gname attrs))
+                                        (number-to-string gid)))
                              (mtime (or (alist-get 'mtime attrs) 0))
                              (is-dir (equal type "directory")))
                         (list :name name :entry entry :size size
+                              :nlinks nlinks :uname uname :gname gname
                               :mtime mtime :is-dir is-dir)))
                     result-list))
+           ;; Calculate dynamic column widths (like ls does)
+           ;; First pass: find maximum widths (with defaults for empty dirs)
+           (max-nlinks-width
+            (if entries-with-data
+                (apply #'max 1
+                       (mapcar (lambda (e)
+                                 (length (number-to-string (plist-get e :nlinks))))
+                               entries-with-data))
+              1))
+           (max-uname-width
+            (if entries-with-data
+                (apply #'max 1
+                       (mapcar (lambda (e)
+                                 (length (plist-get e :uname)))
+                               entries-with-data))
+              8))
+           (max-gname-width
+            (if entries-with-data
+                (apply #'max 1
+                       (mapcar (lambda (e)
+                                 (length (plist-get e :gname)))
+                               entries-with-data))
+              8))
+           (max-size-width
+            (if entries-with-data
+                (if human-readable
+                    ;; For human-readable, calculate max formatted size width
+                    (apply #'max 1
+                           (mapcar (lambda (e)
+                                     (length (tramp-rpc--format-size (plist-get e :size) t 1)))
+                                   entries-with-data))
+                  ;; For numeric, use number of digits of largest size
+                  (apply #'max 1
+                         (mapcar (lambda (e)
+                                   (length (number-to-string (plist-get e :size))))
+                                 entries-with-data)))
+              1))
            ;; Sort entries based on switches
            (sorted-entries
             (let* ((sort-fn
@@ -1492,35 +1553,38 @@ Supported switches: -a -t -S -r -h --group-directories-first."
               ;; Apply reverse if requested
               (if (plist-get opts :reverse)
                   (nreverse sorted)
-                sorted))))
+                sorted)))
+           ;; Build format string with dynamic widths
+           ;; Note: size-str is pre-formatted by tramp-rpc--format-size, so use %s
+           (format-str (format "  %%s %%%dd %%-%ds %%-%ds %%s %%s %%s"
+                               max-nlinks-width
+                               max-uname-width
+                               max-gname-width)))
       ;; Insert header
       (insert (format "  %s:\n" filename))
       (insert "  total 0\n")  ; We don't calculate total blocks
 
-      ;; Insert each entry
+      ;; Insert each entry using dynamic widths
       (dolist (entry-data sorted-entries)
         (let* ((name (plist-get entry-data :name))
                (entry (plist-get entry-data :entry))
                (attrs (alist-get 'attrs entry))
                (type (alist-get 'type attrs))
                (mode (alist-get 'mode attrs))
-               (nlinks (or (alist-get 'nlinks attrs) 1))
-               (uid (or (alist-get 'uid attrs) 0))
-               (gid (or (alist-get 'gid attrs) 0))
-               (uname (or (tramp-rpc--decode-string (alist-get 'uname attrs))
-                          (number-to-string uid)))
-               (gname (or (tramp-rpc--decode-string (alist-get 'gname attrs))
-                          (number-to-string gid)))
+               (nlinks (plist-get entry-data :nlinks))
+               (uname (plist-get entry-data :uname))
+               (gname (plist-get entry-data :gname))
                (size (plist-get entry-data :size))
                (mtime (alist-get 'mtime attrs))
                (link-target (tramp-rpc--decode-string (alist-get 'link_target attrs)))
                (mode-str (tramp-rpc--mode-to-string (or mode 0) (or type "file")))
-               (size-str (tramp-rpc--format-size size (plist-get opts :human-readable)))
+               ;; Format size with dynamic width (already calculated)
+               (size-str (tramp-rpc--format-size size human-readable max-size-width))
                (time-str (tramp-rpc--format-time mtime)))
           ;; Skip . and .. unless -a is given
           (unless (and (member name '("." ".."))
                        (not (plist-get opts :show-hidden)))
-            (insert (format "  %s %3d %-8s %-8s %s %s %s"
+            (insert (format format-str
                             mode-str nlinks uname gname size-str time-str name))
             (when (and link-target (equal type "symlink"))
               (insert (format " -> %s" link-target)))
