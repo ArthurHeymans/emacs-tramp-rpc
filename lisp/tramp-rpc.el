@@ -20,11 +20,10 @@
 ;; instead of parsing shell command output.  This significantly improves
 ;; performance for remote file operations.
 ;;
-;; To use, add to your init.el:
-;;   (require 'tramp-rpc)
-;;
-;; Then access files using the "rpc" method:
+;; Once installed, just access files using the "rpc" method:
 ;;   /rpc:user@host:/path/to/file
+;;
+;; The package autoloads automatically - no (require 'tramp-rpc) needed.
 ;;
 ;; FEATURES:
 ;; - Fast file operations via binary RPC protocol
@@ -48,6 +47,31 @@
 
 ;;; Code:
 
+;; Autoload support - these forms are extracted to tramp-rpc-autoloads.el
+;; and run at package-initialize time, before the full file is loaded.
+
+;;;###autoload
+(defconst tramp-rpc-method "rpc"
+  "TRAMP method for RPC-based remote access.")
+
+;;;###autoload
+(autoload 'tramp-rpc-file-name-p "tramp-rpc"
+  "Check if VEC-OR-FILENAME uses the TRAMP-RPC method.")
+
+;;;###autoload
+(autoload 'tramp-rpc-file-name-handler "tramp-rpc"
+  "Invoke TRAMP-RPC file name handler for OPERATION with ARGS.")
+
+;;;###autoload
+(with-eval-after-load 'tramp
+  ;; Register the method
+  (add-to-list 'tramp-methods `(,tramp-rpc-method))
+  ;; Register the foreign handler - the autoload stubs will trigger
+  ;; full load of tramp-rpc.el when called
+  (add-to-list 'tramp-foreign-file-name-handler-alist
+               '(tramp-rpc-file-name-p . tramp-rpc-file-name-handler)))
+
+;; Now the actual implementation
 (require 'cl-lib)
 (require 'tramp)
 (require 'tramp-sh)
@@ -133,9 +157,6 @@ FORMAT-STRING and ARGS are passed to `format'."
       (insert (format-time-string "[%Y-%m-%d %H:%M:%S.%3N] ")
               (apply #'format format-string args)
               "\n"))))
-
-(defconst tramp-rpc-method "rpc"
-  "TRAMP method for RPC-based remote access.")
 
 ;; ============================================================================
 ;; Connection management
@@ -3240,12 +3261,8 @@ process-file calls are routed through the TRAMP handler."
     (tramp-run-real-handler operation args)))
 
 ;; ============================================================================
-;; Method registration
+;; Method predicate and handler registration
 ;; ============================================================================
-
-;;;###autoload
-(tramp-register-foreign-file-name-handler
- #'tramp-rpc-file-name-p #'tramp-rpc-file-name-handler)
 
 (defun tramp-rpc-file-name-p (vec-or-filename)
   "Check if VEC-OR-FILENAME is handled by TRAMP-RPC.
@@ -3259,12 +3276,10 @@ VEC-OR-FILENAME can be either a tramp-file-name struct or a filename string."
                  (t nil))))
     (string= method tramp-rpc-method)))
 
-;;;###autoload
-(add-to-list 'tramp-methods
-             `(,tramp-rpc-method
-               ;; Minimal method entry - no shell setup needed
-               ;; The foreign file name handler handles everything
-               ))
+;; Register the handler now that the alist is defined.
+;; The method was already added to tramp-methods via the autoload.
+(tramp-register-foreign-file-name-handler
+ #'tramp-rpc-file-name-p #'tramp-rpc-file-name-handler)
 
 ;; ============================================================================
 ;; Unload support
