@@ -9,6 +9,9 @@
 # Compiled Emacs Lisp
 *.elc
 
+# Generated autoloads (created by package.el or tests)
+*-autoloads.el
+
 # Don't ignore binary artifacts - we want to commit them for distribution
 # But do ignore local debug builds
 /target/debug/

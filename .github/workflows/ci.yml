@@ -91,6 +91,32 @@ jobs:
             --eval "(require 'package)" \
             --eval "(with-current-buffer (find-file-noselect \"lisp/tramp-rpc.el\") (package-buffer-info))"
 
+  test-autoload:
+    name: Autoload Tests
+    runs-on: ubuntu-latest
+    needs: elisp
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Emacs
+        uses: purcell/setup-emacs@master
+        with:
+          version: '30.1'
+
+      - name: Install dependencies
+        run: |
+          emacs -Q --batch \
+            --eval "(require 'package)" \
+            --eval "(add-to-list 'package-archives '(\"melpa\" . \"https://melpa.org/packages/\") t)" \
+            --eval "(package-initialize)" \
+            --eval "(package-refresh-contents)" \
+            --eval "(package-install 'msgpack)"
+
+      - name: Run autoload tests
+        run: ./test/run-autoload-tests.sh
+
   test-protocol:
     name: Protocol Tests
     runs-on: ubuntu-latest
@@ -241,7 +267,7 @@ jobs:
   summary:
     name: Test Summary
     runs-on: ubuntu-latest
-    needs: [rust, elisp, test-protocol, test-server]
+    needs: [rust, elisp, test-autoload, test-protocol, test-server]
     if: always()
 
     steps:
@@ -250,11 +276,13 @@ jobs:
           echo "=== CI Summary ==="
           echo "Rust: ${{ needs.rust.result }}"
           echo "Elisp: ${{ needs.elisp.result }}"
+          echo "Autoload Tests: ${{ needs.test-autoload.result }}"
           echo "Protocol Tests: ${{ needs.test-protocol.result }}"
           echo "Server Tests: ${{ needs.test-server.result }}"
           
           if [[ "${{ needs.rust.result }}" != "success" ]] || \
              [[ "${{ needs.elisp.result }}" != "success" ]] || \
+             [[ "${{ needs.test-autoload.result }}" != "success" ]] || \
              [[ "${{ needs.test-protocol.result }}" != "success" ]] || \
              [[ "${{ needs.test-server.result }}" != "success" ]]; then
             echo "Some tests failed!"
