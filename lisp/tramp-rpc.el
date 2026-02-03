@@ -55,19 +55,11 @@
   "TRAMP method for RPC-based remote access.")
 
 ;;;###autoload
-(autoload 'tramp-rpc-file-name-p "tramp-rpc"
-  "Check if VEC-OR-FILENAME uses the TRAMP-RPC method.")
-
-;;;###autoload
-(autoload 'tramp-rpc-file-name-handler "tramp-rpc"
-  "Invoke TRAMP-RPC file name handler for OPERATION with ARGS.")
-
-;;;###autoload
 (with-eval-after-load 'tramp
   ;; Register the method
   (add-to-list 'tramp-methods `(,tramp-rpc-method))
-  ;; Register the foreign handler - the autoload stubs will trigger
-  ;; full load of tramp-rpc.el when called
+  ;; Register the foreign handler - the autoload stubs (from ;;;###autoload
+  ;; on the defuns below) will trigger full load when called
   (add-to-list 'tramp-foreign-file-name-handler-alist
                '(tramp-rpc-file-name-p . tramp-rpc-file-name-handler)))
 
@@ -557,7 +549,7 @@ Returns non-nil on success."
                (equal (tramp-rpc--connection-key (plist-get info :vec))
                       (tramp-rpc--connection-key vec)))
        ;; Cancel timer
-       (when-let ((timer (plist-get info :timer)))
+       (when-let* ((timer (plist-get info :timer)))
          (cancel-timer timer))
        ;; Kill local process
        (when (process-live-p local-process)
@@ -2140,10 +2132,10 @@ Returns the remote process PID."
   "Read output from remote process PID on VEC.
 Returns plist with :stdout, :stderr, :exited, :exit-code."
   (let ((result (tramp-rpc--call vec "process.read" `((pid . ,pid)))))
-    (list :stdout (when-let ((s (alist-get 'stdout result)))
+    (list :stdout (when-let* ((s (alist-get 'stdout result)))
                     (tramp-rpc--decode-output
                      s (alist-get 'stdout_encoding result)))
-          :stderr (when-let ((s (alist-get 'stderr result)))
+          :stderr (when-let* ((s (alist-get 'stderr result)))
                     (tramp-rpc--decode-output
                      s (alist-get 'stderr_encoding result)))
           :exited (alist-get 'exited result)
@@ -2293,10 +2285,10 @@ RESPONSE is the decoded RPC response plist."
         (let* ((info (gethash local-process tramp-rpc--async-processes))
                (stderr-buffer (plist-get info :stderr-buffer))
                (result (plist-get response :result))
-               (stdout (when-let ((s (alist-get 'stdout result)))
+               (stdout (when-let* ((s (alist-get 'stdout result)))
                          (tramp-rpc--decode-output
                           s (alist-get 'stdout_encoding result))))
-               (stderr (when-let ((s (alist-get 'stderr result)))
+               (stderr (when-let* ((s (alist-get 'stderr result)))
                          (tramp-rpc--decode-output
                           s (alist-get 'stderr_encoding result))))
                (exited (alist-get 'exited result))
@@ -2345,7 +2337,7 @@ Returns the new interval."
   "Reschedule the poll timer for LOCAL-PROCESS with NEW-INTERVAL."
   (let ((info (gethash local-process tramp-rpc--async-processes)))
     (when info
-      (when-let ((old-timer (plist-get info :timer)))
+      (when-let* ((old-timer (plist-get info :timer)))
         (cancel-timer old-timer))
       (let ((new-timer (run-with-timer
                         new-interval
@@ -2386,12 +2378,12 @@ Returns the new interval."
                 (tramp-rpc--handle-process-exit local-process -1))
               (when (and result (not process-gone))
             ;; Handle stdout - send to process filter/buffer
-            (when-let ((stdout (plist-get result :stdout)))
+            (when-let* ((stdout (plist-get result :stdout)))
               (when (> (length stdout) 0)
                 (setq had-output t)
-                (if-let ((filter (process-filter local-process)))
+                (if-let* ((filter (process-filter local-process)))
                     (funcall filter local-process stdout)
-                  (when-let ((buf (process-buffer local-process)))
+                  (when-let* ((buf (process-buffer local-process)))
                     (when (buffer-live-p buf)
                       (with-current-buffer buf
                         (let ((inhibit-read-only t))
@@ -2399,7 +2391,7 @@ Returns the new interval."
                           (insert stdout))))))))
             
             ;; Handle stderr - send to stderr buffer if specified
-            (when-let ((stderr (plist-get result :stderr)))
+            (when-let* ((stderr (plist-get result :stderr)))
               (when (> (length stderr) 0)
                 (setq had-output t)
                 (cond
@@ -2411,9 +2403,9 @@ Returns the new interval."
                         (insert stderr)))))
                  ;; If no stderr buffer, mix with stdout
                  (t
-                  (if-let ((filter (process-filter local-process)))
+                  (if-let* ((filter (process-filter local-process)))
                       (funcall filter local-process stderr)
-                    (when-let ((buf (process-buffer local-process)))
+                    (when-let* ((buf (process-buffer local-process)))
                       (when (buffer-live-p buf)
                         (with-current-buffer buf
                           (let ((inhibit-read-only t))
@@ -2440,7 +2432,7 @@ Returns the new interval."
   (let ((info (gethash local-process tramp-rpc--async-processes)))
     (when info
       ;; Cancel the timer (if using timer-based polling)
-      (when-let ((timer (plist-get info :timer)))
+      (when-let* ((timer (plist-get info :timer)))
         (cancel-timer timer))
       ;; Remove from tracking
       (remhash local-process tramp-rpc--async-processes)
@@ -2659,7 +2651,7 @@ DIRENV-ENV is an optional alist of environment variables from direnv."
 
 (defun tramp-rpc--pty-default-filter (process output)
   "Default filter for PTY processes - insert output into process buffer."
-  (when-let ((buf (process-buffer process)))
+  (when-let* ((buf (process-buffer process)))
     (when (buffer-live-p buf)
       (with-current-buffer buf
         (let ((moving (= (point) (process-mark process))))
@@ -2712,7 +2704,7 @@ RESPONSE is the decoded RPC response plist."
              (gethash local-process tramp-rpc--pty-processes))
     (condition-case nil
         (let* ((result (plist-get response :result))
-               (output (when-let ((o (alist-get 'output result)))
+               (output (when-let* ((o (alist-get 'output result)))
                          (tramp-rpc--decode-output
                           o (alist-get 'output_encoding result))))
                (exited (alist-get 'exited result))
@@ -2720,9 +2712,9 @@ RESPONSE is the decoded RPC response plist."
           
           ;; Deliver output via filter
           (when (and output (> (length output) 0))
-            (if-let ((filter (process-filter local-process)))
+            (if-let* ((filter (process-filter local-process)))
                 (funcall filter local-process output)
-              (when-let ((buf (process-buffer local-process)))
+              (when-let* ((buf (process-buffer local-process)))
                 (when (buffer-live-p buf)
                   (with-current-buffer buf
                     (goto-char (point-max))
@@ -2740,7 +2732,7 @@ RESPONSE is the decoded RPC response plist."
 (defun tramp-rpc--handle-pty-exit (local-process exit-code)
   "Handle exit of PTY process associated with LOCAL-PROCESS."
   ;; Clean up PTY on remote
-  (when-let ((vec (process-get local-process :tramp-rpc-vec))
+  (when-let* ((vec (process-get local-process :tramp-rpc-vec))
              (pid (process-get local-process :tramp-rpc-pid)))
     (ignore-errors
       (tramp-rpc--call vec "process.close_pty" `((pid . ,pid)))))
@@ -2771,7 +2763,7 @@ PROCESS is the local relay process, EVENT is the process event."
   (when (memq (process-status process) '(exit signal))
     ;; Clean up remote PTY if still tracked
     (when (gethash process tramp-rpc--pty-processes)
-      (when-let ((vec (process-get process :tramp-rpc-vec))
+      (when-let* ((vec (process-get process :tramp-rpc-vec))
                  (pid (process-get process :tramp-rpc-pid)))
         (ignore-errors
           (tramp-rpc--call vec "process.kill_pty"
@@ -2779,7 +2771,7 @@ PROCESS is the local relay process, EVENT is the process event."
       ;; Remove from tracking
       (remhash process tramp-rpc--pty-processes))
     ;; Call user sentinel
-    (when-let ((user-sentinel (process-get process :tramp-rpc-user-sentinel)))
+    (when-let* ((user-sentinel (process-get process :tramp-rpc-user-sentinel)))
       (funcall user-sentinel process event))))
 
 (defun tramp-rpc--adjust-pty-window-size (process _windows)
@@ -2789,7 +2781,7 @@ Returns nil to tell Emacs not to call `set-process-window-size' on
 the local relay process (we handle resizing via RPC to the remote)."
   (when (and (process-live-p process)
              (process-get process :tramp-rpc-pty))
-    (when-let ((vec (process-get process :tramp-rpc-vec))
+    (when-let* ((vec (process-get process :tramp-rpc-vec))
                (pid (process-get process :tramp-rpc-pid)))
       (let ((size (tramp-rpc--get-terminal-size (process-buffer process))))
         ;; Resize the remote PTY
@@ -2809,7 +2801,7 @@ the calculated size for the specific terminal emulator.
 DISPLAY-UPDATER is a function (width height) that updates the terminal display.
 Returns the final (width . height) cons, or nil if resize was not handled."
   (when (process-live-p process)
-    (when-let ((vec (process-get process :tramp-rpc-vec))
+    (when-let* ((vec (process-get process :tramp-rpc-vec))
                (pid (process-get process :tramp-rpc-pid))
                (buf (process-buffer process)))
       (when (buffer-live-p buf)
@@ -2976,7 +2968,7 @@ For tramp-rpc processes, resize the remote PTY and update eat's display."
 (defun tramp-rpc--process-send-eof-advice (orig-fun &optional process)
   "Advice for `process-send-eof' to handle TRAMP-RPC processes."
   (let ((proc (or process (get-buffer-process (current-buffer)))))
-    (if-let ((pid (process-get proc :tramp-rpc-pid))
+    (if-let* ((pid (process-get proc :tramp-rpc-pid))
              (vec (process-get proc :tramp-rpc-vec)))
         ;; Only try to send EOF if the process hasn't already exited.
         ;; Short-lived processes (like git apply) may exit before we call
@@ -3003,7 +2995,7 @@ For tramp-rpc processes, resize the remote PTY and update eat's display."
 
 (defun tramp-rpc--signal-process-advice (orig-fun process sigcode &optional remote)
   "Advice for `signal-process' to handle TRAMP-RPC processes."
-  (if-let ((pid (and (processp process)
+  (if-let* ((pid (and (processp process)
                      (process-get process :tramp-rpc-pid)))
            (vec (process-get process :tramp-rpc-vec)))
       (condition-case err
@@ -3254,9 +3246,10 @@ process-file calls are routed through the TRAMP handler."
     )
   "Alist of handler functions for TRAMP-RPC method.")
 
+;;;###autoload
 (defun tramp-rpc-file-name-handler (operation &rest args)
   "Invoke TRAMP-RPC file name handler for OPERATION with ARGS."
-  (if-let ((handler (assq operation tramp-rpc-file-name-handler-alist)))
+  (if-let* ((handler (assq operation tramp-rpc-file-name-handler-alist)))
       (save-match-data (apply (cdr handler) args))
     (tramp-run-real-handler operation args)))
 
@@ -3264,6 +3257,7 @@ process-file calls are routed through the TRAMP handler."
 ;; Method predicate and handler registration
 ;; ============================================================================
 
+;;;###autoload
 (defun tramp-rpc-file-name-p (vec-or-filename)
   "Check if VEC-OR-FILENAME is handled by TRAMP-RPC.
 VEC-OR-FILENAME can be either a tramp-file-name struct or a filename string."
@@ -3301,7 +3295,7 @@ Removes advice and cleans up async processes."
   (tramp-rpc--cleanup-async-processes)
   ;; Clean up PTY processes
   (maphash (lambda (proc info)
-             (when-let ((timer (plist-get info :timer)))
+             (when-let* ((timer (plist-get info :timer)))
                (cancel-timer timer))
              (when (process-live-p proc)
                (delete-process proc)))
