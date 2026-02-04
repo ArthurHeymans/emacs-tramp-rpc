@@ -2551,18 +2551,29 @@ Resolves program path and loads direnv environment from working directory."
 (defun tramp-rpc--find-executable (vec program)
   "Find PROGRAM in the remote PATH on VEC.
 Returns the absolute path or nil.
-Uses `command -v` for efficient lookup via login shell."
+Uses `command -v` for efficient lookup via login shell.
+Uses a unique marker to separate MOTD/banner text from actual output,
+following the pattern used by standard TRAMP."
   (condition-case nil
-      (let* ((result (tramp-rpc--call vec "process.run"
+      (let* (;; Use a unique marker (MD5 hash) to delimit output from MOTD text
+             ;; This is the same approach used by tramp-sh.el
+             (marker (md5 (format "tramp-rpc-%s-%s" program (float-time))))
+             (result (tramp-rpc--call vec "process.run"
                                        `((cmd . "/bin/sh")
-                                         (args . ["-l" "-c" ,(concat "command -v " program)])
+                                         (args . ["-l" "-c"
+                                                  ,(format "echo %s; command -v %s"
+                                                           marker program)])
                                          (cwd . "/"))))
              (exit-code (alist-get 'exit_code result))
              (stdout (tramp-rpc--decode-output
                       (alist-get 'stdout result)
                       (alist-get 'stdout_encoding result))))
         (when (and (eq exit-code 0) (> (length stdout) 0))
-          (string-trim stdout)))
+          ;; Find the marker and extract the path after it
+          (when (string-match (concat (regexp-quote marker) "\n\\([^\n]+\\)") stdout)
+            (let ((path (string-trim (match-string 1 stdout))))
+              (when (string-prefix-p "/" path)
+                path)))))
     (error nil)))
 
 (defun tramp-rpc-handle-start-file-process (name buffer program &rest args)
