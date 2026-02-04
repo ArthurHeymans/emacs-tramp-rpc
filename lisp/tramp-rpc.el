@@ -290,6 +290,23 @@ See `tramp-rpc-direnv-essential-vars' for the list of variables."
   "Cache of executable paths keyed by (connection-key . program).
 Value is the full path or :not-found.")
 
+(defun tramp-rpc--clear-executable-cache (&optional vec)
+  "Clear the executable cache.
+If VEC is provided, only clear entries for that connection.
+Otherwise clear all entries."
+  (if vec
+      (let ((conn-key (tramp-rpc--connection-key vec))
+            (keys-to-remove nil))
+        ;; Collect keys first (can't modify hash table during maphash)
+        (maphash (lambda (key _value)
+                   (when (equal (car key) conn-key)
+                     (push key keys-to-remove)))
+                 tramp-rpc--executable-cache)
+        ;; Now remove them
+        (dolist (key keys-to-remove)
+          (remhash key tramp-rpc--executable-cache)))
+    (clrhash tramp-rpc--executable-cache)))
+
 (defun tramp-rpc--resolve-executable (vec program)
   "Resolve PROGRAM to its full path on VEC.
 Returns the full path if found, otherwise the original PROGRAM.
@@ -323,8 +340,10 @@ Results are cached per connection."
            tramp-rpc--connections))
 
 (defun tramp-rpc--remove-connection (vec)
-  "Remove the RPC connection for VEC."
-  (remhash (tramp-rpc--connection-key vec) tramp-rpc--connections))
+  "Remove the RPC connection for VEC.
+Also clears the executable cache for this connection."
+  (remhash (tramp-rpc--connection-key vec) tramp-rpc--connections)
+  (tramp-rpc--clear-executable-cache vec))
 
 (defun tramp-rpc--ensure-connection (vec)
   "Ensure we have an active RPC connection to VEC.
@@ -1428,34 +1447,57 @@ Supported switches: -a -t -S -r -h --group-directories-first."
     (filename &optional visit beg end replace)
   "Like `insert-file-contents' for TRAMP-RPC files."
   (barf-if-buffer-read-only)
-  (with-parsed-tramp-file-name filename nil
-    (let* ((params (tramp-rpc--encode-path localname))
-           (_ (when beg (push `(offset . ,beg) params)))
-           (_ (when end (push `(length . ,(- end (or beg 0))) params)))
-           (result (tramp-rpc--call v "file.read" params))
-           ;; With MessagePack, content is already raw bytes (unibyte string)
-           (content (alist-get 'content result))
-           (size (length content))
-           (point-before (point)))
+  (setq filename (expand-file-name filename))
+  (let (result)
+    (with-parsed-tramp-file-name filename nil
+      (condition-case err
+          ;; Try to read the file
+          (let* ((params (tramp-rpc--encode-path localname))
+                 (_ (when beg (push `(offset . ,beg) params)))
+                 (_ (when end (push `(length . ,(- end (or beg 0))) params)))
+                 (rpc-result (tramp-rpc--call v "file.read" params))
+                 ;; With MessagePack, content is already raw bytes (unibyte string)
+                 (content (alist-get 'content rpc-result))
+                 (size (length content))
+                 (point-before (point)))
 
-      (when replace
-        (delete-region (point-min) (point-max))
-        (setq point-before (point-min)))
+            (when replace
+              (delete-region (point-min) (point-max))
+              (setq point-before (point-min)))
 
-      ;; Insert raw bytes and let Emacs detect/decode the encoding
-      ;; This matches what standard TRAMP does for proper encoding handling
-      (let ((coding-system-for-read 'undecided))
-        (insert content)
-        ;; Decode the inserted region using Emacs' coding system detection
-        ;; This properly handles UTF-8, Chinese, and other encodings
-        (decode-coding-inserted-region point-before (point) filename visit beg end replace))
+            ;; Insert raw bytes and let Emacs detect/decode the encoding
+            ;; This matches what standard TRAMP does for proper encoding handling
+            (let ((coding-system-for-read 'undecided))
+              (insert content)
+              ;; Decode the inserted region using Emacs' coding system detection
+              ;; This properly handles UTF-8, Chinese, and other encodings
+              (decode-coding-inserted-region point-before (point) filename visit beg end replace))
 
-      (when visit
-        (setq buffer-file-name filename)
-        (set-visited-file-modtime)
-        (set-buffer-modified-p nil))
+            ;; Success - set visit state and result
+            (when visit
+              (setq buffer-file-name filename
+                    buffer-read-only (not (file-writable-p filename)))
+              (set-visited-file-modtime)
+              (set-buffer-modified-p nil))
+            (setq result (list filename size)))
 
-      (list filename size))))
+        ;; Handle file-missing specially - this is expected for new files
+        ;; Set buffer-file-name so find-file can create the buffer properly
+        (file-missing
+         (when visit
+           (setq buffer-file-name filename)
+           ;; For new files, check if parent directory is writable
+           ;; Use ignore-errors to avoid hanging on connection issues
+           (setq buffer-read-only
+                 (not (ignore-errors (file-writable-p filename)))))
+         (signal (car err) (cdr err)))
+
+        ;; For other errors, don't set buffer state - just propagate the error
+        (error
+         (signal (car err) (cdr err)))))
+
+    ;; Return result
+    result))
 
 (defun tramp-rpc-handle-write-region
     (start end filename &optional append visit _lockname mustbenew)
@@ -2551,7 +2593,8 @@ Resolves program path and loads direnv environment from working directory."
 (defun tramp-rpc--find-executable (vec program)
   "Find PROGRAM in the remote PATH on VEC.
 Returns the absolute path or nil.
-Uses `command -v` for efficient lookup via login shell."
+Uses `command -v` for efficient lookup via login shell.
+Only the last non-empty line is used to avoid login shell messages."
   (condition-case nil
       (let* ((result (tramp-rpc--call vec "process.run"
                                        `((cmd . "/bin/sh")
@@ -2562,7 +2605,11 @@ Uses `command -v` for efficient lookup via login shell."
                       (alist-get 'stdout result)
                       (alist-get 'stdout_encoding result))))
         (when (and (eq exit-code 0) (> (length stdout) 0))
-          (string-trim stdout)))
+          ;; Take only the last non-empty line to avoid login shell messages
+          ;; (e.g., Wi-Fi warnings, MOTD, etc. that some systems output)
+          (let ((lines (split-string (string-trim stdout) "\n" t)))
+            (when lines
+              (string-trim (car (last lines)))))))
     (error nil)))
 
 (defun tramp-rpc-handle-start-file-process (name buffer program &rest args)
