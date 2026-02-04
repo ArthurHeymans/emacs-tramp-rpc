@@ -525,6 +525,39 @@ This tests Issue #13: Chinese characters decode incorrectly."
       (insert-file-contents tmp nil 2 6)
       (should (equal (buffer-string) "2345")))))
 
+(ert-deftest tramp-rpc-test05-find-file-new-file ()
+  "Test `find-file' for creating new TRAMP RPC files."
+  (skip-unless (tramp-rpc-test-enabled))
+
+  (let ((newfile (tramp-rpc-test--make-temp-name)))
+    (unwind-protect
+        (progn
+          ;; File should not exist initially
+          (should-not (file-exists-p newfile))
+          ;; Open the non-existent file - should create a buffer for new file
+          (find-file newfile)
+          ;; Buffer should exist with empty content
+          (should (get-file-buffer newfile))
+          (with-current-buffer (get-file-buffer newfile)
+            ;; Buffer should be empty (new file)
+            (should (equal (buffer-string) ""))
+            ;; buffer-file-name should be set
+            (should (equal buffer-file-name newfile))
+            ;; Insert content and save
+            (insert "new file content")
+            (save-buffer))
+          ;; File should now exist
+          (should (file-exists-p newfile))
+          ;; Verify content
+          (should (equal "new file content"
+                         (with-temp-buffer
+                           (insert-file-contents newfile)
+                           (buffer-string)))))
+      ;; Cleanup
+      (when (get-file-buffer newfile)
+        (kill-buffer (get-file-buffer newfile)))
+      (ignore-errors (delete-file newfile)))))
+
 ;;; ============================================================================
 ;;; Test 06: File Manipulation
 ;;; ============================================================================
