@@ -21,14 +21,12 @@
 ;; Silence byte-compiler warnings
 (declare-function tramp-rpc--call "tramp-rpc")
 (declare-function tramp-rpc--call-pipelined "tramp-rpc")
-(declare-function tramp-rpc--call-batch "tramp-rpc")
 (declare-function tramp-rpc-run-git-commands "tramp-rpc")
-(declare-function tramp-rpc-magit-status-batch "tramp-rpc")
-(declare-function tramp-rpc-magit-enable-batching "tramp-rpc")
-(declare-function tramp-rpc-magit-disable-batching "tramp-rpc")
+(declare-function tramp-rpc-magit-status "tramp-rpc")
+(declare-function tramp-rpc-magit-enable "tramp-rpc")
+(declare-function tramp-rpc-magit-disable "tramp-rpc")
 (declare-function magit-status-setup-buffer "magit-status")
 (declare-function magit-get-mode-buffer "magit-mode")
-(defvar tramp-rpc-magit-batch-enabled)
 
 ;;; Configuration
 
@@ -113,7 +111,7 @@ Returns timing information for each command."
                    ("git" "rev-parse" "--show-toplevel")
                    ("git" "rev-parse" "HEAD")
                    ("git" "symbolic-ref" "--short" "HEAD")
-                   ("git" "rev-format" "%h %s" "HEAD")
+                   ("git" "log" "-1" "--format=%h %s" "HEAD")
                    ;; Branch info
                    ("git" "config" "branch.main.remote")
                    ("git" "config" "branch.main.merge")
@@ -270,38 +268,40 @@ Returns timing information for each command."
         (display-buffer (current-buffer))))))
 
 (defun tramp-rpc-magit-bench-batched-status ()
-  "Benchmark the tramp-rpc-magit-status-batch function."
+  "Benchmark the tramp-rpc-magit-status RPC function."
   (interactive)
   (let ((default-directory tramp-rpc-magit-bench-remote))
-    (message "Benchmarking batched magit status info gathering...")
+    (message "Benchmarking server-side magit status RPC...")
     
-    (let ((batch-time
+    (let ((rpc-time
            (tramp-rpc-magit-bench--time
-            (tramp-rpc-magit-status-batch default-directory)))
-          (result (tramp-rpc-magit-status-batch default-directory)))
+            (tramp-rpc-magit-status default-directory)))
+          (result (tramp-rpc-magit-status default-directory)))
       
-      (with-current-buffer (get-buffer-create "*Batched Status Results*")
+      (with-current-buffer (get-buffer-create "*RPC Status Results*")
         (erase-buffer)
-        (insert "Batched Magit Status Results\n")
-        (insert "============================\n\n")
+        (insert "Server-side Magit Status Results\n")
+        (insert "================================\n\n")
         (insert (format "Remote: %s\n" tramp-rpc-magit-bench-remote))
         (insert (format "Total time: %s\n\n"
-                        (tramp-rpc-magit-bench--format-time batch-time)))
+                        (tramp-rpc-magit-bench--format-time rpc-time)))
         
-        (insert "Results gathered in single RPC batch:\n")
+        (insert "Results gathered in single RPC call:\n")
         (insert (make-string 50 ?-) "\n")
-        (insert (format "Toplevel:     %s\n" (plist-get result :toplevel)))
-        (insert (format "HEAD ref:     %s\n" (plist-get result :head-ref)))
-        (insert (format "Branch:       %s\n" (plist-get result :branch)))
-        (insert (format "HEAD message: %s\n" (plist-get result :head-message)))
-        (insert (format "Upstream:     %s\n" (plist-get result :upstream)))
-        (insert (format "Push remote:  %s\n" (plist-get result :push-remote)))
-        (insert (format "Status:       %d bytes\n" 
-                        (length (or (plist-get result :status) ""))))
-        (insert (format "Stash list:   %d bytes\n"
-                        (length (or (plist-get result :stash-list) ""))))
-        (insert (format "Config:       %d bytes\n"
-                        (length (or (plist-get result :config) ""))))
+        (insert (format "Toplevel:     %s\n" (alist-get 'toplevel result)))
+        (let ((head (alist-get 'head result)))
+          (insert (format "HEAD hash:    %s\n" (alist-get 'hash head)))
+          (insert (format "Branch:       %s\n" (alist-get 'branch head)))
+          (insert (format "HEAD message: %s\n" (alist-get 'message head))))
+        (let ((upstream (alist-get 'upstream result)))
+          (insert (format "Upstream:     %s\n" (alist-get 'branch upstream))))
+        (let ((push-info (alist-get 'push result)))
+          (insert (format "Push remote:  %s\n" (alist-get 'branch push-info))))
+        (insert (format "State:        %s\n" (alist-get 'state result)))
+        (insert (format "Stashes:      %d\n"
+                        (length (alist-get 'stashes result))))
+        (insert (format "Untracked:    %d files\n"
+                        (length (alist-get 'untracked result))))
         
         (goto-char (point-min))
         (display-buffer (current-buffer))))))
@@ -401,7 +401,7 @@ Returns timing information for each command."
   (tramp-rpc-magit-bench-roundtrip)
   (message "\nRunning batching comparison...")
   (tramp-rpc-magit-bench-compare-batching)
-  (message "\nRunning batched status info benchmark...")
+  (message "\nRunning server-side status RPC benchmark...")
   (tramp-rpc-magit-bench-batched-status))
 
 ;;;###autoload
@@ -435,13 +435,12 @@ Returns timing information for each command."
 ;;;###autoload
 (defun tramp-rpc-magit-bench-optimizations ()
   "Benchmark magit-status with optimizations enabled vs disabled.
-This tests the effectiveness of the caching and batching in tramp-rpc."
+This tests the effectiveness of the caching and prefetching in tramp-rpc."
   (interactive)
   (require 'magit)
   (require 'tramp-rpc)
   
   (let ((default-directory tramp-rpc-magit-bench-remote)
-        (orig-batching tramp-rpc-magit-batch-enabled)
         results-without results-with)
     
     ;; Ensure we have a fresh connection
@@ -449,9 +448,9 @@ This tests the effectiveness of the caching and batching in tramp-rpc."
     (with-temp-buffer
       (process-file "git" nil t nil "rev-parse" "HEAD"))
     
-    ;; Test WITHOUT batching
-    (message "Testing WITHOUT batching optimizations...")
-    (tramp-rpc-magit-disable-batching)
+    ;; Test WITHOUT optimizations
+    (message "Testing WITHOUT magit optimizations...")
+    (tramp-rpc-magit-disable)
     (tramp-rpc-magit-bench--reset-rpc-log)
     
     ;; Add RPC logging advice
@@ -475,9 +474,9 @@ This tests the effectiveness of the caching and batching in tramp-rpc."
           ;; Short pause
           (sleep-for 0.5)
           
-          ;; Test WITH batching
-          (message "Testing WITH batching optimizations...")
-          (tramp-rpc-magit-enable-batching)
+          ;; Test WITH optimizations
+          (message "Testing WITH magit optimizations...")
+          (tramp-rpc-magit-enable)
           (tramp-rpc-magit-bench--reset-rpc-log)
           
           (let ((time-with
@@ -491,9 +490,8 @@ This tests the effectiveness of the caching and batching in tramp-rpc."
       ;; Cleanup
       (when (fboundp 'tramp-rpc--call)
         (advice-remove 'tramp-rpc--call #'tramp-rpc-magit-bench--log-rpc-call))
-      (if orig-batching
-          (tramp-rpc-magit-enable-batching)
-        (tramp-rpc-magit-disable-batching)))
+      ;; Re-enable optimizations (they are on by default)
+      (tramp-rpc-magit-enable))
     
     ;; Display results
     (with-current-buffer (get-buffer-create "*Optimization Benchmark*")
@@ -504,33 +502,33 @@ This tests the effectiveness of the caching and batching in tramp-rpc."
       
       (insert "Timing Results:\n")
       (insert (make-string 50 ?-) "\n")
-      (insert (format "Without batching: %s\n"
+      (insert (format "Without optimizations: %s\n"
                       (tramp-rpc-magit-bench--format-time (plist-get results-without :time))))
-      (insert (format "With batching:    %s\n"
+      (insert (format "With optimizations:    %s\n"
                       (tramp-rpc-magit-bench--format-time (plist-get results-with :time))))
-      (insert (format "Speedup:          %.2fx\n\n"
+      (insert (format "Speedup:               %.2fx\n\n"
                       (/ (plist-get results-without :time)
                          (max 0.001 (plist-get results-with :time)))))
       
       (insert "RPC Call Counts:\n")
       (insert (make-string 50 ?-) "\n")
-      (insert (format "Without batching: %d total RPC calls\n"
+      (insert (format "Without optimizations: %d total RPC calls\n"
                       (plist-get results-without :total-rpcs)))
-      (insert (format "With batching:    %d total RPC calls\n"
+      (insert (format "With optimizations:    %d total RPC calls\n"
                       (plist-get results-with :total-rpcs)))
-      (insert (format "Reduction:        %d%% fewer calls\n\n"
+      (insert (format "Reduction:             %d%% fewer calls\n\n"
                       (if (zerop (plist-get results-without :total-rpcs))
                           0
                         (round (* 100 (- 1.0 (/ (float (plist-get results-with :total-rpcs))
                                                 (plist-get results-without :total-rpcs))))))))
       
       ;; Detailed breakdown
-      (insert "Detailed RPC breakdown (without batching):\n")
+      (insert "Detailed RPC breakdown (without optimizations):\n")
       (maphash (lambda (method count)
                  (insert (format "  %s: %d\n" method count)))
                (plist-get results-without :rpc-counts))
       
-      (insert "\nDetailed RPC breakdown (with batching):\n")
+      (insert "\nDetailed RPC breakdown (with optimizations):\n")
       (maphash (lambda (method count)
                  (insert (format "  %s: %d\n" method count)))
                (plist-get results-with :rpc-counts))

@@ -1056,46 +1056,6 @@ because all commands are sent in a single network round-trip."
                                  (alist-get 'stderr_encoding result)))))
               results))))
 
-(defmacro with-tramp-rpc-process-batch (directory &rest body)
-  "Execute BODY with queued process-file execution for DIRECTORY.
-Process-file calls within BODY are collected and executed together
-at the end, minimizing network round-trips.
-
-This macro provides a transparent optimization for code that makes
-many sequential process-file calls, like magit's status refresh.
-
-Example:
-  (with-tramp-rpc-process-batch default-directory
-    (process-file \"git\" nil t nil \"rev-parse\" \"HEAD\")
-    (process-file \"git\" nil t nil \"status\" \"--porcelain\"))"
-  (declare (indent 1) (debug (form body)))
-  `(let ((tramp-rpc--process-batch-queue nil)
-         (tramp-rpc--process-batch-directory ,directory))
-     (unwind-protect
-         (progn ,@body)
-       ;; Execute any remaining queued commands
-       (tramp-rpc--flush-process-batch-queue))))
-
-(defvar tramp-rpc--process-batch-queue nil
-  "Queue of process-file calls when inside `with-tramp-rpc-process-batch'.")
-
-(defvar tramp-rpc--process-batch-directory nil
-  "Directory for the current process batch context.")
-
-(defun tramp-rpc--flush-process-batch-queue ()
-  "Execute queued process-file calls in a single pipelined RPC."
-  (when (and tramp-rpc--process-batch-queue
-             tramp-rpc--process-batch-directory)
-    (let* ((commands (nreverse tramp-rpc--process-batch-queue))
-           (results (tramp-rpc-run-commands
-                     tramp-rpc--process-batch-directory
-                     commands)))
-      ;; Clear the queue
-      (setq tramp-rpc--process-batch-queue nil)
-      results)))
-
-
-
 ;; ============================================================================
 ;; Output decoding helper
 ;; ============================================================================
@@ -1780,11 +1740,11 @@ Supported switches: -a -t -S -r -h --group-directories-first."
         (set-file-times newname (file-attribute-modification-time
                                  (file-attributes filename)))))
      ;; Both local or different remote hosts - use default
-      (t
-       (tramp-run-real-handler
-        #'copy-file
-        (list filename newname ok-if-already-exists keep-time
-              preserve-uid-gid preserve-permissions))))
+     (t
+      (tramp-run-real-handler
+       #'copy-file
+       (list filename newname ok-if-already-exists keep-time
+             preserve-uid-gid preserve-permissions))))
     ;; Invalidate caches for the destination file (if remote)
     (when dest-remote
       (tramp-rpc--invalidate-cache-for-path newname))))
@@ -2899,8 +2859,11 @@ DIRENV-ENV is an optional alist of environment variables from direnv."
                             "-o" (format "ControlPersist=%s"
                                          tramp-rpc-controlmaster-persist)))
                     ;; Standard options
-                    (list "-o" "BatchMode=yes"
-                          "-o" "StrictHostKeyChecking=accept-new")
+                    ;; Only use BatchMode=yes when ControlMaster handles auth;
+                    ;; without it, BatchMode=yes prevents password prompts.
+                    (when tramp-rpc-use-controlmaster
+                      (list "-o" "BatchMode=yes"))
+                    (list "-o" "StrictHostKeyChecking=accept-new")
                     ;; User-specified SSH options
                     (mapcan (lambda (opt) (list "-o" opt))
                             tramp-rpc-ssh-options)
