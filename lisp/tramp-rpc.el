@@ -29,6 +29,18 @@
 ;; - Fast file operations via binary RPC protocol
 ;; - Async process support (make-process, start-file-process)
 ;; - VC mode integration works (git, etc.)
+;; - Hybrid PTY mode: direct SSH for interactive terminals (vterm, shell)
+;;
+;; HYBRID PTY MODE (DEFAULT):
+;; For interactive terminal use (vterm, shell-mode, term-mode), tramp-rpc
+;; uses a direct SSH connection with PTY allocation instead of going through
+;; the RPC server.  This provides the same low-latency experience as using
+;; SSH directly with vterm, while file operations still benefit from RPC.
+;;
+;; The direct SSH connection reuses the ControlMaster socket, so there's
+;; no additional authentication needed.  To disable this and use RPC for
+;; all PTY operations, set:
+;;   (setq tramp-rpc-use-direct-ssh-pty nil)
 ;;
 ;; HOW ASYNC PROCESSES WORK:
 ;; Remote processes are started via RPC and polled periodically for output.
@@ -76,6 +88,22 @@
 (defvar vterm-copy-mode)
 (defvar vterm-min-window-width)
 (defvar vterm--term)
+
+;; Silence byte-compiler warnings for variables defined later in this file
+(defvar tramp-rpc-magit--prefetch-directory)
+(defvar tramp-rpc-magit--debug)
+(defvar tramp-rpc-magit--status-cache)
+(defvar tramp-rpc-magit--ancestors-cache)
+(defvar tramp-rpc--file-exists-cache)
+(defvar tramp-rpc--file-truename-cache)
+(defvar tramp-rpc--cache-ttl)
+(defvar tramp-rpc--cache-max-size)
+
+;; Silence byte-compiler warnings for external functions
+(declare-function projectile-dir-files-alien "projectile")
+(declare-function projectile-time-seconds "projectile")
+(declare-function magit-status-setup-buffer "magit-status")
+(declare-function magit-get-mode-buffer "magit-mode")
 
 (defgroup tramp-rpc nil
   "TRAMP backend using RPC."
@@ -137,6 +165,19 @@ passing any SSH command-line arguments."
 (defcustom tramp-rpc-debug nil
   "When non-nil, log debug messages to *tramp-rpc-debug* buffer.
 Set to t to enable debugging for hang diagnosis."
+  :type 'boolean
+  :group 'tramp-rpc)
+
+(defcustom tramp-rpc-use-direct-ssh-pty t
+  "When non-nil, use direct SSH for PTY processes instead of RPC.
+This provides much lower latency for interactive terminal use (vterm, shell)
+by creating a direct SSH connection with PTY rather than going through
+the RPC server.  File operations still use the efficient RPC protocol.
+
+The direct SSH connection reuses the ControlMaster socket established
+by tramp-rpc, so authentication is already handled.
+
+Set to nil to use the RPC-based PTY implementation instead."
   :type 'boolean
   :group 'tramp-rpc)
 
@@ -922,6 +963,86 @@ Example:
           (plist-put tramp-rpc--batch-context :requests nil))))))
 
 ;; ============================================================================
+;; Batched process-file support for magit and similar tools
+;; ============================================================================
+
+;;;###autoload
+(defun tramp-rpc-run-git-commands (directory commands)
+  "Run multiple git COMMANDS in DIRECTORY using pipelined RPC.
+COMMANDS is a list of lists, where each sublist is arguments to git.
+For example: ((\"rev-parse\" \"HEAD\") (\"status\" \"--porcelain\"))
+
+Returns a list of plists, each containing:
+  :exit-code - the exit code of the command
+  :stdout    - standard output as a string
+  :stderr    - standard error as a string
+
+This is much faster than running each command sequentially over TRAMP
+because all commands are sent in a single network round-trip."
+  (with-parsed-tramp-file-name directory nil
+    (let* ((requests
+            (mapcar (lambda (args)
+                      (cons "process.run"
+                            `((cmd . "git")
+                              (args . ,(vconcat args))
+                              (cwd . ,localname))))
+                    commands))
+           (results (tramp-rpc--call-pipelined v requests)))
+      ;; Convert results to a more convenient format
+      (mapcar (lambda (result)
+                (if (plist-get result :error)
+                    (list :exit-code -1
+                          :stdout ""
+                          :stderr (or (plist-get result :message) "RPC error"))
+                  (list :exit-code (alist-get 'exit_code result)
+                        :stdout (tramp-rpc--decode-output
+                                 (alist-get 'stdout result)
+                                 (alist-get 'stdout_encoding result))
+                        :stderr (tramp-rpc--decode-output
+                                 (alist-get 'stderr result)
+                                 (alist-get 'stderr_encoding result)))))
+              results))))
+
+;;;###autoload
+(defun tramp-rpc-run-commands (directory commands)
+  "Run multiple shell COMMANDS in DIRECTORY using pipelined RPC.
+COMMANDS is a list of (PROGRAM . ARGS) cons cells.
+For example: ((\"git\" \"rev-parse\" \"HEAD\") (\"ls\" \"-la\"))
+
+Returns a list of plists, each containing:
+  :exit-code - the exit code of the command
+  :stdout    - standard output as a string
+  :stderr    - standard error as a string
+
+This is much faster than running each command sequentially over TRAMP
+because all commands are sent in a single network round-trip."
+  (with-parsed-tramp-file-name directory nil
+    (let* ((requests
+            (mapcar (lambda (cmd)
+                      (let ((program (car cmd))
+                            (args (cdr cmd)))
+                        (cons "process.run"
+                              `((cmd . ,program)
+                                (args . ,(vconcat args))
+                                (cwd . ,localname)))))
+                    commands))
+           (results (tramp-rpc--call-pipelined v requests)))
+      ;; Convert results to a more convenient format
+      (mapcar (lambda (result)
+                (if (plist-get result :error)
+                    (list :exit-code -1
+                          :stdout ""
+                          :stderr (or (plist-get result :message) "RPC error"))
+                  (list :exit-code (alist-get 'exit_code result)
+                        :stdout (tramp-rpc--decode-output
+                                 (alist-get 'stdout result)
+                                 (alist-get 'stdout_encoding result))
+                        :stderr (tramp-rpc--decode-output
+                                 (alist-get 'stderr result)
+                                 (alist-get 'stderr_encoding result)))))
+              results))))
+
+;; ============================================================================
 ;; Output decoding helper
 ;; ============================================================================
 
@@ -966,9 +1087,45 @@ Returns an alist with path."
 ;; ============================================================================
 
 (defun tramp-rpc-handle-file-exists-p (filename)
-  "Like `file-exists-p' for TRAMP-RPC files."
-  (with-parsed-tramp-file-name filename nil
-    (tramp-rpc--call v "file.exists" (tramp-rpc--encode-path localname))))
+  "Like `file-exists-p' for TRAMP-RPC files.
+Uses magit caches when available for better performance.
+Also caches RPC results to avoid repeated calls for the same path."
+  (let ((expanded (expand-file-name filename)))
+    (catch 'result
+      ;; Check if this is the prefetched directory itself
+      (when (and tramp-rpc-magit--prefetch-directory
+                 (string= expanded tramp-rpc-magit--prefetch-directory))
+        (when tramp-rpc-magit--debug
+          (message "file-exists-p HIT (prefetch-dir): %s -> t" filename))
+        (throw 'result t))
+      ;; Check state files cache (git internal files)
+      (when tramp-rpc-magit--status-cache
+        (let ((cached (tramp-rpc-magit--state-file-exists-p filename)))
+          (unless (eq cached 'not-cached)
+            (when tramp-rpc-magit--debug
+              (message "file-exists-p HIT (state): %s -> %s" filename cached))
+            (throw 'result cached))))
+      ;; Check ancestors cache (marker files like .git, .projectile)
+      (when tramp-rpc-magit--ancestors-cache
+        (let ((cached (tramp-rpc-magit--file-exists-p filename)))
+          (unless (eq cached 'not-cached)
+            (when tramp-rpc-magit--debug
+              (message "file-exists-p HIT (ancestors): %s -> %s" filename cached))
+            (throw 'result cached))))
+      ;; Check general file-exists cache (avoids repeated RPC calls)
+      (let ((cached (tramp-rpc--cache-get tramp-rpc--file-exists-cache expanded)))
+        (unless (eq cached 'not-found)
+          (when tramp-rpc-magit--debug
+            (message "file-exists-p HIT (rpc-cache): %s -> %s" filename cached))
+          (throw 'result cached)))
+      ;; Cache miss - make RPC call and cache the result
+      (when tramp-rpc-magit--debug
+        (message "file-exists-p MISS: %s" filename))
+      (with-parsed-tramp-file-name filename nil
+        (let ((result (tramp-rpc--call v "file.exists" (tramp-rpc--encode-path localname))))
+          ;; Cache the result
+          (tramp-rpc--cache-put tramp-rpc--file-exists-cache expanded result)
+          result)))))
 
 (defun tramp-rpc-handle-file-readable-p (filename)
   "Like `file-readable-p' for TRAMP-RPC files."
@@ -1075,18 +1232,35 @@ If LSTAT is non-nil, don't follow symlinks."
 (defun tramp-rpc-handle-file-truename (filename)
   "Like `file-truename' for TRAMP-RPC files.
 If the file doesn't exist, return FILENAME unchanged
-\(like local `file-truename')."
-  (with-parsed-tramp-file-name filename nil
-    (condition-case nil
-        (let* ((result (tramp-rpc--call v "file.truename" (tramp-rpc--encode-path localname)))
-               ;; With MessagePack, path comes as raw bytes - decode to UTF-8
-               (path (tramp-rpc--decode-string
-                      (if (stringp result)
-                          result  ; Direct binary result
-                        (alist-get 'path result)))))  ; Or in result object
-          (tramp-make-tramp-file-name v path))
-      ;; If file doesn't exist, return the filename unchanged
-      (file-missing filename))))
+\(like local `file-truename').
+Results are cached to avoid repeated RPC calls."
+  (let* ((expanded (expand-file-name filename))
+         (cached (tramp-rpc--cache-get tramp-rpc--file-truename-cache expanded)))
+    (if (not (eq cached 'not-found))
+        ;; Cache hit
+        (progn
+          (when tramp-rpc-magit--debug
+            (message "file-truename HIT: %s -> %s" filename cached))
+          cached)
+      ;; Cache miss - make RPC call
+      (when tramp-rpc-magit--debug
+        (message "file-truename MISS: %s" filename))
+      (with-parsed-tramp-file-name filename nil
+        (condition-case nil
+            (let* ((result (tramp-rpc--call v "file.truename" (tramp-rpc--encode-path localname)))
+                   ;; With MessagePack, path comes as raw bytes - decode to UTF-8
+                   (path (tramp-rpc--decode-string
+                          (if (stringp result)
+                              result  ; Direct binary result
+                            (alist-get 'path result))))  ; Or in result object
+                   (truename (tramp-make-tramp-file-name v path)))
+              ;; Cache the result
+              (tramp-rpc--cache-put tramp-rpc--file-truename-cache expanded truename)
+              truename)
+          ;; If file doesn't exist, return the filename unchanged and cache it
+          (file-missing
+           (tramp-rpc--cache-put tramp-rpc--file-truename-cache expanded filename)
+           filename))))))
 
 (defun tramp-rpc-handle-file-attributes (filename &optional id-format)
   "Like `file-attributes' for TRAMP-RPC files."
@@ -1281,14 +1455,18 @@ TYPE is the file type string."
   (with-parsed-tramp-file-name dir nil
     (tramp-rpc--call v "dir.create"
                      (append (tramp-rpc--encode-path localname)
-                             `((parents . ,(if parents t :msgpack-false)))))))
+                             `((parents . ,(if parents t :msgpack-false))))))
+  ;; Invalidate caches for the new directory
+  (tramp-rpc--invalidate-cache-for-path dir))
 
 (defun tramp-rpc-handle-delete-directory (directory &optional recursive trash)
   "Like `delete-directory' for TRAMP-RPC files."
   (tramp-skeleton-delete-directory directory recursive trash
     (tramp-rpc--call v "dir.remove"
                      (append (tramp-rpc--encode-path localname)
-                             `((recursive . ,(if recursive t :msgpack-false)))))))
+                             `((recursive . ,(if recursive t :msgpack-false))))))
+  ;; Invalidate caches for the deleted directory
+  (tramp-rpc--invalidate-cache-for-path directory))
 
 (defun tramp-rpc--parse-dired-switches (switches)
   "Parse SWITCHES string into a plist of options.
@@ -1485,6 +1663,9 @@ Supported switches: -a -t -S -r -h --group-directories-first."
 
       (tramp-rpc--call v "file.write" params)
 
+      ;; Invalidate caches for the written file
+      (tramp-rpc--invalidate-cache-for-path filename)
+
       ;; Handle visit
       (when (or (eq visit t) (stringp visit))
         (setq buffer-file-name filename)
@@ -1549,7 +1730,10 @@ Supported switches: -a -t -S -r -h --group-directories-first."
       (tramp-run-real-handler
        #'copy-file
        (list filename newname ok-if-already-exists keep-time
-             preserve-uid-gid preserve-permissions))))))
+             preserve-uid-gid preserve-permissions))))
+    ;; Invalidate caches for the destination file (if remote)
+    (when dest-remote
+      (tramp-rpc--invalidate-cache-for-path newname))))
 
 (defun tramp-rpc-handle-rename-file (filename newname &optional ok-if-already-exists)
   "Like `rename-file' for TRAMP-RPC files."
@@ -1568,12 +1752,19 @@ Supported switches: -a -t -S -r -h --group-directories-first."
      ;; Different hosts, copy then delete
      (t
       (copy-file filename newname ok-if-already-exists t t t)
-      (delete-file filename)))))
+      (delete-file filename)))
+    ;; Invalidate caches for both source (no longer exists) and destination
+    (when source-remote
+      (tramp-rpc--invalidate-cache-for-path filename))
+    (when dest-remote
+      (tramp-rpc--invalidate-cache-for-path newname))))
 
 (defun tramp-rpc-handle-delete-file (filename &optional trash)
   "Like `delete-file' for TRAMP-RPC files."
   (tramp-skeleton-delete-file filename trash
-    (tramp-rpc--call v "file.delete" (tramp-rpc--encode-path localname))))
+    (tramp-rpc--call v "file.delete" (tramp-rpc--encode-path localname)))
+  ;; Invalidate caches for the deleted file
+  (tramp-rpc--invalidate-cache-for-path filename))
 
 (defun tramp-rpc-handle-make-symbolic-link (target linkname &optional ok-if-already-exists)
   "Like `make-symbolic-link' for TRAMP-RPC files."
@@ -1596,7 +1787,9 @@ Supported switches: -a -t -S -r -h --group-directories-first."
                                  p)))
                            link-path-params)))
       (tramp-rpc--call v "file.make_symlink"
-                       (append `((target . ,target-path)) params)))))
+                       (append `((target . ,target-path)) params))))
+  ;; Invalidate caches for the new symlink
+  (tramp-rpc--invalidate-cache-for-path linkname))
 
 (defun tramp-rpc-handle-add-name-to-file (filename newname &optional ok-if-already-exists)
   "Like `add-name-to-file' for TRAMP-RPC files.
@@ -1807,7 +2000,7 @@ Resolves PROGRAM path and loads direnv environment from working directory."
                     (alist-get 'stderr result)
                     (alist-get 'stderr_encoding result))))
 
-      ;; Handle destination
+      ;; Handle destination (side effects only, we return exit-code below)
       (cond
        ((null destination) nil)
        ((eq destination t)
@@ -1834,7 +2027,7 @@ Resolves PROGRAM path and loads direnv environment from working directory."
               (with-temp-file stderr-dest (insert stderr)))
              ((bufferp stderr-dest)
               (with-current-buffer stderr-dest (insert stderr))))))))
-
+      ;; Always return exit code
       exit-code)))
 
 (defun tramp-rpc-handle-shell-command (command &optional output-buffer error-buffer)
@@ -2551,18 +2744,29 @@ Resolves program path and loads direnv environment from working directory."
 (defun tramp-rpc--find-executable (vec program)
   "Find PROGRAM in the remote PATH on VEC.
 Returns the absolute path or nil.
-Uses `command -v` for efficient lookup via login shell."
+Uses `command -v` for efficient lookup via login shell.
+Uses a unique marker to separate MOTD/banner text from actual output,
+following the pattern used by standard TRAMP."
   (condition-case nil
-      (let* ((result (tramp-rpc--call vec "process.run"
+      (let* (;; Use a unique marker (MD5 hash) to delimit output from MOTD text
+             ;; This is the same approach used by tramp-sh.el
+             (marker (md5 (format "tramp-rpc-%s-%s" program (float-time))))
+             (result (tramp-rpc--call vec "process.run"
                                        `((cmd . "/bin/sh")
-                                         (args . ["-l" "-c" ,(concat "command -v " program)])
+                                         (args . ["-l" "-c"
+                                                  ,(format "echo %s; command -v %s"
+                                                           marker program)])
                                          (cwd . "/"))))
              (exit-code (alist-get 'exit_code result))
              (stdout (tramp-rpc--decode-output
                       (alist-get 'stdout result)
                       (alist-get 'stdout_encoding result))))
         (when (and (eq exit-code 0) (> (length stdout) 0))
-          (string-trim stdout)))
+          ;; Find the marker and extract the path after it
+          (when (string-match (concat (regexp-quote marker) "\n\\([^\n]+\\)") stdout)
+            (let ((path (string-trim (match-string 1 stdout))))
+              (when (string-prefix-p "/" path)
+                path)))))
     (error nil)))
 
 (defun tramp-rpc-handle-start-file-process (name buffer program &rest args)
@@ -2581,6 +2785,124 @@ PROGRAM is the command to run, ARGS are its arguments."
 (defun tramp-rpc--make-pty-process (vec name buffer command coding noquery
                                          filter sentinel localname &optional direnv-env)
   "Create a PTY-based process for terminal emulators.
+VEC is the tramp connection vector.
+NAME, BUFFER, COMMAND, CODING, NOQUERY, FILTER, SENTINEL are process params.
+LOCALNAME is the remote working directory.
+DIRENV-ENV is an optional alist of environment variables from direnv.
+
+When `tramp-rpc-use-direct-ssh-pty' is non-nil (the default), this uses
+a direct SSH connection for the PTY, providing much lower latency for
+interactive terminal use.  Otherwise, uses the RPC-based PTY implementation."
+  (if tramp-rpc-use-direct-ssh-pty
+      ;; Use direct SSH for low-latency PTY
+      (tramp-rpc--make-direct-ssh-pty-process
+       vec name buffer command coding noquery filter sentinel localname direnv-env)
+    ;; Use RPC-based PTY
+    (tramp-rpc--make-rpc-pty-process
+     vec name buffer command coding noquery filter sentinel localname direnv-env)))
+
+(defun tramp-rpc--make-direct-ssh-pty-process (vec name buffer command coding noquery
+                                                    filter sentinel localname &optional direnv-env)
+  "Create a PTY process using direct SSH connection.
+This provides much lower latency than the RPC-based PTY by using a direct
+SSH connection with `-t` for the terminal.  The SSH connection reuses the
+existing ControlMaster socket, so authentication is already handled.
+
+VEC is the tramp connection vector.
+NAME, BUFFER, COMMAND, CODING, NOQUERY, FILTER, SENTINEL are process params.
+LOCALNAME is the remote working directory.
+DIRENV-ENV is an optional alist of environment variables from direnv."
+  (let* ((host (tramp-file-name-host vec))
+         (user (tramp-file-name-user vec))
+         (port (tramp-file-name-port vec))
+         (program (car command))
+         (program-args (cdr command))
+         ;; Build environment exports for the remote command
+         (env-exports (mapconcat
+                       (lambda (pair)
+                         (format "export %s=%s;"
+                                 (car pair)
+                                 (shell-quote-argument (cdr pair))))
+                       (append direnv-env
+                               `(("TERM" . ,(or (getenv "TERM") "xterm-256color"))))
+                       " "))
+         ;; Build the remote command - cd to dir, export env, exec program
+         (remote-cmd (format "cd %s && %s exec %s %s"
+                             (shell-quote-argument localname)
+                             env-exports
+                             (shell-quote-argument program)
+                             (mapconcat #'shell-quote-argument program-args " ")))
+         ;; Build SSH arguments for direct PTY connection
+         (ssh-args (append
+                    (list "ssh")
+                    ;; Request PTY allocation
+                    (list "-t" "-t")  ; Force PTY even without controlling terminal
+                    ;; Reuse ControlMaster if enabled
+                    (when tramp-rpc-use-controlmaster
+                      (list "-o" "ControlMaster=auto"
+                            "-o" (format "ControlPath=%s"
+                                         (tramp-rpc--controlmaster-socket-path vec))
+                            "-o" (format "ControlPersist=%s"
+                                         tramp-rpc-controlmaster-persist)))
+                    ;; Standard options
+                    ;; Only use BatchMode=yes when ControlMaster handles auth;
+                    ;; without it, BatchMode=yes prevents password prompts.
+                    (when tramp-rpc-use-controlmaster
+                      (list "-o" "BatchMode=yes"))
+                    (list "-o" "StrictHostKeyChecking=accept-new")
+                    ;; User-specified SSH options
+                    (mapcan (lambda (opt) (list "-o" opt))
+                            tramp-rpc-ssh-options)
+                    ;; Raw SSH arguments
+                    tramp-rpc-ssh-args
+                    ;; Connection parameters
+                    (when user (list "-l" user))
+                    (when port (list "-p" (number-to-string port)))
+                    ;; Host and command
+                    (list host remote-cmd)))
+         ;; Normalize buffer
+         (actual-buffer (cond
+                         ((bufferp buffer) buffer)
+                         ((stringp buffer) (get-buffer-create buffer))
+                         ((eq buffer t) (current-buffer))
+                         (t nil)))
+         ;; Start the SSH process with PTY
+         (process-connection-type t)  ; Use PTY
+         (process (apply #'start-process
+                         (or name "tramp-rpc-direct-pty")
+                         actual-buffer
+                         ssh-args)))
+    
+    (tramp-rpc--debug "DIRECT-SSH-PTY started: %s -> %s %S"
+                     process host command)
+    
+    ;; Configure the process
+    (when coding
+      (set-process-coding-system process coding coding))
+    (set-process-query-on-exit-flag process (not noquery))
+    
+    ;; Set up filter
+    (when filter
+      (set-process-filter process filter))
+    
+    ;; Set up sentinel
+    (when sentinel
+      (set-process-sentinel process sentinel))
+    
+    ;; Store tramp-rpc metadata for compatibility with other code
+    (process-put process :tramp-rpc-pty t)
+    (process-put process :tramp-rpc-direct-ssh t)
+    (process-put process :tramp-rpc-vec vec)
+    (process-put process :tramp-rpc-user-sentinel sentinel)
+    (process-put process :tramp-rpc-command command)
+    
+    process))
+
+(defun tramp-rpc--make-rpc-pty-process (vec name buffer command coding noquery
+                                             filter sentinel localname &optional direnv-env)
+  "Create a PTY-based process using the RPC server.
+This is the fallback when direct SSH PTY is disabled.
+
 VEC is the tramp connection vector.
 NAME, BUFFER, COMMAND, CODING, NOQUERY, FILTER, SENTINEL are process params.
 LOCALNAME is the remote working directory.
@@ -2829,51 +3151,65 @@ Returns the final (width . height) cons, or nil if resize was not handled."
                   (funcall display-updater width height))
                 (cons width height)))))))))
 
-(defun tramp-rpc--vterm-window-adjust-process-window-size-advice (orig-fun process windows)
-  "Advice for vterm's window adjust function to handle TRAMP-RPC PTY processes.
-For tramp-rpc processes, resize the remote PTY and update vterm's display."
-  (if (and (processp process)
-           (process-get process :tramp-rpc-pty))
-      ;; This is a tramp-rpc PTY process
-      (unless vterm-copy-mode
-        (tramp-rpc--handle-pty-resize
-         process windows
-         ;; Size adjuster: apply vterm margins and minimum width
-         (lambda (width height)
-           (when (fboundp 'vterm--get-margin-width)
-             (setq width (- width (vterm--get-margin-width))))
-           (cons (max width vterm-min-window-width) height))
-         ;; Display updater: call vterm--set-size
-         (lambda (width height)
-           (when (and (boundp 'vterm--term) vterm--term
-                      (fboundp 'vterm--set-size))
-             (vterm--set-size vterm--term height width)))))
-    ;; Not our process, call original
-    (funcall orig-fun process windows)))
-
-(defun tramp-rpc--eat-adjust-process-window-size-advice (orig-fun process windows)
-  "Advice for eat's window adjust function to handle TRAMP-RPC PTY processes.
-For tramp-rpc processes, resize the remote PTY and update eat's display."
-  (if (and (processp process)
-           (process-get process :tramp-rpc-pty))
-      ;; This is a tramp-rpc PTY process
+(defun tramp-rpc--vterm-window-size-advice (orig-fun process windows)
+  "Advice for vterm's window adjust function for TRAMP-RPC PTY processes.
+For tramp-rpc processes, resize the remote PTY and update vterm's display.
+For direct SSH PTY, let the original function handle it (SSH handles resize)."
+  (cond
+   ;; Direct SSH PTY - let original function handle it
+   ;; SSH client handles PTY resize automatically via SSH protocol
+   ((and (processp process)
+         (process-get process :tramp-rpc-direct-ssh))
+    (funcall orig-fun process windows))
+   ;; RPC-based PTY - resize via RPC
+   ((and (processp process)
+         (process-get process :tramp-rpc-pty))
+    (unless vterm-copy-mode
       (tramp-rpc--handle-pty-resize
        process windows
-       ;; Size adjuster: ensure minimum of 1
+       ;; Size adjuster: apply vterm margins and minimum width
        (lambda (width height)
-         (cons (max width 1) (max height 1)))
-       ;; Display updater: resize eat terminal and run hooks
+         (when (fboundp 'vterm--get-margin-width)
+           (setq width (- width (vterm--get-margin-width))))
+         (cons (max width vterm-min-window-width) height))
+       ;; Display updater: call vterm--set-size
        (lambda (width height)
-         (when (and (boundp 'eat-terminal) eat-terminal
-                    (fboundp 'eat-term-resize)
-                    (fboundp 'eat-term-redisplay))
-           (eat-term-resize eat-terminal width height)
-           (eat-term-redisplay eat-terminal))
-         (pcase major-mode
-           ('eat-mode (run-hooks 'eat-update-hook))
-           ('eshell-mode (run-hooks 'eat-eshell-update-hook)))))
-    ;; Not our process, call original
-    (funcall orig-fun process windows)))
+         (when (and (boundp 'vterm--term) vterm--term
+                    (fboundp 'vterm--set-size))
+           (vterm--set-size vterm--term height width))))))
+   ;; Not our process, call original
+   (t (funcall orig-fun process windows))))
+
+(defun tramp-rpc--eat-window-size-advice (orig-fun process windows)
+  "Advice for eat's window adjust function for TRAMP-RPC PTY processes.
+For tramp-rpc processes, resize the remote PTY and update eat's display.
+For direct SSH PTY, let the original function handle it (SSH handles resize)."
+  (cond
+   ;; Direct SSH PTY - let original function handle it
+   ;; SSH client handles PTY resize automatically via SSH protocol
+   ((and (processp process)
+         (process-get process :tramp-rpc-direct-ssh))
+    (funcall orig-fun process windows))
+   ;; RPC-based PTY - resize via RPC
+   ((and (processp process)
+         (process-get process :tramp-rpc-pty))
+    (tramp-rpc--handle-pty-resize
+     process windows
+     ;; Size adjuster: ensure minimum of 1
+     (lambda (width height)
+       (cons (max width 1) (max height 1)))
+     ;; Display updater: resize eat terminal and run hooks
+     (lambda (width height)
+       (when (and (boundp 'eat-terminal) eat-terminal
+                  (fboundp 'eat-term-resize)
+                  (fboundp 'eat-term-redisplay))
+         (eat-term-resize eat-terminal width height)
+         (eat-term-redisplay eat-terminal))
+       (pcase major-mode
+         ('eat-mode (run-hooks 'eat-update-hook))
+         ('eshell-mode (run-hooks 'eat-eshell-update-hook))))))
+   ;; Not our process, call original
+   (t (funcall orig-fun process windows))))
 
 ;; ============================================================================
 ;; Advice for process operations
@@ -2891,8 +3227,12 @@ For tramp-rpc processes, resize the remote PTY and update eat's display."
                   (get-buffer-process (get-buffer process)))
                  (t nil))))
       (cond
-       ;; PTY process - use PTY write (async, fire-and-forget)
-       ((and proc (process-get proc :tramp-rpc-pty))
+       ;; Direct SSH PTY - use normal process-send-string (low latency)
+       ((and proc (process-get proc :tramp-rpc-direct-ssh))
+        (funcall orig-fun process string))
+       ;; RPC-based PTY process - use PTY write (async, fire-and-forget)
+       ((and proc (process-get proc :tramp-rpc-pty)
+             (process-get proc :tramp-rpc-pid))
         (let ((vec (process-get proc :tramp-rpc-vec))
               (pid (process-get proc :tramp-rpc-pid)))
           (tramp-rpc--debug "SEND-STRING PTY pid=%s len=%d" pid (length string))
@@ -2933,8 +3273,12 @@ For tramp-rpc processes, resize the remote PTY and update eat's display."
                   (get-buffer-process (get-buffer process)))
                  (t nil))))
       (cond
-       ;; PTY process - use PTY write
-       ((and proc (process-get proc :tramp-rpc-pty))
+       ;; Direct SSH PTY - use normal process-send-region (low latency)
+       ((and proc (process-get proc :tramp-rpc-direct-ssh))
+        (funcall orig-fun process start end))
+       ;; RPC-based PTY process - use PTY write
+       ((and proc (process-get proc :tramp-rpc-pty)
+             (process-get proc :tramp-rpc-pid))
         (let ((vec (process-get proc :tramp-rpc-vec))
               (pid (process-get proc :tramp-rpc-pid))
               (string (buffer-substring-no-properties start end)))
@@ -2968,8 +3312,16 @@ For tramp-rpc processes, resize the remote PTY and update eat's display."
 (defun tramp-rpc--process-send-eof-advice (orig-fun &optional process)
   "Advice for `process-send-eof' to handle TRAMP-RPC processes."
   (let ((proc (or process (get-buffer-process (current-buffer)))))
-    (if-let* ((pid (process-get proc :tramp-rpc-pid))
-             (vec (process-get proc :tramp-rpc-vec)))
+    (cond
+     ;; Direct SSH PTY - use normal process-send-eof
+     ((and proc (process-get proc :tramp-rpc-direct-ssh))
+      (funcall orig-fun process))
+     ;; RPC-managed process
+     ((and proc
+           (process-get proc :tramp-rpc-pid)
+           (process-get proc :tramp-rpc-vec))
+      (let ((pid (process-get proc :tramp-rpc-pid))
+            (vec (process-get proc :tramp-rpc-vec)))
         ;; Only try to send EOF if the process hasn't already exited.
         ;; Short-lived processes (like git apply) may exit before we call
         ;; process-send-eof, which is fine - stdin was already closed on exit.
@@ -2990,8 +3342,9 @@ For tramp-rpc processes, resize the remote PTY and update eat's display."
              ;; exited before we could close stdin, which is expected for
              ;; short-lived processes like git apply in magit hunk staging.
              (unless (string-match-p "Process not found" (error-message-string err))
-               (message "tramp-rpc: Error closing stdin: %s" err)))))
-      (funcall orig-fun process))))
+               (message "tramp-rpc: Error closing stdin: %s" err)))))))
+     ;; Not a tramp-rpc process
+     (t (funcall orig-fun process)))))
 
 (defun tramp-rpc--signal-process-advice (orig-fun process sigcode &optional remote)
   "Advice for `signal-process' to handle TRAMP-RPC processes."
@@ -3034,9 +3387,11 @@ For tramp-rpc processes, resize the remote PTY and update eat's display."
 
 (defun tramp-rpc--process-tty-name-advice (orig-fun process &optional stream)
   "Advice for `process-tty-name' to return stored TTY name for PTY processes.
-For TRAMP-RPC PTY processes, return the remote TTY name stored during creation."
+For TRAMP-RPC PTY processes, return the remote TTY name stored during creation.
+For direct SSH PTY processes, use the original function (returns local PTY)."
   (if (and (processp process)
-           (process-get process :tramp-rpc-pty))
+           (process-get process :tramp-rpc-pty)
+           (not (process-get process :tramp-rpc-direct-ssh)))  ; Not direct SSH
       (process-get process :tramp-rpc-tty-name)
     (funcall orig-fun process stream)))
 
@@ -3053,12 +3408,12 @@ For TRAMP-RPC PTY processes, return the remote TTY name stored during creation."
 ;; Advice vterm's window resize function for tramp-rpc PTY support
 (with-eval-after-load 'vterm
   (advice-add 'vterm--window-adjust-process-window-size :around
-              #'tramp-rpc--vterm-window-adjust-process-window-size-advice))
+              #'tramp-rpc--vterm-window-size-advice))
 
 ;; Advice eat's window resize function for tramp-rpc PTY support
 (with-eval-after-load 'eat
   (advice-add 'eat--adjust-process-window-size :around
-              #'tramp-rpc--eat-adjust-process-window-size-advice))
+              #'tramp-rpc--eat-window-size-advice))
 
 ;; ============================================================================
 ;; Eglot integration
@@ -3276,6 +3631,444 @@ VEC-OR-FILENAME can be either a tramp-file-name struct or a filename string."
  #'tramp-rpc-file-name-p #'tramp-rpc-file-name-handler)
 
 ;; ============================================================================
+;; Batched file operations for performance optimization
+;; ============================================================================
+
+(defun tramp-rpc-batch-file-exists (directory paths)
+  "Check existence of multiple PATHS in DIRECTORY in a single RPC call.
+PATHS should be local paths (without the remote prefix).
+Returns an alist of (path . exists-p)."
+  (with-parsed-tramp-file-name directory nil
+    (let* ((requests
+            (mapcar (lambda (path)
+                      (cons "file.exists" `((path . ,path))))
+                    paths))
+           (results (tramp-rpc--call-pipelined v requests)))
+      (cl-loop for path in paths
+               for result in results
+               collect (cons path (if (plist-get result :error) nil result))))))
+
+(defun tramp-rpc-batch-file-attributes (directory paths &optional id-format)
+  "Get file attributes for multiple PATHS in DIRECTORY in a single RPC call.
+PATHS should be local paths (without the remote prefix).
+ID-FORMAT specifies whether to use numeric or string IDs (default: integer).
+Returns an alist of (path . attributes) in file-attributes format."
+  (with-parsed-tramp-file-name directory nil
+    (let* ((requests
+            (mapcar (lambda (path)
+                      (cons "file.stat" `((path . ,path))))
+                    paths))
+           (results (tramp-rpc--call-pipelined v requests)))
+      (cl-loop for path in paths
+               for result in results
+               collect (cons path
+                             (if (or (plist-get result :error)
+                                     (not result))
+                                 nil
+                               (tramp-rpc--convert-file-attributes
+                                result (or id-format 'integer))))))))
+
+;; ============================================================================
+;; Magit integration - server-side optimized status
+;; ============================================================================
+
+;; This uses the server-side magit.status RPC which returns all data needed
+;; for magit-status in a single call, eliminating ~60 individual git commands.
+
+(defvar tramp-rpc-magit--status-cache nil
+  "Cached magit status data from server-side RPC.
+Populated by `tramp-rpc-magit--prefetch', used by process-file advice.")
+
+(defvar tramp-rpc-magit--ancestors-cache nil
+  "Cached ancestor scan data from server-side RPC.
+This is populated by `tramp-rpc-magit--prefetch' for file existence checks.")
+
+(defvar tramp-rpc-magit--prefetch-directory nil
+  "The directory that was prefetched.
+Used to answer file-exists-p queries for the directory itself.")
+
+(defvar tramp-rpc-magit--debug nil
+  "When non-nil, log cache hits/misses for debugging.")
+
+(defvar tramp-rpc--file-exists-cache (make-hash-table :test 'equal)
+  "Cache for file-exists-p results.
+Maps absolute file paths to (timestamp . result) pairs.
+This persists across calls to avoid repeated RPC calls for the same path.")
+
+(defvar tramp-rpc--file-truename-cache (make-hash-table :test 'equal)
+  "Cache for file-truename results.
+Maps absolute file paths to (timestamp . truename) pairs.
+This persists across calls to avoid repeated RPC calls for the same path.")
+
+(defvar tramp-rpc--cache-ttl 300
+  "Time-to-live in seconds for file-exists-p and file-truename caches.
+Default is 300 seconds (5 minutes).  Set to nil to disable TTL.")
+
+(defvar tramp-rpc--cache-max-size 10000
+  "Maximum number of entries in each cache.
+When exceeded, the cache is cleared.  Set to nil for no limit.")
+
+(defun tramp-rpc--cache-get (cache key)
+  "Get value from CACHE for KEY, respecting TTL.
+Returns the value if found and not expired, otherwise `not-found'."
+  (let ((entry (gethash key cache 'not-found)))
+    (if (eq entry 'not-found)
+        'not-found
+      ;; Entry is (timestamp . value)
+      (let ((timestamp (car entry))
+            (value (cdr entry)))
+        (if (and tramp-rpc--cache-ttl
+                 (> (- (float-time) timestamp) tramp-rpc--cache-ttl))
+            ;; Expired - remove and return not-found
+            (progn
+              (remhash key cache)
+              'not-found)
+          value)))))
+
+(defun tramp-rpc--cache-put (cache key value)
+  "Put VALUE into CACHE for KEY with current timestamp.
+Clears cache if it exceeds `tramp-rpc--cache-max-size'."
+  ;; Check size limit
+  (when (and tramp-rpc--cache-max-size
+             (>= (hash-table-count cache) tramp-rpc--cache-max-size))
+    (clrhash cache))
+  ;; Store (timestamp . value)
+  (puthash key (cons (float-time) value) cache))
+
+;;;###autoload
+(defun tramp-rpc-magit-status (directory)
+  "Get complete magit status for DIRECTORY using server-side RPC.
+Returns an alist with all data needed for magit-status:
+  toplevel, gitdir, head, upstream, push, state, staged, unstaged,
+  untracked, stashes, recent_commits, tags, remotes, config, state_files.
+
+This is much faster than magit's default behavior because the server
+runs all git commands locally and returns the results in one response."
+  (when (and (file-remote-p directory)
+             (tramp-rpc-file-name-p directory))
+    (with-parsed-tramp-file-name directory nil
+      (let ((result (tramp-rpc--call v "magit.status"
+                                     `((directory . ,localname)))))
+        (when result
+          ;; Decode string fields
+          (dolist (key '(toplevel gitdir state))
+            (when-let* ((val (alist-get key result)))
+              (when (stringp val)
+                (setf (alist-get key result) (decode-coding-string val 'utf-8)))))
+          ;; Decode nested head info
+          (when-let* ((head (alist-get 'head result)))
+            (dolist (key '(hash short branch message))
+              (when-let* ((val (alist-get key head)))
+                (when (stringp val)
+                  (setf (alist-get key head) (decode-coding-string val 'utf-8))))))
+          ;; Decode diff content
+          (dolist (section '(staged unstaged))
+            (when-let* ((data (alist-get section result)))
+              (when-let* ((diff (alist-get 'diff data)))
+                (when (stringp diff)
+                  (setf (alist-get 'diff data) (decode-coding-string diff 'utf-8))))))
+          result)))))
+
+;;;###autoload
+(defun tramp-rpc-ancestors-scan (directory markers &optional max-depth)
+  "Scan ancestor directories of DIRECTORY for MARKERS using server-side RPC.
+MARKERS is a list of file/directory names to look for (e.g., \".git\" \".svn\").
+MAX-DEPTH limits how far up the tree to search (default 10).
+
+Returns an alist of (marker . found-directory) where found-directory is
+the closest ancestor containing that marker, or nil if not found.
+
+This is much faster than checking each ancestor individually because
+the server scans the entire tree in one operation."
+  (when (and (file-remote-p directory)
+             (tramp-rpc-file-name-p directory))
+    (with-parsed-tramp-file-name directory nil
+      (let ((result (tramp-rpc--call v "ancestors.scan"
+                                     `((directory . ,localname)
+                                       (markers . ,(vconcat markers))
+                                       (max_depth . ,(or max-depth 10))))))
+        ;; Convert result to alist with string keys and decoded paths
+        ;; Keys come back as symbols from msgpack (e.g., .git instead of ".git")
+        ;; so we convert them to strings for easier lookup
+        (mapcar (lambda (pair)
+                  (let ((key (car pair))
+                        (val (cdr pair)))
+                    (cons (if (symbolp key) (symbol-name key) key)
+                          (when val
+                            (decode-coding-string val 'utf-8)))))
+                result)))))
+
+(defun tramp-rpc-magit--prefetch (directory)
+  "Prefetch magit status and ancestor data for DIRECTORY.
+Populates `tramp-rpc-magit--status-cache' and ancestors cache."
+  (when (and (file-remote-p directory)
+             (tramp-rpc-file-name-p directory))
+    ;; Remember the directory we prefetched for
+    (setq tramp-rpc-magit--prefetch-directory (expand-file-name directory))
+    ;; Fetch magit status
+    (setq tramp-rpc-magit--status-cache (tramp-rpc-magit-status directory))
+    ;; Fetch ancestor markers for project/VC detection
+    (setq tramp-rpc-magit--ancestors-cache
+          (tramp-rpc-ancestors-scan directory
+                                    '(".git" ".svn" ".hg" ".bzr" "_darcs"
+                                      ".projectile" ".project" ".dir-locals.el"
+                                      ".editorconfig")))
+    (when tramp-rpc-magit--debug
+      (message "tramp-rpc-magit: prefetched status and ancestors for %s" directory))))
+
+(defun tramp-rpc-magit--clear-status-cache ()
+  "Clear only the status cache (git state that changes frequently)."
+  (setq tramp-rpc-magit--status-cache nil))
+
+(defun tramp-rpc-magit--clear-cache ()
+  "Clear all magit-related caches."
+  (setq tramp-rpc-magit--status-cache nil)
+  (setq tramp-rpc-magit--ancestors-cache nil)
+  (setq tramp-rpc-magit--prefetch-directory nil))
+
+(defun tramp-rpc-clear-file-exists-cache ()
+  "Clear the file-exists-p result cache.
+Call this after making changes to the remote filesystem."
+  (interactive)
+  (clrhash tramp-rpc--file-exists-cache)
+  (when (called-interactively-p 'any)
+    (message "tramp-rpc file-exists cache cleared")))
+
+(defun tramp-rpc-clear-file-truename-cache ()
+  "Clear the file-truename result cache.
+Call this after making changes to symlinks on the remote filesystem."
+  (interactive)
+  (clrhash tramp-rpc--file-truename-cache)
+  (when (called-interactively-p 'any)
+    (message "tramp-rpc file-truename cache cleared")))
+
+(defun tramp-rpc--invalidate-cache-for-path (filename)
+  "Invalidate caches for FILENAME and its parent directory.
+Called after file modifications to ensure cache consistency."
+  (when filename
+    (let ((expanded (expand-file-name filename)))
+      ;; Remove the file itself from caches
+      (remhash expanded tramp-rpc--file-exists-cache)
+      (remhash expanded tramp-rpc--file-truename-cache)
+      ;; Also invalidate parent directory (for directory listings)
+      (let ((parent (file-name-directory (directory-file-name expanded))))
+        (when parent
+          (remhash parent tramp-rpc--file-exists-cache)
+          (remhash parent tramp-rpc--file-truename-cache))))))
+
+(defun tramp-rpc-clear-all-caches ()
+  "Clear all tramp-rpc caches.
+Call this after making significant changes to the remote filesystem."
+  (interactive)
+  (tramp-rpc-magit--clear-cache)
+  (tramp-rpc-clear-file-exists-cache)
+  (tramp-rpc-clear-file-truename-cache)
+  (when (called-interactively-p 'any)
+    (message "All tramp-rpc caches cleared")))
+
+(defun tramp-rpc-magit--file-exists-p (filename)
+  "Check if FILENAME exists using cached ancestor data.
+Returns t, nil, or \='not-cached if not in cache.
+Only uses the cache if FILENAME is under the prefetched directory."
+  (if (and tramp-rpc-magit--ancestors-cache
+           tramp-rpc-magit--prefetch-directory)
+      ;; First check if this file is under the prefetched directory
+      (let* ((expanded (expand-file-name filename))
+             (prefetch-local (tramp-file-local-name tramp-rpc-magit--prefetch-directory))
+             (file-local (tramp-file-local-name expanded)))
+        (if (string-prefix-p prefetch-local file-local)
+            ;; File is under the prefetched directory - cache applies
+            (let ((basename (file-name-nondirectory filename)))
+              ;; Check if this is one of the markers we scanned for
+              (if-let* ((entry (assoc basename tramp-rpc-magit--ancestors-cache)))
+                  (if (cdr entry)
+                      ;; Marker was found - check if at right location
+                      (let ((found-dir (cdr entry))
+                            (file-dir (file-name-directory file-local)))
+                        (if (string-prefix-p found-dir file-dir)
+                            t
+                          nil))
+                    nil)
+                'not-cached))
+          ;; File is outside the prefetched directory - cache doesn't apply
+          'not-cached))
+    'not-cached))
+
+(defun tramp-rpc-magit--state-file-exists-p (filename)
+  "Check if git state FILENAME exists using cached status data.
+Returns t, nil, or \='not-cached if not in cache.
+Only uses the cache if FILENAME is under the prefetched directory."
+  (if (and tramp-rpc-magit--status-cache
+           tramp-rpc-magit--prefetch-directory
+           (alist-get 'state_files tramp-rpc-magit--status-cache))
+      ;; Check if file is under the prefetched directory
+      (let* ((expanded (expand-file-name filename))
+             (prefetch-local (tramp-file-local-name tramp-rpc-magit--prefetch-directory))
+             (file-local (tramp-file-local-name expanded)))
+        (if (string-prefix-p prefetch-local file-local)
+            ;; File is under the prefetched directory - cache applies
+            (let* ((state-files (alist-get 'state_files tramp-rpc-magit--status-cache))
+                   ;; Extract the path relative to .git/
+                   (basename (if (string-match "/\\.git/\\(.+\\)$" file-local)
+                                 (match-string 1 file-local)
+                               (file-name-nondirectory filename))))
+              (if-let* ((entry (assoc (intern basename) state-files)))
+                  (if (cdr entry) t nil)
+                'not-cached))
+          ;; File is outside the prefetched directory - cache doesn't apply
+          'not-cached))
+    'not-cached))
+
+(defun tramp-rpc-magit--advice-setup-buffer (orig-fun directory &rest args)
+  "Advice around `magit-status-setup-buffer' to prefetch data."
+  (when (and (file-remote-p directory)
+             (tramp-rpc-file-name-p directory))
+    (tramp-rpc-magit--prefetch directory))
+  (unwind-protect
+      (apply orig-fun directory args)
+    ;; Only clear status cache - ancestors/prefetch-dir stay for other packages
+    (tramp-rpc-magit--clear-status-cache)))
+
+(defun tramp-rpc-magit--advice-refresh-buffer (orig-fun &rest args)
+  "Advice around `magit-status-refresh-buffer' to prefetch data."
+  (when (and (file-remote-p default-directory)
+             (tramp-rpc-file-name-p default-directory)
+             (null tramp-rpc-magit--status-cache))
+    (tramp-rpc-magit--prefetch default-directory))
+  (unwind-protect
+      (apply orig-fun args)
+    ;; Only clear status cache - ancestors/prefetch-dir stay for other packages
+    (tramp-rpc-magit--clear-status-cache)))
+
+;;;###autoload
+(defun tramp-rpc-magit-enable ()
+  "Enable tramp-rpc magit optimizations.
+This uses server-side RPCs to dramatically speed up magit-status
+on remote repositories by fetching all data in a single call."
+  (interactive)
+  (advice-add 'magit-status-setup-buffer :around
+              #'tramp-rpc-magit--advice-setup-buffer)
+  (advice-add 'magit-status-refresh-buffer :around
+              #'tramp-rpc-magit--advice-refresh-buffer)
+  ;; Note: file-exists-p caching is handled in tramp-rpc-handle-file-exists-p
+  ;; via the TRAMP handler mechanism, no global advice needed
+  (message "tramp-rpc magit optimizations enabled"))
+
+;;;###autoload
+(defun tramp-rpc-magit-disable ()
+  "Disable tramp-rpc magit optimizations."
+  (interactive)
+  (advice-remove 'magit-status-setup-buffer
+                 #'tramp-rpc-magit--advice-setup-buffer)
+  (advice-remove 'magit-status-refresh-buffer
+                 #'tramp-rpc-magit--advice-refresh-buffer)
+  (tramp-rpc-magit--clear-cache)
+  (message "tramp-rpc magit optimizations disabled"))
+
+;;;###autoload
+(defun tramp-rpc-magit-enable-debug ()
+  "Enable debug logging for tramp-rpc magit."
+  (interactive)
+  (setq tramp-rpc-magit--debug t)
+  (message "tramp-rpc magit debug enabled"))
+
+;;;###autoload
+(defun tramp-rpc-magit-disable-debug ()
+  "Disable debug logging for tramp-rpc magit."
+  (interactive)
+  (setq tramp-rpc-magit--debug nil)
+  (message "tramp-rpc magit debug disabled"))
+
+;; Auto-enable when magit is loaded
+(with-eval-after-load 'magit
+  (tramp-rpc-magit-enable))
+
+;; ============================================================================
+;; Projectile optimizations
+;; ============================================================================
+
+(defun tramp-rpc-projectile--advice-get-ext-command (orig-fun vcs)
+  "Advice to disable fd for remote directories.
+Projectile checks if fd is available using `executable-find' which
+checks the LOCAL machine, but fd may not be available on the REMOTE.
+This forces git ls-files for remote directories."
+  (if (and (file-remote-p default-directory)
+           (tramp-rpc-file-name-p default-directory)
+           (eq vcs 'git)
+           (boundp 'projectile-git-command))
+      ;; For remote RPC directories, always use git ls-files
+      projectile-git-command
+    ;; Otherwise, use the original function
+    (funcall orig-fun vcs)))
+
+(defun tramp-rpc-projectile--advice-dir-files (orig-fun directory)
+  "Advice to use alien indexing for remote directories.
+Projectile's hybrid indexing calls `file-relative-name' for each file
+which is slow over TRAMP.  For remote directories, we use alien indexing
+directly since git ls-files already returns relative paths."
+  (if (and (file-remote-p directory)
+           (tramp-rpc-file-name-p directory))
+      ;; For remote RPC directories, use alien indexing directly
+      (projectile-dir-files-alien directory)
+    ;; Otherwise, use the original function
+    (funcall orig-fun directory)))
+
+(defun tramp-rpc-projectile--advice-project-files (orig-fun project-root)
+  "Advice to use alien indexing for remote project files.
+This bypasses the expensive `file-relative-name' calls in hybrid mode."
+  (if (and (file-remote-p project-root)
+           (tramp-rpc-file-name-p project-root))
+      ;; For remote RPC directories, use alien indexing directly
+      ;; This skips the cl-mapcan + file-relative-name overhead
+      (let ((files nil))
+        ;; Check cache first (like projectile-project-files does)
+        ;; Guard against projectile not being loaded
+        (when (and (bound-and-true-p projectile-enable-caching)
+                   (boundp 'projectile-projects-cache))
+          (setq files (gethash project-root projectile-projects-cache)))
+        ;; If not cached, fetch and cache
+        (unless files
+          (setq files (projectile-dir-files-alien project-root))
+          (when (and (bound-and-true-p projectile-enable-caching)
+                     (boundp 'projectile-projects-cache)
+                     (boundp 'projectile-projects-cache-time)
+                     (fboundp 'projectile-time-seconds))
+            (puthash project-root files projectile-projects-cache)
+            (puthash project-root (projectile-time-seconds) projectile-projects-cache-time)))
+        files)
+    ;; Otherwise, use the original function
+    (funcall orig-fun project-root)))
+
+;;;###autoload
+(defun tramp-rpc-projectile-enable ()
+  "Enable tramp-rpc projectile optimizations.
+This ensures fd is not used for remote directories where it may not
+be available, and uses alien indexing for better performance."
+  (interactive)
+  (advice-add 'projectile-get-ext-command :around
+              #'tramp-rpc-projectile--advice-get-ext-command)
+  (advice-add 'projectile-dir-files :around
+              #'tramp-rpc-projectile--advice-dir-files)
+  (advice-add 'projectile-project-files :around
+              #'tramp-rpc-projectile--advice-project-files)
+  (message "tramp-rpc projectile optimizations enabled"))
+
+;;;###autoload
+(defun tramp-rpc-projectile-disable ()
+  "Disable tramp-rpc projectile optimizations."
+  (interactive)
+  (advice-remove 'projectile-get-ext-command
+                 #'tramp-rpc-projectile--advice-get-ext-command)
+  (advice-remove 'projectile-dir-files
+                 #'tramp-rpc-projectile--advice-dir-files)
+  (advice-remove 'projectile-project-files
+                 #'tramp-rpc-projectile--advice-project-files)
+  (message "tramp-rpc projectile optimizations disabled"))
+
+;; Auto-enable when projectile is loaded
+(with-eval-after-load 'projectile
+  (tramp-rpc-projectile-enable))
+
 ;; Unload support
 ;; ============================================================================
 
@@ -3291,6 +4084,13 @@ Removes advice and cleans up async processes."
   (advice-remove 'process-exit-status #'tramp-rpc--process-exit-status-advice)
   (advice-remove 'process-command #'tramp-rpc--process-command-advice)
   (advice-remove 'vc-call-backend #'tramp-rpc--vc-call-backend-advice)
+  ;; Remove magit advice
+  (advice-remove 'magit-status-setup-buffer #'tramp-rpc-magit--advice-setup-buffer)
+  (advice-remove 'magit-status-refresh-buffer #'tramp-rpc-magit--advice-refresh-buffer)
+  ;; Remove projectile advice
+  (advice-remove 'projectile-get-ext-command #'tramp-rpc-projectile--advice-get-ext-command)
+  (advice-remove 'projectile-dir-files #'tramp-rpc-projectile--advice-dir-files)
+  (advice-remove 'projectile-project-files #'tramp-rpc-projectile--advice-project-files)
   ;; Clean up all async processes
   (tramp-rpc--cleanup-async-processes)
   ;; Clean up PTY processes
