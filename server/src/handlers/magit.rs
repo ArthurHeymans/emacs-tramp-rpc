@@ -32,7 +32,7 @@ pub async fn status(params: &Value) -> HandlerResult {
         return Err(RpcError::file_not_found(&params.directory));
     }
 
-    // Run git commands in parallel using tokio
+    // Run git commands in a blocking task to avoid blocking the async runtime
     let directory = params.directory.clone();
 
     tokio::task::spawn_blocking(move || collect_magit_status(&directory))
@@ -434,11 +434,8 @@ pub async fn ancestors_scan(params: &Value) -> HandlerResult {
     }
 
     // Initialize results with None for each marker
-    let mut results: HashMap<String, Option<String>> = params
-        .markers
-        .iter()
-        .map(|m| (m.clone(), None))
-        .collect();
+    let mut results: HashMap<String, Option<String>> =
+        params.markers.iter().map(|m| (m.clone(), None)).collect();
 
     // Walk up the directory tree
     let mut current = dir.to_path_buf();
@@ -450,10 +447,7 @@ pub async fn ancestors_scan(params: &Value) -> HandlerResult {
             if results.get(marker).unwrap().is_none() {
                 let marker_path = current.join(marker);
                 if marker_path.exists() {
-                    results.insert(
-                        marker.clone(),
-                        Some(current.to_string_lossy().to_string()),
-                    );
+                    results.insert(marker.clone(), Some(current.to_string_lossy().to_string()));
                 }
             }
         }
