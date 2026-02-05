@@ -24,6 +24,11 @@
 (declare-function tramp-rpc--call-batch "tramp-rpc")
 (declare-function tramp-rpc-run-git-commands "tramp-rpc")
 (declare-function tramp-rpc-magit-status-batch "tramp-rpc")
+(declare-function tramp-rpc-magit-enable-batching "tramp-rpc")
+(declare-function tramp-rpc-magit-disable-batching "tramp-rpc")
+(declare-function magit-status-setup-buffer "magit-status")
+(declare-function magit-get-mode-buffer "magit-mode")
+(defvar tramp-rpc-magit-batch-enabled)
 
 ;;; Configuration
 
@@ -76,7 +81,7 @@
       (process-file "git" nil t nil "rev-parse" "HEAD"))
     
     ;; Measure multiple round trips
-    (dotimes (i 10)
+    (dotimes (_ 10)
       (push (tramp-rpc-magit-bench--time
              (with-temp-buffer
                (process-file "git" nil t nil "rev-parse" "HEAD")))
@@ -164,10 +169,7 @@ Returns timing information for each command."
       (insert (format "Iterations: %d\n\n" tramp-rpc-magit-bench-iterations))
       
       ;; Calculate averages
-      (let ((first-run (car results))
-            (all-commands (mapcar #'car
-                                   (mapcar (lambda (r) (plist-get r :cmd))
-                                           (car results)))))
+      (let ((first-run (car results)))
         (insert (format "%-50s | %14s | %14s\n"
                         "Command" "Avg Time" "Total"))
         (insert (make-string 85 ?-) "\n")
@@ -467,7 +469,7 @@ This tests the effectiveness of the caching and batching in tramp-rpc."
                         :total-rpcs (length tramp-rpc-magit-bench--rpc-call-log))))
           
           ;; Kill the magit buffer
-          (when-let ((buf (magit-get-mode-buffer 'magit-status-mode)))
+          (when-let* ((buf (magit-get-mode-buffer 'magit-status-mode)))
             (kill-buffer buf))
           
           ;; Short pause
