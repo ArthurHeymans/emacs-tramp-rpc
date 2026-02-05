@@ -59,6 +59,15 @@ TRAMP-RPC replaces this with a lightweight Rust server that runs on the remote h
    (require 'tramp-rpc)
    #+end_src
 
+** For DoomEmacs
+1. package.el
+(package! msgpack)
+(package! tramp-rpc :recipe (:host github :repo "ArthurHeymans/emacs-tramp-rpc"))
+
+2. config.el
+(use-package! msgpack)
+(use-package! tramp-rpc)
+
 * Usage
 
 Access remote files using the ~rpc~ method:
