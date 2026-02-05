@@ -3,6 +3,7 @@
 pub mod dir;
 pub mod file;
 pub mod io;
+pub mod magit;
 pub mod process;
 
 use crate::msgpack_map;
@@ -291,6 +292,10 @@ async fn dispatch_inner(request: &Request) -> Response {
         "system.expand_path" => system_expand_path(&request.params),
         "system.statvfs" => system_statvfs(&request.params),
         "system.groups" => system_groups(),
+
+        // Magit operations (optimized for remote git status)
+        "magit.status" => magit::status(&request.params).await,
+        "ancestors.scan" => magit::ancestors_scan(&request.params).await,
 
         // Note: "batch" is NOT allowed in batch (no recursion)
         _ => Err(RpcError::method_not_found(&request.method)),

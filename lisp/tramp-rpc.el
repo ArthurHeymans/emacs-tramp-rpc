@@ -961,6 +961,126 @@ Example:
           (plist-put tramp-rpc--batch-context :requests nil))))))
 
 ;; ============================================================================
+;; Batched process-file support for magit and similar tools
+;; ============================================================================
+
+;;;###autoload
+(defun tramp-rpc-run-git-commands (directory commands)
+  "Run multiple git COMMANDS in DIRECTORY using pipelined RPC.
+COMMANDS is a list of lists, where each sublist is arguments to git.
+For example: ((\"rev-parse\" \"HEAD\") (\"status\" \"--porcelain\"))
+
+Returns a list of plists, each containing:
+  :exit-code - the exit code of the command
+  :stdout    - standard output as a string
+  :stderr    - standard error as a string
+
+This is much faster than running each command sequentially over TRAMP
+because all commands are sent in a single network round-trip."
+  (with-parsed-tramp-file-name directory nil
+    (let* ((requests
+            (mapcar (lambda (args)
+                      (cons "process.run"
+                            `((cmd . "git")
+                              (args . ,(vconcat args))
+                              (cwd . ,localname))))
+                    commands))
+           (results (tramp-rpc--call-pipelined v requests)))
+      ;; Convert results to a more convenient format
+      (mapcar (lambda (result)
+                (if (plist-get result :error)
+                    (list :exit-code -1
+                          :stdout ""
+                          :stderr (or (plist-get result :message) "RPC error"))
+                  (list :exit-code (alist-get 'exit_code result)
+                        :stdout (tramp-rpc--decode-output
+                                 (alist-get 'stdout result)
+                                 (alist-get 'stdout_encoding result))
+                        :stderr (tramp-rpc--decode-output
+                                 (alist-get 'stderr result)
+                                 (alist-get 'stderr_encoding result)))))
+              results))))
+
+;;;###autoload
+(defun tramp-rpc-run-commands (directory commands)
+  "Run multiple shell COMMANDS in DIRECTORY using pipelined RPC.
+COMMANDS is a list of (PROGRAM . ARGS) cons cells.
+For example: ((\"git\" \"rev-parse\" \"HEAD\") (\"ls\" \"-la\"))
+
+Returns a list of plists, each containing:
+  :exit-code - the exit code of the command
+  :stdout    - standard output as a string
+  :stderr    - standard error as a string
+
+This is much faster than running each command sequentially over TRAMP
+because all commands are sent in a single network round-trip."
+  (with-parsed-tramp-file-name directory nil
+    (let* ((requests
+            (mapcar (lambda (cmd)
+                      (let ((program (car cmd))
+                            (args (cdr cmd)))
+                        (cons "process.run"
+                              `((cmd . ,program)
+                                (args . ,(vconcat args))
+                                (cwd . ,localname)))))
+                    commands))
+           (results (tramp-rpc--call-pipelined v requests)))
+      ;; Convert results to a more convenient format
+      (mapcar (lambda (result)
+                (if (plist-get result :error)
+                    (list :exit-code -1
+                          :stdout ""
+                          :stderr (or (plist-get result :message) "RPC error"))
+                  (list :exit-code (alist-get 'exit_code result)
+                        :stdout (tramp-rpc--decode-output
+                                 (alist-get 'stdout result)
+                                 (alist-get 'stdout_encoding result))
+                        :stderr (tramp-rpc--decode-output
+                                 (alist-get 'stderr result)
+                                 (alist-get 'stderr_encoding result)))))
+              results))))
+
+(defmacro with-tramp-rpc-process-batch (directory &rest body)
+  "Execute BODY with queued process-file execution for DIRECTORY.
+Process-file calls within BODY are collected and executed together
+at the end, minimizing network round-trips.
+
+This macro provides a transparent optimization for code that makes
+many sequential process-file calls, like magit's status refresh.
+
+Example:
+  (with-tramp-rpc-process-batch default-directory
+    (process-file \"git\" nil t nil \"rev-parse\" \"HEAD\")
+    (process-file \"git\" nil t nil \"status\" \"--porcelain\"))"
+  (declare (indent 1) (debug (form body)))
+  `(let ((tramp-rpc--process-batch-queue nil)
+         (tramp-rpc--process-batch-directory ,directory))
+     (unwind-protect
+         (progn ,@body)
+       ;; Execute any remaining queued commands
+       (tramp-rpc--flush-process-batch-queue))))
+
+(defvar tramp-rpc--process-batch-queue nil
+  "Queue of process-file calls when inside `with-tramp-rpc-process-batch'.")
+
+(defvar tramp-rpc--process-batch-directory nil
+  "Directory for the current process batch context.")
+
+(defun tramp-rpc--flush-process-batch-queue ()
+  "Execute queued process-file calls in a single pipelined RPC."
+  (when (and tramp-rpc--process-batch-queue
+             tramp-rpc--process-batch-directory)
+    (let* ((commands (nreverse tramp-rpc--process-batch-queue))
+           (results (tramp-rpc-run-commands
+                     tramp-rpc--process-batch-directory
+                     commands)))
+      ;; Clear the queue
+      (setq tramp-rpc--process-batch-queue nil)
+      results)))
+
+
+
+;; ============================================================================
 ;; Output decoding helper
 ;; ============================================================================
 
@@ -1005,9 +1125,45 @@ Returns an alist with path."
 ;; ============================================================================
 
 (defun tramp-rpc-handle-file-exists-p (filename)
-  "Like `file-exists-p' for TRAMP-RPC files."
-  (with-parsed-tramp-file-name filename nil
-    (tramp-rpc--call v "file.exists" (tramp-rpc--encode-path localname))))
+  "Like `file-exists-p' for TRAMP-RPC files.
+Uses magit caches when available for better performance.
+Also caches RPC results to avoid repeated calls for the same path."
+  (let ((expanded (expand-file-name filename)))
+    (catch 'result
+      ;; Check if this is the prefetched directory itself
+      (when (and tramp-rpc-magit--prefetch-directory
+                 (string= expanded tramp-rpc-magit--prefetch-directory))
+        (when tramp-rpc-magit--debug
+          (message "file-exists-p HIT (prefetch-dir): %s -> t" filename))
+        (throw 'result t))
+      ;; Check state files cache (git internal files)
+      (when tramp-rpc-magit--status-cache
+        (let ((cached (tramp-rpc-magit--state-file-exists-p filename)))
+          (unless (eq cached 'not-cached)
+            (when tramp-rpc-magit--debug
+              (message "file-exists-p HIT (state): %s -> %s" filename cached))
+            (throw 'result cached))))
+      ;; Check ancestors cache (marker files like .git, .projectile)
+      (when tramp-rpc-magit--ancestors-cache
+        (let ((cached (tramp-rpc-magit--file-exists-p filename)))
+          (unless (eq cached 'not-cached)
+            (when tramp-rpc-magit--debug
+              (message "file-exists-p HIT (ancestors): %s -> %s" filename cached))
+            (throw 'result cached))))
+      ;; Check general file-exists cache (avoids repeated RPC calls)
+      (let ((cached (tramp-rpc--cache-get tramp-rpc--file-exists-cache expanded)))
+        (unless (eq cached 'not-found)
+          (when tramp-rpc-magit--debug
+            (message "file-exists-p HIT (rpc-cache): %s -> %s" filename cached))
+          (throw 'result cached)))
+      ;; Cache miss - make RPC call and cache the result
+      (when tramp-rpc-magit--debug
+        (message "file-exists-p MISS: %s" filename))
+      (with-parsed-tramp-file-name filename nil
+        (let ((result (tramp-rpc--call v "file.exists" (tramp-rpc--encode-path localname))))
+          ;; Cache the result
+          (tramp-rpc--cache-put tramp-rpc--file-exists-cache expanded result)
+          result)))))
 
 (defun tramp-rpc-handle-file-readable-p (filename)
   "Like `file-readable-p' for TRAMP-RPC files."
@@ -1114,18 +1270,35 @@ If LSTAT is non-nil, don't follow symlinks."
 (defun tramp-rpc-handle-file-truename (filename)
   "Like `file-truename' for TRAMP-RPC files.
 If the file doesn't exist, return FILENAME unchanged
-\(like local `file-truename')."
-  (with-parsed-tramp-file-name filename nil
-    (condition-case nil
-        (let* ((result (tramp-rpc--call v "file.truename" (tramp-rpc--encode-path localname)))
-               ;; With MessagePack, path comes as raw bytes - decode to UTF-8
-               (path (tramp-rpc--decode-string
-                      (if (stringp result)
-                          result  ; Direct binary result
-                        (alist-get 'path result)))))  ; Or in result object
-          (tramp-make-tramp-file-name v path))
-      ;; If file doesn't exist, return the filename unchanged
-      (file-missing filename))))
+\(like local `file-truename').
+Results are cached to avoid repeated RPC calls."
+  (let* ((expanded (expand-file-name filename))
+         (cached (tramp-rpc--cache-get tramp-rpc--file-truename-cache expanded)))
+    (if (not (eq cached 'not-found))
+        ;; Cache hit
+        (progn
+          (when tramp-rpc-magit--debug
+            (message "file-truename HIT: %s -> %s" filename cached))
+          cached)
+      ;; Cache miss - make RPC call
+      (when tramp-rpc-magit--debug
+        (message "file-truename MISS: %s" filename))
+      (with-parsed-tramp-file-name filename nil
+        (condition-case nil
+            (let* ((result (tramp-rpc--call v "file.truename" (tramp-rpc--encode-path localname)))
+                   ;; With MessagePack, path comes as raw bytes - decode to UTF-8
+                   (path (tramp-rpc--decode-string
+                          (if (stringp result)
+                              result  ; Direct binary result
+                            (alist-get 'path result))))  ; Or in result object
+                   (truename (tramp-make-tramp-file-name v path)))
+              ;; Cache the result
+              (tramp-rpc--cache-put tramp-rpc--file-truename-cache expanded truename)
+              truename)
+          ;; If file doesn't exist, return the filename unchanged and cache it
+          (file-missing
+           (tramp-rpc--cache-put tramp-rpc--file-truename-cache expanded filename)
+           filename))))))
 
 (defun tramp-rpc-handle-file-attributes (filename &optional id-format)
   "Like `file-attributes' for TRAMP-RPC files."
@@ -1320,14 +1493,18 @@ TYPE is the file type string."
   (with-parsed-tramp-file-name dir nil
     (tramp-rpc--call v "dir.create"
                      (append (tramp-rpc--encode-path localname)
-                             `((parents . ,(if parents t :msgpack-false)))))))
+                             `((parents . ,(if parents t :msgpack-false))))))
+  ;; Invalidate caches for the new directory
+  (tramp-rpc--invalidate-cache-for-path dir))
 
 (defun tramp-rpc-handle-delete-directory (directory &optional recursive trash)
   "Like `delete-directory' for TRAMP-RPC files."
   (tramp-skeleton-delete-directory directory recursive trash
     (tramp-rpc--call v "dir.remove"
                      (append (tramp-rpc--encode-path localname)
-                             `((recursive . ,(if recursive t :msgpack-false)))))))
+                             `((recursive . ,(if recursive t :msgpack-false))))))
+  ;; Invalidate caches for the deleted directory
+  (tramp-rpc--invalidate-cache-for-path directory))
 
 (defun tramp-rpc--parse-dired-switches (switches)
   "Parse SWITCHES string into a plist of options.
@@ -1524,6 +1701,9 @@ Supported switches: -a -t -S -r -h --group-directories-first."
 
       (tramp-rpc--call v "file.write" params)
 
+      ;; Invalidate caches for the written file
+      (tramp-rpc--invalidate-cache-for-path filename)
+
       ;; Handle visit
       (when (or (eq visit t) (stringp visit))
         (setq buffer-file-name filename)
@@ -1584,11 +1764,14 @@ Supported switches: -a -t -S -r -h --group-directories-first."
         (set-file-times newname (file-attribute-modification-time
                                  (file-attributes filename)))))
      ;; Both local or different remote hosts - use default
-     (t
-      (tramp-run-real-handler
-       #'copy-file
-       (list filename newname ok-if-already-exists keep-time
-             preserve-uid-gid preserve-permissions))))))
+      (t
+       (tramp-run-real-handler
+        #'copy-file
+        (list filename newname ok-if-already-exists keep-time
+              preserve-uid-gid preserve-permissions))))
+    ;; Invalidate caches for the destination file (if remote)
+    (when dest-remote
+      (tramp-rpc--invalidate-cache-for-path newname))))
 
 (defun tramp-rpc-handle-rename-file (filename newname &optional ok-if-already-exists)
   "Like `rename-file' for TRAMP-RPC files."
@@ -1607,12 +1790,19 @@ Supported switches: -a -t -S -r -h --group-directories-first."
      ;; Different hosts, copy then delete
      (t
       (copy-file filename newname ok-if-already-exists t t t)
-      (delete-file filename)))))
+      (delete-file filename)))
+    ;; Invalidate caches for both source (no longer exists) and destination
+    (when source-remote
+      (tramp-rpc--invalidate-cache-for-path filename))
+    (when dest-remote
+      (tramp-rpc--invalidate-cache-for-path newname))))
 
 (defun tramp-rpc-handle-delete-file (filename &optional trash)
   "Like `delete-file' for TRAMP-RPC files."
   (tramp-skeleton-delete-file filename trash
-    (tramp-rpc--call v "file.delete" (tramp-rpc--encode-path localname))))
+    (tramp-rpc--call v "file.delete" (tramp-rpc--encode-path localname)))
+  ;; Invalidate caches for the deleted file
+  (tramp-rpc--invalidate-cache-for-path filename))
 
 (defun tramp-rpc-handle-make-symbolic-link (target linkname &optional ok-if-already-exists)
   "Like `make-symbolic-link' for TRAMP-RPC files."
@@ -1635,7 +1825,9 @@ Supported switches: -a -t -S -r -h --group-directories-first."
                                  p)))
                            link-path-params)))
       (tramp-rpc--call v "file.make_symlink"
-                       (append `((target . ,target-path)) params)))))
+                       (append `((target . ,target-path)) params))))
+  ;; Invalidate caches for the new symlink
+  (tramp-rpc--invalidate-cache-for-path linkname))
 
 (defun tramp-rpc-handle-add-name-to-file (filename newname &optional ok-if-already-exists)
   "Like `add-name-to-file' for TRAMP-RPC files.
@@ -1846,7 +2038,7 @@ Resolves PROGRAM path and loads direnv environment from working directory."
                     (alist-get 'stderr result)
                     (alist-get 'stderr_encoding result))))
 
-      ;; Handle destination
+      ;; Handle destination (side effects only, we return exit-code below)
       (cond
        ((null destination) nil)
        ((eq destination t)
@@ -1873,7 +2065,7 @@ Resolves PROGRAM path and loads direnv environment from working directory."
               (with-temp-file stderr-dest (insert stderr)))
              ((bufferp stderr-dest)
               (with-current-buffer stderr-dest (insert stderr))))))))
-
+      ;; Always return exit code
       exit-code)))
 
 (defun tramp-rpc-handle-shell-command (command &optional output-buffer error-buffer)
@@ -3185,8 +3377,9 @@ For direct SSH PTY processes, let the original function handle it (SSH handles r
              ;; exited before we could close stdin, which is expected for
              ;; short-lived processes like git apply in magit hunk staging.
              (unless (string-match-p "Process not found" (error-message-string err))
-               (message "tramp-rpc: Error closing stdin: %s" err)))))
-      (funcall orig-fun process))))
+               (message "tramp-rpc: Error closing stdin: %s" err)))))))
+     ;; Not a tramp-rpc process
+     (t (funcall orig-fun process)))))
 
 (defun tramp-rpc--signal-process-advice (orig-fun process sigcode &optional remote)
   "Advice for `signal-process' to handle TRAMP-RPC processes."
@@ -3470,6 +3663,444 @@ VEC-OR-FILENAME can be either a tramp-file-name struct or a filename string."
  #'tramp-rpc-file-name-p #'tramp-rpc-file-name-handler)
 
 ;; ============================================================================
+;; Batched file operations for performance optimization
+;; ============================================================================
+
+(defun tramp-rpc-batch-file-exists (directory paths)
+  "Check existence of multiple PATHS in DIRECTORY in a single RPC call.
+PATHS should be local paths (without the remote prefix).
+Returns an alist of (path . exists-p)."
+  (with-parsed-tramp-file-name directory nil
+    (let* ((requests
+            (mapcar (lambda (path)
+                      (cons "file.exists" `((path . ,path))))
+                    paths))
+           (results (tramp-rpc--call-pipelined v requests)))
+      (cl-loop for path in paths
+               for result in results
+               collect (cons path (if (plist-get result :error) nil result))))))
+
+(defun tramp-rpc-batch-file-attributes (directory paths &optional id-format)
+  "Get file attributes for multiple PATHS in DIRECTORY in a single RPC call.
+PATHS should be local paths (without the remote prefix).
+ID-FORMAT specifies whether to use numeric or string IDs (default: integer).
+Returns an alist of (path . attributes) where attributes is in file-attributes format."
+  (with-parsed-tramp-file-name directory nil
+    (let* ((requests
+            (mapcar (lambda (path)
+                      (cons "file.stat" `((path . ,path))))
+                    paths))
+           (results (tramp-rpc--call-pipelined v requests)))
+      (cl-loop for path in paths
+               for result in results
+               collect (cons path
+                             (if (or (plist-get result :error)
+                                     (not result))
+                                 nil
+                               (tramp-rpc--convert-file-attributes
+                                result (or id-format 'integer))))))))
+
+;; ============================================================================
+;; Magit integration - server-side optimized status
+;; ============================================================================
+
+;; This uses the server-side magit.status RPC which returns all data needed
+;; for magit-status in a single call, eliminating ~60 individual git commands.
+
+(defvar tramp-rpc-magit--status-cache nil
+  "Cached magit status data from server-side RPC.
+This is populated by `tramp-rpc-magit--prefetch' and used by process-file advice.")
+
+(defvar tramp-rpc-magit--ancestors-cache nil
+  "Cached ancestor scan data from server-side RPC.
+This is populated by `tramp-rpc-magit--prefetch' for file existence checks.")
+
+(defvar tramp-rpc-magit--prefetch-directory nil
+  "The directory that was prefetched.
+Used to answer file-exists-p queries for the directory itself.")
+
+(defvar tramp-rpc-magit--debug nil
+  "When non-nil, log cache hits/misses for debugging.")
+
+(defvar tramp-rpc--file-exists-cache (make-hash-table :test 'equal)
+  "Cache for file-exists-p results.
+Maps absolute file paths to (timestamp . result) pairs.
+This persists across calls to avoid repeated RPC calls for the same path.")
+
+(defvar tramp-rpc--file-truename-cache (make-hash-table :test 'equal)
+  "Cache for file-truename results.
+Maps absolute file paths to (timestamp . truename) pairs.
+This persists across calls to avoid repeated RPC calls for the same path.")
+
+(defvar tramp-rpc--cache-ttl 300
+  "Time-to-live in seconds for file-exists-p and file-truename caches.
+Default is 300 seconds (5 minutes).  Set to nil to disable TTL.")
+
+(defvar tramp-rpc--cache-max-size 10000
+  "Maximum number of entries in each cache.
+When exceeded, the cache is cleared.  Set to nil for no limit.")
+
+(defun tramp-rpc--cache-get (cache key)
+  "Get value from CACHE for KEY, respecting TTL.
+Returns the value if found and not expired, otherwise `not-found'."
+  (let ((entry (gethash key cache 'not-found)))
+    (if (eq entry 'not-found)
+        'not-found
+      ;; Entry is (timestamp . value)
+      (let ((timestamp (car entry))
+            (value (cdr entry)))
+        (if (and tramp-rpc--cache-ttl
+                 (> (- (float-time) timestamp) tramp-rpc--cache-ttl))
+            ;; Expired - remove and return not-found
+            (progn
+              (remhash key cache)
+              'not-found)
+          value)))))
+
+(defun tramp-rpc--cache-put (cache key value)
+  "Put VALUE into CACHE for KEY with current timestamp.
+Clears cache if it exceeds `tramp-rpc--cache-max-size'."
+  ;; Check size limit
+  (when (and tramp-rpc--cache-max-size
+             (>= (hash-table-count cache) tramp-rpc--cache-max-size))
+    (clrhash cache))
+  ;; Store (timestamp . value)
+  (puthash key (cons (float-time) value) cache))
+
+;;;###autoload
+(defun tramp-rpc-magit-status (directory)
+  "Get complete magit status for DIRECTORY using server-side RPC.
+Returns an alist with all data needed for magit-status:
+  toplevel, gitdir, head, upstream, push, state, staged, unstaged,
+  untracked, stashes, recent_commits, tags, remotes, config, state_files.
+
+This is much faster than magit's default behavior because the server
+runs all git commands locally and returns the results in one response."
+  (when (and (file-remote-p directory)
+             (tramp-rpc-file-name-p directory))
+    (with-parsed-tramp-file-name directory nil
+      (let ((result (tramp-rpc--call v "magit.status"
+                                     `((directory . ,localname)))))
+        (when result
+          ;; Decode string fields
+          (dolist (key '(toplevel gitdir state))
+            (when-let ((val (alist-get key result)))
+              (when (stringp val)
+                (setf (alist-get key result) (decode-coding-string val 'utf-8)))))
+          ;; Decode nested head info
+          (when-let ((head (alist-get 'head result)))
+            (dolist (key '(hash short branch message))
+              (when-let ((val (alist-get key head)))
+                (when (stringp val)
+                  (setf (alist-get key head) (decode-coding-string val 'utf-8))))))
+          ;; Decode diff content
+          (dolist (section '(staged unstaged))
+            (when-let ((data (alist-get section result)))
+              (when-let ((diff (alist-get 'diff data)))
+                (when (stringp diff)
+                  (setf (alist-get 'diff data) (decode-coding-string diff 'utf-8))))))
+          result)))))
+
+;;;###autoload
+(defun tramp-rpc-ancestors-scan (directory markers &optional max-depth)
+  "Scan ancestor directories of DIRECTORY for MARKERS using server-side RPC.
+MARKERS is a list of file/directory names to look for (e.g., \".git\" \".svn\").
+MAX-DEPTH limits how far up the tree to search (default 10).
+
+Returns an alist of (marker . found-directory) where found-directory is
+the closest ancestor containing that marker, or nil if not found.
+
+This is much faster than checking each ancestor individually because
+the server scans the entire tree in one operation."
+  (when (and (file-remote-p directory)
+             (tramp-rpc-file-name-p directory))
+    (with-parsed-tramp-file-name directory nil
+      (let ((result (tramp-rpc--call v "ancestors.scan"
+                                     `((directory . ,localname)
+                                       (markers . ,(vconcat markers))
+                                       (max_depth . ,(or max-depth 10))))))
+        ;; Convert result to alist with string keys and decoded paths
+        ;; Keys come back as symbols from msgpack (e.g., .git instead of ".git")
+        ;; so we convert them to strings for easier lookup
+        (mapcar (lambda (pair)
+                  (let ((key (car pair))
+                        (val (cdr pair)))
+                    (cons (if (symbolp key) (symbol-name key) key)
+                          (when val
+                            (decode-coding-string val 'utf-8)))))
+                result)))))
+
+(defun tramp-rpc-magit--prefetch (directory)
+  "Prefetch magit status and ancestor data for DIRECTORY.
+Populates `tramp-rpc-magit--status-cache' and `tramp-rpc-magit--ancestors-cache'."
+  (when (and (file-remote-p directory)
+             (tramp-rpc-file-name-p directory))
+    ;; Remember the directory we prefetched for
+    (setq tramp-rpc-magit--prefetch-directory (expand-file-name directory))
+    ;; Fetch magit status
+    (setq tramp-rpc-magit--status-cache (tramp-rpc-magit-status directory))
+    ;; Fetch ancestor markers for project/VC detection
+    (setq tramp-rpc-magit--ancestors-cache
+          (tramp-rpc-ancestors-scan directory
+                                    '(".git" ".svn" ".hg" ".bzr" "_darcs"
+                                      ".projectile" ".project" ".dir-locals.el"
+                                      ".editorconfig")))
+    (when tramp-rpc-magit--debug
+      (message "tramp-rpc-magit: prefetched status and ancestors for %s" directory))))
+
+(defun tramp-rpc-magit--clear-status-cache ()
+  "Clear only the status cache (git state that changes frequently)."
+  (setq tramp-rpc-magit--status-cache nil))
+
+(defun tramp-rpc-magit--clear-cache ()
+  "Clear all magit-related caches."
+  (setq tramp-rpc-magit--status-cache nil)
+  (setq tramp-rpc-magit--ancestors-cache nil)
+  (setq tramp-rpc-magit--prefetch-directory nil))
+
+(defun tramp-rpc-clear-file-exists-cache ()
+  "Clear the file-exists-p result cache.
+Call this after making changes to the remote filesystem."
+  (interactive)
+  (clrhash tramp-rpc--file-exists-cache)
+  (when (called-interactively-p 'any)
+    (message "tramp-rpc file-exists cache cleared")))
+
+(defun tramp-rpc-clear-file-truename-cache ()
+  "Clear the file-truename result cache.
+Call this after making changes to symlinks on the remote filesystem."
+  (interactive)
+  (clrhash tramp-rpc--file-truename-cache)
+  (when (called-interactively-p 'any)
+    (message "tramp-rpc file-truename cache cleared")))
+
+(defun tramp-rpc--invalidate-cache-for-path (filename)
+  "Invalidate caches for FILENAME and its parent directory.
+Called after file modifications to ensure cache consistency."
+  (when filename
+    (let ((expanded (expand-file-name filename)))
+      ;; Remove the file itself from caches
+      (remhash expanded tramp-rpc--file-exists-cache)
+      (remhash expanded tramp-rpc--file-truename-cache)
+      ;; Also invalidate parent directory (for directory listings)
+      (let ((parent (file-name-directory (directory-file-name expanded))))
+        (when parent
+          (remhash parent tramp-rpc--file-exists-cache)
+          (remhash parent tramp-rpc--file-truename-cache))))))
+
+(defun tramp-rpc-clear-all-caches ()
+  "Clear all tramp-rpc caches.
+Call this after making significant changes to the remote filesystem."
+  (interactive)
+  (tramp-rpc-magit--clear-cache)
+  (tramp-rpc-clear-file-exists-cache)
+  (tramp-rpc-clear-file-truename-cache)
+  (when (called-interactively-p 'any)
+    (message "All tramp-rpc caches cleared")))
+
+(defun tramp-rpc-magit--file-exists-p (filename)
+  "Check if FILENAME exists using cached ancestor data.
+Returns t, nil, or \='not-cached if not in cache.
+Only uses the cache if FILENAME is under the prefetched directory."
+  (if (and tramp-rpc-magit--ancestors-cache
+           tramp-rpc-magit--prefetch-directory)
+      ;; First check if this file is under the prefetched directory
+      (let* ((expanded (expand-file-name filename))
+             (prefetch-local (tramp-file-local-name tramp-rpc-magit--prefetch-directory))
+             (file-local (tramp-file-local-name expanded)))
+        (if (string-prefix-p prefetch-local file-local)
+            ;; File is under the prefetched directory - cache applies
+            (let ((basename (file-name-nondirectory filename)))
+              ;; Check if this is one of the markers we scanned for
+              (if-let ((entry (assoc basename tramp-rpc-magit--ancestors-cache)))
+                  (if (cdr entry)
+                      ;; Marker was found - check if at right location
+                      (let ((found-dir (cdr entry))
+                            (file-dir (file-name-directory file-local)))
+                        (if (string-prefix-p found-dir file-dir)
+                            t
+                          nil))
+                    nil)
+                'not-cached))
+          ;; File is outside the prefetched directory - cache doesn't apply
+          'not-cached))
+    'not-cached))
+
+(defun tramp-rpc-magit--state-file-exists-p (filename)
+  "Check if git state FILENAME exists using cached status data.
+Returns t, nil, or \='not-cached if not in cache.
+Only uses the cache if FILENAME is under the prefetched directory."
+  (if (and tramp-rpc-magit--status-cache
+           tramp-rpc-magit--prefetch-directory
+           (alist-get 'state_files tramp-rpc-magit--status-cache))
+      ;; Check if file is under the prefetched directory
+      (let* ((expanded (expand-file-name filename))
+             (prefetch-local (tramp-file-local-name tramp-rpc-magit--prefetch-directory))
+             (file-local (tramp-file-local-name expanded)))
+        (if (string-prefix-p prefetch-local file-local)
+            ;; File is under the prefetched directory - cache applies
+            (let* ((state-files (alist-get 'state_files tramp-rpc-magit--status-cache))
+                   ;; Extract the path relative to .git/
+                   (basename (if (string-match "/\\.git/\\(.+\\)$" file-local)
+                                 (match-string 1 file-local)
+                               (file-name-nondirectory filename))))
+              (if-let ((entry (assoc (intern basename) state-files)))
+                  (if (cdr entry) t nil)
+                'not-cached))
+          ;; File is outside the prefetched directory - cache doesn't apply
+          'not-cached))
+    'not-cached))
+
+(defun tramp-rpc-magit--advice-setup-buffer (orig-fun directory &rest args)
+  "Advice around `magit-status-setup-buffer' to prefetch data."
+  (when (and (file-remote-p directory)
+             (tramp-rpc-file-name-p directory))
+    (tramp-rpc-magit--prefetch directory))
+  (unwind-protect
+      (apply orig-fun directory args)
+    ;; Only clear status cache - ancestors/prefetch-dir stay for other packages
+    (tramp-rpc-magit--clear-status-cache)))
+
+(defun tramp-rpc-magit--advice-refresh-buffer (orig-fun &rest args)
+  "Advice around `magit-status-refresh-buffer' to prefetch data."
+  (when (and (file-remote-p default-directory)
+             (tramp-rpc-file-name-p default-directory)
+             (null tramp-rpc-magit--status-cache))
+    (tramp-rpc-magit--prefetch default-directory))
+  (unwind-protect
+      (apply orig-fun args)
+    ;; Only clear status cache - ancestors/prefetch-dir stay for other packages
+    (tramp-rpc-magit--clear-status-cache)))
+
+;;;###autoload
+(defun tramp-rpc-magit-enable ()
+  "Enable tramp-rpc magit optimizations.
+This uses server-side RPCs to dramatically speed up magit-status
+on remote repositories by fetching all data in a single call."
+  (interactive)
+  (advice-add 'magit-status-setup-buffer :around
+              #'tramp-rpc-magit--advice-setup-buffer)
+  (advice-add 'magit-status-refresh-buffer :around
+              #'tramp-rpc-magit--advice-refresh-buffer)
+  ;; Note: file-exists-p caching is handled in tramp-rpc-handle-file-exists-p
+  ;; via the TRAMP handler mechanism, no global advice needed
+  (message "tramp-rpc magit optimizations enabled"))
+
+;;;###autoload
+(defun tramp-rpc-magit-disable ()
+  "Disable tramp-rpc magit optimizations."
+  (interactive)
+  (advice-remove 'magit-status-setup-buffer
+                 #'tramp-rpc-magit--advice-setup-buffer)
+  (advice-remove 'magit-status-refresh-buffer
+                 #'tramp-rpc-magit--advice-refresh-buffer)
+  (tramp-rpc-magit--clear-cache)
+  (message "tramp-rpc magit optimizations disabled"))
+
+;;;###autoload
+(defun tramp-rpc-magit-enable-debug ()
+  "Enable debug logging for tramp-rpc magit."
+  (interactive)
+  (setq tramp-rpc-magit--debug t)
+  (message "tramp-rpc magit debug enabled"))
+
+;;;###autoload
+(defun tramp-rpc-magit-disable-debug ()
+  "Disable debug logging for tramp-rpc magit."
+  (interactive)
+  (setq tramp-rpc-magit--debug nil)
+  (message "tramp-rpc magit debug disabled"))
+
+;; Auto-enable when magit is loaded
+(with-eval-after-load 'magit
+  (tramp-rpc-magit-enable))
+
+;; ============================================================================
+;; Projectile optimizations
+;; ============================================================================
+
+(defun tramp-rpc-projectile--advice-get-ext-command (orig-fun vcs)
+  "Advice to disable fd for remote directories.
+Projectile checks if fd is available using `executable-find' which
+checks the LOCAL machine, but fd may not be available on the REMOTE.
+This forces git ls-files for remote directories."
+  (if (and (file-remote-p default-directory)
+           (tramp-rpc-file-name-p default-directory)
+           (eq vcs 'git)
+           (boundp 'projectile-git-command))
+      ;; For remote RPC directories, always use git ls-files
+      projectile-git-command
+    ;; Otherwise, use the original function
+    (funcall orig-fun vcs)))
+
+(defun tramp-rpc-projectile--advice-dir-files (orig-fun directory)
+  "Advice to use alien indexing for remote directories.
+Projectile's hybrid indexing calls `file-relative-name' for each file
+which is slow over TRAMP.  For remote directories, we use alien indexing
+directly since git ls-files already returns relative paths."
+  (if (and (file-remote-p directory)
+           (tramp-rpc-file-name-p directory))
+      ;; For remote RPC directories, use alien indexing directly
+      (projectile-dir-files-alien directory)
+    ;; Otherwise, use the original function
+    (funcall orig-fun directory)))
+
+(defun tramp-rpc-projectile--advice-project-files (orig-fun project-root)
+  "Advice to use alien indexing for remote project files.
+This bypasses the expensive `file-relative-name' calls in hybrid mode."
+  (if (and (file-remote-p project-root)
+           (tramp-rpc-file-name-p project-root))
+      ;; For remote RPC directories, use alien indexing directly
+      ;; This skips the cl-mapcan + file-relative-name overhead
+      (let ((files nil))
+        ;; Check cache first (like projectile-project-files does)
+        ;; Guard against projectile not being loaded
+        (when (and (bound-and-true-p projectile-enable-caching)
+                   (boundp 'projectile-projects-cache))
+          (setq files (gethash project-root projectile-projects-cache)))
+        ;; If not cached, fetch and cache
+        (unless files
+          (setq files (projectile-dir-files-alien project-root))
+          (when (and (bound-and-true-p projectile-enable-caching)
+                     (boundp 'projectile-projects-cache)
+                     (boundp 'projectile-projects-cache-time)
+                     (fboundp 'projectile-time-seconds))
+            (puthash project-root files projectile-projects-cache)
+            (puthash project-root (projectile-time-seconds) projectile-projects-cache-time)))
+        files)
+    ;; Otherwise, use the original function
+    (funcall orig-fun project-root)))
+
+;;;###autoload
+(defun tramp-rpc-projectile-enable ()
+  "Enable tramp-rpc projectile optimizations.
+This ensures fd is not used for remote directories where it may not
+be available, and uses alien indexing for better performance."
+  (interactive)
+  (advice-add 'projectile-get-ext-command :around
+              #'tramp-rpc-projectile--advice-get-ext-command)
+  (advice-add 'projectile-dir-files :around
+              #'tramp-rpc-projectile--advice-dir-files)
+  (advice-add 'projectile-project-files :around
+              #'tramp-rpc-projectile--advice-project-files)
+  (message "tramp-rpc projectile optimizations enabled"))
+
+;;;###autoload
+(defun tramp-rpc-projectile-disable ()
+  "Disable tramp-rpc projectile optimizations."
+  (interactive)
+  (advice-remove 'projectile-get-ext-command
+                 #'tramp-rpc-projectile--advice-get-ext-command)
+  (advice-remove 'projectile-dir-files
+                 #'tramp-rpc-projectile--advice-dir-files)
+  (advice-remove 'projectile-project-files
+                 #'tramp-rpc-projectile--advice-project-files)
+  (message "tramp-rpc projectile optimizations disabled"))
+
+;; Auto-enable when projectile is loaded
+(with-eval-after-load 'projectile
+  (tramp-rpc-projectile-enable))
+
 ;; Unload support
 ;; ============================================================================
 
@@ -3485,6 +4116,13 @@ Removes advice and cleans up async processes."
   (advice-remove 'process-exit-status #'tramp-rpc--process-exit-status-advice)
   (advice-remove 'process-command #'tramp-rpc--process-command-advice)
   (advice-remove 'vc-call-backend #'tramp-rpc--vc-call-backend-advice)
+  ;; Remove magit advice
+  (advice-remove 'magit-status-setup-buffer #'tramp-rpc-magit--advice-setup-buffer)
+  (advice-remove 'magit-status-refresh-buffer #'tramp-rpc-magit--advice-refresh-buffer)
+  ;; Remove projectile advice
+  (advice-remove 'projectile-get-ext-command #'tramp-rpc-projectile--advice-get-ext-command)
+  (advice-remove 'projectile-dir-files #'tramp-rpc-projectile--advice-dir-files)
+  (advice-remove 'projectile-project-files #'tramp-rpc-projectile--advice-project-files)
   ;; Clean up all async processes
   (tramp-rpc--cleanup-async-processes)
   ;; Clean up PTY processes

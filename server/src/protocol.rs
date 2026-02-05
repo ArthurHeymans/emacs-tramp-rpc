@@ -454,6 +454,12 @@ impl IntoValue for Vec<u8> {
     }
 }
 
+impl IntoValue for Vec<String> {
+    fn into_value(self) -> Value {
+        Value::Array(self.into_iter().map(|s| Value::String(s.into())).collect())
+    }
+}
+
 impl<T: IntoValue> IntoValue for Option<T> {
     fn into_value(self) -> Value {
         match self {
