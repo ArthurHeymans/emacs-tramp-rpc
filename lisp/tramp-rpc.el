@@ -103,6 +103,22 @@
 (defvar vterm-min-window-width)
 (defvar vterm--term)
 
+;; Silence byte-compiler warnings for variables defined later in this file
+(defvar tramp-rpc-magit--prefetch-directory)
+(defvar tramp-rpc-magit--debug)
+(defvar tramp-rpc-magit--status-cache)
+(defvar tramp-rpc-magit--ancestors-cache)
+(defvar tramp-rpc--file-exists-cache)
+(defvar tramp-rpc--file-truename-cache)
+(defvar tramp-rpc--cache-ttl)
+(defvar tramp-rpc--cache-max-size)
+
+;; Silence byte-compiler warnings for external functions
+(declare-function projectile-dir-files-alien "projectile")
+(declare-function projectile-time-seconds "projectile")
+(declare-function magit-status-setup-buffer "magit-status")
+(declare-function magit-get-mode-buffer "magit-mode")
+
 (defgroup tramp-rpc nil
   "TRAMP backend using RPC."
   :group 'tramp)
@@ -3186,10 +3202,10 @@ Returns the final (width . height) cons, or nil if resize was not handled."
                   (funcall display-updater width height))
                 (cons width height)))))))))
 
-(defun tramp-rpc--vterm-window-adjust-process-window-size-advice (orig-fun process windows)
-  "Advice for vterm's window adjust function to handle TRAMP-RPC PTY processes.
+(defun tramp-rpc--vterm-window-size-advice (orig-fun process windows)
+  "Advice for vterm's window adjust function for TRAMP-RPC PTY processes.
 For tramp-rpc processes, resize the remote PTY and update vterm's display.
-For direct SSH PTY processes, let the original function handle it (SSH handles resize)."
+For direct SSH PTY, let the original function handle it (SSH handles resize)."
   (cond
    ;; Direct SSH PTY - let original function handle it
    ;; SSH client handles PTY resize automatically via SSH protocol
@@ -3215,10 +3231,10 @@ For direct SSH PTY processes, let the original function handle it (SSH handles r
    ;; Not our process, call original
    (t (funcall orig-fun process windows))))
 
-(defun tramp-rpc--eat-adjust-process-window-size-advice (orig-fun process windows)
-  "Advice for eat's window adjust function to handle TRAMP-RPC PTY processes.
+(defun tramp-rpc--eat-window-size-advice (orig-fun process windows)
+  "Advice for eat's window adjust function for TRAMP-RPC PTY processes.
 For tramp-rpc processes, resize the remote PTY and update eat's display.
-For direct SSH PTY processes, let the original function handle it (SSH handles resize)."
+For direct SSH PTY, let the original function handle it (SSH handles resize)."
   (cond
    ;; Direct SSH PTY - let original function handle it
    ;; SSH client handles PTY resize automatically via SSH protocol
@@ -3443,12 +3459,12 @@ For direct SSH PTY processes, use the original function (returns local PTY)."
 ;; Advice vterm's window resize function for tramp-rpc PTY support
 (with-eval-after-load 'vterm
   (advice-add 'vterm--window-adjust-process-window-size :around
-              #'tramp-rpc--vterm-window-adjust-process-window-size-advice))
+              #'tramp-rpc--vterm-window-size-advice))
 
 ;; Advice eat's window resize function for tramp-rpc PTY support
 (with-eval-after-load 'eat
   (advice-add 'eat--adjust-process-window-size :around
-              #'tramp-rpc--eat-adjust-process-window-size-advice))
+              #'tramp-rpc--eat-window-size-advice))
 
 ;; ============================================================================
 ;; Eglot integration
@@ -3684,7 +3700,7 @@ Returns an alist of (path . exists-p)."
   "Get file attributes for multiple PATHS in DIRECTORY in a single RPC call.
 PATHS should be local paths (without the remote prefix).
 ID-FORMAT specifies whether to use numeric or string IDs (default: integer).
-Returns an alist of (path . attributes) where attributes is in file-attributes format."
+Returns an alist of (path . attributes) in file-attributes format."
   (with-parsed-tramp-file-name directory nil
     (let* ((requests
             (mapcar (lambda (path)
@@ -3709,7 +3725,7 @@ Returns an alist of (path . attributes) where attributes is in file-attributes f
 
 (defvar tramp-rpc-magit--status-cache nil
   "Cached magit status data from server-side RPC.
-This is populated by `tramp-rpc-magit--prefetch' and used by process-file advice.")
+Populated by `tramp-rpc-magit--prefetch', used by process-file advice.")
 
 (defvar tramp-rpc-magit--ancestors-cache nil
   "Cached ancestor scan data from server-side RPC.
@@ -3784,19 +3800,19 @@ runs all git commands locally and returns the results in one response."
         (when result
           ;; Decode string fields
           (dolist (key '(toplevel gitdir state))
-            (when-let ((val (alist-get key result)))
+            (when-let* ((val (alist-get key result)))
               (when (stringp val)
                 (setf (alist-get key result) (decode-coding-string val 'utf-8)))))
           ;; Decode nested head info
-          (when-let ((head (alist-get 'head result)))
+          (when-let* ((head (alist-get 'head result)))
             (dolist (key '(hash short branch message))
-              (when-let ((val (alist-get key head)))
+              (when-let* ((val (alist-get key head)))
                 (when (stringp val)
                   (setf (alist-get key head) (decode-coding-string val 'utf-8))))))
           ;; Decode diff content
           (dolist (section '(staged unstaged))
-            (when-let ((data (alist-get section result)))
-              (when-let ((diff (alist-get 'diff data)))
+            (when-let* ((data (alist-get section result)))
+              (when-let* ((diff (alist-get 'diff data)))
                 (when (stringp diff)
                   (setf (alist-get 'diff data) (decode-coding-string diff 'utf-8))))))
           result)))))
@@ -3832,7 +3848,7 @@ the server scans the entire tree in one operation."
 
 (defun tramp-rpc-magit--prefetch (directory)
   "Prefetch magit status and ancestor data for DIRECTORY.
-Populates `tramp-rpc-magit--status-cache' and `tramp-rpc-magit--ancestors-cache'."
+Populates `tramp-rpc-magit--status-cache' and ancestors cache."
   (when (and (file-remote-p directory)
              (tramp-rpc-file-name-p directory))
     ;; Remember the directory we prefetched for
@@ -3912,7 +3928,7 @@ Only uses the cache if FILENAME is under the prefetched directory."
             ;; File is under the prefetched directory - cache applies
             (let ((basename (file-name-nondirectory filename)))
               ;; Check if this is one of the markers we scanned for
-              (if-let ((entry (assoc basename tramp-rpc-magit--ancestors-cache)))
+              (if-let* ((entry (assoc basename tramp-rpc-magit--ancestors-cache)))
                   (if (cdr entry)
                       ;; Marker was found - check if at right location
                       (let ((found-dir (cdr entry))
@@ -3944,7 +3960,7 @@ Only uses the cache if FILENAME is under the prefetched directory."
                    (basename (if (string-match "/\\.git/\\(.+\\)$" file-local)
                                  (match-string 1 file-local)
                                (file-name-nondirectory filename))))
-              (if-let ((entry (assoc (intern basename) state-files)))
+              (if-let* ((entry (assoc (intern basename) state-files)))
                   (if (cdr entry) t nil)
                 'not-cached))
           ;; File is outside the prefetched directory - cache doesn't apply
