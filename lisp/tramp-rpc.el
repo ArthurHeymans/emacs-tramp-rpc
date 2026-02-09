@@ -3950,10 +3950,15 @@ Keys are \"connection-key:path\" strings, values are t.")
 (defvar tramp-rpc--watch-debug nil
   "When non-nil, log filesystem watch events.")
 
+(defun tramp-rpc--connection-key-string (vec)
+  "Return a string representation of VEC's connection key for use in hash keys."
+  (let ((key (tramp-rpc--connection-key vec)))
+    (format "%s" key)))
+
 (defun tramp-rpc--directory-watched-p (localname vec)
   "Return non-nil if LOCALNAME (or a parent) is being watched for VEC.
 Checks if any watched directory is a prefix of LOCALNAME."
-  (let ((conn-key (tramp-rpc--connection-key vec))
+  (let ((conn-key (tramp-rpc--connection-key-string vec))
         (found nil))
     (maphash (lambda (key _val)
                (when (string-match (format "^%s:\\(.+\\)$" (regexp-quote conn-key)) key)
@@ -4009,7 +4014,7 @@ This uses inotify (Linux) or kqueue (macOS) on the remote server."
                                       `((path . ,localname)
                                         (recursive . ,(if recursive t :json-false))))))
         (when result
-          (let ((key (format "%s:%s" (tramp-rpc--connection-key v) localname)))
+          (let ((key (format "%s:%s" (tramp-rpc--connection-key-string v) localname)))
             (puthash key t tramp-rpc--watched-directories))
           (when (or tramp-rpc--watch-debug (called-interactively-p 'any))
             (message "tramp-rpc: watching %s%s"
@@ -4026,7 +4031,7 @@ This uses inotify (Linux) or kqueue (macOS) on the remote server."
       (let ((result (tramp-rpc--call v "watch.remove"
                                      `((path . ,localname)))))
         (when result
-          (let ((key (format "%s:%s" (tramp-rpc--connection-key v) localname)))
+          (let ((key (format "%s:%s" (tramp-rpc--connection-key-string v) localname)))
             (remhash key tramp-rpc--watched-directories))
           (when (or tramp-rpc--watch-debug (called-interactively-p 'any))
             (message "tramp-rpc: unwatched %s" localname)))))))
@@ -4053,7 +4058,7 @@ This uses inotify (Linux) or kqueue (macOS) on the remote server."
 DIRECTORY is the TRAMP directory. STATUS-DATA is the magit.status result."
   (when-let* ((toplevel (alist-get 'toplevel status-data)))
     (with-parsed-tramp-file-name directory nil
-      (let ((key (format "%s:%s" (tramp-rpc--connection-key v) toplevel)))
+      (let ((key (format "%s:%s" (tramp-rpc--connection-key-string v) toplevel)))
         (unless (gethash key tramp-rpc--watched-directories)
           ;; Not yet watching this worktree - start watching
           (condition-case err

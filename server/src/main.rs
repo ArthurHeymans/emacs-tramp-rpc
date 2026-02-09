@@ -30,14 +30,11 @@ async fn main() {
 
     // Initialize the filesystem watcher for cache invalidation notifications.
     // If this fails (e.g. inotify not available), we continue without watching.
-    match watcher::WatchManager::new(Arc::clone(&stdout)) {
-        Ok(manager) => {
-            watcher::init(manager);
-            eprintln!("Filesystem watcher initialized");
-        }
-        Err(e) => {
-            eprintln!("Warning: Failed to initialize filesystem watcher: {}", e);
-        }
+    // NOTE: Do NOT use eprintln! here or anywhere in the server -- SSH forwards
+    // the remote process's stderr over the same pipe to Emacs, where it gets
+    // mixed with the binary msgpack protocol on stdout and corrupts framing.
+    if let Ok(manager) = watcher::WatchManager::new(Arc::clone(&stdout)) {
+        watcher::init(manager);
     }
 
     let mut tasks: JoinSet<()> = JoinSet::new();
@@ -53,8 +50,8 @@ async fn main() {
 
         // Sanity check - reject obviously invalid lengths
         if len > 100 * 1024 * 1024 {
-            // 100MB max message size
-            eprintln!("Message too large: {} bytes", len);
+            // 100MB max message size - silently skip
+            // (cannot use eprintln! as SSH merges stderr with stdout)
             continue;
         }
 

@@ -209,9 +209,9 @@ async fn debounce_loop(mut rx: mpsc::UnboundedReceiver<Event>, writer: WriterHan
 
         // Phase 3: Send notification with all collected paths
         if !pending_paths.is_empty() {
-            if let Err(e) = send_notification(&writer, &pending_paths).await {
-                eprintln!("Failed to send fs.changed notification: {}", e);
-                // Stdout is broken (Emacs disconnected), stop the loop
+            if send_notification(&writer, &pending_paths).await.is_err() {
+                // Stdout is broken (Emacs disconnected), stop the loop.
+                // Cannot use eprintln! as SSH merges stderr with stdout.
                 break;
             }
         }
