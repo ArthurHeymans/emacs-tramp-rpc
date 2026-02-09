@@ -195,6 +195,21 @@ Set to t to enable debugging for hang diagnosis."
   :type 'boolean
   :group 'tramp-rpc)
 
+(defcustom tramp-rpc-use-async-read t
+  "When non-nil, use async read loops for remote processes.
+This enables long-polling reads on the server side, providing faster
+output delivery for LSP servers and other chatty processes."
+  :type 'boolean
+  :group 'tramp-rpc)
+
+(defcustom tramp-rpc-async-read-timeout-ms 5000
+  "Timeout in milliseconds for async read requests on the server.
+The server will block up to this duration waiting for process output
+before returning an empty response. Higher values reduce polling overhead
+but increase latency for detecting process exit."
+  :type 'integer
+  :group 'tramp-rpc)
+
 (defcustom tramp-rpc-use-direct-ssh-pty t
   "When non-nil, use direct SSH for PTY processes instead of RPC.
 This provides much lower latency for interactive terminal use (vterm, shell)
