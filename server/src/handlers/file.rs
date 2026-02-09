@@ -283,52 +283,76 @@ fn get_file_type(metadata: &std::fs::Metadata) -> FileType {
 static USER_NAMES: std::sync::LazyLock<Mutex<HashMap<u32, String>>> =
     std::sync::LazyLock::new(|| Mutex::new(HashMap::new()));
 
-/// Get user name from uid
-fn get_user_name(uid: u32) -> Option<String> {
-    let mut cache = USER_NAMES.lock().unwrap();
+/// Get user name from uid using thread-safe getpwuid_r
+pub fn get_user_name(uid: u32) -> Option<String> {
+    let mut cache = USER_NAMES.lock().unwrap_or_else(|e| e.into_inner());
 
     if let Some(result) = cache.get(&uid) {
         Some(result.clone())
     } else {
-        unsafe {
-            let passwd = libc::getpwuid(uid);
-            if passwd.is_null() {
-                return None;
-            }
-            let name = std::ffi::CStr::from_ptr((*passwd).pw_name);
+        // Use getpwuid_r (reentrant) instead of getpwuid for thread safety
+        let mut buf = vec![0u8; 1024];
+        let mut pwd: libc::passwd = unsafe { std::mem::zeroed() };
+        let mut result_ptr: *mut libc::passwd = std::ptr::null_mut();
 
-            name.to_str().ok().map(|s| {
-                let result = s.to_string();
-                cache.insert(uid, result.clone());
-                result
-            })
+        let ret = unsafe {
+            libc::getpwuid_r(
+                uid,
+                &mut pwd,
+                buf.as_mut_ptr() as *mut libc::c_char,
+                buf.len(),
+                &mut result_ptr,
+            )
+        };
+
+        if ret != 0 || result_ptr.is_null() {
+            return None;
         }
+
+        let name = unsafe { std::ffi::CStr::from_ptr(pwd.pw_name) };
+        name.to_str().ok().map(|s| {
+            let result = s.to_string();
+            cache.insert(uid, result.clone());
+            result
+        })
     }
 }
 
 static GROUP_NAMES: std::sync::LazyLock<Mutex<HashMap<u32, String>>> =
     std::sync::LazyLock::new(|| Mutex::new(HashMap::new()));
 
-/// Get group name from gid
-fn get_group_name(gid: u32) -> Option<String> {
-    let mut cache = GROUP_NAMES.lock().unwrap();
+/// Get group name from gid using thread-safe getgrgid_r
+pub fn get_group_name(gid: u32) -> Option<String> {
+    let mut cache = GROUP_NAMES.lock().unwrap_or_else(|e| e.into_inner());
 
     if let Some(result) = cache.get(&gid) {
         Some(result.clone())
     } else {
-        unsafe {
-            let group = libc::getgrgid(gid);
-            if group.is_null() {
-                return None;
-            }
-            let name = std::ffi::CStr::from_ptr((*group).gr_name);
+        // Use getgrgid_r (reentrant) instead of getgrgid for thread safety
+        let mut buf = vec![0u8; 1024];
+        let mut grp: libc::group = unsafe { std::mem::zeroed() };
+        let mut result_ptr: *mut libc::group = std::ptr::null_mut();
 
-            name.to_str().ok().map(|s| {
-                let result = s.to_string();
-                cache.insert(gid, result.clone());
-                result
-            })
+        let ret = unsafe {
+            libc::getgrgid_r(
+                gid,
+                &mut grp,
+                buf.as_mut_ptr() as *mut libc::c_char,
+                buf.len(),
+                &mut result_ptr,
+            )
+        };
+
+        if ret != 0 || result_ptr.is_null() {
+            return None;
         }
+
+        let name = unsafe { std::ffi::CStr::from_ptr(grp.gr_name) };
+        name.to_str().ok().map(|s| {
+            let result = s.to_string();
+            cache.insert(gid, result.clone());
+            result
+        })
     }
 }
 
@@ -351,26 +375,4 @@ pub fn bytes_to_path(bytes: &[u8]) -> PathBuf {
     PathBuf::from(OsStr::from_bytes(bytes))
 }
 
-/// Custom deserializer that accepts either a string or binary for paths
-mod path_or_bytes {
-    use serde::{self, Deserialize, Deserializer};
-
-    pub fn deserialize<'de, D>(deserializer: D) -> Result<Vec<u8>, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        // Try to deserialize as either string or bytes
-        #[derive(Deserialize)]
-        #[serde(untagged)]
-        enum StringOrBytes {
-            String(String),
-            #[serde(with = "serde_bytes")]
-            Bytes(Vec<u8>),
-        }
-
-        match StringOrBytes::deserialize(deserializer)? {
-            StringOrBytes::String(s) => Ok(s.into_bytes()),
-            StringOrBytes::Bytes(b) => Ok(b),
-        }
-    }
-}
+use crate::protocol::path_or_bytes;
