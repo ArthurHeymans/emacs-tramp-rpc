@@ -381,6 +381,20 @@ Results are cached per connection."
   "Remove the RPC connection for VEC."
   (remhash (tramp-rpc--connection-key vec) tramp-rpc--connections))
 
+(defun tramp-rpc--get-system-info (vec)
+  "Return cached system.info for VEC.
+The result is cached at connection time and reused for all subsequent
+calls to avoid redundant RPC round-trips for get-home-directory,
+get-remote-uid, and get-remote-gid."
+  (let ((conn (tramp-rpc--get-connection vec)))
+    (or (and conn (plist-get conn :system-info))
+        ;; Fallback: call the server if cache miss (shouldn't happen
+        ;; normally since we cache at connection time)
+        (let ((result (tramp-rpc--call vec "system.info" nil)))
+          (when (and result conn)
+            (plist-put conn :system-info result))
+          result))))
+
 (defun tramp-rpc--ensure-connection (vec)
   "Ensure we have an active RPC connection to VEC.
 Returns the connection plist."
@@ -574,11 +588,16 @@ Returns non-nil on success."
     ;; Store connection
     (tramp-rpc--set-connection vec process buffer)
 
-    ;; Wait for server to be ready by sending a ping
+    ;; Wait for server to be ready by sending a ping, and cache system.info
     (let ((response (tramp-rpc--call vec "system.info" nil)))
       (unless response
         (tramp-rpc--remove-connection vec)
-        (error "Failed to connect to RPC server on %s" host)))
+        (error "Failed to connect to RPC server on %s" host))
+      ;; Cache system.info in the connection plist (avoids repeated calls
+      ;; for get-home-directory, get-remote-uid, get-remote-gid)
+      (let ((conn (tramp-rpc--get-connection vec)))
+        (when conn
+          (plist-put conn :system-info response))))
 
     ;; Mark as connected for TRAMP's connectivity checks (used by projectile, etc.)
     (tramp-set-connection-property process "connected" t)
@@ -1277,9 +1296,15 @@ Results are cached to avoid repeated RPC calls."
            filename))))))
 
 (defun tramp-rpc-handle-file-attributes (filename &optional id-format)
-  "Like `file-attributes' for TRAMP-RPC files."
+  "Like `file-attributes' for TRAMP-RPC files.
+Also populates the file-exists cache as a side effect — if file.stat
+succeeds, the file obviously exists."
   (with-parsed-tramp-file-name filename nil
     (let ((result (tramp-rpc--call-file-stat v localname t)))  ; lstat=t
+      ;; Populate file-exists cache as a side effect
+      (tramp-rpc--cache-put tramp-rpc--file-exists-cache
+                            (expand-file-name filename)
+                            (if result t nil))
       (when result
         (tramp-rpc--convert-file-attributes result id-format)))))
 
@@ -1363,17 +1388,29 @@ TYPE is the file type string."
                                `((mtime . ,mtime)))))))
 
 (defun tramp-rpc-handle-file-newer-than-file-p (file1 file2)
-  "Like `file-newer-than-file-p' for TRAMP-RPC files."
-  (cond
-   ((not (file-exists-p file1)) nil)
-   ((not (file-exists-p file2)) t)
-   (t
-    ;; Both files exist, compare mtimes
-    (let ((mtime1 (float-time (file-attribute-modification-time
-                               (file-attributes file1))))
-          (mtime2 (float-time (file-attribute-modification-time
-                               (file-attributes file2)))))
-      (> mtime1 mtime2)))))
+  "Like `file-newer-than-file-p' for TRAMP-RPC files.
+When both files are on the same remote host, uses the dedicated
+`file.newer_than' RPC method for a single round-trip instead of
+up to 4 separate calls (2x file-exists-p + 2x file-attributes)."
+  (let ((remote1 (file-remote-p file1))
+        (remote2 (file-remote-p file2)))
+    (if (and remote1 remote2 (string= remote1 remote2))
+        ;; Both files on same remote - use single RPC call
+        (with-parsed-tramp-file-name file1 f1
+          (with-parsed-tramp-file-name file2 f2
+            (tramp-rpc--call f1 "file.newer_than"
+                             `((file1 . ,f1-localname)
+                               (file2 . ,f2-localname)))))
+      ;; Mixed local/remote or different remotes - fall back to generic
+      (cond
+       ((not (file-exists-p file1)) nil)
+       ((not (file-exists-p file2)) t)
+       (t
+        (let ((mtime1 (float-time (file-attribute-modification-time
+                                   (file-attributes file1))))
+              (mtime2 (float-time (file-attribute-modification-time
+                                   (file-attributes file2)))))
+          (> mtime1 mtime2)))))))
 
 ;; ============================================================================
 ;; Directory operations
@@ -2203,8 +2240,8 @@ home directory from system.info.  For other users, looks up via getent."
     (if (or (null target-user)
             (string-empty-p target-user)
             (equal target-user conn-user))
-        ;; Current user - use system.info
-        (let ((result (tramp-rpc--call vec "system.info" nil)))
+        ;; Current user - use cached system.info
+        (let ((result (tramp-rpc--get-system-info vec)))
           (tramp-rpc--decode-string (alist-get 'home result)))
       ;; Different user - look up via getent passwd
       (condition-case nil
@@ -2224,17 +2261,19 @@ home directory from system.info.  For other users, looks up via getent."
         (error nil)))))
 
 (defun tramp-rpc-handle-get-remote-uid (vec id-format)
-  "Return remote UID using RPC."
-  (let ((result (tramp-rpc--call vec "system.info" nil)))
-    (let ((uid (alist-get 'uid result)))
+  "Return remote UID using cached system.info."
+  (let* ((result (tramp-rpc--get-system-info vec))
+         (uid (alist-get 'uid result)))
+    (when uid
       (if (eq id-format 'integer)
           uid
         (number-to-string uid)))))
 
 (defun tramp-rpc-handle-get-remote-gid (vec id-format)
-  "Return remote GID using RPC."
-  (let ((result (tramp-rpc--call vec "system.info" nil)))
-    (let ((gid (alist-get 'gid result)))
+  "Return remote GID using cached system.info."
+  (let* ((result (tramp-rpc--get-system-info vec))
+         (gid (alist-get 'gid result)))
+    (when gid
       (if (eq id-format 'integer)
           gid
         (number-to-string gid)))))

@@ -13,28 +13,7 @@ use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 use super::file::{bytes_to_path, map_io_error};
 use super::HandlerResult;
 
-/// Custom deserializer that accepts either a string or binary for paths
-mod path_or_bytes {
-    use serde::{self, Deserialize, Deserializer};
-
-    pub fn deserialize<'de, D>(deserializer: D) -> Result<Vec<u8>, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        #[derive(Deserialize)]
-        #[serde(untagged)]
-        enum StringOrBytes {
-            String(String),
-            #[serde(with = "serde_bytes")]
-            Bytes(Vec<u8>),
-        }
-
-        match StringOrBytes::deserialize(deserializer)? {
-            StringOrBytes::String(s) => Ok(s.into_bytes()),
-            StringOrBytes::Bytes(b) => Ok(b),
-        }
-    }
-}
+use crate::protocol::path_or_bytes;
 
 /// Read file contents
 pub async fn read(params: &Value) -> HandlerResult {

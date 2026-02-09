@@ -284,7 +284,7 @@ static USER_NAMES: std::sync::LazyLock<Mutex<HashMap<u32, String>>> =
     std::sync::LazyLock::new(|| Mutex::new(HashMap::new()));
 
 /// Get user name from uid
-fn get_user_name(uid: u32) -> Option<String> {
+pub fn get_user_name(uid: u32) -> Option<String> {
     let mut cache = USER_NAMES.lock().unwrap();
 
     if let Some(result) = cache.get(&uid) {
@@ -310,7 +310,7 @@ static GROUP_NAMES: std::sync::LazyLock<Mutex<HashMap<u32, String>>> =
     std::sync::LazyLock::new(|| Mutex::new(HashMap::new()));
 
 /// Get group name from gid
-fn get_group_name(gid: u32) -> Option<String> {
+pub fn get_group_name(gid: u32) -> Option<String> {
     let mut cache = GROUP_NAMES.lock().unwrap();
 
     if let Some(result) = cache.get(&gid) {
@@ -351,26 +351,4 @@ pub fn bytes_to_path(bytes: &[u8]) -> PathBuf {
     PathBuf::from(OsStr::from_bytes(bytes))
 }
 
-/// Custom deserializer that accepts either a string or binary for paths
-mod path_or_bytes {
-    use serde::{self, Deserialize, Deserializer};
-
-    pub fn deserialize<'de, D>(deserializer: D) -> Result<Vec<u8>, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        // Try to deserialize as either string or bytes
-        #[derive(Deserialize)]
-        #[serde(untagged)]
-        enum StringOrBytes {
-            String(String),
-            #[serde(with = "serde_bytes")]
-            Bytes(Vec<u8>),
-        }
-
-        match StringOrBytes::deserialize(deserializer)? {
-            StringOrBytes::String(s) => Ok(s.into_bytes()),
-            StringOrBytes::Bytes(b) => Ok(b),
-        }
-    }
-}
+use crate::protocol::path_or_bytes;

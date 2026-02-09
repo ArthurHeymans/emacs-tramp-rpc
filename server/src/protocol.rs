@@ -484,3 +484,27 @@ pub fn to_value<T: Serialize>(value: &T) -> Result<Value, rmpv::ext::Error> {
 pub fn from_value<T: for<'de> Deserialize<'de>>(value: Value) -> Result<T, rmpv::ext::Error> {
     rmpv::ext::from_value(value)
 }
+
+/// Custom deserializer that accepts either a string or binary for paths.
+/// Use with `#[serde(with = "crate::protocol::path_or_bytes")]` on Vec<u8> fields.
+pub mod path_or_bytes {
+    use serde::{self, Deserialize, Deserializer};
+
+    pub fn deserialize<'de, D>(deserializer: D) -> Result<Vec<u8>, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum StringOrBytes {
+            String(String),
+            #[serde(with = "serde_bytes")]
+            Bytes(Vec<u8>),
+        }
+
+        match StringOrBytes::deserialize(deserializer)? {
+            StringOrBytes::String(s) => Ok(s.into_bytes()),
+            StringOrBytes::Bytes(b) => Ok(b),
+        }
+    }
+}

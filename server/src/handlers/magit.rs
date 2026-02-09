@@ -2,6 +2,8 @@
 //!
 //! This module provides a single RPC call that returns all data needed
 //! for magit-status, eliminating the need for dozens of individual git calls.
+//!
+//! Optimized to run independent git commands in parallel using thread::scope.
 
 use crate::msgpack_map;
 use crate::protocol::{from_value, IntoValue, RpcError};
@@ -10,6 +12,7 @@ use serde::Deserialize;
 use std::collections::HashMap;
 use std::path::Path;
 use std::process::Command;
+use std::thread;
 
 use super::HandlerResult;
 
@@ -17,6 +20,7 @@ use super::HandlerResult;
 ///
 /// This replaces ~60 individual git commands with one RPC call.
 /// Returns all data needed to render a magit-status buffer.
+/// Independent git commands are run in parallel for lower latency.
 pub async fn status(params: &Value) -> HandlerResult {
     #[derive(Deserialize)]
     struct Params {
@@ -41,171 +45,235 @@ pub async fn status(params: &Value) -> HandlerResult {
 }
 
 /// Collect all magit status data synchronously (runs in blocking task)
+/// Uses thread::scope to run independent git commands in parallel.
 fn collect_magit_status(directory: &str) -> HandlerResult {
-    let mut result: Vec<(Value, Value)> = Vec::new();
-
-    // Basic repo info
+    // Phase 1: Get basic repo info first (needed by later phases)
     let toplevel = git_string(directory, &["rev-parse", "--show-toplevel"]);
     let gitdir = git_string(directory, &["rev-parse", "--git-dir"]);
 
-    result.push(("toplevel".into_value(), toplevel.into_value()));
-    result.push(("gitdir".into_value(), gitdir.clone().into_value()));
+    // Phase 2: Run all independent git commands in parallel
+    thread::scope(|s| {
+        // HEAD info - 4 independent commands
+        let head_hash_h = s.spawn(|| git_string(directory, &["rev-parse", "HEAD"]));
+        let head_short_h = s.spawn(|| git_string(directory, &["rev-parse", "--short", "HEAD"]));
+        let head_branch_h =
+            s.spawn(|| git_string(directory, &["symbolic-ref", "--short", "HEAD"]));
+        let head_message_h =
+            s.spawn(|| git_string(directory, &["log", "-1", "--format=%s", "HEAD"]));
 
-    // HEAD info
-    let head_hash = git_string(directory, &["rev-parse", "HEAD"]);
-    let head_short = git_string(directory, &["rev-parse", "--short", "HEAD"]);
-    let head_branch = git_string(directory, &["symbolic-ref", "--short", "HEAD"]);
-    let head_message = git_string(directory, &["log", "-1", "--format=%s", "HEAD"]);
+        // Upstream info
+        let upstream_branch_h =
+            s.spawn(|| git_string(directory, &["rev-parse", "--abbrev-ref", "@{upstream}"]));
 
-    result.push((
-        "head".into_value(),
-        msgpack_map! {
-            "hash" => head_hash.into_value(),
-            "short" => head_short.into_value(),
-            "branch" => head_branch.into_value(),
-            "message" => head_message.into_value()
-        },
-    ));
+        // Push remote info
+        let push_branch_h =
+            s.spawn(|| git_string(directory, &["rev-parse", "--abbrev-ref", "@{push}"]));
 
-    // Upstream info
-    let upstream_branch = git_string(directory, &["rev-parse", "--abbrev-ref", "@{upstream}"]);
-    let (upstream_ahead, upstream_behind) = if upstream_branch.is_some() {
-        parse_ahead_behind(git_string(
-            directory,
-            &["rev-list", "--count", "--left-right", "@{upstream}...HEAD"],
-        ))
-    } else {
-        (None, None)
-    };
+        // Staged changes (2 commands)
+        let staged_diff_h =
+            s.spawn(|| git_output(directory, &["diff", "--cached", "--no-color"]));
+        let staged_stat_h = s.spawn(|| {
+            git_string(directory, &["diff", "--cached", "--stat", "--no-color"])
+        });
 
-    result.push((
-        "upstream".into_value(),
-        msgpack_map! {
-            "branch" => upstream_branch.into_value(),
-            "ahead" => upstream_ahead.into_value(),
-            "behind" => upstream_behind.into_value()
-        },
-    ));
+        // Unstaged changes (2 commands)
+        let unstaged_diff_h = s.spawn(|| git_output(directory, &["diff", "--no-color"]));
+        let unstaged_stat_h =
+            s.spawn(|| git_string(directory, &["diff", "--stat", "--no-color"]));
 
-    // Push remote info
-    let push_branch = git_string(directory, &["rev-parse", "--abbrev-ref", "@{push}"]);
-    let (push_ahead, push_behind) = if push_branch.is_some() {
-        parse_ahead_behind(git_string(
-            directory,
-            &["rev-list", "--count", "--left-right", "@{push}...HEAD"],
-        ))
-    } else {
-        (None, None)
-    };
+        // Untracked files
+        let untracked_h = s.spawn(|| {
+            git_lines(
+                directory,
+                &[
+                    "ls-files",
+                    "--others",
+                    "--exclude-standard",
+                    "--directory",
+                    "--no-empty-directory",
+                ],
+            )
+        });
 
-    result.push((
-        "push".into_value(),
-        msgpack_map! {
-            "branch" => push_branch.into_value(),
-            "ahead" => push_ahead.into_value(),
-            "behind" => push_behind.into_value()
-        },
-    ));
+        // Stashes
+        let stashes_h =
+            s.spawn(|| git_lines(directory, &["stash", "list", "--format=%gd\t%gs"]));
 
-    // Repository state (merge, rebase, cherry-pick, etc.)
-    let state = detect_repo_state(directory, gitdir.as_deref());
-    result.push(("state".into_value(), state));
+        // Recent commits
+        let recent_h =
+            s.spawn(|| git_lines(directory, &["log", "-20", "--format=%H\t%s", "HEAD"]));
 
-    // Staged changes (git diff --cached)
-    let staged_diff = git_output(directory, &["diff", "--cached", "--no-color"]);
-    let staged_stat = git_string(directory, &["diff", "--cached", "--stat", "--no-color"]);
-    result.push((
-        "staged".into_value(),
-        msgpack_map! {
-            "diff" => staged_diff.into_value(),
-            "stat" => staged_stat.into_value()
-        },
-    ));
+        // Tags (2 commands)
+        let tag_at_head_h = s.spawn(|| {
+            git_string(
+                directory,
+                &["describe", "--tags", "--exact-match", "HEAD"],
+            )
+        });
+        let tag_contains_h =
+            s.spawn(|| git_string(directory, &["describe", "--tags", "--abbrev=0"]));
 
-    // Unstaged changes (git diff)
-    let unstaged_diff = git_output(directory, &["diff", "--no-color"]);
-    let unstaged_stat = git_string(directory, &["diff", "--stat", "--no-color"]);
-    result.push((
-        "unstaged".into_value(),
-        msgpack_map! {
-            "diff" => unstaged_diff.into_value(),
-            "stat" => unstaged_stat.into_value()
-        },
-    ));
+        // Remotes
+        let remotes_h = s.spawn(|| git_lines(directory, &["remote"]));
 
-    // Untracked files
-    let untracked = git_lines(
-        directory,
-        &[
-            "ls-files",
-            "--others",
-            "--exclude-standard",
-            "--directory",
-            "--no-empty-directory",
-        ],
-    );
-    result.push(("untracked".into_value(), untracked.into_value()));
+        // Config
+        let config_h = s.spawn(|| collect_git_config(directory));
 
-    // Stashes
-    let stashes = git_lines(directory, &["stash", "list", "--format=%gd\t%gs"]);
-    let stash_list: Vec<Value> = stashes
-        .iter()
-        .filter_map(|line| {
-            let parts: Vec<&str> = line.splitn(2, '\t').collect();
-            if parts.len() == 2 {
-                Some(msgpack_map! {
-                    "ref" => parts[0].to_string().into_value(),
-                    "message" => parts[1].to_string().into_value()
-                })
-            } else {
-                None
-            }
-        })
-        .collect();
-    result.push(("stashes".into_value(), Value::Array(stash_list)));
+        // State files (filesystem only, no git commands)
+        let gitdir_clone = gitdir.clone();
+        let dir_clone = directory.to_string();
+        let state_files_h =
+            s.spawn(move || collect_state_files(&dir_clone, gitdir_clone.as_deref()));
 
-    // Recent commits (for unpushed section)
-    let recent = git_lines(directory, &["log", "-20", "--format=%H\t%s", "HEAD"]);
-    let recent_commits: Vec<Value> = recent
-        .iter()
-        .filter_map(|line| {
-            let parts: Vec<&str> = line.splitn(2, '\t').collect();
-            if parts.len() == 2 {
-                Some(msgpack_map! {
-                    "hash" => parts[0].to_string().into_value(),
-                    "message" => parts[1].to_string().into_value()
-                })
-            } else {
-                None
-            }
-        })
-        .collect();
-    result.push(("recent_commits".into_value(), Value::Array(recent_commits)));
+        // Repo state detection
+        let gitdir_clone2 = gitdir.clone();
+        let dir_clone2 = directory.to_string();
+        let state_h =
+            s.spawn(move || detect_repo_state(&dir_clone2, gitdir_clone2.as_deref()));
 
-    // Tags
-    let tag_at_head = git_string(directory, &["describe", "--tags", "--exact-match", "HEAD"]);
-    let tag_contains = git_string(directory, &["describe", "--tags", "--abbrev=0"]);
-    result.push((
-        "tags".into_value(),
-        msgpack_map! {
-            "at_head" => tag_at_head.into_value(),
-            "latest" => tag_contains.into_value()
-        },
-    ));
+        // ---- Collect all results ----
+        let head_hash = head_hash_h.join().unwrap();
+        let head_short = head_short_h.join().unwrap();
+        let head_branch = head_branch_h.join().unwrap();
+        let head_message = head_message_h.join().unwrap();
+        let upstream_branch = upstream_branch_h.join().unwrap();
+        let push_branch = push_branch_h.join().unwrap();
+        let staged_diff = staged_diff_h.join().unwrap();
+        let staged_stat = staged_stat_h.join().unwrap();
+        let unstaged_diff = unstaged_diff_h.join().unwrap();
+        let unstaged_stat = unstaged_stat_h.join().unwrap();
+        let untracked = untracked_h.join().unwrap();
+        let stashes = stashes_h.join().unwrap();
+        let recent = recent_h.join().unwrap();
+        let tag_at_head = tag_at_head_h.join().unwrap();
+        let tag_contains = tag_contains_h.join().unwrap();
+        let remotes = remotes_h.join().unwrap();
+        let config = config_h.join().unwrap();
+        let state_files = state_files_h.join().unwrap();
+        let state = state_h.join().unwrap();
 
-    // Remotes
-    let remotes = git_lines(directory, &["remote"]);
-    result.push(("remotes".into_value(), remotes.into_value()));
+        // Phase 3: Dependent operations (need upstream/push branch results)
+        // These are quick since they're just rev-list counts
+        let (upstream_ahead, upstream_behind) = if upstream_branch.is_some() {
+            parse_ahead_behind(git_string(
+                directory,
+                &["rev-list", "--count", "--left-right", "@{upstream}...HEAD"],
+            ))
+        } else {
+            (None, None)
+        };
 
-    // Config values magit commonly needs
-    let config = collect_git_config(directory);
-    result.push(("config".into_value(), config));
+        let (push_ahead, push_behind) = if push_branch.is_some() {
+            parse_ahead_behind(git_string(
+                directory,
+                &["rev-list", "--count", "--left-right", "@{push}...HEAD"],
+            ))
+        } else {
+            (None, None)
+        };
 
-    // Git state files existence (for detecting merge/rebase/etc state)
-    let state_files = collect_state_files(directory, gitdir.as_deref());
-    result.push(("state_files".into_value(), state_files));
+        // Build result
+        let mut result: Vec<(Value, Value)> = Vec::with_capacity(16);
 
-    Ok(Value::Map(result))
+        result.push(("toplevel".into_value(), toplevel.into_value()));
+        result.push(("gitdir".into_value(), gitdir.into_value()));
+
+        result.push((
+            "head".into_value(),
+            msgpack_map! {
+                "hash" => head_hash.into_value(),
+                "short" => head_short.into_value(),
+                "branch" => head_branch.into_value(),
+                "message" => head_message.into_value()
+            },
+        ));
+
+        result.push((
+            "upstream".into_value(),
+            msgpack_map! {
+                "branch" => upstream_branch.into_value(),
+                "ahead" => upstream_ahead.into_value(),
+                "behind" => upstream_behind.into_value()
+            },
+        ));
+
+        result.push((
+            "push".into_value(),
+            msgpack_map! {
+                "branch" => push_branch.into_value(),
+                "ahead" => push_ahead.into_value(),
+                "behind" => push_behind.into_value()
+            },
+        ));
+
+        result.push(("state".into_value(), state));
+
+        result.push((
+            "staged".into_value(),
+            msgpack_map! {
+                "diff" => staged_diff.into_value(),
+                "stat" => staged_stat.into_value()
+            },
+        ));
+
+        result.push((
+            "unstaged".into_value(),
+            msgpack_map! {
+                "diff" => unstaged_diff.into_value(),
+                "stat" => unstaged_stat.into_value()
+            },
+        ));
+
+        result.push(("untracked".into_value(), untracked.into_value()));
+
+        // Parse stashes
+        let stash_list: Vec<Value> = stashes
+            .iter()
+            .filter_map(|line| {
+                let parts: Vec<&str> = line.splitn(2, '\t').collect();
+                if parts.len() == 2 {
+                    Some(msgpack_map! {
+                        "ref" => parts[0].to_string().into_value(),
+                        "message" => parts[1].to_string().into_value()
+                    })
+                } else {
+                    None
+                }
+            })
+            .collect();
+        result.push(("stashes".into_value(), Value::Array(stash_list)));
+
+        // Parse recent commits
+        let recent_commits: Vec<Value> = recent
+            .iter()
+            .filter_map(|line| {
+                let parts: Vec<&str> = line.splitn(2, '\t').collect();
+                if parts.len() == 2 {
+                    Some(msgpack_map! {
+                        "hash" => parts[0].to_string().into_value(),
+                        "message" => parts[1].to_string().into_value()
+                    })
+                } else {
+                    None
+                }
+            })
+            .collect();
+        result.push(("recent_commits".into_value(), Value::Array(recent_commits)));
+
+        result.push((
+            "tags".into_value(),
+            msgpack_map! {
+                "at_head" => tag_at_head.into_value(),
+                "latest" => tag_contains.into_value()
+            },
+        ));
+
+        result.push(("remotes".into_value(), remotes.into_value()));
+        result.push(("config".into_value(), config));
+        result.push(("state_files".into_value(), state_files));
+
+        Ok(Value::Map(result))
+    })
 }
 
 /// Detect repository state (merge, rebase, cherry-pick, etc.)
