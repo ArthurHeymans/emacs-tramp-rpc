@@ -146,6 +146,25 @@ impl RpcError {
     }
 }
 
+/// Server-initiated notification (no id, no response expected)
+/// Used for push notifications like filesystem change events.
+#[derive(Debug, Serialize)]
+pub struct Notification {
+    pub version: String,
+    pub method: String,
+    pub params: Value,
+}
+
+impl Notification {
+    pub fn new(method: impl Into<String>, params: Value) -> Self {
+        Self {
+            version: "2.0".to_string(),
+            method: method.into(),
+            params,
+        }
+    }
+}
+
 // ============================================================================
 // File operation types
 // ============================================================================

@@ -285,6 +285,11 @@ async fn dispatch_inner(request: &Request) -> Response {
         "system.statvfs" => system_statvfs(&request.params),
         "system.groups" => system_groups(),
 
+        // Filesystem watching
+        "watch.add" => crate::watcher::handle_add(&request.params),
+        "watch.remove" => crate::watcher::handle_remove(&request.params),
+        "watch.list" => crate::watcher::handle_list(&request.params),
+
         // Note: "batch" is NOT allowed in batch (no recursion)
         _ => Err(RpcError::method_not_found(&request.method)),
     };

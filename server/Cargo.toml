@@ -24,3 +24,6 @@ libc = "0.2"
 
 # For PTY support (term feature includes pty module)
 nix = { version = "0.29", features = ["term", "process", "signal", "fs"] }
+
+# For filesystem watching (inotify on Linux, kqueue on macOS)
+notify = "6.1"
