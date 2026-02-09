@@ -62,6 +62,9 @@
                   (get-buffer-process (get-buffer process)))
                  (t nil))))
       (cond
+       ;; Direct SSH PTY - use normal process-send-string (low latency)
+       ((and proc (process-get proc :tramp-rpc-direct-ssh))
+        (funcall orig-fun process string))
        ;; RPC-based PTY process - use PTY write (async, fire-and-forget)
        ((and proc (process-get proc :tramp-rpc-pty)
              (process-get proc :tramp-rpc-pid))
@@ -105,6 +108,9 @@
                   (get-buffer-process (get-buffer process)))
                  (t nil))))
       (cond
+       ;; Direct SSH PTY - use normal process-send-region (low latency)
+       ((and proc (process-get proc :tramp-rpc-direct-ssh))
+        (funcall orig-fun process start end))
        ;; RPC-based PTY process - use PTY write
        ((and proc (process-get proc :tramp-rpc-pty)
              (process-get proc :tramp-rpc-pid))
@@ -142,6 +148,9 @@
   "Advice for `process-send-eof' to handle TRAMP-RPC processes."
   (let ((proc (or process (get-buffer-process (current-buffer)))))
     (cond
+     ;; Direct SSH PTY - use normal process-send-eof
+     ((and proc (process-get proc :tramp-rpc-direct-ssh))
+      (funcall orig-fun process))
      ;; RPC-managed process
      ((and proc
            (process-get proc :tramp-rpc-pid)
@@ -221,7 +230,8 @@
 For TRAMP-RPC PTY processes, return the remote TTY name stored during creation.
 For direct SSH PTY processes, use the original function (returns local PTY)."
   (if (and (processp process)
-           (process-get process :tramp-rpc-pty))
+           (process-get process :tramp-rpc-pty)
+           (not (process-get process :tramp-rpc-direct-ssh)))
       (process-get process :tramp-rpc-tty-name)
     (funcall orig-fun process stream)))
 

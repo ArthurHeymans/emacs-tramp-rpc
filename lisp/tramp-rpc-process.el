@@ -44,9 +44,15 @@
 (declare-function tramp-rpc--resolve-executable "tramp-rpc")
 (declare-function tramp-rpc--get-direnv-environment "tramp-rpc")
 (declare-function tramp-rpc--decode-output "tramp-rpc")
+(declare-function tramp-rpc--controlmaster-socket-path "tramp-rpc")
 (declare-function tramp-rpc-file-name-p "tramp-rpc")
 
 ;; Variables from tramp-rpc.el
+(defvar tramp-rpc-use-direct-ssh-pty)
+(defvar tramp-rpc-use-controlmaster)
+(defvar tramp-rpc-controlmaster-persist)
+(defvar tramp-rpc-ssh-options)
+(defvar tramp-rpc-ssh-args)
 (defvar tramp-rpc-use-async-read)
 (defvar tramp-rpc-async-read-timeout-ms)
 (defvar tramp-rpc--delivering-output)
@@ -544,6 +550,123 @@ PROGRAM is the command to run, ARGS are its arguments."
 VEC is the tramp connection vector.
 NAME, BUFFER, COMMAND, CODING, NOQUERY, FILTER, SENTINEL are process params.
 LOCALNAME is the remote working directory.
+DIRENV-ENV is an optional alist of environment variables from direnv.
+
+When `tramp-rpc-use-direct-ssh-pty' is non-nil (the default), this uses
+a direct SSH connection for the PTY, providing much lower latency for
+interactive terminal use.  Otherwise, uses the RPC-based PTY implementation."
+  (if tramp-rpc-use-direct-ssh-pty
+      ;; Use direct SSH for low-latency PTY
+      (tramp-rpc--make-direct-ssh-pty-process
+       vec name buffer command coding noquery filter sentinel localname direnv-env)
+    ;; Use RPC-based PTY
+    (tramp-rpc--make-rpc-pty-process
+     vec name buffer command coding noquery filter sentinel localname direnv-env)))
+
+(defun tramp-rpc--make-direct-ssh-pty-process (vec name buffer command coding noquery
+                                                    filter sentinel localname &optional direnv-env)
+  "Create a PTY process using direct SSH connection.
+This provides much lower latency than the RPC-based PTY by using a direct
+SSH connection with `-t` for the terminal.  The SSH connection reuses the
+existing ControlMaster socket, so authentication is already handled.
+
+VEC is the tramp connection vector.
+NAME, BUFFER, COMMAND, CODING, NOQUERY, FILTER, SENTINEL are process params.
+LOCALNAME is the remote working directory.
+DIRENV-ENV is an optional alist of environment variables from direnv."
+  (let* ((host (tramp-file-name-host vec))
+         (user (tramp-file-name-user vec))
+         (port (tramp-file-name-port vec))
+         (program (car command))
+         (program-args (cdr command))
+         ;; Build environment exports for the remote command
+         (env-exports (mapconcat
+                       (lambda (pair)
+                         (format "export %s=%s;"
+                                 (car pair)
+                                 (shell-quote-argument (cdr pair))))
+                       (append direnv-env
+                               `(("TERM" . ,(or (getenv "TERM") "xterm-256color"))))
+                       " "))
+         ;; Build the remote command - cd to dir, export env, exec program
+         (remote-cmd (format "cd %s && %s exec %s %s"
+                             (shell-quote-argument localname)
+                             env-exports
+                             (shell-quote-argument program)
+                             (mapconcat #'shell-quote-argument program-args " ")))
+         ;; Build SSH arguments for direct PTY connection
+         (ssh-args (append
+                    (list "ssh")
+                    ;; Request PTY allocation
+                    (list "-t" "-t")  ; Force PTY even without controlling terminal
+                    ;; Reuse ControlMaster if enabled
+                    (when tramp-rpc-use-controlmaster
+                      (list "-o" "ControlMaster=auto"
+                            "-o" (format "ControlPath=%s"
+                                         (tramp-rpc--controlmaster-socket-path vec))
+                            "-o" (format "ControlPersist=%s"
+                                         tramp-rpc-controlmaster-persist)))
+                    ;; Only use BatchMode=yes when ControlMaster handles auth;
+                    ;; without it, BatchMode=yes prevents password prompts.
+                    (when tramp-rpc-use-controlmaster
+                      (list "-o" "BatchMode=yes"))
+                    (list "-o" "StrictHostKeyChecking=accept-new")
+                    ;; User-specified SSH options
+                    (mapcan (lambda (opt) (list "-o" opt))
+                            tramp-rpc-ssh-options)
+                    ;; Raw SSH arguments
+                    tramp-rpc-ssh-args
+                    ;; Connection parameters
+                    (when user (list "-l" user))
+                    (when port (list "-p" (number-to-string port)))
+                    ;; Host and command
+                    (list host remote-cmd)))
+         ;; Normalize buffer
+         (actual-buffer (cond
+                         ((bufferp buffer) buffer)
+                         ((stringp buffer) (get-buffer-create buffer))
+                         ((eq buffer t) (current-buffer))
+                         (t nil)))
+         ;; Start the SSH process with PTY
+         (process-connection-type t)  ; Use PTY
+         (process (apply #'start-process
+                         (or name "tramp-rpc-direct-pty")
+                         actual-buffer
+                         ssh-args)))
+
+    (tramp-rpc--debug "DIRECT-SSH-PTY started: %s -> %s %S"
+                     process host command)
+
+    ;; Configure the process
+    (when coding
+      (set-process-coding-system process coding coding))
+    (set-process-query-on-exit-flag process (not noquery))
+
+    ;; Set up filter
+    (when filter
+      (set-process-filter process filter))
+
+    ;; Set up sentinel
+    (when sentinel
+      (set-process-sentinel process sentinel))
+
+    ;; Store tramp-rpc metadata for compatibility with other code
+    (process-put process :tramp-rpc-pty t)
+    (process-put process :tramp-rpc-direct-ssh t)
+    (process-put process :tramp-rpc-vec vec)
+    (process-put process :tramp-rpc-user-sentinel sentinel)
+    (process-put process :tramp-rpc-command command)
+
+    process))
+
+(defun tramp-rpc--make-rpc-pty-process (vec name buffer command coding noquery
+                                             filter sentinel localname &optional direnv-env)
+  "Create a PTY-based process using the RPC server.
+This is the fallback when direct SSH PTY is disabled.
+
+VEC is the tramp connection vector.
+NAME, BUFFER, COMMAND, CODING, NOQUERY, FILTER, SENTINEL are process params.
+LOCALNAME is the remote working directory.
 DIRENV-ENV is an optional alist of environment variables from direnv."
   (let* ((program (car command))
          (program-args (cdr command))
@@ -795,11 +918,17 @@ Returns the final (width . height) cons, or nil if resize was not handled."
 
 (defun tramp-rpc--vterm-window-adjust-process-window-size-advice (orig-fun process windows)
   "Advice for vterm's window adjust function to handle TRAMP-RPC PTY processes.
-For tramp-rpc processes, resize the remote PTY and update vterm's display."
-  (if (and (processp process)
-           (process-get process :tramp-rpc-pty))
-      ;; This is a tramp-rpc PTY process
-      (unless vterm-copy-mode
+For tramp-rpc processes, resize the remote PTY and update vterm's display.
+For direct SSH PTY, let the original function handle it (SSH handles resize)."
+  (cond
+   ;; Direct SSH PTY - let original function handle it
+   ((and (processp process)
+         (process-get process :tramp-rpc-direct-ssh))
+    (funcall orig-fun process windows))
+   ;; RPC-based PTY - resize via RPC
+   ((and (processp process)
+         (process-get process :tramp-rpc-pty))
+    (unless vterm-copy-mode
         (tramp-rpc--handle-pty-resize
          process windows
          ;; Size adjuster: apply vterm margins and minimum width
@@ -810,18 +939,24 @@ For tramp-rpc processes, resize the remote PTY and update vterm's display."
          ;; Display updater: call vterm--set-size
          (lambda (width height)
            (when (and (boundp 'vterm--term) vterm--term
-                      (fboundp 'vterm--set-size))
-             (vterm--set-size vterm--term height width)))))
-    ;; Not our process, call original
-    (funcall orig-fun process windows)))
+                    (fboundp 'vterm--set-size))
+             (vterm--set-size vterm--term height width))))))
+   ;; Not our process, call original
+   (t (funcall orig-fun process windows))))
 
 (defun tramp-rpc--eat-adjust-process-window-size-advice (orig-fun process windows)
   "Advice for eat's window adjust function to handle TRAMP-RPC PTY processes.
-For tramp-rpc processes, resize the remote PTY and update eat's display."
-  (if (and (processp process)
-           (process-get process :tramp-rpc-pty))
-      ;; This is a tramp-rpc PTY process
-      (tramp-rpc--handle-pty-resize
+For tramp-rpc processes, resize the remote PTY and update eat's display.
+For direct SSH PTY, let the original function handle it (SSH handles resize)."
+  (cond
+   ;; Direct SSH PTY - let original function handle it
+   ((and (processp process)
+         (process-get process :tramp-rpc-direct-ssh))
+    (funcall orig-fun process windows))
+   ;; RPC-based PTY - resize via RPC
+   ((and (processp process)
+         (process-get process :tramp-rpc-pty))
+    (tramp-rpc--handle-pty-resize
        process windows
        ;; Size adjuster: ensure minimum of 1
        (lambda (width height)
@@ -835,9 +970,9 @@ For tramp-rpc processes, resize the remote PTY and update eat's display."
            (eat-term-redisplay eat-terminal))
          (pcase major-mode
            ('eat-mode (run-hooks 'eat-update-hook))
-           ('eshell-mode (run-hooks 'eat-eshell-update-hook)))))
-    ;; Not our process, call original
-    (funcall orig-fun process windows)))
+           ('eshell-mode (run-hooks 'eat-eshell-update-hook))))))
+   ;; Not our process, call original
+   (t (funcall orig-fun process windows))))
 
 ;; ============================================================================
 ;; Process cleanup

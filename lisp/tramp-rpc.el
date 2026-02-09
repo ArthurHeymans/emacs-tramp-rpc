@@ -144,6 +144,18 @@ passing any SSH command-line arguments."
   :type '(repeat string)
   :group 'tramp-rpc)
 
+(defcustom tramp-rpc-use-direct-ssh-pty t
+  "Whether to use direct SSH connections for PTY processes.
+When non-nil, interactive terminal processes (vterm, shell-mode, term-mode)
+use a direct SSH connection with `-t` for the PTY, providing much lower
+latency than the RPC-based PTY.  The SSH connection reuses the existing
+ControlMaster socket, so authentication is already handled.
+
+Note: `signal-process' on direct SSH PTY sends signal to the local SSH
+process, which may not propagate to the remote process in all cases."
+  :type 'boolean
+  :group 'tramp-rpc)
+
 (defcustom tramp-rpc-debug nil
   "When non-nil, log debug messages to *tramp-rpc-debug* buffer.
 Set to t to enable debugging for hang diagnosis."
