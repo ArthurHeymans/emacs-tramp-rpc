@@ -26,6 +26,16 @@ pub enum RequestId {
     String(String),
 }
 
+/// Server-initiated notification (no id field).
+/// Used for push events like filesystem change notifications.
+/// Follows JSON-RPC 2.0 notification format: has method+params but no id.
+#[derive(Debug, Serialize)]
+pub struct Notification {
+    pub version: String,
+    pub method: String,
+    pub params: Value,
+}
+
 /// RPC response
 #[derive(Debug, Serialize)]
 pub struct Response {

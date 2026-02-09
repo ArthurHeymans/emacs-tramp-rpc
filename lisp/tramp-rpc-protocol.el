@@ -58,21 +58,29 @@ Returns a cons cell (ID . BYTES) for pipelining support."
     (cons id (tramp-rpc-protocol--length-prefix payload))))
 
 (defun tramp-rpc-protocol-decode-response (bytes)
-  "Decode a MessagePack-RPC response from BYTES (unibyte string).
-Returns a plist with :id, :result, and :error keys."
+  "Decode a MessagePack-RPC message from BYTES (unibyte string).
+Returns a plist.  For responses: :id, :result, :error.
+For server notifications: :notification t, :method, :params (no :id)."
   (let* ((msgpack-map-type 'alist)
          (msgpack-key-type 'symbol)
          (msgpack-array-type 'list)
-         (response (msgpack-read-from-string bytes))
-         (id (alist-get 'id response))
-         (result (alist-get 'result response))
-         (error-obj (alist-get 'error response)))
-    (list :id id
-          :result result
-          :error (when error-obj
-                   (list :code (alist-get 'code error-obj)
-                         :message (alist-get 'message error-obj)
-                         :data (alist-get 'data error-obj))))))
+         (msg (msgpack-read-from-string bytes))
+         (id (alist-get 'id msg))
+         (method (alist-get 'method msg)))
+    (if (and method (not id))
+        ;; Server-initiated notification (has method, no id)
+        (list :notification t
+              :method method
+              :params (alist-get 'params msg))
+      ;; Normal response
+      (let ((result (alist-get 'result msg))
+            (error-obj (alist-get 'error msg)))
+        (list :id id
+              :result result
+              :error (when error-obj
+                       (list :code (alist-get 'code error-obj)
+                             :message (alist-get 'message error-obj)
+                             :data (alist-get 'data error-obj))))))))
 
 (defun tramp-rpc-protocol-error-p (response)
   "Return non-nil if RESPONSE contains an error."

@@ -290,6 +290,11 @@ async fn dispatch_inner(request: &Request) -> Response {
         "magit.status" => magit::status(&request.params).await,
         "ancestors.scan" => magit::ancestors_scan(&request.params).await,
 
+        // Filesystem watch operations (for cache invalidation)
+        "watch.add" => crate::watcher::handle_add(&request.params),
+        "watch.remove" => crate::watcher::handle_remove(&request.params),
+        "watch.list" => crate::watcher::handle_list(&request.params),
+
         // Note: "batch" is NOT allowed in batch (no recursion)
         _ => Err(RpcError::method_not_found(&request.method)),
     };

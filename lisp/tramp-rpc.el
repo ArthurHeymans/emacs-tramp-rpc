@@ -661,17 +661,27 @@ Uses length-prefixed binary framing: <4-byte BE length><msgpack payload>."
                 (erase-buffer)
                 (insert remaining)
                 (goto-char (point-min))
-                ;; Handle the response
-                (let* ((id (plist-get response :id))
-                       (callback (gethash id tramp-rpc--async-callbacks)))
-                  (if callback
-                      (progn
-                        (tramp-rpc--debug "FILTER dispatching async id=%s" id)
-                        (remhash id tramp-rpc--async-callbacks)
-                        (funcall callback response))
-                    ;; Not an async response - store for sync code
-                    (tramp-rpc--debug "FILTER storing sync response id=%s" id)
-                    (puthash id response (tramp-rpc--get-pending-responses buffer))))))))))))
+                ;; Handle the message (response or notification)
+                (if (plist-get response :notification)
+                    ;; Server-initiated notification (e.g. fs.changed)
+                    (progn
+                      (tramp-rpc--debug "FILTER notification method=%s"
+                                       (plist-get response :method))
+                      (tramp-rpc--handle-notification
+                       process
+                       (plist-get response :method)
+                       (plist-get response :params)))
+                  ;; Normal response - dispatch by id
+                  (let* ((id (plist-get response :id))
+                         (callback (gethash id tramp-rpc--async-callbacks)))
+                    (if callback
+                        (progn
+                          (tramp-rpc--debug "FILTER dispatching async id=%s" id)
+                          (remhash id tramp-rpc--async-callbacks)
+                          (funcall callback response))
+                      ;; Not an async response - store for sync code
+                      (tramp-rpc--debug "FILTER storing sync response id=%s" id)
+                      (puthash id response (tramp-rpc--get-pending-responses buffer)))))))))))))
 
 (defun tramp-rpc--call-async (vec method params callback)
   "Call METHOD with PARAMS asynchronously on the RPC server for VEC.
@@ -2078,6 +2088,16 @@ Resolves PROGRAM path and loads direnv environment from working directory."
               (with-temp-file stderr-dest (insert stderr)))
              ((bufferp stderr-dest)
               (with-current-buffer stderr-dest (insert stderr))))))))
+      ;; Invalidate file caches after running external commands.
+      ;; External processes (git, make, etc.) can modify the worktree in ways
+      ;; that our file handler doesn't see, so we must clear the caches.
+      ;; Skip this if the directory is already being watched via inotify,
+      ;; since the watcher provides more precise, debounced invalidation
+      ;; and clearing here would redundantly defeat caching on every
+      ;; process-file call (including read-only commands like git rev-parse).
+      (unless (tramp-rpc--directory-watched-p localname v)
+        (tramp-rpc-clear-file-exists-cache)
+        (tramp-rpc-clear-file-truename-cache))
       ;; Always return exit code
       exit-code)))
 
@@ -3857,6 +3877,9 @@ Populates `tramp-rpc-magit--status-cache' and ancestors cache."
     (setq tramp-rpc-magit--prefetch-directory (expand-file-name directory))
     ;; Fetch magit status
     (setq tramp-rpc-magit--status-cache (tramp-rpc-magit-status directory))
+    ;; Auto-watch the git worktree for cache invalidation
+    (when tramp-rpc-magit--status-cache
+      (tramp-rpc--auto-watch-git-worktree directory tramp-rpc-magit--status-cache))
     ;; Fetch ancestor markers for project/VC detection
     (setq tramp-rpc-magit--ancestors-cache
           (tramp-rpc-ancestors-scan directory
@@ -3915,6 +3938,136 @@ Call this after making significant changes to the remote filesystem."
   (tramp-rpc-clear-file-truename-cache)
   (when (called-interactively-p 'any)
     (message "All tramp-rpc caches cleared")))
+
+;; ============================================================================
+;; Server notification handling (inotify-based cache invalidation)
+;; ============================================================================
+
+(defvar tramp-rpc--watched-directories (make-hash-table :test 'equal)
+  "Hash table of directories being watched via inotify.
+Keys are \"connection-key:path\" strings, values are t.")
+
+(defvar tramp-rpc--watch-debug nil
+  "When non-nil, log filesystem watch events.")
+
+(defun tramp-rpc--directory-watched-p (localname vec)
+  "Return non-nil if LOCALNAME (or a parent) is being watched for VEC.
+Checks if any watched directory is a prefix of LOCALNAME."
+  (let ((conn-key (tramp-rpc--connection-key vec))
+        (found nil))
+    (maphash (lambda (key _val)
+               (when (string-match (format "^%s:\\(.+\\)$" (regexp-quote conn-key)) key)
+                 (let ((watched-path (match-string 1 key)))
+                   (when (string-prefix-p watched-path localname)
+                     (setq found t)))))
+             tramp-rpc--watched-directories)
+    found))
+
+(defun tramp-rpc--handle-notification (process method params)
+  "Handle a server-initiated notification.
+PROCESS is the RPC connection process.
+METHOD is the notification method name.
+PARAMS is the notification parameters."
+  (pcase method
+    ("fs.changed"
+     (tramp-rpc--handle-fs-changed process params))
+    (_
+     (when tramp-rpc--watch-debug
+       (message "tramp-rpc: unknown notification method: %s" method)))))
+
+(defun tramp-rpc--handle-fs-changed (_process params)
+  "Handle an fs.changed notification by invalidating caches.
+PARAMS is an alist with a `paths' key containing a list of changed paths."
+  (let ((paths (alist-get 'paths params)))
+    (when tramp-rpc--watch-debug
+      (message "tramp-rpc: fs.changed notification, %d paths" (length paths)))
+    ;; Clear all caches that could be stale.
+    ;; This is the simplest correct approach: the caches refill on demand
+    ;; in a single RPC round-trip each. More granular invalidation
+    ;; (matching individual paths) can be added later if needed.
+    (clrhash tramp-rpc--file-exists-cache)
+    (clrhash tramp-rpc--file-truename-cache)
+    ;; Also clear the magit status cache since git state files or
+    ;; worktree contents may have changed.
+    (tramp-rpc-magit--clear-status-cache)))
+
+(defun tramp-rpc-watch-directory (directory &optional non-recursive)
+  "Start watching DIRECTORY on the remote server for filesystem changes.
+When changes are detected, local caches are automatically invalidated.
+By default, subdirectories are watched recursively.
+If NON-RECURSIVE is non-nil, only the directory itself is watched.
+
+This uses inotify (Linux) or kqueue (macOS) on the remote server."
+  (interactive
+   (list (read-directory-name "Watch directory: " nil nil t)
+         nil))
+  (when (and (file-remote-p directory)
+             (tramp-rpc-file-name-p directory))
+    (with-parsed-tramp-file-name directory nil
+      (let* ((recursive (not non-recursive))
+             (result (tramp-rpc--call v "watch.add"
+                                      `((path . ,localname)
+                                        (recursive . ,(if recursive t :json-false))))))
+        (when result
+          (let ((key (format "%s:%s" (tramp-rpc--connection-key v) localname)))
+            (puthash key t tramp-rpc--watched-directories))
+          (when (or tramp-rpc--watch-debug (called-interactively-p 'any))
+            (message "tramp-rpc: watching %s%s"
+                     localname
+                     (if recursive " (recursive)" ""))))))))
+
+(defun tramp-rpc-unwatch-directory (directory)
+  "Stop watching DIRECTORY on the remote server."
+  (interactive
+   (list (read-directory-name "Unwatch directory: " nil nil t)))
+  (when (and (file-remote-p directory)
+             (tramp-rpc-file-name-p directory))
+    (with-parsed-tramp-file-name directory nil
+      (let ((result (tramp-rpc--call v "watch.remove"
+                                     `((path . ,localname)))))
+        (when result
+          (let ((key (format "%s:%s" (tramp-rpc--connection-key v) localname)))
+            (remhash key tramp-rpc--watched-directories))
+          (when (or tramp-rpc--watch-debug (called-interactively-p 'any))
+            (message "tramp-rpc: unwatched %s" localname)))))))
+
+(defun tramp-rpc-list-watches ()
+  "List currently active filesystem watches on the remote server."
+  (interactive)
+  (if (not (file-remote-p default-directory))
+      (message "Not in a remote directory")
+    (with-parsed-tramp-file-name default-directory nil
+      (let ((result (tramp-rpc--call v "watch.list" nil)))
+        (if (and result (> (length result) 0))
+            (message "Active watches:\n%s"
+                     (mapconcat (lambda (w)
+                                  (format "  %s%s"
+                                          (alist-get 'path w)
+                                          (if (eq (alist-get 'recursive w) t)
+                                              " (recursive)" "")))
+                                result "\n"))
+          (message "No active watches"))))))
+
+(defun tramp-rpc--auto-watch-git-worktree (directory status-data)
+  "Automatically watch a git worktree after magit.status returns.
+DIRECTORY is the TRAMP directory. STATUS-DATA is the magit.status result."
+  (when-let* ((toplevel (alist-get 'toplevel status-data)))
+    (with-parsed-tramp-file-name directory nil
+      (let ((key (format "%s:%s" (tramp-rpc--connection-key v) toplevel)))
+        (unless (gethash key tramp-rpc--watched-directories)
+          ;; Not yet watching this worktree - start watching
+          (condition-case err
+              (let ((result (tramp-rpc--call v "watch.add"
+                                             `((path . ,toplevel)
+                                               (recursive . t)))))
+                (when result
+                  (puthash key t tramp-rpc--watched-directories)
+                  (when tramp-rpc--watch-debug
+                    (message "tramp-rpc: auto-watching git worktree %s" toplevel))))
+            (error
+             (when tramp-rpc--watch-debug
+               (message "tramp-rpc: failed to auto-watch %s: %s"
+                        toplevel (error-message-string err))))))))))
 
 (defun tramp-rpc-magit--file-exists-p (filename)
   "Check if FILENAME exists using cached ancestor data.
