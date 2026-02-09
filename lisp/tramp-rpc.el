@@ -107,11 +107,13 @@
 (defvar tramp-rpc-magit--prefetch-directory)
 (defvar tramp-rpc-magit--debug)
 (defvar tramp-rpc-magit--status-cache)
+(defvar tramp-rpc-magit--process-file-cache)
 (defvar tramp-rpc-magit--ancestors-cache)
 (defvar tramp-rpc--file-exists-cache)
 (defvar tramp-rpc--file-truename-cache)
 (defvar tramp-rpc--cache-ttl)
 (defvar tramp-rpc--cache-max-size)
+(defvar tramp-rpc--suppress-fs-notifications)
 
 ;; Silence byte-compiler warnings for external functions
 (declare-function projectile-dir-files-alien "projectile")
@@ -2033,61 +2035,89 @@ Returns t on success, nil on failure."
 ;; Process operations
 ;; ============================================================================
 
+(defun tramp-rpc--route-process-file-output (destination stdout &optional stderr)
+  "Route process-file STDOUT and STDERR according to DESTINATION.
+DESTINATION follows the `process-file' convention:
+  nil       - discard
+  t         - insert into current buffer
+  string    - write to file
+  buffer    - insert into buffer
+  (stdout-dest . stderr-dest) - cons for separate handling"
+  (cond
+   ((null destination) nil)
+   ((eq destination t)
+    (insert stdout))
+   ((stringp destination)
+    (with-temp-file destination
+      (insert stdout)))
+   ((bufferp destination)
+    (with-current-buffer destination
+      (insert stdout)))
+   ((consp destination)
+    (let ((stdout-dest (car destination))
+          (stderr-dest (cadr destination)))
+      (when stdout-dest
+        (cond
+         ((eq stdout-dest t) (insert stdout))
+         ((stringp stdout-dest)
+          (with-temp-file stdout-dest (insert stdout)))
+         ((bufferp stdout-dest)
+          (with-current-buffer stdout-dest (insert stdout)))))
+      (when (and stderr-dest stderr)
+        (cond
+         ((stringp stderr-dest)
+          (with-temp-file stderr-dest (insert stderr)))
+         ((bufferp stderr-dest)
+          (with-current-buffer stderr-dest (insert stderr)))))))))
+
 (defun tramp-rpc-handle-process-file
     (program &optional infile destination _display &rest args)
   "Like `process-file' for TRAMP-RPC files.
-Resolves PROGRAM path and loads direnv environment from working directory."
+Resolves PROGRAM path and loads direnv environment from working directory.
+When `tramp-rpc-magit--process-file-cache' is populated (during magit
+refresh), git commands are served from the prefetch cache when possible."
   (with-parsed-tramp-file-name default-directory nil
-    (let* ((resolved-program (tramp-rpc--resolve-executable v program))
-           (direnv-env (tramp-rpc--get-direnv-environment v localname))
-           (stdin-content (when (and infile (not (eq infile t)))
-                            (with-temp-buffer
-                              (set-buffer-multibyte nil)
-                              (insert-file-contents-literally infile)
-                              (buffer-string))))
-           (result (tramp-rpc--call v "process.run"
-                                    `((cmd . ,resolved-program)
-                                      (args . ,(vconcat args))
-                                      (cwd . ,localname)
-                                      ,@(when direnv-env
-                                          `((env . ,direnv-env)))
-                                      ,@(when stdin-content
-                                          `((stdin . ,stdin-content))))))
-           (exit-code (alist-get 'exit_code result))
-           (stdout (tramp-rpc--decode-output
-                    (alist-get 'stdout result)
-                    (alist-get 'stdout_encoding result)))
-           (stderr (tramp-rpc--decode-output
-                    (alist-get 'stderr result)
-                    (alist-get 'stderr_encoding result))))
+    ;; Try serving from magit prefetch cache first (no RPC needed)
+    (let ((cached (when (and (null infile)  ; no stdin redirection
+                             tramp-rpc-magit--process-file-cache)
+                    (tramp-rpc-magit--process-cache-lookup program args))))
+      (if cached
+          ;; Cache hit - serve from prefetch
+          (let ((exit-code (car cached))
+                (stdout (cdr cached)))
+            (tramp-rpc--route-process-file-output destination stdout)
+            exit-code)
+        ;; Cache miss - make actual RPC call
+        (when (and tramp-rpc-magit--debug
+                   tramp-rpc-magit--process-file-cache
+                   (or (string-suffix-p "/git" program)
+                       (string= "git" program)))
+          (message "process-file MISS: git %s"
+                   (mapconcat #'identity args " ")))
+        (let* ((resolved-program (tramp-rpc--resolve-executable v program))
+               (direnv-env (tramp-rpc--get-direnv-environment v localname))
+               (stdin-content (when (and infile (not (eq infile t)))
+                                (with-temp-buffer
+                                  (set-buffer-multibyte nil)
+                                  (insert-file-contents-literally infile)
+                                  (buffer-string))))
+               (result (tramp-rpc--call v "process.run"
+                                        `((cmd . ,resolved-program)
+                                          (args . ,(vconcat args))
+                                          (cwd . ,localname)
+                                          ,@(when direnv-env
+                                              `((env . ,direnv-env)))
+                                          ,@(when stdin-content
+                                              `((stdin . ,stdin-content))))))
+               (exit-code (alist-get 'exit_code result))
+               (stdout (tramp-rpc--decode-output
+                        (alist-get 'stdout result)
+                        (alist-get 'stdout_encoding result)))
+               (stderr (tramp-rpc--decode-output
+                        (alist-get 'stderr result)
+                        (alist-get 'stderr_encoding result))))
 
-      ;; Handle destination (side effects only, we return exit-code below)
-      (cond
-       ((null destination) nil)
-       ((eq destination t)
-        (insert stdout))
-       ((stringp destination)
-        (with-temp-file destination
-          (insert stdout)))
-       ((bufferp destination)
-        (with-current-buffer destination
-          (insert stdout)))
-       ((consp destination)
-        (let ((stdout-dest (car destination))
-              (stderr-dest (cadr destination)))
-          (when stdout-dest
-            (cond
-             ((eq stdout-dest t) (insert stdout))
-             ((stringp stdout-dest)
-              (with-temp-file stdout-dest (insert stdout)))
-             ((bufferp stdout-dest)
-              (with-current-buffer stdout-dest (insert stdout)))))
-          (when stderr-dest
-            (cond
-             ((stringp stderr-dest)
-              (with-temp-file stderr-dest (insert stderr)))
-             ((bufferp stderr-dest)
-              (with-current-buffer stderr-dest (insert stderr))))))))
+      (tramp-rpc--route-process-file-output destination stdout stderr)
       ;; Invalidate file caches after running external commands.
       ;; External processes (git, make, etc.) can modify the worktree in ways
       ;; that our file handler doesn't see, so we must clear the caches.
@@ -2099,7 +2129,7 @@ Resolves PROGRAM path and loads direnv environment from working directory."
         (tramp-rpc-clear-file-exists-cache)
         (tramp-rpc-clear-file-truename-cache))
       ;; Always return exit code
-      exit-code)))
+      exit-code)))))
 
 (defun tramp-rpc-handle-shell-command (command &optional output-buffer error-buffer)
   "Like `shell-command' for TRAMP-RPC files."
@@ -3749,6 +3779,11 @@ Returns an alist of (path . attributes) in file-attributes format."
   "Cached magit status data from server-side RPC.
 Populated by `tramp-rpc-magit--prefetch', used by process-file advice.")
 
+(defvar tramp-rpc-magit--process-file-cache nil
+  "Hash table mapping git arg keys to cached results.
+Each value is (exit-code . stdout).  Built from the magit.status
+prefetch by `tramp-rpc-magit--build-process-cache'.")
+
 (defvar tramp-rpc-magit--ancestors-cache nil
   "Cached ancestor scan data from server-side RPC.
 This is populated by `tramp-rpc-magit--prefetch' for file existence checks.")
@@ -3810,7 +3845,9 @@ Clears cache if it exceeds `tramp-rpc--cache-max-size'."
   "Get complete magit status for DIRECTORY using server-side RPC.
 Returns an alist with all data needed for magit-status:
   toplevel, gitdir, head, upstream, push, state, staged, unstaged,
-  untracked, stashes, recent_commits, tags, remotes, config, state_files.
+  untracked, tags, remotes, config, state_files, config_list,
+  describe_long, describe_contains, status_porcelain, config_untracked,
+  stash_reflog, head_parent_short, head_parent_10, recent_decorated.
 
 This is much faster than magit's default behavior because the server
 runs all git commands locally and returns the results in one response."
@@ -3868,34 +3905,380 @@ the server scans the entire tree in one operation."
                             (decode-coding-string val 'utf-8)))))
                 result)))))
 
+(defun tramp-rpc-magit--process-cache-key (&rest args)
+  "Build a cache key from git ARGS.
+Joins args with | as separator for hash table lookup."
+  (mapconcat #'identity args "|"))
+
+(defun tramp-rpc-magit--build-process-cache (status-data)
+  "Build a process-file cache from STATUS-DATA.
+Returns a hash table mapping git arg keys to (exit-code . stdout).
+The server's magit.status already ran all these commands in parallel;
+this lets us serve the results without additional RPCs.
+
+NOTE: Cache keys must match the exact argument patterns that magit
+sends after stripping prefix flags (--no-pager, --literal-pathspecs,
+-c key=value).  These patterns may change across magit versions.
+Enable `tramp-rpc-magit--debug' to log cache misses."
+  (let ((cache (make-hash-table :test 'equal))
+        (toplevel (alist-get 'toplevel status-data))
+        (gitdir (alist-get 'gitdir status-data))
+        (head (alist-get 'head status-data))
+        (upstream (alist-get 'upstream status-data))
+        (push-info (alist-get 'push status-data))
+        (staged (alist-get 'staged status-data))
+        (unstaged (alist-get 'unstaged status-data))
+        (untracked (alist-get 'untracked status-data))
+        (tags (alist-get 'tags status-data))
+        (remotes (alist-get 'remotes status-data))
+        (state (alist-get 'state status-data))
+        (config (alist-get 'config status-data))
+        ;; Raw output fields matching magit's exact invocations
+        (config-list (alist-get 'config_list status-data))
+        (describe-long (alist-get 'describe_long status-data))
+        (describe-contains (alist-get 'describe_contains status-data))
+        (status-porcelain (alist-get 'status_porcelain status-data))
+        (config-untracked (alist-get 'config_untracked status-data))
+        (stash-reflog (alist-get 'stash_reflog status-data))
+        (head-parent-short (alist-get 'head_parent_short status-data))
+        (head-parent-10 (alist-get 'head_parent_10 status-data))
+        (recent-decorated (alist-get 'recent_decorated status-data)))
+    ;; Helper: put an entry; exit-code 0 for Some, 1 for None
+    (cl-flet ((put-result (key value)
+                (puthash key
+                         (if value (cons 0 (concat value "\n")) (cons 1 ""))
+                         cache))
+              (put-exact (key exit-code stdout)
+                (puthash key (cons exit-code stdout) cache)))
+      ;; Basic repo info
+      (put-result (tramp-rpc-magit--process-cache-key "rev-parse" "--show-toplevel")
+                  toplevel)
+      (put-result (tramp-rpc-magit--process-cache-key "rev-parse" "--git-dir")
+                  gitdir)
+
+      ;; HEAD info
+      (when head
+        (put-result (tramp-rpc-magit--process-cache-key "rev-parse" "HEAD")
+                    (alist-get 'hash head))
+        (put-result (tramp-rpc-magit--process-cache-key "rev-parse" "--short" "HEAD")
+                    (alist-get 'short head))
+        (put-result (tramp-rpc-magit--process-cache-key "symbolic-ref" "--short" "HEAD")
+                    (alist-get 'branch head))
+        (put-result (tramp-rpc-magit--process-cache-key "log" "-1" "--format=%s" "HEAD")
+                    (alist-get 'message head))
+        (put-result (tramp-rpc-magit--process-cache-key "rev-parse" "--verify" "HEAD")
+                    (alist-get 'hash head))
+        ;; symbolic-ref HEAD (full) - derive from branch
+        (when (alist-get 'branch head)
+          (put-result (tramp-rpc-magit--process-cache-key "symbolic-ref" "HEAD")
+                      (concat "refs/heads/" (alist-get 'branch head)))))
+
+      ;; Upstream info
+      (when upstream
+        (put-result (tramp-rpc-magit--process-cache-key
+                     "rev-parse" "--abbrev-ref" "@{upstream}")
+                    (alist-get 'branch upstream))
+        (let ((ahead (alist-get 'ahead upstream))
+              (behind (alist-get 'behind upstream)))
+          (when (or ahead behind)
+            (put-exact (tramp-rpc-magit--process-cache-key
+                        "rev-list" "--count" "--left-right" "@{upstream}...HEAD")
+                       0
+                       (format "%s\t%s\n"
+                               (or behind 0) (or ahead 0))))))
+
+      ;; Push remote info
+      (when push-info
+        (put-result (tramp-rpc-magit--process-cache-key
+                     "rev-parse" "--abbrev-ref" "@{push}")
+                    (alist-get 'branch push-info))
+        (let ((ahead (alist-get 'ahead push-info))
+              (behind (alist-get 'behind push-info)))
+          (when (or ahead behind)
+            (put-exact (tramp-rpc-magit--process-cache-key
+                        "rev-list" "--count" "--left-right" "@{push}...HEAD")
+                       0
+                       (format "%s\t%s\n"
+                               (or behind 0) (or ahead 0))))))
+
+      ;; Diff: magit uses --ita-visible-in-index --no-ext-diff --no-prefix
+      ;; (server now runs these exact flags)
+      ;; Unstaged diff
+      (let ((diff (when unstaged (alist-get 'diff unstaged))))
+        (put-exact (tramp-rpc-magit--process-cache-key
+                    "diff" "--ita-visible-in-index"
+                    "--no-ext-diff" "--no-prefix" "--")
+                   0 (or diff "")))
+      ;; Staged (cached) diff
+      (let ((diff (when staged (alist-get 'diff staged))))
+        (put-exact (tramp-rpc-magit--process-cache-key
+                    "diff" "--ita-visible-in-index" "--cached"
+                    "--no-ext-diff" "--no-prefix" "--")
+                   0 (or diff "")))
+
+      ;; Diff stat (magit may still use --stat --no-color variants)
+      (when staged
+        (let ((stat (alist-get 'stat staged)))
+          (when stat
+            (put-result (tramp-rpc-magit--process-cache-key
+                         "diff" "--cached" "--stat" "--no-color")
+                        stat))))
+      (when unstaged
+        (let ((stat (alist-get 'stat unstaged)))
+          (when stat
+            (put-result (tramp-rpc-magit--process-cache-key
+                         "diff" "--stat" "--no-color")
+                        stat))))
+
+      ;; Untracked files
+      (when untracked
+        (put-exact (tramp-rpc-magit--process-cache-key
+                    "ls-files" "--others" "--exclude-standard"
+                    "--directory" "--no-empty-directory")
+                   0
+                   (if (listp untracked)
+                       (concat (mapconcat #'identity untracked "\n") "\n")
+                     (concat untracked "\n"))))
+
+      ;; Tags
+      (when tags
+        (put-result (tramp-rpc-magit--process-cache-key
+                     "describe" "--tags" "--exact-match" "HEAD")
+                    (alist-get 'at_head tags))
+        (put-result (tramp-rpc-magit--process-cache-key
+                     "describe" "--tags" "--abbrev=0")
+                    (alist-get 'latest tags)))
+
+      ;; Remotes
+      (when remotes
+        (put-exact (tramp-rpc-magit--process-cache-key "remote")
+                   0
+                   (if (listp remotes)
+                       (concat (mapconcat #'identity remotes "\n") "\n")
+                     (concat remotes "\n"))))
+
+      ;; Repo state (empty string = no special state)
+      (when state
+        (put-exact (tramp-rpc-magit--process-cache-key
+                    "status" "--porcelain" "--branch")
+                   0 ""))
+
+      ;; Config values (individual key lookups)
+      (when config
+        (dolist (pair config)
+          (let ((key (if (symbolp (car pair))
+                         (symbol-name (car pair))
+                       (car pair)))
+                (val (cdr pair)))
+            (when val
+              (put-result (tramp-rpc-magit--process-cache-key "config" key)
+                          val)))))
+
+      ;; update-index --refresh: safe to return success (read-only refresh)
+      (put-exact (tramp-rpc-magit--process-cache-key "update-index" "--refresh")
+                 0 "")
+
+      ;; rev-parse --is-bare-repository: derive from config core.bare
+      (when config
+        (let ((bare (cdr (or (assoc 'core.bare config)
+                             (assoc "core.bare" config)))))
+          (put-exact (tramp-rpc-magit--process-cache-key
+                      "rev-parse" "--is-bare-repository")
+                     0
+                     (concat (or bare "false") "\n"))))
+
+      ;; HEAD log variants that magit uses
+      (when head
+        (let ((short (alist-get 'short head))
+              (message (alist-get 'message head)))
+          (when (and short message)
+            (put-exact (tramp-rpc-magit--process-cache-key
+                        "log" "--no-walk" "--format=%h %s"
+                        "HEAD^{commit}" "--")
+                       0 (format "%s %s\n" short message)))))
+
+      ;; Stash ref verification (derive from stash_reflog presence)
+      (if stash-reflog
+          (put-exact (tramp-rpc-magit--process-cache-key
+                      "rev-parse" "--verify" "refs/stash")
+                     0 "refs/stash\n")
+        (put-exact (tramp-rpc-magit--process-cache-key
+                    "rev-parse" "--verify" "refs/stash")
+                   1 ""))
+
+      ;; remote get-url origin: derive from config
+      (when config
+        (let ((url (cdr (or (assoc 'remote.origin.url config)
+                            (assoc "remote.origin.url" config)))))
+          (when url
+            (put-result (tramp-rpc-magit--process-cache-key
+                         "remote" "get-url" "origin")
+                        url))))
+
+      ;; === Raw output fields matching magit's exact invocations ===
+
+      ;; config --list -z (raw NUL-separated output)
+      (when config-list
+        (put-exact (tramp-rpc-magit--process-cache-key "config" "--list" "-z")
+                   0 (if (stringp config-list)
+                         config-list
+                       (decode-coding-string config-list 'utf-8-unix))))
+
+      ;; describe --long --tags
+      (put-result (tramp-rpc-magit--process-cache-key
+                   "describe" "--long" "--tags")
+                  (when (stringp describe-long)
+                    (decode-coding-string describe-long 'utf-8-unix)))
+
+      ;; describe --contains HEAD
+      (put-result (tramp-rpc-magit--process-cache-key
+                   "describe" "--contains" "HEAD")
+                  (when (stringp describe-contains)
+                    (decode-coding-string describe-contains 'utf-8-unix)))
+
+      ;; status -z --porcelain --untracked-files=normal --
+      (put-exact (tramp-rpc-magit--process-cache-key
+                  "status" "-z" "--porcelain"
+                  "--untracked-files=normal" "--")
+                 0 (cond
+                    ((stringp status-porcelain) status-porcelain)
+                    (status-porcelain (decode-coding-string status-porcelain 'utf-8-unix))
+                    (t "")))
+
+      ;; config --local -z --get-all --include status.showUntrackedFiles
+      (put-exact (tramp-rpc-magit--process-cache-key
+                  "config" "--local" "-z" "--get-all"
+                  "--include" "status.showUntrackedFiles")
+                 (if config-untracked 0 1)
+                 (if (stringp config-untracked)
+                     (decode-coding-string config-untracked 'utf-8-unix)
+                   ""))
+
+      ;; reflog --format=%gd%x00%aN%x00%at%x00%gs refs/stash
+      (put-exact (tramp-rpc-magit--process-cache-key
+                  "reflog" "--format=%gd%x00%aN%x00%at%x00%gs"
+                  "refs/stash")
+                 (if stash-reflog 0 128)
+                 (cond
+                  ((stringp stash-reflog) stash-reflog)
+                  (stash-reflog (decode-coding-string stash-reflog 'utf-8-unix))
+                  (t "")))
+
+      ;; rev-parse --short HEAD~
+      (put-result (tramp-rpc-magit--process-cache-key
+                   "rev-parse" "--short" "HEAD~")
+                  (when (stringp head-parent-short)
+                    (decode-coding-string head-parent-short 'utf-8-unix)))
+
+      ;; rev-parse --verify HEAD~10
+      (put-result (tramp-rpc-magit--process-cache-key
+                   "rev-parse" "--verify" "HEAD~10")
+                  (when (stringp head-parent-10)
+                    (decode-coding-string head-parent-10 'utf-8-unix)))
+
+      ;; log --format=... --decorate=full -n10 --use-mailmap --no-prefix --
+      (when recent-decorated
+        (put-exact (tramp-rpc-magit--process-cache-key
+                    "log"
+                    "--format=%h%x0c%D%x0c%x0c%aN%x0c%at%x0c%x0c%s"
+                    "--decorate=full" "-n10"
+                    "--use-mailmap" "--no-prefix" "--")
+                   0 (if (stringp recent-decorated)
+                         recent-decorated
+                       (decode-coding-string recent-decorated 'utf-8-unix)))))
+
+    (when tramp-rpc-magit--debug
+      (message "tramp-rpc-magit: built process cache with %d entries"
+               (hash-table-count cache)))
+    cache))
+
+(defun tramp-rpc-magit--strip-git-prefix-args (args)
+  "Strip magit's prefix flags from git ARGS to get the core command.
+Magit prepends --no-pager, --literal-pathspecs, and -c key=value
+before the actual subcommand.  We strip these to normalize the key."
+  (let ((rest (append args nil)))  ; copy list from vector if needed
+    (while (and rest
+                (let ((arg (car rest)))
+                  (cond
+                   ;; Skip --no-pager, --literal-pathspecs, etc.
+                   ((string-prefix-p "--no-pager" arg) t)
+                   ((string-prefix-p "--literal-pathspecs" arg) t)
+                   ((string-prefix-p "--glob-pathspecs" arg) t)
+                   ((string-prefix-p "--noglob-pathspecs" arg) t)
+                   ;; Skip -c key=value (two args: -c then key=value)
+                   ((string= "-c" arg)
+                    (setq rest (cdr rest))  ; skip the value too
+                    t)
+                   ;; Skip -C dir (two args)
+                   ((string= "-C" arg)
+                    (setq rest (cdr rest))
+                    t)
+                   (t nil))))
+      (setq rest (cdr rest)))
+    rest))
+
+(defun tramp-rpc-magit--process-cache-lookup (program args)
+  "Look up PROGRAM ARGS in the process-file cache.
+Returns (exit-code . stdout) if found, nil otherwise.
+Only matches git commands.  Strips magit's prefix flags
+\(--no-pager, -c key=value, etc.) to normalize the key."
+  (when (and tramp-rpc-magit--process-file-cache
+             ;; Only intercept git commands
+             (or (string-suffix-p "/git" program)
+                 (string= "git" program)))
+    (let* ((core-args (tramp-rpc-magit--strip-git-prefix-args args))
+           (key (apply #'tramp-rpc-magit--process-cache-key core-args))
+           (result (gethash key tramp-rpc-magit--process-file-cache)))
+      (when tramp-rpc-magit--debug
+        (if result
+            (message "process-file HIT (prefetch): git %s -> exit %d"
+                     key (car result))
+          (message "process-file MISS (prefetch): git %s" key)))
+      result)))
+
 (defun tramp-rpc-magit--prefetch (directory)
   "Prefetch magit status and ancestor data for DIRECTORY.
-Populates `tramp-rpc-magit--status-cache' and ancestors cache."
+Populates `tramp-rpc-magit--status-cache' and ancestors cache.
+Suppresses fs.changed notifications during RPC calls to prevent
+the server's git commands from triggering inotify events that
+would clear our caches while we're still populating them."
   (when (and (file-remote-p directory)
              (tramp-rpc-file-name-p directory))
-    ;; Remember the directory we prefetched for
-    (setq tramp-rpc-magit--prefetch-directory (expand-file-name directory))
-    ;; Fetch magit status
-    (setq tramp-rpc-magit--status-cache (tramp-rpc-magit-status directory))
-    ;; Auto-watch the git worktree for cache invalidation
-    (when tramp-rpc-magit--status-cache
-      (tramp-rpc--auto-watch-git-worktree directory tramp-rpc-magit--status-cache))
-    ;; Fetch ancestor markers for project/VC detection
-    (setq tramp-rpc-magit--ancestors-cache
-          (tramp-rpc-ancestors-scan directory
-                                    '(".git" ".svn" ".hg" ".bzr" "_darcs"
-                                      ".projectile" ".project" ".dir-locals.el"
-                                      ".editorconfig")))
-    (when tramp-rpc-magit--debug
-      (message "tramp-rpc-magit: prefetched status and ancestors for %s" directory))))
+    ;; Suppress fs.changed notifications during prefetch.
+    ;; The magit.status RPC runs git commands on the server which touch
+    ;; .git/index etc., triggering inotify events that arrive as
+    ;; fs.changed notifications during accept-process-output.  Without
+    ;; suppression, these would clear the cache we're building.
+    (let ((tramp-rpc--suppress-fs-notifications t))
+      ;; Remember the directory we prefetched for
+      (setq tramp-rpc-magit--prefetch-directory (expand-file-name directory))
+      ;; Fetch magit status
+      (setq tramp-rpc-magit--status-cache (tramp-rpc-magit-status directory))
+      ;; Build process-file cache from status data
+      (setq tramp-rpc-magit--process-file-cache
+            (when tramp-rpc-magit--status-cache
+              (tramp-rpc-magit--build-process-cache tramp-rpc-magit--status-cache)))
+      ;; Auto-watch the git worktree for cache invalidation
+      (when tramp-rpc-magit--status-cache
+        (tramp-rpc--auto-watch-git-worktree directory tramp-rpc-magit--status-cache))
+      ;; Fetch ancestor markers for project/VC detection
+      (setq tramp-rpc-magit--ancestors-cache
+            (tramp-rpc-ancestors-scan directory
+                                      '(".git" ".svn" ".hg" ".bzr" "_darcs"
+                                        ".projectile" ".project" ".dir-locals.el"
+                                        ".editorconfig")))
+      (when tramp-rpc-magit--debug
+        (message "tramp-rpc-magit: prefetched status and ancestors for %s" directory)))))
 
 (defun tramp-rpc-magit--clear-status-cache ()
   "Clear only the status cache (git state that changes frequently)."
-  (setq tramp-rpc-magit--status-cache nil))
+  (setq tramp-rpc-magit--status-cache nil)
+  (setq tramp-rpc-magit--process-file-cache nil))
 
 (defun tramp-rpc-magit--clear-cache ()
   "Clear all magit-related caches."
   (setq tramp-rpc-magit--status-cache nil)
+  (setq tramp-rpc-magit--process-file-cache nil)
   (setq tramp-rpc-magit--ancestors-cache nil)
   (setq tramp-rpc-magit--prefetch-directory nil))
 
@@ -3943,6 +4326,11 @@ Call this after making significant changes to the remote filesystem."
 ;; Server notification handling (inotify-based cache invalidation)
 ;; ============================================================================
 
+(defvar tramp-rpc--suppress-fs-notifications nil
+  "When non-nil, suppress fs.changed cache invalidation.
+Bound during magit refresh to prevent inotify notifications from
+clearing caches mid-refresh (git commands touch .git/index etc.).")
+
 (defvar tramp-rpc--watched-directories (make-hash-table :test 'equal)
   "Hash table of directories being watched via inotify.
 Keys are \"connection-key:path\" strings, values are t.")
@@ -3982,19 +4370,25 @@ PARAMS is the notification parameters."
 
 (defun tramp-rpc--handle-fs-changed (_process params)
   "Handle an fs.changed notification by invalidating caches.
-PARAMS is an alist with a `paths' key containing a list of changed paths."
+PARAMS is an alist with a `paths' key containing a list of changed paths.
+When `tramp-rpc--suppress-fs-notifications' is non-nil (e.g. during
+magit refresh), notifications are suppressed.  The advice unwind-protect
+flushes file-exists and file-truename caches after the refresh completes."
   (let ((paths (alist-get 'paths params)))
     (when tramp-rpc--watch-debug
-      (message "tramp-rpc: fs.changed notification, %d paths" (length paths)))
-    ;; Clear all caches that could be stale.
-    ;; This is the simplest correct approach: the caches refill on demand
-    ;; in a single RPC round-trip each. More granular invalidation
-    ;; (matching individual paths) can be added later if needed.
-    (clrhash tramp-rpc--file-exists-cache)
-    (clrhash tramp-rpc--file-truename-cache)
-    ;; Also clear the magit status cache since git state files or
-    ;; worktree contents may have changed.
-    (tramp-rpc-magit--clear-status-cache)))
+      (message "tramp-rpc: fs.changed notification, %d paths%s"
+               (length paths)
+               (if tramp-rpc--suppress-fs-notifications " (suppressed)" "")))
+    (unless tramp-rpc--suppress-fs-notifications
+      ;; Clear all caches that could be stale.
+      ;; This is the simplest correct approach: the caches refill on demand
+      ;; in a single RPC round-trip each. More granular invalidation
+      ;; (matching individual paths) can be added later if needed.
+      (clrhash tramp-rpc--file-exists-cache)
+      (clrhash tramp-rpc--file-truename-cache)
+      ;; Also clear the magit status cache since git state files or
+      ;; worktree contents may have changed.
+      (tramp-rpc-magit--clear-status-cache))))
 
 (defun tramp-rpc-watch-directory (directory &optional non-recursive)
   "Start watching DIRECTORY on the remote server for filesystem changes.
@@ -4105,48 +4499,78 @@ Only uses the cache if FILENAME is under the prefetched directory."
 (defun tramp-rpc-magit--state-file-exists-p (filename)
   "Check if git state FILENAME exists using cached status data.
 Returns t, nil, or \='not-cached if not in cache.
-Only uses the cache if FILENAME is under the prefetched directory."
+Uses the gitdir from status-cache to match paths correctly."
   (if (and tramp-rpc-magit--status-cache
            tramp-rpc-magit--prefetch-directory
            (alist-get 'state_files tramp-rpc-magit--status-cache))
-      ;; Check if file is under the prefetched directory
       (let* ((expanded (expand-file-name filename))
-             (prefetch-local (tramp-file-local-name tramp-rpc-magit--prefetch-directory))
-             (file-local (tramp-file-local-name expanded)))
-        (if (string-prefix-p prefetch-local file-local)
-            ;; File is under the prefetched directory - cache applies
-            (let* ((state-files (alist-get 'state_files tramp-rpc-magit--status-cache))
-                   ;; Extract the path relative to .git/
-                   (basename (if (string-match "/\\.git/\\(.+\\)$" file-local)
-                                 (match-string 1 file-local)
-                               (file-name-nondirectory filename))))
-              (if-let* ((entry (assoc (intern basename) state-files)))
+             (file-local (tramp-file-local-name expanded))
+             (state-files (alist-get 'state_files tramp-rpc-magit--status-cache))
+             ;; Get gitdir from status cache (could be relative like ".git"
+             ;; or absolute like "/path/to/.git")
+             (gitdir-raw (alist-get 'gitdir tramp-rpc-magit--status-cache))
+             (toplevel (alist-get 'toplevel tramp-rpc-magit--status-cache))
+             (abs-gitdir (when gitdir-raw
+                           (if (file-name-absolute-p gitdir-raw)
+                               gitdir-raw
+                             (concat (file-name-as-directory toplevel)
+                                     gitdir-raw))))
+             (gitdir-prefix (when abs-gitdir
+                              (file-name-as-directory abs-gitdir))))
+        (if (and gitdir-prefix
+                 (string-prefix-p gitdir-prefix file-local))
+            ;; File is under the gitdir - extract relative path
+            (let* ((relative (substring file-local (length gitdir-prefix)))
+                   ;; Try symbol key (msgpack-key-type 'symbol) then string
+                   (entry (or (assoc (intern relative) state-files)
+                              (assoc relative state-files))))
+              (if entry
                   (if (cdr entry) t nil)
                 'not-cached))
-          ;; File is outside the prefetched directory - cache doesn't apply
-          'not-cached))
+          ;; Not under gitdir - try fallback regex for unusual layouts
+          (if (string-match "/\\.git/\\(.+\\)$" file-local)
+              (let* ((relative (match-string 1 file-local))
+                     (entry (or (assoc (intern relative) state-files)
+                                (assoc relative state-files))))
+                (if entry
+                    (if (cdr entry) t nil)
+                  'not-cached))
+            'not-cached)))
     'not-cached))
 
 (defun tramp-rpc-magit--advice-setup-buffer (orig-fun directory &rest args)
-  "Advice around `magit-status-setup-buffer' to prefetch data."
+  "Advice around `magit-status-setup-buffer' to prefetch data.
+Suppresses fs.changed notifications during refresh to prevent
+inotify events (from git commands touching .git/index etc.) from
+clearing caches mid-refresh."
   (when (and (file-remote-p directory)
              (tramp-rpc-file-name-p directory))
     (tramp-rpc-magit--prefetch directory))
-  (unwind-protect
-      (apply orig-fun directory args)
-    ;; Only clear status cache - ancestors/prefetch-dir stay for other packages
-    (tramp-rpc-magit--clear-status-cache)))
+  (let ((tramp-rpc--suppress-fs-notifications t))
+    (unwind-protect
+        (apply orig-fun directory args)
+      ;; Clear status/process caches - ancestors/prefetch-dir stay for other packages
+      (tramp-rpc-magit--clear-status-cache)
+      ;; Flush file caches since we suppressed fs.changed during the refresh
+      (clrhash tramp-rpc--file-exists-cache)
+      (clrhash tramp-rpc--file-truename-cache))))
 
 (defun tramp-rpc-magit--advice-refresh-buffer (orig-fun &rest args)
-  "Advice around `magit-status-refresh-buffer' to prefetch data."
+  "Advice around `magit-status-refresh-buffer' to prefetch data.
+Suppresses fs.changed notifications during refresh to prevent
+inotify events from clearing caches mid-refresh."
   (when (and (file-remote-p default-directory)
              (tramp-rpc-file-name-p default-directory)
              (null tramp-rpc-magit--status-cache))
     (tramp-rpc-magit--prefetch default-directory))
-  (unwind-protect
-      (apply orig-fun args)
-    ;; Only clear status cache - ancestors/prefetch-dir stay for other packages
-    (tramp-rpc-magit--clear-status-cache)))
+  (let ((tramp-rpc--suppress-fs-notifications t))
+    (unwind-protect
+        (apply orig-fun args)
+      ;; Clear status/process caches - ancestors/prefetch-dir stay for other packages
+      (tramp-rpc-magit--clear-status-cache)
+      ;; Flush file caches since we suppressed fs.changed during the refresh
+      (clrhash tramp-rpc--file-exists-cache)
+      (clrhash tramp-rpc--file-truename-cache))))
 
 ;;;###autoload
 (defun tramp-rpc-magit-enable ()

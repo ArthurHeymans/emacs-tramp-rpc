@@ -69,12 +69,36 @@ fn collect_magit_status(directory: &str) -> HandlerResult {
             s.spawn(|| git_string(directory, &["rev-parse", "--abbrev-ref", "@{push}"]));
 
         // Staged changes (2 commands)
-        let staged_diff_h = s.spawn(|| git_output(directory, &["diff", "--cached", "--no-color"]));
+        // Use magit's exact flags: --ita-visible-in-index --no-ext-diff --no-prefix
+        let staged_diff_h = s.spawn(|| {
+            git_output(
+                directory,
+                &[
+                    "diff",
+                    "--ita-visible-in-index",
+                    "--cached",
+                    "--no-ext-diff",
+                    "--no-prefix",
+                    "--",
+                ],
+            )
+        });
         let staged_stat_h =
             s.spawn(|| git_string(directory, &["diff", "--cached", "--stat", "--no-color"]));
 
         // Unstaged changes (2 commands)
-        let unstaged_diff_h = s.spawn(|| git_output(directory, &["diff", "--no-color"]));
+        let unstaged_diff_h = s.spawn(|| {
+            git_output(
+                directory,
+                &[
+                    "diff",
+                    "--ita-visible-in-index",
+                    "--no-ext-diff",
+                    "--no-prefix",
+                    "--",
+                ],
+            )
+        });
         let unstaged_stat_h = s.spawn(|| git_string(directory, &["diff", "--stat", "--no-color"]));
 
         // Untracked files
@@ -91,11 +115,8 @@ fn collect_magit_status(directory: &str) -> HandlerResult {
             )
         });
 
-        // Stashes
-        let stashes_h = s.spawn(|| git_lines(directory, &["stash", "list", "--format=%gd\t%gs"]));
-
-        // Recent commits
-        let recent_h = s.spawn(|| git_lines(directory, &["log", "-20", "--format=%H\t%s", "HEAD"]));
+        // (Stash list and recent commits are now served via raw-format
+        // equivalents: stash_reflog and recent_decorated below.)
 
         // Tags (2 commands)
         let tag_at_head_h =
@@ -120,6 +141,80 @@ fn collect_magit_status(directory: &str) -> HandlerResult {
         let dir_clone2 = directory.to_string();
         let state_h = s.spawn(move || detect_repo_state(&dir_clone2, gitdir_clone2.as_deref()));
 
+        // === Additional commands matching magit's exact invocations ===
+
+        // Full config list (magit calls: config --list -z)
+        let config_list_h = s.spawn(|| git_output(directory, &["config", "--list", "-z"]));
+
+        // Tag descriptions in magit's format
+        let describe_long_h =
+            s.spawn(|| git_string(directory, &["describe", "--long", "--tags"]));
+        let describe_contains_h =
+            s.spawn(|| git_string(directory, &["describe", "--contains", "HEAD"]));
+
+        // Porcelain status (magit calls: status -z --porcelain --untracked-files=normal --)
+        let status_porcelain_h = s.spawn(|| {
+            git_output(
+                directory,
+                &[
+                    "status",
+                    "-z",
+                    "--porcelain",
+                    "--untracked-files=normal",
+                    "--",
+                ],
+            )
+        });
+
+        // showUntrackedFiles config
+        let config_untracked_h = s.spawn(|| {
+            git_string(
+                directory,
+                &[
+                    "config",
+                    "--local",
+                    "-z",
+                    "--get-all",
+                    "--include",
+                    "status.showUntrackedFiles",
+                ],
+            )
+        });
+
+        // Stash reflog (magit's format: %gd%x00%aN%x00%at%x00%gs)
+        let stash_reflog_h = s.spawn(|| {
+            git_output(
+                directory,
+                &[
+                    "reflog",
+                    "--format=%gd%x00%aN%x00%at%x00%gs",
+                    "refs/stash",
+                ],
+            )
+        });
+
+        // Parent commit info
+        let head_parent_short_h =
+            s.spawn(|| git_string(directory, &["rev-parse", "--short", "HEAD~"]));
+        let head_parent_10_h =
+            s.spawn(|| git_string(directory, &["rev-parse", "--verify", "HEAD~10"]));
+
+        // Recent log with decorations (magit's format)
+        let recent_decorated_h = s.spawn(|| {
+            git_output(
+                directory,
+                &[
+                    "log",
+                    "--format=%h%x0c%D%x0c%x0c%aN%x0c%at%x0c%x0c%s",
+                    "--decorate=full",
+                    "-n10",
+                    "--use-mailmap",
+                    "--no-prefix",
+                    "--",
+                ],
+            )
+        });
+
         // ---- Collect all results ----
         let head_hash = head_hash_h.join().unwrap();
         let head_short = head_short_h.join().unwrap();
@@ -132,14 +227,21 @@ fn collect_magit_status(directory: &str) -> HandlerResult {
         let unstaged_diff = unstaged_diff_h.join().unwrap();
         let unstaged_stat = unstaged_stat_h.join().unwrap();
         let untracked = untracked_h.join().unwrap();
-        let stashes = stashes_h.join().unwrap();
-        let recent = recent_h.join().unwrap();
         let tag_at_head = tag_at_head_h.join().unwrap();
         let tag_contains = tag_contains_h.join().unwrap();
         let remotes = remotes_h.join().unwrap();
         let config = config_h.join().unwrap();
         let state_files = state_files_h.join().unwrap();
         let state = state_h.join().unwrap();
+        let config_list = config_list_h.join().unwrap();
+        let describe_long = describe_long_h.join().unwrap();
+        let describe_contains = describe_contains_h.join().unwrap();
+        let status_porcelain = status_porcelain_h.join().unwrap();
+        let config_untracked = config_untracked_h.join().unwrap();
+        let stash_reflog = stash_reflog_h.join().unwrap();
+        let head_parent_short = head_parent_short_h.join().unwrap();
+        let head_parent_10 = head_parent_10_h.join().unwrap();
+        let recent_decorated = recent_decorated_h.join().unwrap();
 
         // Phase 3: Dependent operations (need upstream/push branch results)
         // These are quick since they're just rev-list counts
@@ -162,7 +264,7 @@ fn collect_magit_status(directory: &str) -> HandlerResult {
         };
 
         // Build result
-        let mut result: Vec<(Value, Value)> = Vec::with_capacity(16);
+        let mut result: Vec<(Value, Value)> = Vec::with_capacity(25);
 
         result.push(("toplevel".into_value(), toplevel.into_value()));
         result.push(("gitdir".into_value(), gitdir.into_value()));
@@ -215,40 +317,6 @@ fn collect_magit_status(directory: &str) -> HandlerResult {
 
         result.push(("untracked".into_value(), untracked.into_value()));
 
-        // Parse stashes
-        let stash_list: Vec<Value> = stashes
-            .iter()
-            .filter_map(|line| {
-                let parts: Vec<&str> = line.splitn(2, '\t').collect();
-                if parts.len() == 2 {
-                    Some(msgpack_map! {
-                        "ref" => parts[0].to_string().into_value(),
-                        "message" => parts[1].to_string().into_value()
-                    })
-                } else {
-                    None
-                }
-            })
-            .collect();
-        result.push(("stashes".into_value(), Value::Array(stash_list)));
-
-        // Parse recent commits
-        let recent_commits: Vec<Value> = recent
-            .iter()
-            .filter_map(|line| {
-                let parts: Vec<&str> = line.splitn(2, '\t').collect();
-                if parts.len() == 2 {
-                    Some(msgpack_map! {
-                        "hash" => parts[0].to_string().into_value(),
-                        "message" => parts[1].to_string().into_value()
-                    })
-                } else {
-                    None
-                }
-            })
-            .collect();
-        result.push(("recent_commits".into_value(), Value::Array(recent_commits)));
-
         result.push((
             "tags".into_value(),
             msgpack_map! {
@@ -260,6 +328,17 @@ fn collect_magit_status(directory: &str) -> HandlerResult {
         result.push(("remotes".into_value(), remotes.into_value()));
         result.push(("config".into_value(), config));
         result.push(("state_files".into_value(), state_files));
+
+        // Additional fields for magit's exact command patterns
+        result.push(("config_list".into_value(), config_list.into_value()));
+        result.push(("describe_long".into_value(), describe_long.into_value()));
+        result.push(("describe_contains".into_value(), describe_contains.into_value()));
+        result.push(("status_porcelain".into_value(), status_porcelain.into_value()));
+        result.push(("config_untracked".into_value(), config_untracked.into_value()));
+        result.push(("stash_reflog".into_value(), stash_reflog.into_value()));
+        result.push(("head_parent_short".into_value(), head_parent_short.into_value()));
+        result.push(("head_parent_10".into_value(), head_parent_10.into_value()));
+        result.push(("recent_decorated".into_value(), recent_decorated.into_value()));
 
         Ok(Value::Map(result))
     })
