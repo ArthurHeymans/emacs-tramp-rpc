@@ -1,9 +1,9 @@
 //! Request handlers for TRAMP-RPC operations
 
+pub mod commands;
 pub mod dir;
 pub mod file;
 pub mod io;
-pub mod magit;
 pub mod process;
 
 use crate::msgpack_map;
@@ -286,9 +286,9 @@ async fn dispatch_inner(request: &Request) -> Response {
         "system.statvfs" => system_statvfs(&request.params),
         "system.groups" => system_groups(),
 
-        // Magit operations (optimized for remote git status)
-        "magit.status" => magit::status(&request.params).await,
-        "ancestors.scan" => magit::ancestors_scan(&request.params).await,
+        // Parallel command execution and ancestor scanning
+        "commands.run_parallel" => commands::run_parallel(&request.params).await,
+        "ancestors.scan" => commands::ancestors_scan(&request.params).await,
 
         // Filesystem watch operations (for cache invalidation)
         "watch.add" => crate::watcher::handle_add(&request.params),

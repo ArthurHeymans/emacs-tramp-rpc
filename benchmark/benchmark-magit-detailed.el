@@ -22,7 +22,8 @@
 (declare-function tramp-rpc--call "tramp-rpc")
 (declare-function tramp-rpc--call-pipelined "tramp-rpc")
 (declare-function tramp-rpc-run-git-commands "tramp-rpc")
-(declare-function tramp-rpc-magit-status "tramp-rpc")
+(declare-function tramp-rpc-magit--prefetch-git-commands "tramp-rpc-magit")
+(declare-function tramp-rpc--decode-output "tramp-rpc")
 (declare-function tramp-rpc-magit-enable "tramp-rpc")
 (declare-function tramp-rpc-magit-disable "tramp-rpc")
 (declare-function magit-status-setup-buffer "magit-status")
@@ -268,43 +269,39 @@ Returns timing information for each command."
         (display-buffer (current-buffer))))))
 
 (defun tramp-rpc-magit-bench-batched-status ()
-  "Benchmark the tramp-rpc-magit-status RPC function."
+  "Benchmark the commands.run_parallel RPC for magit prefetch."
   (interactive)
   (let ((default-directory tramp-rpc-magit-bench-remote))
-    (message "Benchmarking server-side magit status RPC...")
-    
-    (let ((rpc-time
-           (tramp-rpc-magit-bench--time
-            (tramp-rpc-magit-status default-directory)))
-          (result (tramp-rpc-magit-status default-directory)))
-      
-      (with-current-buffer (get-buffer-create "*RPC Status Results*")
-        (erase-buffer)
-        (insert "Server-side Magit Status Results\n")
-        (insert "================================\n\n")
-        (insert (format "Remote: %s\n" tramp-rpc-magit-bench-remote))
-        (insert (format "Total time: %s\n\n"
-                        (tramp-rpc-magit-bench--format-time rpc-time)))
-        
-        (insert "Results gathered in single RPC call:\n")
-        (insert (make-string 50 ?-) "\n")
-        (insert (format "Toplevel:     %s\n" (alist-get 'toplevel result)))
-        (let ((head (alist-get 'head result)))
-          (insert (format "HEAD hash:    %s\n" (alist-get 'hash head)))
-          (insert (format "Branch:       %s\n" (alist-get 'branch head)))
-          (insert (format "HEAD message: %s\n" (alist-get 'message head))))
-        (let ((upstream (alist-get 'upstream result)))
-          (insert (format "Upstream:     %s\n" (alist-get 'branch upstream))))
-        (let ((push-info (alist-get 'push result)))
-          (insert (format "Push remote:  %s\n" (alist-get 'branch push-info))))
-        (insert (format "State:        %s\n" (alist-get 'state result)))
-        (insert (format "Stashes:      %d\n"
-                        (length (alist-get 'stashes result))))
-        (insert (format "Untracked:    %d files\n"
-                        (length (alist-get 'untracked result))))
-        
-        (goto-char (point-min))
-        (display-buffer (current-buffer))))))
+    (message "Benchmarking parallel command prefetch RPC...")
+    (with-parsed-tramp-file-name default-directory nil
+      (let* ((commands (tramp-rpc-magit--prefetch-git-commands localname))
+             (result nil)
+             (rpc-time
+              (tramp-rpc-magit-bench--time
+               (setq result (tramp-rpc--call v "commands.run_parallel"
+                                             `((commands . ,commands)))))))
+        (with-current-buffer (get-buffer-create "*RPC Status Results*")
+          (erase-buffer)
+          (insert "Parallel Command Prefetch Results\n")
+          (insert "=================================\n\n")
+          (insert (format "Remote: %s\n" tramp-rpc-magit-bench-remote))
+          (insert (format "Total time: %s\n"
+                          (tramp-rpc-magit-bench--format-time rpc-time)))
+          (insert (format "Commands:  %d\n\n" (length commands)))
+          (insert "Results:\n")
+          (insert (make-string 50 ?-) "\n")
+          (dolist (entry result)
+            (let* ((key (if (symbolp (car entry))
+                            (symbol-name (car entry))
+                          (car entry)))
+                   (data (cdr entry))
+                   (exit-code (alist-get 'exit_code data))
+                   (stdout (tramp-rpc--decode-output
+                            (alist-get 'stdout data) nil)))
+              (insert (format "%-50s exit=%d stdout=%d bytes\n"
+                              key exit-code (length (or stdout ""))))))
+          (goto-char (point-min))
+          (display-buffer (current-buffer)))))))
 
 ;;; Benchmark: Real magit-status
 

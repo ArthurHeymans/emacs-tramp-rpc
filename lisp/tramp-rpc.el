@@ -100,7 +100,6 @@
 ;; These are loaded after core definitions via require at the end of this file.
 (defvar tramp-rpc-magit--prefetch-directory)
 (defvar tramp-rpc-magit--debug)
-(defvar tramp-rpc-magit--status-cache)
 (defvar tramp-rpc-magit--process-file-cache)
 (defvar tramp-rpc-magit--ancestors-cache)
 (defvar tramp-rpc--file-exists-cache)
@@ -116,7 +115,6 @@
 (declare-function tramp-rpc--invalidate-cache-for-path "tramp-rpc-magit")
 (declare-function tramp-rpc--directory-watched-p "tramp-rpc-magit")
 (declare-function tramp-rpc--handle-notification "tramp-rpc-magit")
-(declare-function tramp-rpc-magit--state-file-exists-p "tramp-rpc-magit")
 (declare-function tramp-rpc-magit--file-exists-p "tramp-rpc-magit")
 (declare-function tramp-rpc-magit--process-cache-lookup "tramp-rpc-magit")
 (declare-function tramp-rpc-clear-file-exists-cache "tramp-rpc-magit")
@@ -1172,13 +1170,6 @@ Also caches RPC results to avoid repeated calls for the same path."
         (when tramp-rpc-magit--debug
           (message "file-exists-p HIT (prefetch-dir): %s -> t" filename))
         (throw 'result t))
-      ;; Check state files cache (git internal files)
-      (when tramp-rpc-magit--status-cache
-        (let ((cached (tramp-rpc-magit--state-file-exists-p filename)))
-          (unless (eq cached 'not-cached)
-            (when tramp-rpc-magit--debug
-              (message "file-exists-p HIT (state): %s -> %s" filename cached))
-            (throw 'result cached))))
       ;; Check ancestors cache (marker files like .git, .projectile)
       (when tramp-rpc-magit--ancestors-cache
         (let ((cached (tramp-rpc-magit--file-exists-p filename)))
