@@ -11,6 +11,7 @@
 
 mod handlers;
 mod protocol;
+mod watcher;
 
 use protocol::{Request, Response, RpcError};
 use std::sync::Arc;
@@ -18,10 +19,23 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt, BufWriter};
 use tokio::sync::Mutex;
 use tokio::task::JoinSet;
 
+/// Shared handle to the stdout writer, used by both response writing
+/// and the watcher's notification sending.
+pub type WriterHandle = Arc<Mutex<BufWriter<tokio::io::Stdout>>>;
+
 #[tokio::main]
 async fn main() {
     let mut stdin = tokio::io::stdin();
-    let stdout = Arc::new(Mutex::new(BufWriter::new(tokio::io::stdout())));
+    let stdout: WriterHandle = Arc::new(Mutex::new(BufWriter::new(tokio::io::stdout())));
+
+    // Initialize the filesystem watcher for cache invalidation notifications.
+    // If this fails (e.g. inotify not available), we continue without watching.
+    // NOTE: Do NOT use eprintln! here or anywhere in the server -- SSH forwards
+    // the remote process's stderr over the same pipe to Emacs, where it gets
+    // mixed with the binary msgpack protocol on stdout and corrupts framing.
+    if let Ok(manager) = watcher::WatchManager::new(Arc::clone(&stdout)) {
+        watcher::init(manager);
+    }
 
     let mut tasks: JoinSet<()> = JoinSet::new();
 
