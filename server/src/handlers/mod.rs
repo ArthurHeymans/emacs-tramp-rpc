@@ -152,16 +152,9 @@ fn system_groups() -> HandlerResult {
     Ok(Value::Array(group_info))
 }
 
-/// Get group name from gid
+/// Get group name from gid (delegates to file.rs's mutex-protected, cached version)
 fn get_group_name(gid: libc::gid_t) -> Option<String> {
-    unsafe {
-        let group = libc::getgrgid(gid);
-        if group.is_null() {
-            return None;
-        }
-        let name = std::ffi::CStr::from_ptr((*group).gr_name);
-        name.to_str().ok().map(|s| s.to_string())
-    }
+    file::get_group_name(gid)
 }
 
 /// Expand ~ to home directory

@@ -1,40 +1,115 @@
 //! Directory operations
+//!
+//! Optimized to use:
+//! - `d_type` from readdir to get file type without extra syscalls
+//! - `fstatat` with directory fd for efficient attribute collection
+//! - Synchronous blocking task to avoid per-entry async overhead
 
-use crate::protocol::{from_value, to_value, DirEntry, FileType, RpcError};
+use crate::protocol::{from_value, to_value, DirEntry, FileAttributes, FileType, RpcError};
 use rmpv::Value;
 use serde::Deserialize;
 use std::os::unix::ffi::OsStrExt;
-use std::os::unix::fs::FileTypeExt;
 use std::path::Path;
 use tokio::fs;
 
-use super::file::{bytes_to_path, get_file_attributes};
+use super::file::{bytes_to_path, map_io_error};
 use super::HandlerResult;
 
-/// Custom deserializer that accepts either a string or binary for paths
-mod path_or_bytes {
-    use serde::{self, Deserialize, Deserializer};
+use crate::protocol::path_or_bytes;
 
-    pub fn deserialize<'de, D>(deserializer: D) -> Result<Vec<u8>, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        #[derive(Deserialize)]
-        #[serde(untagged)]
-        enum StringOrBytes {
-            String(String),
-            #[serde(with = "serde_bytes")]
-            Bytes(Vec<u8>),
-        }
+/// Get FileAttributes using fstatat relative to directory fd
+fn get_file_attributes_at(
+    dir_fd: libc::c_int,
+    name: &[u8],
+    follow_symlinks: bool,
+) -> Option<FileAttributes> {
+    let mut stat_buf: libc::stat = unsafe { std::mem::zeroed() };
 
-        match StringOrBytes::deserialize(deserializer)? {
-            StringOrBytes::String(s) => Ok(s.into_bytes()),
-            StringOrBytes::Bytes(b) => Ok(b),
-        }
+    // Create null-terminated name
+    let mut name_cstr = name.to_vec();
+    name_cstr.push(0);
+
+    let flags = if follow_symlinks {
+        0
+    } else {
+        libc::AT_SYMLINK_NOFOLLOW
+    };
+
+    let result = unsafe {
+        libc::fstatat(
+            dir_fd,
+            name_cstr.as_ptr() as *const libc::c_char,
+            &mut stat_buf,
+            flags,
+        )
+    };
+
+    if result != 0 {
+        return None;
     }
+
+    // Determine file type from stat mode
+    let file_type = match stat_buf.st_mode & libc::S_IFMT {
+        libc::S_IFREG => FileType::File,
+        libc::S_IFDIR => FileType::Directory,
+        libc::S_IFLNK => FileType::Symlink,
+        libc::S_IFCHR => FileType::CharDevice,
+        libc::S_IFBLK => FileType::BlockDevice,
+        libc::S_IFIFO => FileType::Fifo,
+        libc::S_IFSOCK => FileType::Socket,
+        _ => FileType::Unknown,
+    };
+
+    // Get link target if symlink
+    let link_target = if file_type == FileType::Symlink {
+        let full_name = if name == b"." || name == b".." {
+            // For . and .., we need the full path for readlink
+            None
+        } else {
+            // Use readlinkat with the dir fd
+            let mut buf = vec![0u8; 4096];
+            let len = unsafe {
+                libc::readlinkat(
+                    dir_fd,
+                    name_cstr.as_ptr() as *const libc::c_char,
+                    buf.as_mut_ptr() as *mut libc::c_char,
+                    buf.len(),
+                )
+            };
+            if len >= 0 {
+                buf.truncate(len as usize);
+                Some(String::from_utf8_lossy(&buf).to_string())
+            } else {
+                None
+            }
+        };
+        full_name
+    } else {
+        None
+    };
+
+    let uid = stat_buf.st_uid;
+    let gid = stat_buf.st_gid;
+
+    Some(FileAttributes {
+        file_type,
+        nlinks: stat_buf.st_nlink as u64,
+        uid,
+        gid,
+        uname: super::file::get_user_name(uid),
+        gname: super::file::get_group_name(gid),
+        atime: stat_buf.st_atime as i64,
+        mtime: stat_buf.st_mtime as i64,
+        ctime: stat_buf.st_ctime as i64,
+        size: stat_buf.st_size as u64,
+        mode: stat_buf.st_mode,
+        inode: stat_buf.st_ino as u64,
+        dev: stat_buf.st_dev as u64,
+        link_target,
+    })
 }
 
-/// List directory contents
+/// List directory contents using optimized synchronous I/O with d_type and fstatat
 pub async fn list(params: &Value) -> HandlerResult {
     #[derive(Deserialize)]
     struct Params {
@@ -57,72 +132,99 @@ pub async fn list(params: &Value) -> HandlerResult {
 
     let path = bytes_to_path(&params.path);
     let path_str = path.to_string_lossy().to_string();
+    let include_attrs = params.include_attrs;
+    let include_hidden = params.include_hidden;
 
-    let mut entries = fs::read_dir(&path)
-        .await
-        .map_err(|e| super::file::map_io_error(e, &path_str))?;
+    // Do all I/O in a single blocking task for efficiency
+    let results =
+        tokio::task::spawn_blocking(move || list_dir_sync(&path, include_attrs, include_hidden))
+            .await
+            .map_err(|e| RpcError::internal_error(format!("Task join error: {}", e)))?
+            .map_err(|e| map_io_error(e, &path_str))?;
+
+    // Convert to array of map values with named fields
+    let values: Vec<Value> = results.iter().map(|e| e.to_value()).collect();
+    Ok(Value::Array(values))
+}
+
+/// Synchronous directory listing with d_type and fstatat optimizations
+fn list_dir_sync(
+    path: &Path,
+    include_attrs: bool,
+    include_hidden: bool,
+) -> Result<Vec<DirEntry>, std::io::Error> {
+    // Open directory fd for fstatat
+    let dir_fd = if include_attrs {
+        let mut path_cstr = path.as_os_str().as_bytes().to_vec();
+        path_cstr.push(0);
+        let fd = unsafe {
+            libc::open(
+                path_cstr.as_ptr() as *const libc::c_char,
+                libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC,
+            )
+        };
+        if fd < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        Some(fd)
+    } else {
+        None
+    };
+
+    // Ensure we close the fd on all exit paths
+    struct DirFdGuard(Option<libc::c_int>);
+    impl Drop for DirFdGuard {
+        fn drop(&mut self) {
+            if let Some(fd) = self.0 {
+                unsafe {
+                    libc::close(fd);
+                }
+            }
+        }
+    }
+    let _guard = DirFdGuard(dir_fd);
 
     let mut results: Vec<DirEntry> = Vec::new();
 
     // Add . and .. entries
-    if params.include_hidden {
+    if include_hidden {
         results.push(DirEntry {
             name: b".".to_vec(),
             file_type: FileType::Directory,
-            attrs: if params.include_attrs {
-                get_file_attributes(&path, false).await.ok()
-            } else {
-                None
-            },
+            attrs: dir_fd.and_then(|fd| get_file_attributes_at(fd, b".", true)),
         });
 
-        let parent = path.parent().unwrap_or(&path);
         results.push(DirEntry {
             name: b"..".to_vec(),
             file_type: FileType::Directory,
-            attrs: if params.include_attrs {
-                get_file_attributes(parent, false).await.ok()
-            } else {
-                None
-            },
+            attrs: dir_fd.and_then(|fd| get_file_attributes_at(fd, b"..", true)),
         });
     }
 
-    while let Ok(Some(entry)) = entries.next_entry().await {
-        // Get filename as raw bytes (no encoding needed!)
+    // Use std::fs::read_dir which exposes d_type on Linux via DirEntry::file_type()
+    let read_dir = std::fs::read_dir(path)?;
+
+    for entry_result in read_dir {
+        let entry = entry_result?;
         let name_bytes = entry.file_name().as_bytes().to_vec();
 
         // Skip hidden files if not requested
         let is_hidden = name_bytes.first() == Some(&b'.');
-        if !params.include_hidden && is_hidden {
+        if !include_hidden && is_hidden {
             continue;
         }
 
-        let file_type = match entry.file_type().await {
-            Ok(ft) => {
-                if ft.is_file() {
-                    FileType::File
-                } else if ft.is_dir() {
-                    FileType::Directory
-                } else if ft.is_symlink() {
-                    FileType::Symlink
-                } else if ft.is_char_device() {
-                    FileType::CharDevice
-                } else if ft.is_block_device() {
-                    FileType::BlockDevice
-                } else if ft.is_fifo() {
-                    FileType::Fifo
-                } else if ft.is_socket() {
-                    FileType::Socket
-                } else {
-                    FileType::Unknown
-                }
-            }
+        // Get file type - std::fs::DirEntry::file_type() uses d_type on Linux
+        // (no extra syscall needed unless d_type is DT_UNKNOWN)
+        let file_type = match entry.file_type() {
+            Ok(ft) => file_type_from_metadata_ft(&ft),
             Err(_) => FileType::Unknown,
         };
 
-        let attrs = if params.include_attrs {
-            get_file_attributes(&entry.path(), true).await.ok()
+        let attrs = if include_attrs {
+            // Use lstat (follow_symlinks=false) so symlinks show as symlinks
+            // with their link_target resolved, matching Emacs expectations
+            dir_fd.and_then(|fd| get_file_attributes_at(fd, &name_bytes, false))
         } else {
             None
         };
@@ -137,9 +239,29 @@ pub async fn list(params: &Value) -> HandlerResult {
     // Sort by name
     results.sort_by(|a, b| a.name.cmp(&b.name));
 
-    // Convert to array of map values with named fields
-    let values: Vec<Value> = results.iter().map(|e| e.to_value()).collect();
-    Ok(Value::Array(values))
+    Ok(results)
+}
+
+/// Convert std::fs::FileType to our FileType
+fn file_type_from_metadata_ft(ft: &std::fs::FileType) -> FileType {
+    use std::os::unix::fs::FileTypeExt;
+    if ft.is_file() {
+        FileType::File
+    } else if ft.is_dir() {
+        FileType::Directory
+    } else if ft.is_symlink() {
+        FileType::Symlink
+    } else if ft.is_char_device() {
+        FileType::CharDevice
+    } else if ft.is_block_device() {
+        FileType::BlockDevice
+    } else if ft.is_fifo() {
+        FileType::Fifo
+    } else if ft.is_socket() {
+        FileType::Socket
+    } else {
+        FileType::Unknown
+    }
 }
 
 /// Create a directory
@@ -172,7 +294,7 @@ pub async fn create(params: &Value) -> HandlerResult {
         fs::create_dir(&path).await
     };
 
-    result.map_err(|e| super::file::map_io_error(e, &path_str))?;
+    result.map_err(|e| map_io_error(e, &path_str))?;
 
     // Set permissions
     #[cfg(unix)]
@@ -181,7 +303,7 @@ pub async fn create(params: &Value) -> HandlerResult {
         let perms = std::fs::Permissions::from_mode(params.mode);
         fs::set_permissions(&path, perms)
             .await
-            .map_err(|e| super::file::map_io_error(e, &path_str))?;
+            .map_err(|e| map_io_error(e, &path_str))?;
     }
 
     Ok(Value::Boolean(true))
@@ -210,7 +332,7 @@ pub async fn remove(params: &Value) -> HandlerResult {
         fs::remove_dir(&path).await
     };
 
-    result.map_err(|e| super::file::map_io_error(e, &path_str))?;
+    result.map_err(|e| map_io_error(e, &path_str))?;
 
     Ok(Value::Boolean(true))
 }
@@ -228,26 +350,29 @@ pub async fn completions(params: &Value) -> HandlerResult {
     let params: Params =
         from_value(params.clone()).map_err(|e| RpcError::invalid_params(e.to_string()))?;
 
-    let dir_path = Path::new(&params.directory);
+    let directory = params.directory.clone();
+    let prefix = params.prefix.clone();
 
-    let mut entries = fs::read_dir(dir_path)
+    // Use synchronous I/O in blocking task - d_type gives us directory detection for free
+    let completions = tokio::task::spawn_blocking(move || completions_sync(&directory, &prefix))
         .await
-        .map_err(|e| super::file::map_io_error(e, &params.directory))?;
+        .map_err(|e| RpcError::internal_error(format!("Task join error: {}", e)))?
+        .map_err(|e| map_io_error(e, &params.directory))?;
 
+    to_value(&completions).map_err(|e| RpcError::internal_error(e.to_string()))
+}
+
+/// Synchronous completions using d_type for directory detection
+fn completions_sync(directory: &str, prefix: &str) -> Result<Vec<String>, std::io::Error> {
     let mut completions: Vec<String> = Vec::new();
 
-    while let Ok(Some(entry)) = entries.next_entry().await {
+    for entry_result in std::fs::read_dir(directory)? {
+        let entry = entry_result?;
         let name = entry.file_name().to_string_lossy().to_string();
 
-        // Check if name starts with prefix
-        if name.starts_with(&params.prefix) {
-            // Append / for directories
-            let suffix = if entry
-                .file_type()
-                .await
-                .map(|ft| ft.is_dir())
-                .unwrap_or(false)
-            {
+        if name.starts_with(prefix) {
+            // file_type() uses d_type on Linux - no extra stat syscall
+            let suffix = if entry.file_type().map(|ft| ft.is_dir()).unwrap_or(false) {
                 "/"
             } else {
                 ""
@@ -257,6 +382,5 @@ pub async fn completions(params: &Value) -> HandlerResult {
     }
 
     completions.sort();
-
-    to_value(&completions).map_err(|e| RpcError::internal_error(e.to_string()))
+    Ok(completions)
 }

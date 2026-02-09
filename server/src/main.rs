@@ -36,8 +36,17 @@ async fn main() {
 
         // Sanity check - reject obviously invalid lengths
         if len > 100 * 1024 * 1024 {
-            // 100MB max message size
-            eprintln!("Message too large: {} bytes", len);
+            // 100MB max message size - drain the payload to keep framing in sync
+            // (cannot use eprintln! as SSH merges stderr with stdout)
+            let mut discard = vec![0u8; 8192];
+            let mut remaining = len;
+            while remaining > 0 {
+                let to_read = remaining.min(discard.len());
+                if stdin.read_exact(&mut discard[..to_read]).await.is_err() {
+                    break;
+                }
+                remaining -= to_read;
+            }
             continue;
         }
 
