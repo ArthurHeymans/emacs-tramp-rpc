@@ -91,6 +91,61 @@ The binary is cached locally in =~/.emacs.d/tramp-rpc/= and deployed to =~/.cach
 └─────────────┘                        └──────────────────┘
 #+end_example
 
+** Module Organization
+
+The Emacs Lisp client is organized into focused modules:
+
+| Module                     | Lines | Purpose                                    |
+|----------------------------+-------+--------------------------------------------|
+| ~tramp-rpc.el~             | 2626  | Core RPC communication & file handlers     |
+| ~tramp-rpc-process.el~     | 1012  | Async process & PTY support                |
+| ~tramp-rpc-magit.el~       | 1000  | Git/Magit/Projectile optimizations         |
+| ~tramp-rpc-advice.el~      | 328   | Advice functions for process/VC integration|
+| ~tramp-rpc-protocol.el~    | 178   | MessagePack-RPC protocol implementation    |
+| ~tramp-rpc-deploy.el~      | 774   | Binary deployment & version management     |
+| ~tramp-rpc-autoloads.el~   | 43    | Package autoloads                          |
+
+*** Core Module (~tramp-rpc.el~)
+
+The core module provides:
+- SSH ControlMaster connection management
+- RPC call/batch/pipeline primitives
+- Direnv environment caching for processes
+- All TRAMP file handler operations (~file-exists-p~, ~file-attributes~, ~insert-file-contents~, etc.)
+- File name handler registration and dispatch
+
+*** Process Module (~tramp-rpc-process.el~)
+
+Handles all process-related functionality:
+- Async pipe processes (~make-process~, ~start-file-process~)
+- PTY processes with two modes:
+  - *Direct SSH PTY* (default): Low-latency terminals via SSH ~-t~ flag
+  - *RPC-based PTY* (fallback): PTY tunneled through RPC server
+- Terminal resize handling for vterm/eat/shell-mode
+- Process I/O queuing with async callback-based reading
+- Adaptive polling for long-running processes
+
+*** Magit Module (~tramp-rpc-magit.el~)
+
+Performance optimizations for git operations:
+- *Server-side prefetch*: Single RPC replaces ~60+ git commands
+- *Process-file cache*: Serves git commands from prefetched data
+- *Ancestor scanning*: Fast project/VC root detection
+- *File-exists cache*: TTL-based caching with automatic invalidation
+- *Filesystem watching*: Inotify-based cache invalidation via server push
+- *Projectile integration*: Optimized remote directory operations
+
+*** Advice Module (~tramp-rpc-advice.el~)
+
+Centralizes all advice functions:
+- Process I/O: ~process-send-string~, ~process-send-region~, ~process-send-eof~
+- Process info: ~signal-process~, ~process-status~, ~process-exit-status~
+- Process metadata: ~process-command~, ~process-tty-name~
+- VC integration: ~vc-call-backend~ for proper ~default-directory~ handling
+- Eglot integration: Bypass shell wrapping for RPC connections
+
+** RPC Server Methods
+
 The server exposes RPC methods for:
 
 | Category  | Methods                                                  |
