@@ -100,6 +100,11 @@
 (declare-function tramp-rpc-clear-file-exists-cache "tramp-rpc-magit")
 (declare-function tramp-rpc-clear-file-truename-cache "tramp-rpc-magit")
 (declare-function tramp-rpc--cleanup-watches-for-connection "tramp-rpc-magit")
+(declare-function tramp-rpc-magit--process-cache-lookup "tramp-rpc-magit")
+(declare-function tramp-rpc-magit--file-exists-p "tramp-rpc-magit")
+(declare-function tramp-rpc-magit--clear-cache "tramp-rpc-magit")
+(defvar tramp-rpc-magit--debug)
+(defvar tramp-rpc-magit--process-caches)
 
 (defvar tramp-rpc--readonly-programs
   '("git" "ls" "cat" "find" "grep" "rg" "test" "stat" "head" "tail"
@@ -1873,71 +1878,129 @@ Returns t on success, nil on failure."
 ;; Process operations
 ;; ============================================================================
 
+(defun tramp-rpc-run-git-commands (directory commands)
+  "Run multiple git COMMANDS in DIRECTORY using pipelined RPC.
+COMMANDS is a list of lists, where each sublist is arguments to git.
+For example: ((\"rev-parse\" \"HEAD\") (\"status\" \"--porcelain\"))
+
+Returns a list of plists, each containing:
+  :exit-code - the exit code of the command
+  :stdout    - standard output as a string
+  :stderr    - standard error as a string
+
+This is much faster than running each command sequentially over TRAMP
+because all commands are sent in a single network round-trip."
+  (with-parsed-tramp-file-name directory nil
+    (let* ((requests
+            (mapcar (lambda (args)
+                      (cons "process.run"
+                            `((cmd . "git")
+                              (args . ,(vconcat args))
+                              (cwd . ,localname))))
+                    commands))
+           (results (tramp-rpc--call-pipelined v requests)))
+      ;; Convert results to a more convenient format
+      (mapcar (lambda (result)
+                (if (plist-get result :error)
+                    (list :exit-code -1
+                          :stdout ""
+                          :stderr (or (plist-get result :message) "RPC error"))
+                  (list :exit-code (alist-get 'exit_code result)
+                        :stdout (tramp-rpc--decode-output
+                                 (alist-get 'stdout result)
+                                 (alist-get 'stdout_encoding result))
+                        :stderr (tramp-rpc--decode-output
+                                 (alist-get 'stderr result)
+                                 (alist-get 'stderr_encoding result)))))
+              results))))
+
+(defun tramp-rpc--route-process-file-output (destination stdout &optional stderr)
+  "Route process-file STDOUT and STDERR according to DESTINATION.
+DESTINATION follows the `process-file' convention:
+  nil       - discard
+  t         - insert into current buffer
+  string    - write to file
+  buffer    - insert into buffer
+  (stdout-dest . stderr-dest) - cons for separate handling"
+  (cond
+   ((null destination) nil)
+   ((eq destination t)
+    (insert stdout))
+   ((stringp destination)
+    (with-temp-file destination
+      (insert stdout)))
+   ((bufferp destination)
+    (with-current-buffer destination
+      (insert stdout)))
+   ((consp destination)
+    (let ((stdout-dest (car destination))
+          (stderr-dest (cadr destination)))
+      (when stdout-dest
+        (cond
+         ((eq stdout-dest t) (insert stdout))
+         ((stringp stdout-dest)
+          (with-temp-file stdout-dest (insert stdout)))
+         ((bufferp stdout-dest)
+          (with-current-buffer stdout-dest (insert stdout)))))
+      (when (and stderr-dest stderr)
+        (cond
+         ((stringp stderr-dest)
+          (with-temp-file stderr-dest (insert stderr)))
+         ((bufferp stderr-dest)
+          (with-current-buffer stderr-dest (insert stderr)))))))))
+
 (defun tramp-rpc-handle-process-file
     (program &optional infile destination _display &rest args)
   "Like `process-file' for TRAMP-RPC files.
-Resolves PROGRAM path and loads direnv environment from working directory."
+Resolves PROGRAM path and loads direnv environment from working directory.
+When `tramp-rpc-magit--process-caches' is populated (during magit
+refresh), git commands are served from the prefetch cache when possible."
   (with-parsed-tramp-file-name default-directory nil
-    (let* ((resolved-program (tramp-rpc--resolve-executable v program))
-           (direnv-env (tramp-rpc--get-direnv-environment v localname))
-           (stdin-content (when (and infile (not (eq infile t)))
-                            (with-temp-buffer
-                              (set-buffer-multibyte nil)
-                              (insert-file-contents-literally infile)
-                              (buffer-string))))
-           (result (tramp-rpc--call v "process.run"
-                                    `((cmd . ,resolved-program)
-                                      (args . ,(vconcat args))
-                                      (cwd . ,localname)
-                                      ,@(when direnv-env
-                                          `((env . ,direnv-env)))
-                                      ,@(when stdin-content
-                                          `((stdin . ,stdin-content))))))
-           (exit-code (alist-get 'exit_code result))
-           (stdout (tramp-rpc--decode-output
-                    (alist-get 'stdout result)
-                    (alist-get 'stdout_encoding result)))
-           (stderr (tramp-rpc--decode-output
-                    (alist-get 'stderr result)
-                    (alist-get 'stderr_encoding result))))
+    ;; Try serving from magit prefetch cache first (no RPC needed)
+    (let ((cached (when (null infile)  ; no stdin redirection
+                    (tramp-rpc-magit--process-cache-lookup program args))))
+      (if cached
+          ;; Cache hit - serve from prefetch
+          (let ((exit-code (car cached))
+                (stdout (cdr cached)))
+            (tramp-rpc--route-process-file-output destination stdout)
+            exit-code)
+        ;; Cache miss - make actual RPC call
+        (let* ((resolved-program (tramp-rpc--resolve-executable v program))
+               (direnv-env (tramp-rpc--get-direnv-environment v localname))
+               (stdin-content (when (and infile (not (eq infile t)))
+                                (with-temp-buffer
+                                  (set-buffer-multibyte nil)
+                                  (insert-file-contents-literally infile)
+                                  (buffer-string))))
+               (result (tramp-rpc--call v "process.run"
+                                        `((cmd . ,resolved-program)
+                                          (args . ,(vconcat args))
+                                          (cwd . ,localname)
+                                          ,@(when direnv-env
+                                              `((env . ,direnv-env)))
+                                          ,@(when stdin-content
+                                              `((stdin . ,stdin-content))))))
+               (exit-code (alist-get 'exit_code result))
+               (stdout (tramp-rpc--decode-output
+                        (alist-get 'stdout result)
+                        (alist-get 'stdout_encoding result)))
+               (stderr (tramp-rpc--decode-output
+                        (alist-get 'stderr result)
+                        (alist-get 'stderr_encoding result))))
 
-      ;; Handle destination
-      (cond
-       ((null destination) nil)
-       ((eq destination t)
-        (insert stdout))
-       ((stringp destination)
-        (with-temp-file destination
-          (insert stdout)))
-       ((bufferp destination)
-        (with-current-buffer destination
-          (insert stdout)))
-       ((consp destination)
-        (let ((stdout-dest (car destination))
-              (stderr-dest (cadr destination)))
-          (when stdout-dest
-            (cond
-             ((eq stdout-dest t) (insert stdout))
-             ((stringp stdout-dest)
-              (with-temp-file stdout-dest (insert stdout)))
-             ((bufferp stdout-dest)
-              (with-current-buffer stdout-dest (insert stdout)))))
-          (when stderr-dest
-            (cond
-             ((stringp stderr-dest)
-              (with-temp-file stderr-dest (insert stderr)))
-             ((bufferp stderr-dest)
-              (with-current-buffer stderr-dest (insert stderr))))))))
+          ;; Handle destination
+          (tramp-rpc--route-process-file-output destination stdout stderr)
 
-      ;; Invalidate caches if the program might modify the filesystem
-      ;; and the directory isn't being watched (watched dirs get
-      ;; server-pushed invalidation)
-      (let ((program-name (file-name-nondirectory program)))
-        (unless (or (member program-name tramp-rpc--readonly-programs)
-                    (tramp-rpc--directory-watched-p localname v))
-          (tramp-rpc--invalidate-cache-for-path default-directory)))
+          ;; Invalidate caches if the program might modify the filesystem
+          ;; and the directory isn't being watched (watched dirs get
+          ;; server-pushed invalidation)
+          (let ((program-name (file-name-nondirectory program)))
+            (unless (or (member program-name tramp-rpc--readonly-programs)
+                        (tramp-rpc--directory-watched-p localname v))
+              (tramp-rpc--invalidate-cache-for-path default-directory)))
 
-      exit-code)))
+          exit-code)))))
 
 (defun tramp-rpc-handle-shell-command (command &optional output-buffer error-buffer)
   "Like `shell-command' for TRAMP-RPC files."
