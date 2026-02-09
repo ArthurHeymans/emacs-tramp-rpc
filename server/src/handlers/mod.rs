@@ -1,5 +1,6 @@
 //! Request handlers for TRAMP-RPC operations
 
+pub mod commands;
 pub mod dir;
 pub mod file;
 pub mod io;
@@ -285,7 +286,11 @@ async fn dispatch_inner(request: &Request) -> Response {
         "system.statvfs" => system_statvfs(&request.params),
         "system.groups" => system_groups(),
 
-        // Filesystem watching
+        // Parallel command execution and ancestor scanning
+        "commands.run_parallel" => commands::run_parallel(&request.params).await,
+        "ancestors.scan" => commands::ancestors_scan(&request.params).await,
+
+        // Filesystem watch operations (for cache invalidation)
         "watch.add" => crate::watcher::handle_add(&request.params),
         "watch.remove" => crate::watcher::handle_remove(&request.params),
         "watch.list" => crate::watcher::handle_list(&request.params),
