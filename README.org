@@ -91,6 +91,53 @@ The binary is cached locally in =~/.emacs.d/tramp-rpc/= and deployed to =~/.cach
 └─────────────┘                        └──────────────────┘
 #+end_example
 
+** Module Organization
+
+The Emacs Lisp client is organized into focused modules:
+
+| Module                     | Lines | Purpose                                    |
+|----------------------------+-------+--------------------------------------------|
+| ~tramp-rpc.el~             | ~2280 | Core RPC communication & file handlers     |
+| ~tramp-rpc-process.el~     | ~900  | Async process & PTY support                |
+| ~tramp-rpc-magit.el~       | (stub)| Git/Magit/Projectile optimizations (TBD)   |
+| ~tramp-rpc-advice.el~      | ~320  | Advice functions for process/VC integration|
+| ~tramp-rpc-protocol.el~    | 178   | MessagePack-RPC protocol implementation    |
+| ~tramp-rpc-deploy.el~      | 774   | Binary deployment & version management     |
+| ~tramp-rpc-autoloads.el~   | 43    | Package autoloads                          |
+
+*** Core Module (~tramp-rpc.el~)
+
+The core module provides:
+- SSH ControlMaster connection management
+- RPC call/batch/pipeline primitives
+- Direnv environment caching for processes
+- All TRAMP file handler operations (~file-exists-p~, ~file-attributes~, ~insert-file-contents~, etc.)
+- File name handler registration and dispatch
+
+*** Process Module (~tramp-rpc-process.el~)
+
+Handles all process-related functionality:
+- Async pipe processes (~make-process~, ~start-file-process~)
+- RPC-based PTY processes for terminal emulators
+- Terminal resize handling for vterm/eat/shell-mode
+- Process I/O queuing with async callback-based reading
+- Adaptive polling for long-running processes
+
+*** Magit Module (~tramp-rpc-magit.el~)
+
+Placeholder module for git/magit/projectile optimizations (to be added in future branches).
+
+*** Advice Module (~tramp-rpc-advice.el~)
+
+Centralizes all advice functions:
+- Process I/O: ~process-send-string~, ~process-send-region~, ~process-send-eof~
+- Process info: ~signal-process~, ~process-status~, ~process-exit-status~
+- Process metadata: ~process-command~, ~process-tty-name~
+- VC integration: ~vc-call-backend~ for proper ~default-directory~ handling
+- Eglot integration: Bypass shell wrapping for RPC connections
+
+** RPC Server Methods
+
 The server exposes RPC methods for:
 
 | Category  | Methods                                                  |
