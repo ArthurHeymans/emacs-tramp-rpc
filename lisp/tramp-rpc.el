@@ -87,6 +87,30 @@
 ;; Silence byte-compiler warnings for functions defined elsewhere
 ;; (vterm variables are declared in tramp-rpc-process.el)
 
+;; Forward declarations for cache/watch functions (tramp-rpc-magit.el)
+(defvar tramp-rpc--file-exists-cache)
+(defvar tramp-rpc--file-truename-cache)
+(defvar tramp-rpc--suppress-fs-notifications)
+(defvar tramp-rpc--watched-directories)
+(declare-function tramp-rpc--cache-get "tramp-rpc-magit")
+(declare-function tramp-rpc--cache-put "tramp-rpc-magit")
+(declare-function tramp-rpc--invalidate-cache-for-path "tramp-rpc-magit")
+(declare-function tramp-rpc--directory-watched-p "tramp-rpc-magit")
+(declare-function tramp-rpc--handle-notification "tramp-rpc-magit")
+(declare-function tramp-rpc-clear-file-exists-cache "tramp-rpc-magit")
+(declare-function tramp-rpc-clear-file-truename-cache "tramp-rpc-magit")
+(declare-function tramp-rpc--cleanup-watches-for-connection "tramp-rpc-magit")
+
+(defvar tramp-rpc--readonly-programs
+  '("git" "ls" "cat" "find" "grep" "rg" "test" "stat" "head" "tail"
+    "wc" "sort" "uniq" "diff" "comm" "file" "readlink" "realpath"
+    "which" "whereis" "id" "whoami" "hostname" "uname" "env" "printenv"
+    "date" "du" "df" "free" "uptime" "ps" "top" "awk" "sed" "tr"
+    "cut" "paste" "join" "tee" "xargs" "basename" "dirname" "sha256sum"
+    "md5sum" "true" "false" "echo" "printf")
+  "Programs known to not modify the filesystem.
+Used to skip cache invalidation in `tramp-rpc-handle-process-file'.")
+
 (defgroup tramp-rpc nil
   "TRAMP backend using RPC."
   :group 'tramp)
@@ -562,6 +586,9 @@ Returns non-nil on success."
     ;; Store connection
     (tramp-rpc--set-connection vec process buffer)
 
+    ;; Store vec on the process so notifications can identify the connection
+    (process-put process :tramp-rpc-vec vec)
+
     ;; Wait for server to be ready by sending a ping
     (let ((response (tramp-rpc--call vec "system.info" nil)))
       (unless response
@@ -578,6 +605,8 @@ Returns non-nil on success."
   ;; First, clean up any async and PTY processes for this connection
   (tramp-rpc--cleanup-async-processes vec)
   (tramp-rpc--cleanup-pty-processes vec)
+  ;; Clean up watched directory entries for this connection
+  (tramp-rpc--cleanup-watches-for-connection vec)
   (let ((conn (tramp-rpc--get-connection vec)))
     (when conn
       (let ((process (plist-get conn :process)))
@@ -614,17 +643,23 @@ Uses length-prefixed binary framing: <4-byte BE length><msgpack payload>."
                 (erase-buffer)
                 (insert remaining)
                 (goto-char (point-min))
-                ;; Handle the response
-                (let* ((id (plist-get response :id))
-                       (callback (gethash id tramp-rpc--async-callbacks)))
-                  (if callback
-                      (progn
-                        (tramp-rpc--debug "FILTER dispatching async id=%s" id)
-                        (remhash id tramp-rpc--async-callbacks)
-                        (funcall callback response))
-                    ;; Not an async response - store for sync code
-                    (tramp-rpc--debug "FILTER storing sync response id=%s" id)
-                    (puthash id response (tramp-rpc--get-pending-responses buffer))))))))))))
+                ;; Check for server-initiated notification (no id, has method)
+                (if (plist-get response :notification)
+                    (tramp-rpc--handle-notification
+                     process
+                     (plist-get response :method)
+                     (plist-get response :params))
+                  ;; Handle normal response
+                  (let* ((id (plist-get response :id))
+                         (callback (gethash id tramp-rpc--async-callbacks)))
+                    (if callback
+                        (progn
+                          (tramp-rpc--debug "FILTER dispatching async id=%s" id)
+                          (remhash id tramp-rpc--async-callbacks)
+                          (funcall callback response))
+                      ;; Not an async response - store for sync code
+                      (tramp-rpc--debug "FILTER storing sync response id=%s" id)
+                      (puthash id response (tramp-rpc--get-pending-responses buffer)))))))))))))
 
 (defun tramp-rpc--call-async (vec method params callback)
   "Call METHOD with PARAMS asynchronously on the RPC server for VEC.
@@ -994,8 +1029,13 @@ Returns an alist with path."
 
 (defun tramp-rpc-handle-file-exists-p (filename)
   "Like `file-exists-p' for TRAMP-RPC files."
-  (with-parsed-tramp-file-name filename nil
-    (tramp-rpc--call v "file.exists" (tramp-rpc--encode-path localname))))
+  (let ((expanded (expand-file-name filename)))
+    (or (tramp-rpc--cache-get tramp-rpc--file-exists-cache expanded)
+        (with-parsed-tramp-file-name filename nil
+          (let ((result (tramp-rpc--call v "file.exists"
+                                         (tramp-rpc--encode-path localname))))
+            (tramp-rpc--cache-put tramp-rpc--file-exists-cache expanded result)
+            result)))))
 
 (defun tramp-rpc-handle-file-readable-p (filename)
   "Like `file-readable-p' for TRAMP-RPC files."
@@ -1103,22 +1143,33 @@ If LSTAT is non-nil, don't follow symlinks."
   "Like `file-truename' for TRAMP-RPC files.
 If the file doesn't exist, return FILENAME unchanged
 \(like local `file-truename')."
-  (with-parsed-tramp-file-name filename nil
-    (condition-case nil
-        (let* ((result (tramp-rpc--call v "file.truename" (tramp-rpc--encode-path localname)))
-               ;; With MessagePack, path comes as raw bytes - decode to UTF-8
-               (path (tramp-rpc--decode-string
-                      (if (stringp result)
-                          result  ; Direct binary result
-                        (alist-get 'path result)))))  ; Or in result object
-          (tramp-make-tramp-file-name v path))
-      ;; If file doesn't exist, return the filename unchanged
-      (file-missing filename))))
+  (let* ((expanded (expand-file-name filename))
+         (cached (tramp-rpc--cache-get tramp-rpc--file-truename-cache expanded)))
+    (or cached
+        (with-parsed-tramp-file-name filename nil
+          (condition-case nil
+              (let* ((result (tramp-rpc--call v "file.truename"
+                                              (tramp-rpc--encode-path localname)))
+                     ;; With MessagePack, path comes as raw bytes - decode to UTF-8
+                     (path (tramp-rpc--decode-string
+                            (if (stringp result)
+                                result  ; Direct binary result
+                              (alist-get 'path result))))  ; Or in result object
+                     (truename (tramp-make-tramp-file-name v path)))
+                (tramp-rpc--cache-put tramp-rpc--file-truename-cache
+                                      expanded truename)
+                truename)
+            ;; If file doesn't exist, return the filename unchanged
+            (file-missing filename))))))
 
 (defun tramp-rpc-handle-file-attributes (filename &optional id-format)
   "Like `file-attributes' for TRAMP-RPC files."
   (with-parsed-tramp-file-name filename nil
     (let ((result (tramp-rpc--call-file-stat v localname t)))  ; lstat=t
+      ;; Populate file-exists cache as side effect
+      (let ((expanded (expand-file-name filename)))
+        (tramp-rpc--cache-put tramp-rpc--file-exists-cache
+                              expanded (if result t nil)))
       (when result
         (tramp-rpc--convert-file-attributes result id-format)))))
 
@@ -1308,14 +1359,16 @@ TYPE is the file type string."
   (with-parsed-tramp-file-name dir nil
     (tramp-rpc--call v "dir.create"
                      (append (tramp-rpc--encode-path localname)
-                             `((parents . ,(if parents t :msgpack-false)))))))
+                             `((parents . ,(if parents t :msgpack-false))))))
+  (tramp-rpc--invalidate-cache-for-path dir))
 
 (defun tramp-rpc-handle-delete-directory (directory &optional recursive trash)
   "Like `delete-directory' for TRAMP-RPC files."
   (tramp-skeleton-delete-directory directory recursive trash
     (tramp-rpc--call v "dir.remove"
                      (append (tramp-rpc--encode-path localname)
-                             `((recursive . ,(if recursive t :msgpack-false)))))))
+                             `((recursive . ,(if recursive t :msgpack-false))))))
+  (tramp-rpc--invalidate-cache-for-path directory))
 
 (defun tramp-rpc--parse-dired-switches (switches)
   "Parse SWITCHES string into a plist of options.
@@ -1510,7 +1563,11 @@ Supported switches: -a -t -S -r -h --group-directories-first."
                      (format "File %s exists; overwrite? " filename))
               (signal 'file-already-exists (list filename))))))
 
-      (tramp-rpc--call v "file.write" params)
+      (let ((tramp-rpc--suppress-fs-notifications t))
+        (tramp-rpc--call v "file.write" params))
+
+      ;; Invalidate caches for the written file
+      (tramp-rpc--invalidate-cache-for-path filename)
 
       ;; Handle visit
       (when (or (eq visit t) (stringp visit))
@@ -1576,7 +1633,10 @@ Supported switches: -a -t -S -r -h --group-directories-first."
       (tramp-run-real-handler
        #'copy-file
        (list filename newname ok-if-already-exists keep-time
-             preserve-uid-gid preserve-permissions))))))
+             preserve-uid-gid preserve-permissions))))
+    ;; Invalidate caches for the destination
+    (when dest-remote
+      (tramp-rpc--invalidate-cache-for-path newname))))
 
 (defun tramp-rpc-handle-rename-file (filename newname &optional ok-if-already-exists)
   "Like `rename-file' for TRAMP-RPC files."
@@ -1595,12 +1655,18 @@ Supported switches: -a -t -S -r -h --group-directories-first."
      ;; Different hosts, copy then delete
      (t
       (copy-file filename newname ok-if-already-exists t t t)
-      (delete-file filename)))))
+      (delete-file filename)))
+    ;; Invalidate caches for both source and destination
+    (when source-remote
+      (tramp-rpc--invalidate-cache-for-path filename))
+    (when dest-remote
+      (tramp-rpc--invalidate-cache-for-path newname))))
 
 (defun tramp-rpc-handle-delete-file (filename &optional trash)
   "Like `delete-file' for TRAMP-RPC files."
   (tramp-skeleton-delete-file filename trash
-    (tramp-rpc--call v "file.delete" (tramp-rpc--encode-path localname))))
+    (tramp-rpc--call v "file.delete" (tramp-rpc--encode-path localname)))
+  (tramp-rpc--invalidate-cache-for-path filename))
 
 (defun tramp-rpc-handle-make-symbolic-link (target linkname &optional ok-if-already-exists)
   "Like `make-symbolic-link' for TRAMP-RPC files."
@@ -1623,7 +1689,8 @@ Supported switches: -a -t -S -r -h --group-directories-first."
                                  p)))
                            link-path-params)))
       (tramp-rpc--call v "file.make_symlink"
-                       (append `((target . ,target-path)) params)))))
+                       (append `((target . ,target-path)) params)))
+    (tramp-rpc--invalidate-cache-for-path linkname)))
 
 (defun tramp-rpc-handle-add-name-to-file (filename newname &optional ok-if-already-exists)
   "Like `add-name-to-file' for TRAMP-RPC files.
@@ -1861,6 +1928,14 @@ Resolves PROGRAM path and loads direnv environment from working directory."
               (with-temp-file stderr-dest (insert stderr)))
              ((bufferp stderr-dest)
               (with-current-buffer stderr-dest (insert stderr))))))))
+
+      ;; Invalidate caches if the program might modify the filesystem
+      ;; and the directory isn't being watched (watched dirs get
+      ;; server-pushed invalidation)
+      (let ((program-name (file-name-nondirectory program)))
+        (unless (or (member program-name tramp-rpc--readonly-programs)
+                    (tramp-rpc--directory-watched-p localname v))
+          (tramp-rpc--invalidate-cache-for-path default-directory)))
 
       exit-code)))
 
@@ -2130,10 +2205,11 @@ When nil, uses timer-based polling (slower, for debugging)."
   :type 'boolean
   :group 'tramp-rpc)
 
-(defcustom tramp-rpc-async-read-timeout-ms 100
+(defcustom tramp-rpc-async-read-timeout-ms 200
   "Timeout in milliseconds for async process reads.
 The server will block for this long waiting for data before returning.
-Lower values mean more responsive but higher CPU usage."
+Lower values mean more responsive but higher CPU usage.
+Also controls process exit detection latency."
   :type 'integer
   :group 'tramp-rpc)
 
