@@ -58,8 +58,22 @@
 (with-eval-after-load 'tramp
   ;; Register the method
   (add-to-list 'tramp-methods `(,tramp-rpc-method))
-  ;; Register the foreign handler - the autoload stubs (from ;;;###autoload
-  ;; on the defuns below) will trigger full load when called
+
+  ;; Define the predicate inline (as defsubst) so it's available without
+  ;; loading tramp-rpc.el.  This avoids recursive autoloading: TRAMP calls
+  ;; the predicate to decide which handler to use, and if it were an
+  ;; autoload stub it would load tramp-rpc.el which `(require 'tramp)'.
+  ;; Reference TRAMP uses the same pattern (defsubst in tramp-loaddefs.el).
+  (defsubst tramp-rpc-file-name-p (vec-or-filename)
+    "Check if VEC-OR-FILENAME is handled by TRAMP-RPC."
+    (when-let* ((vec (tramp-ensure-dissected-file-name vec-or-filename)))
+      (string= (tramp-file-name-method vec) tramp-rpc-method)))
+
+  ;; Register the foreign handler directly in the alist.  We cannot use
+  ;; `tramp-register-foreign-file-name-handler' here because it tries to
+  ;; read `tramp-rpc-file-name-handler-alist' (defined in the full file),
+  ;; which isn't loaded yet.  The handler function itself is an autoload
+  ;; stub that triggers loading of tramp-rpc.el on first use.
   (add-to-list 'tramp-foreign-file-name-handler-alist
                '(tramp-rpc-file-name-p . tramp-rpc-file-name-handler)))
 
@@ -3257,21 +3271,18 @@ process-file calls are routed through the TRAMP handler."
 ;; Method predicate and handler registration
 ;; ============================================================================
 
-;;;###autoload
+;; `tramp-rpc-file-name-p' is defined as defsubst in the with-eval-after-load
+;; block above (extracted into autoloads).  Re-define it here as defun for
+;; the full-load case so it gets proper byte-compilation.
 (defun tramp-rpc-file-name-p (vec-or-filename)
   "Check if VEC-OR-FILENAME is handled by TRAMP-RPC.
 VEC-OR-FILENAME can be either a tramp-file-name struct or a filename string."
-  (let ((method (cond
-                 ((tramp-file-name-p vec-or-filename)
-                  (tramp-file-name-method vec-or-filename))
-                 ((stringp vec-or-filename)
-                  (and (tramp-tramp-file-p vec-or-filename)
-                       (tramp-file-name-method (tramp-dissect-file-name vec-or-filename))))
-                 (t nil))))
-    (string= method tramp-rpc-method)))
+  (when-let* ((vec (tramp-ensure-dissected-file-name vec-or-filename)))
+    (string= (tramp-file-name-method vec) tramp-rpc-method)))
 
-;; Register the handler now that the alist is defined.
-;; The method was already added to tramp-methods via the autoload.
+;; Re-register with the full defun now that the file is loaded.
+;; (Already registered via with-eval-after-load, but this ensures the
+;; byte-compiled defun version is used.)
 (tramp-register-foreign-file-name-handler
  #'tramp-rpc-file-name-p #'tramp-rpc-file-name-handler)
 
