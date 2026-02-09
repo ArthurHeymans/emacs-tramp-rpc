@@ -29,7 +29,11 @@ fn get_file_attributes_at(
     let mut name_cstr = name.to_vec();
     name_cstr.push(0);
 
-    let flags = if follow_symlinks { 0 } else { libc::AT_SYMLINK_NOFOLLOW };
+    let flags = if follow_symlinks {
+        0
+    } else {
+        libc::AT_SYMLINK_NOFOLLOW
+    };
 
     let result = unsafe {
         libc::fstatat(
@@ -132,12 +136,11 @@ pub async fn list(params: &Value) -> HandlerResult {
     let include_hidden = params.include_hidden;
 
     // Do all I/O in a single blocking task for efficiency
-    let results = tokio::task::spawn_blocking(move || {
-        list_dir_sync(&path, include_attrs, include_hidden)
-    })
-    .await
-    .map_err(|e| RpcError::internal_error(format!("Task join error: {}", e)))?
-    .map_err(|e| map_io_error(e, &path_str))?;
+    let results =
+        tokio::task::spawn_blocking(move || list_dir_sync(&path, include_attrs, include_hidden))
+            .await
+            .map_err(|e| RpcError::internal_error(format!("Task join error: {}", e)))?
+            .map_err(|e| map_io_error(e, &path_str))?;
 
     // Convert to array of map values with named fields
     let values: Vec<Value> = results.iter().map(|e| e.to_value()).collect();
@@ -173,7 +176,9 @@ fn list_dir_sync(
     impl Drop for DirFdGuard {
         fn drop(&mut self) {
             if let Some(fd) = self.0 {
-                unsafe { libc::close(fd); }
+                unsafe {
+                    libc::close(fd);
+                }
             }
         }
     }
@@ -347,12 +352,10 @@ pub async fn completions(params: &Value) -> HandlerResult {
     let prefix = params.prefix.clone();
 
     // Use synchronous I/O in blocking task - d_type gives us directory detection for free
-    let completions = tokio::task::spawn_blocking(move || {
-        completions_sync(&directory, &prefix)
-    })
-    .await
-    .map_err(|e| RpcError::internal_error(format!("Task join error: {}", e)))?
-    .map_err(|e| map_io_error(e, &params.directory))?;
+    let completions = tokio::task::spawn_blocking(move || completions_sync(&directory, &prefix))
+        .await
+        .map_err(|e| RpcError::internal_error(format!("Task join error: {}", e)))?
+        .map_err(|e| map_io_error(e, &params.directory))?;
 
     to_value(&completions).map_err(|e| RpcError::internal_error(e.to_string()))
 }
@@ -367,11 +370,7 @@ fn completions_sync(directory: &str, prefix: &str) -> Result<Vec<String>, std::i
 
         if name.starts_with(prefix) {
             // file_type() uses d_type on Linux - no extra stat syscall
-            let suffix = if entry
-                .file_type()
-                .map(|ft| ft.is_dir())
-                .unwrap_or(false)
-            {
+            let suffix = if entry.file_type().map(|ft| ft.is_dir()).unwrap_or(false) {
                 "/"
             } else {
                 ""

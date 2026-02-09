@@ -69,9 +69,7 @@ impl WatchManager {
                 if let Ok(event) = event {
                     // Only forward events that indicate filesystem mutations
                     match event.kind {
-                        EventKind::Create(_)
-                        | EventKind::Modify(_)
-                        | EventKind::Remove(_) => {
+                        EventKind::Create(_) | EventKind::Modify(_) | EventKind::Remove(_) => {
                             let _ = tx.send(event);
                         }
                         _ => {} // Ignore Access, Other events

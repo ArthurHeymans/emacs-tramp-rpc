@@ -56,8 +56,7 @@ fn collect_magit_status(directory: &str) -> HandlerResult {
         // HEAD info - 4 independent commands
         let head_hash_h = s.spawn(|| git_string(directory, &["rev-parse", "HEAD"]));
         let head_short_h = s.spawn(|| git_string(directory, &["rev-parse", "--short", "HEAD"]));
-        let head_branch_h =
-            s.spawn(|| git_string(directory, &["symbolic-ref", "--short", "HEAD"]));
+        let head_branch_h = s.spawn(|| git_string(directory, &["symbolic-ref", "--short", "HEAD"]));
         let head_message_h =
             s.spawn(|| git_string(directory, &["log", "-1", "--format=%s", "HEAD"]));
 
@@ -70,16 +69,13 @@ fn collect_magit_status(directory: &str) -> HandlerResult {
             s.spawn(|| git_string(directory, &["rev-parse", "--abbrev-ref", "@{push}"]));
 
         // Staged changes (2 commands)
-        let staged_diff_h =
-            s.spawn(|| git_output(directory, &["diff", "--cached", "--no-color"]));
-        let staged_stat_h = s.spawn(|| {
-            git_string(directory, &["diff", "--cached", "--stat", "--no-color"])
-        });
+        let staged_diff_h = s.spawn(|| git_output(directory, &["diff", "--cached", "--no-color"]));
+        let staged_stat_h =
+            s.spawn(|| git_string(directory, &["diff", "--cached", "--stat", "--no-color"]));
 
         // Unstaged changes (2 commands)
         let unstaged_diff_h = s.spawn(|| git_output(directory, &["diff", "--no-color"]));
-        let unstaged_stat_h =
-            s.spawn(|| git_string(directory, &["diff", "--stat", "--no-color"]));
+        let unstaged_stat_h = s.spawn(|| git_string(directory, &["diff", "--stat", "--no-color"]));
 
         // Untracked files
         let untracked_h = s.spawn(|| {
@@ -96,20 +92,14 @@ fn collect_magit_status(directory: &str) -> HandlerResult {
         });
 
         // Stashes
-        let stashes_h =
-            s.spawn(|| git_lines(directory, &["stash", "list", "--format=%gd\t%gs"]));
+        let stashes_h = s.spawn(|| git_lines(directory, &["stash", "list", "--format=%gd\t%gs"]));
 
         // Recent commits
-        let recent_h =
-            s.spawn(|| git_lines(directory, &["log", "-20", "--format=%H\t%s", "HEAD"]));
+        let recent_h = s.spawn(|| git_lines(directory, &["log", "-20", "--format=%H\t%s", "HEAD"]));
 
         // Tags (2 commands)
-        let tag_at_head_h = s.spawn(|| {
-            git_string(
-                directory,
-                &["describe", "--tags", "--exact-match", "HEAD"],
-            )
-        });
+        let tag_at_head_h =
+            s.spawn(|| git_string(directory, &["describe", "--tags", "--exact-match", "HEAD"]));
         let tag_contains_h =
             s.spawn(|| git_string(directory, &["describe", "--tags", "--abbrev=0"]));
 
@@ -128,8 +118,7 @@ fn collect_magit_status(directory: &str) -> HandlerResult {
         // Repo state detection
         let gitdir_clone2 = gitdir.clone();
         let dir_clone2 = directory.to_string();
-        let state_h =
-            s.spawn(move || detect_repo_state(&dir_clone2, gitdir_clone2.as_deref()));
+        let state_h = s.spawn(move || detect_repo_state(&dir_clone2, gitdir_clone2.as_deref()));
 
         // ---- Collect all results ----
         let head_hash = head_hash_h.join().unwrap();
