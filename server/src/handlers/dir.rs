@@ -17,6 +17,12 @@ use super::HandlerResult;
 
 use crate::protocol::path_or_bytes;
 
+/// Extract time fields from libc::stat in a cross-platform way
+#[inline]
+fn extract_stat_times(stat_buf: &libc::stat) -> (i64, i64, i64) {
+    (stat_buf.st_atime, stat_buf.st_mtime, stat_buf.st_ctime)
+}
+
 /// Get FileAttributes using fstatat relative to directory fd
 fn get_file_attributes_at(
     dir_fd: libc::c_int,
@@ -90,6 +96,7 @@ fn get_file_attributes_at(
 
     let uid = stat_buf.st_uid;
     let gid = stat_buf.st_gid;
+    let (atime, mtime, ctime) = extract_stat_times(&stat_buf);
 
     Some(FileAttributes {
         file_type,
@@ -98,9 +105,9 @@ fn get_file_attributes_at(
         gid,
         uname: super::file::get_user_name(uid),
         gname: super::file::get_group_name(gid),
-        atime: stat_buf.st_atime as i64,
-        mtime: stat_buf.st_mtime as i64,
-        ctime: stat_buf.st_ctime as i64,
+        atime,
+        mtime,
+        ctime,
         size: stat_buf.st_size as u64,
         mode: stat_buf.st_mode,
         inode: stat_buf.st_ino as u64,
