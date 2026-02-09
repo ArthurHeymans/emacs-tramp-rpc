@@ -17,10 +17,23 @@ use super::HandlerResult;
 
 use crate::protocol::path_or_bytes;
 
-/// Extract time fields from libc::stat in a cross-platform way
+/// Extract time and mode fields from libc::stat in a cross-platform way
+/// Returns (atime, mtime, ctime, mode)
+/// - On Linux: st_mode is u32, time fields are i64
+/// - On macOS: st_mode is u16, time fields are i64
 #[inline]
-fn extract_stat_times(stat_buf: &libc::stat) -> (i64, i64, i64) {
-    (stat_buf.st_atime, stat_buf.st_mtime, stat_buf.st_ctime)
+fn extract_stat_fields(stat_buf: &libc::stat) -> (i64, i64, i64, u32) {
+    #[cfg(target_os = "macos")]
+    let mode = stat_buf.st_mode as u32;
+    #[cfg(not(target_os = "macos"))]
+    let mode = stat_buf.st_mode;
+
+    (
+        stat_buf.st_atime,
+        stat_buf.st_mtime,
+        stat_buf.st_ctime,
+        mode,
+    )
 }
 
 /// Get FileAttributes using fstatat relative to directory fd
@@ -96,7 +109,7 @@ fn get_file_attributes_at(
 
     let uid = stat_buf.st_uid;
     let gid = stat_buf.st_gid;
-    let (atime, mtime, ctime) = extract_stat_times(&stat_buf);
+    let (atime, mtime, ctime, mode) = extract_stat_fields(&stat_buf);
 
     Some(FileAttributes {
         file_type,
@@ -109,7 +122,7 @@ fn get_file_attributes_at(
         mtime,
         ctime,
         size: stat_buf.st_size as u64,
-        mode: stat_buf.st_mode,
+        mode,
         inode: stat_buf.st_ino as u64,
         dev: stat_buf.st_dev as u64,
         link_target,
