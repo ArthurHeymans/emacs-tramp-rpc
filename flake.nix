@@ -20,6 +20,18 @@
       forAllSystems = lib.genAttrs lib.systems.flakeExposed;
     in
     {
+      packages = forAllSystems (
+        system:
+        let
+          pkgs = nixpkgs.legacyPackages.${system};
+          self' = self.packages.${system};
+        in
+        {
+          tramp-rpc-server = pkgs.pkgsStatic.callPackage ./default.nix { };
+          default = self'.tramp-rpc-server;
+        }
+      );
+
       devShells = forAllSystems (
         system:
         let
