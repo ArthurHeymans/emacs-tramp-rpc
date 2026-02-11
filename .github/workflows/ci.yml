@@ -264,6 +264,80 @@ jobs:
             -l test/tramp-rpc-tests.el \
             --eval "(ert-run-tests-batch-and-exit \"^tramp-rpc-test\")"
 
+  test-upstream-tramp:
+    name: Upstream Tramp Tests
+    runs-on: ubuntu-latest
+    needs: [rust, elisp]
+    # Only run on main branch — requires SSH to localhost
+    if: github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master'
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Emacs
+        uses: purcell/setup-emacs@master
+        with:
+          version: '30.1'
+
+      - name: Clone upstream tramp
+        run: |
+          git clone --depth 1 https://github.com/emacsmirror/tramp.git ~/src/tramp
+          echo "Tramp commit: $(git -C ~/src/tramp rev-parse HEAD)"
+
+      - name: Download server binary
+        uses: actions/download-artifact@v4
+        with:
+          name: tramp-rpc-server-x86_64-unknown-linux-musl
+          path: target/x86_64-unknown-linux-musl/release/
+
+      - name: Make server executable
+        run: chmod +x target/x86_64-unknown-linux-musl/release/tramp-rpc-server
+
+      - name: Setup SSH for localhost
+        run: |
+          ssh-keygen -t ed25519 -f ~/.ssh/id_ed25519 -N ""
+          cat ~/.ssh/id_ed25519.pub >> ~/.ssh/authorized_keys
+          chmod 600 ~/.ssh/authorized_keys
+          echo "Host localhost" >> ~/.ssh/config
+          echo "  StrictHostKeyChecking no" >> ~/.ssh/config
+          echo "  UserKnownHostsFile /dev/null" >> ~/.ssh/config
+          chmod 600 ~/.ssh/config
+          sudo service ssh start || true
+          ssh localhost "echo 'SSH connection successful'"
+
+      - name: Deploy server to localhost
+        run: |
+          VERSION=$(grep -oP 'tramp-rpc-deploy-version "\K[^"]+' lisp/tramp-rpc-deploy.el)
+          echo "Deploying version: $VERSION"
+          mkdir -p ~/.cache/tramp-rpc
+          cp target/x86_64-unknown-linux-musl/release/tramp-rpc-server ~/.cache/tramp-rpc/tramp-rpc-server-${VERSION}
+
+      - name: Install dependencies
+        run: |
+          emacs -Q --batch \
+            --eval "(require 'package)" \
+            --eval "(add-to-list 'package-archives '(\"melpa\" . \"https://melpa.org/packages/\") t)" \
+            --eval "(package-initialize)" \
+            --eval "(package-refresh-contents)" \
+            --eval "(package-install 'msgpack)"
+
+      - name: Run upstream tramp tests
+        env:
+          TRAMP_RPC_TEST_HOST: localhost
+          TRAMP_TEST_SOURCE: ~/src/tramp
+        run: |
+          # Exclude known unfixable tests:
+          #   test49: requires tramp-add-external-operation (newer tramp API)
+          #   test52: tramp-rpc features not cleaned up on unload-feature
+          emacs -Q --batch \
+            -L lisp \
+            --eval "(require 'package)" \
+            --eval "(add-to-list 'package-archives '(\"melpa\" . \"https://melpa.org/packages/\") t)" \
+            --eval "(package-initialize)" \
+            -l test/run-tramp-tests.el \
+            --eval "(ert-run-tests-batch-and-exit '(and \"^tramp-test\" (not \"tramp-test49\") (not \"tramp-test52\")))"
+
   summary:
     name: Test Summary
     runs-on: ubuntu-latest

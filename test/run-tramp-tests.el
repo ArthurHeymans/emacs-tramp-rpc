@@ -28,6 +28,8 @@
 ;;   TRAMP_RPC_TEST_HOST  - Remote host (default: "x220-nixos")
 ;;   TRAMP_RPC_TEST_USER  - Remote user (default: current user)
 ;;   TRAMP_VERBOSE        - Tramp verbosity level (default: 0)
+;;   TRAMP_TEST_SOURCE    - Path to tramp source tree containing test/tramp-tests.el
+;;                          (default: "~/src/tramp")
 
 ;;; Code:
 
@@ -135,11 +137,20 @@ Overridden to include tramp-rpc."
 ;; Load the upstream test suite
 ;; ============================================================================
 
+(defvar tramp-rpc-test-source
+  (or (getenv "TRAMP_TEST_SOURCE")
+      (expand-file-name "~/src/tramp"))
+  "Path to the tramp source tree containing test/tramp-tests.el.")
+
 (message "=== Running tramp-tests.el with tramp-rpc method ===")
 (message "Remote directory: %s" ert-remote-temporary-file-directory)
 (message "Method: rpc, Host: %s" tramp-rpc-test-host)
+(message "Tramp source: %s" tramp-rpc-test-source)
 
-(load (expand-file-name "~/src/tramp/test/tramp-tests.el"))
+(let ((test-file (expand-file-name "test/tramp-tests.el" tramp-rpc-test-source)))
+  (unless (file-exists-p test-file)
+    (error "Upstream tramp-tests.el not found at %s.\nSet TRAMP_TEST_SOURCE to the tramp source tree" test-file))
+  (load test-file))
 
 (provide 'run-tramp-tests)
 ;;; run-tramp-tests.el ends here
