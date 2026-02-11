@@ -165,34 +165,92 @@ pub async fn copy(params: &Value) -> HandlerResult {
         }
     }
 
-    // Copy the file
-    let bytes_copied = fs::copy(&params.src, &dest_path)
+    let src_metadata = fs::metadata(&params.src)
         .await
         .map_err(|e| map_io_error(e, &params.src))?;
 
-    // Preserve attributes if requested
-    if params.preserve {
-        if let Ok(metadata) = fs::metadata(&params.src).await {
-            // Preserve permissions
-            let _ = fs::set_permissions(&dest_path, metadata.permissions()).await;
+    let bytes_copied = if src_metadata.is_dir() {
+        // Recursive directory copy
+        copy_dir_recursive(src_path, &dest_path, params.preserve)
+            .await
+            .map_err(|e| map_io_error(e, &params.src))?
+    } else {
+        // Copy regular file (or symlink target)
+        let n = fs::copy(&params.src, &dest_path)
+            .await
+            .map_err(|e| map_io_error(e, &params.src))?;
 
-            // Preserve timestamps
+        // Preserve attributes if requested
+        if params.preserve {
+            let _ = fs::set_permissions(&dest_path, src_metadata.permissions()).await;
             #[cfg(unix)]
             {
                 use std::os::unix::fs::MetadataExt;
-                let atime = metadata.atime();
-                let mtime = metadata.mtime();
+                let atime = src_metadata.atime();
+                let mtime = src_metadata.mtime();
                 let dest = dest_path.to_string_lossy().to_string();
                 let _ =
                     tokio::task::spawn_blocking(move || set_file_times_sync(&dest, atime, mtime))
                         .await;
             }
         }
-    }
+        n
+    };
 
     Ok(msgpack_map! {
         "copied" => bytes_copied
     })
+}
+
+/// Recursively copy a directory and its contents.
+async fn copy_dir_recursive(src: &Path, dest: &Path, preserve: bool) -> std::io::Result<u64> {
+    // Create destination directory
+    fs::create_dir_all(dest).await?;
+
+    if preserve {
+        // Copy permissions from source dir
+        let src_meta = fs::metadata(src).await?;
+        let _ = fs::set_permissions(dest, src_meta.permissions()).await;
+    }
+
+    let mut total: u64 = 0;
+    let mut entries = fs::read_dir(src).await?;
+
+    while let Some(entry) = entries.next_entry().await? {
+        let entry_path = entry.path();
+        let dest_child = dest.join(entry.file_name());
+        let file_type = entry.file_type().await?;
+
+        if file_type.is_dir() {
+            total += Box::pin(copy_dir_recursive(&entry_path, &dest_child, preserve)).await?;
+        } else if file_type.is_symlink() {
+            // Preserve symlinks as symlinks
+            let link_target = fs::read_link(&entry_path).await?;
+            tokio::fs::symlink(&link_target, &dest_child).await?;
+        } else {
+            let n = fs::copy(&entry_path, &dest_child).await?;
+            total += n;
+
+            if preserve {
+                if let Ok(meta) = fs::metadata(&entry_path).await {
+                    let _ = fs::set_permissions(&dest_child, meta.permissions()).await;
+                    #[cfg(unix)]
+                    {
+                        use std::os::unix::fs::MetadataExt;
+                        let atime = meta.atime();
+                        let mtime = meta.mtime();
+                        let dest_str = dest_child.to_string_lossy().to_string();
+                        let _ = tokio::task::spawn_blocking(move || {
+                            set_file_times_sync(&dest_str, atime, mtime)
+                        })
+                        .await;
+                    }
+                }
+            }
+        }
+    }
+
+    Ok(total)
 }
 
 /// Rename/move a file
