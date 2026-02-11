@@ -52,6 +52,9 @@
 ;; Load tramp-rpc before setting up the test directory
 (require 'tramp)
 (require 'tramp-rpc)
+;; userlock.el defines the `file-locked' error type needed by lock file tests.
+;; Loading it directly fails (no feature provided), so load it without require.
+(load "userlock" t t)
 
 ;; ============================================================================
 ;; Configuration

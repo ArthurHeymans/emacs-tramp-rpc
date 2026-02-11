@@ -1197,9 +1197,10 @@ path unchanged (after resolving any symlinks in parent directories)."
                           result
                         (alist-get 'path result)))))
           (or path localname))
-      ;; If file doesn't exist, fall back to symlink-chasing approach
-      ;; (same as tramp-handle-file-truename)
-      (file-missing
+      ;; If file doesn't exist or has a symlink loop, fall back to
+      ;; symlink-chasing approach (same as tramp-handle-file-truename).
+      ;; ELOOP (symlink loop) maps to file-error, not file-missing.
+      (file-error
        (let ((result (directory-file-name localname))
              (numchase 0)
              (numchase-limit 20)
@@ -1885,6 +1886,10 @@ point management, and REPLACE semantics come for free."
 (defun tramp-rpc-handle-add-name-to-file (filename newname &optional ok-if-already-exists)
   "Like `add-name-to-file' for TRAMP-RPC files.
 Creates a hard link from NEWNAME to FILENAME."
+  ;; When newname is a directory-name (trailing /), create the link inside it.
+  (when (and (directory-name-p newname)
+             (file-directory-p newname))
+    (setq newname (expand-file-name (file-name-nondirectory filename) newname)))
   (unless (tramp-equal-remote filename newname)
     (with-parsed-tramp-file-name
         (if (tramp-tramp-file-p filename) filename newname) nil
@@ -1903,6 +1908,7 @@ Creates a hard link from NEWNAME to FILENAME."
                                    v2-localname)))))
             (tramp-error v2 'file-already-exists newname)
           (delete-file newname)))
+      (tramp-flush-file-properties v2 v2-localname)
       (tramp-rpc--call v1 "file.make_hardlink"
                        `((src . ,(tramp-rpc--path-to-bytes
                                   (file-name-unquote v1-localname)))
@@ -2508,7 +2514,8 @@ Also controls process exit detection latency."
     (file-name-all-completions . tramp-rpc-handle-file-name-all-completions)
     (make-directory . tramp-rpc-handle-make-directory)
     (delete-directory . tramp-rpc-handle-delete-directory)
-    (insert-directory . tramp-rpc-handle-insert-directory)
+    (insert-directory . tramp-handle-insert-directory)
+    (copy-directory . tramp-handle-copy-directory)
 
     ;; =========================================================================
     ;; RPC-based file I/O operations
@@ -2559,7 +2566,7 @@ Also controls process exit detection latency."
     ;; delegate to our RPC handlers internally.
     ;; =========================================================================
     (abbreviate-file-name . tramp-handle-abbreviate-file-name)
-    (access-file . tramp-rpc-handle-access-file)
+    (access-file . tramp-handle-access-file)
     (directory-file-name . tramp-handle-directory-file-name)
     (dired-uncache . tramp-handle-dired-uncache)
     (file-accessible-directory-p . tramp-handle-file-accessible-directory-p)
