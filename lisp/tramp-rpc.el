@@ -422,8 +422,12 @@ Also clears the executable cache for this connection."
 Returns the connection plist."
   (let ((conn (tramp-rpc--get-connection vec)))
     (if (and conn
-             (process-live-p (plist-get conn :process)))
+             (process-live-p (plist-get conn :process))
+             (buffer-live-p (plist-get conn :buffer)))
         conn
+      ;; Stale connection - remove it before reconnecting
+      (when conn
+        (tramp-rpc--remove-connection vec))
       ;; Need to establish connection
       (tramp-rpc--connect vec))))
 
@@ -2174,19 +2178,25 @@ Handles tilde expansion by looking up the remote home directory."
   (let ((dir (or dir default-directory)))
     (cond
      ;; Absolute path with tramp prefix - parse and expand
-     ((tramp-tramp-file-p name)
-      (with-parsed-tramp-file-name name nil
-        ;; Make sure localname is absolute
-        (unless (tramp-run-real-handler #'file-name-absolute-p (list localname))
-          (setq localname (concat "/" localname)))
-        ;; Handle tilde expansion
-        (when (string-prefix-p "~" localname)
-          (setq localname (tramp-rpc--expand-tilde v localname)))
-        ;; Do normal expand-file-name for "./" and "../"
-        (let ((default-directory tramp-compat-temporary-file-directory))
-          (tramp-make-tramp-file-name
-           v (tramp-drop-volume-letter
-              (tramp-run-real-handler #'expand-file-name (list localname)))))))
+      ((tramp-tramp-file-p name)
+       (with-parsed-tramp-file-name name nil
+         ;; Make sure localname is absolute
+         (unless (tramp-run-real-handler #'file-name-absolute-p (list localname))
+           (setq localname (concat "/" localname)))
+         ;; Handle tilde expansion
+         (when (string-prefix-p "~" localname)
+           (setq localname (tramp-rpc--expand-tilde v localname)))
+         ;; Remove double slashes
+         (while (string-match "//" localname)
+           (setq localname (replace-match "/" t t localname)))
+         ;; Do not keep "/.." or "/.".
+         (when (string-match-p (rx bos "/" (** 1 2 ".") eos) localname)
+           (setq localname "/"))
+         ;; Do normal expand-file-name for "./" and "../"
+         (let ((default-directory tramp-compat-temporary-file-directory))
+           (tramp-make-tramp-file-name
+            v (tramp-drop-volume-letter
+               (tramp-run-real-handler #'expand-file-name (list localname)))))))
      ;; Absolute local path - make it remote
      ((file-name-absolute-p name)
       (with-parsed-tramp-file-name dir nil
@@ -2200,10 +2210,13 @@ Handles tilde expansion by looking up the remote home directory."
              v (tramp-drop-volume-letter
                 (tramp-run-real-handler #'expand-file-name (list expanded))))))))
      ;; Relative path
-     (t
-      (tramp-make-tramp-file-name
-       (tramp-dissect-file-name dir)
-       (expand-file-name name (tramp-file-local-name dir)))))))
+      (t
+       (let ((localname (expand-file-name name (tramp-file-local-name dir))))
+         ;; Do not keep "/.." or "/.".
+         (when (string-match-p (rx bos "/" (** 1 2 ".") eos) localname)
+           (setq localname "/"))
+         (tramp-make-tramp-file-name
+          (tramp-dissect-file-name dir) localname))))))
 
 (defun tramp-rpc--expand-tilde (vec localname)
   "Expand tilde in LOCALNAME for remote connection VEC.
