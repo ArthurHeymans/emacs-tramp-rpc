@@ -548,7 +548,10 @@ This tests Issue #13: Chinese characters decode incorrectly."
         (ignore-errors (delete-file dest))))))
 
 (ert-deftest tramp-rpc-test06-copy-file-to-directory ()
-  "Test `copy-file' to a directory destination (issue #45)."
+  "Test `copy-file' to a directory destination (issue #45).
+When NEWNAME is a directory without trailing slash, `copy-file' should
+signal `file-already-exists'.  With trailing slash (via
+`file-name-as-directory'), it should copy the file INTO the directory."
   (skip-unless (tramp-rpc-test-enabled))
 
   (tramp-rpc-test--with-temp-file src "source content for dir copy"
@@ -558,8 +561,15 @@ This tests Issue #13: Chinese characters decode incorrectly."
             ;; Create destination directory
             (make-directory dest-dir)
             (should (file-directory-p dest-dir))
-            ;; Copy file to directory - should copy INTO the directory
-            (copy-file src dest-dir)
+            ;; Without trailing /, should signal file-already-exists
+            (should-error (copy-file src dest-dir)
+                          :type 'file-already-exists)
+            ;; With ok-if-already-exists but no trailing /, should
+            ;; signal file-error ("File is a directory")
+            (should-error (copy-file src dest-dir 'ok)
+                          :type 'file-error)
+            ;; With trailing / (file-name-as-directory), should copy INTO dir
+            (copy-file src (file-name-as-directory dest-dir))
             ;; File should now exist inside the directory with original name
             (let ((expected-dest (expand-file-name
                                   (file-name-nondirectory src) dest-dir)))

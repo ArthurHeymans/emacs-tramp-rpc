@@ -51,6 +51,17 @@
                                          (expand-file-name "test/run-tramp-tests.el"))))))
   (add-to-list 'load-path lisp-dir))
 
+;; Add upstream tramp lisp to load-path so that the test file and
+;; tramp library versions stay in sync.  Without this, loading a newer
+;; tramp-tests.el against the system tramp.el can fail when tests
+;; reference variables (e.g. `tramp-local-host-names') that only exist
+;; in the upstream version.
+(let* ((tramp-src (or (getenv "TRAMP_TEST_SOURCE")
+                      (expand-file-name "~/src/tramp")))
+       (upstream-lisp (expand-file-name "lisp" tramp-src)))
+  (when (file-directory-p upstream-lisp)
+    (add-to-list 'load-path upstream-lisp)))
+
 ;; Load tramp-rpc before setting up the test directory
 (require 'tramp)
 (require 'tramp-rpc)
