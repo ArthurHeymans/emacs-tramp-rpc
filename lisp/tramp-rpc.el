@@ -809,11 +809,17 @@ Returns the result or signals an error."
                ((string-match "os error 39\\>" msg) ;; ENOTEMPTY
                 (signal 'file-error (list "RPC" "Directory not empty" msg)))
                ((string-match "os error 20\\>" msg) ;; ENOTDIR
-                (signal 'file-error (list "RPC" "Not a directory" msg)))
-               ((string-match "os error 21\\>" msg) ;; EISDIR
-                (signal 'file-error (list "RPC" "Is a directory" msg)))
-               (t
-                (error "RPC error: %s" msg))))
+                 (signal 'file-error (list "RPC" "Not a directory" msg)))
+                ((string-match "os error 21\\>" msg) ;; EISDIR
+                 (signal 'file-error (list "RPC" "Is a directory" msg)))
+                ((string-match "os error 40\\>" msg) ;; ELOOP
+                 (signal 'file-error (list "RPC" "Too many levels of symbolic links" msg)))
+                ;; All other IO errors also signal file-error so callers
+                ;; can catch them uniformly with condition-case.
+                ((= code tramp-rpc-protocol-error-io)
+                 (signal 'file-error (list "RPC" msg)))
+                (t
+                 (error "RPC error: %s" msg))))
           (plist-get response :result))))))
 
 (defun tramp-rpc--call-batch (vec requests)
@@ -1061,8 +1067,9 @@ the server, since the remote side does not understand it."
 (defun tramp-rpc--encode-path (path)
   "Encode PATH for transmission to the server.
 With MessagePack, paths are sent directly as strings/binary.
+Strips any Emacs file-name quoting (/:) before encoding.
 Returns an alist with path."
-  `((path . ,(tramp-rpc--path-to-bytes path))))
+  `((path . ,(tramp-rpc--path-to-bytes (file-name-unquote path)))))
 
 ;; ============================================================================
 ;; File name handler operations
@@ -1147,14 +1154,20 @@ If LSTAT is non-nil, don't follow symlinks."
           (error "Timeout waiting for file.stat response"))
         (tramp-rpc--debug "RECV id=%s (found)" expected-id)
         (if (tramp-rpc-protocol-error-p response)
-            (let ((code (tramp-rpc-protocol-error-code response)))
-              ;; Return nil for file-not-found, signal for other errors
-              (if (= code tramp-rpc-protocol-error-file-not-found)
-                  nil
-                (let ((msg (tramp-rpc-protocol-error-message response)))
-                  (if (= code tramp-rpc-protocol-error-permission-denied)
-                      (signal 'file-error (list "RPC" "Permission denied" msg))
-                    (error "RPC error: %s" msg)))))
+            (let ((code (tramp-rpc-protocol-error-code response))
+                  (msg (tramp-rpc-protocol-error-message response)))
+              (cond
+               ;; Return nil for file-not-found (file doesn't exist)
+               ((= code tramp-rpc-protocol-error-file-not-found)
+                nil)
+               ;; Return nil for ELOOP (symlink loop) - file can't be
+               ;; resolved, so it effectively doesn't exist for stat
+               ((string-match "os error 40\\>" msg)
+                nil)
+               ((= code tramp-rpc-protocol-error-permission-denied)
+                (signal 'file-error (list "RPC" "Permission denied" msg)))
+               (t
+                (signal 'file-error (list "RPC" msg)))))
           (plist-get response :result))))))
 
 (defun tramp-rpc-handle-file-directory-p (filename)
@@ -1873,12 +1886,12 @@ point management, and REPLACE semantics come for free."
            (link-path-params (tramp-rpc--encode-path localname))
            ;; Rename 'path' to 'link_path' in the encoded params
            (params (mapcar (lambda (p)
-                             (if (eq (car p) 'path)
-                                 (cons 'link_path (cdr p))
-                               (if (eq (car p) 'path_encoding)
-                                   (cons 'link_path_encoding (cdr p))
-                                 p)))
-                           link-path-params)))
+                              (if (eq (car p) 'path)
+                                  (cons 'link_path (cdr p))
+                                (if (eq (car p) 'path_encoding)
+                                    (cons 'link_path_encoding (cdr p))
+                                  p)))
+                            link-path-params)))
       (tramp-rpc--call v "file.make_symlink"
                        (append `((target . ,(tramp-rpc--path-to-bytes target-path))) params)))
     (tramp-rpc--invalidate-cache-for-path linkname)))

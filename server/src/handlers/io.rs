@@ -390,9 +390,20 @@ pub async fn make_symlink(params: &Value) -> HandlerResult {
 
     #[cfg(unix)]
     {
-        fs::symlink(&target, &link_path)
-            .await
-            .map_err(|e| map_io_error(e, &link_path_str))?;
+        // Try creating the symlink; if it already exists, remove it and retry
+        // (matching `ln -sf` behavior needed by tramp lock files).
+        match fs::symlink(&target, &link_path).await {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                fs::remove_file(&link_path)
+                    .await
+                    .map_err(|e| map_io_error(e, &link_path_str))?;
+                fs::symlink(&target, &link_path)
+                    .await
+                    .map_err(|e| map_io_error(e, &link_path_str))?;
+            }
+            Err(e) => return Err(map_io_error(e, &link_path_str)),
+        }
     }
 
     Ok(Value::Boolean(true))
