@@ -196,8 +196,6 @@ jobs:
     name: Full Test Suite (with SSH)
     runs-on: ubuntu-latest
     needs: [rust, elisp]
-    # Only run on main branch to avoid SSH setup complexity in PRs
-    if: github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master'
 
     steps:
       - name: Checkout
@@ -268,8 +266,6 @@ jobs:
     name: Upstream Tramp Tests
     runs-on: ubuntu-latest
     needs: [rust, elisp]
-    # Only run on main branch — requires SSH to localhost
-    if: github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master'
 
     steps:
       - name: Checkout
@@ -341,7 +337,7 @@ jobs:
   summary:
     name: Test Summary
     runs-on: ubuntu-latest
-    needs: [rust, elisp, test-autoload, test-protocol, test-server]
+    needs: [rust, elisp, test-autoload, test-protocol, test-server, test-full-suite, test-upstream-tramp]
     if: always()
 
     steps:
@@ -353,12 +349,16 @@ jobs:
           echo "Autoload Tests: ${{ needs.test-autoload.result }}"
           echo "Protocol Tests: ${{ needs.test-protocol.result }}"
           echo "Server Tests: ${{ needs.test-server.result }}"
+          echo "Full Test Suite: ${{ needs.test-full-suite.result }}"
+          echo "Upstream Tramp Tests: ${{ needs.test-upstream-tramp.result }}"
           
           if [[ "${{ needs.rust.result }}" != "success" ]] || \
              [[ "${{ needs.elisp.result }}" != "success" ]] || \
              [[ "${{ needs.test-autoload.result }}" != "success" ]] || \
              [[ "${{ needs.test-protocol.result }}" != "success" ]] || \
-             [[ "${{ needs.test-server.result }}" != "success" ]]; then
+             [[ "${{ needs.test-server.result }}" != "success" ]] || \
+             [[ "${{ needs.test-full-suite.result }}" != "success" ]] || \
+             [[ "${{ needs.test-upstream-tramp.result }}" != "success" ]]; then
             echo "Some tests failed!"
             exit 1
           fi
