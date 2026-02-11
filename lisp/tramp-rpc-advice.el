@@ -205,7 +205,7 @@
 
 (defun tramp-rpc--process-status-advice (orig-fun process)
   "Advice for `process-status' to handle TRAMP-RPC processes."
-  (if (process-get process :tramp-rpc-pid)
+  (if (and (processp process) (process-get process :tramp-rpc-pid))
       (cond
        ((process-get process :tramp-rpc-exited) 'exit)
        ;; Use orig-fun to check live status, not process-live-p (which would recurse)
@@ -215,7 +215,7 @@
 
 (defun tramp-rpc--process-exit-status-advice (orig-fun process)
   "Advice for `process-exit-status' to handle TRAMP-RPC processes."
-  (if (process-get process :tramp-rpc-pid)
+  (if (and (processp process) (process-get process :tramp-rpc-pid))
       (or (process-get process :tramp-rpc-exit-code) 0)
     (funcall orig-fun process)))
 
