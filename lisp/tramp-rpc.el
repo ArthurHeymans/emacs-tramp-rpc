@@ -334,6 +334,23 @@ See `tramp-rpc-direnv-essential-vars' for the list of variables."
   "Cache of executable paths keyed by (connection-key . program).
 Value is the full path or :not-found.")
 
+(defun tramp-rpc--clear-executable-cache (&optional vec)
+  "Clear the executable cache.
+If VEC is provided, only clear entries for that connection.
+Otherwise clear all entries."
+  (if vec
+      (let ((conn-key (tramp-rpc--connection-key vec))
+            (keys-to-remove nil))
+        ;; Collect keys first (can't modify hash table during maphash)
+        (maphash (lambda (key _value)
+                   (when (equal (car key) conn-key)
+                     (push key keys-to-remove)))
+                 tramp-rpc--executable-cache)
+        ;; Now remove them
+        (dolist (key keys-to-remove)
+          (remhash key tramp-rpc--executable-cache)))
+    (clrhash tramp-rpc--executable-cache)))
+
 (defun tramp-rpc--resolve-executable (vec program)
   "Resolve PROGRAM to its full path on VEC.
 Returns the full path if found, otherwise the original PROGRAM.
@@ -395,8 +412,10 @@ following the pattern used by standard TRAMP."
            tramp-rpc--connections))
 
 (defun tramp-rpc--remove-connection (vec)
-  "Remove the RPC connection for VEC."
-  (remhash (tramp-rpc--connection-key vec) tramp-rpc--connections))
+  "Remove the RPC connection for VEC.
+Also clears the executable cache for this connection."
+  (remhash (tramp-rpc--connection-key vec) tramp-rpc--connections)
+  (tramp-rpc--clear-executable-cache vec))
 
 (defun tramp-rpc--ensure-connection (vec)
   "Ensure we have an active RPC connection to VEC.
