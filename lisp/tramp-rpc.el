@@ -802,6 +802,16 @@ Returns the result or signals an error."
                 (signal 'file-missing (list "RPC" "No such file" msg)))
                ((= code tramp-rpc-protocol-error-permission-denied)
                 (signal 'file-error (list "RPC" "Permission denied" msg)))
+               ;; Map OS errno values embedded in error messages to
+               ;; appropriate Emacs error symbols.
+               ((string-match "os error 17\\>" msg) ;; EEXIST
+                (signal 'file-already-exists (list "RPC" msg)))
+               ((string-match "os error 39\\>" msg) ;; ENOTEMPTY
+                (signal 'file-error (list "RPC" "Directory not empty" msg)))
+               ((string-match "os error 20\\>" msg) ;; ENOTDIR
+                (signal 'file-error (list "RPC" "Not a directory" msg)))
+               ((string-match "os error 21\\>" msg) ;; EISDIR
+                (signal 'file-error (list "RPC" "Is a directory" msg)))
                (t
                 (error "RPC error: %s" msg))))
           (plist-get response :result))))))
@@ -1040,10 +1050,13 @@ With MessagePack, filenames come as raw bytes - decode to UTF-8."
 
 (defun tramp-rpc--path-to-bytes (path)
   "Convert PATH to a unibyte string for MessagePack transmission.
-Handles both multibyte UTF-8 strings and unibyte byte strings."
-  (if (multibyte-string-p path)
-      (encode-coding-string path 'utf-8-unix)
-    path))
+Handles both multibyte UTF-8 strings and unibyte byte strings.
+Strips Emacs file-name quoting (the /: prefix) before sending to
+the server, since the remote side does not understand it."
+  (let ((unquoted (file-name-unquote path)))
+    (if (multibyte-string-p unquoted)
+        (encode-coding-string unquoted 'utf-8-unix)
+      unquoted)))
 
 (defun tramp-rpc--encode-path (path)
   "Encode PATH for transmission to the server.
@@ -1057,13 +1070,9 @@ Returns an alist with path."
 
 (defun tramp-rpc-handle-file-exists-p (filename)
   "Like `file-exists-p' for TRAMP-RPC files."
-  (let ((expanded (expand-file-name filename)))
-    (or (tramp-rpc--cache-get tramp-rpc--file-exists-cache expanded)
-        (with-parsed-tramp-file-name filename nil
-          (let ((result (tramp-rpc--call v "file.exists"
-                                         (tramp-rpc--encode-path localname))))
-            (tramp-rpc--cache-put tramp-rpc--file-exists-cache expanded result)
-            result)))))
+  (tramp-skeleton-file-exists-p filename
+    (tramp-rpc--call v "file.exists"
+                     (tramp-rpc--encode-path localname))))
 
 (defun tramp-rpc-handle-file-readable-p (filename)
   "Like `file-readable-p' for TRAMP-RPC files."
@@ -1320,30 +1329,15 @@ TYPE is the file type string."
 
 (defun tramp-rpc-handle-directory-files (directory &optional full match nosort count)
   "Like `directory-files' for TRAMP-RPC files."
-  (with-parsed-tramp-file-name (expand-file-name directory) nil
+  (tramp-skeleton-directory-files directory full match nosort count
     (let* ((result (tramp-rpc--call v "dir.list"
                                     (append (tramp-rpc--encode-path localname)
                                             '((include_attrs . :msgpack-false)
                                               (include_hidden . t)))))
            (files (mapcar #'tramp-rpc--decode-filename result)))
-      ;; Filter by match pattern
-      (when match
-        (setq files (cl-remove-if-not
-                     (lambda (f) (string-match-p match f))
-                     files)))
-      ;; Add full path if requested
-      (when full
-        (setq files (mapcar
-                     (lambda (f)
-                       (tramp-make-tramp-file-name
-                        v (expand-file-name f localname)))
-                     files)))
-      ;; Sort unless nosort
-      (unless nosort
-        (setq files (sort files #'string<)))
-      ;; Limit count
-      (when count
-        (setq files (seq-take files count)))
+      ;; Ensure "." and ".." are present (some storage systems omit them)
+      (unless (member "." files) (push "." files))
+      (unless (member ".." files) (push ".." files))
       files)))
 
 (defun tramp-rpc-handle-directory-files-and-attributes
@@ -1405,11 +1399,15 @@ TYPE is the file type string."
 
 (defun tramp-rpc-handle-make-directory (dir &optional parents)
   "Like `make-directory' for TRAMP-RPC files."
-  (with-parsed-tramp-file-name dir nil
+  (tramp-skeleton-make-directory dir parents
     (tramp-rpc--call v "dir.create"
                      (append (tramp-rpc--encode-path localname)
-                             `((parents . ,(if parents t :msgpack-false))))))
-  (tramp-rpc--invalidate-cache-for-path dir))
+                             ;; Don't pass parents here - the skeleton
+                             ;; handles the recursive parent creation.
+                             `((parents . :msgpack-false))))
+    ;; Flush parent directory properties so file-exists-p sees the new dir.
+    (tramp-flush-directory-properties v (file-name-directory localname))
+    (tramp-rpc--invalidate-cache-for-path dir)))
 
 (defun tramp-rpc-handle-delete-directory (directory &optional recursive trash)
   "Like `delete-directory' for TRAMP-RPC files."
@@ -1483,19 +1481,34 @@ Note: Uses the C locale for month names to ensure consistent width."
         (format-time-string "%b %e  %Y" time)))))
 
 (defun tramp-rpc-handle-insert-directory
-    (filename switches &optional _wildcard _full-directory-p)
+    (filename switches &optional _wildcard full-directory-p)
   "Like `insert-directory' for TRAMP-RPC files.
 Produces ls-like output for dired.
 Supported switches: -a -t -S -r -h --group-directories-first."
   (with-parsed-tramp-file-name (expand-file-name filename) nil
     (let* ((opts (tramp-rpc--parse-dired-switches switches))
            (human-readable (plist-get opts :human-readable))
+           ;; If not full-directory-p and filename is not a directory,
+           ;; list the parent and filter to just this file (like ls -d).
+           (single-file-p (and (not full-directory-p)
+                               (not (file-directory-p filename))))
+           (list-dir (if single-file-p
+                         (file-name-directory localname)
+                       localname))
            (result (tramp-rpc--call v "dir.list"
-                                    (append (tramp-rpc--encode-path localname)
+                                    (append (tramp-rpc--encode-path list-dir)
                                             `((include_attrs . t)
                                               (include_hidden . ,(if (plist-get opts :show-hidden) t :msgpack-false))))))
            ;; Convert vector to list if needed
-           (result-list (if (vectorp result) (append result nil) result))
+           (result-list (let ((rl (if (vectorp result) (append result nil) result)))
+                          ;; For single-file mode, filter to just the target file
+                          (if single-file-p
+                              (let ((target-name (file-name-nondirectory localname)))
+                                (cl-remove-if-not
+                                 (lambda (entry)
+                                   (equal (tramp-rpc--decode-filename entry) target-name))
+                                 rl))
+                            rl)))
            ;; Pre-decode names and extract all data needed for formatting
            (entries-with-data
             (mapcar (lambda (entry)
@@ -1583,9 +1596,10 @@ Supported switches: -a -t -S -r -h --group-directories-first."
                                max-nlinks-width
                                max-uname-width
                                max-gname-width)))
-      ;; Insert header
-      (insert (format "  %s:\n" filename))
-      (insert "  total 0\n")  ; We don't calculate total blocks
+      ;; Insert header (only for directory listings, not single files)
+      (unless single-file-p
+        (insert (format "  %s:\n" filename))
+        (insert "  total 0\n"))  ; We don't calculate total blocks
 
       ;; Insert each entry using dynamic widths
       (dolist (entry-data sorted-entries)
@@ -1619,74 +1633,95 @@ Supported switches: -a -t -S -r -h --group-directories-first."
 
 (defun tramp-rpc-handle-insert-file-contents
     (filename &optional visit beg end replace)
-  "Like `insert-file-contents' for TRAMP-RPC files."
+  "Like `insert-file-contents' for TRAMP-RPC files.
+Uses `file-local-copy' to get a local copy, then inserts it.
+This matches the upstream tramp approach: proper coding system handling,
+point management, and REPLACE semantics come for free."
   (barf-if-buffer-read-only)
   (setq filename (expand-file-name filename))
-  (let (result)
+  (let (result local-copy)
     (with-parsed-tramp-file-name filename nil
       (unwind-protect
-          (let* ((params (tramp-rpc--encode-path localname))
-                 (_ (when beg (push `(offset . ,beg) params)))
-                 (_ (when end (push `(length . ,(- end (or beg 0))) params)))
-                 (rpc-result (tramp-rpc--call v "file.read" params))
-                 ;; With MessagePack, content is already raw bytes (unibyte string)
-                 (content (alist-get 'content rpc-result))
-                 (size (length content))
-                 (point-before (point)))
+          (condition-case err
+              (tramp-barf-if-file-missing v filename
+                ;; Get a local copy of the remote file.
+                (setq local-copy
+                      (let ((inhibit-file-name-operation
+                             (when (eq inhibit-file-name-operation
+                                       'insert-file-contents)
+                               'file-local-copy)))
+                        (file-local-copy filename)))
 
-            (when replace
-              (delete-region (point-min) (point-max))
-              (setq point-before (point-min)))
+                ;; We must ensure that `file-coding-system-alist'
+                ;; matches `local-copy'.
+                (let ((file-coding-system-alist
+                       (tramp-find-file-name-coding-system-alist
+                        filename local-copy)))
+                  (setq result
+                        (insert-file-contents
+                         local-copy visit beg end replace))))
 
-            ;; Insert raw bytes and let Emacs detect/decode the encoding
-            ;; This matches what standard TRAMP does for proper encoding handling
-            (let ((coding-system-for-read 'undecided))
-              (insert content)
-              ;; Decode the inserted region using Emacs' coding system detection
-              ;; This properly handles UTF-8, Chinese, and other encodings
-              (decode-coding-inserted-region point-before (point) filename visit beg end replace))
+            (file-error
+             (let ((tramp-verbose (if visit 0 tramp-verbose)))
+               (tramp-error v 'file-missing filename)))
+            (error
+             (add-hook 'find-file-not-found-functions
+                       `(lambda () (signal ',(car err) ',(cdr err)))
+                       nil t)
+             (signal (car err) (cdr err))))
 
-            (setq result (list filename size)))
-
-        ;; Cleanup/exit - runs even if an error was signaled.
-        ;; This ensures buffer-file-name is set when VISIT is non-nil,
-        ;; which is required by find-file-noselect-1 for proper buffer setup.
-        ;; Without this, find-file on non-existing files fails with
-        ;; "wrong-type-argument arrayp nil" (GitHub issue #37).
+        ;; Save exit.
         (when visit
           (setq buffer-file-name filename
                 buffer-read-only (not (file-writable-p filename)))
           (set-visited-file-modtime)
-          (set-buffer-modified-p nil))))
+          (set-buffer-modified-p nil))
+        (when (stringp local-copy)
+          (delete-file local-copy))))
 
-    ;; Return result (or nil if file didn't exist)
-    (or result (list filename 0))))
+    ;; Result.
+    (cons filename (cdr result))))
 
 (defun tramp-rpc-handle-write-region
-    (start end filename &optional append visit _lockname mustbenew)
+    (start end filename &optional append visit lockname mustbenew)
   "Like `write-region' for TRAMP-RPC files."
-  (with-parsed-tramp-file-name filename nil
-    ;; If START is a string, write it directly; otherwise extract from buffer
-    ;; Note: START and END can be nil (meaning entire buffer) when called from save-buffer
+  (tramp-skeleton-write-region
+      start end filename append visit lockname mustbenew
+    ;; If START is a string, write it directly; otherwise extract from buffer.
+    ;; When APPEND is an integer, it is a file offset for writing.
     (let* ((content (if (stringp start)
                         start
                       (buffer-substring-no-properties
                        (or start (point-min))
                        (or end (point-max)))))
-           ;; With MessagePack, send content as binary directly
-           (content-bytes (encode-coding-string content 'utf-8-unix))
+           ;; Encode using buffer's coding system or default to utf-8
+           (coding (or (and (not (stringp start))
+                            buffer-file-coding-system)
+                       'utf-8-unix))
+           (content-bytes (encode-coding-string content coding))
+           ;; When APPEND is an integer, it's a file offset.
+           ;; Read the existing file content first, then splice.
+           (real-append (cond
+                         ((integerp append)
+                          ;; Offset write: read file, truncate at offset, append new
+                          (let* ((existing (condition-case nil
+                                              (let ((r (tramp-rpc--call
+                                                        v "file.read"
+                                                        (tramp-rpc--encode-path localname))))
+                                                (alist-get 'content r))
+                                            (file-missing nil)))
+                                 (prefix (if existing
+                                             (substring existing 0 (min append (length existing)))
+                                           "")))
+                            ;; Combine prefix + new content
+                            (setq content-bytes (concat prefix content-bytes))
+                            ;; Not an append anymore, full overwrite
+                            nil))
+                         (append t)
+                         (t nil)))
            (params (append (tramp-rpc--encode-path localname)
                            `((content . ,(msgpack-bin-make content-bytes))
-                             (append . ,(if append t :msgpack-false))))))
-
-      ;; Check mustbenew
-      (when mustbenew
-        (when (file-exists-p filename)
-          (if (eq mustbenew 'excl)
-              (signal 'file-already-exists (list filename))
-            (unless (yes-or-no-p
-                     (format "File %s exists; overwrite? " filename))
-              (signal 'file-already-exists (list filename))))))
+                             (append . ,(if real-append t :msgpack-false))))))
 
       (let ((tramp-rpc--suppress-fs-notifications t))
         (tramp-rpc--call v "file.write" params))
@@ -1694,15 +1729,11 @@ Supported switches: -a -t -S -r -h --group-directories-first."
       ;; Invalidate caches for the written file
       (tramp-rpc--invalidate-cache-for-path filename)
 
-      ;; Handle visit
-      (when (or (eq visit t) (stringp visit))
-        (setq buffer-file-name filename)
-        (set-visited-file-modtime)
-        (set-buffer-modified-p nil))
-      (when (stringp visit)
-        (setq buffer-file-name visit))
-
-      nil)))
+      ;; Tell the skeleton which coding system we used.
+      ;; `encode-coding-string' sets `last-coding-system-used', but
+      ;; the skeleton shadows it with a local `let', so use the value
+      ;; from our `coding' variable instead.
+      (setq coding-system-used coding))))
 
 (defun tramp-rpc-handle-copy-file
     (filename newname &optional ok-if-already-exists keep-time
@@ -1710,12 +1741,14 @@ Supported switches: -a -t -S -r -h --group-directories-first."
   "Like `copy-file' for TRAMP-RPC files."
   (setq filename (expand-file-name filename)
         newname (expand-file-name newname))
-  ;; If newname is a directory, copy the file INTO it
-  (when (file-directory-p newname)
-    (setq newname (expand-file-name (file-name-nondirectory filename) newname)))
   (let ((source-remote (tramp-tramp-file-p filename))
         (dest-remote (tramp-tramp-file-p newname)))
     (cond
+     ;; Directory source with different hosts: delegate to copy-directory.
+     ((and (file-directory-p filename)
+           (not (tramp-equal-remote filename newname)))
+      (copy-directory filename newname keep-time t))
+
      ;; Both on same remote host using RPC - use server-side copy
      ((and source-remote dest-remote
            (tramp-equal-remote filename newname))
@@ -1724,9 +1757,15 @@ Supported switches: -a -t -S -r -h --group-directories-first."
           (unless ok-if-already-exists
             (when (file-exists-p newname)
               (signal 'file-already-exists (list newname))))
+          (when (and (file-directory-p newname)
+                     (not (directory-name-p newname)))
+            (tramp-error v1 'file-error
+                         "File is a directory %s" newname))
           (tramp-rpc--call v1 "file.copy"
-                           `((src . ,v1-localname)
-                             (dest . ,v2-localname)
+                           `((src . ,(tramp-rpc--path-to-bytes
+                                      (file-name-unquote v1-localname)))
+                             (dest . ,(tramp-rpc--path-to-bytes
+                                       (file-name-unquote v2-localname)))
                              (preserve . ,(if (or keep-time preserve-permissions) t :msgpack-false)))))))
      ;; Remote source, local dest - read via RPC, write locally
      ((and source-remote (not dest-remote))
@@ -1762,12 +1801,33 @@ Supported switches: -a -t -S -r -h --group-directories-first."
        #'copy-file
        (list filename newname ok-if-already-exists keep-time
              preserve-uid-gid preserve-permissions))))
-    ;; Invalidate caches for the destination
+    ;; Flush tramp file property cache for source and destination
+    (when source-remote
+      (with-parsed-tramp-file-name filename v1
+        (tramp-flush-file-properties v1 v1-localname)))
     (when dest-remote
+      (with-parsed-tramp-file-name newname v2
+        (tramp-flush-file-properties v2 v2-localname)
+        (tramp-flush-directory-properties v2 v2-localname))
       (tramp-rpc--invalidate-cache-for-path newname))))
 
 (defun tramp-rpc-handle-rename-file (filename newname &optional ok-if-already-exists)
   "Like `rename-file' for TRAMP-RPC files."
+  (setq filename (expand-file-name filename)
+        newname (expand-file-name newname))
+  ;; Check ok-if-already-exists BEFORE any directory rewriting.
+  (when (file-exists-p newname)
+    (unless ok-if-already-exists
+      (signal 'file-already-exists (list newname)))
+    ;; Even with ok-if-already-exists, can't rename a file onto a directory.
+    (when (and (file-directory-p newname)
+               (not (directory-name-p newname))
+               (not (file-directory-p filename)))
+      (signal 'file-error (list "File is a directory" newname))))
+  ;; If newname is a directory (with trailing slash), rename INTO it.
+  (when (and (file-directory-p newname)
+             (directory-name-p newname))
+    (setq newname (expand-file-name (file-name-nondirectory filename) newname)))
   (let ((source-remote (tramp-tramp-file-p filename))
         (dest-remote (tramp-tramp-file-p newname)))
     (cond
@@ -1777,17 +1837,26 @@ Supported switches: -a -t -S -r -h --group-directories-first."
       (with-parsed-tramp-file-name filename v1
         (with-parsed-tramp-file-name newname v2
           (tramp-rpc--call v1 "file.rename"
-                           `((src . ,v1-localname)
-                             (dest . ,v2-localname)
+                           `((src . ,(tramp-rpc--path-to-bytes
+                                      (file-name-unquote v1-localname)))
+                             (dest . ,(tramp-rpc--path-to-bytes
+                                       (file-name-unquote v2-localname)))
                              (overwrite . ,(if ok-if-already-exists t :msgpack-false)))))))
      ;; Different hosts, copy then delete
      (t
       (copy-file filename newname ok-if-already-exists t t t)
-      (delete-file filename)))
-    ;; Invalidate caches for both source and destination
+      (if (file-directory-p filename)
+          (delete-directory filename 'recursive)
+        (delete-file filename))))
+    ;; Flush tramp file property cache for source and destination
     (when source-remote
+      (with-parsed-tramp-file-name filename v1
+        (tramp-flush-file-properties v1 v1-localname))
       (tramp-rpc--invalidate-cache-for-path filename))
     (when dest-remote
+      (with-parsed-tramp-file-name newname v2
+        (tramp-flush-file-properties v2 v2-localname)
+        (tramp-flush-directory-properties v2 v2-localname))
       (tramp-rpc--invalidate-cache-for-path newname))))
 
 (defun tramp-rpc-handle-delete-file (filename &optional trash)
@@ -1798,15 +1867,8 @@ Supported switches: -a -t -S -r -h --group-directories-first."
 
 (defun tramp-rpc-handle-make-symbolic-link (target linkname &optional ok-if-already-exists)
   "Like `make-symbolic-link' for TRAMP-RPC files."
-  (with-parsed-tramp-file-name linkname nil
-    (unless ok-if-already-exists
-      (when (file-exists-p linkname)
-        (signal 'file-already-exists (list linkname))))
-    (when (file-exists-p linkname)
-      (delete-file linkname))
-    (let* ((target-path (if (tramp-tramp-file-p target)
-                            (tramp-file-local-name target)
-                          target))
+  (tramp-skeleton-make-symbolic-link target linkname ok-if-already-exists
+    (let* ((target-path (file-name-unquote target))
            (link-path-params (tramp-rpc--encode-path localname))
            ;; Rename 'path' to 'link_path' in the encoded params
            (params (mapcar (lambda (p)
@@ -1817,7 +1879,7 @@ Supported switches: -a -t -S -r -h --group-directories-first."
                                  p)))
                            link-path-params)))
       (tramp-rpc--call v "file.make_symlink"
-                       (append `((target . ,target-path)) params)))
+                       (append `((target . ,(tramp-rpc--path-to-bytes target-path))) params)))
     (tramp-rpc--invalidate-cache-for-path linkname)))
 
 (defun tramp-rpc-handle-add-name-to-file (filename newname &optional ok-if-already-exists)
@@ -1842,8 +1904,10 @@ Creates a hard link from NEWNAME to FILENAME."
             (tramp-error v2 'file-already-exists newname)
           (delete-file newname)))
       (tramp-rpc--call v1 "file.make_hardlink"
-                       `((src . ,v1-localname)
-                         (dest . ,v2-localname))))))
+                       `((src . ,(tramp-rpc--path-to-bytes
+                                  (file-name-unquote v1-localname)))
+                         (dest . ,(tramp-rpc--path-to-bytes
+                                   (file-name-unquote v2-localname))))))))
 
 (defun tramp-rpc-handle-set-file-uid-gid (filename &optional uid gid)
   "Like `tramp-set-file-uid-gid' for TRAMP-RPC files.
@@ -2274,15 +2338,13 @@ Caches the result per connection."
 
 (defun tramp-rpc-handle-file-local-copy (filename)
   "Create a local copy of remote FILENAME using RPC."
-  (with-parsed-tramp-file-name filename nil
+  (tramp-skeleton-file-local-copy filename
     (let* ((result (tramp-rpc--call v "file.read" (tramp-rpc--encode-path localname)))
            ;; With MessagePack, content is already raw bytes
-           (content (alist-get 'content result))
-           (tmpfile (make-temp-file "tramp-rpc.")))
+           (content (alist-get 'content result)))
       (with-temp-file tmpfile
         (set-buffer-multibyte nil)
-        (insert content))
-      tmpfile)))
+        (insert content)))))
 
 (defun tramp-rpc-handle-get-home-directory (vec &optional user)
   "Return home directory for USER on remote host VEC using RPC.
@@ -2496,13 +2558,14 @@ Also controls process exit detection latency."
     ;; These use tramp-handle-* functions that operate on cached data or
     ;; delegate to our RPC handlers internally.
     ;; =========================================================================
+    (abbreviate-file-name . tramp-handle-abbreviate-file-name)
     (access-file . tramp-rpc-handle-access-file)
     (directory-file-name . tramp-handle-directory-file-name)
     (dired-uncache . tramp-handle-dired-uncache)
     (file-accessible-directory-p . tramp-handle-file-accessible-directory-p)
     (file-equal-p . tramp-handle-file-equal-p)
     (file-in-directory-p . tramp-handle-file-in-directory-p)
-    (file-name-as-directory . tramp-rpc-handle-file-name-as-directory)
+    (file-name-as-directory . tramp-handle-file-name-as-directory)
     (file-name-case-insensitive-p . tramp-rpc-handle-file-name-case-insensitive-p)
     (file-name-completion . tramp-handle-file-name-completion)
     (file-name-directory . tramp-handle-file-name-directory)
