@@ -220,14 +220,13 @@ async fn send_notification(
         .map(|p| Value::String(p.to_string_lossy().to_string().into()))
         .collect();
 
-    let notification = Notification {
-        version: "2.0".to_string(),
-        method: "fs.changed".to_string(),
-        params: Value::Map(vec![(
+    let notification = Notification::new(
+        "fs.changed",
+        Value::Map(vec![(
             Value::String("paths".into()),
             Value::Array(paths_value),
         )]),
-    };
+    );
 
     let bytes = rmp_serde::to_vec_named(&notification)?;
     let mut w = writer.lock().await;
