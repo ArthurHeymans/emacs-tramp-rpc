@@ -145,8 +145,10 @@ pub async fn write(params: &Value) -> HandlerResult {
 pub async fn copy(params: &Value) -> HandlerResult {
     #[derive(Deserialize)]
     struct Params {
-        src: String,
-        dest: String,
+        #[serde(with = "path_or_bytes")]
+        src: Vec<u8>,
+        #[serde(with = "path_or_bytes")]
+        dest: Vec<u8>,
         /// Preserve file attributes
         #[serde(default)]
         preserve: bool,
@@ -155,8 +157,8 @@ pub async fn copy(params: &Value) -> HandlerResult {
     let params: Params =
         from_value(params.clone()).map_err(|e| RpcError::invalid_params(e.to_string()))?;
 
-    let src_path = Path::new(&params.src);
-    let mut dest_path = std::path::PathBuf::from(&params.dest);
+    let src_path = bytes_to_path(&params.src);
+    let mut dest_path = bytes_to_path(&params.dest).to_path_buf();
 
     // If destination is a directory, append the source filename
     if dest_path.is_dir() {
@@ -165,20 +167,22 @@ pub async fn copy(params: &Value) -> HandlerResult {
         }
     }
 
-    let src_metadata = fs::metadata(&params.src)
+    let src_str = src_path.to_string_lossy().to_string();
+
+    let src_metadata = fs::metadata(&src_path)
         .await
-        .map_err(|e| map_io_error(e, &params.src))?;
+        .map_err(|e| map_io_error(e, &src_str))?;
 
     let bytes_copied = if src_metadata.is_dir() {
         // Recursive directory copy
-        copy_dir_recursive(src_path, &dest_path, params.preserve)
+        copy_dir_recursive(&src_path, &dest_path, params.preserve)
             .await
-            .map_err(|e| map_io_error(e, &params.src))?
+            .map_err(|e| map_io_error(e, &src_str))?
     } else {
         // Copy regular file (or symlink target)
-        let n = fs::copy(&params.src, &dest_path)
+        let n = fs::copy(&src_path, &dest_path)
             .await
-            .map_err(|e| map_io_error(e, &params.src))?;
+            .map_err(|e| map_io_error(e, &src_str))?;
 
         // Preserve attributes if requested
         if params.preserve {
@@ -257,8 +261,10 @@ async fn copy_dir_recursive(src: &Path, dest: &Path, preserve: bool) -> std::io:
 pub async fn rename(params: &Value) -> HandlerResult {
     #[derive(Deserialize)]
     struct Params {
-        src: String,
-        dest: String,
+        #[serde(with = "path_or_bytes")]
+        src: Vec<u8>,
+        #[serde(with = "path_or_bytes")]
+        dest: Vec<u8>,
         /// Overwrite destination if it exists
         #[serde(default)]
         overwrite: bool,
@@ -267,18 +273,23 @@ pub async fn rename(params: &Value) -> HandlerResult {
     let params: Params =
         from_value(params.clone()).map_err(|e| RpcError::invalid_params(e.to_string()))?;
 
+    let src = bytes_to_path(&params.src);
+    let dest = bytes_to_path(&params.dest);
+    let dest_str = dest.to_string_lossy().to_string();
+    let src_str = src.to_string_lossy().to_string();
+
     // Check if destination exists and overwrite is false
-    if !params.overwrite && Path::new(&params.dest).exists() {
+    if !params.overwrite && dest.exists() {
         return Err(RpcError {
             code: RpcError::IO_ERROR,
-            message: format!("Destination already exists: {}", params.dest),
+            message: format!("Destination already exists: {}", dest_str),
             data: None,
         });
     }
 
-    fs::rename(&params.src, &params.dest)
+    fs::rename(&src, &dest)
         .await
-        .map_err(|e| map_io_error(e, &params.src))?;
+        .map_err(|e| map_io_error(e, &src_str))?;
 
     Ok(Value::Boolean(true))
 }
@@ -364,18 +375,24 @@ pub async fn set_times(params: &Value) -> HandlerResult {
 pub async fn make_symlink(params: &Value) -> HandlerResult {
     #[derive(Deserialize)]
     struct Params {
-        target: String,
-        link_path: String,
+        #[serde(with = "path_or_bytes")]
+        target: Vec<u8>,
+        #[serde(with = "path_or_bytes")]
+        link_path: Vec<u8>,
     }
 
     let params: Params =
         from_value(params.clone()).map_err(|e| RpcError::invalid_params(e.to_string()))?;
 
+    let target = bytes_to_path(&params.target);
+    let link_path = bytes_to_path(&params.link_path);
+    let link_path_str = link_path.to_string_lossy().to_string();
+
     #[cfg(unix)]
     {
-        fs::symlink(&params.target, &params.link_path)
+        fs::symlink(&target, &link_path)
             .await
-            .map_err(|e| map_io_error(e, &params.link_path))?;
+            .map_err(|e| map_io_error(e, &link_path_str))?;
     }
 
     Ok(Value::Boolean(true))
@@ -386,17 +403,23 @@ pub async fn make_hardlink(params: &Value) -> HandlerResult {
     #[derive(Deserialize)]
     struct Params {
         /// The existing file to link to
-        src: String,
+        #[serde(with = "path_or_bytes")]
+        src: Vec<u8>,
         /// The new hard link path
-        dest: String,
+        #[serde(with = "path_or_bytes")]
+        dest: Vec<u8>,
     }
 
     let params: Params =
         from_value(params.clone()).map_err(|e| RpcError::invalid_params(e.to_string()))?;
 
-    fs::hard_link(&params.src, &params.dest)
+    let src = bytes_to_path(&params.src);
+    let dest = bytes_to_path(&params.dest);
+    let dest_str = dest.to_string_lossy().to_string();
+
+    fs::hard_link(&src, &dest)
         .await
-        .map_err(|e| map_io_error(e, &params.dest))?;
+        .map_err(|e| map_io_error(e, &dest_str))?;
 
     Ok(Value::Boolean(true))
 }
