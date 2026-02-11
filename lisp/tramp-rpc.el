@@ -1507,12 +1507,23 @@ point management, and REPLACE semantics come for free."
   "Like `copy-file' for TRAMP-RPC files."
   (setq filename (expand-file-name filename)
         newname (expand-file-name newname))
+  ;; When NEWNAME is a directory name (trailing /), copy INTO it.
+  (when (and (directory-name-p newname)
+             (file-directory-p newname))
+    (setq newname (expand-file-name
+                   (file-name-nondirectory filename) newname)))
+  ;; Common checks before dispatching by host combination.
+  (unless ok-if-already-exists
+    (when (file-exists-p newname)
+      (signal 'file-already-exists (list newname))))
+  (when (and (file-directory-p newname)
+             (not (directory-name-p newname)))
+    (signal 'file-error (list "File is a directory" newname)))
   (let ((source-remote (tramp-tramp-file-p filename))
         (dest-remote (tramp-tramp-file-p newname)))
     (cond
-     ;; Directory source with different hosts: delegate to copy-directory.
-     ((and (file-directory-p filename)
-           (not (tramp-equal-remote filename newname)))
+     ;; Directory source: delegate to copy-directory.
+     ((file-directory-p filename)
       (copy-directory filename newname keep-time t))
 
      ;; Both on same remote host using RPC - use server-side copy
@@ -1520,13 +1531,6 @@ point management, and REPLACE semantics come for free."
            (tramp-equal-remote filename newname))
       (with-parsed-tramp-file-name filename v1
         (with-parsed-tramp-file-name newname v2
-          (unless ok-if-already-exists
-            (when (file-exists-p newname)
-              (signal 'file-already-exists (list newname))))
-          (when (and (file-directory-p newname)
-                     (not (directory-name-p newname)))
-            (tramp-error v1 'file-error
-                         "File is a directory %s" newname))
           (tramp-rpc--call v1 "file.copy"
                            `((src . ,(tramp-rpc--path-to-bytes
                                       (file-name-unquote v1-localname)))
@@ -1535,9 +1539,6 @@ point management, and REPLACE semantics come for free."
                              (preserve . ,(if (or keep-time preserve-permissions) t :msgpack-false)))))))
      ;; Remote source, local dest - read via RPC, write locally
      ((and source-remote (not dest-remote))
-      (unless ok-if-already-exists
-        (when (file-exists-p newname)
-          (signal 'file-already-exists (list newname))))
       ;; Use file-local-copy to get a temp local copy, then rename
       (let ((tmpfile (file-local-copy filename)))
         (unwind-protect
@@ -1550,9 +1551,6 @@ point management, and REPLACE semantics come for free."
             (delete-file tmpfile)))))
      ;; Local source, remote dest - read locally, write via RPC
      ((and (not source-remote) dest-remote)
-      (unless ok-if-already-exists
-        (when (file-exists-p newname)
-          (signal 'file-already-exists (list newname))))
       ;; Read local file and write to remote
       (with-temp-buffer
         (set-buffer-multibyte nil)
