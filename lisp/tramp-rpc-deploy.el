@@ -36,7 +36,7 @@
   "Deployment settings for TRAMP-RPC."
   :group 'tramp)
 
-(defconst tramp-rpc-deploy-version "0.4.0"
+(defconst tramp-rpc-deploy-version "0.5.0"
   "Current version of tramp-rpc-server.")
 
 (defconst tramp-rpc-deploy-binary-name "tramp-rpc-server"
