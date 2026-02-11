@@ -89,6 +89,14 @@
 ;; However, tramp-rpc supports processes and many sh-gated features.
 ;; We define a tramp--test-rpc-p predicate and override the capability
 ;; predicates to include rpc.
+;;
+;; WARNING: These overrides redefine upstream functions wholesale.  If
+;; upstream tramp-tests.el adds new method checks or changes the logic
+;; of these predicates, these overrides will silently shadow the new
+;; behavior.  When updating ~/src/tramp, review the upstream definitions
+;; of `tramp--test-supports-processes-p' and
+;; `tramp--test-supports-set-file-modes-p' and update these copies to
+;; match (adding `(tramp--test-rpc-p)' to the `or' form).
 
 (defun tramp--test-rpc-p ()
   "Check whether the rpc method is used."

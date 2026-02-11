@@ -138,10 +138,18 @@ impl RpcError {
     }
 
     pub fn io_error(err: std::io::Error) -> Self {
+        // Include the raw OS errno in the data field so clients can
+        // match on it structurally rather than parsing the message text.
+        let data = err.raw_os_error().map(|errno| {
+            Value::Map(vec![(
+                Value::String("os_errno".into()),
+                Value::Integer(rmpv::Integer::from(errno)),
+            )])
+        });
         Self {
             code: Self::IO_ERROR,
             message: err.to_string(),
-            data: None,
+            data,
         }
     }
 }

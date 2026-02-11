@@ -795,31 +795,33 @@ Returns the result or signals an error."
         (tramp-rpc--debug "RECV id=%s (found)" expected-id)
         (if (tramp-rpc-protocol-error-p response)
             (let ((code (tramp-rpc-protocol-error-code response))
-                  (msg (tramp-rpc-protocol-error-message response)))
-              (tramp-rpc--debug "ERROR id=%s code=%s msg=%s" expected-id code msg)
+                  (msg (tramp-rpc-protocol-error-message response))
+                  (os-errno (tramp-rpc-protocol-error-errno response)))
+              (tramp-rpc--debug "ERROR id=%s code=%s msg=%s errno=%s"
+                               expected-id code msg os-errno)
               (cond
                ((= code tramp-rpc-protocol-error-file-not-found)
                 (signal 'file-missing (list "RPC" "No such file" msg)))
                ((= code tramp-rpc-protocol-error-permission-denied)
                 (signal 'file-error (list "RPC" "Permission denied" msg)))
-               ;; Map OS errno values embedded in error messages to
-               ;; appropriate Emacs error symbols.
-               ((string-match "os error 17\\>" msg) ;; EEXIST
+               ;; Map OS errno values to appropriate Emacs error symbols.
+               ;; The server includes the raw errno in the error data field.
+               ((eql os-errno 17) ;; EEXIST
                 (signal 'file-already-exists (list "RPC" msg)))
-               ((string-match "os error 39\\>" msg) ;; ENOTEMPTY
+               ((eql os-errno 39) ;; ENOTEMPTY
                 (signal 'file-error (list "RPC" "Directory not empty" msg)))
-               ((string-match "os error 20\\>" msg) ;; ENOTDIR
-                 (signal 'file-error (list "RPC" "Not a directory" msg)))
-                ((string-match "os error 21\\>" msg) ;; EISDIR
-                 (signal 'file-error (list "RPC" "Is a directory" msg)))
-                ((string-match "os error 40\\>" msg) ;; ELOOP
-                 (signal 'file-error (list "RPC" "Too many levels of symbolic links" msg)))
-                ;; All other IO errors also signal file-error so callers
-                ;; can catch them uniformly with condition-case.
-                ((= code tramp-rpc-protocol-error-io)
-                 (signal 'file-error (list "RPC" msg)))
-                (t
-                 (error "RPC error: %s" msg))))
+               ((eql os-errno 20) ;; ENOTDIR
+                (signal 'file-error (list "RPC" "Not a directory" msg)))
+               ((eql os-errno 21) ;; EISDIR
+                (signal 'file-error (list "RPC" "Is a directory" msg)))
+               ((eql os-errno 40) ;; ELOOP
+                (signal 'file-error (list "RPC" "Too many levels of symbolic links" msg)))
+               ;; All other IO errors also signal file-error so callers
+               ;; can catch them uniformly with condition-case.
+               ((= code tramp-rpc-protocol-error-io)
+                (signal 'file-error (list "RPC" msg)))
+               (t
+                (error "RPC error: %s" msg))))
           (plist-get response :result))))))
 
 (defun tramp-rpc--call-batch (vec requests)
@@ -1069,7 +1071,7 @@ the server, since the remote side does not understand it."
 With MessagePack, paths are sent directly as strings/binary.
 Strips any Emacs file-name quoting (/:) before encoding.
 Returns an alist with path."
-  `((path . ,(tramp-rpc--path-to-bytes (file-name-unquote path)))))
+  `((path . ,(tramp-rpc--path-to-bytes path))))
 
 ;; ============================================================================
 ;; File name handler operations
@@ -1115,60 +1117,20 @@ Optimized to use pipelined requests for better performance."
 
 (defun tramp-rpc--call-file-stat (vec localname &optional lstat)
   "Call file.stat for LOCALNAME on VEC, returning nil if file doesn't exist.
-If LSTAT is non-nil, don't follow symlinks."
-  (let* ((conn (tramp-rpc--ensure-connection vec))
-         (process (plist-get conn :process))
-         (buffer (plist-get conn :buffer))
-         (params (append (tramp-rpc--encode-path localname)
-                         (when lstat '((lstat . t)))))
-         (id-and-request (tramp-rpc-protocol-encode-request-with-id "file.stat" params))
-         (expected-id (car id-and-request))
-         (request (cdr id-and-request)))
-    (tramp-rpc--debug "SEND id=%s method=file.stat" expected-id)
-    (process-send-string process request)
-    (with-current-buffer buffer
-      (let ((timeout 30)
-            response)
-        (while (and (not response)
-                    (> timeout 0)
-                    (process-live-p process))
-          ;; Check if process is locked to another thread before trying to accept
-          (if (not (tramp-rpc--process-accessible-p process))
-              ;; Process locked - if non-essential, bail out; otherwise sleep and retry
-              (if non-essential
-                  (progn
-                    (tramp-rpc--debug "LOCKED file.stat (non-essential, bailing)")
-                    (throw 'non-essential 'non-essential))
-                ;; Sleep briefly - other thread may receive our response
-                (sleep-for 0.1)
-                ;; Check if other thread already got our response
-                (setq response (tramp-rpc--find-response-by-id expected-id)))
-            ;; Process is accessible
-            (if (with-local-quit
-                  (accept-process-output process 0.1 nil t)
-                  t)
-                (setq response (tramp-rpc--find-response-by-id expected-id))
-              (keyboard-quit)))
-          (cl-decf timeout 0.1))
-        (unless response
-          (error "Timeout waiting for file.stat response"))
-        (tramp-rpc--debug "RECV id=%s (found)" expected-id)
-        (if (tramp-rpc-protocol-error-p response)
-            (let ((code (tramp-rpc-protocol-error-code response))
-                  (msg (tramp-rpc-protocol-error-message response)))
-              (cond
-               ;; Return nil for file-not-found (file doesn't exist)
-               ((= code tramp-rpc-protocol-error-file-not-found)
-                nil)
-               ;; Return nil for ELOOP (symlink loop) - file can't be
-               ;; resolved, so it effectively doesn't exist for stat
-               ((string-match "os error 40\\>" msg)
-                nil)
-               ((= code tramp-rpc-protocol-error-permission-denied)
-                (signal 'file-error (list "RPC" "Permission denied" msg)))
-               (t
-                (signal 'file-error (list "RPC" msg)))))
-          (plist-get response :result))))))
+If LSTAT is non-nil, don't follow symlinks.
+Uses `tramp-rpc--call' internally but converts file-missing and
+ELOOP errors to nil (the file effectively doesn't exist for stat)."
+  (let ((params (append (tramp-rpc--encode-path localname)
+                        (when lstat '((lstat . t))))))
+    (condition-case err
+        (tramp-rpc--call vec "file.stat" params)
+      (file-missing nil)
+      (file-error
+       ;; Return nil for ELOOP (symlink loop) - file can't be resolved,
+       ;; so it effectively doesn't exist for stat purposes.
+       (if (string-match-p "Too many levels of symbolic links" (cadr err))
+           nil
+         (signal (car err) (cdr err)))))))
 
 (defun tramp-rpc-handle-file-directory-p (filename)
   "Like `file-directory-p' for TRAMP-RPC files."
@@ -1430,216 +1392,6 @@ TYPE is the file type string."
                      (append (tramp-rpc--encode-path localname)
                              `((recursive . ,(if recursive t :msgpack-false))))))
   (tramp-rpc--invalidate-cache-for-path directory))
-
-(defun tramp-rpc--parse-dired-switches (switches)
-  "Parse SWITCHES string into a plist of options.
-Supported switches:
-  -a: show hidden files
-  -t: sort by modification time
-  -S: sort by size
-  -r: reverse sort order
-  -h: human-readable sizes
-  --group-directories-first: directories before files"
-  (let ((sw (or switches "")))
-    (list
-     :show-hidden (string-match-p "a" sw)
-     :sort-by-time (string-match-p "t" sw)
-     :sort-by-size (string-match-p "S" sw)
-     :reverse (string-match-p "r" sw)
-     :human-readable (string-match-p "h" sw)
-     :group-directories-first (string-match-p "group-directories-first" sw))))
-
-(defun tramp-rpc--format-size (size human-readable &optional width)
-  "Format SIZE for display.
-If HUMAN-READABLE is non-nil, use human-readable format (K, M, G, T, P).
-WIDTH is the minimum field width for right-alignment (default varies by mode).
-Returns right-aligned string."
-  (if human-readable
-      (let* ((formatted
-              (cond
-               ((>= size 1125899906842624) (format "%.1fP" (/ size 1125899906842624.0)))  ; >= 1 PiB
-               ((>= size 1099511627776) (format "%.1fT" (/ size 1099511627776.0)))        ; >= 1 TiB
-               ((>= size 1073741824) (format "%.1fG" (/ size 1073741824.0)))              ; >= 1 GiB
-               ((>= size 1048576) (format "%.1fM" (/ size 1048576.0)))                    ; >= 1 MiB
-               ((>= size 1024) (format "%.1fK" (/ size 1024.0)))                          ; >= 1 KiB
-               (t (number-to-string size))))
-             (w (or width (max 6 (length formatted)))))
-        (format (format "%%%ds" w) formatted))
-    (let ((w (or width 13)))
-      (format (format "%%%dd" w) size))))
-
-(defun tramp-rpc--format-time (mtime)
-  "Format MTIME (Unix timestamp) for ls-like display.
-Uses the standard ls -l convention (matching ls-lisp.el):
-- Files modified within the last 6 months: \"Mon DD HH:MM\"
-- Files modified more than 6 months ago: \"Mon DD  YYYY\"
-Returns a fixed-width 12-character string.
-Note: Uses the C locale for month names to ensure consistent width."
-  (if (null mtime)
-      "Jan  1  1970"
-    (let* ((time (seconds-to-time mtime))
-           (diff (time-subtract time nil))
-           ;; Consider a time to be recent if it is within the past six
-           ;; months.  A Gregorian year has 365.2425 * 24 * 60 * 60 ==
-           ;; 31556952 seconds on the average, and half of that is 15778476.
-           ;; Write the constant explicitly to avoid roundoff error.
-           ;; (This matches ls-lisp.el exactly)
-           (past-cutoff -15778476)
-           ;; Use C locale for consistent 3-char month abbreviations
-           (system-time-locale "C"))
-      (if (and (not (time-less-p diff past-cutoff))  ; not older than 6 months
-               (not (time-less-p 0 diff)))           ; not in the future
-          ;; Recent file: show time
-          (format-time-string "%b %e %H:%M" time)
-        ;; Old file or future: show year instead of time
-        (format-time-string "%b %e  %Y" time)))))
-
-(defun tramp-rpc-handle-insert-directory
-    (filename switches &optional _wildcard full-directory-p)
-  "Like `insert-directory' for TRAMP-RPC files.
-Produces ls-like output for dired.
-Supported switches: -a -t -S -r -h --group-directories-first."
-  (with-parsed-tramp-file-name (expand-file-name filename) nil
-    (let* ((opts (tramp-rpc--parse-dired-switches switches))
-           (human-readable (plist-get opts :human-readable))
-           ;; If not full-directory-p and filename is not a directory,
-           ;; list the parent and filter to just this file (like ls -d).
-           (single-file-p (and (not full-directory-p)
-                               (not (file-directory-p filename))))
-           (list-dir (if single-file-p
-                         (file-name-directory localname)
-                       localname))
-           (result (tramp-rpc--call v "dir.list"
-                                    (append (tramp-rpc--encode-path list-dir)
-                                            `((include_attrs . t)
-                                              (include_hidden . ,(if (plist-get opts :show-hidden) t :msgpack-false))))))
-           ;; Convert vector to list if needed
-           (result-list (let ((rl (if (vectorp result) (append result nil) result)))
-                          ;; For single-file mode, filter to just the target file
-                          (if single-file-p
-                              (let ((target-name (file-name-nondirectory localname)))
-                                (cl-remove-if-not
-                                 (lambda (entry)
-                                   (equal (tramp-rpc--decode-filename entry) target-name))
-                                 rl))
-                            rl)))
-           ;; Pre-decode names and extract all data needed for formatting
-           (entries-with-data
-            (mapcar (lambda (entry)
-                      (let* ((name (tramp-rpc--decode-filename entry))
-                             (attrs (alist-get 'attrs entry))
-                             (type (alist-get 'type attrs))
-                             (size (or (alist-get 'size attrs) 0))
-                             (nlinks (or (alist-get 'nlinks attrs) 1))
-                             (uid (or (alist-get 'uid attrs) 0))
-                             (gid (or (alist-get 'gid attrs) 0))
-                             (uname (or (tramp-rpc--decode-string (alist-get 'uname attrs))
-                                        (number-to-string uid)))
-                             (gname (or (tramp-rpc--decode-string (alist-get 'gname attrs))
-                                        (number-to-string gid)))
-                             (mtime (or (alist-get 'mtime attrs) 0))
-                             (is-dir (equal type "directory")))
-                        (list :name name :entry entry :size size
-                              :nlinks nlinks :uname uname :gname gname
-                              :mtime mtime :is-dir is-dir)))
-                    result-list))
-           ;; Calculate dynamic column widths (like ls does)
-           ;; First pass: find maximum widths (with defaults for empty dirs)
-           (max-nlinks-width
-            (if entries-with-data
-                (apply #'max 1
-                       (mapcar (lambda (e)
-                                 (length (number-to-string (plist-get e :nlinks))))
-                               entries-with-data))
-              1))
-           (max-uname-width
-            (if entries-with-data
-                (apply #'max 1
-                       (mapcar (lambda (e)
-                                 (length (plist-get e :uname)))
-                               entries-with-data))
-              8))
-           (max-gname-width
-            (if entries-with-data
-                (apply #'max 1
-                       (mapcar (lambda (e)
-                                 (length (plist-get e :gname)))
-                               entries-with-data))
-              8))
-           (max-size-width
-            (if entries-with-data
-                (if human-readable
-                    ;; For human-readable, calculate max formatted size width
-                    (apply #'max 1
-                           (mapcar (lambda (e)
-                                     (length (tramp-rpc--format-size (plist-get e :size) t 1)))
-                                   entries-with-data))
-                  ;; For numeric, use number of digits of largest size
-                  (apply #'max 1
-                         (mapcar (lambda (e)
-                                   (length (number-to-string (plist-get e :size))))
-                                 entries-with-data)))
-              1))
-           ;; Sort entries based on switches
-           (sorted-entries
-            (let* ((sort-fn
-                    (cond
-                     ((plist-get opts :sort-by-time)
-                      (lambda (a b) (> (plist-get a :mtime) (plist-get b :mtime))))
-                     ((plist-get opts :sort-by-size)
-                      (lambda (a b) (> (plist-get a :size) (plist-get b :size))))
-                     (t
-                      (lambda (a b) (string< (plist-get a :name) (plist-get b :name))))))
-                   ;; Apply --group-directories-first
-                   (sorted (if (plist-get opts :group-directories-first)
-                               (append
-                                (sort (cl-remove-if-not (lambda (e) (plist-get e :is-dir))
-                                                        entries-with-data)
-                                      sort-fn)
-                                (sort (cl-remove-if (lambda (e) (plist-get e :is-dir))
-                                                    entries-with-data)
-                                      sort-fn))
-                             (sort entries-with-data sort-fn))))
-              ;; Apply reverse if requested
-              (if (plist-get opts :reverse)
-                  (nreverse sorted)
-                sorted)))
-           ;; Build format string with dynamic widths
-           ;; Note: size-str is pre-formatted by tramp-rpc--format-size, so use %s
-           (format-str (format "  %%s %%%dd %%-%ds %%-%ds %%s %%s %%s"
-                               max-nlinks-width
-                               max-uname-width
-                               max-gname-width)))
-      ;; Insert header (only for directory listings, not single files)
-      (unless single-file-p
-        (insert (format "  %s:\n" filename))
-        (insert "  total 0\n"))  ; We don't calculate total blocks
-
-      ;; Insert each entry using dynamic widths
-      (dolist (entry-data sorted-entries)
-        (let* ((name (plist-get entry-data :name))
-               (entry (plist-get entry-data :entry))
-               (attrs (alist-get 'attrs entry))
-               (type (alist-get 'type attrs))
-               (mode (alist-get 'mode attrs))
-               (nlinks (plist-get entry-data :nlinks))
-               (uname (plist-get entry-data :uname))
-               (gname (plist-get entry-data :gname))
-               (size (plist-get entry-data :size))
-               (mtime (alist-get 'mtime attrs))
-               (link-target (tramp-rpc--decode-string (alist-get 'link_target attrs)))
-               (mode-str (tramp-rpc--mode-to-string (or mode 0) (or type "file")))
-               ;; Format size with dynamic width (already calculated)
-               (size-str (tramp-rpc--format-size size human-readable max-size-width))
-               (time-str (tramp-rpc--format-time mtime)))
-          ;; Skip . and .. unless -a is given
-          (unless (and (member name '("." ".."))
-                       (not (plist-get opts :show-hidden)))
-            (insert (format format-str
-                            mode-str nlinks uname gname size-str time-str name))
-            (when (and link-target (equal type "symlink"))
-              (insert (format " -> %s" link-target)))
-            (insert "\n")))))))
 
 ;; ============================================================================
 ;; File I/O operations
@@ -2426,39 +2178,12 @@ If GROUP is non-nil, also check that group would be preserved."
                (= (file-attribute-group-id attributes)
                   (tramp-rpc-handle-get-remote-gid v 'integer))))))))
 
-(defun tramp-rpc-handle-access-file (filename string)
-  "Like `access-file' for TRAMP-RPC files.
-Check if FILENAME is accessible, signaling an error if not.
-STRING is used in error messages."
-  (setq filename (file-truename filename))
-  (if (file-exists-p filename)
-      (unless (funcall
-               (if (file-directory-p filename)
-                   #'file-accessible-directory-p #'file-readable-p)
-               filename)
-        (tramp-error
-         (tramp-dissect-file-name filename)
-         'file-error
-         (format "%s: Permission denied, %s" string filename)))
-    (tramp-error
-     (tramp-dissect-file-name filename)
-     'file-missing
-     (format "%s: No such file or directory, %s" string filename))))
-
 (defun tramp-rpc-handle-file-name-case-insensitive-p (_filename)
   "Like `file-name-case-insensitive-p' for TRAMP-RPC files.
 Returns nil since most remote systems (Linux) are case-sensitive."
   ;; For simplicity, assume case-sensitive (most common for remote servers).
   ;; A more thorough implementation would check the remote filesystem type.
   nil)
-
-(defun tramp-rpc-handle-file-name-as-directory (file)
-  "Like `file-name-as-directory' for TRAMP-RPC files."
-  (with-parsed-tramp-file-name file nil
-    (tramp-make-tramp-file-name
-     v (if (tramp-string-empty-or-nil-p localname)
-           "/"
-         (file-name-as-directory localname)))))
 
 ;; ============================================================================
 ;; Process and advice modules (extracted)

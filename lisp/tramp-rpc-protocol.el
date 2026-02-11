@@ -95,6 +95,18 @@ with :notification t, :method, and :params keys."
   "Extract the error code from RESPONSE."
   (plist-get (plist-get response :error) :code))
 
+(defun tramp-rpc-protocol-error-data (response)
+  "Extract the error data from RESPONSE.
+Returns the data alist, or nil if not present."
+  (plist-get (plist-get response :error) :data))
+
+(defun tramp-rpc-protocol-error-errno (response)
+  "Extract the OS errno from an IO error RESPONSE.
+Returns the integer errno, or nil if not an IO error with errno."
+  (let ((data (tramp-rpc-protocol-error-data response)))
+    (when data
+      (alist-get 'os_errno data))))
+
 ;; Error codes
 (defconst tramp-rpc-protocol-error-parse -32700)
 (defconst tramp-rpc-protocol-error-invalid-request -32600)
