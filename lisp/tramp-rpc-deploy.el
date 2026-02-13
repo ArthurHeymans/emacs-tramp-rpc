@@ -129,9 +129,26 @@ FORMAT-STRING and ARGS are passed to `format'."
 ;;; Architecture detection and path helpers
 ;;; ============================================================================
 
+(defun tramp-rpc-deploy--normalize-hops (hop-string)
+  "Convert \"rpc:\" method references in HOP-STRING to \"ssh:\" for bootstrap.
+The bootstrap vec uses standard TRAMP methods (sshx) which need ssh-compatible
+hop methods for their own multi-hop traversal.
+Preserves the trailing \"|\" that TRAMP uses in canonical hop format."
+  (when hop-string
+    (concat
+     (mapconcat
+      (lambda (hop-str)
+        (replace-regexp-in-string
+         (rx bos "rpc:") "ssh:" hop-str))
+      (split-string hop-string tramp-postfix-hop-regexp 'omit)
+      tramp-postfix-hop-format)
+     tramp-postfix-hop-format)))
+
 (defun tramp-rpc-deploy--bootstrap-vec (vec)
   "Convert VEC to use the bootstrap method for deployment operations.
-This allows us to use sshx for deployment even when the main method is rpc."
+This allows us to use sshx for deployment even when the main method is rpc.
+Any \"rpc:\" hops in the hop chain are normalized to \"ssh:\" so that
+standard TRAMP can traverse them."
   (let ((method (tramp-file-name-method vec)))
     (if (member method '("ssh" "sshx" "scpx"))
         vec  ; Already a shell-based method
@@ -143,7 +160,8 @@ This allows us to use sshx for deployment even when the main method is rpc."
        :host (tramp-file-name-host vec)
        :port (tramp-file-name-port vec)
        :localname (tramp-file-name-localname vec)
-       :hop (tramp-file-name-hop vec)))))
+       :hop (tramp-rpc-deploy--normalize-hops
+             (tramp-file-name-hop vec))))))
 
 (defun tramp-rpc-deploy--detect-remote-arch (vec)
   "Detect the architecture of remote host specified by VEC.

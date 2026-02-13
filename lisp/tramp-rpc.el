@@ -75,13 +75,26 @@
   ;; which isn't loaded yet.  The handler function itself is an autoload
   ;; stub that triggers loading of tramp-rpc.el on first use.
   (add-to-list 'tramp-foreign-file-name-handler-alist
-               '(tramp-rpc-file-name-p . tramp-rpc-file-name-handler)))
+               '(tramp-rpc-file-name-p . tramp-rpc-file-name-handler))
+
+  ;; Allow the "rpc" method in multi-hop filename syntax.
+  ;; TRAMP's `tramp-multi-hop-p' only returns t for tramp-sh methods,
+  ;; which would cause `tramp-dissect-file-name' to reject filenames like
+  ;; /rpc:hop|rpc:target:/path.  We advise it to also accept "rpc".
+  (defun tramp-rpc--multi-hop-advice (orig-fun vec)
+    "Allow the rpc method in multi-hop chains."
+    (or (string= (tramp-file-name-method vec) tramp-rpc-method)
+        (funcall orig-fun vec)))
+  (advice-add 'tramp-multi-hop-p :around #'tramp-rpc--multi-hop-advice))
 
 ;; Now the actual implementation
 (require 'cl-lib)
 (require 'tramp)
 (require 'tramp-sh)
 (require 'tramp-rpc-protocol)
+
+;; Silence byte-compiler warning for function defined in with-eval-after-load
+(declare-function tramp-rpc--multi-hop-advice "tramp-rpc")
 (require 'tramp-rpc-deploy)
 
 ;; Silence byte-compiler warnings for functions defined elsewhere
@@ -207,7 +220,7 @@ FORMAT-STRING and ARGS are passed to `format'."
 
 (defvar tramp-rpc--connections (make-hash-table :test 'equal)
   "Hash table mapping connection keys to RPC process info.
-Key is (host user port), value is a plist with :process and :buffer.")
+Key is (host user port hop), value is a plist with :process and :buffer.")
 
 ;; tramp-rpc--async-processes and tramp-rpc--pty-processes are defined in
 ;; tramp-rpc-process.el (loaded via require below)
@@ -396,10 +409,13 @@ following the pattern used by standard TRAMP."
     (error nil)))
 
 (defun tramp-rpc--connection-key (vec)
-  "Generate a connection key for VEC."
+  "Generate a connection key for VEC.
+Includes the hop chain so that different multi-hop routes to the
+same host produce distinct connections."
   (list (tramp-file-name-host vec)
         (tramp-file-name-user vec)
-        (or (tramp-file-name-port vec) 22)))
+        (or (tramp-file-name-port vec) 22)
+        (tramp-file-name-hop vec)))
 
 (defun tramp-rpc--get-connection (vec)
   "Get the RPC connection for VEC, or nil if not connected."
@@ -447,6 +463,33 @@ Creates the directory from `tramp-rpc-controlmaster-path' if needed."
           (seq "Enter passphrase for")))
   "Regexp matching SSH password/passphrase prompts.")
 
+;;; ============================================================================
+;;; Multi-hop support
+;;; ============================================================================
+
+(defun tramp-rpc--hops-to-proxyjump (vec)
+  "Convert VEC's hop chain to an SSH ProxyJump (-J) string.
+Parses the TRAMP hop field (e.g. \"rpc:user@gateway|\") and converts
+each hop to the SSH ProxyJump format (e.g. \"user@gateway\").
+Returns nil if there are no hops.
+
+Supports mixed methods: both \"rpc:\" and \"ssh:\" hops are accepted
+since ProxyJump only needs host connectivity."
+  (when-let* ((hops (tramp-file-name-hop vec)))
+    (mapconcat
+     (lambda (hop-str)
+       (let* ((hop-name (concat tramp-prefix-format hop-str
+                                tramp-postfix-host-format))
+              (hop-vec (tramp-dissect-file-name hop-name 'nodefault)))
+         (concat
+          (when (tramp-file-name-user hop-vec)
+            (concat (tramp-file-name-user hop-vec) "@"))
+          (tramp-file-name-host hop-vec)
+          (when-let* ((port (tramp-file-name-port hop-vec)))
+            (concat ":" (if (numberp port) (number-to-string port) port))))))
+     (split-string hops tramp-postfix-hop-regexp 'omit)
+     ",")))
+
 (defun tramp-rpc--controlmaster-socket-path (vec)
   "Return the ControlMaster socket path for VEC.
 Expands SSH escape sequences in `tramp-rpc-controlmaster-path'."
@@ -461,9 +504,11 @@ Expands SSH escape sequences in `tramp-rpc-controlmaster-path'."
     (setq path (replace-regexp-in-string "%r" user path t t))
     (setq path (replace-regexp-in-string "%p" (number-to-string port) path t t))
     ;; For %C, use a simple hash approximation
+    ;; Include the hop chain so different multi-hop routes get different sockets
     (setq path (replace-regexp-in-string
                 "%C"
-                (md5 (format "%s%s%s%s" (system-name) host port user))
+                (md5 (format "%s%s%s%s%s" (system-name) host port user
+                             (or (tramp-file-name-hop vec) "")))
                 path t t))
     (expand-file-name path)))
 
@@ -472,13 +517,15 @@ Expands SSH escape sequences in `tramp-rpc-controlmaster-path'."
   (let ((socket-path (tramp-rpc--controlmaster-socket-path vec))
         (host (tramp-file-name-host vec))
         (user (tramp-file-name-user vec))
-        (port (tramp-file-name-port vec)))
+        (port (tramp-file-name-port vec))
+        (proxyjump (tramp-rpc--hops-to-proxyjump vec)))
     (and (file-exists-p socket-path)
          ;; Check if the socket is actually usable via ssh -O check
          (zerop (apply #'call-process "ssh" nil nil nil
                        (append
                         (when user (list "-l" user))
                         (when port (list "-p" (number-to-string port)))
+                        (when proxyjump (list "-J" proxyjump))
                         (list "-o" (format "ControlPath=%s" socket-path)
                               "-O" "check"
                               host)))))))
@@ -497,6 +544,7 @@ Returns non-nil on success."
   (let* ((host (tramp-file-name-host vec))
          (user (tramp-file-name-user vec))
          (port (tramp-file-name-port vec))
+         (proxyjump (tramp-rpc--hops-to-proxyjump vec))
          (socket-path (tramp-rpc--controlmaster-socket-path vec))
          (process-name (format "*tramp-rpc-auth %s*" host))
          (buffer (get-buffer-create (format " *tramp-rpc-auth %s*" host)))
@@ -505,6 +553,8 @@ Returns non-nil on success."
                     tramp-rpc-ssh-args
                     (when user (list "-l" user))
                     (when port (list "-p" (number-to-string port)))
+                    ;; Multi-hop via ProxyJump
+                    (when proxyjump (list "-J" proxyjump))
                     ;; NO BatchMode - allow password prompts
                     (list "-o" "StrictHostKeyChecking=accept-new")
                     ;; ControlMaster options
@@ -566,6 +616,7 @@ Returns non-nil on success."
          (host (tramp-file-name-host vec))
          (user (tramp-file-name-user vec))
          (port (tramp-file-name-port vec))
+         (proxyjump (tramp-rpc--hops-to-proxyjump vec))
          ;; Build SSH command to run the RPC server
          (ssh-args (append
                     (list "ssh")
@@ -573,6 +624,8 @@ Returns non-nil on success."
                     tramp-rpc-ssh-args
                     (when user (list "-l" user))
                     (when port (list "-p" (number-to-string port)))
+                    ;; Multi-hop via ProxyJump
+                    (when proxyjump (list "-J" proxyjump))
                     ;; Default options
                     (list "-o" "BatchMode=yes")
                     (list "-o" "StrictHostKeyChecking=accept-new")
