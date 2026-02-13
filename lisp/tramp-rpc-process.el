@@ -45,6 +45,7 @@
 (declare-function tramp-rpc--get-direnv-environment "tramp-rpc")
 (declare-function tramp-rpc--decode-output "tramp-rpc")
 (declare-function tramp-rpc--controlmaster-socket-path "tramp-rpc")
+(declare-function tramp-rpc--hops-to-proxyjump "tramp-rpc")
 (declare-function tramp-rpc-file-name-p "tramp-rpc")
 
 ;; Variables from tramp-rpc.el
@@ -607,11 +608,14 @@ DIRENV-ENV is an optional alist of environment variables from direnv."
                              env-exports
                              (shell-quote-argument program)
                              (mapconcat #'shell-quote-argument program-args " ")))
+         (proxyjump (tramp-rpc--hops-to-proxyjump vec))
          ;; Build SSH arguments for direct PTY connection
          (ssh-args (append
                     (list "ssh")
                     ;; Request PTY allocation
                     (list "-t" "-t")  ; Force PTY even without controlling terminal
+                    ;; Multi-hop via ProxyJump
+                    (when proxyjump (list "-J" proxyjump))
                     ;; Reuse ControlMaster if enabled
                     (when tramp-rpc-use-controlmaster
                       (list "-o" "ControlMaster=auto"
