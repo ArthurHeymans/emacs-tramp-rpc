@@ -621,7 +621,14 @@ Returns non-nil on success."
     (let ((response (tramp-rpc--call vec "system.info" nil)))
       (unless response
         (tramp-rpc--remove-connection vec)
-        (error "Failed to connect to RPC server on %s" host)))
+        (if tramp-rpc-deploy-never-deploy
+            (error "Failed to connect to RPC server on %s.\n\
+`tramp-rpc-deploy-never-deploy' is set, so no deployment was attempted.\n\
+Ensure `tramp-rpc-server' is installed on the remote host.\n\
+Tried to run: %s\n\
+You can set `tramp-rpc-deploy-remote-binary-path' to an absolute path"
+                   host binary-path)
+          (error "Failed to connect to RPC server on %s" host))))
 
     ;; Mark as connected for TRAMP's connectivity checks (used by projectile, etc.)
     (tramp-set-connection-property process "connected" t)
