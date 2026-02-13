@@ -260,14 +260,16 @@ pub fn handle_add(params: &Value) -> HandlerResult {
     let params: Params =
         from_value(params.clone()).map_err(|e| RpcError::invalid_params(e.to_string()))?;
 
+    let expanded = crate::handlers::expand_tilde(&params.path);
+
     let manager = get().ok_or_else(|| RpcError::internal_error("File watcher not available"))?;
 
     manager
-        .watch(Path::new(&params.path), params.recursive)
+        .watch(Path::new(&expanded), params.recursive)
         .map_err(|e| RpcError::internal_error(format!("Failed to watch: {}", e)))?;
 
     Ok(msgpack_map! {
-        "path" => params.path.clone(),
+        "path" => expanded.clone(),
         "recursive" => Value::Boolean(params.recursive)
     })
 }
@@ -284,10 +286,12 @@ pub fn handle_remove(params: &Value) -> HandlerResult {
     let params: Params =
         from_value(params.clone()).map_err(|e| RpcError::invalid_params(e.to_string()))?;
 
+    let expanded = crate::handlers::expand_tilde(&params.path);
+
     let manager = get().ok_or_else(|| RpcError::internal_error("File watcher not available"))?;
 
     manager
-        .unwatch(Path::new(&params.path))
+        .unwatch(Path::new(&expanded))
         .map_err(|e| RpcError::internal_error(format!("Failed to unwatch: {}", e)))?;
 
     Ok(Value::Boolean(true))

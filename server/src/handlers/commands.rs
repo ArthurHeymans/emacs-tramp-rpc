@@ -84,7 +84,7 @@ pub async fn run_parallel(params: &Value) -> HandlerResult {
                         let mut cmd = Command::new(&entry.cmd);
                         cmd.args(&entry.args);
                         if let Some(ref cwd) = entry.cwd {
-                            cmd.current_dir(cwd);
+                            cmd.current_dir(super::expand_tilde(cwd));
                         }
                         let value = match cmd.output() {
                             Ok(output) => {
@@ -152,10 +152,11 @@ pub async fn ancestors_scan(params: &Value) -> HandlerResult {
         from_value(params.clone()).map_err(|e| RpcError::invalid_params(e.to_string()))?;
 
     // Wrap in spawn_blocking since this does blocking filesystem I/O
+    let expanded_directory = super::expand_tilde(&params.directory);
     tokio::task::spawn_blocking(move || {
-        let dir = Path::new(&params.directory);
+        let dir = Path::new(&expanded_directory);
         if !dir.exists() {
-            return Err(RpcError::file_not_found(&params.directory));
+            return Err(RpcError::file_not_found(&expanded_directory));
         }
 
         // Initialize results with None for each marker

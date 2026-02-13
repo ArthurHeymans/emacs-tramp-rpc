@@ -81,7 +81,7 @@ pub async fn run(params: &Value) -> HandlerResult {
     cmd.args(&params.args);
 
     if let Some(cwd) = &params.cwd {
-        cmd.current_dir(cwd);
+        cmd.current_dir(super::expand_tilde(cwd));
     }
 
     if params.clear_env {
@@ -158,7 +158,7 @@ pub async fn start(params: &Value) -> HandlerResult {
     cmd.args(&params.args);
 
     if let Some(cwd) = &params.cwd {
-        cmd.current_dir(cwd);
+        cmd.current_dir(super::expand_tilde(cwd));
     }
 
     if params.clear_env {
@@ -552,7 +552,7 @@ fn do_fork_exec(params: PtyStartParams) -> Result<ForkResult2, RpcError> {
                 let _ = close(slave.as_raw_fd());
             }
             if let Some(cwd) = &params.cwd {
-                let _ = std::env::set_current_dir(cwd);
+                let _ = std::env::set_current_dir(super::expand_tilde(cwd));
             }
             if params.clear_env {
                 for (key, _) in std::env::vars() {

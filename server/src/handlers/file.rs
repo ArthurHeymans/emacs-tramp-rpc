@@ -52,6 +52,7 @@ pub async fn stat_batch(params: &Value) -> HandlerResult {
             let path = path.clone();
             let lstat = params.lstat;
             async move {
+                let path = super::expand_tilde(&path);
                 match get_file_attributes(Path::new(&path), lstat).await {
                     Ok(attrs) => StatResult::Ok(attrs),
                     Err(e) => StatResult::Err {
@@ -199,7 +200,9 @@ pub async fn newer_than(params: &Value) -> HandlerResult {
         from_value(params.clone()).map_err(|e| RpcError::invalid_params(e.to_string()))?;
 
     // Get both metadata concurrently
-    let (meta1, meta2) = tokio::join!(fs::metadata(&params.file1), fs::metadata(&params.file2));
+    let file1 = super::expand_tilde(&params.file1);
+    let file2 = super::expand_tilde(&params.file2);
+    let (meta1, meta2) = tokio::join!(fs::metadata(&file1), fs::metadata(&file2));
 
     let result = match (meta1, meta2) {
         (Ok(m1), Ok(m2)) => {
@@ -372,7 +375,20 @@ use std::path::PathBuf;
 
 /// Convert raw bytes to a PathBuf
 pub fn bytes_to_path(bytes: &[u8]) -> PathBuf {
-    PathBuf::from(OsStr::from_bytes(bytes))
+    let path = PathBuf::from(OsStr::from_bytes(bytes));
+    expand_tilde_path(&path)
+}
+
+/// Expand ~ to home directory in a PathBuf.
+/// Delegates to the canonical string-based `expand_tilde` in mod.rs.
+fn expand_tilde_path(path: &Path) -> PathBuf {
+    let s = path.to_string_lossy();
+    let expanded = super::expand_tilde(&s);
+    if expanded.as_str() != s.as_ref() {
+        PathBuf::from(expanded)
+    } else {
+        path.to_path_buf()
+    }
 }
 
 use crate::protocol::path_or_bytes;
