@@ -153,12 +153,29 @@ FORMAT-STRING and ARGS are passed to `format'."
 ;;; Architecture detection and path helpers
 ;;; ============================================================================
 
+(defun tramp-rpc-deploy--normalize-hops (hop-string)
+  "Convert \"rpc:\" method references in HOP-STRING to \"ssh:\" for bootstrap.
+The bootstrap vec uses standard TRAMP methods (sshx) which need ssh-compatible
+hop methods for their own multi-hop traversal.
+Preserves the trailing \"|\" that TRAMP uses in canonical hop format."
+  (when hop-string
+    (concat
+     (mapconcat
+      (lambda (hop-str)
+        (replace-regexp-in-string
+         (rx bos "rpc:") "ssh:" hop-str))
+      (split-string hop-string tramp-postfix-hop-regexp 'omit)
+      tramp-postfix-hop-format)
+     tramp-postfix-hop-format)))
+
 (defun tramp-rpc-deploy--bootstrap-vec (vec)
   "Convert VEC to use the bootstrap method for deployment operations.
 This converts the rpc method to a standard TRAMP method for deployment.
 The method used is controlled by `tramp-rpc-deploy-bootstrap-method'.
 Methods like \"scp\" and \"rsync\" use out-of-band transfer for `copy-file',
-while \"ssh\" and \"sshx\" use inline encoding (base64 through the shell)."
+while \"ssh\" and \"sshx\" use inline encoding (base64 through the shell).
+Any \"rpc:\" hops in the hop chain are normalized to \"ssh:\" so that
+standard TRAMP can traverse them."
   (let ((method (tramp-file-name-method vec)))
     (if (member method '("ssh" "sshx" "scp" "scpx" "rsync"))
         vec  ; Already a TRAMP method that supports shell commands and file transfer
@@ -170,7 +187,8 @@ while \"ssh\" and \"sshx\" use inline encoding (base64 through the shell)."
        :host (tramp-file-name-host vec)
        :port (tramp-file-name-port vec)
        :localname (tramp-file-name-localname vec)
-       :hop (tramp-file-name-hop vec)))))
+       :hop (tramp-rpc-deploy--normalize-hops
+             (tramp-file-name-hop vec))))))
 
 (defun tramp-rpc-deploy--detect-remote-arch (vec)
   "Detect the architecture of remote host specified by VEC.

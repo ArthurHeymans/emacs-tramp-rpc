@@ -483,6 +483,218 @@ Returns the result or signals an error."
     (tramp-rpc-mock-test--stop-server)))
 
 ;;; ============================================================================
+;;; Multi-Hop Tests (No server or SSH required)
+;;; ============================================================================
+
+;; Load tramp-rpc fully for multi-hop function testing
+(defvar tramp-rpc-mock-test--tramp-rpc-loaded
+  (condition-case err
+      (progn
+        (require 'tramp)
+        (require 'tramp-rpc)
+        t)
+    (error
+     (message "Could not load tramp-rpc: %s" err)
+     nil))
+  "Non-nil if tramp-rpc.el loaded successfully.")
+
+(ert-deftest tramp-rpc-mock-test-multi-hop-advice ()
+  "Test that tramp-multi-hop-p returns t for the rpc method."
+  :tags '(:multi-hop)
+  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
+  (let ((vec (make-tramp-file-name :method "rpc" :host "target")))
+    (should (tramp-multi-hop-p vec))))
+
+(ert-deftest tramp-rpc-mock-test-multi-hop-advice-ssh-still-works ()
+  "Test that tramp-multi-hop-p still returns t for ssh method."
+  :tags '(:multi-hop)
+  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
+  (let ((vec (make-tramp-file-name :method "ssh" :host "target")))
+    (should (tramp-multi-hop-p vec))))
+
+(ert-deftest tramp-rpc-mock-test-multi-hop-dissect-single-hop ()
+  "Test that TRAMP can dissect a single-hop rpc filename."
+  :tags '(:multi-hop)
+  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
+  (let ((vec (tramp-dissect-file-name "/rpc:gateway|rpc:user@target:/path")))
+    (should (equal (tramp-file-name-method vec) "rpc"))
+    (should (equal (tramp-file-name-user vec) "user"))
+    (should (equal (tramp-file-name-host vec) "target"))
+    (should (equal (tramp-file-name-localname vec) "/path"))
+    ;; Hop should be set
+    (should (tramp-file-name-hop vec))))
+
+(ert-deftest tramp-rpc-mock-test-multi-hop-dissect-multi-hop ()
+  "Test that TRAMP can dissect a multi-hop rpc filename."
+  :tags '(:multi-hop)
+  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
+  (let ((vec (tramp-dissect-file-name "/rpc:hop1|rpc:hop2|rpc:user@target:/path")))
+    (should (equal (tramp-file-name-method vec) "rpc"))
+    (should (equal (tramp-file-name-user vec) "user"))
+    (should (equal (tramp-file-name-host vec) "target"))
+    (should (equal (tramp-file-name-localname vec) "/path"))
+    (should (tramp-file-name-hop vec))))
+
+(ert-deftest tramp-rpc-mock-test-multi-hop-dissect-mixed-methods ()
+  "Test that TRAMP can dissect a mixed ssh/rpc hop filename."
+  :tags '(:multi-hop)
+  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
+  (let ((vec (tramp-dissect-file-name "/ssh:gateway|rpc:user@target:/path")))
+    (should (equal (tramp-file-name-method vec) "rpc"))
+    (should (equal (tramp-file-name-user vec) "user"))
+    (should (equal (tramp-file-name-host vec) "target"))
+    (should (equal (tramp-file-name-localname vec) "/path"))
+    (should (tramp-file-name-hop vec))))
+
+(ert-deftest tramp-rpc-mock-test-hops-to-proxyjump-nil ()
+  "Test that hops-to-proxyjump returns nil for no hops."
+  :tags '(:multi-hop)
+  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
+  (let ((vec (make-tramp-file-name :method "rpc" :host "target"
+                                   :localname "/path")))
+    (should-not (tramp-rpc--hops-to-proxyjump vec))))
+
+(ert-deftest tramp-rpc-mock-test-hops-to-proxyjump-single ()
+  "Test ProxyJump conversion with a single hop."
+  :tags '(:multi-hop)
+  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
+  (let ((vec (tramp-dissect-file-name "/rpc:gateway|rpc:user@target:/path")))
+    (should (equal (tramp-rpc--hops-to-proxyjump vec) "gateway"))))
+
+(ert-deftest tramp-rpc-mock-test-hops-to-proxyjump-single-with-user ()
+  "Test ProxyJump conversion with a single hop that has a user."
+  :tags '(:multi-hop)
+  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
+  (let ((vec (tramp-dissect-file-name "/rpc:admin@gateway|rpc:user@target:/path")))
+    (should (equal (tramp-rpc--hops-to-proxyjump vec) "admin@gateway"))))
+
+(ert-deftest tramp-rpc-mock-test-hops-to-proxyjump-multiple ()
+  "Test ProxyJump conversion with multiple hops."
+  :tags '(:multi-hop)
+  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
+  (let ((vec (tramp-dissect-file-name "/rpc:hop1|rpc:hop2|rpc:user@target:/path")))
+    (should (equal (tramp-rpc--hops-to-proxyjump vec) "hop1,hop2"))))
+
+(ert-deftest tramp-rpc-mock-test-hops-to-proxyjump-with-port ()
+  "Test ProxyJump conversion with a hop that has a port."
+  :tags '(:multi-hop)
+  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
+  (let ((vec (tramp-dissect-file-name "/rpc:admin@gateway#2222|rpc:user@target:/path")))
+    (should (equal (tramp-rpc--hops-to-proxyjump vec) "admin@gateway:2222"))))
+
+(ert-deftest tramp-rpc-mock-test-hops-to-proxyjump-mixed-methods ()
+  "Test ProxyJump conversion with mixed ssh/rpc hops."
+  :tags '(:multi-hop)
+  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
+  (let ((vec (tramp-dissect-file-name "/ssh:gateway|rpc:user@target:/path")))
+    (should (equal (tramp-rpc--hops-to-proxyjump vec) "gateway"))))
+
+(ert-deftest tramp-rpc-mock-test-connection-key-no-hop ()
+  "Test connection key without hops."
+  :tags '(:multi-hop)
+  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
+  (let ((vec (make-tramp-file-name :method "rpc" :host "target"
+                                   :user "user" :localname "/path")))
+    (should (equal (tramp-rpc--connection-key vec)
+                   '("target" "user" 22 nil)))))
+
+(ert-deftest tramp-rpc-mock-test-connection-key-with-hop ()
+  "Test connection key includes hop for differentiation."
+  :tags '(:multi-hop)
+  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
+  (let* ((vec1 (tramp-dissect-file-name "/rpc:gateway|rpc:user@target:/path"))
+         (vec2 (make-tramp-file-name :method "rpc" :host "target"
+                                     :user "user" :localname "/path"))
+         (key1 (tramp-rpc--connection-key vec1))
+         (key2 (tramp-rpc--connection-key vec2)))
+    ;; Keys should differ because one has a hop and the other doesn't
+    (should-not (equal key1 key2))
+    ;; Both should have the same host/user/port
+    (should (equal (nth 0 key1) (nth 0 key2)))
+    (should (equal (nth 1 key1) (nth 1 key2)))
+    (should (equal (nth 2 key1) (nth 2 key2)))
+    ;; Hop should differ
+    (should (nth 3 key1))
+    (should-not (nth 3 key2))))
+
+(ert-deftest tramp-rpc-mock-test-connection-key-different-hops ()
+  "Test that different hop routes produce different connection keys."
+  :tags '(:multi-hop)
+  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
+  (let* ((vec1 (tramp-dissect-file-name "/rpc:gateway1|rpc:user@target:/path"))
+         (vec2 (tramp-dissect-file-name "/rpc:gateway2|rpc:user@target:/path"))
+         (key1 (tramp-rpc--connection-key vec1))
+         (key2 (tramp-rpc--connection-key vec2)))
+    (should-not (equal key1 key2))))
+
+(ert-deftest tramp-rpc-mock-test-controlmaster-socket-different-hops ()
+  "Test that different hop routes produce different ControlMaster socket paths."
+  :tags '(:multi-hop)
+  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
+  (let* ((vec1 (tramp-dissect-file-name "/rpc:gateway1|rpc:user@target:/path"))
+         (vec2 (tramp-dissect-file-name "/rpc:gateway2|rpc:user@target:/path"))
+         (vec3 (make-tramp-file-name :method "rpc" :host "target"
+                                     :user "user" :localname "/path"))
+         (path1 (tramp-rpc--controlmaster-socket-path vec1))
+         (path2 (tramp-rpc--controlmaster-socket-path vec2))
+         (path3 (tramp-rpc--controlmaster-socket-path vec3)))
+    ;; All three should be different
+    (should-not (equal path1 path2))
+    (should-not (equal path1 path3))
+    (should-not (equal path2 path3))))
+
+(ert-deftest tramp-rpc-mock-test-deploy-normalize-hops-nil ()
+  "Test hop normalization with nil input."
+  :tags '(:multi-hop)
+  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
+  (should-not (tramp-rpc-deploy--normalize-hops nil)))
+
+(ert-deftest tramp-rpc-mock-test-deploy-normalize-hops-rpc ()
+  "Test hop normalization converts rpc: to ssh:."
+  :tags '(:multi-hop)
+  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
+  (should (equal (tramp-rpc-deploy--normalize-hops "rpc:gateway|")
+                 "ssh:gateway|")))
+
+(ert-deftest tramp-rpc-mock-test-deploy-normalize-hops-ssh ()
+  "Test hop normalization leaves ssh: unchanged."
+  :tags '(:multi-hop)
+  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
+  (should (equal (tramp-rpc-deploy--normalize-hops "ssh:gateway|")
+                 "ssh:gateway|")))
+
+(ert-deftest tramp-rpc-mock-test-deploy-normalize-hops-mixed ()
+  "Test hop normalization with mixed methods."
+  :tags '(:multi-hop)
+  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
+  (should (equal (tramp-rpc-deploy--normalize-hops "rpc:hop1|ssh:hop2|")
+                 "ssh:hop1|ssh:hop2|")))
+
+(ert-deftest tramp-rpc-mock-test-deploy-normalize-hops-with-user ()
+  "Test hop normalization preserves user@host."
+  :tags '(:multi-hop)
+  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
+  (should (equal (tramp-rpc-deploy--normalize-hops "rpc:admin@gateway|")
+                 "ssh:admin@gateway|")))
+
+(ert-deftest tramp-rpc-mock-test-deploy-bootstrap-vec-preserves-hop ()
+  "Test that bootstrap vec preserves and normalizes hops."
+  :tags '(:multi-hop)
+  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
+  (let* ((vec (tramp-dissect-file-name "/rpc:gateway|rpc:user@target:/path"))
+         (bootstrap (tramp-rpc-deploy--bootstrap-vec vec)))
+    ;; Method should be the bootstrap method (sshx)
+    (should (equal (tramp-file-name-method bootstrap) "sshx"))
+    ;; Host and user should be preserved
+    (should (equal (tramp-file-name-host bootstrap) "target"))
+    (should (equal (tramp-file-name-user bootstrap) "user"))
+    ;; Hop should be present and normalized (rpc -> ssh)
+    (let ((hop (tramp-file-name-hop bootstrap)))
+      (should hop)
+      (should (string-match-p "ssh:" hop))
+      (should-not (string-match-p "rpc:" hop)))))
+
+;;; ============================================================================
 ;;; Test Runner
 ;;; ============================================================================
 
