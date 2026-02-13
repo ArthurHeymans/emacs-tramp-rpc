@@ -370,7 +370,7 @@ pub async fn completions(params: &Value) -> HandlerResult {
     let params: Params =
         from_value(params.clone()).map_err(|e| RpcError::invalid_params(e.to_string()))?;
 
-    let directory = params.directory.clone();
+    let directory = super::expand_tilde(&params.directory);
     let prefix = params.prefix.clone();
 
     // Use synchronous I/O in blocking task - d_type gives us directory detection for free

@@ -95,8 +95,9 @@ fn system_statvfs(params: &Value) -> HandlerResult {
         from_value(params.clone()).map_err(|e| RpcError::invalid_params(e.to_string()))?;
 
     use std::ffi::CString;
+    let expanded = expand_tilde(&params.path);
     let path_cstr =
-        CString::new(params.path.as_str()).map_err(|_| RpcError::invalid_params("Invalid path"))?;
+        CString::new(expanded.as_str()).map_err(|_| RpcError::invalid_params("Invalid path"))?;
 
     let mut stat: libc::statvfs = unsafe { std::mem::zeroed() };
     let result = unsafe { libc::statvfs(path_cstr.as_ptr(), &mut stat) };
@@ -159,7 +160,7 @@ fn get_group_name(gid: libc::gid_t) -> Option<String> {
 }
 
 /// Expand ~ to home directory
-fn expand_tilde(path: &str) -> String {
+pub(crate) fn expand_tilde(path: &str) -> String {
     if path.starts_with("~/") {
         if let Ok(home) = std::env::var("HOME") {
             return format!("{}{}", home, &path[1..]);
