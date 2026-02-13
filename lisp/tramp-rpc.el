@@ -2187,12 +2187,9 @@ Returns nil since most remote systems (Linux) are case-sensitive."
 ;; Process and advice modules (extracted)
 ;; ============================================================================
 
-;; Process support, advice functions, and magit integration are now in
-;; separate modules for better organization and maintainability.
-(require 'tramp-rpc-process)
-(require 'tramp-rpc-advice)
-(require 'tramp-rpc-magit)
-
+;; These variables must be defined BEFORE requiring the sub-modules,
+;; since tramp-rpc-advice.el and tramp-rpc-process.el reference them
+;; at load time (advice is auto-installed on load).
 (defvar tramp-rpc--delivering-output nil
   "Non-nil while delivering process output to the local relay.
 Used by advice functions to bypass interception during output delivery.")
@@ -2211,6 +2208,12 @@ Lower values mean more responsive but higher CPU usage.
 Also controls process exit detection latency."
   :type 'integer
   :group 'tramp-rpc)
+
+;; Process support, advice functions, and magit integration are now in
+;; separate modules for better organization and maintainability.
+(require 'tramp-rpc-process)
+(require 'tramp-rpc-advice)
+(require 'tramp-rpc-magit)
 
 
 ;; ============================================================================
