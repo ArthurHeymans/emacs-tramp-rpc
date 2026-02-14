@@ -433,13 +433,17 @@ Returns the new interval."
         ;; execution context.  Using run-at-time is safer than make-thread
         ;; because Emacs threads share a global lock and sentinels that call
         ;; accept-process-output can deadlock.
+        ;; We bind inhibit-quit to nil because timer handlers run with
+        ;; inhibit-quit=t, but sentinels (e.g. vc-exec-after) may call
+        ;; accept-process-output which warns/hangs when quit is inhibited.
         (when sentinel
           (run-at-time 0 nil
            (lambda ()
-             (condition-case err
-                 (funcall sentinel local-process event)
-               (error
-                (tramp-rpc--debug "SENTINEL-ERROR: %S" err))))))))))
+             (let ((inhibit-quit nil))
+               (condition-case err
+                   (funcall sentinel local-process event)
+                 (error
+                  (tramp-rpc--debug "SENTINEL-ERROR: %S" err)))))))))))
 
 
 ;; ============================================================================
