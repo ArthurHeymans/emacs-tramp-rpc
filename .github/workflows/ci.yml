@@ -324,6 +324,7 @@ jobs:
           TRAMP_TEST_SOURCE: ~/src/tramp
         run: |
           # Exclude known unfixable tests:
+          #   :unstable: not recommended by upstream Tramp
           #   test49: requires tramp-add-external-operation (newer tramp API)
           #   test52: tramp-rpc features not cleaned up on unload-feature
           emacs -Q --batch \
@@ -332,7 +333,7 @@ jobs:
             --eval "(add-to-list 'package-archives '(\"melpa\" . \"https://melpa.org/packages/\") t)" \
             --eval "(package-initialize)" \
             -l test/run-tramp-tests.el \
-            --eval "(ert-run-tests-batch-and-exit '(and \"^tramp-test\" (not \"tramp-test49\") (not \"tramp-test52\")))"
+            --eval "(ert-run-tests-batch-and-exit '(and (not (tag :unstable)) (not \"tramp-test49\") (not \"tramp-test52\")))"
 
   summary:
     name: Test Summary
@@ -351,7 +352,7 @@ jobs:
           echo "Server Tests: ${{ needs.test-server.result }}"
           echo "Full Test Suite: ${{ needs.test-full-suite.result }}"
           echo "Upstream Tramp Tests: ${{ needs.test-upstream-tramp.result }}"
-          
+
           if [[ "${{ needs.rust.result }}" != "success" ]] || \
              [[ "${{ needs.elisp.result }}" != "success" ]] || \
              [[ "${{ needs.test-autoload.result }}" != "success" ]] || \
