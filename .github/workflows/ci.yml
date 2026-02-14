@@ -227,8 +227,10 @@ jobs:
           echo "  StrictHostKeyChecking no" >> ~/.ssh/config
           echo "  UserKnownHostsFile /dev/null" >> ~/.ssh/config
           chmod 600 ~/.ssh/config
-          # Start SSH server if not running
-          sudo service ssh start || true
+          # Increase MaxSessions for parallel async process tests
+          echo "MaxSessions 50" | sudo tee -a /etc/ssh/sshd_config
+          # Start SSH server
+          sudo service ssh restart || sudo service ssh start || true
           # Test SSH connection
           ssh localhost "echo 'SSH connection successful'"
 
@@ -299,7 +301,10 @@ jobs:
           echo "  StrictHostKeyChecking no" >> ~/.ssh/config
           echo "  UserKnownHostsFile /dev/null" >> ~/.ssh/config
           chmod 600 ~/.ssh/config
-          sudo service ssh start || true
+          # Increase MaxSessions for parallel async process tests
+          # (test45 opens 10+ concurrent multiplexed SSH sessions)
+          echo "MaxSessions 50" | sudo tee -a /etc/ssh/sshd_config
+          sudo service ssh restart || sudo service ssh start || true
           ssh localhost "echo 'SSH connection successful'"
 
       - name: Deploy server to localhost
