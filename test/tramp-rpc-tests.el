@@ -89,6 +89,11 @@ Set via TRAMP_RPC_TEST_HOST environment variable.")
 (defvar tramp-rpc-test-user (getenv "TRAMP_RPC_TEST_USER")
   "User for remote host. If nil, uses default SSH user.")
 
+(defvar tramp-rpc-test-host-2 (getenv "TRAMP_RPC_TEST_HOST_2")
+  "Second remote host for cross-remote tests.
+Set via TRAMP_RPC_TEST_HOST_2 environment variable.
+When set, cross-remote tests (copy/rename between different hosts) are run.")
+
 (defvar tramp-rpc-test-mock-mode (getenv "TRAMP_RPC_TEST_MOCK")
   "When non-nil, use mock mode for testing without SSH.")
 
@@ -159,19 +164,66 @@ Returns non-nil if tests can run."
                   (error nil)))))
   (cdr tramp-rpc-test-enabled-checked))
 
+(defun tramp-rpc-test--make-remote-path-2 (filename)
+  "Make a full TRAMP RPC path on the second host for FILENAME."
+  (format "/rpc:%s:%s/%s"
+          tramp-rpc-test-host-2
+          tramp-rpc-test-temp-dir
+          filename))
+
+(defun tramp-rpc-test--make-temp-name-2 ()
+  "Return a temporary file name on the second host.
+The file is not created."
+  (tramp-rpc-test--make-remote-path-2
+   (make-temp-name tramp-rpc-test-name-prefix)))
+
+(defun tramp-rpc-test--remote-directory-2 ()
+  "Return the remote test directory path on the second host."
+  (format "/rpc:%s:%s" tramp-rpc-test-host-2 tramp-rpc-test-temp-dir))
+
+(defvar tramp-rpc-test-cross-remote-checked nil
+  "Cached result of `tramp-rpc-test-cross-remote-enabled'.
+Value is a cons cell (CHECKED . RESULT).")
+
+(defun tramp-rpc-test-cross-remote-enabled ()
+  "Check if cross-remote testing is enabled and working.
+Returns non-nil if both test hosts are reachable."
+  (unless (consp tramp-rpc-test-cross-remote-checked)
+    (setq tramp-rpc-test-cross-remote-checked
+          (cons t
+                (and tramp-rpc-test-host-2
+                     (tramp-rpc-test-enabled)
+                     (condition-case nil
+                         (let ((dir (tramp-rpc-test--remote-directory-2)))
+                           (and (file-remote-p dir)
+                                (progn
+                                  (ignore-errors (make-directory dir t))
+                                  (file-directory-p dir)
+                                  (file-writable-p dir))))
+                       (error nil))))))
+  (cdr tramp-rpc-test-cross-remote-checked))
+
 (defun tramp-rpc-test--setup ()
   "Set up test environment."
   (let ((dir (tramp-rpc-test--remote-directory)))
     ;; Clean up any leftover test files
     (ignore-errors (delete-directory dir t))
     ;; Create fresh test directory
-    (make-directory dir t)))
+    (make-directory dir t))
+  ;; Also set up second host if available
+  (when tramp-rpc-test-host-2
+    (let ((dir2 (tramp-rpc-test--remote-directory-2)))
+      (ignore-errors (delete-directory dir2 t))
+      (ignore-errors (make-directory dir2 t)))))
 
 (defun tramp-rpc-test--cleanup ()
   "Clean up test environment."
   (let ((dir (tramp-rpc-test--remote-directory)))
-    (ignore-errors (delete-directory dir t))
-    (ignore-errors (tramp-cleanup-all-connections))))
+    (ignore-errors (delete-directory dir t)))
+  (when tramp-rpc-test-host-2
+    (let ((dir2 (tramp-rpc-test--remote-directory-2)))
+      (ignore-errors (delete-directory dir2 t))))
+  (ignore-errors (tramp-cleanup-all-connections)))
 
 (defmacro tramp-rpc-test--with-temp-file (var content &rest body)
   "Create a temporary remote file with CONTENT, bind to VAR, execute BODY.
@@ -610,6 +662,76 @@ signal `file-already-exists'.  With trailing slash (via
     (should (file-exists-p file))
     (delete-file file)
     (should-not (file-exists-p file))))
+
+(ert-deftest tramp-rpc-test06-copy-file-cross-remote ()
+  "Test `copy-file' between two different RPC hosts.
+This exercises the via-buffer code path that is used when source
+and destination are on different remote hosts."
+  :tags '(:expensive-test)
+  (skip-unless (tramp-rpc-test-cross-remote-enabled))
+
+  (tramp-rpc-test--with-temp-file src "cross-remote copy content"
+    (let ((dest (tramp-rpc-test--make-temp-name-2)))
+      (unwind-protect
+          (progn
+            ;; Verify source and dest are on different remotes
+            (should-not (tramp-equal-remote src dest))
+            (copy-file src dest)
+            (should (file-exists-p dest))
+            (should (equal (with-temp-buffer
+                             (insert-file-contents src)
+                             (buffer-string))
+                           (with-temp-buffer
+                             (insert-file-contents dest)
+                             (buffer-string)))))
+        (ignore-errors (delete-file dest))))))
+
+(ert-deftest tramp-rpc-test06-copy-file-cross-remote-to-directory ()
+  "Test `copy-file' between different RPC hosts into a directory."
+  :tags '(:expensive-test)
+  (skip-unless (tramp-rpc-test-cross-remote-enabled))
+
+  (tramp-rpc-test--with-temp-file src "cross-remote dir copy content"
+    (let ((dest-dir (tramp-rpc-test--make-temp-name-2)))
+      (unwind-protect
+          (progn
+            (make-directory dest-dir)
+            (should (file-directory-p dest-dir))
+            ;; Copy into directory with trailing /
+            (copy-file src (file-name-as-directory dest-dir))
+            (let ((expected-dest (expand-file-name
+                                  (file-name-nondirectory src) dest-dir)))
+              (should (file-exists-p expected-dest))
+              (should (equal (with-temp-buffer
+                               (insert-file-contents src)
+                               (buffer-string))
+                             (with-temp-buffer
+                               (insert-file-contents expected-dest)
+                               (buffer-string))))))
+        (ignore-errors (delete-directory dest-dir t))))))
+
+(ert-deftest tramp-rpc-test06-rename-file-cross-remote ()
+  "Test `rename-file' between two different RPC hosts.
+This exercises copy-then-delete for cross-remote renames."
+  :tags '(:expensive-test)
+  (skip-unless (tramp-rpc-test-cross-remote-enabled))
+
+  (let ((src (tramp-rpc-test--make-temp-name))
+        (dest (tramp-rpc-test--make-temp-name-2))
+        (content "cross-remote rename content"))
+    (unwind-protect
+        (progn
+          (write-region content nil src)
+          ;; Verify source and dest are on different remotes
+          (should-not (tramp-equal-remote src dest))
+          (rename-file src dest)
+          (should-not (file-exists-p src))
+          (should (file-exists-p dest))
+          (should (equal content (with-temp-buffer
+                                   (insert-file-contents dest)
+                                   (buffer-string)))))
+      (ignore-errors (delete-file src))
+      (ignore-errors (delete-file dest)))))
 
 ;;; ============================================================================
 ;;; Test 07: Directory Operations
