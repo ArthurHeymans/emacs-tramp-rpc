@@ -28,8 +28,11 @@ pub async fn stat(params: &Value) -> HandlerResult {
         from_value(params.clone()).map_err(|e| RpcError::invalid_params(e.to_string()))?;
 
     let path = bytes_to_path(&params.path);
-    let attrs = get_file_attributes(&path, params.lstat).await?;
-    Ok(attrs.to_value())
+    match get_file_attributes(&path, params.lstat).await {
+        Ok(attrs) => Ok(attrs.to_value()),
+        Err(e) if e.code == RpcError::FILE_NOT_FOUND => Ok(Value::Nil),
+        Err(e) => Err(e),
+    }
 }
 
 /// Batch stat operation - returns results for multiple paths concurrently
