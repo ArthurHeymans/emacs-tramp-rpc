@@ -190,7 +190,7 @@ Linux targets use musl for fully static binaries."
     ("aarch64-linux" "aarch64-unknown-linux-musl")
     ("x86_64-darwin" "x86_64-apple-darwin")
     ("aarch64-darwin" "aarch64-apple-darwin")
-    (_ (error "Unknown architecture: %s" arch))))
+    (_ (signal 'remote-file-error (list "Unknown architecture: %s" arch)))))
 
 (defun tramp-rpc-deploy--local-cache-path (arch)
   "Return the local cache path for binary of ARCH."
@@ -257,15 +257,16 @@ Returns t on success, nil on failure."
             (url-show-status nil))
         (message "Downloading %s..." url)
         (with-timeout (tramp-rpc-deploy-download-timeout
-                       (error "Download timed out after %d seconds"
-                              tramp-rpc-deploy-download-timeout))
+                       (signal 'remote-file-error
+			       (list "Download timed out after %d seconds"
+				     tramp-rpc-deploy-download-timeout)))
           (with-current-buffer (url-retrieve-synchronously url t t)
             (goto-char (point-min))
             ;; Check for HTTP errors
             (unless (re-search-forward "^HTTP/[0-9.]+ 200" nil t)
               (if (re-search-forward "^HTTP/[0-9.]+ \\([0-9]+\\)" nil t)
-                  (error "HTTP error %s" (match-string 1))
-                (error "Invalid HTTP response")))
+                  (signal 'remote-file-error (list "HTTP error %s" (match-string 1)))
+                (signal 'remote-file-error (list "Invalid HTTP response"))))
             ;; Find body (after blank line)
             (re-search-forward "^\r?\n" nil t)
             ;; Write body to file
@@ -317,19 +318,21 @@ Returns the path to the binary on success, signals error on failure."
             ;; Download tarball
             (message "Downloading tramp-rpc-server for %s..." arch)
             (unless (tramp-rpc-deploy--download-file tarball-url tarball-path)
-              (error "Download failed from %s (release may not exist)" tarball-url))
+              (signal
+	       'remote-file-error
+	       (list "Download failed from %s (release may not exist)" tarball-url)))
             ;; Verify checksum if we got one
             (when checksum-ok
               (let ((expected (with-temp-buffer
                                 (insert-file-contents checksum-path)
                                 (buffer-string))))
                 (unless (tramp-rpc-deploy--verify-checksum tarball-path expected)
-                  (error "Checksum verification failed"))))
+                  (signal 'remote-file-error (list "Checksum verification failed")))))
             ;; Extract
             (message "Extracting binary...")
             (make-directory cache-dir t)
             (unless (tramp-rpc-deploy--extract-tarball tarball-path cache-dir)
-              (error "Failed to extract tarball"))
+              (signal 'remote-file-error (list "Failed to extract tarball")))
             (message "Downloaded tramp-rpc-server for %s" arch)
             cache-path))
       ;; Cleanup temp dir
@@ -352,13 +355,15 @@ Cross-compilation requires additional setup, so we only build natively."
   "Build the binary for ARCH from source.
 Returns the path to the binary on success, nil on failure."
   (unless tramp-rpc-deploy-source-directory
-    (error "Source directory not configured"))
+    (signal 'remote-file-error (list "Source directory not configured")))
   (unless (tramp-rpc-deploy--cargo-available-p)
-    (error "Rust toolchain (cargo) not found"))
+    (signal 'remote-file-error (list "Rust toolchain (cargo) not found")))
   (unless (tramp-rpc-deploy--can-build-for-arch-p arch)
-    (error "Cannot cross-compile for %s on %s"
-           arch (tramp-rpc-deploy--detect-local-arch)))
-  
+    (signal
+     'remote-file-error
+     (list "Cannot cross-compile for %s on %s"
+           arch (tramp-rpc-deploy--detect-local-arch))))
+
   (let* ((default-directory tramp-rpc-deploy-source-directory)
          (target (tramp-rpc-deploy--arch-to-rust-target arch))
          (cache-path (tramp-rpc-deploy--local-cache-path arch))
@@ -368,12 +373,12 @@ Returns the path to the binary on success, nil on failure."
                                 target tramp-rpc-deploy-binary-name)
                         tramp-rpc-deploy-source-directory))
          (build-buffer (get-buffer-create "*tramp-rpc-build*")))
-    
+
     (message "Building tramp-rpc-server for %s (this may take a minute)..." arch)
-    
+
     (with-current-buffer build-buffer
       (erase-buffer))
-    
+
     (let ((exit-code
            (call-process "cargo" nil build-buffer nil
                          "build" "--release"
@@ -389,7 +394,9 @@ Returns the path to the binary on success, nil on failure."
             (message "Built tramp-rpc-server for %s" arch)
             cache-path)
         (with-current-buffer build-buffer
-          (error "Build failed (exit %d):\n%s" exit-code (buffer-string)))))))
+          (signal
+	   'remote-file-error
+	   (list "Build failed (exit %d):\n%s" exit-code (buffer-string))))))))
 
 ;;; ============================================================================
 ;;; Main logic: ensure local binary exists
@@ -412,13 +419,13 @@ Returns the path to the local binary."
      (bundled-path
       (message "Using bundled binary for %s" arch)
       bundled-path)
-     
+
      ;; Check cache
      ((and (file-exists-p cache-path)
            (file-executable-p cache-path))
       (message "Using cached binary for %s" arch)
       cache-path)
-     
+
      ;; Need to obtain binary
      (t
       (let ((methods (if tramp-rpc-deploy-prefer-build
@@ -426,7 +433,7 @@ Returns the path to the local binary."
                        '(download build)))
             (result nil)
             (errors nil))
-        
+
         (dolist (method methods)
           (unless result
             (condition-case err
@@ -441,15 +448,17 @@ Returns the path to the local binary."
                            (tramp-rpc-deploy--build-binary arch)))))
               (error
                (push (cons method (error-message-string err)) errors)))))
-        
+
         (or result
-            (error "Failed to obtain tramp-rpc-server for %s.\n\nErrors:\n%s\n\n%s"
+            (signal
+	     'remote-file-error
+	     (list "Failed to obtain tramp-rpc-server for %s.\n\nErrors:\n%s\n\n%s"
                    arch
                    (mapconcat (lambda (e)
                                 (format "  %s: %s" (car e) (cdr e)))
                               (reverse errors)
                               "\n")
-                   (tramp-rpc-deploy--help-message arch))))))))
+                   (tramp-rpc-deploy--help-message arch)))))))))
 
 (defun tramp-rpc-deploy--help-message (arch)
   "Return a help message for obtaining binary for ARCH."
@@ -529,17 +538,17 @@ Uses TRAMP's copy-file for reliable binary transfer with checksum verification."
          (retries 0)
          (success nil)
          (errors nil))
-    
+
     (tramp-rpc-deploy--log "Transfer starting: local=%s remote=%s" local-path remote-local)
     (tramp-rpc-deploy--log "Local binary size: %d bytes, checksum: %s..."
                            (file-attribute-size (file-attributes local-path))
                            (substring local-checksum 0 16))
-    
+
     ;; Ensure remote directory exists
     (tramp-rpc-deploy--ensure-remote-directory vec)
-    
+
     (message "Transferring binary to %s:%s..." (tramp-file-name-host vec) remote-local)
-    
+
     ;; Retry loop for reliability
     (while (and (not success) (< retries tramp-rpc-deploy-max-retries))
       (let ((attempt (1+ retries)))
@@ -549,17 +558,21 @@ Uses TRAMP's copy-file for reliable binary transfer with checksum verification."
               ;; Use TRAMP's copy-file for binary transfer (via sshx bootstrap method)
               ;; This is much more reliable than base64 encoding through heredocs
               (copy-file local-path remote-tmp-path t)
-              
+
               ;; Verify the file was created and has content
               (unless (tramp-send-command-and-check
                        vec
                        (format "test -s %s" (tramp-shell-quote-argument remote-tmp-local)))
-                (error "Temp file not created or is empty after copy"))
-              
+                (signal
+		 'remote-file-error
+		 (list "Temp file not created or is empty after copy")))
+
               ;; Verify checksum
               (let ((remote-checksum (tramp-rpc-deploy--remote-checksum vec remote-tmp-local)))
                 (unless remote-checksum
-                  (error "Could not compute remote checksum (sha256sum/shasum not available?)"))
+                  (signal
+		   'remote-file-error
+		   (list "Could not compute remote checksum (sha256sum/shasum not available?)")))
                 (if (string= local-checksum remote-checksum)
                     (progn
                       ;; Checksum matches - make executable and atomically move
@@ -587,15 +600,17 @@ Uses TRAMP's copy-file for reliable binary transfer with checksum verification."
              (message "Transfer error: %s" err-msg))
            (ignore-errors (delete-file remote-tmp-path))
            (setq retries (1+ retries))))))
-    
+
     (unless success
-      (error "Failed to transfer binary after %d attempts.\n\nErrors:\n%s\n\nTroubleshooting:\n- Verify SSH access: ssh %s@%s echo success\n- Check write permissions to %s on remote host\n- Ensure sha256sum or shasum command is available on remote host"
+      (signal
+       'remote-file-error
+       (list "Failed to transfer binary after %d attempts.\n\nErrors:\n%s\n\nTroubleshooting:\n- Verify SSH access: ssh %s@%s echo success\n- Check write permissions to %s on remote host\n- Ensure sha256sum or shasum command is available on remote host"
              tramp-rpc-deploy-max-retries
              (mapconcat #'identity (nreverse errors) "\n")
              (or (tramp-file-name-user vec) "USER")
              (tramp-file-name-host vec)
-             tramp-rpc-deploy-remote-directory))
-    
+             tramp-rpc-deploy-remote-directory)))
+
     remote-path))
 
 ;;; ============================================================================
@@ -619,8 +634,10 @@ signals an error."
                      arch (tramp-file-name-host vec))
             (tramp-file-local-name
              (tramp-rpc-deploy--transfer-binary bootstrap-vec local-binary)))
-        (error "tramp-rpc-server not found on %s and auto-deploy is disabled"
-               (tramp-file-name-host vec))))))
+        (signal
+	 'remote-file-error
+	 (list "tramp-rpc-server not found on %s and auto-deploy is disabled"
+               (tramp-file-name-host vec)))))))
 
 (defun tramp-rpc-deploy-remove-binary (vec)
   "Remove the tramp-rpc-server binary from remote VEC."
@@ -661,7 +678,7 @@ signals an error."
       (insert (format "Source directory: %s\n"
                       (or tramp-rpc-deploy-source-directory "not set")))
       (insert (format "Cache directory: %s\n\n" tramp-rpc-deploy-local-cache-directory))
-      
+
       (insert "Cached Binaries:\n")
       (insert "----------------\n")
       (dolist (arch '("x86_64-linux" "aarch64-linux" "x86_64-darwin" "aarch64-darwin"))
@@ -693,7 +710,7 @@ This helps troubleshoot deployment issues."
       (insert (format "TRAMP-RPC Deployment Diagnostics for %s%s\n"
                       (if user (concat user "@") "") host))
       (insert "=" (make-string 50 ?=) "\n\n")
-      
+
       ;; Test 1: SSH connectivity
       (insert "1. Testing SSH connectivity...\n")
       (let* ((ssh-cmd (append
@@ -707,7 +724,7 @@ This helps troubleshoot deployment issues."
             (insert "   [OK] SSH connection successful\n")
           (insert "   [FAIL] SSH connection failed\n")
           (insert (format "   Output: %s\n" (string-trim output)))))
-      
+
       ;; Test 2: Remote architecture
       (insert "\n2. Detecting remote architecture...\n")
       (let* ((ssh-cmd (append
@@ -721,7 +738,7 @@ This helps troubleshoot deployment issues."
         (if (string-match-p "FAILED" output)
             (insert "   [FAIL] Could not detect architecture\n")
           (insert (format "   [OK] Architecture: %s\n" (string-trim output)))))
-      
+
       ;; Test 3: Remote directory writable
       (insert "\n3. Testing remote directory access...\n")
       (let* ((dir tramp-rpc-deploy-remote-directory)
@@ -737,7 +754,7 @@ This helps troubleshoot deployment issues."
         (if (string-match-p "WRITABLE" output)
             (insert (format "   [OK] Directory %s is writable\n" dir))
           (insert (format "   [FAIL] Directory %s not writable\n" dir))))
-      
+
       ;; Test 4: Checksum command
       (insert "\n4. Testing checksum command availability...\n")
       (let* ((ssh-cmd (append
@@ -750,7 +767,7 @@ This helps troubleshoot deployment issues."
         (if (string-match-p "NONE" output)
             (insert "   [FAIL] No checksum command found (need sha256sum or shasum)\n")
           (insert (format "   [OK] Found: %s\n" output))))
-      
+
       ;; Test 5: Local binary availability
       (insert "\n5. Checking local binary cache...\n")
       (dolist (arch '("x86_64-linux" "aarch64-linux" "x86_64-darwin" "aarch64-darwin"))
@@ -762,8 +779,8 @@ This helps troubleshoot deployment issues."
            ((file-exists-p path)
             (insert (format "   [OK] %s: cached at %s\n" arch path)))
            (t
-            (insert (format "   [ ] %s: not available locally\n" arch))))))
-      
+             (insert (format "   [ ] %s: not available locally\n" arch))))))
+
       (insert "\n\nIf deployment fails, try:\n")
       (insert "  1. Enable debug logging: (setq tramp-rpc-deploy-debug t)\n")
       (insert "  2. Retry the connection and check *tramp-rpc-deploy* buffer\n")
