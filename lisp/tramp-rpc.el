@@ -549,7 +549,9 @@ Returns non-nil on success."
       (when (process-live-p process)
         (delete-process process))
       (let ((output (with-current-buffer buffer (buffer-string))))
-        (error "Failed to establish SSH connection to %s: %s" host output)))))
+        (signal
+	 'remote-file-error
+	 (list "Failed to establish SSH connection to %s: %s" host output))))))
 
 (defun tramp-rpc--connect (vec)
   "Establish an RPC connection to VEC."
@@ -607,7 +609,7 @@ Returns non-nil on success."
     ;; Configure process
     (set-process-query-on-exit-flag process nil)
     (set-process-coding-system process 'binary 'binary)
-    
+
     ;; Set up filter for async response handling
     (set-process-filter process #'tramp-rpc--connection-filter)
 
@@ -621,7 +623,7 @@ Returns non-nil on success."
     (let ((response (tramp-rpc--call vec "system.info" nil)))
       (unless response
         (tramp-rpc--remove-connection vec)
-        (error "Failed to connect to RPC server on %s" host)))
+        (signal 'remote-file-error (list "Failed to connect to RPC server on %s" host))))
 
     ;; Mark as connected for TRAMP's connectivity checks (used by projectile, etc.)
     (tramp-set-connection-property process "connected" t)
@@ -789,8 +791,10 @@ Returns the result or signals an error."
         (unless response
           (tramp-rpc--debug "TIMEOUT id=%s method=%s buffer-size=%d"
                            expected-id method (buffer-size))
-          (error "Timeout waiting for RPC response from %s (id=%s, method=%s)"
-                 (tramp-file-name-host vec) expected-id method))
+          (signal
+	   'remote-file-error
+	   (list "Timeout waiting for RPC response from %s (id=%s, method=%s)"
+                 (tramp-file-name-host vec) expected-id method)))
 
         (tramp-rpc--debug "RECV id=%s (found)" expected-id)
         (if (tramp-rpc-protocol-error-p response)
@@ -803,7 +807,7 @@ Returns the result or signals an error."
                ((= code tramp-rpc-protocol-error-file-not-found)
                 (signal 'file-missing (list "RPC" "No such file" msg)))
                ((= code tramp-rpc-protocol-error-permission-denied)
-                (signal 'file-error (list "RPC" "Permission denied" msg)))
+                (signal 'permission-denied (list "RPC" "Permission denied" msg)))
                ;; Map OS errno values to appropriate Emacs error symbols.
                ;; The server includes the raw errno in the error data field.
                ((eql os-errno 17) ;; EEXIST
@@ -819,9 +823,9 @@ Returns the result or signals an error."
                ;; All other IO errors also signal file-error so callers
                ;; can catch them uniformly with condition-case.
                ((= code tramp-rpc-protocol-error-io)
-                (signal 'file-error (list "RPC" msg)))
+                (signal 'remote-file-error (list "RPC" msg)))
                (t
-                (error "RPC error: %s" msg))))
+                (signal 'remote-file-error (list "RPC error: %s" msg)))))
           (plist-get response :result))))))
 
 (defun tramp-rpc--call-batch (vec requests)
@@ -837,7 +841,7 @@ Example:
 
 Returns:
   (t                          ; file.exists result
-   ((type . \"file\") ...)    ; file.stat result  
+   ((type . \"file\") ...)    ; file.stat result
    (:error -32001 :message \"...\"))  ; or error plist"
   (let* ((conn (tramp-rpc--ensure-connection vec))
          (process (plist-get conn :process))
@@ -882,16 +886,20 @@ Returns:
         (unless response
           (tramp-rpc--debug "TIMEOUT-BATCH id=%s buffer-size=%d"
                            expected-id (buffer-size))
-          (error "Timeout waiting for batch RPC response from %s (id=%s)"
-                 (tramp-file-name-host vec) expected-id))
+          (signal
+	   'remote-file-error
+	   (list "Timeout waiting for batch RPC response from %s (id=%s)"
+		 (tramp-file-name-host vec) expected-id)))
 
         (tramp-rpc--debug "RECV-BATCH id=%s (found)" expected-id)
         (if (tramp-rpc-protocol-error-p response)
             (progn
               (tramp-rpc--debug "ERROR-BATCH id=%s msg=%s"
                                expected-id (tramp-rpc-protocol-error-message response))
-              (error "Batch RPC error: %s"
-                     (tramp-rpc-protocol-error-message response)))
+              (signal
+	       'remote-file-error
+	       (list "Batch RPC error: %s"
+                     (tramp-rpc-protocol-error-message response))))
           (tramp-rpc-protocol-decode-batch-response response))))))
 
 ;; ============================================================================
@@ -1657,7 +1665,7 @@ Creates a hard link from NEWNAME to FILENAME."
     (with-parsed-tramp-file-name
         (if (tramp-tramp-file-p filename) filename newname) nil
       (tramp-error
-       v 'file-error
+       v 'remote-file-error
        "add-name-to-file: %s"
        "only implemented for same method, same user, same host")))
   (with-parsed-tramp-file-name (expand-file-name filename) v1

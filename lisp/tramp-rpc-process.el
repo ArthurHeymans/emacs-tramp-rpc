@@ -216,7 +216,7 @@ STDERR-BUFFER is the separate stderr buffer, or nil to mix with stdout."
       (when (and stdout (> (length stdout) 0))
         (tramp-rpc--debug "DELIVER stdout %d bytes to %s" (length stdout) local-process)
         (process-send-string local-process stdout))
-      
+
       ;; Deliver stderr
       (when (and stderr (> (length stderr) 0))
         (tramp-rpc--debug "DELIVER stderr %d bytes" (length stderr))
@@ -270,18 +270,18 @@ RESPONSE is the decoded RPC response plist."
                           s (alist-get 'stderr_encoding result))))
                (exited (alist-get 'exited result))
                (exit-code (alist-get 'exit_code result)))
-          
+
           (tramp-rpc--debug "ASYNC-READ response: stdout=%s stderr=%s exited=%s"
                            (if stdout (length stdout) "nil")
                            (if stderr (length stderr) "nil")
                            exited)
-          
+
           ;; Deliver output - use run-at-time to ensure event loop processes it
           ;; This is critical for accept-process-output to work correctly
           (when (or stdout stderr)
             (run-at-time 0 nil #'tramp-rpc--deliver-process-output
                          local-process stdout stderr stderr-buffer))
-          
+
           ;; Handle process exit or chain next read
           (if exited
               (run-at-time 0 nil #'tramp-rpc--handle-process-exit local-process exit-code)
@@ -366,7 +366,7 @@ Returns the new interval."
                         (let ((inhibit-read-only t))
                           (goto-char (point-max))
                           (insert stdout))))))))
-            
+
             ;; Handle stderr - send to stderr buffer if specified
             (when-let* ((stderr (plist-get result :stderr)))
               (when (> (length stderr) 0)
@@ -388,7 +388,7 @@ Returns the new interval."
                           (let ((inhibit-read-only t))
                             (goto-char (point-max))
                             (insert stderr))))))))))
-            
+
             ;; Adaptive polling: adjust interval based on output
             (let* ((current-interval (or (plist-get info :poll-interval)
                                          tramp-rpc--process-poll-interval-initial))
@@ -398,7 +398,7 @@ Returns the new interval."
               (when (> (abs (- new-interval current-interval))
                        (* 0.2 current-interval))
                 (tramp-rpc--reschedule-poll-timer local-process new-interval)))
-            
+
             ;; Check if process exited
             (when (plist-get result :exited)
               (tramp-rpc--handle-process-exit
@@ -475,11 +475,13 @@ Resolves program path and loads direnv environment from working directory."
          (program-args (cdr command))
          ;; Determine if PTY is requested
          (use-pty (memq connection-type '(pty t))))
-    
+
     ;; Ensure we're in a remote directory
     (unless (tramp-tramp-file-p default-directory)
-      (error "tramp-rpc-handle-make-process called without remote default-directory"))
-    
+      (signal
+       'remote-file-error
+       (list "tramp-rpc-handle-make-process called without remote default-directory")))
+
     (with-parsed-tramp-file-name default-directory nil
       ;; Get direnv environment for this directory
       (let ((direnv-env (tramp-rpc--get-direnv-environment v localname)))
@@ -503,15 +505,15 @@ Resolves program path and loads direnv environment from working directory."
                                  ((bufferp stderr) stderr)
                                  ((stringp stderr) (get-buffer-create stderr))
                                  (t nil))))
-          
+
           ;; Configure the local relay process
           (when coding
             (set-process-coding-system local-process coding coding))
           (set-process-query-on-exit-flag local-process (not noquery))
-          
+
           (process-put local-process :tramp-rpc-vec v)
           (process-put local-process :tramp-rpc-pid remote-pid)
-          
+
           (when filter
             (set-process-filter local-process filter))
           (when sentinel
@@ -519,20 +521,20 @@ Resolves program path and loads direnv environment from working directory."
             (set-process-sentinel local-process
                                   (lambda (proc event)
                                     (tramp-rpc--pipe-process-sentinel proc event sentinel))))
-          
+
           ;; Store process info
           (puthash local-process
                    (list :vec v
                          :pid remote-pid
                          :stderr-buffer stderr-buffer)
                    tramp-rpc--async-processes)
-          
+
           (tramp-rpc--debug "MAKE-PROCESS created local=%s remote-pid=%s program=%s"
                            local-process remote-pid remote-program)
-          
+
           ;; Start async read loop
           (tramp-rpc--start-async-read local-process)
-          
+
           local-process))))))
 
 (defun tramp-rpc-handle-start-file-process (name buffer program &rest args)
@@ -704,16 +706,16 @@ DIRENV-ENV is an optional alist of environment variables from direnv."
          (local-process (make-pipe-process
                          :name (or name "tramp-rpc-pty")
                          :buffer actual-buffer
-                         :coding (or coding 'utf-8-unix)
-                         :noquery t)))
-    
+                          :coding (or coding 'utf-8-unix)
+                          :noquery t)))
+
     ;; Configure the local relay process
     (set-process-filter local-process (or filter #'tramp-rpc--pty-default-filter))
     (set-process-sentinel local-process #'tramp-rpc--pty-sentinel)
     (set-process-query-on-exit-flag local-process (not noquery))
     (when coding
       (set-process-coding-system local-process coding coding))
-    
+
     ;; Store process info
     (process-put local-process :tramp-rpc-pty t)
     (process-put local-process :tramp-rpc-pid remote-pid)
@@ -721,19 +723,19 @@ DIRENV-ENV is an optional alist of environment variables from direnv."
     (process-put local-process :tramp-rpc-user-sentinel sentinel)
     (process-put local-process :tramp-rpc-command command)
     (process-put local-process :tramp-rpc-tty-name tty-name)
-    
+
     ;; Set up window size adjustment function
     (process-put local-process 'adjust-window-size-function
                  #'tramp-rpc--adjust-pty-window-size)
-    
+
     ;; Track the PTY process
     (puthash local-process
              (list :vec vec :pid remote-pid)
              tramp-rpc--pty-processes)
-    
+
     ;; Start async read loop
     (tramp-rpc--pty-start-async-read local-process)
-    
+
     local-process))
 
 (defun tramp-rpc--pty-default-filter (process output)
@@ -795,8 +797,8 @@ RESPONSE is the decoded RPC response plist."
                          (tramp-rpc--decode-output
                           o (alist-get 'output_encoding result))))
                (exited (alist-get 'exited result))
-               (exit-code (alist-get 'exit_code result)))
-          
+                (exit-code (alist-get 'exit_code result)))
+
           ;; Deliver output via filter
           (when (and output (> (length output) 0))
             (if-let* ((filter (process-filter local-process)))
@@ -806,7 +808,7 @@ RESPONSE is the decoded RPC response plist."
                   (with-current-buffer buf
                     (goto-char (point-max))
                     (insert output))))))
-          
+
           ;; Handle process exit or chain next read
           (if exited
               (tramp-rpc--handle-pty-exit local-process exit-code)
@@ -823,14 +825,14 @@ RESPONSE is the decoded RPC response plist."
              (pid (process-get local-process :tramp-rpc-pid)))
     (ignore-errors
       (tramp-rpc--call vec "process.close_pty" `((pid . ,pid)))))
-  
+
   ;; Remove from tracking
   (remhash local-process tramp-rpc--pty-processes)
-  
+
   ;; Store exit info
   (process-put local-process :tramp-rpc-exit-code (or exit-code 0))
   (process-put local-process :tramp-rpc-exited t)
-  
+
   ;; Get user sentinel
   (let ((user-sentinel (process-get local-process :tramp-rpc-user-sentinel))
         (event (if (and exit-code (= exit-code 0))
