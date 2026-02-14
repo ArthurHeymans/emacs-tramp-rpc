@@ -123,8 +123,21 @@ pub async fn run(params: &Value) -> HandlerResult {
     })?;
 
     // Return binary data directly (no encoding needed!)
+    // On Unix, signal-killed processes have code() == None.
+    // Convention: return 128 + signal_number (e.g. SIGKILL=9 -> 137).
+    let exit_code = output.status.code().unwrap_or_else(|| {
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::ExitStatusExt;
+            output.status.signal().map(|s| 128 + s).unwrap_or(-1)
+        }
+        #[cfg(not(unix))]
+        {
+            -1
+        }
+    });
     let result = ProcessResult {
-        exit_code: output.status.code().unwrap_or(-1),
+        exit_code,
         stdout: output.stdout,
         stderr: output.stderr,
     };
@@ -294,7 +307,17 @@ pub async fn read(params: &Value) -> HandlerResult {
         "stdout" => stdout_val,
         "stderr" => stderr_val,
         "exited" => exit_status.is_some(),
-        "exit_code" => exit_status.and_then(|s| s.code()).map(|c| Value::Integer(c.into())).unwrap_or(Value::Nil)
+        "exit_code" => exit_status.map(|s| {
+            #[cfg(unix)]
+            {
+                use std::os::unix::process::ExitStatusExt;
+                s.code().unwrap_or_else(|| s.signal().map(|sig| 128 + sig).unwrap_or(-1))
+            }
+            #[cfg(not(unix))]
+            {
+                s.code().unwrap_or(-1)
+            }
+        }).map(|c| Value::Integer(c.into())).unwrap_or(Value::Nil)
     })
 }
 
@@ -410,7 +433,17 @@ pub async fn list(_params: &Value) -> HandlerResult {
                 "os_pid" => managed.child.id().map(|id| Value::Integer((id as i64).into())).unwrap_or(Value::Nil),
                 "cmd" => managed.cmd.clone(),
                 "exited" => exited.is_some(),
-                "exit_code" => exited.and_then(|s| s.code()).map(|c| Value::Integer(c.into())).unwrap_or(Value::Nil)
+                "exit_code" => exited.map(|s| {
+                    #[cfg(unix)]
+                    {
+                        use std::os::unix::process::ExitStatusExt;
+                        s.code().unwrap_or_else(|| s.signal().map(|sig| 128 + sig).unwrap_or(-1))
+                    }
+                    #[cfg(not(unix))]
+                    {
+                        s.code().unwrap_or(-1)
+                    }
+                }).map(|c| Value::Integer(c.into())).unwrap_or(Value::Nil)
             }
         })
         .collect();

@@ -458,7 +458,11 @@ or when `process-connection-type' is t.
 For pipe mode, uses async polling for long-running processes.
 Resolves program path and loads direnv environment from working directory."
   (let* ((name (plist-get args :name))
-         (buffer (plist-get args :buffer))
+         (buffer-arg (plist-get args :buffer))
+         ;; tramp-handle-shell-command passes (output-buffer error-file)
+         ;; as the buffer argument for async commands with stderr.
+         ;; Extract the actual buffer from the list.
+         (buffer (if (consp buffer-arg) (car buffer-arg) buffer-arg))
          (command (plist-get args :command))
          (coding (plist-get args :coding))
          (noquery (plist-get args :noquery))
@@ -483,6 +487,8 @@ Resolves program path and loads direnv environment from working directory."
        (list "tramp-rpc-handle-make-process called without remote default-directory")))
 
     (with-parsed-tramp-file-name default-directory nil
+      ;; Unquote localname in case of file-name-quoted paths (e.g. /: prefix).
+      (setq localname (file-name-unquote localname))
       ;; Get direnv environment for this directory
       (let ((direnv-env (tramp-rpc--get-direnv-environment v localname)))
         (if use-pty
@@ -513,6 +519,7 @@ Resolves program path and loads direnv environment from working directory."
 
           (process-put local-process :tramp-rpc-vec v)
           (process-put local-process :tramp-rpc-pid remote-pid)
+          (process-put local-process 'remote-command command)
 
           (when filter
             (set-process-filter local-process filter))
@@ -617,6 +624,8 @@ DIRENV-ENV is an optional alist of environment variables from direnv."
                     (when tramp-rpc-use-controlmaster
                       (list "-o" "BatchMode=yes"))
                     (list "-o" "StrictHostKeyChecking=accept-new")
+                    ;; Suppress "Shared connection to ... closed." messages
+                    (list "-o" "LogLevel=error")
                     ;; User-specified SSH options
                     (mapcan (lambda (opt) (list "-o" opt))
                             tramp-rpc-ssh-options)
@@ -662,6 +671,8 @@ DIRENV-ENV is an optional alist of environment variables from direnv."
     (process-put process :tramp-rpc-vec vec)
     (process-put process :tramp-rpc-user-sentinel sentinel)
     (process-put process :tramp-rpc-command command)
+    ;; Standard tramp property expected by tests and upstream code
+    (process-put process 'remote-command command)
 
     process))
 
@@ -723,6 +734,8 @@ DIRENV-ENV is an optional alist of environment variables from direnv."
     (process-put local-process :tramp-rpc-user-sentinel sentinel)
     (process-put local-process :tramp-rpc-command command)
     (process-put local-process :tramp-rpc-tty-name tty-name)
+    ;; Standard tramp property expected by tests and upstream code
+    (process-put local-process 'remote-command command)
 
     ;; Set up window size adjustment function
     (process-put local-process 'adjust-window-size-function
