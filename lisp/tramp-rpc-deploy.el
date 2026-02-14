@@ -20,6 +20,7 @@
 
 ;;; Code:
 
+(require 'cl-lib)
 (require 'tramp)
 (require 'url)
 
@@ -93,10 +94,33 @@ By default, downloading is attempted first as it's faster."
   :type 'boolean
   :group 'tramp-rpc-deploy)
 
-(defcustom tramp-rpc-deploy-bootstrap-method "sshx"
+(defcustom tramp-rpc-deploy-bootstrap-method "scp"
   "TRAMP method to use for bootstrapping (deploying the binary).
-Use \"sshx\" to avoid PTY allocation issues, or \"ssh\" for standard SSH."
-  :type 'string
+This controls how the server binary is transferred to the remote host
+and how shell commands are run during deployment.
+
+Recommended methods:
+  \"scp\"   - Uses the scp protocol for file transfer (out-of-band).
+             Shell commands use a separate SSH session.  This is the
+             default and most reliable option for transferring large
+             binaries.
+  \"rsync\" - Uses rsync for file transfer (out-of-band).  Requires
+             rsync to be installed on both local and remote hosts.
+             Efficient for repeated deployments due to delta transfer.
+
+Legacy methods (use inline encoding for file transfer):
+  \"sshx\"  - Encodes the binary as base64 and sends it through the
+             shell session.  This can be fragile with large files due
+             to PTY input buffer size limits.
+  \"ssh\"   - Similar to sshx but with PTY allocation.  Same inline
+             encoding limitations apply.
+  \"scpx\"  - Like scp but uses a PTY for the shell session."
+  :type '(choice (const :tag "SCP - out-of-band transfer (recommended)" "scp")
+                 (const :tag "rsync - out-of-band transfer (requires rsync)" "rsync")
+                 (const :tag "sshx - inline encoding (legacy)" "sshx")
+                 (const :tag "ssh - inline encoding (legacy)" "ssh")
+                 (const :tag "scpx - out-of-band with PTY shell" "scpx")
+                 (string :tag "Other TRAMP method"))
   :group 'tramp-rpc-deploy)
 
 (defcustom tramp-rpc-deploy-max-retries 3
@@ -131,10 +155,13 @@ FORMAT-STRING and ARGS are passed to `format'."
 
 (defun tramp-rpc-deploy--bootstrap-vec (vec)
   "Convert VEC to use the bootstrap method for deployment operations.
-This allows us to use sshx for deployment even when the main method is rpc."
+This converts the rpc method to a standard TRAMP method for deployment.
+The method used is controlled by `tramp-rpc-deploy-bootstrap-method'.
+Methods like \"scp\" and \"rsync\" use out-of-band transfer for `copy-file',
+while \"ssh\" and \"sshx\" use inline encoding (base64 through the shell)."
   (let ((method (tramp-file-name-method vec)))
-    (if (member method '("ssh" "sshx" "scpx"))
-        vec  ; Already a shell-based method
+    (if (member method '("ssh" "sshx" "scp" "scpx" "rsync"))
+        vec  ; Already a TRAMP method that supports shell commands and file transfer
       ;; Convert to bootstrap method - create a new tramp-file-name struct
       (make-tramp-file-name
        :method tramp-rpc-deploy-bootstrap-method
@@ -522,7 +549,11 @@ Tries sha256sum first, then shasum -a 256 for macOS compatibility."
 
 (defun tramp-rpc-deploy--transfer-binary (vec local-path)
   "Transfer the binary at LOCAL-PATH to the remote host VEC.
-Uses TRAMP's copy-file for reliable binary transfer with checksum verification."
+Uses TRAMP's `copy-file' with the bootstrap method for binary transfer.
+When the bootstrap method is \"scp\", \"scpx\", or \"rsync\", the transfer
+uses out-of-band protocols (the actual scp/rsync binaries) which is fast
+and reliable for large files.  With \"ssh\" or \"sshx\", TRAMP falls back
+to inline encoding (base64 through the shell), which can be fragile."
   (let* ((remote-path (tramp-rpc-deploy--remote-binary-path vec))
          (remote-local (tramp-file-local-name remote-path))
          (remote-tmp-name (format "%s.tmp.%d"
@@ -539,7 +570,8 @@ Uses TRAMP's copy-file for reliable binary transfer with checksum verification."
          (success nil)
          (errors nil))
 
-    (tramp-rpc-deploy--log "Transfer starting: local=%s remote=%s" local-path remote-local)
+    (tramp-rpc-deploy--log "Transfer starting: local=%s remote=%s (method: %s)"
+                           local-path remote-local (tramp-file-name-method vec))
     (tramp-rpc-deploy--log "Local binary size: %d bytes, checksum: %s..."
                            (file-attribute-size (file-attributes local-path))
                            (substring local-checksum 0 16))
@@ -555,8 +587,9 @@ Uses TRAMP's copy-file for reliable binary transfer with checksum verification."
         (message "Transfer attempt %d/%d..." attempt tramp-rpc-deploy-max-retries)
         (condition-case err
             (progn
-              ;; Use TRAMP's copy-file for binary transfer (via sshx bootstrap method)
-              ;; This is much more reliable than base64 encoding through heredocs
+              ;; Use TRAMP's copy-file for binary transfer via the bootstrap method.
+              ;; With "scp"/"rsync" methods this uses out-of-band transfer
+              ;; (actual scp/rsync binaries), avoiding inline base64 encoding.
               (copy-file local-path remote-tmp-path t)
 
               ;; Verify the file was created and has content
@@ -672,6 +705,11 @@ signals an error."
       (insert "TRAMP-RPC Server Deployment Status\n")
       (insert "===================================\n\n")
       (insert (format "Version: %s\n" tramp-rpc-deploy-version))
+      (insert (format "Bootstrap method: %s%s\n"
+                      tramp-rpc-deploy-bootstrap-method
+                      (if (member tramp-rpc-deploy-bootstrap-method '("scp" "scpx" "rsync"))
+                          " (out-of-band transfer)"
+                        " (inline encoding)")))
       (insert (format "Local arch: %s\n" (tramp-rpc-deploy--detect-local-arch)))
       (insert (format "Cargo available: %s\n"
                       (if (tramp-rpc-deploy--cargo-available-p) "yes" "no")))
@@ -711,80 +749,114 @@ This helps troubleshoot deployment issues."
                       (if user (concat user "@") "") host))
       (insert "=" (make-string 50 ?=) "\n\n")
 
-      ;; Test 1: SSH connectivity
-      (insert "1. Testing SSH connectivity...\n")
-      (let* ((ssh-cmd (append
-                       (list "ssh" "-o" "BatchMode=yes" "-o" "ConnectTimeout=10")
-                       (when user (list "-l" user))
-                       (list host "echo 'SSH_OK'")))
-             (output (with-temp-buffer
-                       (apply #'call-process (car ssh-cmd) nil t nil (cdr ssh-cmd))
-                       (buffer-string))))
-        (if (string-match-p "SSH_OK" output)
-            (insert "   [OK] SSH connection successful\n")
-          (insert "   [FAIL] SSH connection failed\n")
-          (insert (format "   Output: %s\n" (string-trim output)))))
+      (let ((test-num 1))
+        ;; Bootstrap method
+        (insert (format "%d. Bootstrap method configuration...\n" test-num))
+        (insert (format "   Bootstrap method: %s\n" tramp-rpc-deploy-bootstrap-method))
+        (if (member tramp-rpc-deploy-bootstrap-method '("scp" "scpx" "rsync"))
+            (progn
+              (insert "   [OK] Using out-of-band transfer (fast, reliable)\n")
+              (when (string= tramp-rpc-deploy-bootstrap-method "rsync")
+                (if (executable-find "rsync")
+                    (insert "   [OK] Local rsync found\n")
+                  (insert "   [WARN] Local rsync not found - transfer may fail\n"))))
+          (insert "   [WARN] Using inline encoding - may be slow/fragile for large binaries\n")
+          (insert "   Consider: (setq tramp-rpc-deploy-bootstrap-method \"scp\")\n"))
 
-      ;; Test 2: Remote architecture
-      (insert "\n2. Detecting remote architecture...\n")
-      (let* ((ssh-cmd (append
-                       (list "ssh" "-o" "BatchMode=yes")
-                       (when user (list "-l" user))
-                       (list host "uname -m && uname -s")))
-             (output (with-temp-buffer
-                       (if (zerop (apply #'call-process (car ssh-cmd) nil t nil (cdr ssh-cmd)))
-                           (buffer-string)
-                         "FAILED"))))
-        (if (string-match-p "FAILED" output)
-            (insert "   [FAIL] Could not detect architecture\n")
-          (insert (format "   [OK] Architecture: %s\n" (string-trim output)))))
+        ;; SSH connectivity
+        (cl-incf test-num)
+        (insert (format "\n%d. Testing SSH connectivity...\n" test-num))
+        (let* ((ssh-cmd (append
+                         (list "ssh" "-o" "BatchMode=yes" "-o" "ConnectTimeout=10")
+                         (when user (list "-l" user))
+                         (list host "echo 'SSH_OK'")))
+               (output (with-temp-buffer
+                         (apply #'call-process (car ssh-cmd) nil t nil (cdr ssh-cmd))
+                         (buffer-string))))
+          (if (string-match-p "SSH_OK" output)
+              (insert "   [OK] SSH connection successful\n")
+            (insert "   [FAIL] SSH connection failed\n")
+            (insert (format "   Output: %s\n" (string-trim output)))))
 
-      ;; Test 3: Remote directory writable
-      (insert "\n3. Testing remote directory access...\n")
-      (let* ((dir tramp-rpc-deploy-remote-directory)
-             (ssh-cmd (append
-                       (list "ssh" "-o" "BatchMode=yes")
-                       (when user (list "-l" user))
-                       (list host (format "mkdir -p %s && test -w %s && echo 'WRITABLE'"
-                                          (shell-quote-argument dir)
-                                          (shell-quote-argument dir)))))
-             (output (with-temp-buffer
-                       (apply #'call-process (car ssh-cmd) nil t nil (cdr ssh-cmd))
-                       (buffer-string))))
-        (if (string-match-p "WRITABLE" output)
-            (insert (format "   [OK] Directory %s is writable\n" dir))
-          (insert (format "   [FAIL] Directory %s not writable\n" dir))))
+        ;; Remote architecture
+        (cl-incf test-num)
+        (insert (format "\n%d. Detecting remote architecture...\n" test-num))
+        (let* ((ssh-cmd (append
+                         (list "ssh" "-o" "BatchMode=yes")
+                         (when user (list "-l" user))
+                         (list host "uname -m && uname -s")))
+               (output (with-temp-buffer
+                         (if (zerop (apply #'call-process (car ssh-cmd) nil t nil (cdr ssh-cmd)))
+                             (buffer-string)
+                           "FAILED"))))
+          (if (string-match-p "FAILED" output)
+              (insert "   [FAIL] Could not detect architecture\n")
+            (insert (format "   [OK] Architecture: %s\n" (string-trim output)))))
 
-      ;; Test 4: Checksum command
-      (insert "\n4. Testing checksum command availability...\n")
-      (let* ((ssh-cmd (append
-                       (list "ssh" "-o" "BatchMode=yes")
-                       (when user (list "-l" user))
-                       (list host "which sha256sum || which shasum || echo 'NONE'")))
-             (output (with-temp-buffer
-                       (apply #'call-process (car ssh-cmd) nil t nil (cdr ssh-cmd))
-                       (string-trim (buffer-string)))))
-        (if (string-match-p "NONE" output)
-            (insert "   [FAIL] No checksum command found (need sha256sum or shasum)\n")
-          (insert (format "   [OK] Found: %s\n" output))))
+        ;; Remote directory writable
+        (cl-incf test-num)
+        (insert (format "\n%d. Testing remote directory access...\n" test-num))
+        (let* ((dir tramp-rpc-deploy-remote-directory)
+               (ssh-cmd (append
+                         (list "ssh" "-o" "BatchMode=yes")
+                         (when user (list "-l" user))
+                         (list host (format "mkdir -p %s && test -w %s && echo 'WRITABLE'"
+                                            (shell-quote-argument dir)
+                                            (shell-quote-argument dir)))))
+               (output (with-temp-buffer
+                         (apply #'call-process (car ssh-cmd) nil t nil (cdr ssh-cmd))
+                         (buffer-string))))
+          (if (string-match-p "WRITABLE" output)
+              (insert (format "   [OK] Directory %s is writable\n" dir))
+            (insert (format "   [FAIL] Directory %s not writable\n" dir))))
 
-      ;; Test 5: Local binary availability
-      (insert "\n5. Checking local binary cache...\n")
-      (dolist (arch '("x86_64-linux" "aarch64-linux" "x86_64-darwin" "aarch64-darwin"))
-        (let ((path (tramp-rpc-deploy--local-cache-path arch))
-              (bundled (tramp-rpc-deploy--bundled-binary-path arch)))
-          (cond
-           ((and bundled (file-exists-p bundled))
-            (insert (format "   [OK] %s: bundled binary available\n" arch)))
-           ((file-exists-p path)
-            (insert (format "   [OK] %s: cached at %s\n" arch path)))
-           (t
-             (insert (format "   [ ] %s: not available locally\n" arch))))))
+        ;; Checksum command
+        (cl-incf test-num)
+        (insert (format "\n%d. Testing checksum command availability...\n" test-num))
+        (let* ((ssh-cmd (append
+                         (list "ssh" "-o" "BatchMode=yes")
+                         (when user (list "-l" user))
+                         (list host "which sha256sum || which shasum || echo 'NONE'")))
+               (output (with-temp-buffer
+                         (apply #'call-process (car ssh-cmd) nil t nil (cdr ssh-cmd))
+                         (string-trim (buffer-string)))))
+          (if (string-match-p "NONE" output)
+              (insert "   [FAIL] No checksum command found (need sha256sum or shasum)\n")
+            (insert (format "   [OK] Found: %s\n" output))))
 
-      (insert "\n\nIf deployment fails, try:\n")
-      (insert "  1. Enable debug logging: (setq tramp-rpc-deploy-debug t)\n")
-      (insert "  2. Retry the connection and check *tramp-rpc-deploy* buffer\n")
-      (insert "  3. Manually test: ssh " (if user (concat user "@") "") host " echo success\n"))
+        ;; Conditional: rsync availability (when using rsync bootstrap method)
+        (when (string= tramp-rpc-deploy-bootstrap-method "rsync")
+          (cl-incf test-num)
+          (insert (format "\n%d. Testing rsync availability on remote...\n" test-num))
+          (let* ((ssh-cmd (append
+                           (list "ssh" "-o" "BatchMode=yes")
+                           (when user (list "-l" user))
+                           (list host "which rsync || echo 'NONE'")))
+                 (output (with-temp-buffer
+                           (apply #'call-process (car ssh-cmd) nil t nil (cdr ssh-cmd))
+                           (string-trim (buffer-string)))))
+            (if (string-match-p "NONE" output)
+                (insert "   [FAIL] rsync not found on remote (needed for rsync bootstrap method)\n")
+              (insert (format "   [OK] Found: %s\n" output)))))
+
+        ;; Local binary availability
+        (cl-incf test-num)
+        (insert (format "\n%d. Checking local binary cache...\n" test-num))
+        (dolist (arch '("x86_64-linux" "aarch64-linux" "x86_64-darwin" "aarch64-darwin"))
+          (let ((path (tramp-rpc-deploy--local-cache-path arch))
+                (bundled (tramp-rpc-deploy--bundled-binary-path arch)))
+            (cond
+             ((and bundled (file-exists-p bundled))
+              (insert (format "   [OK] %s: bundled binary available\n" arch)))
+             ((file-exists-p path)
+              (insert (format "   [OK] %s: cached at %s\n" arch path)))
+             (t
+              (insert (format "   [ ] %s: not available locally\n" arch))))))
+
+        (insert "\n\nIf deployment fails, try:\n")
+        (insert "  1. Enable debug logging: (setq tramp-rpc-deploy-debug t)\n")
+        (insert "  2. Retry the connection and check *tramp-rpc-deploy* buffer\n")
+        (insert "  3. Manually test: ssh " (if user (concat user "@") "") host " echo success\n")))
     (display-buffer buf)))
 
 (provide 'tramp-rpc-deploy)
