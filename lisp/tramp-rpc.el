@@ -57,7 +57,26 @@
 ;;;###autoload
 (with-eval-after-load 'tramp
   ;; Register the method
-  (add-to-list 'tramp-methods `(,tramp-rpc-method))
+  (add-to-list 'tramp-methods
+               `(,tramp-rpc-method
+                 ;; Direct async process support: tramp-rpc uses direct SSH
+                 ;; PTY connections for async processes, which means stderr
+                 ;; is mixed with stdout (normal PTY behavior).  Setting
+                 ;; tramp-direct-async lets upstream tests know to skip
+                 ;; stderr-separation assertions for async shell-command.
+                 (tramp-direct-async t)))
+
+  ;; Enable direct-async-process for the rpc method.
+  ;; This tells upstream tramp that our async processes are "direct"
+  ;; (i.e., they use a direct SSH PTY connection rather than piping
+  ;; through the control channel).  As a consequence, stderr cannot
+  ;; be separated from stdout in async processes.
+  (connection-local-set-profile-variables
+   'tramp-rpc-connection-local-default-profile
+   '((tramp-direct-async-process . t)))
+  (connection-local-set-profiles
+   `(:application tramp :protocol ,tramp-rpc-method)
+   'tramp-rpc-connection-local-default-profile)
 
   ;; Define the predicate inline (as defsubst) so it's available without
   ;; loading tramp-rpc.el.  This avoids recursive autoloading: TRAMP calls
@@ -1388,7 +1407,8 @@ TYPE is the file type string."
                      (append (tramp-rpc--encode-path localname)
                              ;; Don't pass parents here - the skeleton
                              ;; handles the recursive parent creation.
-                             `((parents . :msgpack-false))))
+                             `((parents . :msgpack-false)
+                               (mode . ,(default-file-modes)))))
     ;; Flush parent directory properties so file-exists-p sees the new dir.
     (tramp-flush-directory-properties v (file-name-directory localname))
     (tramp-rpc--invalidate-cache-for-path dir)))
@@ -1855,6 +1875,7 @@ Returns a list of plists, each containing:
 This is much faster than running each command sequentially over TRAMP
 because all commands are sent in a single network round-trip."
   (with-parsed-tramp-file-name directory nil
+    (setq localname (file-name-unquote localname))
     (let* ((requests
             (mapcar (lambda (args)
                       (cons "process.run"
@@ -1913,6 +1934,46 @@ DESTINATION follows the `process-file' convention:
          ((bufferp stderr-dest)
           (with-current-buffer stderr-dest (insert stderr)))))))))
 
+(defun tramp-rpc--get-signal-strings (vec)
+  "Strings to return by `process-file' in case of signals on VEC.
+Runs `kill -l' on the remote host to get signal names, then maps
+signal numbers to human-readable strings like \"Interrupt\" or
+\"Signal 2\".  The result is cached per connection."
+  (with-tramp-connection-property vec "rpc-signal-strings"
+    (let* ((result (tramp-rpc--call vec "process.run"
+                                    `((cmd . "/bin/sh")
+                                      (args . ["-c" "kill -l"])
+                                      (cwd . "/"))))
+           (exit-code (alist-get 'exit_code result))
+           (stdout (tramp-rpc--decode-output
+                    (alist-get 'stdout result)
+                    (alist-get 'stdout_encoding result)))
+           (raw-signals (when (and (eq exit-code 0) (> (length stdout) 0))
+                          (split-string (string-trim stdout) nil 'omit)))
+           ;; Prepend a placeholder 0 for signal 0 so that (nth 1 signals)
+           ;; corresponds to signal 1 (HUP), (nth 2 signals) to signal 2 (INT), etc.
+           (signals (cons 0 raw-signals))
+           (vec-strings (make-vector 128 nil)))
+      ;; Sanity: remove duplicate leading "0" entry if kill -l included one
+      (when (and (stringp (cadr signals)) (string-equal (cadr signals) "0"))
+        (setcdr signals (cddr signals)))
+      ;; Map signal names to human-readable strings
+      (dotimes (i 128)
+        (let ((sig (nth i signals)))
+          (aset vec-strings i
+                (cond
+                 ((zerop i) 0)
+                 ((null sig) (format "Signal %d" i))
+                 ((string-equal sig "HUP") "Hangup")
+                 ((string-equal sig "INT") "Interrupt")
+                 ((string-equal sig "QUIT") "Quit")
+                 ((string-equal sig "STOP") "Stopped (signal)")
+                 ((string-equal sig "TSTP") "Stopped")
+                 ((string-equal sig "TTIN") "Stopped (tty input)")
+                 ((string-equal sig "TTOU") "Stopped (tty output)")
+                 (t (format "Signal %d" i))))))
+      vec-strings)))
+
 (defun tramp-rpc-handle-process-file
     (program &optional infile destination _display &rest args)
   "Like `process-file' for TRAMP-RPC files.
@@ -1920,6 +1981,8 @@ Resolves PROGRAM path and loads direnv environment from working directory.
 When `tramp-rpc-magit--process-caches' is populated (during magit
 refresh), git commands are served from the prefetch cache when possible."
   (with-parsed-tramp-file-name default-directory nil
+    ;; Unquote localname in case of file-name-quoted paths (e.g. /: prefix).
+    (setq localname (file-name-unquote localname))
     ;; Try serving from magit prefetch cache first (no RPC needed)
     (let ((cached (when (null infile)  ; no stdin redirection
                     (tramp-rpc-magit--process-cache-lookup program args))))
@@ -1937,66 +2000,49 @@ refresh), git commands are served from the prefetch cache when possible."
                                   (set-buffer-multibyte nil)
                                   (insert-file-contents-literally infile)
                                   (buffer-string))))
-               (result (tramp-rpc--call v "process.run"
-                                        `((cmd . ,resolved-program)
-                                          (args . ,(vconcat args))
-                                          (cwd . ,localname)
-                                          ,@(when direnv-env
-                                              `((env . ,direnv-env)))
-                                          ,@(when stdin-content
-                                              `((stdin . ,stdin-content))))))
-               (exit-code (alist-get 'exit_code result))
-               (stdout (tramp-rpc--decode-output
-                        (alist-get 'stdout result)
-                        (alist-get 'stdout_encoding result)))
-               (stderr (tramp-rpc--decode-output
-                        (alist-get 'stderr result)
-                        (alist-get 'stderr_encoding result))))
+               (result (condition-case _err
+                           (tramp-rpc--call v "process.run"
+                                            `((cmd . ,resolved-program)
+                                              (args . ,(vconcat args))
+                                              (cwd . ,localname)
+                                              ,@(when direnv-env
+                                                  `((env . ,direnv-env)))
+                                              ,@(when stdin-content
+                                                  `((stdin . ,stdin-content)))))
+                         ;; When the binary doesn't exist or can't be
+                         ;; spawned, return exit code 127 (command not
+                         ;; found) instead of signaling an error.
+                         (remote-file-error nil))))
+          (if result
+              (let ((exit-code (alist-get 'exit_code result))
+                    (stdout (tramp-rpc--decode-output
+                             (alist-get 'stdout result)
+                             (alist-get 'stdout_encoding result)))
+                    (stderr (tramp-rpc--decode-output
+                             (alist-get 'stderr result)
+                             (alist-get 'stderr_encoding result))))
 
-          ;; Handle destination
-          (tramp-rpc--route-process-file-output destination stdout stderr)
+                ;; Handle destination
+                (tramp-rpc--route-process-file-output destination stdout stderr)
 
-          ;; Invalidate caches if the program might modify the filesystem
-          ;; and the directory isn't being watched (watched dirs get
-          ;; server-pushed invalidation)
-          (let ((program-name (file-name-nondirectory program)))
-            (unless (or (member program-name tramp-rpc--readonly-programs)
-                        (tramp-rpc--directory-watched-p localname v))
-              (tramp-rpc--invalidate-cache-for-path default-directory)))
+                ;; Invalidate caches if the program might modify the filesystem
+                ;; and the directory isn't being watched (watched dirs get
+                ;; server-pushed invalidation)
+                (let ((program-name (file-name-nondirectory program)))
+                  (unless (or (member program-name tramp-rpc--readonly-programs)
+                              (tramp-rpc--directory-watched-p localname v))
+                    (tramp-rpc--invalidate-cache-for-path default-directory)))
 
-          exit-code)))))
-
-(defun tramp-rpc-handle-shell-command (command &optional output-buffer error-buffer)
-  "Like `shell-command' for TRAMP-RPC files."
-  (with-parsed-tramp-file-name default-directory nil
-    (let* ((result (tramp-rpc--call v "process.run"
-                                    `((cmd . "/bin/sh")
-                                      (args . ["-c" ,command])
-                                      (cwd . ,localname))))
-           (exit-code (alist-get 'exit_code result))
-           (stdout (tramp-rpc--decode-output
-                    (alist-get 'stdout result)
-                    (alist-get 'stdout_encoding result)))
-           (stderr (tramp-rpc--decode-output
-                    (alist-get 'stderr result)
-                    (alist-get 'stderr_encoding result))))
-
-      ;; Handle output-buffer: t means current buffer, buffer/string means that buffer
-      (cond
-       ((eq output-buffer t)
-        (insert stdout))
-       ((or (bufferp output-buffer) (stringp output-buffer))
-        (with-current-buffer (get-buffer-create output-buffer)
-          (erase-buffer)
-          (insert stdout))))
-
-      ;; Handle error-buffer
-      (when (or (bufferp error-buffer) (stringp error-buffer))
-        (with-current-buffer (get-buffer-create error-buffer)
-          (erase-buffer)
-          (insert stderr)))
-
-      exit-code)))
+                ;; Handle signal strings: when
+                ;; `process-file-return-signal-string' is non-nil and exit
+                ;; code >= 128, return the signal name string instead.
+                (if (and (bound-and-true-p process-file-return-signal-string)
+                         (natnump exit-code) (>= exit-code 128))
+                    (let ((strings (tramp-rpc--get-signal-strings v)))
+                      (aref strings (- exit-code 128)))
+                  exit-code))
+            ;; Process spawn failed - return 127 (command not found)
+            127))))))
 
 (defun tramp-rpc-handle-vc-registered (file)
   "Like `vc-registered' for TRAMP-RPC files.
@@ -2085,14 +2131,21 @@ Returns the expanded path, or LOCALNAME unchanged if expansion fails."
 
 (defun tramp-rpc-handle-exec-path ()
   "Return remote exec-path using RPC.
-Caches the result per connection."
+Appends the remote working directory as the last element (the equivalent
+of `exec-directory'), matching `tramp-sh-handle-exec-path' behavior.
+Caches the PATH portion per connection."
   (with-parsed-tramp-file-name default-directory nil
     (let* ((key (tramp-rpc--connection-key v))
-           (cached (gethash key tramp-rpc--exec-path-cache)))
-      (or cached
-          (let ((path (tramp-rpc--fetch-remote-exec-path v)))
-            (puthash key path tramp-rpc--exec-path-cache)
-            path)))))
+           (cached (gethash key tramp-rpc--exec-path-cache))
+           (remote-path (or cached
+                            (let ((path (tramp-rpc--fetch-remote-exec-path v)))
+                              (puthash key path tramp-rpc--exec-path-cache)
+                              path))))
+      ;; Append localname of default-directory as last element,
+      ;; the equivalent to `exec-directory'.
+      (append remote-path
+              (list (tramp-file-local-name
+                     (expand-file-name default-directory)))))))
 
 (defun tramp-rpc--fetch-remote-exec-path (vec)
   "Fetch the remote PATH from VEC and split into directories."
@@ -2112,6 +2165,23 @@ Caches the result per connection."
     (error
      ;; On error, return default paths
      '("/usr/local/bin" "/usr/bin" "/bin" "/usr/local/sbin" "/usr/sbin" "/sbin"))))
+
+(defun tramp-rpc-handle-list-system-processes ()
+  "Return list of PIDs on the remote host."
+  (with-parsed-tramp-file-name default-directory nil
+    (condition-case nil
+        (let* ((result (tramp-rpc--call v "process.run"
+                                         `((cmd . "/bin/ps")
+                                           (args . ["-e" "-o" "pid="])
+                                           (cwd . "/"))))
+               (exit-code (alist-get 'exit_code result))
+               (stdout (tramp-rpc--decode-output
+                        (alist-get 'stdout result)
+                        (alist-get 'stdout_encoding result))))
+          (when (eq exit-code 0)
+            (mapcar #'string-to-number
+                    (split-string (string-trim stdout) "\n" t "[ \t]+"))))
+      (error nil))))
 
 (defun tramp-rpc-handle-file-local-copy (filename)
   "Create a local copy of remote FILENAME using RPC."
@@ -2277,7 +2347,7 @@ Also controls process exit detection latency."
     ;; RPC-based process operations
     ;; =========================================================================
     (process-file . tramp-rpc-handle-process-file)
-    (shell-command . tramp-rpc-handle-shell-command)
+    (shell-command . tramp-handle-shell-command)
     (make-process . tramp-rpc-handle-make-process)
     (start-file-process . tramp-rpc-handle-start-file-process)
 
@@ -2289,6 +2359,7 @@ Also controls process exit detection latency."
     (tramp-get-remote-gid . tramp-rpc-handle-get-remote-gid)
     (tramp-get-remote-groups . tramp-rpc-handle-get-remote-groups)
     (exec-path . tramp-rpc-handle-exec-path)
+    (list-system-processes . tramp-rpc-handle-list-system-processes)
 
     ;; =========================================================================
     ;; RPC-based extended attributes (ACL/SELinux via process.run)
