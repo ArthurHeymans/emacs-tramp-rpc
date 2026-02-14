@@ -8,7 +8,8 @@
 #   --protocol  Run protocol tests only (no server required)
 #   --server    Run server tests (requires built server)
 #   --remote    Run remote tests (requires SSH to TRAMP_RPC_TEST_HOST)
-#   --all       Run all tests
+#   --upstream  Run upstream tests (requires SSH to TRAMP_RPC_TEST_HOST)
+#   --all       Run protocol and server tests (requires SSH to TRAMP_RPC_TEST_HOST)
 #   --help      Show this help
 
 set -e
@@ -30,7 +31,8 @@ usage() {
     echo "  --protocol  Run protocol tests only (no server required)"
     echo "  --server    Run server tests (requires built server)"
     echo "  --remote    Run remote tests (requires SSH to TRAMP_RPC_TEST_HOST)"
-    echo "  --all       Run all tests"
+    echo "  --upstream  Run upstream tests (requires SSH to TRAMP_RPC_TEST_HOST)"
+    echo "  --all       Run protocol and server tests (requires SSH to TRAMP_RPC_TEST_HOST)"
     echo "  --help      Show this help"
     echo ""
     echo "Environment variables:"
@@ -75,10 +77,17 @@ run_remote_tests() {
         --eval "(ert-run-tests-batch-and-exit \"^tramp-rpc-test\")"
 }
 
+run_upstream_tests() {
+    echo -e "${YELLOW}Running upstream tests against ${TRAMP_RPC_TEST_HOST:-localhost}...${NC}"
+    ${EMACS:-emacs} -Q --batch \
+        -l "$SCRIPT_DIR/run-tramp-tests.el" \
+        --eval "(ert-run-tests-batch-and-exit '(and (not (tag :unstable)) (not \"tramp-test49\") (not \"tramp-test52\")))"
+}
+
 run_all_tests() {
     echo -e "${YELLOW}Running all tests...${NC}"
     local failed=0
-    
+
     echo ""
     echo "=== Protocol Tests ==="
     if run_protocol_tests; then
@@ -87,7 +96,7 @@ run_all_tests() {
         echo -e "${RED}Protocol tests failed${NC}"
         failed=1
     fi
-    
+
     echo ""
     echo "=== Server Tests ==="
     if run_server_tests; then
@@ -96,7 +105,7 @@ run_all_tests() {
         echo -e "${RED}Server tests failed${NC}"
         failed=1
     fi
-    
+
     return $failed
 }
 
@@ -119,6 +128,9 @@ case "$1" in
         ;;
     --remote)
         run_remote_tests
+        ;;
+    --upstream)
+        run_upstream_tests
         ;;
     --all)
         run_all_tests
