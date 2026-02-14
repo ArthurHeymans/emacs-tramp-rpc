@@ -1534,6 +1534,12 @@ point management, and REPLACE semantics come for free."
      ((file-directory-p filename)
       (copy-directory filename newname keep-time t))
 
+     ;; Symlink source: recreate the symlink at the destination rather
+     ;; than copying the target file contents (matches upstream tramp).
+     ((file-symlink-p filename)
+      (make-symbolic-link
+       (file-symlink-p filename) newname ok-if-already-exists))
+
      ;; Both on same remote host using RPC - use server-side copy
      ((and source-remote dest-remote
            (tramp-equal-remote filename newname))
@@ -1567,7 +1573,25 @@ point management, and REPLACE semantics come for free."
       (when (or keep-time preserve-permissions)
         (set-file-times newname (file-attribute-modification-time
                                  (file-attributes filename)))))
-     ;; Both local or different remote hosts - use default
+     ;; Both remote, different hosts - copy via local Emacs buffer.
+     ;; This is the universal fallback matching upstream tramp's
+     ;; `tramp-do-copy-or-rename-file-via-buffer': read source via its
+     ;; handler, write destination via its handler.
+     ((and source-remote dest-remote)
+      (abort-if-file-too-large
+       (file-attribute-size (file-attributes (file-truename filename)))
+       "copy" filename)
+      (let ((coding-system-for-read 'binary)
+            (coding-system-for-write 'binary)
+            (jka-compr-inhibit t))
+        (with-temp-buffer
+          (set-buffer-multibyte nil)
+          (insert-file-contents-literally filename)
+          (write-region (point-min) (point-max) newname nil 'nomessage)))
+      (when (or keep-time preserve-permissions)
+        (set-file-times newname (file-attribute-modification-time
+                                 (file-attributes filename)))))
+     ;; Neither remote - should not reach this handler, but be safe.
      (t
       (tramp-run-real-handler
        #'copy-file
