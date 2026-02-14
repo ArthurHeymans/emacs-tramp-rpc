@@ -123,5 +123,32 @@
 ;; tramp-rpc supports set-file-modes via file.chmod RPC
 (setf (symbol-function #'tramp--test-supports-set-file-modes-p) #'always)
 
+;; ============================================================================
+;; Expected failures
+;; ============================================================================
+
+;; test45-asynchronous-requests assumes single-channel serialization: the
+;; async shell process and file-attribute queries share one SSH connection so
+;; `process-send-string' followed by `file-attributes' is implicitly ordered.
+;;
+;; tramp-rpc uses separate channels — direct SSH PTY for shell processes and
+;; the RPC server for file operations — so there is no ordering guarantee.
+;; The test sends data to the shell and immediately checks the filesystem via
+;; RPC before the shell has finished writing.  Even upstream tramp marks the
+;; direct-async variant of this test as 'unstable (tramp-tests.el line 8273).
+(when (ert-test-boundp 'tramp-test45-asynchronous-requests)
+  (setf (ert-test-expected-result-type
+         (ert-get-test 'tramp-test45-asynchronous-requests))
+        :failed))
+
+;; test52-unload checks that no "tramp" features remain after unloading.
+;; tramp-rpc is a separate package that doesn't participate in tramp's
+;; `unload-feature' mechanism, so its features (tramp-rpc, tramp-rpc-process,
+;; tramp-rpc-deploy, etc.) remain loaded.  This is expected.
+(when (ert-test-boundp 'tramp-test52-unload)
+  (setf (ert-test-expected-result-type
+         (ert-get-test 'tramp-test52-unload))
+        :failed))
+
 (provide 'run-tramp-tests)
 ;;; run-tramp-tests.el ends here
