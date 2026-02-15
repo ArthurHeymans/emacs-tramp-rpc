@@ -94,7 +94,10 @@
   ;; which isn't loaded yet.  The handler function itself is an autoload
   ;; stub that triggers loading of tramp-rpc.el on first use.
   (add-to-list 'tramp-foreign-file-name-handler-alist
-               '(tramp-rpc-file-name-p . tramp-rpc-file-name-handler)))
+               '(tramp-rpc-file-name-p . tramp-rpc-file-name-handler))
+
+  ;; Configure user and host name completion.
+  (tramp-set-completion-function "rpc" tramp-completion-function-alist-ssh))
 
 ;; Now the actual implementation
 (require 'cl-lib)
