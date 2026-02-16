@@ -856,9 +856,15 @@ Returns the result or signals an error."
             ;; - JUST-THIS-ONE=t to only accept from this process (Bug#12145)
             ;; - with-local-quit to allow C-g, returns t on success
             ;; - Propagate quit if user pressed C-g
-            (if (with-local-quit
-                  (accept-process-output process poll-interval nil t)
-                  t)
+            ;; - with-tramp-suspended-timers to prevent deferred process
+            ;;   sentinels (scheduled via run-at-time 0) from firing
+            ;;   inside accept-process-output and blocking this call.
+            ;;   The sentinels will run when control returns to the
+            ;;   command loop.  (Mirrors tramp-accept-process-output.)
+            (if (with-tramp-suspended-timers
+                  (with-local-quit
+                    (accept-process-output process poll-interval nil t)
+                    t))
                 ;; Check if our response arrived in pending responses
                 (setq response (tramp-rpc--find-response-by-id expected-id))
               ;; User quit - propagate it
