@@ -2075,6 +2075,19 @@ If GROUP is non-nil, also check that group would be preserved."
 
 
 
+(defun tramp-rpc-handle-expand-file-name (name &optional dir)
+  "Like `expand-file-name' for TRAMP-RPC files.
+Delegates to `tramp-handle-expand-file-name'.  If tilde expansion
+fails because the connection is not available (e.g. during
+`tramp-cleanup-all-connections'), retries with `tramp-tolerate-tilde'
+so the path is returned with the tilde unexpanded rather than
+signalling an error."
+  (condition-case nil
+      (tramp-handle-expand-file-name name dir)
+    (file-error
+     (let ((tramp-tolerate-tilde t))
+       (tramp-handle-expand-file-name name dir)))))
+
 ;; ============================================================================
 ;; Process and advice modules (extracted)
 ;; ============================================================================
@@ -2189,7 +2202,7 @@ Also controls process exit detection latency."
     ;; =========================================================================
     ;; RPC-based path and VC operations
     ;; =========================================================================
-    (expand-file-name . tramp-handle-expand-file-name)
+    (expand-file-name . tramp-rpc-handle-expand-file-name)
     (vc-registered . tramp-rpc-handle-vc-registered)
 
     ;; =========================================================================
