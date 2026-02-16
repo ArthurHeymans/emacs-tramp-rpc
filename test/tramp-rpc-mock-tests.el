@@ -67,7 +67,7 @@
 (ert-deftest tramp-rpc-mock-test-protocol-encode-request ()
   "Test MessagePack-RPC request encoding."
   (skip-unless tramp-rpc-mock-test--msgpack-available)
-  (let* ((result (tramp-rpc-protocol-encode-request-with-id "file.exists" '((path . "/test"))))
+  (let* ((result (tramp-rpc-protocol-encode-request-with-id "file.stat" '((path . "/test"))))
          (id (car result))
          (bytes (cdr result)))
     ;; Should be a unibyte string with length prefix
@@ -87,7 +87,7 @@
       (should (assoc 'version parsed))
       (should (equal (cdr (assoc 'version parsed)) "2.0"))
       (should (assoc 'method parsed))
-      (should (equal (cdr (assoc 'method parsed)) "file.exists"))
+      (should (equal (cdr (assoc 'method parsed)) "file.stat"))
       (should (assoc 'params parsed))
       (should (equal (cdr (assoc 'path (cdr (assoc 'params parsed)))) "/test"))
       (should (assoc 'id parsed))
@@ -120,7 +120,7 @@
 (ert-deftest tramp-rpc-mock-test-protocol-batch-encode ()
   "Test MessagePack-RPC batch request encoding."
   (skip-unless tramp-rpc-mock-test--msgpack-available)
-  (let* ((requests '(("file.exists" . ((path . "/a")))
+  (let* ((requests '(("file.stat" . ((path . "/a")))
                      ("file.stat" . ((path . "/b")))))
          (result (tramp-rpc-protocol-encode-batch-request-with-id requests))
          (id (car result))
@@ -373,9 +373,9 @@ Returns the result or signals an error."
       (progn
         (tramp-rpc-mock-test--start-server)
         (let ((test-file (expand-file-name "test.txt" tramp-rpc-mock-test-temp-dir)))
-          ;; File shouldn't exist yet (false becomes nil in Emacs)
+          ;; File shouldn't exist yet (stat returns nil)
           (let ((result (tramp-rpc-mock-test--rpc-call
-                         "file.exists" `((path . ,(encode-coding-string test-file 'utf-8))))))
+                         "file.stat" `((path . ,(encode-coding-string test-file 'utf-8))))))
             (should (not result)))
 
           ;; Write a file - content is now raw binary, not base64
@@ -384,9 +384,9 @@ Returns the result or signals an error."
                           (content . "hello world")
                           (append . :msgpack-false)))
 
-          ;; File should exist now
+          ;; File should exist now (stat returns attributes)
           (let ((result (tramp-rpc-mock-test--rpc-call
-                         "file.exists" `((path . ,(encode-coding-string test-file 'utf-8))))))
+                         "file.stat" `((path . ,(encode-coding-string test-file 'utf-8))))))
             (should result))
 
           ;; Read the file - content comes back as raw binary
@@ -407,7 +407,7 @@ Returns the result or signals an error."
           (tramp-rpc-mock-test--rpc-call "file.delete"
                                           `((path . ,(encode-coding-string test-file 'utf-8))))
           (let ((result (tramp-rpc-mock-test--rpc-call
-                         "file.exists" `((path . ,(encode-coding-string test-file 'utf-8))))))
+                         "file.stat" `((path . ,(encode-coding-string test-file 'utf-8))))))
             (should (not result)))))
     (tramp-rpc-mock-test--stop-server)))
 
@@ -456,9 +456,9 @@ Returns the result or signals an error."
            "dir.remove" `((path . ,(encode-coding-string test-dir 'utf-8))
                           (recursive . t)))
 
-          ;; Should be gone
+          ;; Should be gone (stat returns nil)
           (let ((result (tramp-rpc-mock-test--rpc-call
-                         "file.exists" `((path . ,(encode-coding-string test-dir 'utf-8))))))
+                         "file.stat" `((path . ,(encode-coding-string test-dir 'utf-8))))))
             (should (not result)))))
     (tramp-rpc-mock-test--stop-server)))
 
