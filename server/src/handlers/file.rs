@@ -7,7 +7,6 @@ use std::collections::HashMap;
 use std::os::unix::fs::{FileTypeExt, MetadataExt};
 use std::path::Path;
 use std::sync::Mutex;
-use std::time::UNIX_EPOCH;
 use tokio::fs;
 
 use super::HandlerResult;
@@ -73,74 +72,6 @@ pub async fn stat_batch(params: &Value) -> HandlerResult {
 }
 
 /// Check if file exists
-pub async fn exists(params: &Value) -> HandlerResult {
-    #[derive(Deserialize)]
-    struct Params {
-        #[serde(with = "path_or_bytes")]
-        path: Vec<u8>,
-    }
-
-    let params: Params =
-        from_value(params.clone()).map_err(|e| RpcError::invalid_params(e.to_string()))?;
-
-    let path = bytes_to_path(&params.path);
-    // tokio::fs doesn't have exists(), so we try metadata
-    let exists = fs::metadata(&path).await.is_ok();
-    Ok(Value::Boolean(exists))
-}
-
-/// Check if file is readable
-pub async fn readable(params: &Value) -> HandlerResult {
-    #[derive(Deserialize)]
-    struct Params {
-        #[serde(with = "path_or_bytes")]
-        path: Vec<u8>,
-    }
-
-    let params: Params =
-        from_value(params.clone()).map_err(|e| RpcError::invalid_params(e.to_string()))?;
-
-    let path = bytes_to_path(&params.path);
-    // Use access() syscall to check read permission
-    let readable = tokio::task::spawn_blocking(move || {
-        use std::os::unix::ffi::OsStrExt;
-        let path_bytes = path.as_os_str().as_bytes();
-        // Create null-terminated path
-        let mut path_cstr = path_bytes.to_vec();
-        path_cstr.push(0);
-        unsafe { libc::access(path_cstr.as_ptr() as *const libc::c_char, libc::R_OK) == 0 }
-    })
-    .await
-    .unwrap_or(false);
-
-    Ok(Value::Boolean(readable))
-}
-
-/// Check if file is writable
-pub async fn writable(params: &Value) -> HandlerResult {
-    #[derive(Deserialize)]
-    struct Params {
-        #[serde(with = "path_or_bytes")]
-        path: Vec<u8>,
-    }
-
-    let params: Params =
-        from_value(params.clone()).map_err(|e| RpcError::invalid_params(e.to_string()))?;
-
-    let path = bytes_to_path(&params.path);
-    let writable = tokio::task::spawn_blocking(move || {
-        use std::os::unix::ffi::OsStrExt;
-        let path_bytes = path.as_os_str().as_bytes();
-        let mut path_cstr = path_bytes.to_vec();
-        path_cstr.push(0);
-        unsafe { libc::access(path_cstr.as_ptr() as *const libc::c_char, libc::W_OK) == 0 }
-    })
-    .await
-    .unwrap_or(false);
-
-    Ok(Value::Boolean(writable))
-}
-
 /// Check if file is executable
 pub async fn executable(params: &Value) -> HandlerResult {
     #[derive(Deserialize)]
@@ -189,35 +120,6 @@ pub async fn truename(params: &Value) -> HandlerResult {
     use std::os::unix::ffi::OsStrExt;
     let bytes = canonical.as_os_str().as_bytes();
     Ok(Value::Binary(bytes.to_vec()))
-}
-
-/// Check if file1 is newer than file2
-pub async fn newer_than(params: &Value) -> HandlerResult {
-    #[derive(Deserialize)]
-    struct Params {
-        file1: String,
-        file2: String,
-    }
-
-    let params: Params =
-        from_value(params.clone()).map_err(|e| RpcError::invalid_params(e.to_string()))?;
-
-    // Get both metadata concurrently
-    let file1 = super::expand_tilde(&params.file1);
-    let file2 = super::expand_tilde(&params.file2);
-    let (meta1, meta2) = tokio::join!(fs::metadata(&file1), fs::metadata(&file2));
-
-    let result = match (meta1, meta2) {
-        (Ok(m1), Ok(m2)) => {
-            let t1 = m1.modified().unwrap_or(UNIX_EPOCH);
-            let t2 = m2.modified().unwrap_or(UNIX_EPOCH);
-            t1 > t2
-        }
-        (Ok(_), Err(_)) => true, // file1 exists, file2 doesn't
-        (Err(_), _) => false,    // file1 doesn't exist
-    };
-
-    Ok(Value::Boolean(result))
 }
 
 // ============================================================================
