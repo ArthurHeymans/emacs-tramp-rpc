@@ -237,12 +237,8 @@ async fn dispatch_inner(request: &Request) -> Response {
         // File metadata operations
         "file.stat" => file::stat(&request.params).await,
         "file.stat_batch" => file::stat_batch(&request.params).await,
-        "file.exists" => file::exists(&request.params).await,
-        "file.readable" => file::readable(&request.params).await,
-        "file.writable" => file::writable(&request.params).await,
         "file.executable" => file::executable(&request.params).await,
         "file.truename" => file::truename(&request.params).await,
-        "file.newer_than" => file::newer_than(&request.params).await,
 
         // Directory operations
         "dir.list" => dir::list(&request.params).await,

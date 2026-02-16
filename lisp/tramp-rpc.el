@@ -1160,39 +1160,6 @@ Returns an alist with path."
 ;; File name handler operations
 ;; ============================================================================
 
-(defun tramp-rpc-handle-file-exists-p (filename)
-  "Like `file-exists-p' for TRAMP-RPC files."
-  (tramp-skeleton-file-exists-p filename
-    (tramp-rpc--call v "file.exists"
-                     (tramp-rpc--encode-path localname))))
-
-(defun tramp-rpc-handle-file-readable-p (filename)
-  "Like `file-readable-p' for TRAMP-RPC files."
-  (with-parsed-tramp-file-name filename nil
-    (tramp-rpc--call v "file.readable" (tramp-rpc--encode-path localname))))
-
-(defun tramp-rpc-handle-file-writable-p (filename)
-  "Like `file-writable-p' for TRAMP-RPC files.
-Optimized to use pipelined requests for better performance."
-  (with-parsed-tramp-file-name filename nil
-    (let* ((parent (file-name-directory (directory-file-name localname)))
-           (localname-encoded (tramp-rpc--encode-path localname))
-           (parent-encoded (tramp-rpc--encode-path parent))
-           ;; Send both requests in parallel
-           (results (tramp-rpc--call-pipelined
-                     v
-                     `(("file.exists" . ,localname-encoded)
-                       ("file.writable" . ,localname-encoded)
-                       ("file.writable" . ,parent-encoded))))
-           (exists (nth 0 results))
-           (file-writable (nth 1 results))
-           (parent-writable (nth 2 results)))
-      (if exists
-          ;; File exists - check if it's writable
-          (and (not (plist-get file-writable :error)) file-writable)
-        ;; File doesn't exist - check if parent is writable
-        (and (not (plist-get parent-writable :error)) parent-writable)))))
-
 (defun tramp-rpc-handle-file-executable-p (filename)
   "Like `file-executable-p' for TRAMP-RPC files."
   (with-parsed-tramp-file-name filename nil
@@ -1215,24 +1182,7 @@ ELOOP errors to nil (the file effectively doesn't exist for stat)."
            nil
          (signal (car err) (cdr err)))))))
 
-(defun tramp-rpc-handle-file-directory-p (filename)
-  "Like `file-directory-p' for TRAMP-RPC files."
-  (with-parsed-tramp-file-name filename nil
-    (let ((result (tramp-rpc--call-file-stat v localname)))
-      (and result (equal (alist-get 'type result) "directory")))))
 
-(defun tramp-rpc-handle-file-regular-p (filename)
-  "Like `file-regular-p' for TRAMP-RPC files."
-  (with-parsed-tramp-file-name filename nil
-    (let ((result (tramp-rpc--call-file-stat v localname)))
-      (and result (equal (alist-get 'type result) "file")))))
-
-(defun tramp-rpc-handle-file-symlink-p (filename)
-  "Like `file-symlink-p' for TRAMP-RPC files."
-  (with-parsed-tramp-file-name filename nil
-    (let ((result (tramp-rpc--call-file-stat v localname t)))  ; lstat=t
-      (when (and result (equal (alist-get 'type result) "symlink"))
-        (tramp-rpc--decode-string (alist-get 'link_target result))))))
 
 (defun tramp-rpc-handle-file-truename (filename)
   "Like `file-truename' for TRAMP-RPC files.
@@ -1282,13 +1232,15 @@ path unchanged (after resolving any symlinks in parent directories)."
 (defun tramp-rpc-handle-file-attributes (filename &optional id-format)
   "Like `file-attributes' for TRAMP-RPC files."
   (with-parsed-tramp-file-name filename nil
-    (let ((result (tramp-rpc--call-file-stat v localname t)))  ; lstat=t
-      ;; Populate file-exists cache as side effect
-      (let ((expanded (expand-file-name filename)))
-        (tramp-rpc--cache-put tramp-rpc--file-exists-cache
-                              expanded (if result t nil)))
-      (when result
-        (tramp-rpc--convert-file-attributes result id-format)))))
+    (with-tramp-file-property
+        v localname (format "file-attributes-%s" id-format)
+      (let ((result (tramp-rpc--call-file-stat v localname t)))  ; lstat=t
+        ;; Populate file-exists cache as side effect
+        (let ((expanded (expand-file-name filename)))
+          (tramp-rpc--cache-put tramp-rpc--file-exists-cache
+                                expanded (if result t nil)))
+        (when result
+          (tramp-rpc--convert-file-attributes result id-format))))))
 
 (defun tramp-rpc--convert-file-attributes (stat id-format)
   "Convert STAT result to Emacs file-attributes format.
@@ -1348,11 +1300,7 @@ TYPE is the file type string."
                 (if (> (logand mode #o001) 0) ?t ?T)
               (if (> (logand mode #o001) 0) ?x ?-)))))
 
-(defun tramp-rpc-handle-file-modes (filename &optional _flag)
-  "Like `file-modes' for TRAMP-RPC files."
-  (let ((attrs (tramp-rpc-handle-file-attributes filename)))
-    (when attrs
-      (tramp-mode-string-to-int (nth 8 attrs)))))
+
 
 (defun tramp-rpc-handle-set-file-modes (filename mode &optional _flag)
   "Like `set-file-modes' for TRAMP-RPC files."
@@ -1369,18 +1317,7 @@ TYPE is the file type string."
                        (append (tramp-rpc--encode-path localname)
                                `((mtime . ,mtime)))))))
 
-(defun tramp-rpc-handle-file-newer-than-file-p (file1 file2)
-  "Like `file-newer-than-file-p' for TRAMP-RPC files."
-  (cond
-   ((not (file-exists-p file1)) nil)
-   ((not (file-exists-p file2)) t)
-   (t
-    ;; Both files exist, compare mtimes
-    (let ((mtime1 (float-time (file-attribute-modification-time
-                               (file-attributes file1))))
-          (mtime2 (float-time (file-attribute-modification-time
-                               (file-attributes file2)))))
-      (> mtime1 mtime2)))))
+
 
 ;; ============================================================================
 ;; Directory operations
@@ -1481,56 +1418,7 @@ TYPE is the file type string."
 ;; File I/O operations
 ;; ============================================================================
 
-(defun tramp-rpc-handle-insert-file-contents
-    (filename &optional visit beg end replace)
-  "Like `insert-file-contents' for TRAMP-RPC files.
-Uses `file-local-copy' to get a local copy, then inserts it.
-This matches the upstream tramp approach: proper coding system handling,
-point management, and REPLACE semantics come for free."
-  (barf-if-buffer-read-only)
-  (setq filename (expand-file-name filename))
-  (let (result local-copy)
-    (with-parsed-tramp-file-name filename nil
-      (unwind-protect
-          (condition-case err
-              (tramp-barf-if-file-missing v filename
-                ;; Get a local copy of the remote file.
-                (setq local-copy
-                      (let ((inhibit-file-name-operation
-                             (when (eq inhibit-file-name-operation
-                                       'insert-file-contents)
-                               'file-local-copy)))
-                        (file-local-copy filename)))
 
-                ;; We must ensure that `file-coding-system-alist'
-                ;; matches `local-copy'.
-                (let ((file-coding-system-alist
-                       (tramp-find-file-name-coding-system-alist
-                        filename local-copy)))
-                  (setq result
-                        (insert-file-contents
-                         local-copy visit beg end replace))))
-
-            (file-error
-             (let ((tramp-verbose (if visit 0 tramp-verbose)))
-               (tramp-error v 'file-missing filename)))
-            (error
-             (add-hook 'find-file-not-found-functions
-                       `(lambda () (signal ',(car err) ',(cdr err)))
-                       nil t)
-             (signal (car err) (cdr err))))
-
-        ;; Save exit.
-        (when visit
-          (setq buffer-file-name filename
-                buffer-read-only (not (file-writable-p filename)))
-          (set-visited-file-modtime)
-          (set-buffer-modified-p nil))
-        (when (stringp local-copy)
-          (delete-file local-copy))))
-
-    ;; Result.
-    (cons filename (cdr result))))
 
 (defun tramp-rpc-handle-write-region
     (start end filename &optional append visit lockname mustbenew)
@@ -2185,22 +2073,6 @@ Caches the PATH portion per connection."
      ;; On error, return default paths
      '("/usr/local/bin" "/usr/bin" "/bin" "/usr/local/sbin" "/usr/sbin" "/sbin"))))
 
-(defun tramp-rpc-handle-list-system-processes ()
-  "Return list of PIDs on the remote host."
-  (with-parsed-tramp-file-name default-directory nil
-    (condition-case nil
-        (let* ((result (tramp-rpc--call v "process.run"
-                                         `((cmd . "/bin/ps")
-                                           (args . ["-e" "-o" "pid="])
-                                           (cwd . "/"))))
-               (exit-code (alist-get 'exit_code result))
-               (stdout (tramp-rpc--decode-output
-                        (alist-get 'stdout result)
-                        (alist-get 'stdout_encoding result))))
-          (when (eq exit-code 0)
-            (mapcar #'string-to-number
-                    (split-string (string-trim stdout) "\n" t "[ \t]+"))))
-      (error nil))))
 
 (defun tramp-rpc-handle-file-local-copy (filename)
   "Create a local copy of remote FILENAME using RPC."
@@ -2273,12 +2145,7 @@ If GROUP is non-nil, also check that group would be preserved."
                (= (file-attribute-group-id attributes)
                   (tramp-rpc-handle-get-remote-gid v 'integer))))))))
 
-(defun tramp-rpc-handle-file-name-case-insensitive-p (_filename)
-  "Like `file-name-case-insensitive-p' for TRAMP-RPC files.
-Returns nil since most remote systems (Linux) are case-sensitive."
-  ;; For simplicity, assume case-sensitive (most common for remote servers).
-  ;; A more thorough implementation would check the remote filesystem type.
-  nil)
+
 
 ;; ============================================================================
 ;; Process and advice modules (extracted)
@@ -2318,17 +2185,19 @@ Also controls process exit detection latency."
   '(;; =========================================================================
     ;; RPC-based file attribute operations
     ;; =========================================================================
-    (file-exists-p . tramp-rpc-handle-file-exists-p)
-    (file-readable-p . tramp-rpc-handle-file-readable-p)
-    (file-writable-p . tramp-rpc-handle-file-writable-p)
+    ;; RPC-based file attribute operations
+    ;; =========================================================================
+    (file-exists-p . tramp-handle-file-exists-p)
+    (file-readable-p . tramp-handle-file-readable-p)
+    (file-writable-p . tramp-handle-file-writable-p)
     (file-executable-p . tramp-rpc-handle-file-executable-p)
-    (file-directory-p . tramp-rpc-handle-file-directory-p)
-    (file-regular-p . tramp-rpc-handle-file-regular-p)
-    (file-symlink-p . tramp-rpc-handle-file-symlink-p)
+    (file-directory-p . tramp-handle-file-directory-p)
+    (file-regular-p . tramp-handle-file-regular-p)
+    (file-symlink-p . tramp-handle-file-symlink-p)
     (file-truename . tramp-rpc-handle-file-truename)
     (file-attributes . tramp-rpc-handle-file-attributes)
-    (file-modes . tramp-rpc-handle-file-modes)
-    (file-newer-than-file-p . tramp-rpc-handle-file-newer-than-file-p)
+    (file-modes . tramp-handle-file-modes)
+    (file-newer-than-file-p . tramp-handle-file-newer-than-file-p)
     (file-ownership-preserved-p . tramp-rpc-handle-file-ownership-preserved-p)
     (file-system-info . tramp-rpc-handle-file-system-info)
 
@@ -2353,7 +2222,7 @@ Also controls process exit detection latency."
     ;; =========================================================================
     ;; RPC-based file I/O operations
     ;; =========================================================================
-    (insert-file-contents . tramp-rpc-handle-insert-file-contents)
+    (insert-file-contents . tramp-handle-insert-file-contents)
     (write-region . tramp-rpc-handle-write-region)
     (copy-file . tramp-rpc-handle-copy-file)
     (rename-file . tramp-rpc-handle-rename-file)
@@ -2378,7 +2247,8 @@ Also controls process exit detection latency."
     (tramp-get-remote-gid . tramp-rpc-handle-get-remote-gid)
     (tramp-get-remote-groups . tramp-rpc-handle-get-remote-groups)
     (exec-path . tramp-rpc-handle-exec-path)
-    (list-system-processes . tramp-rpc-handle-list-system-processes)
+    (list-system-processes . tramp-handle-list-system-processes)
+    (process-attributes . tramp-handle-process-attributes)
 
     ;; =========================================================================
     ;; RPC-based extended attributes (ACL/SELinux via process.run)
@@ -2400,6 +2270,9 @@ Also controls process exit detection latency."
     ;; delegate to our RPC handlers internally.
     ;; =========================================================================
     (abbreviate-file-name . tramp-handle-abbreviate-file-name)
+    (file-group-gid . tramp-handle-file-group-gid)
+    (file-user-uid . tramp-handle-file-user-uid)
+    (memory-info . tramp-handle-memory-info)
     (access-file . tramp-handle-access-file)
     (directory-file-name . tramp-handle-directory-file-name)
     (dired-uncache . tramp-handle-dired-uncache)
@@ -2407,7 +2280,7 @@ Also controls process exit detection latency."
     (file-equal-p . tramp-handle-file-equal-p)
     (file-in-directory-p . tramp-handle-file-in-directory-p)
     (file-name-as-directory . tramp-handle-file-name-as-directory)
-    (file-name-case-insensitive-p . tramp-rpc-handle-file-name-case-insensitive-p)
+    (file-name-case-insensitive-p . tramp-handle-file-name-case-insensitive-p)
     (file-name-completion . tramp-handle-file-name-completion)
     (file-name-directory . tramp-handle-file-name-directory)
     (file-name-nondirectory . tramp-handle-file-name-nondirectory)
