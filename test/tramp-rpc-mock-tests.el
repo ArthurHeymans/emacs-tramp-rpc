@@ -683,8 +683,9 @@ Returns the result or signals an error."
   (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
   (let* ((vec (tramp-dissect-file-name "/rpc:gateway|rpc:user@target:/path"))
          (bootstrap (tramp-rpc-deploy--bootstrap-vec vec)))
-    ;; Method should be the bootstrap method (sshx)
-    (should (equal (tramp-file-name-method bootstrap) "sshx"))
+    ;; Method should be the bootstrap method (default: scp)
+    (should (equal (tramp-file-name-method bootstrap)
+                   tramp-rpc-deploy-bootstrap-method))
     ;; Host and user should be preserved
     (should (equal (tramp-file-name-host bootstrap) "target"))
     (should (equal (tramp-file-name-user bootstrap) "user"))
