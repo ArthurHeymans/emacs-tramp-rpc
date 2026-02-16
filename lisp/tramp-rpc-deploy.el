@@ -668,6 +668,14 @@ to inline encoding (base64 through the shell), which can be fragile."
 ;;; Public API
 ;;; ============================================================================
 
+(defun tramp-rpc-deploy-expected-binary-localname ()
+  "Return the expected remote binary localname without network access.
+This computes the path deterministically from customization variables,
+allowing `tramp-rpc--connect' to try connecting directly without
+opening a bootstrap (scpx) connection for the deploy check."
+  (concat (file-name-as-directory tramp-rpc-deploy-remote-directory)
+          (format "%s-%s" tramp-rpc-deploy-binary-name tramp-rpc-deploy-version)))
+
 (defun tramp-rpc-deploy-ensure-binary (vec)
   "Ensure the tramp-rpc-server binary is available on remote VEC.
 Returns the remote path to the binary.
