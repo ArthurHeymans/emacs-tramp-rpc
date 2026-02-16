@@ -664,7 +664,10 @@ Returns non-nil on success."
       (let ((process (plist-get conn :process)))
         (when (process-live-p process)
           (delete-process process)))
-      (tramp-rpc--remove-connection vec))))
+      (tramp-rpc--remove-connection vec)))
+  ;; Flush TRAMP caches so a reconnect gets fresh data (home dir, uid, etc.)
+  (tramp-flush-directory-properties vec "/")
+  (tramp-flush-connection-properties vec))
 
 ;; ============================================================================
 ;; RPC communication
@@ -2010,31 +2013,33 @@ Caches the PATH portion per connection."
 (defun tramp-rpc-handle-get-home-directory (vec &optional user)
   "Return home directory for USER on remote host VEC using RPC.
 If USER is nil or matches the connection user, returns the current user's
-home directory from system.info.  For other users, looks up via getent."
+home directory from system.info.  For other users, looks up via getent.
+Signals an error rather than returning nil, so that
+`tramp-get-home-directory' does not cache a nil result."
   (let* ((conn-user (tramp-file-name-user vec))
          (target-user (or user conn-user)))
     (if (or (null target-user)
             (string-empty-p target-user)
             (equal target-user conn-user))
-        ;; Current user - use system.info
-        (let ((result (tramp-rpc--call vec "system.info" nil)))
-          (tramp-rpc--decode-string (alist-get 'home result)))
+        ;; Current user - use system.info (errors propagate, not cached)
+        (or (tramp-rpc--decode-string
+             (alist-get 'home (tramp-rpc--call vec "system.info" nil)))
+            (tramp-error vec 'file-error
+                         "Remote home directory not available"))
       ;; Different user - look up via getent passwd
-      (condition-case nil
-          (let* ((result (tramp-rpc--call vec "process.run"
-                                          `((cmd . "getent")
-                                            (args . ["passwd" ,target-user])
-                                            (cwd . "/"))))
-                 (exit-code (alist-get 'exit_code result))
-                 (stdout (tramp-rpc--decode-output
-                          (alist-get 'stdout result)
-                          (alist-get 'stdout_encoding result))))
-            (when (and (eq exit-code 0) (> (length stdout) 0))
-              ;; getent passwd format: name:x:uid:gid:gecos:home:shell
-              (let ((fields (split-string (string-trim stdout) ":")))
-                (when (>= (length fields) 6)
-                  (nth 5 fields)))))
-        (error nil)))))
+      (let* ((result (tramp-rpc--call vec "process.run"
+                                       `((cmd . "getent")
+                                         (args . ["passwd" ,target-user])
+                                         (cwd . "/"))))
+             (exit-code (alist-get 'exit_code result))
+             (stdout (tramp-rpc--decode-output
+                      (alist-get 'stdout result)
+                      (alist-get 'stdout_encoding result))))
+        (when (and (eq exit-code 0) (> (length stdout) 0))
+          ;; getent passwd format: name:x:uid:gid:gecos:home:shell
+          (let ((fields (split-string (string-trim stdout) ":")))
+            (when (>= (length fields) 6)
+              (nth 5 fields))))))))
 
 (defun tramp-rpc-handle-get-remote-uid (vec id-format)
   "Return remote UID using RPC."
