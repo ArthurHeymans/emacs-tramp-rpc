@@ -599,7 +599,8 @@ Returns non-nil on success."
       (while (and (process-live-p process)
                   (not (file-exists-p socket-path))
                   (< (float-time (time-subtract (current-time) start-time)) timeout))
-        (accept-process-output process 0.1)
+        (with-tramp-suspended-timers
+          (accept-process-output process 0.1))
         (with-current-buffer buffer
           (goto-char (point-min))
           (when (re-search-forward tramp-rpc--password-prompt-regexp nil t)
@@ -958,9 +959,10 @@ Returns:
                 ;; Check if other thread already got our response
                 (setq response (tramp-rpc--find-response-by-id expected-id)))
             ;; Process is accessible
-            (if (with-local-quit
-                  (accept-process-output process 0.1 nil t)
-                  t)
+            (if (with-tramp-suspended-timers
+                  (with-local-quit
+                    (accept-process-output process 0.1 nil t)
+                    t))
                 ;; Check if our response arrived in pending responses
                 (setq response (tramp-rpc--find-response-by-id expected-id))
               (tramp-rpc--debug "QUIT-BATCH id=%s (user interrupted)" expected-id)
@@ -1040,9 +1042,10 @@ TIMEOUT is the maximum time to wait in seconds (default 30)."
                     (puthash id response responses)
                     (setq remaining-ids (delete id remaining-ids))))))
           ;; Process is accessible
-          (if (with-local-quit
-                (accept-process-output process 0.1 nil t)
-                t)
+          (if (with-tramp-suspended-timers
+                (with-local-quit
+                  (accept-process-output process 0.1 nil t)
+                  t))
               ;; Check for each remaining ID in pending responses
               (dolist (id remaining-ids)
                 (let ((response (tramp-rpc--find-response-by-id id)))
@@ -2164,9 +2167,13 @@ Delegates to `tramp-handle-expand-file-name'.  If tilde expansion
 fails because the connection is not available (e.g. during
 `tramp-cleanup-all-connections'), retries with `tramp-tolerate-tilde'
 so the path is returned with the tilde unexpanded rather than
-signalling an error."
+signalling an error.
+`tramp-verbose' is suppressed during the first attempt because
+`tramp-error' logs a level-1 message before signalling, which
+would otherwise flood the echo area with \"Cannot expand tilde\"."
   (condition-case nil
-      (tramp-handle-expand-file-name name dir)
+      (let ((tramp-verbose 0))
+        (tramp-handle-expand-file-name name dir))
     (file-error
      (let ((tramp-tolerate-tilde t))
        (tramp-handle-expand-file-name name dir)))))
