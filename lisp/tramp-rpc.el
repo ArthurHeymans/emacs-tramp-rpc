@@ -576,19 +576,11 @@ Returns non-nil on success."
 	 'remote-file-error
 	 (list "Failed to establish SSH connection to %s: %s" host output))))))
 
-(defun tramp-rpc--connect (vec)
-  "Establish an RPC connection to VEC."
-  ;; Ensure ControlMaster directory exists
-  (tramp-rpc--ensure-controlmaster-directory)
-  ;; When ControlMaster is enabled, establish it first.
-  ;; This handles both key-based and password authentication:
-  ;; - Key-based: connects silently
-  ;; - Password: prompts user, then subsequent connections reuse it
-  (when tramp-rpc-use-controlmaster
-    (tramp-rpc--establish-controlmaster vec))
-  ;; Ensure the binary is deployed using shell-based tramp
-  (let* ((binary-path (tramp-rpc-deploy-ensure-binary vec))
-         (host (tramp-file-name-host vec))
+(defun tramp-rpc--start-server-process (vec binary-path)
+  "Start the RPC server on VEC at BINARY-PATH and verify it responds.
+BINARY-PATH is the remote localname of the server binary (may contain ~).
+Returns the connection plist.  Signals `remote-file-error' on failure."
+  (let* ((host (tramp-file-name-host vec))
          (user (tramp-file-name-user vec))
          (port (tramp-file-name-port vec))
          ;; Build SSH command to run the RPC server
@@ -652,6 +644,55 @@ Returns non-nil on success."
     (tramp-set-connection-property process "connected" t)
 
     (tramp-rpc--get-connection vec)))
+
+(defun tramp-rpc--cleanup-failed-connection (vec)
+  "Clean up a failed connection attempt for VEC.
+Kills the process if still alive and removes the connection entry."
+  (let ((conn (tramp-rpc--get-connection vec)))
+    (when conn
+      (let ((proc (plist-get conn :process)))
+        (when (process-live-p proc)
+          (delete-process proc)))
+      (tramp-rpc--remove-connection vec))))
+
+(defun tramp-rpc--cleanup-bootstrap-connection (vec)
+  "Close the scpx/scp bootstrap connection for VEC if it exists.
+The bootstrap connection is only needed during deploy and should be
+closed afterward to prevent other packages (vc, diff-hl) from
+accidentally routing file operations through tramp-sh."
+  (let* ((bootstrap-vec (tramp-rpc-deploy--bootstrap-vec vec))
+         (proc (tramp-get-connection-process bootstrap-vec)))
+    (when (and proc (process-live-p proc))
+      (delete-process proc))))
+
+(defun tramp-rpc--connect (vec)
+  "Establish an RPC connection to VEC."
+  ;; Ensure ControlMaster directory exists
+  (tramp-rpc--ensure-controlmaster-directory)
+  ;; When ControlMaster is enabled, establish it first.
+  ;; This handles both key-based and password authentication:
+  ;; - Key-based: connects silently
+  ;; - Password: prompts user, then subsequent connections reuse it
+  (when tramp-rpc-use-controlmaster
+    (tramp-rpc--establish-controlmaster vec))
+  ;; Try connecting with the expected binary path first.  This avoids
+  ;; opening a bootstrap (scpx) connection just to run `test -x binary',
+  ;; which takes ~6s for tramp-sh to establish the shell.  If the binary
+  ;; exists (the common case after first deploy), this connects directly.
+  ;; If it doesn't exist (first time or after version bump), SSH exits
+  ;; immediately, we catch the error, deploy via scpx, and retry.
+  (condition-case nil
+      (tramp-rpc--start-server-process
+       vec (tramp-rpc-deploy-expected-binary-localname))
+    (remote-file-error
+     ;; Connection failed - binary likely missing.  Clean up and deploy.
+     (tramp-rpc--cleanup-failed-connection vec)
+     (let ((binary-path (tramp-rpc-deploy-ensure-binary vec)))
+       ;; Close the bootstrap connection - it's no longer needed and
+       ;; leaving it alive can cause vc/diff-hl sentinels to route
+       ;; file operations through tramp-sh instead of tramp-rpc.
+       (tramp-rpc--cleanup-bootstrap-connection vec)
+       (tramp-rpc--start-server-process vec binary-path)))))
 
 (defun tramp-rpc--disconnect (vec)
   "Disconnect the RPC connection to VEC."
