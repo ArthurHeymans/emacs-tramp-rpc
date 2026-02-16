@@ -2062,68 +2062,7 @@ process-file calls from VC backends are routed through our tramp handler."
             process-file-side-effects)
         (tramp-run-real-handler #'vc-registered (list file))))))
 
-(defun tramp-rpc-handle-expand-file-name (name &optional dir)
-  "Like `expand-file-name' for TRAMP-RPC files.
-Handles tilde expansion by looking up the remote home directory."
-  (let ((dir (or dir default-directory)))
-    (cond
-     ;; Absolute path with tramp prefix - parse and expand
-      ((tramp-tramp-file-p name)
-       (with-parsed-tramp-file-name name nil
-         ;; Make sure localname is absolute
-         (unless (tramp-run-real-handler #'file-name-absolute-p (list localname))
-           (setq localname (concat "/" localname)))
-         ;; Handle tilde expansion
-         (when (string-prefix-p "~" localname)
-           (setq localname (tramp-rpc--expand-tilde v localname)))
-         ;; Remove double slashes
-         (while (string-match "//" localname)
-           (setq localname (replace-match "/" t t localname)))
-         ;; Do not keep "/.." or "/.".
-         (when (string-match-p (rx bos "/" (** 1 2 ".") eos) localname)
-           (setq localname "/"))
-         ;; Do normal expand-file-name for "./" and "../"
-         (let ((default-directory tramp-compat-temporary-file-directory))
-           (tramp-make-tramp-file-name
-            v (tramp-drop-volume-letter
-               (tramp-run-real-handler #'expand-file-name (list localname)))))))
-     ;; Absolute local path - make it remote
-     ((file-name-absolute-p name)
-      (with-parsed-tramp-file-name dir nil
-        (tramp-make-tramp-file-name v name)))
-     ;; Tilde path - expand relative to remote home
-     ((string-prefix-p "~" name)
-      (with-parsed-tramp-file-name dir nil
-        (let ((expanded (tramp-rpc--expand-tilde v name)))
-          (let ((default-directory tramp-compat-temporary-file-directory))
-            (tramp-make-tramp-file-name
-             v (tramp-drop-volume-letter
-                (tramp-run-real-handler #'expand-file-name (list expanded))))))))
-     ;; Relative path
-      (t
-       (let ((localname (expand-file-name name (tramp-file-local-name dir))))
-         ;; Do not keep "/.." or "/.".
-         (when (string-match-p (rx bos "/" (** 1 2 ".") eos) localname)
-           (setq localname "/"))
-         (tramp-make-tramp-file-name
-          (tramp-dissect-file-name dir) localname))))))
 
-(defun tramp-rpc--expand-tilde (vec localname)
-  "Expand tilde in LOCALNAME for remote connection VEC.
-Returns the expanded path, or LOCALNAME unchanged if expansion fails."
-  (if (string-match (rx bos "~" (group (* (not "/"))) (group (* nonl)) eos) localname)
-      (let ((uname (match-string 1 localname))
-            (fname (match-string 2 localname))
-            hname)
-        ;; Empty username means current user
-        (when (string-empty-p uname)
-          (setq uname (tramp-file-name-user vec)))
-        ;; Get home directory
-        (if (setq hname (tramp-get-home-directory vec uname))
-            (concat hname fname)
-          ;; Can't expand - return as-is (will error later)
-          localname))
-    localname))
 
 ;; ============================================================================
 ;; Additional handlers to avoid shell dependency
@@ -2375,7 +2314,7 @@ Also controls process exit detection latency."
     ;; =========================================================================
     ;; RPC-based path and VC operations
     ;; =========================================================================
-    (expand-file-name . tramp-rpc-handle-expand-file-name)
+    (expand-file-name . tramp-handle-expand-file-name)
     (vc-registered . tramp-rpc-handle-vc-registered)
 
     ;; =========================================================================
