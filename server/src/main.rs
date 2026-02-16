@@ -136,7 +136,7 @@ mod tests {
             Value::String("path".into()),
             Value::String("/tmp".into()),
         )]);
-        let payload = make_request("file.exists", params);
+        let payload = make_request("file.stat", params);
         let response = process_request(&payload).await;
         assert!(response.error.is_none());
     }
