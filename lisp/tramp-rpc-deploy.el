@@ -94,7 +94,7 @@ By default, downloading is attempted first as it's faster."
   :type 'boolean
   :group 'tramp-rpc-deploy)
 
-(defcustom tramp-rpc-deploy-bootstrap-method "scp"
+(defcustom tramp-rpc-deploy-bootstrap-method "scpx"
   "TRAMP method to use for bootstrapping (deploying the binary).
 This controls how the server binary is transferred to the remote host
 and how shell commands are run during deployment.
