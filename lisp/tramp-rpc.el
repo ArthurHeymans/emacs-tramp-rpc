@@ -1307,7 +1307,8 @@ TYPE is the file type string."
   (with-parsed-tramp-file-name filename nil
     (tramp-rpc--call v "file.set_modes"
                      (append (tramp-rpc--encode-path localname)
-                             `((mode . ,mode))))))
+                             `((mode . ,mode))))
+    (tramp-flush-file-properties v localname)))
 
 (defun tramp-rpc-handle-set-file-times (filename &optional timestamp _flag)
   "Like `set-file-times' for TRAMP-RPC files."
@@ -1315,7 +1316,8 @@ TYPE is the file type string."
     (let ((mtime (floor (float-time (or timestamp (current-time))))))
       (tramp-rpc--call v "file.set_times"
                        (append (tramp-rpc--encode-path localname)
-                               `((mtime . ,mtime)))))))
+                               `((mtime . ,mtime)))))
+    (tramp-flush-file-properties v localname)))
 
 
 
