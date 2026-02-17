@@ -43,7 +43,6 @@ async fn get_next_pid() -> u32 {
 
 struct ManagedProcess {
     child: Child,
-    #[allow(dead_code)]
     cmd: String,
 }
 
@@ -52,7 +51,7 @@ struct ManagedProcess {
 // ============================================================================
 
 /// Run a command and wait for it to complete
-pub async fn run(params: &Value) -> HandlerResult {
+pub async fn run(params: Value) -> HandlerResult {
     #[derive(Deserialize)]
     struct Params {
         /// Command to run
@@ -75,7 +74,7 @@ pub async fn run(params: &Value) -> HandlerResult {
     }
 
     let params: Params =
-        from_value(params.clone()).map_err(|e| RpcError::invalid_params(e.to_string()))?;
+        from_value(params).map_err(|e| RpcError::invalid_params(e.to_string()))?;
 
     let mut cmd = Command::new(&params.cmd);
     cmd.args(&params.args);
@@ -102,11 +101,9 @@ pub async fn run(params: &Value) -> HandlerResult {
     cmd.stdout(Stdio::piped());
     cmd.stderr(Stdio::piped());
 
-    let mut child = cmd.spawn().map_err(|e| RpcError {
-        code: RpcError::PROCESS_ERROR,
-        message: format!("Failed to spawn process: {}", e),
-        data: None,
-    })?;
+    let mut child = cmd
+        .spawn()
+        .map_err(|e| RpcError::process_error(format!("Failed to spawn process: {}", e)))?;
 
     // Write stdin if provided (no base64 decoding needed!)
     if let Some(stdin_data) = params.stdin {
@@ -116,26 +113,13 @@ pub async fn run(params: &Value) -> HandlerResult {
     }
 
     // Wait for process to complete (async!)
-    let output = child.wait_with_output().await.map_err(|e| RpcError {
-        code: RpcError::PROCESS_ERROR,
-        message: format!("Failed to wait for process: {}", e),
-        data: None,
-    })?;
+    let output = child
+        .wait_with_output()
+        .await
+        .map_err(|e| RpcError::process_error(format!("Failed to wait for process: {}", e)))?;
 
     // Return binary data directly (no encoding needed!)
-    // On Unix, signal-killed processes have code() == None.
-    // Convention: return 128 + signal_number (e.g. SIGKILL=9 -> 137).
-    let exit_code = output.status.code().unwrap_or_else(|| {
-        #[cfg(unix)]
-        {
-            use std::os::unix::process::ExitStatusExt;
-            output.status.signal().map(|s| 128 + s).unwrap_or(-1)
-        }
-        #[cfg(not(unix))]
-        {
-            -1
-        }
-    });
+    let exit_code = crate::protocol::exit_code_from_status(output.status);
     let result = ProcessResult {
         exit_code,
         stdout: output.stdout,
@@ -150,7 +134,7 @@ pub async fn run(params: &Value) -> HandlerResult {
 // ============================================================================
 
 /// Start an async process
-pub async fn start(params: &Value) -> HandlerResult {
+pub async fn start(params: Value) -> HandlerResult {
     #[derive(Deserialize)]
     struct Params {
         cmd: String,
@@ -165,7 +149,7 @@ pub async fn start(params: &Value) -> HandlerResult {
     }
 
     let params: Params =
-        from_value(params.clone()).map_err(|e| RpcError::invalid_params(e.to_string()))?;
+        from_value(params).map_err(|e| RpcError::invalid_params(e.to_string()))?;
 
     let mut cmd = Command::new(&params.cmd);
     cmd.args(&params.args);
@@ -188,11 +172,9 @@ pub async fn start(params: &Value) -> HandlerResult {
     cmd.stdout(Stdio::piped());
     cmd.stderr(Stdio::piped());
 
-    let child = cmd.spawn().map_err(|e| RpcError {
-        code: RpcError::PROCESS_ERROR,
-        message: format!("Failed to spawn process: {}", e),
-        data: None,
-    })?;
+    let child = cmd
+        .spawn()
+        .map_err(|e| RpcError::process_error(format!("Failed to spawn process: {}", e)))?;
 
     let pid = get_next_pid().await;
 
@@ -209,7 +191,7 @@ pub async fn start(params: &Value) -> HandlerResult {
 }
 
 /// Write to an async process's stdin
-pub async fn write(params: &Value) -> HandlerResult {
+pub async fn write(params: Value) -> HandlerResult {
     #[derive(Deserialize)]
     struct Params {
         pid: u32,
@@ -219,24 +201,21 @@ pub async fn write(params: &Value) -> HandlerResult {
     }
 
     let params: Params =
-        from_value(params.clone()).map_err(|e| RpcError::invalid_params(e.to_string()))?;
+        from_value(params).map_err(|e| RpcError::invalid_params(e.to_string()))?;
 
     // Data is already binary, no decoding needed!
     let data = params.data;
 
     let mut processes = get_process_map().lock().await;
-    let managed = processes.get_mut(&params.pid).ok_or_else(|| RpcError {
-        code: RpcError::PROCESS_ERROR,
-        message: format!("Process not found: {}", params.pid),
-        data: None,
-    })?;
+    let managed = processes
+        .get_mut(&params.pid)
+        .ok_or_else(|| RpcError::process_error(format!("Process not found: {}", params.pid)))?;
 
     if let Some(stdin) = managed.child.stdin.as_mut() {
-        stdin.write_all(&data).await.map_err(|e| RpcError {
-            code: RpcError::PROCESS_ERROR,
-            message: format!("Failed to write to stdin: {}", e),
-            data: None,
-        })?;
+        stdin
+            .write_all(&data)
+            .await
+            .map_err(|e| RpcError::process_error(format!("Failed to write to stdin: {}", e)))?;
     }
 
     Ok(msgpack_map! {
@@ -245,7 +224,7 @@ pub async fn write(params: &Value) -> HandlerResult {
 }
 
 /// Read from an async process's stdout/stderr
-pub async fn read(params: &Value) -> HandlerResult {
+pub async fn read(params: Value) -> HandlerResult {
     #[derive(Deserialize)]
     struct Params {
         pid: u32,
@@ -262,16 +241,14 @@ pub async fn read(params: &Value) -> HandlerResult {
     }
 
     let params: Params =
-        from_value(params.clone()).map_err(|e| RpcError::invalid_params(e.to_string()))?;
+        from_value(params).map_err(|e| RpcError::invalid_params(e.to_string()))?;
 
     let timeout = params.timeout_ms.unwrap_or(0);
 
     let mut processes = get_process_map().lock().await;
-    let managed = processes.get_mut(&params.pid).ok_or_else(|| RpcError {
-        code: RpcError::PROCESS_ERROR,
-        message: format!("Process not found: {}", params.pid),
-        data: None,
-    })?;
+    let managed = processes
+        .get_mut(&params.pid)
+        .ok_or_else(|| RpcError::process_error(format!("Process not found: {}", params.pid)))?;
 
     // Try to read stdout (with optional blocking timeout)
     let stdout_data = if let Some(stdout) = managed.child.stdout.as_mut() {
@@ -307,17 +284,7 @@ pub async fn read(params: &Value) -> HandlerResult {
         "stdout" => stdout_val,
         "stderr" => stderr_val,
         "exited" => exit_status.is_some(),
-        "exit_code" => exit_status.map(|s| {
-            #[cfg(unix)]
-            {
-                use std::os::unix::process::ExitStatusExt;
-                s.code().unwrap_or_else(|| s.signal().map(|sig| 128 + sig).unwrap_or(-1))
-            }
-            #[cfg(not(unix))]
-            {
-                s.code().unwrap_or(-1)
-            }
-        }).map(|c| Value::Integer(c.into())).unwrap_or(Value::Nil)
+        "exit_code" => exit_status.map(|s| crate::protocol::exit_code_from_status(s)).map(|c| Value::Integer(c.into())).unwrap_or(Value::Nil)
     })
 }
 
@@ -348,21 +315,19 @@ async fn try_read_async_with_timeout<R: tokio::io::AsyncRead + Unpin>(
 }
 
 /// Close the stdin of an async process (signals EOF)
-pub async fn close_stdin(params: &Value) -> HandlerResult {
+pub async fn close_stdin(params: Value) -> HandlerResult {
     #[derive(Deserialize)]
     struct Params {
         pid: u32,
     }
 
     let params: Params =
-        from_value(params.clone()).map_err(|e| RpcError::invalid_params(e.to_string()))?;
+        from_value(params).map_err(|e| RpcError::invalid_params(e.to_string()))?;
 
     let mut processes = get_process_map().lock().await;
-    let managed = processes.get_mut(&params.pid).ok_or_else(|| RpcError {
-        code: RpcError::PROCESS_ERROR,
-        message: format!("Process not found: {}", params.pid),
-        data: None,
-    })?;
+    let managed = processes
+        .get_mut(&params.pid)
+        .ok_or_else(|| RpcError::process_error(format!("Process not found: {}", params.pid)))?;
 
     // Drop stdin to close it
     managed.child.stdin.take();
@@ -371,7 +336,7 @@ pub async fn close_stdin(params: &Value) -> HandlerResult {
 }
 
 /// Kill an async process
-pub async fn kill(params: &Value) -> HandlerResult {
+pub async fn kill(params: Value) -> HandlerResult {
     #[derive(Deserialize)]
     struct Params {
         pid: u32,
@@ -385,31 +350,27 @@ pub async fn kill(params: &Value) -> HandlerResult {
     }
 
     let params: Params =
-        from_value(params.clone()).map_err(|e| RpcError::invalid_params(e.to_string()))?;
+        from_value(params).map_err(|e| RpcError::invalid_params(e.to_string()))?;
 
     let mut processes = get_process_map().lock().await;
-    let managed = processes.get_mut(&params.pid).ok_or_else(|| RpcError {
-        code: RpcError::PROCESS_ERROR,
-        message: format!("Process not found: {}", params.pid),
-        data: None,
-    })?;
+    let managed = processes
+        .get_mut(&params.pid)
+        .ok_or_else(|| RpcError::process_error(format!("Process not found: {}", params.pid)))?;
 
     // Get the actual OS PID
-    let os_pid = managed.child.id().ok_or_else(|| RpcError {
-        code: RpcError::PROCESS_ERROR,
-        message: "Process has no PID (already exited?)".to_string(),
-        data: None,
-    })?;
+    let os_pid = managed
+        .child
+        .id()
+        .ok_or_else(|| RpcError::process_error("Process has no PID (already exited?)"))?;
 
     // Send the signal
     let result = unsafe { libc::kill(os_pid as i32, params.signal) };
 
     if result != 0 {
-        return Err(RpcError {
-            code: RpcError::PROCESS_ERROR,
-            message: format!("Failed to send signal: {}", std::io::Error::last_os_error()),
-            data: None,
-        });
+        return Err(RpcError::process_error(format!(
+            "Failed to send signal: {}",
+            std::io::Error::last_os_error()
+        )));
     }
 
     // If SIGKILL, remove from process map
@@ -421,7 +382,7 @@ pub async fn kill(params: &Value) -> HandlerResult {
 }
 
 /// List all managed async processes
-pub async fn list(_params: &Value) -> HandlerResult {
+pub async fn list(_params: Value) -> HandlerResult {
     let mut processes = get_process_map().lock().await;
 
     let list: Vec<Value> = processes
@@ -433,17 +394,7 @@ pub async fn list(_params: &Value) -> HandlerResult {
                 "os_pid" => managed.child.id().map(|id| Value::Integer((id as i64).into())).unwrap_or(Value::Nil),
                 "cmd" => managed.cmd.clone(),
                 "exited" => exited.is_some(),
-                "exit_code" => exited.map(|s| {
-                    #[cfg(unix)]
-                    {
-                        use std::os::unix::process::ExitStatusExt;
-                        s.code().unwrap_or_else(|| s.signal().map(|sig| 128 + sig).unwrap_or(-1))
-                    }
-                    #[cfg(not(unix))]
-                    {
-                        s.code().unwrap_or(-1)
-                    }
-                }).map(|c| Value::Integer(c.into())).unwrap_or(Value::Nil)
+                "exit_code" => exited.map(|s| crate::protocol::exit_code_from_status(s)).map(|c| Value::Integer(c.into())).unwrap_or(Value::Nil)
             }
         })
         .collect();
@@ -521,11 +472,8 @@ struct ForkResult2 {
 }
 
 fn do_fork_exec(params: PtyStartParams) -> Result<ForkResult2, RpcError> {
-    let OpenptyResult { master, slave } = openpty(None, None).map_err(|e| RpcError {
-        code: RpcError::PROCESS_ERROR,
-        message: format!("Failed to open PTY: {}", e),
-        data: None,
-    })?;
+    let OpenptyResult { master, slave } = openpty(None, None)
+        .map_err(|e| RpcError::process_error(format!("Failed to open PTY: {}", e)))?;
 
     let tty_name = {
         let mut buf = vec![0u8; 256];
@@ -537,24 +485,17 @@ fn do_fork_exec(params: PtyStartParams) -> Result<ForkResult2, RpcError> {
             )
         };
         if ret != 0 {
-            return Err(RpcError {
-                code: RpcError::PROCESS_ERROR,
-                message: format!(
-                    "Failed to get tty name: {}",
-                    std::io::Error::from_raw_os_error(ret)
-                ),
-                data: None,
-            });
+            return Err(RpcError::process_error(format!(
+                "Failed to get tty name: {}",
+                std::io::Error::from_raw_os_error(ret)
+            )));
         }
         let nul_pos = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
         String::from_utf8_lossy(&buf[..nul_pos]).into_owned()
     };
 
-    set_window_size(master.as_raw_fd(), params.rows, params.cols).map_err(|e| RpcError {
-        code: RpcError::PROCESS_ERROR,
-        message: format!("Failed to set window size: {}", e),
-        data: None,
-    })?;
+    set_window_size(master.as_raw_fd(), params.rows, params.cols)
+        .map_err(|e| RpcError::process_error(format!("Failed to set window size: {}", e)))?;
 
     let cmd_cstring = CString::new(params.cmd.clone()).map_err(|e| RpcError {
         code: RpcError::INVALID_PARAMS,
@@ -602,24 +543,20 @@ fn do_fork_exec(params: PtyStartParams) -> Result<ForkResult2, RpcError> {
         }
         Ok(ForkResult::Parent { child }) => {
             drop(slave);
-            let master_fd = master.as_raw_fd();
-            std::mem::forget(master);
+            use std::os::fd::IntoRawFd;
+            let master_fd = master.into_raw_fd();
             Ok(ForkResult2 {
                 master_fd,
                 child_pid: child,
                 tty_name,
             })
         }
-        Err(e) => Err(RpcError {
-            code: RpcError::PROCESS_ERROR,
-            message: format!("Failed to fork: {}", e),
-            data: None,
-        }),
+        Err(e) => Err(RpcError::process_error(format!("Failed to fork: {}", e))),
     }
 }
 
 /// Start a process with a PTY (pseudo-terminal)
-pub async fn start_pty(params: &Value) -> HandlerResult {
+pub async fn start_pty(params: Value) -> HandlerResult {
     #[derive(Deserialize)]
     struct Params {
         cmd: String,
@@ -645,7 +582,7 @@ pub async fn start_pty(params: &Value) -> HandlerResult {
     }
 
     let params: Params =
-        from_value(params.clone()).map_err(|e| RpcError::invalid_params(e.to_string()))?;
+        from_value(params).map_err(|e| RpcError::invalid_params(e.to_string()))?;
 
     let start_params = PtyStartParams {
         cmd: params.cmd.clone(),
@@ -659,24 +596,14 @@ pub async fn start_pty(params: &Value) -> HandlerResult {
 
     let fork_result = tokio::task::spawn_blocking(move || do_fork_exec(start_params))
         .await
-        .map_err(|e| RpcError {
-            code: RpcError::PROCESS_ERROR,
-            message: format!("Task join error: {}", e),
-            data: None,
-        })??;
+        .map_err(|e| RpcError::process_error(format!("Task join error: {}", e)))??;
 
-    set_fd_nonblocking(fork_result.master_fd).map_err(|e| RpcError {
-        code: RpcError::PROCESS_ERROR,
-        message: format!("Failed to set non-blocking: {}", e),
-        data: None,
-    })?;
+    set_fd_nonblocking(fork_result.master_fd)
+        .map_err(|e| RpcError::process_error(format!("Failed to set non-blocking: {}", e)))?;
 
     let owned_fd = unsafe { OwnedFd::from_raw_fd(fork_result.master_fd) };
-    let async_fd = AsyncFd::new(owned_fd).map_err(|e| RpcError {
-        code: RpcError::PROCESS_ERROR,
-        message: format!("Failed to create AsyncFd: {}", e),
-        data: None,
-    })?;
+    let async_fd = AsyncFd::new(owned_fd)
+        .map_err(|e| RpcError::process_error(format!("Failed to create AsyncFd: {}", e)))?;
 
     let our_pid = get_next_pty_pid().await;
 
@@ -697,7 +624,7 @@ pub async fn start_pty(params: &Value) -> HandlerResult {
 }
 
 /// Resize a PTY terminal
-pub async fn resize_pty(params: &Value) -> HandlerResult {
+pub async fn resize_pty(params: Value) -> HandlerResult {
     #[derive(Deserialize)]
     struct Params {
         pid: u32,
@@ -706,22 +633,17 @@ pub async fn resize_pty(params: &Value) -> HandlerResult {
     }
 
     let params: Params =
-        from_value(params.clone()).map_err(|e| RpcError::invalid_params(e.to_string()))?;
+        from_value(params).map_err(|e| RpcError::invalid_params(e.to_string()))?;
 
     let processes = get_pty_process_map().lock().await;
-    let managed = processes.get(&params.pid).ok_or_else(|| RpcError {
-        code: RpcError::PROCESS_ERROR,
-        message: format!("PTY process not found: {}", params.pid),
-        data: None,
+    let managed = processes.get(&params.pid).ok_or_else(|| {
+        RpcError::process_error(format!("PTY process not found: {}", params.pid))
     })?;
 
     let fd = managed.async_fd.get_ref().as_raw_fd();
 
-    set_window_size(fd, params.rows, params.cols).map_err(|e| RpcError {
-        code: RpcError::PROCESS_ERROR,
-        message: format!("Failed to resize PTY: {}", e),
-        data: None,
-    })?;
+    set_window_size(fd, params.rows, params.cols)
+        .map_err(|e| RpcError::process_error(format!("Failed to resize PTY: {}", e)))?;
 
     match tcgetpgrp(unsafe { BorrowedFd::borrow_raw(fd) }) {
         Ok(fg_pgrp) => {
@@ -739,7 +661,7 @@ pub async fn resize_pty(params: &Value) -> HandlerResult {
 }
 
 /// Read from a PTY process with optional blocking
-pub async fn read_pty(params: &Value) -> HandlerResult {
+pub async fn read_pty(params: Value) -> HandlerResult {
     #[derive(Deserialize)]
     struct Params {
         pid: u32,
@@ -754,7 +676,7 @@ pub async fn read_pty(params: &Value) -> HandlerResult {
     }
 
     let params: Params =
-        from_value(params.clone()).map_err(|e| RpcError::invalid_params(e.to_string()))?;
+        from_value(params).map_err(|e| RpcError::invalid_params(e.to_string()))?;
 
     let timeout = params.timeout_ms.unwrap_or(0);
     let mut buf = vec![0u8; params.max_bytes];
@@ -916,7 +838,7 @@ async fn wait_for_pty_readable(pid: u32) -> bool {
 }
 
 /// Write to a PTY process (async)
-pub async fn write_pty(params: &Value) -> HandlerResult {
+pub async fn write_pty(params: Value) -> HandlerResult {
     #[derive(Deserialize)]
     struct Params {
         pid: u32,
@@ -926,26 +848,22 @@ pub async fn write_pty(params: &Value) -> HandlerResult {
     }
 
     let params: Params =
-        from_value(params.clone()).map_err(|e| RpcError::invalid_params(e.to_string()))?;
+        from_value(params).map_err(|e| RpcError::invalid_params(e.to_string()))?;
 
     // Data is already binary, no decoding needed!
     let data = params.data;
 
     let processes = get_pty_process_map().lock().await;
-    let managed = processes.get(&params.pid).ok_or_else(|| RpcError {
-        code: RpcError::PROCESS_ERROR,
-        message: format!("PTY process not found: {}", params.pid),
-        data: None,
+    let managed = processes.get(&params.pid).ok_or_else(|| {
+        RpcError::process_error(format!("PTY process not found: {}", params.pid))
     })?;
 
     let mut guard = managed
         .async_fd
         .ready(Interest::WRITABLE)
         .await
-        .map_err(|e| RpcError {
-            code: RpcError::PROCESS_ERROR,
-            message: format!("Failed to wait for writable: {}", e),
-            data: None,
+        .map_err(|e| {
+            RpcError::process_error(format!("Failed to wait for writable: {}", e))
         })?;
 
     let written = match guard.try_io(|inner| {
@@ -964,11 +882,10 @@ pub async fn write_pty(params: &Value) -> HandlerResult {
     }) {
         Ok(Ok(n)) => n,
         Ok(Err(e)) => {
-            return Err(RpcError {
-                code: RpcError::PROCESS_ERROR,
-                message: format!("Failed to write to PTY: {}", e),
-                data: None,
-            })
+            return Err(RpcError::process_error(format!(
+                "Failed to write to PTY: {}",
+                e
+            )))
         }
         Err(_would_block) => 0,
     };
@@ -979,7 +896,7 @@ pub async fn write_pty(params: &Value) -> HandlerResult {
 }
 
 /// Kill a PTY process
-pub async fn kill_pty(params: &Value) -> HandlerResult {
+pub async fn kill_pty(params: Value) -> HandlerResult {
     #[derive(Deserialize)]
     struct Params {
         pid: u32,
@@ -992,13 +909,11 @@ pub async fn kill_pty(params: &Value) -> HandlerResult {
     }
 
     let params: Params =
-        from_value(params.clone()).map_err(|e| RpcError::invalid_params(e.to_string()))?;
+        from_value(params).map_err(|e| RpcError::invalid_params(e.to_string()))?;
 
     let mut processes = get_pty_process_map().lock().await;
-    let managed = processes.get(&params.pid).ok_or_else(|| RpcError {
-        code: RpcError::PROCESS_ERROR,
-        message: format!("PTY process not found: {}", params.pid),
-        data: None,
+    let managed = processes.get(&params.pid).ok_or_else(|| {
+        RpcError::process_error(format!("PTY process not found: {}", params.pid))
     })?;
 
     let signal = Signal::try_from(params.signal).map_err(|_| RpcError {
@@ -1007,11 +922,8 @@ pub async fn kill_pty(params: &Value) -> HandlerResult {
         data: None,
     })?;
 
-    nix::sys::signal::kill(managed.child_pid, signal).map_err(|e| RpcError {
-        code: RpcError::PROCESS_ERROR,
-        message: format!("Failed to send signal: {}", e),
-        data: None,
-    })?;
+    nix::sys::signal::kill(managed.child_pid, signal)
+        .map_err(|e| RpcError::process_error(format!("Failed to send signal: {}", e)))?;
 
     if params.signal == libc::SIGKILL {
         processes.remove(&params.pid);
@@ -1021,14 +933,14 @@ pub async fn kill_pty(params: &Value) -> HandlerResult {
 }
 
 /// Close a PTY process and clean up
-pub async fn close_pty(params: &Value) -> HandlerResult {
+pub async fn close_pty(params: Value) -> HandlerResult {
     #[derive(Deserialize)]
     struct Params {
         pid: u32,
     }
 
     let params: Params =
-        from_value(params.clone()).map_err(|e| RpcError::invalid_params(e.to_string()))?;
+        from_value(params).map_err(|e| RpcError::invalid_params(e.to_string()))?;
 
     let mut processes = get_pty_process_map().lock().await;
 
@@ -1036,37 +948,21 @@ pub async fn close_pty(params: &Value) -> HandlerResult {
         let _ = nix::sys::signal::kill(managed.child_pid, Signal::SIGKILL);
         Ok(Value::Boolean(true))
     } else {
-        Err(RpcError {
-            code: RpcError::PROCESS_ERROR,
-            message: format!("PTY process not found: {}", params.pid),
-            data: None,
-        })
+        Err(RpcError::process_error(format!(
+            "PTY process not found: {}",
+            params.pid
+        )))
     }
 }
 
 /// List all PTY processes
-pub async fn list_pty(_params: &Value) -> HandlerResult {
+pub async fn list_pty(_params: Value) -> HandlerResult {
     let mut processes = get_pty_process_map().lock().await;
 
     let list: Vec<Value> = processes
         .iter_mut()
         .map(|(pid, managed)| {
-            let (exited, exit_code) = if managed.exit_status.is_some() {
-                (true, managed.exit_status)
-            } else {
-                match waitpid(managed.child_pid, Some(WaitPidFlag::WNOHANG)) {
-                    Ok(WaitStatus::Exited(_, code)) => {
-                        managed.exit_status = Some(code);
-                        (true, Some(code))
-                    }
-                    Ok(WaitStatus::Signaled(_, signal, _)) => {
-                        let code = 128 + signal as i32;
-                        managed.exit_status = Some(code);
-                        (true, Some(code))
-                    }
-                    _ => (false, None),
-                }
-            };
+            let (exited, exit_code) = check_exit_status(managed);
 
             msgpack_map! {
                 "pid" => *pid,

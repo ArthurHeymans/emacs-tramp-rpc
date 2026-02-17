@@ -112,7 +112,7 @@ async fn process_request(payload: &[u8]) -> Response {
     }
 
     // Dispatch to handler
-    handlers::dispatch(&request).await
+    handlers::dispatch(request).await
 }
 
 #[cfg(test)]

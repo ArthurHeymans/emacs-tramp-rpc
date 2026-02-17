@@ -16,7 +16,7 @@ use super::HandlerResult;
 use crate::protocol::path_or_bytes;
 
 /// Read file contents
-pub async fn read(params: &Value) -> HandlerResult {
+pub async fn read(params: Value) -> HandlerResult {
     #[derive(Deserialize)]
     struct Params {
         #[serde(with = "path_or_bytes")]
@@ -30,10 +30,10 @@ pub async fn read(params: &Value) -> HandlerResult {
     }
 
     let params: Params =
-        from_value(params.clone()).map_err(|e| RpcError::invalid_params(e.to_string()))?;
+        from_value(params).map_err(|e| RpcError::invalid_params(e.to_string()))?;
 
     let path = bytes_to_path(&params.path);
-    let path_str = path.to_string_lossy().to_string();
+    let path_str = path.to_string_lossy().into_owned();
 
     let mut file = File::open(&path)
         .await
@@ -72,7 +72,7 @@ pub async fn read(params: &Value) -> HandlerResult {
 }
 
 /// Write file contents
-pub async fn write(params: &Value) -> HandlerResult {
+pub async fn write(params: Value) -> HandlerResult {
     #[derive(Deserialize)]
     struct Params {
         #[serde(with = "path_or_bytes")]
@@ -92,10 +92,10 @@ pub async fn write(params: &Value) -> HandlerResult {
     }
 
     let params: Params =
-        from_value(params.clone()).map_err(|e| RpcError::invalid_params(e.to_string()))?;
+        from_value(params).map_err(|e| RpcError::invalid_params(e.to_string()))?;
 
     let path = bytes_to_path(&params.path);
-    let path_str = path.to_string_lossy().to_string();
+    let path_str = path.to_string_lossy().into_owned();
 
     // Content is already binary, no decoding needed!
     let content = params.content;
@@ -142,7 +142,7 @@ pub async fn write(params: &Value) -> HandlerResult {
 }
 
 /// Copy a file
-pub async fn copy(params: &Value) -> HandlerResult {
+pub async fn copy(params: Value) -> HandlerResult {
     #[derive(Deserialize)]
     struct Params {
         #[serde(with = "path_or_bytes")]
@@ -155,10 +155,10 @@ pub async fn copy(params: &Value) -> HandlerResult {
     }
 
     let params: Params =
-        from_value(params.clone()).map_err(|e| RpcError::invalid_params(e.to_string()))?;
+        from_value(params).map_err(|e| RpcError::invalid_params(e.to_string()))?;
 
     let src_path = bytes_to_path(&params.src);
-    let mut dest_path = bytes_to_path(&params.dest).to_path_buf();
+    let mut dest_path = bytes_to_path(&params.dest);
 
     // If destination is a directory, append the source filename
     if dest_path.is_dir() {
@@ -167,7 +167,7 @@ pub async fn copy(params: &Value) -> HandlerResult {
         }
     }
 
-    let src_str = src_path.to_string_lossy().to_string();
+    let src_str = src_path.to_string_lossy().into_owned();
 
     let src_metadata = fs::metadata(&src_path)
         .await
@@ -192,7 +192,7 @@ pub async fn copy(params: &Value) -> HandlerResult {
                 use std::os::unix::fs::MetadataExt;
                 let atime = src_metadata.atime();
                 let mtime = src_metadata.mtime();
-                let dest = dest_path.to_string_lossy().to_string();
+                let dest = dest_path.to_string_lossy().into_owned();
                 let _ =
                     tokio::task::spawn_blocking(move || set_file_times_sync(&dest, atime, mtime))
                         .await;
@@ -243,7 +243,7 @@ async fn copy_dir_recursive(src: &Path, dest: &Path, preserve: bool) -> std::io:
                         use std::os::unix::fs::MetadataExt;
                         let atime = meta.atime();
                         let mtime = meta.mtime();
-                        let dest_str = dest_child.to_string_lossy().to_string();
+                        let dest_str = dest_child.to_string_lossy().into_owned();
                         let _ = tokio::task::spawn_blocking(move || {
                             set_file_times_sync(&dest_str, atime, mtime)
                         })
@@ -258,7 +258,7 @@ async fn copy_dir_recursive(src: &Path, dest: &Path, preserve: bool) -> std::io:
 }
 
 /// Rename/move a file
-pub async fn rename(params: &Value) -> HandlerResult {
+pub async fn rename(params: Value) -> HandlerResult {
     #[derive(Deserialize)]
     struct Params {
         #[serde(with = "path_or_bytes")]
@@ -271,12 +271,12 @@ pub async fn rename(params: &Value) -> HandlerResult {
     }
 
     let params: Params =
-        from_value(params.clone()).map_err(|e| RpcError::invalid_params(e.to_string()))?;
+        from_value(params).map_err(|e| RpcError::invalid_params(e.to_string()))?;
 
     let src = bytes_to_path(&params.src);
     let dest = bytes_to_path(&params.dest);
-    let dest_str = dest.to_string_lossy().to_string();
-    let src_str = src.to_string_lossy().to_string();
+    let dest_str = dest.to_string_lossy().into_owned();
+    let src_str = src.to_string_lossy().into_owned();
 
     // Check if destination exists and overwrite is false
     if !params.overwrite && dest.exists() {
@@ -295,7 +295,7 @@ pub async fn rename(params: &Value) -> HandlerResult {
 }
 
 /// Delete a file
-pub async fn delete(params: &Value) -> HandlerResult {
+pub async fn delete(params: Value) -> HandlerResult {
     #[derive(Deserialize)]
     struct Params {
         #[serde(with = "path_or_bytes")]
@@ -306,10 +306,10 @@ pub async fn delete(params: &Value) -> HandlerResult {
     }
 
     let params: Params =
-        from_value(params.clone()).map_err(|e| RpcError::invalid_params(e.to_string()))?;
+        from_value(params).map_err(|e| RpcError::invalid_params(e.to_string()))?;
 
     let path = bytes_to_path(&params.path);
-    let path_str = path.to_string_lossy().to_string();
+    let path_str = path.to_string_lossy().into_owned();
 
     match fs::remove_file(&path).await {
         Ok(()) => Ok(Value::Boolean(true)),
@@ -321,7 +321,7 @@ pub async fn delete(params: &Value) -> HandlerResult {
 }
 
 /// Set file permissions
-pub async fn set_modes(params: &Value) -> HandlerResult {
+pub async fn set_modes(params: Value) -> HandlerResult {
     #[derive(Deserialize)]
     struct Params {
         #[serde(with = "path_or_bytes")]
@@ -330,10 +330,10 @@ pub async fn set_modes(params: &Value) -> HandlerResult {
     }
 
     let params: Params =
-        from_value(params.clone()).map_err(|e| RpcError::invalid_params(e.to_string()))?;
+        from_value(params).map_err(|e| RpcError::invalid_params(e.to_string()))?;
 
     let path = bytes_to_path(&params.path);
-    let path_str = path.to_string_lossy().to_string();
+    let path_str = path.to_string_lossy().into_owned();
 
     let perms = std::fs::Permissions::from_mode(params.mode);
     fs::set_permissions(&path, perms)
@@ -344,7 +344,7 @@ pub async fn set_modes(params: &Value) -> HandlerResult {
 }
 
 /// Set file timestamps
-pub async fn set_times(params: &Value) -> HandlerResult {
+pub async fn set_times(params: Value) -> HandlerResult {
     #[derive(Deserialize)]
     struct Params {
         #[serde(with = "path_or_bytes")]
@@ -357,7 +357,7 @@ pub async fn set_times(params: &Value) -> HandlerResult {
     }
 
     let params: Params =
-        from_value(params.clone()).map_err(|e| RpcError::invalid_params(e.to_string()))?;
+        from_value(params).map_err(|e| RpcError::invalid_params(e.to_string()))?;
 
     let path = bytes_to_path(&params.path);
     let atime = params.atime.unwrap_or(params.mtime);
@@ -372,7 +372,7 @@ pub async fn set_times(params: &Value) -> HandlerResult {
 }
 
 /// Create a symbolic link
-pub async fn make_symlink(params: &Value) -> HandlerResult {
+pub async fn make_symlink(params: Value) -> HandlerResult {
     #[derive(Deserialize)]
     struct Params {
         #[serde(with = "path_or_bytes")]
@@ -382,11 +382,11 @@ pub async fn make_symlink(params: &Value) -> HandlerResult {
     }
 
     let params: Params =
-        from_value(params.clone()).map_err(|e| RpcError::invalid_params(e.to_string()))?;
+        from_value(params).map_err(|e| RpcError::invalid_params(e.to_string()))?;
 
     let target = bytes_to_path(&params.target);
     let link_path = bytes_to_path(&params.link_path);
-    let link_path_str = link_path.to_string_lossy().to_string();
+    let link_path_str = link_path.to_string_lossy().into_owned();
 
     #[cfg(unix)]
     {
@@ -410,7 +410,7 @@ pub async fn make_symlink(params: &Value) -> HandlerResult {
 }
 
 /// Create a hard link
-pub async fn make_hardlink(params: &Value) -> HandlerResult {
+pub async fn make_hardlink(params: Value) -> HandlerResult {
     #[derive(Deserialize)]
     struct Params {
         /// The existing file to link to
@@ -422,11 +422,11 @@ pub async fn make_hardlink(params: &Value) -> HandlerResult {
     }
 
     let params: Params =
-        from_value(params.clone()).map_err(|e| RpcError::invalid_params(e.to_string()))?;
+        from_value(params).map_err(|e| RpcError::invalid_params(e.to_string()))?;
 
     let src = bytes_to_path(&params.src);
     let dest = bytes_to_path(&params.dest);
-    let dest_str = dest.to_string_lossy().to_string();
+    let dest_str = dest.to_string_lossy().into_owned();
 
     fs::hard_link(&src, &dest)
         .await
@@ -436,7 +436,7 @@ pub async fn make_hardlink(params: &Value) -> HandlerResult {
 }
 
 /// Change file ownership (chown)
-pub async fn chown(params: &Value) -> HandlerResult {
+pub async fn chown(params: Value) -> HandlerResult {
     #[derive(Deserialize)]
     struct Params {
         #[serde(with = "path_or_bytes")]
@@ -448,7 +448,7 @@ pub async fn chown(params: &Value) -> HandlerResult {
     }
 
     let params: Params =
-        from_value(params.clone()).map_err(|e| RpcError::invalid_params(e.to_string()))?;
+        from_value(params).map_err(|e| RpcError::invalid_params(e.to_string()))?;
 
     let path = bytes_to_path(&params.path);
     let uid = params.uid;

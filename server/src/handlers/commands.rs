@@ -37,7 +37,7 @@ const MAX_PARALLEL_COMMANDS: usize = 256;
 /// channel does not grant any capabilities beyond what SSH already provides.
 /// If the transport model ever changes (e.g., TCP socket), this handler
 /// would need a command whitelist.
-pub async fn run_parallel(params: &Value) -> HandlerResult {
+pub async fn run_parallel(params: Value) -> HandlerResult {
     #[derive(Deserialize)]
     struct CommandEntry {
         /// Lookup key (client-defined, returned as-is in results)
@@ -57,7 +57,7 @@ pub async fn run_parallel(params: &Value) -> HandlerResult {
     }
 
     let params: Params =
-        from_value(params.clone()).map_err(|e| RpcError::invalid_params(e.to_string()))?;
+        from_value(params).map_err(|e| RpcError::invalid_params(e.to_string()))?;
 
     if params.commands.is_empty() {
         return Ok(Value::Map(vec![]));
@@ -132,7 +132,7 @@ pub async fn run_parallel(params: &Value) -> HandlerResult {
 ///
 /// This is useful for project detection, VCS detection, etc.
 /// Returns a map of marker -> directory where it was found (or null if not found)
-pub async fn ancestors_scan(params: &Value) -> HandlerResult {
+pub async fn ancestors_scan(params: Value) -> HandlerResult {
     #[derive(Deserialize)]
     struct Params {
         /// Starting directory
@@ -149,7 +149,7 @@ pub async fn ancestors_scan(params: &Value) -> HandlerResult {
     }
 
     let params: Params =
-        from_value(params.clone()).map_err(|e| RpcError::invalid_params(e.to_string()))?;
+        from_value(params).map_err(|e| RpcError::invalid_params(e.to_string()))?;
 
     // Wrap in spawn_blocking since this does blocking filesystem I/O
     let expanded_directory = super::expand_tilde(&params.directory);
@@ -173,7 +173,7 @@ pub async fn ancestors_scan(params: &Value) -> HandlerResult {
                 if results.get(marker).unwrap().is_none() {
                     let marker_path = current.join(marker);
                     if marker_path.exists() {
-                        results.insert(marker.clone(), Some(current.to_string_lossy().to_string()));
+                        results.insert(marker.clone(), Some(current.to_string_lossy().into_owned()));
                     }
                 }
             }

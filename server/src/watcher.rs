@@ -217,7 +217,7 @@ async fn send_notification(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let paths_value: Vec<Value> = paths
         .iter()
-        .map(|p| Value::String(p.to_string_lossy().to_string().into()))
+        .map(|p| Value::String(p.to_string_lossy().into_owned().into()))
         .collect();
 
     let notification = Notification::new(
@@ -246,7 +246,7 @@ use crate::handlers::HandlerResult;
 /// Handle `watch.add` - start watching a directory for changes.
 ///
 /// Params: { "path": "/path/to/dir", "recursive": true|false }
-pub fn handle_add(params: &Value) -> HandlerResult {
+pub fn handle_add(params: Value) -> HandlerResult {
     #[derive(serde::Deserialize)]
     struct Params {
         path: String,
@@ -258,7 +258,7 @@ pub fn handle_add(params: &Value) -> HandlerResult {
     }
 
     let params: Params =
-        from_value(params.clone()).map_err(|e| RpcError::invalid_params(e.to_string()))?;
+        from_value(params).map_err(|e| RpcError::invalid_params(e.to_string()))?;
 
     let expanded = crate::handlers::expand_tilde(&params.path);
 
@@ -277,14 +277,14 @@ pub fn handle_add(params: &Value) -> HandlerResult {
 /// Handle `watch.remove` - stop watching a directory.
 ///
 /// Params: { "path": "/path/to/dir" }
-pub fn handle_remove(params: &Value) -> HandlerResult {
+pub fn handle_remove(params: Value) -> HandlerResult {
     #[derive(serde::Deserialize)]
     struct Params {
         path: String,
     }
 
     let params: Params =
-        from_value(params.clone()).map_err(|e| RpcError::invalid_params(e.to_string()))?;
+        from_value(params).map_err(|e| RpcError::invalid_params(e.to_string()))?;
 
     let expanded = crate::handlers::expand_tilde(&params.path);
 
@@ -300,7 +300,7 @@ pub fn handle_remove(params: &Value) -> HandlerResult {
 /// Handle `watch.list` - list currently watched paths.
 ///
 /// Params: {} (none)
-pub fn handle_list(_params: &Value) -> HandlerResult {
+pub fn handle_list(_params: Value) -> HandlerResult {
     let manager = get().ok_or_else(|| RpcError::internal_error("File watcher not available"))?;
 
     let watches: Vec<Value> = manager
@@ -308,7 +308,7 @@ pub fn handle_list(_params: &Value) -> HandlerResult {
         .into_iter()
         .map(|(path, recursive)| {
             msgpack_map! {
-                "path" => path.to_string_lossy().to_string(),
+                "path" => path.to_string_lossy().into_owned(),
                 "recursive" => Value::Boolean(recursive)
             }
         })

@@ -333,7 +333,7 @@ performance issues with large environments."
   "Fetch direnv environment for DIRECTORY on VEC.
 Returns alist of (VAR . VALUE) pairs for essential variables only.
 See `tramp-rpc-direnv-essential-vars' for the list of variables."
-  (condition-case nil
+  (condition-case err
       (let* ((result (tramp-rpc--call vec "process.run"
                                        `((cmd . "/bin/sh")
                                          (args . ["-l" "-c"
@@ -347,7 +347,7 @@ See `tramp-rpc-direnv-essential-vars' for the list of variables."
         (if (and (eq exit-code 0)
                  (> (length stdout) 0))
             ;; Parse JSON output into alist, filter to essential vars
-            (condition-case nil
+            (condition-case err
                 (let* ((json-object-type 'alist)
                        (json-key-type 'string)
                        (full-env (json-read-from-string stdout)))
@@ -355,15 +355,18 @@ See `tramp-rpc-direnv-essential-vars' for the list of variables."
                   (cl-loop for var in tramp-rpc-direnv-essential-vars
                            for pair = (assoc var full-env)
                            when pair collect pair))
-              (error nil))
+              (error
+               (tramp-rpc--debug "direnv JSON parse failed: %S" err)
+               nil))
           ;; If exit code is 127 (command not found), mark direnv as unavailable
           (when (eq exit-code 127)
             (puthash (tramp-rpc--connection-key vec)
                      :unavailable
                      tramp-rpc--direnv-available-cache))
           nil))
-    ;; If any error, return nil silently
-    (error nil)))
+    (error
+     (tramp-rpc--debug "direnv fetch failed: %S" err)
+     nil)))
 
 (defvar tramp-rpc--executable-cache (make-hash-table :test 'equal)
   "Cache of executable paths keyed by (connection-key . program).
@@ -408,7 +411,7 @@ Returns the absolute path or nil.
 Uses `command -v` for efficient lookup via login shell.
 Uses a unique marker to separate MOTD/banner text from actual output,
 following the pattern used by standard TRAMP."
-  (condition-case nil
+  (condition-case err
       (let* (;; Use a unique marker (MD5 hash) to delimit output from MOTD text
              ;; This is the same approach used by tramp-sh.el
              (marker (md5 (format "tramp-rpc-%s-%s" program (float-time))))
@@ -428,7 +431,9 @@ following the pattern used by standard TRAMP."
             (let ((path (string-trim (match-string 1 stdout))))
               (when (string-prefix-p "/" path)
                 path)))))
-    (error nil)))
+    (error
+     (tramp-rpc--debug "find-executable failed for %s: %S" program err)
+     nil)))
 
 (defun tramp-rpc--connection-key (vec)
   "Generate a connection key for VEC.
@@ -1149,44 +1154,6 @@ This is more efficient when the server has async support."
                       (list :error code :message msg))
                   (plist-get response :result))))
             responses)))
-
-;; ============================================================================
-;; Batch context for automatic operation batching
-;; ============================================================================
-
-(defvar tramp-rpc--batch-context nil
-  "When non-nil, a plist with :vec, :requests, :results for batch collection.")
-
-(defmacro with-tramp-rpc-batch (vec &rest body)
-  "Execute BODY with automatic batching of RPC operations for VEC.
-Operations within BODY that would normally make individual RPC calls
-are collected and executed together when the batch context ends.
-
-This is useful for optimizing code that makes many small RPC calls,
-such as iterating over files.
-
-Example:
-  (with-tramp-rpc-batch vec
-    (dolist (file files)
-      (when (file-exists-p file)
-        (push (file-attributes file) attrs))))"
-  (declare (indent 1))
-  `(let ((tramp-rpc--batch-context
-          (list :vec ,vec :requests nil :results nil)))
-     (unwind-protect
-         (progn ,@body)
-       ;; Flush any pending requests
-       (tramp-rpc--flush-batch-context))))
-
-(defun tramp-rpc--flush-batch-context ()
-  "Execute any pending requests in the current batch context."
-  (when tramp-rpc--batch-context
-    (let ((requests (plist-get tramp-rpc--batch-context :requests)))
-      (when requests
-        (let* ((vec (plist-get tramp-rpc--batch-context :vec))
-               (results (tramp-rpc--call-pipelined vec (nreverse requests))))
-          (plist-put tramp-rpc--batch-context :results results)
-          (plist-put tramp-rpc--batch-context :requests nil))))))
 
 ;; ============================================================================
 ;; Output decoding helper
@@ -2264,22 +2231,9 @@ would otherwise flood the echo area with \"Cannot expand tilde\"."
 ;; Process and advice modules (extracted)
 ;; ============================================================================
 
-;; Process support, advice functions, and magit integration are now in
-;; separate modules for better organization and maintainability.
-(require 'tramp-rpc-process)
-(require 'tramp-rpc-advice)
-(require 'tramp-rpc-magit)
-
 (defvar tramp-rpc--delivering-output nil
   "Non-nil while delivering process output to the local relay.
 Used by advice functions to bypass interception during output delivery.")
-
-(defcustom tramp-rpc-use-async-read t
-  "Whether to use async callback-based reads for pipe processes.
-When t (default), uses fast async reads with server-side blocking.
-When nil, uses timer-based polling (slower, for debugging)."
-  :type 'boolean
-  :group 'tramp-rpc)
 
 (defcustom tramp-rpc-async-read-timeout-ms 200
   "Timeout in milliseconds for async process reads.
@@ -2289,14 +2243,18 @@ Also controls process exit detection latency."
   :type 'integer
   :group 'tramp-rpc)
 
+;; Process support, advice functions, and magit integration are now in
+;; separate modules for better organization and maintainability.
+(require 'tramp-rpc-process)
+(require 'tramp-rpc-advice)
+(require 'tramp-rpc-magit)
+
 ;; ============================================================================
 ;; File name handler registration
 ;; ============================================================================
 
 (defconst tramp-rpc-file-name-handler-alist
   '(;; =========================================================================
-    ;; RPC-based file attribute operations
-    ;; =========================================================================
     ;; RPC-based file attribute operations
     ;; =========================================================================
     (file-exists-p . tramp-handle-file-exists-p)

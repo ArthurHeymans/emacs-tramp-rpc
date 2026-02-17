@@ -12,7 +12,7 @@ use tokio::fs;
 use super::HandlerResult;
 
 /// Get file attributes
-pub async fn stat(params: &Value) -> HandlerResult {
+pub async fn stat(params: Value) -> HandlerResult {
     #[derive(Deserialize)]
     struct Params {
         /// Path as string (UTF-8) or bytes (non-UTF8)
@@ -24,7 +24,7 @@ pub async fn stat(params: &Value) -> HandlerResult {
     }
 
     let params: Params =
-        from_value(params.clone()).map_err(|e| RpcError::invalid_params(e.to_string()))?;
+        from_value(params).map_err(|e| RpcError::invalid_params(e.to_string()))?;
 
     let path = bytes_to_path(&params.path);
     match get_file_attributes(&path, params.lstat).await {
@@ -35,7 +35,7 @@ pub async fn stat(params: &Value) -> HandlerResult {
 }
 
 /// Get the true name of a file (resolve symlinks)
-pub async fn truename(params: &Value) -> HandlerResult {
+pub async fn truename(params: Value) -> HandlerResult {
     #[derive(Deserialize)]
     struct Params {
         #[serde(with = "path_or_bytes")]
@@ -43,10 +43,10 @@ pub async fn truename(params: &Value) -> HandlerResult {
     }
 
     let params: Params =
-        from_value(params.clone()).map_err(|e| RpcError::invalid_params(e.to_string()))?;
+        from_value(params).map_err(|e| RpcError::invalid_params(e.to_string()))?;
 
     let path = bytes_to_path(&params.path);
-    let path_str = path.to_string_lossy().to_string();
+    let path_str = path.to_string_lossy().into_owned();
 
     // Use tokio's async canonicalize
     let canonical = fs::canonicalize(&path)
@@ -77,7 +77,7 @@ pub async fn get_file_attributes(path: &Path, lstat: bool) -> Result<FileAttribu
         fs::read_link(path)
             .await
             .ok()
-            .map(|p| p.to_string_lossy().to_string())
+            .map(|p| p.to_string_lossy().into_owned())
     } else {
         None
     };

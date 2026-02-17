@@ -137,6 +137,14 @@ impl RpcError {
         }
     }
 
+    pub fn process_error(msg: impl Into<String>) -> Self {
+        Self {
+            code: Self::PROCESS_ERROR,
+            message: msg.into(),
+            data: None,
+        }
+    }
+
     pub fn io_error(err: std::io::Error) -> Self {
         // Include the raw OS errno in the data field so clients can
         // match on it structurally rather than parsing the message text.
@@ -191,6 +199,22 @@ pub enum FileType {
     Unknown,
 }
 
+impl FileType {
+    /// Return the string representation of this file type.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            FileType::File => "file",
+            FileType::Directory => "directory",
+            FileType::Symlink => "symlink",
+            FileType::CharDevice => "chardevice",
+            FileType::BlockDevice => "blockdevice",
+            FileType::Fifo => "fifo",
+            FileType::Socket => "socket",
+            FileType::Unknown => "unknown",
+        }
+    }
+}
+
 /// File attributes (similar to Emacs file-attributes)
 #[derive(Debug, Serialize, Deserialize)]
 pub struct FileAttributes {
@@ -231,21 +255,10 @@ pub struct FileAttributes {
 impl FileAttributes {
     /// Convert to a MessagePack Value with named fields (map instead of array)
     pub fn to_value(&self) -> Value {
-        let file_type_str = match self.file_type {
-            FileType::File => "file",
-            FileType::Directory => "directory",
-            FileType::Symlink => "symlink",
-            FileType::CharDevice => "chardevice",
-            FileType::BlockDevice => "blockdevice",
-            FileType::Fifo => "fifo",
-            FileType::Socket => "socket",
-            FileType::Unknown => "unknown",
-        };
-
         let mut pairs: Vec<(Value, Value)> = vec![
             (
                 Value::String("type".into()),
-                Value::String(file_type_str.into()),
+                Value::String(self.file_type.as_str().into()),
             ),
             (
                 Value::String("nlinks".into()),
@@ -318,17 +331,6 @@ pub struct DirEntry {
 impl DirEntry {
     /// Convert to a MessagePack Value with named fields
     pub fn to_value(&self) -> Value {
-        let file_type_str = match self.file_type {
-            FileType::File => "file",
-            FileType::Directory => "directory",
-            FileType::Symlink => "symlink",
-            FileType::CharDevice => "chardevice",
-            FileType::BlockDevice => "blockdevice",
-            FileType::Fifo => "fifo",
-            FileType::Socket => "socket",
-            FileType::Unknown => "unknown",
-        };
-
         let mut pairs: Vec<(Value, Value)> = vec![
             (
                 Value::String("name".into()),
@@ -336,7 +338,7 @@ impl DirEntry {
             ),
             (
                 Value::String("type".into()),
-                Value::String(file_type_str.into()),
+                Value::String(self.file_type.as_str().into()),
             ),
         ];
 
@@ -479,6 +481,24 @@ impl IntoValue for Value {
     fn into_value(self) -> Value {
         self
     }
+}
+
+/// Extract an exit code from a `std::process::ExitStatus`.
+///
+/// On Unix, signal-killed processes have `code() == None`.
+/// Convention: return 128 + signal_number (e.g. SIGKILL=9 -> 137).
+pub fn exit_code_from_status(status: std::process::ExitStatus) -> i32 {
+    status.code().unwrap_or_else(|| {
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::ExitStatusExt;
+            status.signal().map(|s| 128 + s).unwrap_or(-1)
+        }
+        #[cfg(not(unix))]
+        {
+            -1
+        }
+    })
 }
 
 /// Helper to deserialize from rmpv::Value to a typed struct
