@@ -1242,9 +1242,11 @@ Checks executable permission from cached `file-attributes' mode bits
 using `tramp-check-cached-permissions'.  No RPC call needed."
   (with-parsed-tramp-file-name (expand-file-name filename) nil
     (with-tramp-file-property v localname "file-executable-p"
-      (or (tramp-check-cached-permissions v ?x 'force)
-          (tramp-check-cached-permissions v ?s 'force)
-          (tramp-check-cached-permissions v ?t 'force)))))
+      ;; `tramp-check-cached-permissions' gained an optional FORCE arg
+      ;; after Emacs 30.1.  Use 2-arg form for compatibility.
+      (or (tramp-check-cached-permissions v ?x)
+          (tramp-check-cached-permissions v ?s)
+          (tramp-check-cached-permissions v ?t)))))
 
 (defun tramp-rpc--call-file-stat (vec localname &optional lstat)
   "Call file.stat for LOCALNAME on VEC, returning nil if file doesn't exist.
