@@ -235,19 +235,35 @@ STDERR-BUFFER is the separate stderr buffer, or nil to mix with stdout."
 (defun tramp-rpc--pipe-process-sentinel (proc event user-sentinel)
   "Sentinel for pipe relay processes.
 PROC is the local cat process, EVENT is the event string.
-USER-SENTINEL is the user's original sentinel function."
-  ;; If cat died unexpectedly, clean up the remote process
+USER-SENTINEL is the user's original sentinel function.
+
+This sentinel fires in two scenarios:
+1. Cat died unexpectedly (signal/crash) - kill the remote process.
+2. Cat exited after EOF from `tramp-rpc--handle-process-exit' -
+   the remote process already exited, cat flushed remaining data
+   and exited naturally.
+
+In both cases, use the remote exit code (if known) to construct the
+event string for the user's sentinel, so that it sees the remote
+process's exit status rather than cat's."
   (when (and (memq (process-status proc) '(exit signal))
              (gethash proc tramp-rpc--async-processes))
     (let* ((info (gethash proc tramp-rpc--async-processes))
            (vec (plist-get info :vec))
            (pid (plist-get info :pid)))
-      ;; Kill remote process if still running
-      (when (and vec pid)
-        (ignore-errors
-          (tramp-rpc--kill-remote-process vec pid 9)))
+      ;; Kill remote process if still running (unexpected cat death)
+      (unless (process-get proc :tramp-rpc-exited)
+        (when (and vec pid)
+          (ignore-errors
+            (tramp-rpc--kill-remote-process vec pid 9))))
       ;; Remove from tracking
       (remhash proc tramp-rpc--async-processes)))
+  ;; Use the remote exit code for the event string when available,
+  ;; so the user's sentinel sees the remote process status.
+  (when-let* ((remote-exit (process-get proc :tramp-rpc-exit-code)))
+    (setq event (if (= remote-exit 0)
+                    "finished\n"
+                  (format "exited abnormally with code %d\n" remote-exit))))
   ;; Call user's sentinel if provided
   (when user-sentinel
     (funcall user-sentinel proc event)))
@@ -406,7 +422,17 @@ Returns the new interval."
                local-process (plist-get result :exit-code)))))))))))
 
 (defun tramp-rpc--handle-process-exit (local-process exit-code)
-  "Handle exit of remote process associated with LOCAL-PROCESS."
+  "Handle exit of remote process associated with LOCAL-PROCESS.
+Stores the remote exit code and sends EOF to the local cat relay so
+it flushes remaining output and exits naturally.  The process sentinel
+\(`tramp-rpc--pipe-process-sentinel') fires when cat exits, handles
+cleanup, and calls the user's sentinel with the correct event string.
+
+This design follows TRAMP's approach: let Emacs's process machinery
+handle sentinel dispatch rather than fighting it with `delete-process'
++ deferred `run-at-time' sentinel calls.  Doing `delete-process'
+before the cat relay drains its pipe causes a stale FD that makes
+`input-pending-p' return t permanently, starving keyboard input."
   (let ((info (gethash local-process tramp-rpc--async-processes)))
     (when info
       ;; Cancel the timer (if using timer-based polling)
@@ -415,37 +441,16 @@ Returns the new interval."
       ;; Clean up write queue for this process's PID
       (when-let* ((pid (plist-get info :pid)))
         (remhash pid tramp-rpc--process-write-queues))
-      ;; Remove from tracking
-      (remhash local-process tramp-rpc--async-processes)
-      ;; Store exit code and mark as exited
+      ;; Store exit code and mark as exited.  The sentinel reads these
+      ;; to construct the correct event string for the user's sentinel.
       (process-put local-process :tramp-rpc-exit-code (or exit-code 0))
       (process-put local-process :tramp-rpc-exited t)
-      ;; Get sentinel before we modify anything
-      (let ((sentinel (process-sentinel local-process))
-            (event (if (and exit-code (= exit-code 0))
-                       "finished\n"
-                     (format "exited abnormally with code %d\n" (or exit-code -1)))))
-        ;; Remove sentinel temporarily to prevent double-call
-        (set-process-sentinel local-process nil)
-        ;; Delete the process (changes status)
-        (when (process-live-p local-process)
-          (delete-process local-process))
-        ;; Call sentinel via run-at-time to avoid blocking the current
-        ;; execution context.  Using run-at-time is safer than make-thread
-        ;; because Emacs threads share a global lock and sentinels that call
-        ;; accept-process-output can deadlock.
-        ;; We bind inhibit-quit to nil because timer handlers run with
-        ;; inhibit-quit=t, but sentinels (e.g. vc-exec-after) may call
-        ;; accept-process-output which warns/hangs when quit is inhibited.
-        (when sentinel
-          (run-at-time 0 nil
-           (lambda ()
-             (let ((inhibit-quit nil))
-               (condition-case err
-                   (funcall sentinel local-process event)
-                 (error
-                  (tramp-rpc--debug "SENTINEL-ERROR: %S" err)))))))))))
-
+      ;; Send EOF to the cat relay.  Cat will flush any remaining data
+      ;; (written by deliver-process-output) to stdout, where the process
+      ;; filter reads it, then exit naturally on EOF.  Emacs fires the
+      ;; sentinel (tramp-rpc--pipe-process-sentinel) which does final cleanup.
+      (when (process-live-p local-process)
+        (ignore-errors (process-send-eof local-process))))))
 
 ;; ============================================================================
 ;; make-process handler

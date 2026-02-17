@@ -883,13 +883,18 @@ Returns the result or signals an error."
     ;; Send request (binary data with length prefix, no newline)
     (process-send-string process request)
 
-    ;; Wait for response with matching ID
+    ;; Wait for response with matching ID using wall-clock deadline.
+    ;; NOTE: We use (float-time) instead of decrementing a counter because
+    ;; accept-process-output can return early (e.g. async process output
+    ;; arrives), and decrementing by poll-interval each iteration would
+    ;; cause premature timeouts when there is concurrent I/O traffic.
     (with-current-buffer buffer
-      (let ((timeout total-timeout)
+      (let ((start-time (float-time))
+            (deadline (+ (float-time) total-timeout))
             response)
         ;; Wait for a response with the correct ID
         (while (and (not response)
-                    (> timeout 0)
+                    (< (float-time) deadline)
                     (process-live-p process))
           ;; Check if process is locked to another thread before trying to accept
           (if (not (tramp-rpc--process-accessible-p process))
@@ -923,16 +928,17 @@ Returns the result or signals an error."
                 (setq response (tramp-rpc--find-response-by-id expected-id))
               ;; User quit - propagate it
               (tramp-rpc--debug "QUIT id=%s (user interrupted)" expected-id)
-              (keyboard-quit)))
-          (cl-decf timeout poll-interval))
+              (keyboard-quit))))
 
         (unless response
-          (tramp-rpc--debug "TIMEOUT id=%s method=%s buffer-size=%d"
-                           expected-id method (buffer-size))
-          (signal
-	   'remote-file-error
-	   (list "Timeout waiting for RPC response from %s (id=%s, method=%s)"
-                 (tramp-file-name-host vec) expected-id method)))
+          (let ((elapsed (- (float-time) start-time)))
+            (tramp-rpc--debug
+             "TIMEOUT id=%s method=%s elapsed=%.1fs buffer-size=%d process-live=%s"
+             expected-id method elapsed (buffer-size) (process-live-p process))
+            (signal
+             'remote-file-error
+             (list "Timeout waiting for RPC response from %s (id=%s, method=%s, waited %.1fs)"
+                   (tramp-file-name-host vec) expected-id method elapsed))))
 
         (tramp-rpc--debug "RECV id=%s (found)" expected-id)
         (if (tramp-rpc-protocol-error-p response)
@@ -993,12 +999,13 @@ Returns:
     ;; Send batch request (binary data with length prefix, no newline)
     (process-send-string process request)
 
-    ;; Wait for response with matching ID
+    ;; Wait for response with matching ID using wall-clock deadline
     (with-current-buffer buffer
-      (let ((timeout 30)
+      (let ((start-time (float-time))
+            (deadline (+ (float-time) 30))
             response)
         (while (and (not response)
-                    (> timeout 0)
+                    (< (float-time) deadline)
                     (process-live-p process))
           ;; Check if process is locked to another thread before trying to accept
           (if (not (tramp-rpc--process-accessible-p process))
@@ -1019,16 +1026,17 @@ Returns:
                 ;; Check if our response arrived in pending responses
                 (setq response (tramp-rpc--find-response-by-id expected-id))
               (tramp-rpc--debug "QUIT-BATCH id=%s (user interrupted)" expected-id)
-              (keyboard-quit)))
-          (cl-decf timeout 0.1))
+              (keyboard-quit))))
 
         (unless response
-          (tramp-rpc--debug "TIMEOUT-BATCH id=%s buffer-size=%d"
-                           expected-id (buffer-size))
-          (signal
-	   'remote-file-error
-	   (list "Timeout waiting for batch RPC response from %s (id=%s)"
-		 (tramp-file-name-host vec) expected-id)))
+          (let ((elapsed (- (float-time) start-time)))
+            (tramp-rpc--debug
+             "TIMEOUT-BATCH id=%s elapsed=%.1fs buffer-size=%d process-live=%s"
+             expected-id elapsed (buffer-size) (process-live-p process))
+            (signal
+             'remote-file-error
+             (list "Timeout waiting for batch RPC response from %s (id=%s, waited %.1fs)"
+                   (tramp-file-name-host vec) expected-id elapsed))))
 
         (tramp-rpc--debug "RECV-BATCH id=%s (found)" expected-id)
         (if (tramp-rpc-protocol-error-p response)
@@ -1070,13 +1078,13 @@ TIMEOUT is the maximum time to wait in seconds (default 30)."
   (let* ((conn (tramp-rpc--ensure-connection vec))
          (process (plist-get conn :process))
          (buffer (plist-get conn :buffer))
-         (timeout (or timeout 30))
+         (deadline (+ (float-time) (or timeout 30)))
          (remaining-ids (copy-sequence ids))
          (responses (make-hash-table :test 'eql)))
     (tramp-rpc--debug "RECV-PIPE waiting for %d responses: %S" (length ids) ids)
     (with-current-buffer buffer
       (while (and remaining-ids
-                  (> timeout 0)
+                  (< (float-time) deadline)
                   (process-live-p process))
         ;; Check if process is locked to another thread before trying to accept
         (if (not (tramp-rpc--process-accessible-p process))
@@ -1109,8 +1117,7 @@ TIMEOUT is the maximum time to wait in seconds (default 30)."
                     ;; Remove from remaining
                     (setq remaining-ids (delete id remaining-ids)))))
             (tramp-rpc--debug "RECV-PIPE quit (user interrupted)")
-            (keyboard-quit)))
-        (cl-decf timeout 0.1)))
+            (keyboard-quit)))))
     (when remaining-ids
       (tramp-rpc--debug "RECV-PIPE timeout, missing ids: %S" remaining-ids))
     ;; Convert hash table to alist in original order
