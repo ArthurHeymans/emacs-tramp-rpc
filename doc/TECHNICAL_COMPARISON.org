@@ -1,6 +1,6 @@
 #+TITLE: TRAMP-RPC Technical Comparison
 #+AUTHOR: Arthur Heymans <arthur@aheymans.xyz>
-#+DATE: January 2026
+#+DATE: February 2026
 #+OPTIONS: toc:3 num:t
 
 * Executive Summary
@@ -8,10 +8,10 @@
 TRAMP-RPC is a high-performance alternative TRAMP backend that replaces shell command parsing with a binary MessagePack-RPC server. This document provides an in-depth technical comparison between TRAMP-RPC and the original TRAMP implementation (tramp-sh).
 
 Key findings:
-- *2-14x faster* for most file operations
-- *57x faster* for file writes
-- *Batching support* enables additional 3-6x speedup for multiple operations
-- Trade-off: Large output commands (>1MB) may be slower due to encoding overhead
+- *2-38x faster* for most file operations
+- *27x faster* for directory-files-and-attributes (critical for dired)
+- *Batching support* enables additional 2-4x speedup for multiple operations
+- Multi-hop, macOS, and filesystem watching fully supported
 
 * Architecture Comparison
 
@@ -97,20 +97,25 @@ And receives (MessagePack-encoded):
 
 *** TRAMP-RPC Source Structure
 
-| Component                  | Lines  | Purpose                            |
-|----------------------------+--------+------------------------------------|
-| lisp/tramp-rpc.el          | ~2200  | Main Emacs integration             |
-| lisp/tramp-rpc-protocol.el | ~125   | MessagePack-RPC protocol handling  |
-| lisp/tramp-rpc-deploy.el   | ~260   | Binary deployment                  |
-| server/src/main.rs         | ~100   | Server entry point (Rust)          |
-| server/src/handlers/       | ~1200  | RPC method implementations         |
-| server/src/protocol.rs     | ~200   | Protocol types                     |
+| Component                  | Lines  | Purpose                                  |
+|----------------------------+--------+------------------------------------------|
+| lisp/tramp-rpc.el          | ~2450  | Core RPC communication & file handlers   |
+| lisp/tramp-rpc-process.el  | ~1050  | Async process & PTY support              |
+| lisp/tramp-rpc-magit.el    | ~780   | Magit/Projectile optimizations & caching |
+| lisp/tramp-rpc-deploy.el   | ~950   | Binary deployment & version management   |
+| lisp/tramp-rpc-advice.el   | ~330   | Advice functions for process/VC/eglot    |
+| lisp/tramp-rpc-protocol.el | ~190   | MessagePack-RPC protocol implementation  |
+| server/src/main.rs         | ~160   | Server entry point (Rust)                |
+| server/src/handlers/       | ~2850  | RPC method implementations               |
+| server/src/protocol.rs     | ~540   | Protocol types & serialization           |
+| server/src/watcher.rs      | ~320   | Filesystem watching (inotify/kqueue)     |
 
 Key characteristics:
 - *Shell-independent*: Only needs SSH transport
 - *Structured responses*: No text parsing required
 - *Single round-trip*: Most operations complete in one request
 - *Concurrent processing*: Server handles multiple requests in parallel
+- *Multi-hop*: SSH ProxyJump for chained connections
 
 * Protocol Comparison
 
@@ -152,58 +157,73 @@ Advantages:
 TRAMP-RPC exposes these method categories:
 
 **** File Operations
-| Method             | Parameters              | Returns                        |
-|--------------------+-------------------------+--------------------------------|
-| file.stat          | path, lstat             | FileAttributes                 |
-| file.exists        | path                    | boolean                        |
-| file.readable      | path                    | boolean                        |
-| file.writable      | path                    | boolean                        |
-| file.executable    | path                    | boolean                        |
-| file.truename      | path                    | string (canonical path)        |
-| file.read          | path, offset?, length?  | {content: base64, size: int}   |
-| file.write         | path, content, append?  | {written: int}                 |
-| file.copy          | src, dest, preserve?    | boolean                        |
-| file.rename        | src, dest, overwrite?   | boolean                        |
-| file.delete        | path                    | boolean                        |
-| file.set_modes     | path, mode              | boolean                        |
-| file.set_times     | path, mtime             | boolean                        |
-| file.make_symlink  | target, link_path       | boolean                        |
-| file.make_hardlink | src, dest               | boolean                        |
-| file.chown         | path, uid, gid          | boolean                        |
+| Method             | Parameters              | Returns                            |
+|--------------------+-------------------------+------------------------------------|
+| file.stat          | path, lstat             | FileAttributes (or null if absent) |
+| file.stat_batch    | paths, lstat            | [FileAttributes or null]           |
+| file.executable    | path                    | boolean                            |
+| file.truename      | path                    | string (canonical path)            |
+| file.read          | path, offset?, length?  | {content: binary, size: int}       |
+| file.write         | path, content, append?  | {written: int}                     |
+| file.copy          | src, dest, preserve?    | boolean                            |
+| file.rename        | src, dest, overwrite?   | boolean                            |
+| file.delete        | path, force?            | boolean                            |
+| file.set_modes     | path, mode              | boolean                            |
+| file.set_times     | path, mtime             | boolean                            |
+| file.make_symlink  | target, link_path       | boolean                            |
+| file.make_hardlink | src, dest               | boolean                            |
+| file.chown         | path, uid, gid          | boolean                            |
 
 **** Directory Operations
-| Method      | Parameters               | Returns                  |
-|-------------+--------------------------+--------------------------|
-| dir.list    | path, include_attrs      | [{name, type, attrs?}]   |
-| dir.create  | path, parents?           | boolean                  |
-| dir.remove  | path, recursive?         | boolean                  |
+| Method           | Parameters               | Returns                  |
+|------------------+--------------------------+--------------------------|
+| dir.list         | path, include_attrs      | [{name, type, attrs?}]   |
+| dir.create       | path, parents?           | boolean                  |
+| dir.remove       | path, recursive?         | boolean                  |
+| dir.completions  | directory, prefix        | [string]                 |
 
 **** Process Operations
 | Method            | Parameters                   | Returns                    |
 |-------------------+------------------------------+----------------------------|
 | process.run       | cmd, args, cwd, env?, stdin? | {exit_code, stdout, stderr} |
 | process.start     | cmd, args, cwd, env?         | {pid}                      |
-| process.read      | pid, max_bytes?              | {stdout, stderr, exited}   |
+| process.read      | pid, timeout_ms?             | {stdout, stderr, exited}   |
 | process.write     | pid, data                    | {written}                  |
 | process.kill      | pid, signal?                 | boolean                    |
 | process.close_stdin | pid                        | boolean                    |
+| process.list      | (none)                       | [{pid, cmd, running}]      |
 | process.start_pty | cmd, args, cwd, rows, cols   | {pid, tty_name}            |
 | process.read_pty  | pid, timeout_ms?             | {output, exited}           |
 | process.write_pty | pid, data                    | {written}                  |
 | process.resize_pty| pid, rows, cols              | boolean                    |
+| process.kill_pty  | pid, signal?                 | boolean                    |
+| process.close_pty | pid                          | boolean                    |
+| process.list_pty  | (none)                       | [{pid, cmd, running}]      |
 
 **** System Operations
-| Method         | Parameters | Returns                           |
-|----------------+------------+-----------------------------------|
-| system.info    | (none)     | {home, uid, gid, username, ...}   |
-| system.getenv  | name       | string or null                    |
-| system.statvfs | path       | {total, free, available}          |
-| system.groups  | (none)     | [{gid, name}]                     |
+| Method              | Parameters | Returns                           |
+|---------------------+------------+-----------------------------------|
+| system.info         | (none)     | {home, uid, gid, username, ...}   |
+| system.getenv       | name       | string or null                    |
+| system.expand_path  | path       | string (tilde expanded)           |
+| system.statvfs      | path       | {total, free, available}          |
+| system.groups       | (none)     | [{gid, name}]                     |
 
-**** Batch Operations
-| Method | Parameters                      | Returns             |
-|--------+---------------------------------+---------------------|
-| batch  | {requests: [{method, params}]}  | {results: [...]}    |
+**** Batch/Parallel Operations
+| Method                | Parameters                      | Returns             |
+|-----------------------+---------------------------------+---------------------|
+| batch                 | {requests: [{method, params}]}  | {results: [...]}    |
+| commands.run_parallel | {commands: [{cmd, args, cwd}]}  | [{exit_code, stdout, stderr}] |
+| ancestors.scan        | {path, markers}                 | {found: [{marker, directory}]} |
+
+**** Filesystem Watch Operations
+| Method       | Parameters     | Returns                   |
+|--------------+----------------+---------------------------|
+| watch.add    | path           | boolean                   |
+| watch.remove | path           | boolean                   |
+| watch.list   | (none)         | [string]                  |
+
+The server also pushes ~fs.changed~ notifications (no id) when watched directories change.
 
 * Performance Analysis
 
@@ -213,27 +233,27 @@ Tests performed on WiFi network between two Linux hosts (x220-nixos target).
 
 *** File Operation Benchmarks
 
-| Operation            | RPC (median)  | SSH (median)  | Speedup |
-|----------------------+---------------+---------------+---------|
-| connection-setup     | 661 ms        | 1.21 s        | 1.8x    |
-| file-exists          | 4.1 ms        | 56.1 ms       | *13.7x* |
-| file-attributes      | 6.4 ms        | 28.0 ms       | 4.4x    |
-| file-read            | 4.4 ms        | 17.4 ms       | 3.9x    |
-| file-write           | 4.1 ms        | 231.9 ms      | *56.6x* |
-| directory-files      | 4.1 ms        | 43.1 ms       | *10.5x* |
-| dir-files-attrs      | 30.4 ms       | 68.8 ms       | 2.3x    |
-| process-file (ls)    | 10.2 ms       | 19.4 ms       | 1.9x    |
-| process-file (cat)   | 6.6 ms        | 21.5 ms       | 3.3x    |
-| copy-file            | 21.9 ms       | 189.7 ms      | *8.7x*  |
-| multi-stat (10x)     | 66.0 ms       | 221.6 ms      | 3.4x    |
-| seq-mixed-ops        | 24.9 ms       | 92.6 ms       | 3.7x    |
+| Operation            | RPC (median)  | SSH (median)  | Speedup  |
+|----------------------+---------------+---------------+----------|
+| connection-setup     | 31 ms         | 1.17 s        | *38.2x*  |
+| file-exists          | 3.3 ms        | 38.8 ms       | *11.9x*  |
+| file-attributes      | 3.4 ms        | 23.3 ms       | 6.8x     |
+| file-read            | 7.7 ms        | 20.2 ms       | 2.6x     |
+| file-write           | 74.2 ms       | 219.9 ms      | 3.0x     |
+| directory-files      | 12.1 ms       | 37.2 ms       | 3.1x     |
+| dir-files-attrs      | 3.5 ms        | 95.9 ms       | *27.1x*  |
+| process-file (ls)    | 11.4 ms       | 27.0 ms       | 2.4x     |
+| process-file (cat)   | 8.9 ms        | 27.6 ms       | 3.1x     |
+| copy-file            | 43.1 ms       | 192.0 ms      | *4.5x*   |
+| multi-stat (10x)     | 37.6 ms       | 304.7 ms      | *8.1x*   |
+| seq-mixed-ops        | 15.2 ms       | 93.9 ms       | 6.2x     |
 
 *** Batch Operation Benchmarks (RPC only)
 
 | Operation            | Sequential   | Batched     | Speedup |
 |----------------------+--------------+-------------+---------|
-| 10x file.stat        | 66.0 ms      | 11.6 ms     | *5.7x*  |
-| 5x mixed ops         | 24.9 ms      | 7.0 ms      | *3.6x*  |
+| 10x file.stat        | 37.6 ms      | 9.1 ms      | *4.1x*  |
+| 5x mixed ops         | 15.2 ms      | 6.5 ms      | *2.4x*  |
 
 *** Git/VC Operation Benchmarks (Linux kernel repo)
 
@@ -258,7 +278,7 @@ Tests performed on WiFi network between two Linux hosts (x220-nixos target).
 
 2. *Native Syscalls*
    - Original: ~stat --format='...' file~ → parse text
-   - RPC: ~stat()~ syscall → JSON response
+   - RPC: ~stat()~ syscall → MessagePack response
 
 3. *No Shell Quoting*
    - Original: Must escape paths with special characters
@@ -274,18 +294,13 @@ Tests performed on WiFi network between two Linux hosts (x220-nixos target).
 
 *** Where Original TRAMP Can Be Faster
 
-1. *Large Output Commands*
-   - Commands producing >1MB output may be slower with RPC
-   - Base64 encoding adds ~33% overhead for binary data
-   - Example: ~git ls-files~ on large repos
+1. *Cold Connection*
+   - RPC requires binary deployment on first connect
+   - Subsequent connections are fast due to ControlMaster reuse
 
-2. *Cold Connection*
-   - RPC requires binary deployment on first connect (~700ms)
-   - Subsequent connections are faster due to ControlMaster
-
-3. *Cached Operations*
+2. *Cached Operations*
    - Original TRAMP's aggressive caching can make repeated operations instant
-   - RPC always queries the server (fresher data, but more round-trips)
+   - RPC also caches, but the magit module adds additional TTL-based caching and prefetch
 
 * Implementation Details
 
@@ -298,12 +313,17 @@ The server is implemented in Rust using Tokio for async I/O:
 async fn main() {
     let stdin = tokio::io::stdin();
     let stdout = tokio::io::stdout();
-    
-    // Process requests concurrently
-    while let Ok(Some(line)) = lines.next_line().await {
+
+    // Read length-prefixed MessagePack frames
+    loop {
+        let len = read_u32_be(&mut stdin).await;
+        let payload = read_exact(&mut stdin, len).await;
+        let request: Request = rmp_serde::from_slice(&payload);
+
+        // Process request concurrently
         tasks.spawn(async move {
-            let response = process_request(&line).await;
-            // Send response
+            let response = dispatch(&request).await;
+            send_response(&mut stdout, &response).await;
         });
     }
 }
@@ -312,9 +332,9 @@ async fn main() {
 Key design decisions:
 
 1. *Async I/O*: Uses Tokio for non-blocking file and process operations
-2. *Concurrent Request Processing*: Multiple requests processed in parallel
-3. *Static Binary*: Built with musl for maximum portability
-4. *Size Optimization*: LTO, strip, panic=abort (~1.5MB binary)
+2. *Concurrent Request Processing*: Multiple requests processed in parallel via JoinSet
+3. *Static Binary*: Built with musl for maximum portability (Linux)
+4. *Size Optimization*: LTO, strip, panic=abort, opt-level "z" (~850KB binary)
 
 ** Emacs Integration
 
@@ -343,8 +363,8 @@ Key features:
 On first connection, TRAMP-RPC:
 
 1. Detects remote architecture (~uname -m~, ~uname -s~)
-2. Selects appropriate pre-compiled binary
-3. Transfers via base64 over existing SSH connection
+2. Selects appropriate pre-compiled binary (from local cache or GitHub Releases)
+3. Transfers via scp (scpx method) with retry support
 4. Verifies SHA256 checksum
 5. Makes executable and stores in ~/.cache/tramp-rpc/
 
@@ -362,55 +382,52 @@ On first connection, TRAMP-RPC:
 
 * Feature Comparison Matrix
 
-| Feature                    | Original TRAMP | TRAMP-RPC |
-|----------------------------+----------------+-----------|
-| File operations            | Yes            | Yes       |
-| Directory operations       | Yes            | Yes       |
-| Synchronous processes      | Yes            | Yes       |
-| Async processes            | Yes            | Yes       |
-| PTY/terminal support       | Yes            | Yes       |
-| VC integration             | Yes            | Yes       |
-| Multi-hop connections      | Yes            | No*       |
-| Windows remote hosts       | Yes            | No        |
-| macOS remote hosts         | Partial        | No**      |
-| Batch operations           | No             | Yes       |
-| Request pipelining         | No             | Yes       |
-| Binary data handling       | Via encoding   | Base64    |
-| Shell required on remote   | Yes            | No        |
-| Additional binary required | No             | Yes       |
-
-*Multi-hop support planned but not implemented
-**macOS binaries not yet cross-compiled
+| Feature                    | Original TRAMP | TRAMP-RPC             |
+|----------------------------+----------------+-----------------------|
+| File operations            | Yes            | Yes                   |
+| Directory operations       | Yes            | Yes                   |
+| Synchronous processes      | Yes            | Yes                   |
+| Async processes            | Yes            | Yes                   |
+| PTY/terminal support       | Yes            | Yes                   |
+| VC integration             | Yes            | Yes                   |
+| Multi-hop connections      | Yes            | Yes (via ProxyJump)   |
+| Magit/Projectile prefetch  | No             | Yes (parallel)        |
+| Filesystem watching        | No             | Yes (inotify/kqueue)  |
+| Windows remote hosts       | Yes            | No                    |
+| macOS remote hosts         | Partial        | Yes                   |
+| Linux remote hosts         | Yes            | Yes                   |
+| Batch operations           | No             | Yes                   |
+| Request pipelining         | No             | Yes                   |
+| Binary data handling       | Via encoding   | Native binary         |
+| Shell required on remote   | Yes            | No                    |
+| Additional binary required | No             | Yes (~850KB)          |
+| Direnv support             | No             | Yes (cached)          |
 
 * When to Use Each
 
 ** Use Original TRAMP When:
 
-- Connecting to Windows hosts
-- Using multi-hop connections (jump hosts)
-- Remote host architecture not supported (non-Linux)
-- Minimizing remote system requirements
-- Working with very large files (>10MB) frequently
+- Connecting to Windows remote hosts
+- Remote host architecture not supported (non x86_64/aarch64 Linux or macOS)
+- Minimizing remote system requirements (no binary deployment)
 
 ** Use TRAMP-RPC When:
 
-- Primary focus is Linux remote hosts
-- Performance is critical (editing, VC operations)
+- Performance is critical (editing, VC operations, dired)
 - Working with many small files (source code)
-- Using magit or other VC tools intensively
+- Using magit or other VC tools intensively (parallel prefetch)
 - Running many remote commands (compilation, testing)
+- Using multi-hop connections (ProxyJump is cleaner than ad-hoc methods)
+- Need filesystem watching for cache invalidation
 
 * Future Directions
 
-1. *Multi-hop Support*: Chain RPC connections through jump hosts
-2. *macOS/BSD Binaries*: Cross-compile for more platforms
-3. *Incremental File Sync*: rsync-like differential updates
-4. *File Watching*: Native inotify integration for file-notify
-5. *Compression*: Optional compression for large transfers
-6. *Authentication Caching*: Reduce connection setup time
+1. *Incremental File Sync*: rsync-like differential updates
+2. *Compression*: Optional compression for large transfers
+3. *MELPA Package*: Publish to MELPA for easier installation
 
 * Conclusion
 
 TRAMP-RPC represents a fundamentally different approach to remote file access in Emacs. By replacing shell command parsing with a purpose-built binary protocol, it achieves significant performance improvements for the most common operations while maintaining full compatibility with Emacs' file handling APIs.
 
-The trade-off is the requirement for a pre-compiled binary on the remote host, which limits platform support compared to original TRAMP's shell-based universality. For Linux-to-Linux workflows, which represent a large portion of development use cases, TRAMP-RPC offers a compelling performance advantage.
+The trade-off is the requirement for a pre-compiled binary on the remote host (~850KB), which limits platform support compared to original TRAMP's shell-based universality. For Linux and macOS workflows (x86_64 and aarch64), which represent the majority of development use cases, TRAMP-RPC offers a compelling performance advantage with features like multi-hop support, magit prefetch, and filesystem watching.

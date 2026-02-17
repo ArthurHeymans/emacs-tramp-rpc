@@ -18,16 +18,19 @@ TRAMP-RPC replaces this with a lightweight Rust server that runs on the remote h
 | Latency          | Multiple round-trips     | Single round-trip        |
 | Batching         | Not supported            | Multiple ops per request |
 | Shell dependency | Required on remote       | Not needed               |
-| Binary required  | None                     | ~1MB Rust server         |
+| Binary required  | None                     | ~850KB Rust server       |
 
 * Features
 
-- Fast file operations via binary RPC protocol (2-57x faster than shell-based TRAMP)
+- Fast file operations via binary RPC protocol (2-38x faster than shell-based TRAMP)
 - Async process support (~make-process~, ~start-file-process~)
 - Full VC mode integration (git, etc.)
+- Magit/Projectile optimizations with parallel git command prefetch
 - Automatic binary deployment (download or build from source)
 - Support for Linux and macOS (x86_64 and aarch64)
 - Batch/pipelined requests for reduced round-trip latency
+- Multi-hop support via SSH ProxyJump
+- Filesystem watching with automatic cache invalidation
 - PTY support for terminal emulators (vterm, eat)
 
 * Requirements
@@ -78,7 +81,7 @@ Access remote files using the ~rpc~ method:
 
 On first connection, the server binary is automatically obtained and deployed:
 
-1. *Download* from GitHub Releases (fastest, ~1MB download)
+1. *Download* from GitHub Releases (fastest, ~850KB download)
 2. *Build from source* if Rust is installed and download fails
 
 The binary is cached locally in =~/.emacs.d/tramp-rpc/= and deployed to =~/.cache/tramp-rpc/= on the remote host.
@@ -106,13 +109,12 @@ The Emacs Lisp client is organized into focused modules:
 
 | Module                     | Lines | Purpose                                    |
 |----------------------------+-------+--------------------------------------------|
-| ~tramp-rpc.el~             | ~2280 | Core RPC communication & file handlers     |
-| ~tramp-rpc-process.el~     | ~900  | Async process & PTY support                |
-| ~tramp-rpc-magit.el~       | (stub)| Git/Magit/Projectile optimizations (TBD)   |
-| ~tramp-rpc-advice.el~      | ~320  | Advice functions for process/VC integration|
-| ~tramp-rpc-protocol.el~    | 178   | MessagePack-RPC protocol implementation    |
-| ~tramp-rpc-deploy.el~      | 774   | Binary deployment & version management     |
-| ~tramp-rpc-autoloads.el~   | 43    | Package autoloads                          |
+| ~tramp-rpc.el~             | ~2450 | Core RPC communication & file handlers     |
+| ~tramp-rpc-process.el~     | ~1050 | Async process & PTY support                |
+| ~tramp-rpc-magit.el~       | ~780  | Magit/Projectile optimizations & caching   |
+| ~tramp-rpc-deploy.el~      | ~950  | Binary deployment & version management     |
+| ~tramp-rpc-advice.el~      | ~330  | Advice functions for process/VC integration|
+| ~tramp-rpc-protocol.el~    | ~190  | MessagePack-RPC protocol implementation    |
 
 *** Core Module (~tramp-rpc.el~)
 
@@ -134,7 +136,13 @@ Handles all process-related functionality:
 
 *** Magit Module (~tramp-rpc-magit.el~)
 
-Placeholder module for git/magit/projectile optimizations (to be added in future branches).
+Optimizations for git/magit/projectile on remote hosts:
+- Parallel git command prefetch via ~commands.run_parallel~ RPC (sends ~60+ git commands in a single round-trip)
+- TTL-based caches for file-exists and file-truename with max-size eviction
+- Filesystem watch management via server push notifications for cache invalidation
+- Process-file cache for serving git commands from prefetched data
+- Ancestor directory scanning for fast project/VC root detection
+- Projectile integration (force git ls-files, alien indexing for remote)
 
 *** Advice Module (~tramp-rpc-advice.el~)
 
@@ -149,13 +157,16 @@ Centralizes all advice functions:
 
 The server exposes RPC methods for:
 
-| Category  | Methods                                                  |
-|-----------+----------------------------------------------------------|
-| File      | ~file.stat~, ~file.read~, ~file.write~, ~file.copy~, ... |
-| Directory | ~dir.list~, ~dir.create~, ~dir.remove~, ~dir.completions~|
-| Process   | ~process.run~, ~process.start~, ~process.read~, ...      |
-| PTY       | ~process.start_pty~, ~process.read_pty~, ~process.resize_pty~, ... |
-| System    | ~system.info~, ~system.getenv~, ~system.statvfs~         |
+| Category  | Methods                                                            |
+|-----------+--------------------------------------------------------------------|
+| File      | ~file.stat~, ~file.stat_batch~, ~file.executable~, ~file.truename~ |
+| File I/O  | ~file.read~, ~file.write~, ~file.copy~, ~file.rename~, ~file.delete~, ~file.set_modes~, ~file.set_times~, ~file.make_symlink~, ~file.make_hardlink~, ~file.chown~ |
+| Directory | ~dir.list~, ~dir.create~, ~dir.remove~, ~dir.completions~         |
+| Process   | ~process.run~, ~process.start~, ~process.read~, ~process.write~, ~process.close_stdin~, ~process.kill~, ~process.list~ |
+| PTY       | ~process.start_pty~, ~process.read_pty~, ~process.write_pty~, ~process.resize_pty~, ~process.kill_pty~, ~process.close_pty~, ~process.list_pty~ |
+| System    | ~system.info~, ~system.getenv~, ~system.expand_path~, ~system.statvfs~, ~system.groups~ |
+| Batch     | ~batch~, ~commands.run_parallel~, ~ancestors.scan~                 |
+| Watch     | ~watch.add~, ~watch.remove~, ~watch.list~                         |
 
 * Binary Deployment
 
@@ -286,7 +297,7 @@ If you experience issues with ~diff-hl~ in dired buffers on remote hosts:
 
 ** Connection issues
 
-The server binary is deployed using standard SSH (~sshx~ method). Ensure you can connect to the remote host with:
+The server binary is deployed using standard SSH (~scpx~ method by default). Ensure you can connect to the remote host with:
 
 #+begin_src bash
 ssh -o BatchMode=yes user@host echo success
@@ -369,15 +380,19 @@ File content, paths, and process I/O are transmitted as raw binary (MessagePack 
 
 TRAMP-RPC significantly outperforms traditional TRAMP for most operations:
 
-| Operation       | Speedup vs SSH |
-|-----------------+----------------|
-| file-exists     | 13.7x          |
-| file-write      | 56.6x          |
-| directory-files | 10.5x          |
-| copy-file       | 8.7x           |
-| git commands    | 2-5x           |
+| Operation              | RPC (median) | SSH (median) | Speedup |
+|------------------------+--------------+--------------+---------|
+| connection-setup       | 31 ms        | 1.17 s       | 38.2x   |
+| file-exists            | 3.3 ms       | 38.8 ms      | 11.9x   |
+| file-attributes        | 3.4 ms       | 23.3 ms      | 6.8x    |
+| dir-files-and-attrs    | 3.5 ms       | 95.9 ms      | 27.1x   |
+| file-read              | 7.7 ms       | 20.2 ms      | 2.6x    |
+| file-write             | 74.2 ms      | 219.9 ms     | 3.0x    |
+| directory-files        | 12.1 ms      | 37.2 ms      | 3.1x    |
+| copy-file              | 43.1 ms      | 192.0 ms     | 4.5x    |
+| 10x file-attributes    | 37.6 ms      | 304.7 ms     | 8.1x    |
 
-Batch operations provide additional 3-6x speedup by combining multiple requests into a single round-trip.
+Batch operations provide additional 2-4x speedup by combining multiple requests into a single round-trip (e.g., 10x file.stat drops from 37.6 ms sequential to 9.1 ms batched).
 
 For detailed benchmarks and an in-depth technical comparison with original TRAMP, see [[file:doc/TECHNICAL_COMPARISON.org][Technical Comparison]].
 
@@ -387,12 +402,14 @@ TRAMP-RPC includes a comprehensive test suite using Emacs ERT (Emacs Lisp Regres
 
 ** Test Categories
 
-| Category          | Tests | Requirements           |
-|-------------------+-------+------------------------|
-| Protocol          | 6     | None (pure Elisp)      |
-| Conversion        | 2     | None (pure Elisp)      |
-| Server Integration| 4     | RPC server binary      |
-| Remote File Ops   | 18    | SSH + RPC server       |
+| Category           | Tests | Requirements           |
+|--------------------+-------+------------------------|
+| Protocol           | 8     | None (pure Elisp)      |
+| Conversion         | 2     | None (pure Elisp)      |
+| Server Integration | 4     | RPC server binary      |
+| Multi-hop          | 21    | None (pure Elisp)      |
+| Autoload           | 8     | None (pure Elisp)      |
+| Remote File Ops    | 53    | SSH + RPC server       |
 
 ** Running Tests
 
@@ -436,15 +453,23 @@ emacs -Q --batch \
 
 - =test/tramp-rpc-tests.el= - Full ERT test suite for remote operations
 - =test/tramp-rpc-mock-tests.el= - CI-compatible tests (no SSH required)
+- =test/tramp-rpc-autoload-tests.el= - Autoload mechanism tests
+- =test/run-tramp-tests.el= - Upstream tramp-tests.el against tramp-rpc backend
 - =test/run-tests.sh= - Test runner script
+- =test/run-autoload-tests.sh= - Autoload test runner
 
 ** CI Integration
 
 The GitHub Actions workflow runs:
 
-1. *Protocol Tests* - MessagePack-RPC encoding/decoding (no server)
-2. *Server Integration Tests* - Direct server communication (Rust binary)
-3. *Full Test Suite* - (main branch only) Complete tests via SSH to localhost
+1. *Rust Build* - Builds for 4 targets (x86_64/aarch64 Linux/macOS) with format check
+2. *Elisp Byte-compile* - Verifies all .el files compile without errors
+3. *Autoload Tests* - Verifies method registration and handler setup
+4. *Protocol Tests* - MessagePack-RPC encoding/decoding (no server)
+5. *Multi-hop Tests* - ProxyJump conversion, connection keys, hop normalization
+6. *Server Integration Tests* - Direct server communication (Rust binary)
+7. *Full Test Suite* - Complete tests via SSH to localhost
+8. *Upstream TRAMP Tests* - Runs tramp-tests.el against tramp-rpc backend
 
 * License
 

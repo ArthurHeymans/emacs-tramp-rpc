@@ -97,6 +97,59 @@ jobs:
       - name: List artifacts
         run: ls -la artifacts/
 
+      - name: Generate release notes
+        id: notes
+        run: |
+          VERSION=${{ steps.version.outputs.version }}
+          TAG=${{ steps.version.outputs.tag }}
+
+          # Find the previous tag
+          PREV_TAG=$(git tag --sort=-v:refname | grep -v "^${TAG}$" | head -1)
+
+          # Generate changelog from commits
+          if [ -n "$PREV_TAG" ]; then
+            CHANGELOG=$(git log ${PREV_TAG}..${TAG} --oneline --no-merges --pretty=format:"- %s" | grep -v "^- Bump tramp-rpc-deploy version")
+            RANGE="${PREV_TAG}...${TAG}"
+          else
+            CHANGELOG=$(git log --oneline --no-merges --pretty=format:"- %s" | head -20)
+            RANGE=""
+          fi
+
+          # Write the release body
+          cat > release-notes.md << ENDOFNOTES
+          ## tramp-rpc-server ${VERSION}
+
+          ### What's Changed
+
+          ${CHANGELOG}
+
+          **Full Changelog**: https://github.com/${{ github.repository }}/compare/${RANGE}
+
+          ### Installation
+
+          This release is automatically downloaded by the Emacs package when needed.
+
+          For manual installation, download the appropriate binary for your architecture:
+
+          | Architecture | File | Notes |
+          |-------------|------|-------|
+          | Linux x86_64 | \`tramp-rpc-server-x86_64-linux-${VERSION}.tar.gz\` | Static musl binary |
+          | Linux aarch64 | \`tramp-rpc-server-aarch64-linux-${VERSION}.tar.gz\` | Static musl binary |
+          | macOS x86_64 | \`tramp-rpc-server-x86_64-darwin-${VERSION}.tar.gz\` | |
+          | macOS aarch64 (Apple Silicon) | \`tramp-rpc-server-aarch64-darwin-${VERSION}.tar.gz\` | |
+
+          Linux binaries are fully statically linked and will work on any Linux distribution.
+
+          Extract and place the binary in:
+          \`\`\`
+          ~/.cache/tramp-rpc/tramp-rpc-server-${VERSION}
+          \`\`\`
+
+          ### Checksums
+
+          SHA256 checksums are provided in \`.sha256\` files for each binary.
+          ENDOFNOTES
+
       - name: Create Release
         uses: softprops/action-gh-release@v1
         with:
@@ -107,36 +160,6 @@ jobs:
           files: |
             artifacts/*.tar.gz
             artifacts/*.sha256
-          body: |
-            ## tramp-rpc-server ${{ steps.version.outputs.version }}
-
-            ### What's New
-
-            - **Size-optimized static binaries** - Linux binaries are now fully static (musl) and ~45% smaller
-            - Built with `build-std` for maximum size reduction
-
-            ### Installation
-
-            This release is automatically downloaded by the Emacs package when needed.
-
-            For manual installation, download the appropriate binary for your architecture:
-
-            | Architecture | File | Notes |
-            |-------------|------|-------|
-            | Linux x86_64 | `tramp-rpc-server-x86_64-linux-${{ steps.version.outputs.version }}.tar.gz` | Static musl binary |
-            | Linux aarch64 | `tramp-rpc-server-aarch64-linux-${{ steps.version.outputs.version }}.tar.gz` | Static musl binary |
-            | macOS x86_64 | `tramp-rpc-server-x86_64-darwin-${{ steps.version.outputs.version }}.tar.gz` | |
-            | macOS aarch64 (Apple Silicon) | `tramp-rpc-server-aarch64-darwin-${{ steps.version.outputs.version }}.tar.gz` | |
-
-            Linux binaries are fully statically linked and will work on any Linux distribution.
-
-            Extract and place the binary in:
-            ```
-            ~/.cache/tramp-rpc/tramp-rpc-server-${{ steps.version.outputs.version }}
-            ```
-
-            ### Checksums
-
-            SHA256 checksums are provided in `.sha256` files for each binary.
+          body_path: release-notes.md
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
