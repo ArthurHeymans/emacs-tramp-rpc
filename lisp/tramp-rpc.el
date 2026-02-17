@@ -1238,15 +1238,28 @@ Returns an alist with path."
 
 (defun tramp-rpc-handle-file-executable-p (filename)
   "Like `file-executable-p' for TRAMP-RPC files.
-Checks executable permission from cached `file-attributes' mode bits
-using `tramp-check-cached-permissions'.  No RPC call needed."
+Checks execute permission from `file-attributes' mode string and
+the remote uid/gid.  No dedicated RPC call needed."
   (with-parsed-tramp-file-name (expand-file-name filename) nil
     (with-tramp-file-property v localname "file-executable-p"
-      ;; `tramp-check-cached-permissions' gained an optional FORCE arg
-      ;; after Emacs 30.1.  Use 2-arg form for compatibility.
-      (or (tramp-check-cached-permissions v ?x)
-          (tramp-check-cached-permissions v ?s)
-          (tramp-check-cached-permissions v ?t)))))
+      (when-let* ((attrs (file-attributes filename 'integer))
+                  ;; Don't check symlinks directly.
+                  ((not (stringp (file-attribute-type attrs))))
+                  (mode-string (file-attribute-modes attrs))
+                  (remote-uid (tramp-get-remote-uid v 'integer))
+                  (remote-gid (tramp-get-remote-gid v 'integer)))
+        (or
+         ;; World executable.
+         (memq (aref mode-string 9) '(?x ?t))
+         ;; Owner executable and we are owner (or root).
+         (and (memq (aref mode-string 3) '(?x ?s))
+              (or (equal remote-uid tramp-root-id-integer)
+                  (equal remote-uid (file-attribute-user-id attrs))))
+         ;; Group executable and we are in that group.
+         (and (memq (aref mode-string 6) '(?x ?s))
+              (or (equal remote-gid (file-attribute-group-id attrs))
+                  (member (file-attribute-group-id attrs)
+                          (tramp-get-remote-groups v 'integer)))))))))
 
 (defun tramp-rpc--call-file-stat (vec localname &optional lstat)
   "Call file.stat for LOCALNAME on VEC, returning nil if file doesn't exist.
