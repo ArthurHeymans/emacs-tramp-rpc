@@ -54,7 +54,6 @@
 (defvar tramp-rpc-controlmaster-persist)
 (defvar tramp-rpc-ssh-options)
 (defvar tramp-rpc-ssh-args)
-(defvar tramp-rpc-use-async-read)
 (defvar tramp-rpc-async-read-timeout-ms)
 (defvar tramp-rpc--delivering-output)
 
@@ -73,27 +72,6 @@ Value is a plist with :vec, :pid.")
 (defvar tramp-rpc--process-write-queues (make-hash-table :test 'eql)
   "Hash table mapping remote PIDs to write queue state.
 Value is a plist with :pending (list of pending write data) and :writing (bool).")
-
-;; ============================================================================
-;; Polling configuration
-;; ============================================================================
-
-(defvar tramp-rpc--process-poll-interval-min 0.01
-  "Minimum interval in seconds between polling remote process for output.
-Used when process is actively producing output.")
-
-(defvar tramp-rpc--process-poll-interval-max 0.5
-  "Maximum interval in seconds between polling remote process for output.
-Used when process has been idle for a while.")
-
-(defvar tramp-rpc--process-poll-interval-initial 0.05
-  "Initial interval in seconds for polling a new process.")
-
-(defvar tramp-rpc--process-poll-backoff-factor 1.5
-  "Factor by which to increase poll interval when no output is received.")
-
-(defvar tramp-rpc--poll-in-progress nil
-  "Non-nil while a poll is in progress (prevents reentrancy).")
 
 ;; ============================================================================
 ;; Remote process primitives
@@ -309,118 +287,6 @@ RESPONSE is the decoded RPC response plist."
        ;; On error, clean up
        (run-at-time 0 nil #'tramp-rpc--handle-process-exit local-process -1)))))
 
-(defun tramp-rpc--adjust-poll-interval (local-process had-output)
-  "Adjust the poll interval for LOCAL-PROCESS based on whether it HAD-OUTPUT.
-Returns the new interval."
-  (let* ((info (gethash local-process tramp-rpc--async-processes))
-         (current-interval (or (plist-get info :poll-interval)
-                               tramp-rpc--process-poll-interval-initial))
-         (new-interval
-          (if had-output
-              ;; Got output - use minimum interval for responsiveness
-              tramp-rpc--process-poll-interval-min
-            ;; No output - back off gradually
-            (min (* current-interval tramp-rpc--process-poll-backoff-factor)
-                 tramp-rpc--process-poll-interval-max))))
-    ;; Update stored interval
-    (when info
-      (plist-put info :poll-interval new-interval))
-    new-interval))
-
-(defun tramp-rpc--reschedule-poll-timer (local-process new-interval)
-  "Reschedule the poll timer for LOCAL-PROCESS with NEW-INTERVAL."
-  (let ((info (gethash local-process tramp-rpc--async-processes)))
-    (when info
-      (when-let* ((old-timer (plist-get info :timer)))
-        (cancel-timer old-timer))
-      (let ((new-timer (run-with-timer
-                        new-interval
-                        new-interval
-                        #'tramp-rpc--poll-process
-                        local-process)))
-        (plist-put info :timer new-timer)))))
-
-(defun tramp-rpc--poll-process (local-process)
-  "Poll for output from the remote process associated with LOCAL-PROCESS."
-  ;; Guard against reentrancy (can happen during accept-process-output)
-  ;; Also ensure quitting is allowed since timers run with inhibit-quit=t
-  (unless tramp-rpc--poll-in-progress
-    (let ((tramp-rpc--poll-in-progress t)
-          (inhibit-quit nil))
-      (when (process-live-p local-process)
-        (let ((info (gethash local-process tramp-rpc--async-processes)))
-          (when info
-            (let* ((vec (plist-get info :vec))
-                   (pid (plist-get info :pid))
-                   (stderr-buffer (plist-get info :stderr-buffer))
-                   (process-gone nil)
-                   (result (condition-case err
-                               (tramp-rpc--read-remote-process vec pid)
-                             (error
-                              ;; Check if this is a "process not found" error
-                              ;; which means the remote process died unexpectedly
-                              (if (string-match-p "Process not found" (error-message-string err))
-                                  (progn
-                                    (tramp-rpc--debug "POLL process %s gone (pid=%s)" local-process pid)
-                                    (setq process-gone t)
-                                    nil)
-                                (message "tramp-rpc: Error polling process: %s" err)
-                                nil))))
-                   (had-output nil))
-              ;; If the remote process disappeared, clean up and stop
-              (when process-gone
-                (tramp-rpc--handle-process-exit local-process -1))
-              (when (and result (not process-gone))
-            ;; Handle stdout - send to process filter/buffer
-            (when-let* ((stdout (plist-get result :stdout)))
-              (when (> (length stdout) 0)
-                (setq had-output t)
-                (if-let* ((filter (process-filter local-process)))
-                    (funcall filter local-process stdout)
-                  (when-let* ((buf (process-buffer local-process)))
-                    (when (buffer-live-p buf)
-                      (with-current-buffer buf
-                        (let ((inhibit-read-only t))
-                          (goto-char (point-max))
-                          (insert stdout))))))))
-
-            ;; Handle stderr - send to stderr buffer if specified
-            (when-let* ((stderr (plist-get result :stderr)))
-              (when (> (length stderr) 0)
-                (setq had-output t)
-                (cond
-                 ((bufferp stderr-buffer)
-                  (when (buffer-live-p stderr-buffer)
-                    (with-current-buffer stderr-buffer
-                      (let ((inhibit-read-only t))
-                        (goto-char (point-max))
-                        (insert stderr)))))
-                 ;; If no stderr buffer, mix with stdout
-                 (t
-                  (if-let* ((filter (process-filter local-process)))
-                      (funcall filter local-process stderr)
-                    (when-let* ((buf (process-buffer local-process)))
-                      (when (buffer-live-p buf)
-                        (with-current-buffer buf
-                          (let ((inhibit-read-only t))
-                            (goto-char (point-max))
-                            (insert stderr))))))))))
-
-            ;; Adaptive polling: adjust interval based on output
-            (let* ((current-interval (or (plist-get info :poll-interval)
-                                         tramp-rpc--process-poll-interval-initial))
-                   (new-interval (tramp-rpc--adjust-poll-interval
-                                  local-process had-output)))
-              ;; Only reschedule if interval changed significantly (>20%)
-              (when (> (abs (- new-interval current-interval))
-                       (* 0.2 current-interval))
-                (tramp-rpc--reschedule-poll-timer local-process new-interval)))
-
-            ;; Check if process exited
-            (when (plist-get result :exited)
-              (tramp-rpc--handle-process-exit
-               local-process (plist-get result :exit-code)))))))))))
-
 (defun tramp-rpc--handle-process-exit (local-process exit-code)
   "Handle exit of remote process associated with LOCAL-PROCESS.
 Stores the remote exit code and sends EOF to the local cat relay so
@@ -435,9 +301,6 @@ before the cat relay drains its pipe causes a stale FD that makes
 `input-pending-p' return t permanently, starving keyboard input."
   (let ((info (gethash local-process tramp-rpc--async-processes)))
     (when info
-      ;; Cancel the timer (if using timer-based polling)
-      (when-let* ((timer (plist-get info :timer)))
-        (cancel-timer timer))
       ;; Clean up write queue for this process's PID
       (when-let* ((pid (plist-get info :pid)))
         (remhash pid tramp-rpc--process-write-queues))

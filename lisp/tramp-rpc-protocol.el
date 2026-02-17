@@ -22,6 +22,7 @@
 
 ;;; Code:
 
+(require 'cl-lib)
 (require 'msgpack)
 
 (defvar tramp-rpc-protocol--request-id 0
@@ -35,16 +36,6 @@
   "Add 4-byte big-endian length prefix to PAYLOAD (unibyte string)."
   (let ((len (length payload)))
     (concat (msgpack-unsigned-to-bytes len 4) payload)))
-
-(defun tramp-rpc-protocol-encode-request (method params)
-  "Encode a MessagePack-RPC request for METHOD with PARAMS.
-Returns a length-prefixed unibyte string ready for transmission."
-  (let* ((request `((version . "2.0")
-                    (id . ,(tramp-rpc-protocol--next-id))
-                    (method . ,method)
-                    (params . ,params)))
-         (payload (msgpack-encode request)))
-    (tramp-rpc-protocol--length-prefix payload)))
 
 (defun tramp-rpc-protocol-encode-request-with-id (method params)
   "Encode a MessagePack-RPC request for METHOD with PARAMS.
@@ -107,16 +98,10 @@ Returns the integer errno, or nil if not an IO error with errno."
     (when data
       (alist-get 'os_errno data))))
 
-;; Error codes
-(defconst tramp-rpc-protocol-error-parse -32700)
-(defconst tramp-rpc-protocol-error-invalid-request -32600)
-(defconst tramp-rpc-protocol-error-method-not-found -32601)
-(defconst tramp-rpc-protocol-error-invalid-params -32602)
-(defconst tramp-rpc-protocol-error-internal -32603)
+;; Error codes (only codes actually used by the client)
 (defconst tramp-rpc-protocol-error-file-not-found -32001)
 (defconst tramp-rpc-protocol-error-permission-denied -32002)
 (defconst tramp-rpc-protocol-error-io -32003)
-(defconst tramp-rpc-protocol-error-process -32004)
 
 ;; ============================================================================
 ;; Length-prefixed framing support
@@ -145,19 +130,6 @@ the leftover bytes.  Returns nil if no complete message yet."
 ;; ============================================================================
 ;; Batch request support
 ;; ============================================================================
-
-(defun tramp-rpc-protocol-encode-batch-request (requests)
-  "Encode a batch request containing multiple REQUESTS.
-REQUESTS is a list of (METHOD . PARAMS) cons cells.
-Returns length-prefixed bytes for a single RPC call to the batch method."
-  (let ((batch-requests
-         (mapcar (lambda (req)
-                   `((method . ,(car req))
-                     (params . ,(cdr req))))
-                 requests)))
-    (tramp-rpc-protocol-encode-request
-     "batch"
-     `((requests . ,(vconcat batch-requests))))))
 
 (defun tramp-rpc-protocol-encode-batch-request-with-id (requests)
   "Encode a batch request containing multiple REQUESTS.

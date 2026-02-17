@@ -130,7 +130,7 @@ fn get_file_attributes_at(
 }
 
 /// List directory contents using optimized synchronous I/O with d_type and fstatat
-pub async fn list(params: &Value) -> HandlerResult {
+pub async fn list(params: Value) -> HandlerResult {
     #[derive(Deserialize)]
     struct Params {
         #[serde(with = "path_or_bytes")]
@@ -148,10 +148,10 @@ pub async fn list(params: &Value) -> HandlerResult {
     }
 
     let params: Params =
-        from_value(params.clone()).map_err(|e| RpcError::invalid_params(e.to_string()))?;
+        from_value(params).map_err(|e| RpcError::invalid_params(e.to_string()))?;
 
     let path = bytes_to_path(&params.path);
-    let path_str = path.to_string_lossy().to_string();
+    let path_str = path.to_string_lossy().into_owned();
     let include_attrs = params.include_attrs;
     let include_hidden = params.include_hidden;
 
@@ -285,7 +285,7 @@ fn file_type_from_metadata_ft(ft: &std::fs::FileType) -> FileType {
 }
 
 /// Create a directory
-pub async fn create(params: &Value) -> HandlerResult {
+pub async fn create(params: Value) -> HandlerResult {
     #[derive(Deserialize)]
     struct Params {
         #[serde(with = "path_or_bytes")]
@@ -303,10 +303,10 @@ pub async fn create(params: &Value) -> HandlerResult {
     }
 
     let params: Params =
-        from_value(params.clone()).map_err(|e| RpcError::invalid_params(e.to_string()))?;
+        from_value(params).map_err(|e| RpcError::invalid_params(e.to_string()))?;
 
     let path = bytes_to_path(&params.path);
-    let path_str = path.to_string_lossy().to_string();
+    let path_str = path.to_string_lossy().into_owned();
 
     let result = if params.parents {
         fs::create_dir_all(&path).await
@@ -330,7 +330,7 @@ pub async fn create(params: &Value) -> HandlerResult {
 }
 
 /// Remove a directory
-pub async fn remove(params: &Value) -> HandlerResult {
+pub async fn remove(params: Value) -> HandlerResult {
     #[derive(Deserialize)]
     struct Params {
         #[serde(with = "path_or_bytes")]
@@ -341,10 +341,10 @@ pub async fn remove(params: &Value) -> HandlerResult {
     }
 
     let params: Params =
-        from_value(params.clone()).map_err(|e| RpcError::invalid_params(e.to_string()))?;
+        from_value(params).map_err(|e| RpcError::invalid_params(e.to_string()))?;
 
     let path = bytes_to_path(&params.path);
-    let path_str = path.to_string_lossy().to_string();
+    let path_str = path.to_string_lossy().into_owned();
 
     let result = if params.recursive {
         fs::remove_dir_all(&path).await
