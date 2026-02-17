@@ -303,27 +303,6 @@ impl FileAttributes {
     }
 }
 
-/// Stat result - either attributes or an error
-#[derive(Debug, Serialize)]
-#[serde(untagged)]
-pub enum StatResult {
-    Ok(FileAttributes),
-    Err { error: String },
-}
-
-impl StatResult {
-    /// Convert to a MessagePack Value with named fields
-    pub fn to_value(&self) -> Value {
-        match self {
-            StatResult::Ok(attrs) => attrs.to_value(),
-            StatResult::Err { error } => Value::Map(vec![(
-                Value::String("error".into()),
-                Value::String(error.clone().into()),
-            )]),
-        }
-    }
-}
-
 /// Directory entry - filenames are now raw bytes (binary in MessagePack)
 #[derive(Debug, Serialize, Deserialize)]
 pub struct DirEntry {
@@ -500,11 +479,6 @@ impl IntoValue for Value {
     fn into_value(self) -> Value {
         self
     }
-}
-
-/// Helper to convert a serializable type to rmpv::Value
-pub fn to_value<T: Serialize>(value: &T) -> Result<Value, rmpv::ext::Error> {
-    rmpv::ext::to_value(value)
 }
 
 /// Helper to deserialize from rmpv::Value to a typed struct

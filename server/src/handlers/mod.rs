@@ -236,15 +236,12 @@ async fn dispatch_inner(request: &Request) -> Response {
     let result = match request.method.as_str() {
         // File metadata operations
         "file.stat" => file::stat(&request.params).await,
-        "file.stat_batch" => file::stat_batch(&request.params).await,
-        "file.executable" => file::executable(&request.params).await,
         "file.truename" => file::truename(&request.params).await,
 
         // Directory operations
         "dir.list" => dir::list(&request.params).await,
         "dir.create" => dir::create(&request.params).await,
         "dir.remove" => dir::remove(&request.params).await,
-        "dir.completions" => dir::completions(&request.params).await,
 
         // File I/O operations
         "file.read" => io::read(&request.params).await,

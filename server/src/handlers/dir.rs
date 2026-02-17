@@ -5,7 +5,7 @@
 //! - `fstatat` with directory fd for efficient attribute collection
 //! - Synchronous blocking task to avoid per-entry async overhead
 
-use crate::protocol::{from_value, to_value, DirEntry, FileAttributes, FileType, RpcError};
+use crate::protocol::{from_value, DirEntry, FileAttributes, FileType, RpcError};
 use rmpv::Value;
 use serde::Deserialize;
 use std::os::unix::ffi::OsStrExt;
@@ -357,50 +357,4 @@ pub async fn remove(params: &Value) -> HandlerResult {
     Ok(Value::Boolean(true))
 }
 
-/// Get completions for a path prefix
-pub async fn completions(params: &Value) -> HandlerResult {
-    #[derive(Deserialize)]
-    struct Params {
-        /// Directory to search in
-        directory: String,
-        /// Prefix to complete
-        prefix: String,
-    }
 
-    let params: Params =
-        from_value(params.clone()).map_err(|e| RpcError::invalid_params(e.to_string()))?;
-
-    let directory = super::expand_tilde(&params.directory);
-    let prefix = params.prefix.clone();
-
-    // Use synchronous I/O in blocking task - d_type gives us directory detection for free
-    let completions = tokio::task::spawn_blocking(move || completions_sync(&directory, &prefix))
-        .await
-        .map_err(|e| RpcError::internal_error(format!("Task join error: {}", e)))?
-        .map_err(|e| map_io_error(e, &params.directory))?;
-
-    to_value(&completions).map_err(|e| RpcError::internal_error(e.to_string()))
-}
-
-/// Synchronous completions using d_type for directory detection
-fn completions_sync(directory: &str, prefix: &str) -> Result<Vec<String>, std::io::Error> {
-    let mut completions: Vec<String> = Vec::new();
-
-    for entry_result in std::fs::read_dir(directory)? {
-        let entry = entry_result?;
-        let name = entry.file_name().to_string_lossy().to_string();
-
-        if name.starts_with(prefix) {
-            // file_type() uses d_type on Linux - no extra stat syscall
-            let suffix = if entry.file_type().map(|ft| ft.is_dir()).unwrap_or(false) {
-                "/"
-            } else {
-                ""
-            };
-            completions.push(format!("{}{}", name, suffix));
-        }
-    }
-
-    completions.sort();
-    Ok(completions)
-}
