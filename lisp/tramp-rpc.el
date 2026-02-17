@@ -728,24 +728,36 @@ accidentally routing file operations through tramp-sh."
   ;; - Password: prompts user, then subsequent connections reuse it
   (when tramp-rpc-use-controlmaster
     (tramp-rpc--establish-controlmaster vec))
-  ;; Try connecting with the expected binary path first.  This avoids
-  ;; opening a bootstrap (scpx) connection just to run `test -x binary',
-  ;; which takes ~6s for tramp-sh to establish the shell.  If the binary
-  ;; exists (the common case after first deploy), this connects directly.
-  ;; If it doesn't exist (first time or after version bump), SSH exits
-  ;; immediately, we catch the error, deploy via scpx, and retry.
-  (condition-case nil
-      (tramp-rpc--start-server-process
-       vec (tramp-rpc-deploy-expected-binary-localname))
-    (remote-file-error
-     ;; Connection failed - binary likely missing.  Clean up and deploy.
-     (tramp-rpc--cleanup-failed-connection vec)
-     (let ((binary-path (tramp-rpc-deploy-ensure-binary vec)))
-       ;; Close the bootstrap connection - it's no longer needed and
-       ;; leaving it alive can cause vc/diff-hl sentinels to route
-       ;; file operations through tramp-sh instead of tramp-rpc.
-       (tramp-rpc--cleanup-bootstrap-connection vec)
-       (tramp-rpc--start-server-process vec binary-path)))))
+  (if tramp-rpc-deploy-never-deploy
+      ;; Never-deploy mode: use the configured path directly, no fallback.
+      (let ((binary-path (tramp-rpc-deploy-ensure-binary vec)))
+        (condition-case err
+            (tramp-rpc--start-server-process vec binary-path)
+          (remote-file-error
+           (tramp-rpc--cleanup-failed-connection vec)
+           (signal 'remote-file-error
+                   (list "tramp-rpc-server not found at \"%s\" on %s (never-deploy is set, no deployment attempted). Set `tramp-rpc-deploy-remote-binary-path' to the correct path. Original error: %s"
+                         binary-path (tramp-file-name-host vec)
+                         (error-message-string err))))))
+    ;; Normal mode: try expected path first, deploy on failure.
+    ;; This avoids opening a bootstrap (scpx) connection just to run
+    ;; `test -x binary', which takes ~6s for tramp-sh to establish the
+    ;; shell.  If the binary exists (the common case after first deploy),
+    ;; this connects directly.  If it doesn't exist (first time or after
+    ;; version bump), SSH exits immediately, we catch the error, deploy
+    ;; via scpx, and retry.
+    (condition-case nil
+        (tramp-rpc--start-server-process
+         vec (tramp-rpc-deploy-expected-binary-localname))
+      (remote-file-error
+       ;; Connection failed - binary likely missing.  Clean up and deploy.
+       (tramp-rpc--cleanup-failed-connection vec)
+       (let ((binary-path (tramp-rpc-deploy-ensure-binary vec)))
+         ;; Close the bootstrap connection - it's no longer needed and
+         ;; leaving it alive can cause vc/diff-hl sentinels to route
+         ;; file operations through tramp-sh instead of tramp-rpc.
+         (tramp-rpc--cleanup-bootstrap-connection vec)
+         (tramp-rpc--start-server-process vec binary-path))))))
 
 (defun tramp-rpc--disconnect (vec)
   "Disconnect the RPC connection to VEC."

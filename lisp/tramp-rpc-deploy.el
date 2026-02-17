@@ -84,8 +84,52 @@ are placed here and used directly without needing to download or cache.")
   :group 'tramp-rpc-deploy)
 
 (defcustom tramp-rpc-deploy-auto-deploy t
-  "If non-nil, automatically deploy the server binary when needed."
+  "If non-nil, automatically deploy the server binary when needed.
+This has no effect when `tramp-rpc-deploy-never-deploy' is non-nil,
+since that option takes precedence and disables all deployment."
   :type 'boolean
+  :group 'tramp-rpc-deploy)
+
+(defcustom tramp-rpc-deploy-never-deploy nil
+  "If non-nil, never deploy binaries to remote hosts.
+This completely disables all binary deployment (downloading from
+GitHub, building from source, and transferring to the remote).
+When this is set, `tramp-rpc-deploy-auto-deploy' has no effect.
+
+The server binary must already be installed on the remote host.
+Use `tramp-rpc-deploy-remote-binary-path' to specify the full
+path to the binary on the remote.  If that variable is nil, the
+bare name \"tramp-rpc-server\" is used, which requires the binary
+to be in the remote shell's PATH.
+
+Note: SSH with BatchMode=yes may not source login shell profiles
+\(e.g., ~/.profile), so PATH may be limited.  Setting
+`tramp-rpc-deploy-remote-binary-path' to an absolute path is
+recommended for reliability.
+
+This option is useful for security-conscious setups where the
+server is managed by the system package manager (e.g., Nix, Guix)
+or manually installed.
+
+To configure different paths for different hosts, use Emacs
+connection-local variables."
+  :type 'boolean
+  :group 'tramp-rpc-deploy)
+
+(defcustom tramp-rpc-deploy-remote-binary-path nil
+  "Explicit path to the tramp-rpc-server binary on the remote host.
+When `tramp-rpc-deploy-never-deploy' is non-nil and this is set,
+this path is used directly as the command in the SSH invocation.
+
+Examples:
+  \"/usr/bin/tramp-rpc-server\"
+  \"/run/current-system/sw/bin/tramp-rpc-server\"
+  \"/home/user/.nix-profile/bin/tramp-rpc-server\"
+
+When nil, the bare name \"tramp-rpc-server\" is used, relying on
+the remote shell's PATH to locate it."
+  :type '(choice (const :tag "Use PATH lookup" nil)
+                 (string :tag "Absolute path"))
   :group 'tramp-rpc-deploy)
 
 (defcustom tramp-rpc-deploy-prefer-build nil
@@ -678,25 +722,37 @@ opening a bootstrap (scpx) connection for the deploy check."
 
 (defun tramp-rpc-deploy-ensure-binary (vec)
   "Ensure the tramp-rpc-server binary is available on remote VEC.
-Returns the remote path to the binary.
-If `tramp-rpc-deploy-auto-deploy' is nil and the binary is missing,
-signals an error."
-  (let ((bootstrap-vec (tramp-rpc-deploy--bootstrap-vec vec)))
-    (if (tramp-rpc-deploy--remote-binary-exists-p bootstrap-vec)
-        ;; Binary already exists
-        (tramp-file-local-name (tramp-rpc-deploy--remote-binary-path bootstrap-vec))
-      ;; Need to deploy
-      (if tramp-rpc-deploy-auto-deploy
-          (let* ((arch (tramp-rpc-deploy--detect-remote-arch bootstrap-vec))
-                 (local-binary (tramp-rpc-deploy--ensure-local-binary arch)))
-            (message "Deploying tramp-rpc-server (%s) to %s..."
-                     arch (tramp-file-name-host vec))
-            (tramp-file-local-name
-             (tramp-rpc-deploy--transfer-binary bootstrap-vec local-binary)))
-        (signal
-	 'remote-file-error
-	 (list "tramp-rpc-server not found on %s and auto-deploy is disabled"
-               (tramp-file-name-host vec)))))))
+Returns the remote path (or bare binary name) to the binary.
+
+When `tramp-rpc-deploy-never-deploy' is non-nil, no deployment is
+attempted.  Returns `tramp-rpc-deploy-remote-binary-path' if set,
+otherwise the bare binary name \"tramp-rpc-server\".
+
+Otherwise, if `tramp-rpc-deploy-auto-deploy' is nil and the binary
+is missing, signals an error."
+  (if tramp-rpc-deploy-never-deploy
+      ;; Never deploy mode: use explicit path or bare binary name
+      (let ((path (or tramp-rpc-deploy-remote-binary-path
+                      tramp-rpc-deploy-binary-name)))
+        (message "tramp-rpc: never-deploy mode, using %s on remote" path)
+        path)
+    ;; Normal deployment flow
+    (let ((bootstrap-vec (tramp-rpc-deploy--bootstrap-vec vec)))
+      (if (tramp-rpc-deploy--remote-binary-exists-p bootstrap-vec)
+          ;; Binary already exists
+          (tramp-file-local-name (tramp-rpc-deploy--remote-binary-path bootstrap-vec))
+        ;; Need to deploy
+        (if tramp-rpc-deploy-auto-deploy
+            (let* ((arch (tramp-rpc-deploy--detect-remote-arch bootstrap-vec))
+                   (local-binary (tramp-rpc-deploy--ensure-local-binary arch)))
+              (message "Deploying tramp-rpc-server (%s) to %s..."
+                       arch (tramp-file-name-host vec))
+              (tramp-file-local-name
+               (tramp-rpc-deploy--transfer-binary bootstrap-vec local-binary)))
+          (signal
+	   'remote-file-error
+	   (list "tramp-rpc-server not found on %s and auto-deploy is disabled"
+                 (tramp-file-name-host vec))))))))
 
 (defun tramp-rpc-deploy-remove-binary (vec)
   "Remove the tramp-rpc-server binary from remote VEC."
@@ -731,6 +787,12 @@ signals an error."
       (insert "TRAMP-RPC Server Deployment Status\n")
       (insert "===================================\n\n")
       (insert (format "Version: %s\n" tramp-rpc-deploy-version))
+      (insert (format "Never deploy: %s\n" (if tramp-rpc-deploy-never-deploy "yes" "no")))
+      (when tramp-rpc-deploy-never-deploy
+        (insert (format "Remote binary path: %s\n"
+                        (or tramp-rpc-deploy-remote-binary-path
+                            (format "%s (PATH lookup)" tramp-rpc-deploy-binary-name)))))
+      (insert (format "Auto deploy: %s\n" (if tramp-rpc-deploy-auto-deploy "yes" "no")))
       (insert (format "Bootstrap method: %s%s\n"
                       tramp-rpc-deploy-bootstrap-method
                       (if (member tramp-rpc-deploy-bootstrap-method '("scp" "scpx" "rsync"))
