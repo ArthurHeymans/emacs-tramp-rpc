@@ -1239,27 +1239,31 @@ Returns an alist with path."
 (defun tramp-rpc-handle-file-executable-p (filename)
   "Like `file-executable-p' for TRAMP-RPC files.
 Checks execute permission from `file-attributes' mode string and
-the remote uid/gid.  No dedicated RPC call needed."
+the remote uid/gid.  No dedicated RPC call needed.
+For symlinks, follows through to the target (like
+`tramp-handle-file-readable-p' does)."
   (with-parsed-tramp-file-name (expand-file-name filename) nil
     (with-tramp-file-property v localname "file-executable-p"
-      (when-let* ((attrs (file-attributes filename 'integer))
-                  ;; Don't check symlinks directly.
-                  ((not (stringp (file-attribute-type attrs))))
-                  (mode-string (file-attribute-modes attrs))
-                  (remote-uid (tramp-get-remote-uid v 'integer))
-                  (remote-gid (tramp-get-remote-gid v 'integer)))
-        (or
-         ;; World executable.
-         (memq (aref mode-string 9) '(?x ?t))
-         ;; Owner executable and we are owner (or root).
-         (and (memq (aref mode-string 3) '(?x ?s))
-              (or (equal remote-uid tramp-root-id-integer)
-                  (equal remote-uid (file-attribute-user-id attrs))))
-         ;; Group executable and we are in that group.
-         (and (memq (aref mode-string 6) '(?x ?s))
-              (or (equal remote-gid (file-attribute-group-id attrs))
-                  (member (file-attribute-group-id attrs)
-                          (tramp-get-remote-groups v 'integer)))))))))
+      (when-let* ((attrs (file-attributes filename 'integer)))
+        (if (stringp (file-attribute-type attrs))
+            ;; Symlink: follow it and check the target.
+            (file-executable-p (file-truename filename))
+          ;; Regular file or directory: check mode bits.
+          (when-let* ((mode-string (file-attribute-modes attrs))
+                      (remote-uid (tramp-get-remote-uid v 'integer))
+                      (remote-gid (tramp-get-remote-gid v 'integer)))
+            (or
+             ;; World executable.
+             (memq (aref mode-string 9) '(?x ?t))
+             ;; Owner executable and we are owner (or root).
+             (and (memq (aref mode-string 3) '(?x ?s))
+                  (or (equal remote-uid tramp-root-id-integer)
+                      (equal remote-uid (file-attribute-user-id attrs))))
+             ;; Group executable and we are in that group.
+             (and (memq (aref mode-string 6) '(?x ?s))
+                  (or (equal remote-gid (file-attribute-group-id attrs))
+                      (member (file-attribute-group-id attrs)
+                              (tramp-get-remote-groups v 'integer)))))))))))
 
 (defun tramp-rpc--call-file-stat (vec localname &optional lstat)
   "Call file.stat for LOCALNAME on VEC, returning nil if file doesn't exist.
