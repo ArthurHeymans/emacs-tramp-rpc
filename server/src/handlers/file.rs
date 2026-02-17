@@ -1,6 +1,6 @@
 //! File metadata operations
 
-use crate::protocol::{from_value, FileAttributes, FileType, RpcError, StatResult};
+use crate::protocol::{from_value, FileAttributes, FileType, RpcError};
 use rmpv::Value;
 use serde::Deserialize;
 use std::collections::HashMap;
@@ -32,69 +32,6 @@ pub async fn stat(params: &Value) -> HandlerResult {
         Err(e) if e.code == RpcError::FILE_NOT_FOUND => Ok(Value::Nil),
         Err(e) => Err(e),
     }
-}
-
-/// Batch stat operation - returns results for multiple paths concurrently
-pub async fn stat_batch(params: &Value) -> HandlerResult {
-    #[derive(Deserialize)]
-    struct Params {
-        paths: Vec<String>,
-        #[serde(default)]
-        lstat: bool,
-    }
-
-    let params: Params =
-        from_value(params.clone()).map_err(|e| RpcError::invalid_params(e.to_string()))?;
-
-    // Run all stat operations concurrently
-    let futures: Vec<_> = params
-        .paths
-        .iter()
-        .map(|path| {
-            let path = path.clone();
-            let lstat = params.lstat;
-            async move {
-                let path = super::expand_tilde(&path);
-                match get_file_attributes(Path::new(&path), lstat).await {
-                    Ok(attrs) => StatResult::Ok(attrs),
-                    Err(e) => StatResult::Err {
-                        error: e.message.clone(),
-                    },
-                }
-            }
-        })
-        .collect();
-
-    let results = futures::future::join_all(futures).await;
-    // Convert to array of map values with named fields
-    let values: Vec<Value> = results.iter().map(|r| r.to_value()).collect();
-    Ok(Value::Array(values))
-}
-
-/// Check if file exists
-/// Check if file is executable
-pub async fn executable(params: &Value) -> HandlerResult {
-    #[derive(Deserialize)]
-    struct Params {
-        #[serde(with = "path_or_bytes")]
-        path: Vec<u8>,
-    }
-
-    let params: Params =
-        from_value(params.clone()).map_err(|e| RpcError::invalid_params(e.to_string()))?;
-
-    let path = bytes_to_path(&params.path);
-    let executable = tokio::task::spawn_blocking(move || {
-        use std::os::unix::ffi::OsStrExt;
-        let path_bytes = path.as_os_str().as_bytes();
-        let mut path_cstr = path_bytes.to_vec();
-        path_cstr.push(0);
-        unsafe { libc::access(path_cstr.as_ptr() as *const libc::c_char, libc::X_OK) == 0 }
-    })
-    .await
-    .unwrap_or(false);
-
-    Ok(Value::Boolean(executable))
 }
 
 /// Get the true name of a file (resolve symlinks)

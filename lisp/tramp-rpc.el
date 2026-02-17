@@ -1237,9 +1237,14 @@ Returns an alist with path."
 ;; ============================================================================
 
 (defun tramp-rpc-handle-file-executable-p (filename)
-  "Like `file-executable-p' for TRAMP-RPC files."
-  (with-parsed-tramp-file-name filename nil
-    (tramp-rpc--call v "file.executable" (tramp-rpc--encode-path localname))))
+  "Like `file-executable-p' for TRAMP-RPC files.
+Checks executable permission from cached `file-attributes' mode bits
+using `tramp-check-cached-permissions'.  No RPC call needed."
+  (with-parsed-tramp-file-name (expand-file-name filename) nil
+    (with-tramp-file-property v localname "file-executable-p"
+      (or (tramp-check-cached-permissions v ?x 'force)
+          (tramp-check-cached-permissions v ?s 'force)
+          (tramp-check-cached-permissions v ?t 'force)))))
 
 (defun tramp-rpc--call-file-stat (vec localname &optional lstat)
   "Call file.stat for LOCALNAME on VEC, returning nil if file doesn't exist.
@@ -2204,7 +2209,9 @@ Signals an error rather than returning nil, so that
 (defun tramp-rpc-handle-file-ownership-preserved-p (filename &optional group)
   "Like `file-ownership-preserved-p' for TRAMP-RPC files.
 Check if file ownership would be preserved when creating FILENAME.
-If GROUP is non-nil, also check that group would be preserved."
+If GROUP is non-nil, also check that group would be preserved.
+Uses cached `file-attributes' and connection-cached remote uid/gid,
+so this typically requires no RPC calls."
   (with-parsed-tramp-file-name (expand-file-name filename) nil
     (let ((attributes (file-attributes filename 'integer)))
       ;; Return t if the file doesn't exist, since it's true that no
@@ -2212,10 +2219,10 @@ If GROUP is non-nil, also check that group would be preserved."
       (or (null attributes)
           (and
            (= (file-attribute-user-id attributes)
-              (tramp-rpc-handle-get-remote-uid v 'integer))
+              (tramp-get-remote-uid v 'integer))
            (or (not group)
                (= (file-attribute-group-id attributes)
-                   (tramp-rpc-handle-get-remote-gid v 'integer))))))))
+                   (tramp-get-remote-gid v 'integer))))))))
 
 (defun tramp-rpc-handle-expand-file-name (name &optional dir)
   "Like `expand-file-name' for TRAMP-RPC files.
