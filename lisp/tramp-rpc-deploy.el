@@ -279,7 +279,7 @@ Linux targets use musl for fully static binaries."
     ("aarch64-linux" "aarch64-unknown-linux-musl")
     ("x86_64-darwin" "x86_64-apple-darwin")
     ("aarch64-darwin" "aarch64-apple-darwin")
-    (_ (signal 'remote-file-error (list "Unknown architecture: %s" arch)))))
+    (_ (signal 'remote-file-error (list "Unknown architecture" arch)))))
 
 (defun tramp-rpc-deploy--local-cache-path (arch)
   "Return the local cache path for binary of ARCH."
@@ -347,14 +347,15 @@ Returns t on success, nil on failure."
         (message "Downloading %s..." url)
         (with-timeout (tramp-rpc-deploy-download-timeout
                        (signal 'remote-file-error
-			       (list "Download timed out after %d seconds"
-				     tramp-rpc-deploy-download-timeout)))
+			       (list (format
+				      "Download timed out after %d seconds"
+				      tramp-rpc-deploy-download-timeout))))
           (with-current-buffer (url-retrieve-synchronously url t t)
             (goto-char (point-min))
             ;; Check for HTTP errors
             (unless (re-search-forward "^HTTP/[0-9.]+ 200" nil t)
               (if (re-search-forward "^HTTP/[0-9.]+ \\([0-9]+\\)" nil t)
-                  (signal 'remote-file-error (list "HTTP error %s" (match-string 1)))
+                  (signal 'remote-file-error (list "HTTP error" (match-string 1)))
                 (signal 'remote-file-error (list "Invalid HTTP response"))))
             ;; Find body (after blank line)
             (re-search-forward "^\r?\n" nil t)
@@ -409,7 +410,7 @@ Returns the path to the binary on success, signals error on failure."
             (unless (tramp-rpc-deploy--download-file tarball-url tarball-path)
               (signal
 	       'remote-file-error
-	       (list "Download failed from %s (release may not exist)" tarball-url)))
+	       (list "Download failed from" tarball-url "(release may not exist)")))
             ;; Verify checksum if we got one
             (when checksum-ok
               (let ((expected (with-temp-buffer
@@ -450,8 +451,8 @@ Returns the path to the binary on success, nil on failure."
   (unless (tramp-rpc-deploy--can-build-for-arch-p arch)
     (signal
      'remote-file-error
-     (list "Cannot cross-compile for %s on %s"
-           arch (tramp-rpc-deploy--detect-local-arch))))
+     (list "Cannot cross-compile for" arch "on"
+	   (tramp-rpc-deploy--detect-local-arch))))
 
   (let* ((default-directory tramp-rpc-deploy-source-directory)
          (target (tramp-rpc-deploy--arch-to-rust-target arch))
@@ -485,7 +486,7 @@ Returns the path to the binary on success, nil on failure."
         (with-current-buffer build-buffer
           (signal
 	   'remote-file-error
-	   (list "Build failed (exit %d):\n%s" exit-code (buffer-string))))))))
+	   (list (format "Build failed (exit %d):\n%s" exit-code (buffer-string)))))))))
 
 ;;; ============================================================================
 ;;; Main logic: ensure local binary exists
@@ -541,13 +542,14 @@ Returns the path to the local binary."
         (or result
             (signal
 	     'remote-file-error
-	     (list "Failed to obtain tramp-rpc-server for %s.\n\nErrors:\n%s\n\n%s"
-                   arch
-                   (mapconcat (lambda (e)
-                                (format "  %s: %s" (car e) (cdr e)))
-                              (reverse errors)
-                              "\n")
-                   (tramp-rpc-deploy--help-message arch)))))))))
+	     (list (format
+		    "Failed to obtain tramp-rpc-server for %s.\n\nErrors:\n%s\n\n%s"
+                    arch
+                    (mapconcat (lambda (e)
+                                 (format "  %s: %s" (car e) (cdr e)))
+                               (reverse errors)
+                               "\n")
+                    (tramp-rpc-deploy--help-message arch))))))))))
 
 (defun tramp-rpc-deploy--help-message (arch)
   "Return a help message for obtaining binary for ARCH."
@@ -699,12 +701,13 @@ to inline encoding (base64 through the shell), which can be fragile."
     (unless success
       (signal
        'remote-file-error
-       (list "Failed to transfer binary after %d attempts.\n\nErrors:\n%s\n\nTroubleshooting:\n- Verify SSH access: ssh %s@%s echo success\n- Check write permissions to %s on remote host\n- Ensure sha256sum or shasum command is available on remote host"
-             tramp-rpc-deploy-max-retries
-             (mapconcat #'identity (nreverse errors) "\n")
-             (or (tramp-file-name-user vec) "USER")
-             (tramp-file-name-host vec)
-             tramp-rpc-deploy-remote-directory)))
+       (list (format
+	      "Failed to transfer binary after %d attempts.\n\nErrors:\n%s\n\nTroubleshooting:\n- Verify SSH access: ssh %s@%s echo success\n- Check write permissions to %s on remote host\n- Ensure sha256sum or shasum command is available on remote host"
+              tramp-rpc-deploy-max-retries
+              (mapconcat #'identity (nreverse errors) "\n")
+              (or (tramp-file-name-user vec) "USER")
+              (tramp-file-name-host vec)
+              tramp-rpc-deploy-remote-directory))))
 
     remote-path))
 
@@ -751,8 +754,9 @@ is missing, signals an error."
                (tramp-rpc-deploy--transfer-binary bootstrap-vec local-binary)))
           (signal
 	   'remote-file-error
-	   (list "tramp-rpc-server not found on %s and auto-deploy is disabled"
-                 (tramp-file-name-host vec))))))))
+	   (list "tramp-rpc-server not found on"
+		 (tramp-file-name-host vec)
+		 "and auto-deploy is disabled")))))))
 
 (defun tramp-rpc-deploy-remove-binary (vec)
   "Remove the tramp-rpc-server binary from remote VEC."

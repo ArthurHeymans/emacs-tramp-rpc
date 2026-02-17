@@ -624,7 +624,8 @@ Returns non-nil on success."
       (let ((output (with-current-buffer buffer (buffer-string))))
         (signal
 	 'remote-file-error
-	 (list "Failed to establish SSH connection to %s: %s" host output))))))
+	 (list (format
+		"Failed to establish SSH connection to %s: %s" host output)))))))
 
 (defun tramp-rpc--start-server-process (vec binary-path)
   "Start the RPC server on VEC at BINARY-PATH and verify it responds.
@@ -691,7 +692,7 @@ Returns the connection plist.  Signals `remote-file-error' on failure."
     (let ((response (tramp-rpc--call vec "system.info" nil)))
       (unless response
         (tramp-rpc--remove-connection vec)
-        (signal 'remote-file-error (list "Failed to connect to RPC server on %s" host))))
+        (signal 'remote-file-error (list "Failed to connect to RPC server on" host))))
 
     ;; Mark as connected for TRAMP's connectivity checks (used by projectile, etc.)
     (tramp-set-connection-property process "connected" t)
@@ -736,9 +737,10 @@ accidentally routing file operations through tramp-sh."
           (remote-file-error
            (tramp-rpc--cleanup-failed-connection vec)
            (signal 'remote-file-error
-                   (list "tramp-rpc-server not found at \"%s\" on %s (never-deploy is set, no deployment attempted). Set `tramp-rpc-deploy-remote-binary-path' to the correct path. Original error: %s"
-                         binary-path (tramp-file-name-host vec)
-                         (error-message-string err))))))
+                   (list (format
+			  "tramp-rpc-server not found at \"%s\" on %s (never-deploy is set, no deployment attempted). Set `tramp-rpc-deploy-remote-binary-path' to the correct path. Original error: %s"
+                          binary-path (tramp-file-name-host vec)
+                          (error-message-string err)))))))
     ;; Normal mode: try expected path first, deploy on failure.
     ;; This avoids opening a bootstrap (scpx) connection just to run
     ;; `test -x binary', which takes ~6s for tramp-sh to establish the
@@ -936,9 +938,10 @@ Returns the result or signals an error."
              "TIMEOUT id=%s method=%s elapsed=%.1fs buffer-size=%d process-live=%s"
              expected-id method elapsed (buffer-size) (process-live-p process))
             (signal
-             'remote-file-error
-             (list "Timeout waiting for RPC response from %s (id=%s, method=%s, waited %.1fs)"
-                   (tramp-file-name-host vec) expected-id method elapsed))))
+	     'remote-file-error
+	     (list (format
+		    "Timeout waiting for RPC response from %s (id=%s, method=%s, waited %.1fs)"
+                    (tramp-file-name-host vec) expected-id method elapsed)))))
 
         (tramp-rpc--debug "RECV id=%s (found)" expected-id)
         (if (tramp-rpc-protocol-error-p response)
@@ -969,7 +972,7 @@ Returns the result or signals an error."
                ((= code tramp-rpc-protocol-error-io)
                 (signal 'remote-file-error (list "RPC" msg)))
                (t
-                (signal 'remote-file-error (list "RPC error: %s" msg)))))
+                (signal 'remote-file-error (list "RPC error" msg)))))
           (plist-get response :result))))))
 
 (defun tramp-rpc--call-batch (vec requests)
@@ -1034,9 +1037,10 @@ Returns:
              "TIMEOUT-BATCH id=%s elapsed=%.1fs buffer-size=%d process-live=%s"
              expected-id elapsed (buffer-size) (process-live-p process))
             (signal
-             'remote-file-error
-             (list "Timeout waiting for batch RPC response from %s (id=%s, waited %.1fs)"
-                   (tramp-file-name-host vec) expected-id elapsed))))
+	     'remote-file-error
+	     (list (format
+		    "Timeout waiting for batch RPC response from %s (id=%s, waited %.1fs)"
+		    (tramp-file-name-host vec) expected-id elapsed)))))
 
         (tramp-rpc--debug "RECV-BATCH id=%s (found)" expected-id)
         (if (tramp-rpc-protocol-error-p response)
@@ -1045,7 +1049,7 @@ Returns:
                                expected-id (tramp-rpc-protocol-error-message response))
               (signal
 	       'remote-file-error
-	       (list "Batch RPC error: %s"
+	       (list "Batch RPC error"
                      (tramp-rpc-protocol-error-message response))))
           (tramp-rpc-protocol-decode-batch-response response))))))
 
@@ -1255,7 +1259,6 @@ ELOOP errors to nil (the file effectively doesn't exist for stat)."
          (signal (car err) (cdr err)))))))
 
 
-
 (defun tramp-rpc-handle-file-truename (filename)
   "Like `file-truename' for TRAMP-RPC files.
 Resolves symlinks in the path.  For non-existing files, returns the
@@ -1373,7 +1376,6 @@ TYPE is the file type string."
               (if (> (logand mode #o001) 0) ?x ?-)))))
 
 
-
 (defun tramp-rpc-handle-set-file-modes (filename mode &optional _flag)
   "Like `set-file-modes' for TRAMP-RPC files."
   (with-parsed-tramp-file-name filename nil
@@ -1390,7 +1392,6 @@ TYPE is the file type string."
                        (append (tramp-rpc--encode-path localname)
                                `((mtime . ,mtime)))))
     (tramp-flush-file-properties v localname)))
-
 
 
 ;; ============================================================================
@@ -1491,8 +1492,6 @@ TYPE is the file type string."
 ;; ============================================================================
 ;; File I/O operations
 ;; ============================================================================
-
-
 
 (defun tramp-rpc-handle-write-region
     (start end filename &optional append visit lockname mustbenew)
@@ -2101,8 +2100,6 @@ process-file calls from VC backends are routed through our tramp handler."
             process-file-side-effects)
         (tramp-run-real-handler #'vc-registered (list file))))))
 
-
-
 ;; ============================================================================
 ;; Additional handlers to avoid shell dependency
 ;; ============================================================================
@@ -2146,7 +2143,6 @@ Caches the PATH portion per connection."
     (error
      ;; On error, return default paths
      '("/usr/local/bin" "/usr/bin" "/bin" "/usr/local/sbin" "/usr/sbin" "/sbin"))))
-
 
 (defun tramp-rpc-handle-file-local-copy (filename)
   "Create a local copy of remote FILENAME using RPC."
@@ -2219,9 +2215,7 @@ If GROUP is non-nil, also check that group would be preserved."
               (tramp-rpc-handle-get-remote-uid v 'integer))
            (or (not group)
                (= (file-attribute-group-id attributes)
-                  (tramp-rpc-handle-get-remote-gid v 'integer))))))))
-
-
+                   (tramp-rpc-handle-get-remote-gid v 'integer))))))))
 
 (defun tramp-rpc-handle-expand-file-name (name &optional dir)
   "Like `expand-file-name' for TRAMP-RPC files.
@@ -2268,7 +2262,6 @@ Lower values mean more responsive but higher CPU usage.
 Also controls process exit detection latency."
   :type 'integer
   :group 'tramp-rpc)
-
 
 ;; ============================================================================
 ;; File name handler registration
