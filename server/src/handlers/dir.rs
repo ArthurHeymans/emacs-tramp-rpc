@@ -356,5 +356,3 @@ pub async fn remove(params: &Value) -> HandlerResult {
 
     Ok(Value::Boolean(true))
 }
-
-
