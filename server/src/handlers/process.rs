@@ -73,8 +73,7 @@ pub async fn run(params: Value) -> HandlerResult {
         clear_env: bool,
     }
 
-    let params: Params =
-        from_value(params).map_err(|e| RpcError::invalid_params(e.to_string()))?;
+    let params: Params = from_value(params).map_err(|e| RpcError::invalid_params(e.to_string()))?;
 
     let mut cmd = Command::new(&params.cmd);
     cmd.args(&params.args);
@@ -148,8 +147,7 @@ pub async fn start(params: Value) -> HandlerResult {
         clear_env: bool,
     }
 
-    let params: Params =
-        from_value(params).map_err(|e| RpcError::invalid_params(e.to_string()))?;
+    let params: Params = from_value(params).map_err(|e| RpcError::invalid_params(e.to_string()))?;
 
     let mut cmd = Command::new(&params.cmd);
     cmd.args(&params.args);
@@ -200,8 +198,7 @@ pub async fn write(params: Value) -> HandlerResult {
         data: Vec<u8>,
     }
 
-    let params: Params =
-        from_value(params).map_err(|e| RpcError::invalid_params(e.to_string()))?;
+    let params: Params = from_value(params).map_err(|e| RpcError::invalid_params(e.to_string()))?;
 
     // Data is already binary, no decoding needed!
     let data = params.data;
@@ -240,8 +237,7 @@ pub async fn read(params: Value) -> HandlerResult {
         65536
     }
 
-    let params: Params =
-        from_value(params).map_err(|e| RpcError::invalid_params(e.to_string()))?;
+    let params: Params = from_value(params).map_err(|e| RpcError::invalid_params(e.to_string()))?;
 
     let timeout = params.timeout_ms.unwrap_or(0);
 
@@ -321,8 +317,7 @@ pub async fn close_stdin(params: Value) -> HandlerResult {
         pid: u32,
     }
 
-    let params: Params =
-        from_value(params).map_err(|e| RpcError::invalid_params(e.to_string()))?;
+    let params: Params = from_value(params).map_err(|e| RpcError::invalid_params(e.to_string()))?;
 
     let mut processes = get_process_map().lock().await;
     let managed = processes
@@ -349,8 +344,7 @@ pub async fn kill(params: Value) -> HandlerResult {
         libc::SIGTERM
     }
 
-    let params: Params =
-        from_value(params).map_err(|e| RpcError::invalid_params(e.to_string()))?;
+    let params: Params = from_value(params).map_err(|e| RpcError::invalid_params(e.to_string()))?;
 
     let mut processes = get_process_map().lock().await;
     let managed = processes
@@ -581,8 +575,7 @@ pub async fn start_pty(params: Value) -> HandlerResult {
         80
     }
 
-    let params: Params =
-        from_value(params).map_err(|e| RpcError::invalid_params(e.to_string()))?;
+    let params: Params = from_value(params).map_err(|e| RpcError::invalid_params(e.to_string()))?;
 
     let start_params = PtyStartParams {
         cmd: params.cmd.clone(),
@@ -632,13 +625,12 @@ pub async fn resize_pty(params: Value) -> HandlerResult {
         cols: u16,
     }
 
-    let params: Params =
-        from_value(params).map_err(|e| RpcError::invalid_params(e.to_string()))?;
+    let params: Params = from_value(params).map_err(|e| RpcError::invalid_params(e.to_string()))?;
 
     let processes = get_pty_process_map().lock().await;
-    let managed = processes.get(&params.pid).ok_or_else(|| {
-        RpcError::process_error(format!("PTY process not found: {}", params.pid))
-    })?;
+    let managed = processes
+        .get(&params.pid)
+        .ok_or_else(|| RpcError::process_error(format!("PTY process not found: {}", params.pid)))?;
 
     let fd = managed.async_fd.get_ref().as_raw_fd();
 
@@ -675,8 +667,7 @@ pub async fn read_pty(params: Value) -> HandlerResult {
         65536
     }
 
-    let params: Params =
-        from_value(params).map_err(|e| RpcError::invalid_params(e.to_string()))?;
+    let params: Params = from_value(params).map_err(|e| RpcError::invalid_params(e.to_string()))?;
 
     let timeout = params.timeout_ms.unwrap_or(0);
     let mut buf = vec![0u8; params.max_bytes];
@@ -847,24 +838,21 @@ pub async fn write_pty(params: Value) -> HandlerResult {
         data: Vec<u8>,
     }
 
-    let params: Params =
-        from_value(params).map_err(|e| RpcError::invalid_params(e.to_string()))?;
+    let params: Params = from_value(params).map_err(|e| RpcError::invalid_params(e.to_string()))?;
 
     // Data is already binary, no decoding needed!
     let data = params.data;
 
     let processes = get_pty_process_map().lock().await;
-    let managed = processes.get(&params.pid).ok_or_else(|| {
-        RpcError::process_error(format!("PTY process not found: {}", params.pid))
-    })?;
+    let managed = processes
+        .get(&params.pid)
+        .ok_or_else(|| RpcError::process_error(format!("PTY process not found: {}", params.pid)))?;
 
     let mut guard = managed
         .async_fd
         .ready(Interest::WRITABLE)
         .await
-        .map_err(|e| {
-            RpcError::process_error(format!("Failed to wait for writable: {}", e))
-        })?;
+        .map_err(|e| RpcError::process_error(format!("Failed to wait for writable: {}", e)))?;
 
     let written = match guard.try_io(|inner| {
         let n = unsafe {
@@ -908,13 +896,12 @@ pub async fn kill_pty(params: Value) -> HandlerResult {
         libc::SIGTERM
     }
 
-    let params: Params =
-        from_value(params).map_err(|e| RpcError::invalid_params(e.to_string()))?;
+    let params: Params = from_value(params).map_err(|e| RpcError::invalid_params(e.to_string()))?;
 
     let mut processes = get_pty_process_map().lock().await;
-    let managed = processes.get(&params.pid).ok_or_else(|| {
-        RpcError::process_error(format!("PTY process not found: {}", params.pid))
-    })?;
+    let managed = processes
+        .get(&params.pid)
+        .ok_or_else(|| RpcError::process_error(format!("PTY process not found: {}", params.pid)))?;
 
     let signal = Signal::try_from(params.signal).map_err(|_| RpcError {
         code: RpcError::INVALID_PARAMS,
@@ -939,8 +926,7 @@ pub async fn close_pty(params: Value) -> HandlerResult {
         pid: u32,
     }
 
-    let params: Params =
-        from_value(params).map_err(|e| RpcError::invalid_params(e.to_string()))?;
+    let params: Params = from_value(params).map_err(|e| RpcError::invalid_params(e.to_string()))?;
 
     let mut processes = get_pty_process_map().lock().await;
 

@@ -147,8 +147,7 @@ pub async fn list(params: Value) -> HandlerResult {
         true
     }
 
-    let params: Params =
-        from_value(params).map_err(|e| RpcError::invalid_params(e.to_string()))?;
+    let params: Params = from_value(params).map_err(|e| RpcError::invalid_params(e.to_string()))?;
 
     let path = bytes_to_path(&params.path);
     let path_str = path.to_string_lossy().into_owned();
@@ -302,8 +301,7 @@ pub async fn create(params: Value) -> HandlerResult {
         0o755
     }
 
-    let params: Params =
-        from_value(params).map_err(|e| RpcError::invalid_params(e.to_string()))?;
+    let params: Params = from_value(params).map_err(|e| RpcError::invalid_params(e.to_string()))?;
 
     let path = bytes_to_path(&params.path);
     let path_str = path.to_string_lossy().into_owned();
@@ -340,8 +338,7 @@ pub async fn remove(params: Value) -> HandlerResult {
         recursive: bool,
     }
 
-    let params: Params =
-        from_value(params).map_err(|e| RpcError::invalid_params(e.to_string()))?;
+    let params: Params = from_value(params).map_err(|e| RpcError::invalid_params(e.to_string()))?;
 
     let path = bytes_to_path(&params.path);
     let path_str = path.to_string_lossy().into_owned();

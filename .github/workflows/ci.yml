@@ -68,12 +68,16 @@ jobs:
 
       - name: Install dependencies
         run: |
-          emacs -Q --batch \
-            --eval "(require 'package)" \
-            --eval "(add-to-list 'package-archives '(\"melpa\" . \"https://melpa.org/packages/\") t)" \
-            --eval "(package-initialize)" \
-            --eval "(package-refresh-contents)" \
-            --eval "(package-install 'msgpack)"
+          for attempt in 1 2 3; do
+            emacs -Q --batch \
+              --eval "(require 'package)" \
+              --eval "(add-to-list 'package-archives '(\"melpa\" . \"https://melpa.org/packages/\") t)" \
+              --eval "(package-initialize)" \
+              --eval "(package-refresh-contents)" \
+              --eval "(package-install 'msgpack)" && break
+            echo "Attempt $attempt failed, retrying in 10s..."
+            sleep 10
+          done
 
       - name: Byte-compile
         run: |
@@ -107,12 +111,16 @@ jobs:
 
       - name: Install dependencies
         run: |
-          emacs -Q --batch \
-            --eval "(require 'package)" \
-            --eval "(add-to-list 'package-archives '(\"melpa\" . \"https://melpa.org/packages/\") t)" \
-            --eval "(package-initialize)" \
-            --eval "(package-refresh-contents)" \
-            --eval "(package-install 'msgpack)"
+          for attempt in 1 2 3; do
+            emacs -Q --batch \
+              --eval "(require 'package)" \
+              --eval "(add-to-list 'package-archives '(\"melpa\" . \"https://melpa.org/packages/\") t)" \
+              --eval "(package-initialize)" \
+              --eval "(package-refresh-contents)" \
+              --eval "(package-install 'msgpack)" && break
+            echo "Attempt $attempt failed, retrying in 10s..."
+            sleep 10
+          done
 
       - name: Run autoload tests
         run: ./test/run-autoload-tests.sh
@@ -133,12 +141,16 @@ jobs:
 
       - name: Install dependencies
         run: |
-          emacs -Q --batch \
-            --eval "(require 'package)" \
-            --eval "(add-to-list 'package-archives '(\"melpa\" . \"https://melpa.org/packages/\") t)" \
-            --eval "(package-initialize)" \
-            --eval "(package-refresh-contents)" \
-            --eval "(package-install 'msgpack)"
+          for attempt in 1 2 3; do
+            emacs -Q --batch \
+              --eval "(require 'package)" \
+              --eval "(add-to-list 'package-archives '(\"melpa\" . \"https://melpa.org/packages/\") t)" \
+              --eval "(package-initialize)" \
+              --eval "(package-refresh-contents)" \
+              --eval "(package-install 'msgpack)" && break
+            echo "Attempt $attempt failed, retrying in 10s..."
+            sleep 10
+          done
 
       - name: Run protocol tests
         run: |
@@ -166,12 +178,16 @@ jobs:
 
       - name: Install dependencies
         run: |
-          emacs -Q --batch \
-            --eval "(require 'package)" \
-            --eval "(add-to-list 'package-archives '(\"melpa\" . \"https://melpa.org/packages/\") t)" \
-            --eval "(package-initialize)" \
-            --eval "(package-refresh-contents)" \
-            --eval "(package-install 'msgpack)"
+          for attempt in 1 2 3; do
+            emacs -Q --batch \
+              --eval "(require 'package)" \
+              --eval "(add-to-list 'package-archives '(\"melpa\" . \"https://melpa.org/packages/\") t)" \
+              --eval "(package-initialize)" \
+              --eval "(package-refresh-contents)" \
+              --eval "(package-install 'msgpack)" && break
+            echo "Attempt $attempt failed, retrying in 10s..."
+            sleep 10
+          done
 
       - name: Run multi-hop tests
         run: |
@@ -208,12 +224,16 @@ jobs:
 
       - name: Install dependencies
         run: |
-          emacs -Q --batch \
-            --eval "(require 'package)" \
-            --eval "(add-to-list 'package-archives '(\"melpa\" . \"https://melpa.org/packages/\") t)" \
-            --eval "(package-initialize)" \
-            --eval "(package-refresh-contents)" \
-            --eval "(package-install 'msgpack)"
+          for attempt in 1 2 3; do
+            emacs -Q --batch \
+              --eval "(require 'package)" \
+              --eval "(add-to-list 'package-archives '(\"melpa\" . \"https://melpa.org/packages/\") t)" \
+              --eval "(package-initialize)" \
+              --eval "(package-refresh-contents)" \
+              --eval "(package-install 'msgpack)" && break
+            echo "Attempt $attempt failed, retrying in 10s..."
+            sleep 10
+          done
 
       - name: Run server integration tests
         run: |
@@ -277,12 +297,16 @@ jobs:
 
       - name: Install dependencies
         run: |
-          emacs -Q --batch \
-            --eval "(require 'package)" \
-            --eval "(add-to-list 'package-archives '(\"melpa\" . \"https://melpa.org/packages/\") t)" \
-            --eval "(package-initialize)" \
-            --eval "(package-refresh-contents)" \
-            --eval "(package-install 'msgpack)"
+          for attempt in 1 2 3; do
+            emacs -Q --batch \
+              --eval "(require 'package)" \
+              --eval "(add-to-list 'package-archives '(\"melpa\" . \"https://melpa.org/packages/\") t)" \
+              --eval "(package-initialize)" \
+              --eval "(package-refresh-contents)" \
+              --eval "(package-install 'msgpack)" && break
+            echo "Attempt $attempt failed, retrying in 10s..."
+            sleep 10
+          done
 
       - name: Run full test suite
         env:
@@ -349,12 +373,16 @@ jobs:
 
       - name: Install dependencies
         run: |
-          emacs -Q --batch \
-            --eval "(require 'package)" \
-            --eval "(add-to-list 'package-archives '(\"melpa\" . \"https://melpa.org/packages/\") t)" \
-            --eval "(package-initialize)" \
-            --eval "(package-refresh-contents)" \
-            --eval "(package-install 'msgpack)"
+          for attempt in 1 2 3; do
+            emacs -Q --batch \
+              --eval "(require 'package)" \
+              --eval "(add-to-list 'package-archives '(\"melpa\" . \"https://melpa.org/packages/\") t)" \
+              --eval "(package-initialize)" \
+              --eval "(package-refresh-contents)" \
+              --eval "(package-install 'msgpack)" && break
+            echo "Attempt $attempt failed, retrying in 10s..."
+            sleep 10
+          done
 
       - name: Run upstream tramp tests
         env:

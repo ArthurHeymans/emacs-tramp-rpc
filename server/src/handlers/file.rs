@@ -23,8 +23,7 @@ pub async fn stat(params: Value) -> HandlerResult {
         lstat: bool,
     }
 
-    let params: Params =
-        from_value(params).map_err(|e| RpcError::invalid_params(e.to_string()))?;
+    let params: Params = from_value(params).map_err(|e| RpcError::invalid_params(e.to_string()))?;
 
     let path = bytes_to_path(&params.path);
     match get_file_attributes(&path, params.lstat).await {
@@ -42,8 +41,7 @@ pub async fn truename(params: Value) -> HandlerResult {
         path: Vec<u8>,
     }
 
-    let params: Params =
-        from_value(params).map_err(|e| RpcError::invalid_params(e.to_string()))?;
+    let params: Params = from_value(params).map_err(|e| RpcError::invalid_params(e.to_string()))?;
 
     let path = bytes_to_path(&params.path);
     let path_str = path.to_string_lossy().into_owned();

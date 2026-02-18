@@ -56,8 +56,7 @@ pub async fn run_parallel(params: Value) -> HandlerResult {
         commands: Vec<CommandEntry>,
     }
 
-    let params: Params =
-        from_value(params).map_err(|e| RpcError::invalid_params(e.to_string()))?;
+    let params: Params = from_value(params).map_err(|e| RpcError::invalid_params(e.to_string()))?;
 
     if params.commands.is_empty() {
         return Ok(Value::Map(vec![]));
@@ -148,8 +147,7 @@ pub async fn ancestors_scan(params: Value) -> HandlerResult {
         10
     }
 
-    let params: Params =
-        from_value(params).map_err(|e| RpcError::invalid_params(e.to_string()))?;
+    let params: Params = from_value(params).map_err(|e| RpcError::invalid_params(e.to_string()))?;
 
     // Wrap in spawn_blocking since this does blocking filesystem I/O
     let expanded_directory = super::expand_tilde(&params.directory);
@@ -173,7 +171,8 @@ pub async fn ancestors_scan(params: Value) -> HandlerResult {
                 if results.get(marker).unwrap().is_none() {
                     let marker_path = current.join(marker);
                     if marker_path.exists() {
-                        results.insert(marker.clone(), Some(current.to_string_lossy().into_owned()));
+                        results
+                            .insert(marker.clone(), Some(current.to_string_lossy().into_owned()));
                     }
                 }
             }
