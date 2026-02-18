@@ -56,6 +56,7 @@
 (defvar tramp-rpc-ssh-args)
 (defvar tramp-rpc-async-read-timeout-ms)
 (defvar tramp-rpc--delivering-output)
+(defvar tramp-rpc--closing-local-relay)
 
 ;; ============================================================================
 ;; Process tracking state
@@ -304,16 +305,51 @@ before the cat relay drains its pipe causes a stale FD that makes
       ;; Clean up write queue for this process's PID
       (when-let* ((pid (plist-get info :pid)))
         (remhash pid tramp-rpc--process-write-queues))
-      ;; Store exit code and mark as exited.  The sentinel reads these
-      ;; to construct the correct event string for the user's sentinel.
+      ;; Store exit code (the sentinel reads this to construct the event
+      ;; string).  Do NOT set :tramp-rpc-exited yet — the process-status
+      ;; advice returns 'exit when that flag is set, which makes
+      ;; `process-live-p' return nil and would prevent the EOF below
+      ;; from being sent.
       (process-put local-process :tramp-rpc-exit-code (or exit-code 0))
-      (process-put local-process :tramp-rpc-exited t)
-      ;; Send EOF to the cat relay.  Cat will flush any remaining data
-      ;; (written by deliver-process-output) to stdout, where the process
-      ;; filter reads it, then exit naturally on EOF.  Emacs fires the
-      ;; sentinel (tramp-rpc--pipe-process-sentinel) which does final cleanup.
+      ;; Send EOF to the LOCAL cat relay (not the remote process).
+      ;; Bind `tramp-rpc--closing-local-relay' so the `process-send-eof'
+      ;; advice calls the original function instead of routing to the
+      ;; remote stdin (which has already exited).  Cat will flush any
+      ;; remaining data to stdout, then exit naturally on EOF.  Emacs
+      ;; fires the sentinel chain; the cleanup installed by
+      ;; `tramp-rpc--install-process-cleanup' then deletes the process.
       (when (process-live-p local-process)
-        (ignore-errors (process-send-eof local-process))))))
+        (let ((tramp-rpc--closing-local-relay t))
+          (ignore-errors (process-send-eof local-process))))
+      ;; Now mark as exited so process-status advice returns 'exit.
+      (process-put local-process :tramp-rpc-exited t))))
+
+;; ============================================================================
+;; Process cleanup after exit
+;; ============================================================================
+
+(defun tramp-rpc--install-process-cleanup (process)
+  "Add sentinel cleanup to PROCESS so it is deleted after exit.
+Uses `add-function' to append after whatever sentinel the caller has
+already installed (e.g. `vc-do-command' sets #\\='ignore then adds
+via `add-function').  When the sentinel fires for exit/signal, we
+schedule a deferred `delete-process' that removes the process from
+Emacs's `Vprocess_alist'.  Without this, `get-buffer-process' keeps
+returning the dead cat relay, which makes `vc-dir-busy' think an
+update is still running."
+  (when (process-live-p process)
+    (add-function :after (process-sentinel process)
+                  (lambda (proc _event)
+                    (when (memq (process-status proc) '(exit signal))
+                      ;; Defer the deletion so the full sentinel chain
+                      ;; (including vc-exec-after stages) completes first.
+                      (run-at-time 0 nil
+                                   (lambda ()
+                                     (when (and (processp proc)
+                                                (not (process-live-p proc)))
+                                       (remhash proc tramp-rpc--async-processes)
+                                       (ignore-errors
+                                         (delete-process proc))))))))))
 
 ;; ============================================================================
 ;; make-process handler
@@ -410,6 +446,21 @@ Resolves program path and loads direnv environment from working directory."
 
           ;; Start async read loop
           (tramp-rpc--start-async-read local-process)
+
+          ;; Schedule deferred sentinel cleanup.  Callers like `vc-do-command'
+          ;; replace the sentinel with `set-process-sentinel' AFTER
+          ;; `start-file-process' returns, so we must add our cleanup wrapper
+          ;; after that.  `run-at-time 0' ensures it runs once the current
+          ;; code path (including the caller's sentinel setup) completes.
+          ;; The wrapper calls `delete-process' after the sentinel chain
+          ;; finishes, which removes the process from `Vprocess_alist'.
+          ;; Without this, `get-buffer-process' returns stale exited cat
+          ;; relays, causing e.g. `vc-dir-busy' to report a false positive.
+          (let ((proc local-process))
+            (run-at-time 0 nil
+                         (lambda ()
+                           (when (processp proc)
+                             (tramp-rpc--install-process-cleanup proc)))))
 
           local-process))))))
 
