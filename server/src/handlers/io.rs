@@ -29,8 +29,7 @@ pub async fn read(params: Value) -> HandlerResult {
         length: Option<usize>,
     }
 
-    let params: Params =
-        from_value(params).map_err(|e| RpcError::invalid_params(e.to_string()))?;
+    let params: Params = from_value(params).map_err(|e| RpcError::invalid_params(e.to_string()))?;
 
     let path = bytes_to_path(&params.path);
     let path_str = path.to_string_lossy().into_owned();
@@ -91,8 +90,7 @@ pub async fn write(params: Value) -> HandlerResult {
         offset: Option<u64>,
     }
 
-    let params: Params =
-        from_value(params).map_err(|e| RpcError::invalid_params(e.to_string()))?;
+    let params: Params = from_value(params).map_err(|e| RpcError::invalid_params(e.to_string()))?;
 
     let path = bytes_to_path(&params.path);
     let path_str = path.to_string_lossy().into_owned();
@@ -154,8 +152,7 @@ pub async fn copy(params: Value) -> HandlerResult {
         preserve: bool,
     }
 
-    let params: Params =
-        from_value(params).map_err(|e| RpcError::invalid_params(e.to_string()))?;
+    let params: Params = from_value(params).map_err(|e| RpcError::invalid_params(e.to_string()))?;
 
     let src_path = bytes_to_path(&params.src);
     let mut dest_path = bytes_to_path(&params.dest);
@@ -270,8 +267,7 @@ pub async fn rename(params: Value) -> HandlerResult {
         overwrite: bool,
     }
 
-    let params: Params =
-        from_value(params).map_err(|e| RpcError::invalid_params(e.to_string()))?;
+    let params: Params = from_value(params).map_err(|e| RpcError::invalid_params(e.to_string()))?;
 
     let src = bytes_to_path(&params.src);
     let dest = bytes_to_path(&params.dest);
@@ -305,8 +301,7 @@ pub async fn delete(params: Value) -> HandlerResult {
         force: bool,
     }
 
-    let params: Params =
-        from_value(params).map_err(|e| RpcError::invalid_params(e.to_string()))?;
+    let params: Params = from_value(params).map_err(|e| RpcError::invalid_params(e.to_string()))?;
 
     let path = bytes_to_path(&params.path);
     let path_str = path.to_string_lossy().into_owned();
@@ -329,8 +324,7 @@ pub async fn set_modes(params: Value) -> HandlerResult {
         mode: u32,
     }
 
-    let params: Params =
-        from_value(params).map_err(|e| RpcError::invalid_params(e.to_string()))?;
+    let params: Params = from_value(params).map_err(|e| RpcError::invalid_params(e.to_string()))?;
 
     let path = bytes_to_path(&params.path);
     let path_str = path.to_string_lossy().into_owned();
@@ -356,8 +350,7 @@ pub async fn set_times(params: Value) -> HandlerResult {
         atime: Option<i64>,
     }
 
-    let params: Params =
-        from_value(params).map_err(|e| RpcError::invalid_params(e.to_string()))?;
+    let params: Params = from_value(params).map_err(|e| RpcError::invalid_params(e.to_string()))?;
 
     let path = bytes_to_path(&params.path);
     let atime = params.atime.unwrap_or(params.mtime);
@@ -381,8 +374,7 @@ pub async fn make_symlink(params: Value) -> HandlerResult {
         link_path: Vec<u8>,
     }
 
-    let params: Params =
-        from_value(params).map_err(|e| RpcError::invalid_params(e.to_string()))?;
+    let params: Params = from_value(params).map_err(|e| RpcError::invalid_params(e.to_string()))?;
 
     let target = bytes_to_path(&params.target);
     let link_path = bytes_to_path(&params.link_path);
@@ -421,8 +413,7 @@ pub async fn make_hardlink(params: Value) -> HandlerResult {
         dest: Vec<u8>,
     }
 
-    let params: Params =
-        from_value(params).map_err(|e| RpcError::invalid_params(e.to_string()))?;
+    let params: Params = from_value(params).map_err(|e| RpcError::invalid_params(e.to_string()))?;
 
     let src = bytes_to_path(&params.src);
     let dest = bytes_to_path(&params.dest);
@@ -447,8 +438,7 @@ pub async fn chown(params: Value) -> HandlerResult {
         gid: i32,
     }
 
-    let params: Params =
-        from_value(params).map_err(|e| RpcError::invalid_params(e.to_string()))?;
+    let params: Params = from_value(params).map_err(|e| RpcError::invalid_params(e.to_string()))?;
 
     let path = bytes_to_path(&params.path);
     let uid = params.uid;

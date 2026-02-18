@@ -64,8 +64,7 @@ fn system_getenv(params: Value) -> HandlerResult {
         name: String,
     }
 
-    let params: Params =
-        from_value(params).map_err(|e| RpcError::invalid_params(e.to_string()))?;
+    let params: Params = from_value(params).map_err(|e| RpcError::invalid_params(e.to_string()))?;
 
     Ok(std::env::var(&params.name).ok().into_value())
 }
@@ -77,8 +76,7 @@ fn system_expand_path(params: Value) -> HandlerResult {
         path: String,
     }
 
-    let params: Params =
-        from_value(params).map_err(|e| RpcError::invalid_params(e.to_string()))?;
+    let params: Params = from_value(params).map_err(|e| RpcError::invalid_params(e.to_string()))?;
 
     let expanded = expand_tilde(&params.path);
     Ok(expanded.into_value())
@@ -91,8 +89,7 @@ fn system_statvfs(params: Value) -> HandlerResult {
         path: String,
     }
 
-    let params: Params =
-        from_value(params).map_err(|e| RpcError::invalid_params(e.to_string()))?;
+    let params: Params = from_value(params).map_err(|e| RpcError::invalid_params(e.to_string()))?;
 
     use std::ffi::CString;
     let expanded = expand_tilde(&params.path);
@@ -233,7 +230,9 @@ async fn batch_execute(params: Value) -> HandlerResult {
 /// Inner dispatch that handles the actual method routing
 /// Used by both single requests and batch requests
 async fn dispatch_inner(request: Request) -> Response {
-    let Request { id, method, params, .. } = request;
+    let Request {
+        id, method, params, ..
+    } = request;
 
     let result = match method.as_str() {
         // File metadata operations

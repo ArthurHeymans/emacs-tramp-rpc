@@ -257,8 +257,7 @@ pub fn handle_add(params: Value) -> HandlerResult {
         true
     }
 
-    let params: Params =
-        from_value(params).map_err(|e| RpcError::invalid_params(e.to_string()))?;
+    let params: Params = from_value(params).map_err(|e| RpcError::invalid_params(e.to_string()))?;
 
     let expanded = crate::handlers::expand_tilde(&params.path);
 
@@ -283,8 +282,7 @@ pub fn handle_remove(params: Value) -> HandlerResult {
         path: String,
     }
 
-    let params: Params =
-        from_value(params).map_err(|e| RpcError::invalid_params(e.to_string()))?;
+    let params: Params = from_value(params).map_err(|e| RpcError::invalid_params(e.to_string()))?;
 
     let expanded = crate::handlers::expand_tilde(&params.path);
 
