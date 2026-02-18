@@ -2235,6 +2235,11 @@ would otherwise flood the echo area with \"Cannot expand tilde\"."
   "Non-nil while delivering process output to the local relay.
 Used by advice functions to bypass interception during output delivery.")
 
+(defvar tramp-rpc--closing-local-relay nil
+  "Non-nil while sending EOF to a local cat relay process.
+Tells the `process-send-eof' advice to call the original function
+instead of routing to the remote process.")
+
 (defcustom tramp-rpc-async-read-timeout-ms 200
   "Timeout in milliseconds for async process reads.
 The server will block for this long waiting for data before returning.

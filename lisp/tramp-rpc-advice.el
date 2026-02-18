@@ -44,7 +44,9 @@
 
 ;; Variables from tramp-rpc.el / tramp-rpc-process.el
 (defvar tramp-rpc--delivering-output)
+(defvar tramp-rpc--closing-local-relay)
 (defvar tramp-rpc--pty-processes)
+(defvar tramp-rpc--async-processes)
 
 ;; ============================================================================
 ;; Process I/O advice
@@ -146,40 +148,44 @@
 
 (defun tramp-rpc--process-send-eof-advice (orig-fun &optional process)
   "Advice for `process-send-eof' to handle TRAMP-RPC processes."
-  (let ((proc (or process (get-buffer-process (current-buffer)))))
-    (cond
-     ;; Direct SSH PTY - use normal process-send-eof
-     ((and proc (process-get proc :tramp-rpc-direct-ssh))
-      (funcall orig-fun process))
-     ;; RPC-managed process
-     ((and proc
-           (process-get proc :tramp-rpc-pid)
-           (process-get proc :tramp-rpc-vec))
-      (let ((pid (process-get proc :tramp-rpc-pid))
-            (vec (process-get proc :tramp-rpc-vec)))
-        ;; Only try to send EOF if the process hasn't already exited.
-        ;; Short-lived processes (like git apply) may exit before we call
-        ;; process-send-eof, which is fine - stdin was already closed on exit.
-        (unless (or (process-get proc :tramp-rpc-exited)
-                    (not (process-live-p proc)))
-          (condition-case err
-              (if (process-get proc :tramp-rpc-pty)
-                  ;; PTY processes: send Ctrl-D (EOF character) via the PTY
-                  (let ((eof-char (string 4))) ; ASCII 4 = Ctrl-D
-                    (tramp-rpc--call-async vec "process.write_pty"
-                                           `((pid . ,pid)
-                                             (data . ,(msgpack-bin-make eof-char)))
-                                           #'ignore))
-                ;; Pipe processes: close the stdin pipe
-                (tramp-rpc--close-remote-stdin vec pid))
-            (error
-             ;; Ignore "Process not found" errors - they just mean the process
-             ;; exited before we could close stdin, which is expected for
-             ;; short-lived processes like git apply in magit hunk staging.
-             (unless (string-match-p "Process not found" (error-message-string err))
-               (message "tramp-rpc: Error closing stdin: %s" err)))))))
-     ;; Not a tramp-rpc process
-     (t (funcall orig-fun process)))))
+  ;; When closing a local cat relay, bypass this advice entirely so
+  ;; the EOF reaches the local process rather than the remote one.
+  (if tramp-rpc--closing-local-relay
+      (funcall orig-fun process)
+    (let ((proc (or process (get-buffer-process (current-buffer)))))
+      (cond
+       ;; Direct SSH PTY - use normal process-send-eof
+       ((and proc (process-get proc :tramp-rpc-direct-ssh))
+        (funcall orig-fun process))
+       ;; RPC-managed process
+       ((and proc
+             (process-get proc :tramp-rpc-pid)
+             (process-get proc :tramp-rpc-vec))
+        (let ((pid (process-get proc :tramp-rpc-pid))
+              (vec (process-get proc :tramp-rpc-vec)))
+          ;; Only try to send EOF if the process hasn't already exited.
+          ;; Short-lived processes (like git apply) may exit before we call
+          ;; process-send-eof, which is fine - stdin was already closed on exit.
+          (unless (or (process-get proc :tramp-rpc-exited)
+                      (not (process-live-p proc)))
+            (condition-case err
+                (if (process-get proc :tramp-rpc-pty)
+                    ;; PTY processes: send Ctrl-D (EOF character) via the PTY
+                    (let ((eof-char (string 4))) ; ASCII 4 = Ctrl-D
+                      (tramp-rpc--call-async vec "process.write_pty"
+                                             `((pid . ,pid)
+                                               (data . ,(msgpack-bin-make eof-char)))
+                                             #'ignore))
+                  ;; Pipe processes: close the stdin pipe
+                  (tramp-rpc--close-remote-stdin vec pid))
+              (error
+               ;; Ignore "Process not found" errors - they just mean the process
+               ;; exited before we could close stdin, which is expected for
+               ;; short-lived processes like git apply in magit hunk staging.
+               (unless (string-match-p "Process not found" (error-message-string err))
+                 (message "tramp-rpc: Error closing stdin: %s" err)))))))
+       ;; Not a tramp-rpc process
+       (t (funcall orig-fun process))))))
 
 (defun tramp-rpc--signal-process-advice (orig-fun process sigcode &optional remote)
   "Advice for `signal-process' to handle TRAMP-RPC processes."
@@ -283,6 +289,34 @@ and handles binary data correctly."
     (funcall orig-fun contact)))
 
 ;; ============================================================================
+;; vc-dir stale-process guard
+;; ============================================================================
+
+;; `vc-dir-busy' tests (get-buffer-process vc-dir-process-buffer).
+;; In Emacs, `get-buffer-process' returns ANY process associated with the
+;; buffer -- including exited ones -- as long as `delete-process' has not
+;; been called.  Normally our deferred `tramp-rpc--install-process-cleanup'
+;; handles this, but if the timer hasn't fired yet (or if the cat relay got
+;; stuck), the stale process causes "Another update process is in progress".
+;; This advice acts as a safety net: before `vc-dir-refresh' checks the
+;; busy flag, we delete any exited tramp-rpc relay process from the buffer.
+
+(defun tramp-rpc--vc-dir-refresh-advice (orig-fun)
+  "Advice for `vc-dir-refresh' to clean up stale TRAMP-RPC relay processes.
+If the vc-dir process buffer has a tramp-rpc cat relay that has already
+exited (remote side finished), delete it so the refresh can proceed."
+  (when (and (bound-and-true-p vc-dir-process-buffer)
+             (buffer-live-p vc-dir-process-buffer))
+    (let ((proc (get-buffer-process vc-dir-process-buffer)))
+      (when (and proc
+                 (process-get proc :tramp-rpc-pid)
+                 (or (process-get proc :tramp-rpc-exited)
+                     (not (process-live-p proc))))
+        (remhash proc tramp-rpc--async-processes)
+        (ignore-errors (delete-process proc)))))
+  (funcall orig-fun))
+
+;; ============================================================================
 ;; Install and uninstall advice
 ;; ============================================================================
 
@@ -298,7 +332,9 @@ and handles binary data correctly."
   (advice-add 'process-tty-name :around #'tramp-rpc--process-tty-name-advice)
   (advice-add 'vc-call-backend :around #'tramp-rpc--vc-call-backend-advice)
   (with-eval-after-load 'eglot
-    (advice-add 'eglot--cmd :around #'tramp-rpc--eglot-cmd-advice)))
+    (advice-add 'eglot--cmd :around #'tramp-rpc--eglot-cmd-advice))
+  (with-eval-after-load 'vc-dir
+    (advice-add 'vc-dir-refresh :around #'tramp-rpc--vc-dir-refresh-advice)))
 
 (defun tramp-rpc-advice-remove ()
   "Remove all process advice installed by tramp-rpc."
@@ -311,7 +347,8 @@ and handles binary data correctly."
   (advice-remove 'process-command #'tramp-rpc--process-command-advice)
   (advice-remove 'process-tty-name #'tramp-rpc--process-tty-name-advice)
   (advice-remove 'vc-call-backend #'tramp-rpc--vc-call-backend-advice)
-  (advice-remove 'eglot--cmd #'tramp-rpc--eglot-cmd-advice))
+  (advice-remove 'eglot--cmd #'tramp-rpc--eglot-cmd-advice)
+  (advice-remove 'vc-dir-refresh #'tramp-rpc--vc-dir-refresh-advice))
 
 (defcustom tramp-rpc-install-advice-on-load t
   "Whether to install process advice when tramp-rpc-advice is loaded.
