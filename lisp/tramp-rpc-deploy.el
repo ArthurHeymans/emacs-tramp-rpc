@@ -78,7 +78,7 @@ Used for building from source.  Set to nil to disable source builds."
 This is useful for development - binaries built by scripts/build-all.sh
 are placed here and used directly without needing to download or cache.")
 
-(defcustom tramp-rpc-deploy-remote-directory "~/.cache/tramp-rpc"
+(defcustom tramp-rpc-deploy-remote-directory "~/.cache/emacs/tramp-rpc"
   "Remote directory where the server binary will be installed."
   :type 'string
   :group 'tramp-rpc-deploy)
