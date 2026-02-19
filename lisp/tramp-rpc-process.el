@@ -199,16 +199,17 @@ STDERR-BUFFER is the separate stderr buffer, or nil to mix with stdout."
       ;; Deliver stderr
       (when (and stderr (> (length stderr) 0))
         (tramp-rpc--debug "DELIVER stderr %d bytes" (length stderr))
-        (cond
-         ((bufferp stderr-buffer)
-          (when (buffer-live-p stderr-buffer)
-            (with-current-buffer stderr-buffer
-              (let ((inhibit-read-only t))
-                (goto-char (point-max))
-                (insert stderr)))))
-         ;; Mix with stdout if no separate stderr buffer - write to cat relay
-         (t
-          (process-send-string local-process stderr)))))))
+        (let ((stderr-process
+               (when stderr-buffer
+                 (plist-get (gethash local-process tramp-rpc--async-processes)
+                            :stderr-process))))
+          (cond
+           ;; Write to stderr cat relay if available, triggering proper I/O events
+           ((and stderr-process (process-live-p stderr-process))
+            (process-send-string stderr-process stderr))
+           ;; Mix with stdout if no separate stderr buffer - write to cat relay
+           (t
+            (process-send-string local-process stderr))))))))
 
 (defun tramp-rpc--pipe-process-sentinel (proc event user-sentinel)
   "Sentinel for pipe relay processes.
@@ -234,6 +235,10 @@ process's exit status rather than cat's."
         (when (and vec pid)
           (ignore-errors
             (tramp-rpc--kill-remote-process vec pid 9))))
+      ;; Clean up stderr relay process
+      (when-let* ((stderr-process (plist-get info :stderr-process)))
+        (when (process-live-p stderr-process)
+          (ignore-errors (delete-process stderr-process))))
       ;; Remove from tracking
       (remhash proc tramp-rpc--async-processes)))
   ;; Use the remote exit code for the event string when available,
@@ -308,6 +313,10 @@ before the cat relay drains its pipe causes a stale FD that makes
       ;; to construct the correct event string for the user's sentinel.
       (process-put local-process :tramp-rpc-exit-code (or exit-code 0))
       (process-put local-process :tramp-rpc-exited t)
+      ;; Send EOF to the stderr cat relay so it exits cleanly.
+      (when-let* ((stderr-process (plist-get info :stderr-process)))
+        (when (process-live-p stderr-process)
+          (ignore-errors (process-send-eof stderr-process))))
       ;; Send EOF to the cat relay.  Cat will flush any remaining data
       ;; (written by deliver-process-output) to stdout, where the process
       ;; filter reads it, then exit naturally on EOF.  Emacs fires the
@@ -379,7 +388,19 @@ Resolves program path and loads direnv environment from working directory."
                  (stderr-buffer (cond
                                  ((bufferp stderr) stderr)
                                  ((stringp stderr) (get-buffer-create stderr))
-                                 (t nil))))
+                                 (t nil)))
+                 ;; Create a stderr cat relay so that
+                 ;; (get-buffer-process stderr-buffer) returns a process,
+                 ;; matching the contract of native `make-process' with :stderr.
+                 (stderr-process
+                  (when stderr-buffer
+                    (let* ((process-connection-type nil)
+                           (proc (start-process
+                                  (format "%s-stderr" (or name "tramp-rpc-async"))
+                                  stderr-buffer
+                                  "cat")))
+                      (set-process-query-on-exit-flag proc nil)
+                      proc))))
 
           ;; Configure the local relay process
           (when coding
@@ -402,7 +423,8 @@ Resolves program path and loads direnv environment from working directory."
           (puthash local-process
                    (list :vec v
                          :pid remote-pid
-                         :stderr-buffer stderr-buffer)
+                         :stderr-buffer stderr-buffer
+                         :stderr-process stderr-process)
                    tramp-rpc--async-processes)
 
           (tramp-rpc--debug "MAKE-PROCESS created local=%s remote-pid=%s program=%s"
@@ -899,6 +921,10 @@ For direct SSH PTY, let the original function handle it (SSH handles resize)."
        ;; Cancel timer
        (when-let* ((timer (plist-get info :timer)))
          (cancel-timer timer))
+       ;; Kill stderr relay process
+       (when-let* ((stderr-process (plist-get info :stderr-process)))
+         (when (process-live-p stderr-process)
+           (ignore-errors (delete-process stderr-process))))
        ;; Kill local process
        (when (process-live-p local-process)
          (delete-process local-process))
