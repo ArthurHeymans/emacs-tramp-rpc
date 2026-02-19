@@ -48,6 +48,9 @@
 (defvar tramp-rpc--pty-processes)
 (defvar tramp-rpc--async-processes)
 
+;; Variables from vc-dir.el (used in vc-dir-refresh advice)
+(defvar vc-dir-process-buffer)
+
 ;; ============================================================================
 ;; Process I/O advice
 ;; ============================================================================
