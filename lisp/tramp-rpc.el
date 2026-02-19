@@ -2116,11 +2116,32 @@ Caches the PATH portion per connection."
               (list (tramp-file-local-name
                      (expand-file-name default-directory)))))))
 
-(defun tramp-rpc--fetch-remote-exec-path (vec)
-  "Fetch the remote PATH from VEC and split into directories."
+(defun tramp-rpc--get-remote-login-shell (vec)
+  "Return the login shell for the remote user on VEC.
+Looks up the user's shell via /bin/sh getent passwd.  Falls back to /bin/sh."
   (condition-case nil
       (let* ((result (tramp-rpc--call vec "process.run"
                                        `((cmd . "/bin/sh")
+                                         (args . ["-c" "getent passwd \"$(whoami)\" | cut -d: -f7"])
+                                         (cwd . "/"))))
+             (exit-code (alist-get 'exit_code result))
+             (stdout (tramp-rpc--decode-output
+                      (alist-get 'stdout result)
+                      (alist-get 'stdout_encoding result))))
+        (if (and (eq exit-code 0)
+                 (> (length (string-trim stdout)) 0))
+            (string-trim stdout)
+          "/bin/sh"))
+    (error "/bin/sh")))
+
+(defun tramp-rpc--fetch-remote-exec-path (vec)
+  "Fetch the remote PATH from VEC and split into directories.
+Uses the user's login shell to ensure PATH reflects their shell
+configuration (e.g. .zshenv, .zprofile, .bash_profile)."
+  (condition-case nil
+      (let* ((shell (tramp-rpc--get-remote-login-shell vec))
+             (result (tramp-rpc--call vec "process.run"
+                                       `((cmd . ,shell)
                                          (args . ["-l" "-c" "echo $PATH"])
                                          (cwd . "/"))))
              (exit-code (alist-get 'exit_code result))
