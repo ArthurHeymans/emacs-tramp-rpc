@@ -159,5 +159,13 @@ Returns a list where each element is either:
                 (alist-get 'result result-obj)))
             results-array)))
 
+;; ============================================================================
+;; Unload support
+;; ============================================================================
+
+(add-hook 'tramp-rpc-unload-hook
+	  (lambda ()
+	    (unload-feature 'tramp-rpc-protocol 'force)))
+
 (provide 'tramp-rpc-protocol)
 ;;; tramp-rpc-protocol.el ends here

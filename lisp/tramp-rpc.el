@@ -56,6 +56,10 @@
 
 ;;;###autoload
 (with-eval-after-load 'tramp
+  ;; Check, that `tramp-rpc-method' is still bound.  It isn't after
+  ;; unloading `tramp-rpc', but this body still exists as compiled
+  ;; function in `after-load-alist'.
+  (when (boundp 'tramp-rpc-method)
   ;; Register the method
   (add-to-list 'tramp-methods
                `(,tramp-rpc-method
@@ -107,7 +111,7 @@
     "Allow the rpc method in multi-hop chains."
     (or (string= (tramp-file-name-method vec) tramp-rpc-method)
         (funcall orig-fun vec)))
-  (advice-add 'tramp-multi-hop-p :around #'tramp-rpc--multi-hop-advice))
+  (advice-add 'tramp-multi-hop-p :around #'tramp-rpc--multi-hop-advice)))
 
 ;; Now the actual implementation
 (require 'cl-lib)
@@ -2420,21 +2424,31 @@ VEC-OR-FILENAME can be either a tramp-file-name struct or a filename string."
 (tramp-register-foreign-file-name-handler
  #'tramp-rpc-file-name-p #'tramp-rpc-file-name-handler)
 
+(defun tramp-rpc--multi-hop-advice-remove ()
+  "Remove multi-hop advice."
+  (advice-remove 'process-send-string #'tramp-rpc--multi-hop-advice))
+
 ;; ============================================================================
 ;; Unload support
 ;; ============================================================================
 
 (defun tramp-rpc-unload-function ()
   "Unload function for tramp-rpc.
-Removes advice and cleans up async processes."
-  ;; Remove all advice (from tramp-rpc-advice module)
-  (tramp-rpc-advice-remove)
-  ;; Clean up all async processes (from tramp-rpc-process module)
-  (tramp-rpc--cleanup-async-processes)
-  ;; Clean up PTY processes (from tramp-rpc-process module)
-  (tramp-rpc--cleanup-pty-processes)
+Removes advice.  Deletes `tramp-rpc-method' from `tramp-methods', and
+`tramp-rpc-file-name-p' from `tramp-foreign-file-name-handler-alist'."
+  ;; Remove advice.
+  (tramp-rpc--multi-hop-advice-remove)
+  ;; Clean up `tramp-methods' and `tramp-foreign-file-name-handler-alist'.
+  (setq tramp-methods (delete (assoc tramp-rpc-method tramp-methods) tramp-methods))
+  (setq tramp-foreign-file-name-handler-alist
+	(delete (assoc 'tramp-rpc-file-name-p tramp-foreign-file-name-handler-alist)
+		tramp-foreign-file-name-handler-alist))
   ;; Return nil to allow normal unload to proceed
   nil)
+
+(add-hook 'tramp-unload-hook
+	  (lambda ()
+	    (unload-feature 'tramp-rpc 'force)))
 
 (provide 'tramp-rpc)
 ;;; tramp-rpc.el ends here

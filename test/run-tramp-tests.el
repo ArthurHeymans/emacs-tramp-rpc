@@ -123,18 +123,5 @@
 ;; tramp-rpc supports set-file-modes via file.chmod RPC
 (setf (symbol-function #'tramp--test-supports-set-file-modes-p) #'always)
 
-;; ============================================================================
-;; Expected failures
-;; ============================================================================
-
-;; test52-unload checks that no "tramp" features remain after unloading.
-;; tramp-rpc is a separate package that doesn't participate in tramp's
-;; `unload-feature' mechanism, so its features (tramp-rpc, tramp-rpc-process,
-;; tramp-rpc-deploy, etc.) remain loaded.  This is expected.
-(when (ert-test-boundp 'tramp-test52-unload)
-  (setf (ert-test-expected-result-type
-         (ert-get-test 'tramp-test52-unload))
-        :failed))
-
 (provide 'run-tramp-tests)
 ;;; run-tramp-tests.el ends here

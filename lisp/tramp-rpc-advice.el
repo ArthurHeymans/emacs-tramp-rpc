@@ -363,5 +363,34 @@ Set to nil before loading to prevent automatic advice installation."
 (when tramp-rpc-install-advice-on-load
   (tramp-rpc-advice-install))
 
+;; ============================================================================
+;; Unload support
+;; ============================================================================
+
+(defun tramp-rpc-advice-unload-function ()
+  "Unload function for tramp-rpc-advice.
+Removes advices."
+  ;; Remove all advices.
+  (tramp-rpc-advice-remove)
+  ;; Return nil to allow normal unload to proceed
+  nil)
+
+(add-hook 'tramp-rpc-unload-hook
+	  (lambda ()
+	    ;; When Emacs is configured --with-native-compilation,
+	    ;; `load-history' contains `--anonymous-lambda' defun
+	    ;; entries for tramp-rpc-advice.el.  This raises an
+	    ;; `cl--assertion-failed' error when unloading.  Emacs
+	    ;; bug#80446.
+	    (dolist (entry load-history)
+	      (when (string-match-p
+		     (rx "tramp-rpc-advice" (| ".el" ".elc") eos) (car entry))
+		(setcdr entry
+			(seq-remove
+			 (lambda (item)
+			   (equal item '(defun . --anonymous-lambda)))
+			 (cdr entry)))))
+	    (unload-feature 'tramp-rpc-advice 'force)))
+
 (provide 'tramp-rpc-advice)
 ;;; tramp-rpc-advice.el ends here

@@ -772,5 +772,22 @@ be available, and uses alien indexing for better performance."
 (with-eval-after-load 'projectile
   (tramp-rpc-projectile-enable))
 
+;; ============================================================================
+;; Unload support
+;; ============================================================================
+
+(defun tramp-rpc-magit-unload-function ()
+  "Unload function for tramp-rpc-magit.
+Removes advices."
+  ;; Remove all advices.
+  (tramp-rpc-magit-disable)
+  (tramp-rpc-projectile-disable)
+  ;; Return nil to allow normal unload to proceed
+  nil)
+
+(add-hook 'tramp-rpc-unload-hook
+	  (lambda ()
+	    (unload-feature 'tramp-rpc-magit 'force)))
+
 (provide 'tramp-rpc-magit)
 ;;; tramp-rpc-magit.el ends here

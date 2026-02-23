@@ -951,5 +951,13 @@ This helps troubleshoot deployment issues."
         (insert "  3. Manually test: ssh " (if user (concat user "@") "") host " echo success\n")))
     (display-buffer buf)))
 
+;; ============================================================================
+;; Unload support
+;; ============================================================================
+
+(add-hook 'tramp-rpc-unload-hook
+	  (lambda ()
+	    (unload-feature 'tramp-rpc-deploy 'force)))
+
 (provide 'tramp-rpc-deploy)
 ;;; tramp-rpc-deploy.el ends here

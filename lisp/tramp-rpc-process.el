@@ -969,5 +969,32 @@ For direct SSH PTY, let the original function handle it (SSH handles resize)."
   (advice-add 'eat--adjust-process-window-size :around
               #'tramp-rpc--eat-adjust-process-window-size-advice))
 
+(defun tramp-rpc--process-advice-remove ()
+  "Remove advices."
+  (advice-remove 'vterm--window-adjust-process-window-size
+              #'tramp-rpc--vterm-window-adjust-process-window-size-advice)
+  (advice-remove 'eat--adjust-process-window-size
+              #'tramp-rpc--eat-adjust-process-window-size-advice))
+
+;; ============================================================================
+;; Unload support
+;; ============================================================================
+
+(defun tramp-rpc-process-unload-function ()
+  "Unload function for tramp-rpc-process.
+Removes advices and cleans up async processes."
+  ;; Remove all advices
+  (tramp-rpc--process-advice-remove)
+  ;; Clean up all async processes.
+  (tramp-rpc--cleanup-async-processes)
+  ;; Clean up PTY processes.
+  (tramp-rpc--cleanup-pty-processes)
+  ;; Return nil to allow normal unload to proceed
+  nil)
+
+(add-hook 'tramp-rpc-unload-hook
+	  (lambda ()
+	    (unload-feature 'tramp-rpc-process 'force)))
+
 (provide 'tramp-rpc-process)
 ;;; tramp-rpc-process.el ends here

@@ -391,15 +391,13 @@ jobs:
         run: |
           # Exclude known unfixable tests:
           #   :unstable: not recommended by upstream Tramp
-          #   test49: requires tramp-add-external-operation (newer tramp API)
-          #   test52: tramp-rpc features not cleaned up on unload-feature
           emacs -Q --batch \
             -L lisp \
             --eval "(require 'package)" \
             --eval "(add-to-list 'package-archives '(\"melpa\" . \"https://melpa.org/packages/\") t)" \
             --eval "(package-initialize)" \
             -l test/run-tramp-tests.el \
-            --eval "(ert-run-tests-batch-and-exit '(and (not (tag :unstable)) (not \"tramp-test49\") (not \"tramp-test52\")))"
+            --eval "(ert-run-tests-batch-and-exit '(not (tag :unstable))"
 
   summary:
     name: Test Summary
