@@ -397,7 +397,7 @@ jobs:
             --eval "(add-to-list 'package-archives '(\"melpa\" . \"https://melpa.org/packages/\") t)" \
             --eval "(package-initialize)" \
             -l test/run-tramp-tests.el \
-            --eval "(ert-run-tests-batch-and-exit '(not (tag :unstable))"
+            --eval "(ert-run-tests-batch-and-exit '(not (tag :unstable)))"
 
   summary:
     name: Test Summary

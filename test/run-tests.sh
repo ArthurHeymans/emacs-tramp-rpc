@@ -81,7 +81,7 @@ run_upstream_tests() {
     echo -e "${YELLOW}Running upstream tests against ${TRAMP_RPC_TEST_HOST:-localhost}...${NC}"
     ${EMACS:-emacs} -Q --batch \
         -l "$SCRIPT_DIR/run-tramp-tests.el" \
-        --eval "(ert-run-tests-batch-and-exit '(not (tag :unstable))"
+        --eval "(ert-run-tests-batch-and-exit '(not (tag :unstable)))"
 }
 
 run_all_tests() {
