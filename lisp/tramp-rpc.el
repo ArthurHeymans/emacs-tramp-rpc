@@ -1243,9 +1243,11 @@ ELOOP errors to nil (the file effectively doesn't exist for stat)."
         (tramp-rpc--call vec "file.stat" params)
       (file-missing nil)
       (file-error
-       ;; Return nil for ELOOP (symlink loop) - file can't be resolved,
-       ;; so it effectively doesn't exist for stat purposes.
-       (if (string-match-p "Too many levels of symbolic links" (cadr err))
+       ;; Return nil for ELOOP (symlink loop) and ENOTDIR (path component
+       ;; is not a directory, e.g. "file.py/.editorconfig") - the file
+       ;; can't be resolved, so it effectively doesn't exist for stat purposes.
+       (if (or (string-match-p "Too many levels of symbolic links" (cadr err))
+               (string-match-p "Not a directory" (cadr err)))
            nil
          (signal (car err) (cdr err)))))))
 
