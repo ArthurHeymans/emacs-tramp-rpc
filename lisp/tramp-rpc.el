@@ -462,6 +462,15 @@ Otherwise clear all entries."
   "Cache of executable paths keyed by (connection-key . program).
 Value is the full path or :not-found.")
 
+;; Forward-declare caches used by tramp-rpc--remove-connection (defined
+;; later in the exec-path section).  The byte-compiler needs to see
+;; these defvars before their first reference.
+(defvar tramp-rpc--exec-path-cache (make-hash-table :test 'equal)
+  "Cache of remote exec-path keyed by connection-key.")
+
+(defvar tramp-rpc--login-shell-cache (make-hash-table :test 'equal)
+  "Cache of remote login shell keyed by connection-key.")
+
 (defun tramp-rpc--clear-executable-cache (&optional vec)
   "Clear the executable cache.
 If VEC is provided, only clear entries for that connection.
@@ -2260,12 +2269,6 @@ process-file calls from VC backends are routed through our tramp handler."
 ;; ============================================================================
 ;; Additional handlers to avoid shell dependency
 ;; ============================================================================
-
-(defvar tramp-rpc--exec-path-cache (make-hash-table :test 'equal)
-  "Cache of remote exec-path keyed by connection-key.")
-
-(defvar tramp-rpc--login-shell-cache (make-hash-table :test 'equal)
-  "Cache of remote login shell keyed by connection-key.")
 
 (defun tramp-rpc-handle-exec-path ()
   "Return remote exec-path using RPC.
