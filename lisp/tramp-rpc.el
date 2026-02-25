@@ -485,8 +485,11 @@ same host produce distinct connections."
 
 (defun tramp-rpc--remove-connection (vec)
   "Remove the RPC connection for VEC.
-Also clears the executable cache for this connection."
-  (remhash (tramp-rpc--connection-key vec) tramp-rpc--connections)
+Also clears the executable, exec-path, and login shell caches."
+  (let ((key (tramp-rpc--connection-key vec)))
+    (remhash key tramp-rpc--connections)
+    (remhash key tramp-rpc--exec-path-cache)
+    (remhash key tramp-rpc--login-shell-cache))
   (tramp-rpc--clear-executable-cache vec))
 
 (defun tramp-rpc--ensure-connection (vec)
@@ -2129,6 +2132,9 @@ process-file calls from VC backends are routed through our tramp handler."
 (defvar tramp-rpc--exec-path-cache (make-hash-table :test 'equal)
   "Cache of remote exec-path keyed by connection-key.")
 
+(defvar tramp-rpc--login-shell-cache (make-hash-table :test 'equal)
+  "Cache of remote login shell keyed by connection-key.")
+
 (defun tramp-rpc-handle-exec-path ()
   "Return remote exec-path using RPC.
 Resolves `tramp-rpc-remote-path' by expanding the placeholder
@@ -2174,16 +2180,21 @@ user's login shell PATH.  Removes duplicates."
   "Return the login shell for the remote user on VEC.
 Tries the `shell' field from system.info (populated via getpwuid on
 the server).  Falls back to looking up the user via `getent passwd'
-and extracting field 7.  Returns \"/bin/sh\" if all lookups fail."
-  ;; Try system.info first (no extra RPC call if already cached)
-  (condition-case nil
-      (let* ((info (tramp-rpc--call vec "system.info" nil))
-             (shell (alist-get 'shell info)))
-        (if (and shell (stringp shell) (> (length shell) 0))
-            shell
-          ;; Fallback: getent passwd
-          (tramp-rpc--get-remote-login-shell-via-getent vec)))
-    (error (tramp-rpc--get-remote-login-shell-via-getent vec))))
+and extracting field 7.  Returns \"/bin/sh\" if all lookups fail.
+Result is cached per connection."
+  (let* ((key (tramp-rpc--connection-key vec))
+         (cached (gethash key tramp-rpc--login-shell-cache)))
+    (or cached
+        (let ((shell
+               (condition-case nil
+                   (let* ((info (tramp-rpc--call vec "system.info" nil))
+                          (sh (alist-get 'shell info)))
+                     (if (and sh (stringp sh) (> (length sh) 0))
+                         sh
+                       (tramp-rpc--get-remote-login-shell-via-getent vec)))
+                 (error (tramp-rpc--get-remote-login-shell-via-getent vec)))))
+          (puthash key shell tramp-rpc--login-shell-cache)
+          shell))))
 
 (defun tramp-rpc--get-remote-login-shell-via-getent (vec)
   "Look up the login shell for the remote user on VEC via getent.
