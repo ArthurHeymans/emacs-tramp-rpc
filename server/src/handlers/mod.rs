@@ -39,8 +39,24 @@ fn system_info() -> HandlerResult {
         "uid" => unsafe { libc::getuid() },
         "gid" => unsafe { libc::getgid() },
         "home" => env::var("HOME").ok().into_value(),
-        "user" => env::var("USER").ok().into_value()
+        "user" => env::var("USER").ok().into_value(),
+        "shell" => login_shell().into_value()
     })
+}
+
+/// Look up the current user's login shell from the passwd database.
+fn login_shell() -> Option<String> {
+    let uid = unsafe { libc::getuid() };
+    let pw = unsafe { libc::getpwuid(uid) };
+    if pw.is_null() {
+        return None;
+    }
+    let shell = unsafe { (*pw).pw_shell };
+    if shell.is_null() {
+        return None;
+    }
+    let cstr = unsafe { std::ffi::CStr::from_ptr(shell) };
+    cstr.to_str().ok().map(|s| s.to_string())
 }
 
 use crate::protocol::IntoValue;
