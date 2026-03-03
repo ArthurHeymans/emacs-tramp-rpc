@@ -181,6 +181,10 @@ The file is not created."
   "Return the remote test directory path on the second host."
   (format "/rpc:%s:%s" tramp-rpc-test-host-2 tramp-rpc-test-temp-dir))
 
+(defvar tramp-rpc-test-multi-hop-checked nil
+  "Cached result of `tramp-rpc-test-multi-hop-enabled'.
+Value is a cons cell (CHECKED . RESULT).")
+
 (defvar tramp-rpc-test-cross-remote-checked nil
   "Cached result of `tramp-rpc-test-cross-remote-enabled'.
 Value is a cons cell (CHECKED . RESULT).")
@@ -202,6 +206,49 @@ Returns non-nil if both test hosts are reachable."
                                   (file-writable-p dir))))
                        (error nil))))))
   (cdr tramp-rpc-test-cross-remote-checked))
+
+(defun tramp-rpc-test--make-multi-hop-remote-path (filename)
+  "Make a TRAMP RPC path using multi-hop syntax for FILENAME.
+Uses the test host as both the hop and the target (self-referential
+ProxyJump), which tests the full multi-hop connection machinery."
+  (let ((user-part (if tramp-rpc-test-user
+                       (concat tramp-rpc-test-user "@")
+                     "")))
+    (format "/rpc:%s%s|rpc:%s%s:%s/%s"
+            user-part tramp-rpc-test-host
+            user-part tramp-rpc-test-host
+            tramp-rpc-test-temp-dir
+            filename)))
+
+(defun tramp-rpc-test--multi-hop-remote-directory ()
+  "Return the remote test directory path via multi-hop."
+  (let ((user-part (if tramp-rpc-test-user
+                       (concat tramp-rpc-test-user "@")
+                     "")))
+    (format "/rpc:%s%s|rpc:%s%s:%s"
+            user-part tramp-rpc-test-host
+            user-part tramp-rpc-test-host
+            tramp-rpc-test-temp-dir)))
+
+(defun tramp-rpc-test-multi-hop-enabled ()
+  "Check if multi-hop testing is possible.
+This requires the test host to be able to SSH to itself (self-referential
+ProxyJump).  The result is cached after the first check."
+  (unless (consp tramp-rpc-test-multi-hop-checked)
+    (setq tramp-rpc-test-multi-hop-checked
+          (cons t
+                (and (tramp-rpc-test-enabled)
+                     (condition-case nil
+                         (let ((hop-dir (tramp-rpc-test--multi-hop-remote-directory)))
+                           (file-directory-p hop-dir))
+                       (error nil))))))
+  (cdr tramp-rpc-test-multi-hop-checked))
+
+(defun tramp-rpc-test--make-multi-hop-temp-name ()
+  "Return a temporary file name via multi-hop.
+The file is not created."
+  (tramp-rpc-test--make-multi-hop-remote-path
+   (make-temp-name tramp-rpc-test-name-prefix)))
 
 (defun tramp-rpc-test--setup ()
   "Set up test environment."
@@ -1218,6 +1265,107 @@ and returns a valid path."
                               (insert-file-contents file)
                               (buffer-string)))))
       (ignore-errors (delete-file file)))))
+
+;;; ============================================================================
+;;; Test 19: Multi-Hop
+;;; ============================================================================
+
+(ert-deftest tramp-rpc-test19-multi-hop-file-operations ()
+  "Test file operations through multi-hop syntax.
+Uses the test host as both hop and target (self-referential ProxyJump).
+This exercises the full multi-hop connection machinery:
+- Filename parsing with hop chain
+- ProxyJump SSH argument construction
+- Separate ControlMaster socket for the hopped connection
+- Server startup through the hopped SSH connection
+- File I/O through the multi-hop RPC channel"
+  :tags '(:expensive-test :multi-hop)
+  (skip-unless (tramp-rpc-test-multi-hop-enabled))
+
+  (let ((file (tramp-rpc-test--make-multi-hop-temp-name))
+        (content "multi-hop test content"))
+    (unwind-protect
+        (progn
+          ;; Write file through multi-hop
+          (write-region content nil file)
+          (should (file-exists-p file))
+          ;; Read back through multi-hop
+          (should (equal content
+                         (with-temp-buffer
+                           (insert-file-contents file)
+                           (buffer-string))))
+          ;; File attributes should work
+          (let ((attrs (file-attributes file)))
+            (should attrs)
+            (should (null (file-attribute-type attrs)))
+            (should (= (file-attribute-size attrs) (length content))))
+          ;; The same file should be visible via the direct (non-hopped) path
+          (let ((direct-file (tramp-rpc-test--make-remote-path
+                              (file-name-nondirectory file))))
+            (should (file-exists-p direct-file))
+            (should (equal content
+                           (with-temp-buffer
+                             (insert-file-contents direct-file)
+                             (buffer-string))))))
+      (ignore-errors (delete-file file)))))
+
+(ert-deftest tramp-rpc-test19-multi-hop-directory-operations ()
+  "Test directory operations through multi-hop syntax."
+  :tags '(:expensive-test :multi-hop)
+  (skip-unless (tramp-rpc-test-multi-hop-enabled))
+
+  (let ((dir (tramp-rpc-test--make-multi-hop-temp-name)))
+    (unwind-protect
+        (progn
+          ;; Create directory through multi-hop
+          (make-directory dir)
+          (should (file-directory-p dir))
+          ;; Create a file inside
+          (let ((file (expand-file-name "test.txt" dir)))
+            (write-region "inside multi-hop dir" nil file)
+            (should (file-exists-p file)))
+          ;; List directory through multi-hop
+          (let ((files (directory-files dir)))
+            (should (member "test.txt" files))))
+      (ignore-errors (delete-directory dir t)))))
+
+(ert-deftest tramp-rpc-test19-multi-hop-distinct-connection ()
+  "Test that multi-hop and direct paths use distinct connections.
+The multi-hop path should have a different connection key and
+ControlMaster socket from the direct path to the same host."
+  :tags '(:multi-hop)
+  (skip-unless (tramp-rpc-test-multi-hop-enabled))
+
+  (let* ((direct-dir (tramp-rpc-test--remote-directory))
+         (hop-dir (tramp-rpc-test--multi-hop-remote-directory))
+         (direct-vec (tramp-dissect-file-name direct-dir))
+         (hop-vec (tramp-dissect-file-name hop-dir)))
+    ;; Connection keys must differ
+    (should-not (equal (tramp-rpc--connection-key direct-vec)
+                       (tramp-rpc--connection-key hop-vec)))
+    ;; ControlMaster socket paths must differ
+    (should-not (equal (tramp-rpc--controlmaster-socket-path direct-vec)
+                       (tramp-rpc--controlmaster-socket-path hop-vec)))
+    ;; But the target host/user should be the same
+    (should (equal (tramp-file-name-host direct-vec)
+                   (tramp-file-name-host hop-vec)))
+    (should (equal (tramp-file-name-user direct-vec)
+                   (tramp-file-name-user hop-vec)))))
+
+(ert-deftest tramp-rpc-test19-multi-hop-process-file ()
+  "Test process execution through multi-hop syntax."
+  :tags '(:expensive-test :multi-hop :process)
+  (skip-unless (tramp-rpc-test-multi-hop-enabled))
+
+  (let ((default-directory (file-name-as-directory
+                            (tramp-rpc-test--multi-hop-remote-directory))))
+    ;; Simple command
+    (should (= 0 (process-file "true")))
+    (should (= 1 (process-file "false")))
+    ;; Command with output
+    (with-temp-buffer
+      (process-file "echo" nil t nil "multi-hop-output")
+      (should (string-match-p "multi-hop-output" (buffer-string))))))
 
 ;;; ============================================================================
 ;;; Test Runner

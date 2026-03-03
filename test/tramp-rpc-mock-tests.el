@@ -589,6 +589,24 @@ Returns the result or signals an error."
   (let ((vec (tramp-dissect-file-name "/ssh:gateway|rpc:user@target:/path")))
     (should (equal (tramp-rpc--hops-to-proxyjump vec) "gateway"))))
 
+(ert-deftest tramp-rpc-mock-test-hops-to-proxyjump-port-only ()
+  "Test ProxyJump conversion with a hop that has a port but no user."
+  :tags '(:multi-hop)
+  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
+  (let ((vec (tramp-dissect-file-name "/rpc:gateway#2222|rpc:user@target:/path")))
+    (should (equal (tramp-rpc--hops-to-proxyjump vec) "gateway:2222"))))
+
+(ert-deftest tramp-rpc-mock-test-hops-to-proxyjump-complex ()
+  "Test ProxyJump conversion with complex multi-hop chain.
+Tests a realistic scenario: bastion with user+port, then a middle
+hop with user only, all leading to a final target."
+  :tags '(:multi-hop)
+  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
+  (let ((vec (tramp-dissect-file-name
+              "/ssh:admin@bastion#2222|rpc:devuser@middleware|rpc:user@target:/path")))
+    (should (equal (tramp-rpc--hops-to-proxyjump vec)
+                   "admin@bastion:2222,devuser@middleware"))))
+
 (ert-deftest tramp-rpc-mock-test-connection-key-no-hop ()
   "Test connection key without hops."
   :tags '(:multi-hop)
@@ -683,9 +701,10 @@ Returns the result or signals an error."
   (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
   (let* ((vec (tramp-dissect-file-name "/rpc:gateway|rpc:user@target:/path"))
          (bootstrap (tramp-rpc-deploy--bootstrap-vec vec)))
-    ;; Method should be the bootstrap method (default: scp)
-    (should (equal (tramp-file-name-method bootstrap)
-                   tramp-rpc-deploy-bootstrap-method))
+    ;; When hops are present and the default bootstrap method is an
+    ;; out-of-band method (scpx), the bootstrap vec should fall back to
+    ;; "sshx" because out-of-band methods fail tramp-multi-hop-p.
+    (should (equal (tramp-file-name-method bootstrap) "sshx"))
     ;; Host and user should be preserved
     (should (equal (tramp-file-name-host bootstrap) "target"))
     (should (equal (tramp-file-name-user bootstrap) "user"))
@@ -694,6 +713,62 @@ Returns the result or signals an error."
       (should hop)
       (should (string-match-p "ssh:" hop))
       (should-not (string-match-p "rpc:" hop)))))
+
+(ert-deftest tramp-rpc-mock-test-deploy-bootstrap-vec-no-hop-uses-default ()
+  "Test that bootstrap vec without hops uses the configured method."
+  :tags '(:multi-hop)
+  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
+  (let* ((vec (make-tramp-file-name :method "rpc" :host "target"
+                                    :user "user" :localname "/path"))
+         (bootstrap (tramp-rpc-deploy--bootstrap-vec vec)))
+    ;; Without hops, the configured bootstrap method should be used as-is
+    (should (equal (tramp-file-name-method bootstrap)
+                   tramp-rpc-deploy-bootstrap-method))
+    ;; No hop should be present
+    (should-not (tramp-file-name-hop bootstrap))))
+
+(ert-deftest tramp-rpc-mock-test-deploy-bootstrap-vec-hop-with-sshx ()
+  "Test that bootstrap vec with hops keeps sshx if already configured."
+  :tags '(:multi-hop)
+  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
+  (let* ((tramp-rpc-deploy-bootstrap-method "sshx")
+         (vec (tramp-dissect-file-name "/rpc:gateway|rpc:user@target:/path"))
+         (bootstrap (tramp-rpc-deploy--bootstrap-vec vec)))
+    ;; sshx supports multi-hop, so it should be used as-is
+    (should (equal (tramp-file-name-method bootstrap) "sshx"))))
+
+(ert-deftest tramp-rpc-mock-test-deploy-bootstrap-vec-hop-forces-sshx ()
+  "Test that out-of-band bootstrap methods fall back to sshx with hops.
+TRAMP's `tramp-multi-hop-p' rejects methods with `tramp-copy-program'
+\(scp, scpx, rsync), so the bootstrap must use an inline method."
+  :tags '(:multi-hop)
+  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
+  (dolist (oob-method '("scp" "scpx" "rsync"))
+    (let* ((tramp-rpc-deploy-bootstrap-method oob-method)
+           (vec (tramp-dissect-file-name "/rpc:gateway|rpc:user@target:/path"))
+           (bootstrap (tramp-rpc-deploy--bootstrap-vec vec)))
+      (should (equal (tramp-file-name-method bootstrap) "sshx")))))
+
+(ert-deftest tramp-rpc-mock-test-multi-hop-rpc-with-sudo ()
+  "Test that /rpc:host|sudo:user@:/path passes TRAMP's multi-hop validation.
+This exercises `tramp-compute-multi-hops' which checks that each hop's
+method either uses \"%h\" in its tramp-login-args (meaning the method
+actually connects to the specified host) or that the host matches the
+previous hop.  Without tramp-login-args containing \"%h\" in the rpc
+method definition, the host validation fails with:
+  Host name `host' does not match `tramp-local-host-regexp'"
+  :tags '(:multi-hop)
+  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
+  ;; Verify the rpc method now has tramp-login-args with "%h"
+  (let* ((vec (make-tramp-file-name :method "rpc" :host "myhost"
+                                    :localname "/path"))
+         (login-args (tramp-get-method-parameter vec 'tramp-login-args)))
+    (should login-args)
+    (should (member "%h" (flatten-tree login-args))))
+  ;; Verify that tramp-compute-multi-hops succeeds for rpc|sudo
+  ;; (previously this would signal an error)
+  (let ((vec (tramp-dissect-file-name "/rpc:myhost|sudo:www-data@:/path")))
+    (should (tramp-compute-multi-hops vec))))
 
 ;;; ============================================================================
 ;;; Test Runner

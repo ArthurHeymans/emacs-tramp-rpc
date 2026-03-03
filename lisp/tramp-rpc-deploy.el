@@ -219,20 +219,37 @@ The method used is controlled by `tramp-rpc-deploy-bootstrap-method'.
 Methods like \"scp\" and \"rsync\" use out-of-band transfer for `copy-file',
 while \"ssh\" and \"sshx\" use inline encoding (base64 through the shell).
 Any \"rpc:\" hops in the hop chain are normalized to \"ssh:\" so that
-standard TRAMP can traverse them."
+standard TRAMP can traverse them.
+
+When hops are present, out-of-band methods (scp, scpx, rsync) cannot be
+used because TRAMP's `tramp-multi-hop-p' rejects methods that have
+`tramp-copy-program'.  In this case, \"sshx\" is used instead, which
+transfers the binary via inline encoding (slower but compatible with
+multi-hop)."
   (let ((method (tramp-file-name-method vec)))
     (if (member method '("ssh" "sshx" "scp" "scpx" "rsync"))
         vec  ; Already a TRAMP method that supports shell commands and file transfer
       ;; Convert to bootstrap method - create a new tramp-file-name struct
-      (make-tramp-file-name
-       :method tramp-rpc-deploy-bootstrap-method
-       :user (tramp-file-name-user vec)
-       :domain (tramp-file-name-domain vec)
-       :host (tramp-file-name-host vec)
-       :port (tramp-file-name-port vec)
-       :localname (tramp-file-name-localname vec)
-       :hop (tramp-rpc-deploy--normalize-hops
-             (tramp-file-name-hop vec))))))
+      (let* ((hops (tramp-file-name-hop vec))
+             (normalized-hops (tramp-rpc-deploy--normalize-hops hops))
+             ;; When hops are present, out-of-band methods (scp, scpx,
+             ;; rsync) fail TRAMP's multi-hop validation because they have
+             ;; tramp-copy-program set.  Fall back to "sshx" which supports
+             ;; multi-hop (inline transfer only).
+             (bootstrap-method
+              (if (and normalized-hops
+                       (member tramp-rpc-deploy-bootstrap-method
+                               '("scp" "scpx" "rsync")))
+                  "sshx"
+                tramp-rpc-deploy-bootstrap-method)))
+        (make-tramp-file-name
+         :method bootstrap-method
+         :user (tramp-file-name-user vec)
+         :domain (tramp-file-name-domain vec)
+         :host (tramp-file-name-host vec)
+         :port (tramp-file-name-port vec)
+         :localname (tramp-file-name-localname vec)
+         :hop normalized-hops)))))
 
 (defun tramp-rpc-deploy--detect-remote-arch (vec)
   "Detect the architecture of remote host specified by VEC.

@@ -60,9 +60,26 @@
   ;; unloading `tramp-rpc', but this body still exists as compiled
   ;; function in `after-load-alist'.
   (when (boundp 'tramp-rpc-method)
-  ;; Register the method
+  ;; Register the method.  The SSH login parameters (tramp-login-program,
+  ;; tramp-login-args, tramp-remote-shell) are used by tramp-sh when "rpc"
+  ;; appears as a hop in a multi-hop chain with a tramp-sh target method
+  ;; (e.g., /rpc:host|sudo:user@:/path).  In that case tramp-sh opens an
+  ;; SSH shell on the hop host, then chains the target method (sudo) inside
+  ;; it -- exactly like the built-in "ssh" method.  When "rpc" is the final
+  ;; target, the tramp-rpc foreign handler is used instead and these
+  ;; parameters are ignored.
   (add-to-list 'tramp-methods
                `(,tramp-rpc-method
+                 (tramp-login-program        "ssh")
+                 (tramp-login-args           (("-l" "%u") ("-p" "%p") ("%c")
+                                              ("-e" "none")
+                                              ("-o" ,(format
+                                                      "SetEnv=\"TERM=%s\""
+                                                      tramp-terminal-type))
+                                              ("%h")))
+                 (tramp-remote-shell         ,tramp-default-remote-shell)
+                 (tramp-remote-shell-login   ("-l"))
+                 (tramp-remote-shell-args    ("-c"))
                  ;; Direct async process support: tramp-rpc uses direct SSH
                  ;; PTY connections for async processes, which means stderr
                  ;; is mixed with stdout (normal PTY behavior).  Setting
