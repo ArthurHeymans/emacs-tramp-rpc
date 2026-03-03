@@ -49,6 +49,16 @@ TRAMP-RPC replaces this with a lightweight Rust server that runs on the remote h
   :ensure t)
 #+end_src
 
+** From Git (Emacs 30+)
+
+#+begin_src elisp
+(use-package tramp-rpc
+  :after tramp
+  :vc (:url "https://github.com/ArthurHeymans/emacs-tramp-rpc"
+       :rev :newest
+       :lisp-dir "lisp"))
+#+end_src
+
 ** Manual Installation
 
 1. Clone this repository:
