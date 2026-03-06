@@ -231,6 +231,11 @@ Set to t to enable debugging for hang diagnosis."
   :type 'boolean
   :group 'tramp-rpc)
 
+(defcustom tramp-rpc-compress-file-read (fboundp 'zlib-decompress-region)
+  "When non-nil, use compression for file reads to enable faster transfers."
+  :type 'boolean
+  :group 'tramp-rpc)
+
 (defun tramp-rpc--debug (format-string &rest args)
   "Log a debug message to *tramp-rpc-debug* buffer if debugging is enabled.
 FORMAT-STRING and ARGS are passed to `format'."
@@ -240,6 +245,44 @@ FORMAT-STRING and ARGS are passed to `format'."
       (insert (format-time-string "[%Y-%m-%d %H:%M:%S.%3N] ")
               (apply #'format format-string args)
               "\n"))))
+
+(defun tramp-rpc--extract-file-read-content (rpc-result)
+  "Extract and optionally decompress content from FILE.READ RPC-RESULT.
+Signals `remote-file-error' on compressed payload decode failures."
+  (let ((content (if (stringp rpc-result)
+                     rpc-result
+                   (alist-get 'content rpc-result))))
+    (if (and (not (stringp rpc-result))
+             (alist-get 'compressed rpc-result))
+        (let ((compression (or (alist-get 'compression rpc-result) "zlib")))
+          (cond
+           ((and (string= compression "zlib")
+                 (fboundp 'zlib-decompress-region))
+            (condition-case err
+                (with-temp-buffer
+                  (set-buffer-multibyte nil)
+                  (insert content)
+                  (zlib-decompress-region (point-min) (point-max))
+                  (buffer-string))
+              (error
+               (signal 'remote-file-error
+                       (list "RPC"
+                             (format "zlib decompression failed: %s" err))))))
+           (t
+            (signal 'remote-file-error
+                    (list "RPC"
+                          (format "Unsupported file.read compression: %s" compression))))))
+      content)))
+
+(defun tramp-rpc--file-read-params (localname &optional force-uncompressed)
+  "Build params for `file.read' on LOCALNAME.
+When `tramp-rpc-compress-file-read' is non-nil, request compression unless
+FORCE-UNCOMPRESSED is non-nil."
+  (let ((params (tramp-rpc--encode-path localname)))
+    (when (and tramp-rpc-compress-file-read
+               (not force-uncompressed))
+      (push '(compress . t) params))
+    params))
 
 ;; ============================================================================
 ;; Connection management
@@ -2215,9 +2258,9 @@ Caches the PATH portion per connection."
 (defun tramp-rpc-handle-file-local-copy (filename)
   "Create a local copy of remote FILENAME using RPC."
   (tramp-skeleton-file-local-copy filename
-    (let* ((result (tramp-rpc--call v "file.read" (tramp-rpc--encode-path localname)))
-           ;; With MessagePack, content is already raw bytes
-           (content (alist-get 'content result)))
+    (let* ((params (tramp-rpc--file-read-params localname))
+           (result (tramp-rpc--call v "file.read" params))
+           (content (tramp-rpc--extract-file-read-content result)))
       (with-temp-file tmpfile
         (set-buffer-multibyte nil)
         (insert content)))))

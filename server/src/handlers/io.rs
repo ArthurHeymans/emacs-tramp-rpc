@@ -2,9 +2,11 @@
 
 use crate::msgpack_map;
 use crate::protocol::{from_value, RpcError};
+use flate2::write::ZlibEncoder;
+use flate2::Compression;
 use rmpv::Value;
 use serde::Deserialize;
-use std::io::SeekFrom;
+use std::io::{SeekFrom, Write};
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use tokio::fs::{self, File, OpenOptions};
@@ -27,6 +29,9 @@ pub async fn read(params: Value) -> HandlerResult {
         /// Maximum number of bytes to read (default: entire file)
         #[serde(default)]
         length: Option<usize>,
+        /// When true, zlib-compress payload bytes before sending.
+        #[serde(default)]
+        compress: bool,
     }
 
     let params: Params = from_value(params).map_err(|e| RpcError::invalid_params(e.to_string()))?;
@@ -47,27 +52,52 @@ pub async fn read(params: Value) -> HandlerResult {
 
     // Read the content
     let content = if let Some(length) = params.length {
-        let mut buf = vec![0u8; length];
-        let bytes_read = file
-            .read(&mut buf)
+        // Read up to LENGTH bytes in a single pass. `take` keeps reads bounded.
+        let mut buf = Vec::with_capacity(length);
+        let mut reader = file.take(length as u64);
+        reader
+            .read_to_end(&mut buf)
             .await
             .map_err(|e| map_io_error(e, &path_str))?;
-        buf.truncate(bytes_read);
         buf
     } else {
+        // Pre-size from metadata to avoid repeated reallocations on large reads.
         let mut buf = Vec::new();
+        if let Ok(metadata) = file.metadata().await {
+            let mut expected_len = metadata.len() as usize;
+            if let Some(offset) = params.offset {
+                expected_len = expected_len.saturating_sub(offset as usize);
+            }
+            buf.reserve(expected_len);
+        }
         file.read_to_end(&mut buf)
             .await
             .map_err(|e| map_io_error(e, &path_str))?;
         buf
     };
 
-    // Return binary content directly (no base64!)
+    // Return binary content directly (no base64!). Compression is opt-in.
     let size = content.len();
-    Ok(msgpack_map! {
-        "content" => Value::Binary(content),
-        "size" => size
-    })
+    if params.compress {
+        let mut encoder = ZlibEncoder::new(Vec::new(), Compression::fast());
+        encoder
+            .write_all(&content)
+            .map_err(|e| RpcError::internal_error(format!("zlib write failed: {e}")))?;
+        let compressed = encoder
+            .finish()
+            .map_err(|e| RpcError::internal_error(format!("zlib finish failed: {e}")))?;
+        Ok(msgpack_map! {
+            "content" => Value::Binary(compressed),
+            "size" => size,
+            "compressed" => true,
+            "compression" => "zlib"
+        })
+    } else {
+        Ok(msgpack_map! {
+            "content" => Value::Binary(content),
+            "size" => size
+        })
+    }
 }
 
 /// Write file contents

@@ -17,6 +17,7 @@ rmpv.workspace = true
 serde_bytes.workspace = true
 tokio.workspace = true
 futures.workspace = true
+flate2 = "1.0"
 
 # For file operations
 libc = "0.2"
