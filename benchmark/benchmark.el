@@ -107,7 +107,32 @@
         (with-temp-buffer
           (insert (format "Test file %d\n" i))
           (insert (make-string 1000 ?x))
-          (write-region (point-min) (point-max) file))))))
+          (write-region (point-min) (point-max) file))))
+    ;; Create a 10MB fixture for large read benchmark.
+    (let ((file (tramp-rpc-benchmark--make-path method "file-large-10mb.txt")))
+      (with-temp-buffer
+        (let* ((chunk-size 8192)
+               (chunk (make-string chunk-size ?L))
+               (target-size (* 10 1024 1024))
+               (chunk-count (/ target-size chunk-size)))
+          (dotimes (_ chunk-count)
+            (insert chunk)))
+        (write-region (point-min) (point-max) file)))
+    ;; Create a 10MB high-entropy fixture (intentionally hard to compress).
+    ;; Keep it printable ASCII so both sshx and rpc can write it reliably.
+    (let ((file (tramp-rpc-benchmark--make-path method "file-large-10mb-random.bin")))
+      (with-temp-buffer
+        (let* ((chunk-size 8192)
+               (alphabet "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/")
+               (alphabet-len (length alphabet))
+               (chunk (make-string chunk-size ?A))
+               (target-size (* 10 1024 1024))
+               (chunk-count (/ target-size chunk-size)))
+          (dotimes (_ chunk-count)
+            (dotimes (i chunk-size)
+              (aset chunk i (aref alphabet (random alphabet-len))))
+            (insert chunk)))
+        (write-region (point-min) (point-max) file)))))
 
 (defun tramp-rpc-benchmark--teardown (method)
   "Clean up test environment for METHOD."
@@ -145,6 +170,22 @@
      (with-temp-buffer
        (insert-file-contents file)
        (buffer-string)))))
+
+(defun tramp-rpc-benchmark--file-read-10mb (method)
+  "Benchmark reading a 10MB file for METHOD."
+  (let ((file (tramp-rpc-benchmark--make-path method "file-large-10mb.txt")))
+    (tramp-rpc-benchmark--time
+     (with-temp-buffer
+       (insert-file-contents file)
+       (buffer-size)))))
+
+(defun tramp-rpc-benchmark--file-read-10mb-random (method)
+  "Benchmark reading a high-entropy 10MB file for METHOD."
+  (let ((file (tramp-rpc-benchmark--make-path method "file-large-10mb-random.bin")))
+    (tramp-rpc-benchmark--time
+     (with-temp-buffer
+       (insert-file-contents file)
+       (buffer-size)))))
 
 (defun tramp-rpc-benchmark--file-write (method)
   "Benchmark writing a file for METHOD."
@@ -267,6 +308,8 @@ Same operations as batch-mixed-ops but done one at a time."
     ("file-exists"        . tramp-rpc-benchmark--file-exists)
     ("file-attributes"    . tramp-rpc-benchmark--file-attributes)
     ("file-read"          . tramp-rpc-benchmark--file-read)
+    ("file-read-10mb"     . tramp-rpc-benchmark--file-read-10mb)
+    ("file-read-10mb-random" . tramp-rpc-benchmark--file-read-10mb-random)
     ("file-write"         . tramp-rpc-benchmark--file-write)
     ("directory-files"    . tramp-rpc-benchmark--directory-files)
     ("dir-files-attrs"    . tramp-rpc-benchmark--directory-files-and-attributes)
