@@ -36,6 +36,9 @@
 (declare-function tramp-rpc--kill-remote-process "tramp-rpc-process")
 (declare-function tramp-rpc--cleanup-async-processes "tramp-rpc-process")
 
+;; Functions from tramp-cmds.el
+(declare-function tramp-file-name-with-sudo "tramp-cmds")
+
 ;; Functions from tramp-rpc.el
 (declare-function tramp-rpc--debug "tramp-rpc")
 (declare-function tramp-rpc--call "tramp-rpc")
@@ -272,6 +275,42 @@ process-file calls are routed through the TRAMP handler."
       (apply orig-fun backend function-name args))))
 
 ;; ============================================================================
+;; Privilege elevation integration
+;; ============================================================================
+
+;; `tramp-file-name-with-sudo' assumes the current TRAMP method can participate
+;; directly in the elevated multi-hop path.  That does not hold for `rpc:'.
+;; Rewrite RPC-backed paths to elevate through an SSH hop instead.
+
+(defun tramp-rpc--file-name-with-sudo-via-ssh (filename)
+  "Build an elevated TRAMP file name for RPC-backed FILENAME via SSH."
+  (with-parsed-tramp-file-name (expand-file-name filename) nil
+    (let* ((sudo-method
+            (or (and (boundp 'tramp-file-name-with-method)
+                     tramp-file-name-with-method)
+                "sudo"))
+           (ssh-hop
+            (tramp-make-tramp-hop-name
+             (make-tramp-file-name :method "ssh" :user user :host host))))
+      (let ((tramp-show-ad-hoc-proxies t))
+        (tramp-make-tramp-file-name
+         (make-tramp-file-name
+          :method (tramp-find-method sudo-method nil host)
+          :user (tramp-find-user sudo-method nil host)
+          :host (tramp-find-host sudo-method nil host)
+          :localname localname
+          :hop ssh-hop))))))
+
+(defun tramp-rpc--file-name-with-sudo-advice (orig-fun filename)
+  "Route RPC-backed sudo elevation through SSH for FILENAME."
+  (let ((filename (expand-file-name filename)))
+    (if (and (tramp-tramp-file-p filename)
+             (with-parsed-tramp-file-name filename nil
+               (string= method "rpc")))
+        (tramp-rpc--file-name-with-sudo-via-ssh filename)
+      (funcall orig-fun filename))))
+
+;; ============================================================================
 ;; Eglot integration
 ;; ============================================================================
 
@@ -334,6 +373,9 @@ exited (remote side finished), delete it so the refresh can proceed."
   (advice-add 'process-command :around #'tramp-rpc--process-command-advice)
   (advice-add 'process-tty-name :around #'tramp-rpc--process-tty-name-advice)
   (advice-add 'vc-call-backend :around #'tramp-rpc--vc-call-backend-advice)
+  (with-eval-after-load 'tramp-cmds
+    (when (fboundp 'tramp-file-name-with-sudo)
+      (advice-add 'tramp-file-name-with-sudo :around #'tramp-rpc--file-name-with-sudo-advice)))
   (with-eval-after-load 'eglot
     (advice-add 'eglot--cmd :around #'tramp-rpc--eglot-cmd-advice))
   (with-eval-after-load 'vc-dir
@@ -350,6 +392,8 @@ exited (remote side finished), delete it so the refresh can proceed."
   (advice-remove 'process-command #'tramp-rpc--process-command-advice)
   (advice-remove 'process-tty-name #'tramp-rpc--process-tty-name-advice)
   (advice-remove 'vc-call-backend #'tramp-rpc--vc-call-backend-advice)
+  (when (fboundp 'tramp-file-name-with-sudo)
+    (advice-remove 'tramp-file-name-with-sudo #'tramp-rpc--file-name-with-sudo-advice))
   (advice-remove 'eglot--cmd #'tramp-rpc--eglot-cmd-advice)
   (advice-remove 'vc-dir-refresh #'tramp-rpc--vc-dir-refresh-advice))
 

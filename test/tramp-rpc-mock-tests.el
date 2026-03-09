@@ -498,6 +498,11 @@ Returns the result or signals an error."
      nil))
   "Non-nil if tramp-rpc.el loaded successfully.")
 
+(defun tramp-rpc-mock-test--sudo-helper-available-p ()
+  "Return non-nil when the sudo path helpers needed by this test are available."
+  (and (require 'tramp-cmds nil t)
+       (fboundp 'tramp-file-name-with-sudo)))
+
 (ert-deftest tramp-rpc-mock-test-multi-hop-advice ()
   "Test that tramp-multi-hop-p returns t for the rpc method."
   :tags '(:multi-hop)
@@ -694,6 +699,38 @@ Returns the result or signals an error."
       (should hop)
       (should (string-match-p "ssh:" hop))
       (should-not (string-match-p "rpc:" hop)))))
+
+(ert-deftest tramp-rpc-mock-test-zz-file-name-with-sudo-rpc-via-ssh ()
+  "Test that RPC sudo elevation is rewritten through an SSH hop."
+  :tags '(:multi-hop)
+  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
+  (skip-unless (tramp-rpc-mock-test--sudo-helper-available-p))
+  (let* ((tramp-file-name-with-method "sudo")
+         (filename (tramp-file-name-with-sudo "/rpc:user@target:/etc/hosts"))
+         (vec (tramp-dissect-file-name filename))
+         (hop (tramp-file-name-hop vec)))
+    (should (tramp-tramp-file-p filename))
+    (should (equal (tramp-file-name-localname vec) "/etc/hosts"))
+    (should hop)
+    (should (string-match-p (rx bos "ssh:") hop))
+    (should-not (string-match-p "rpc:" hop))
+    (should-not (string-match-p (rx bos "/rpc:") filename))))
+
+(ert-deftest tramp-rpc-mock-test-zz-file-name-with-sudo-non-rpc-passthrough ()
+  "Test that non-RPC sudo elevation still calls the original function."
+  :tags '(:multi-hop)
+  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
+  (skip-unless (tramp-rpc-mock-test--sudo-helper-available-p))
+  (let ((called-with nil)
+        (filename "/ssh:user@target:/etc/hosts"))
+    (should
+     (eq (tramp-rpc--file-name-with-sudo-advice
+          (lambda (arg)
+            (setq called-with arg)
+            'passthrough)
+          filename)
+         'passthrough))
+    (should (equal called-with (expand-file-name filename)))))
 
 ;;; ============================================================================
 ;;; Test Runner
