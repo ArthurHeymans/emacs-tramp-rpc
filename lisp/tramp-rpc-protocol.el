@@ -48,15 +48,18 @@ Returns a cons cell (ID . BYTES) for pipelining support."
          (payload (msgpack-encode request)))
     (cons id (tramp-rpc-protocol--length-prefix payload))))
 
-(defun tramp-rpc-protocol-decode-response (bytes)
-  "Decode a MessagePack-RPC response or notification from BYTES.
+(defun tramp-rpc-protocol-decode-response (buffer start)
+  "Decode a MessagePack-RPC response or notification in BUFEER from START.
 Returns a plist with :id, :result, and :error keys for responses.
 For server-initiated notifications (no :id, has :method), returns a plist
 with :notification t, :method, and :params keys."
   (let* ((msgpack-map-type 'alist)
          (msgpack-key-type 'symbol)
          (msgpack-array-type 'list)
-         (response (msgpack-read-from-string bytes))
+         (response
+	  (with-current-buffer buffer
+	    (goto-char start)
+	    (msgpack-read)))
          (id (alist-get 'id response))
          (method (alist-get 'method response)))
     ;; Notifications have method but no id (JSON-RPC 2.0 spec)
@@ -107,25 +110,25 @@ Returns the integer errno, or nil if not an IO error with errno."
 ;; Length-prefixed framing support
 ;; ============================================================================
 
-(defun tramp-rpc-protocol-read-length (bytes)
-  "Read the 4-byte big-endian length from BYTES.
-Returns the length as an integer, or nil if BYTES is too short."
-  (when (>= (length bytes) 4)
-    (msgpack-bytes-to-unsigned (substring bytes 0 4))))
+(defun tramp-rpc-protocol-read-length (buffer)
+  "Read the 4-byte big-endian length from BUFFER.
+Returns the length as an integer, or nil if the BUFFER is too short."
+  (with-current-buffer buffer
+    (when (>= (point-max) (+ (mark-marker) 4))
+      (msgpack-bytes-to-unsigned
+       (buffer-substring (mark-marker) (+ (mark-marker) 4))))))
 
 (defun tramp-rpc-protocol-try-read-message (buffer)
   "Try to read a complete message from BUFFER.
-BUFFER should be a unibyte string containing received data.
-Returns (MESSAGE . REMAINING) if a complete message is available,
-where MESSAGE is the decoded response plist and REMAINING is
-the leftover bytes.  Returns nil if no complete message yet."
-  (when (>= (length buffer) 4)
-    (let ((len (tramp-rpc-protocol-read-length buffer)))
-      (when (and len (>= (length buffer) (+ 4 len)))
-        (let* ((payload (substring buffer 4 (+ 4 len)))
-               (remaining (substring buffer (+ 4 len)))
-               (response (tramp-rpc-protocol-decode-response payload)))
-          (cons response remaining))))))
+BUFFER should the process buffer containing received data.  Returns a
+MESSAGE if a complete message is available, where MESSAGE is the decoded
+response plist.  Returns nil if no complete message yet."
+  (with-current-buffer buffer
+    (when-let* ((start (+ (mark-marker) 4))
+		(len (tramp-rpc-protocol-read-length buffer))
+		((>= (point-max) (+ start len))))
+      (set-marker (mark-marker) (+ start len))
+      (tramp-rpc-protocol-decode-response buffer start))))
 
 ;; ============================================================================
 ;; Batch request support

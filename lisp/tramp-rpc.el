@@ -677,7 +677,8 @@ Returns the connection plist.  Signals `remote-file-error' on failure."
     ;; Clear buffer - use unibyte for binary MessagePack framing
     (with-current-buffer buffer
       (erase-buffer)
-      (set-buffer-multibyte nil))
+      (set-buffer-multibyte nil)
+      (set-marker (mark-marker) (point-min)))
 
     ;; Start the process with pipe connection (not PTY)
     ;; PTY has line buffering and ~4KB line length limits that break large JSON-RPC requests
@@ -795,44 +796,38 @@ accidentally routing file operations through tramp-sh."
   "Filter for RPC connection PROCESS receiving OUTPUT.
 Handles async responses by dispatching to registered callbacks.
 Uses length-prefixed binary framing: <4-byte BE length><msgpack payload>."
-  (let ((buffer (process-buffer process)))
+  (let ((buffer (process-buffer process))
+	response)
     (when (buffer-live-p buffer)
       (with-current-buffer buffer
         ;; Append output to buffer
         (goto-char (point-max))
         (insert output)
         (tramp-rpc--debug "FILTER received %d bytes, buffer-size=%d"
-                         (length output) (buffer-size))
+                          (length output) (buffer-size))
         ;; Process complete messages
         (goto-char (point-min))
-        (let ((result t))
-          (while result
-            (setq result (tramp-rpc-protocol-try-read-message
-                          (buffer-substring (point-min) (point-max))))
-            (when result
-              (let ((response (car result))
-                    (remaining (cdr result)))
-                ;; Replace buffer contents with remaining data
-                (erase-buffer)
-                (insert remaining)
-                (goto-char (point-min))
-                ;; Check for server-initiated notification (no id, has method)
-                (if (plist-get response :notification)
-                    (tramp-rpc--handle-notification
-                     process
-                     (plist-get response :method)
-                     (plist-get response :params))
-                  ;; Handle normal response
-                  (let* ((id (plist-get response :id))
-                         (callback (gethash id tramp-rpc--async-callbacks)))
-                    (if callback
-                        (progn
-                          (tramp-rpc--debug "FILTER dispatching async id=%s" id)
-                          (remhash id tramp-rpc--async-callbacks)
-                          (funcall callback response))
-                      ;; Not an async response - store for sync code
-                      (tramp-rpc--debug "FILTER storing sync response id=%s" id)
-                      (puthash id response (tramp-rpc--get-pending-responses buffer)))))))))))))
+        (while (setq response (tramp-rpc-protocol-try-read-message buffer))
+          ;; Replace buffer contents with remaining data
+          (delete-region (point-min) (mark-marker))
+          (goto-char (point-min))
+          ;; Check for server-initiated notification (no id, has method)
+          (if (plist-get response :notification)
+              (tramp-rpc--handle-notification
+               process
+               (plist-get response :method)
+               (plist-get response :params))
+            ;; Handle normal response
+            (let* ((id (plist-get response :id))
+                   (callback (gethash id tramp-rpc--async-callbacks)))
+              (if callback
+                  (progn
+                    (tramp-rpc--debug "FILTER dispatching async id=%s" id)
+                    (remhash id tramp-rpc--async-callbacks)
+                    (funcall callback response))
+                ;; Not an async response - store for sync code
+                (tramp-rpc--debug "FILTER storing sync response id=%s" id)
+                (puthash id response (tramp-rpc--get-pending-responses buffer))))))))))
 
 (defun tramp-rpc--call-async (vec method params callback)
   "Call METHOD with PARAMS asynchronously on the RPC server for VEC.
