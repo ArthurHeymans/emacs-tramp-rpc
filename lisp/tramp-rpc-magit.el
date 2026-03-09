@@ -126,6 +126,23 @@ Evicts oldest 25%% of entries when cache exceeds max size."
   (tramp-rpc-clear-file-exists-cache)
   (tramp-rpc-clear-file-truename-cache))
 
+(defun tramp-rpc--clear-file-caches-for-connection (vec)
+  "Clear file-exists and file-truename cache entries for connection VEC.
+Entries are keyed by expanded TRAMP filenames; this removes those
+matching the remote prefix of VEC."
+  (let ((prefix (tramp-make-tramp-file-name vec "/")))
+    ;; Match the prefix up to the colon-slash that starts the localname.
+    ;; e.g. "/rpc:user@host:/" -- any key starting with this belongs to VEC.
+    (dolist (cache (list tramp-rpc--file-exists-cache
+                        tramp-rpc--file-truename-cache))
+      (let ((keys-to-remove nil))
+        (maphash (lambda (key _value)
+                   (when (string-prefix-p prefix key)
+                     (push key keys-to-remove)))
+                 cache)
+        (dolist (key keys-to-remove)
+          (remhash key cache))))))
+
 ;; ============================================================================
 ;; Filesystem watching
 ;; ============================================================================

@@ -139,6 +139,7 @@
 (declare-function tramp-rpc-clear-file-exists-cache "tramp-rpc-magit")
 (declare-function tramp-rpc-clear-file-truename-cache "tramp-rpc-magit")
 (declare-function tramp-rpc--cleanup-watches-for-connection "tramp-rpc-magit")
+(declare-function tramp-rpc--clear-file-caches-for-connection "tramp-rpc-magit")
 (declare-function tramp-rpc-magit--process-cache-lookup "tramp-rpc-magit")
 (declare-function tramp-rpc-magit--file-exists-p "tramp-rpc-magit")
 (declare-function tramp-rpc-magit--clear-cache "tramp-rpc-magit")
@@ -371,6 +372,25 @@ See `tramp-rpc-direnv-essential-vars' for the list of variables."
     (error
      (tramp-rpc--debug "direnv fetch failed: %S" err)
      nil)))
+
+(defun tramp-rpc--clear-direnv-cache (&optional vec)
+  "Clear the direnv caches.
+If VEC is provided, only clear entries for that connection.
+Otherwise clear all entries."
+  (if vec
+      (let ((conn-key (tramp-rpc--connection-key vec)))
+        ;; Clear environment cache entries for this connection
+        (let ((keys-to-remove nil))
+          (maphash (lambda (key _value)
+                     (when (equal (car key) conn-key)
+                       (push key keys-to-remove)))
+                   tramp-rpc--direnv-cache)
+          (dolist (key keys-to-remove)
+            (remhash key tramp-rpc--direnv-cache)))
+        ;; Clear availability cache for this connection
+        (remhash conn-key tramp-rpc--direnv-available-cache))
+    (clrhash tramp-rpc--direnv-cache)
+    (clrhash tramp-rpc--direnv-available-cache)))
 
 (defvar tramp-rpc--executable-cache (make-hash-table :test 'equal)
   "Cache of executable paths keyed by (connection-key . program).
@@ -703,8 +723,17 @@ Returns the connection plist.  Signals `remote-file-error' on failure."
         (tramp-rpc--remove-connection vec)
         (signal 'remote-file-error (list "Failed to connect to RPC server on" host))))
 
-    ;; Mark as connected for TRAMP's connectivity checks (used by projectile, etc.)
+    ;; Mark as connected on the process (used by projectile, etc.)
     (tramp-set-connection-property process "connected" t)
+
+    ;; Mark as connected on the vec so `tramp-list-connections' finds
+    ;; this connection and `tramp-cleanup-connection' can offer it
+    ;; interactively.  The value is the connection buffer, matching the
+    ;; convention in `tramp-get-buffer'.
+    ;; Emacs 30.x uses "process-buffer"; newer TRAMP (31+) uses " connected".
+    ;; Set both for compatibility.
+    (tramp-set-connection-property vec "process-buffer" buffer)
+    (tramp-set-connection-property vec " connected" buffer)
 
     (tramp-rpc--get-connection vec)))
 
@@ -786,6 +815,38 @@ accidentally routing file operations through tramp-sh."
   ;; Flush TRAMP caches so a reconnect gets fresh data (home dir, uid, etc.)
   (tramp-flush-directory-properties vec "/")
   (tramp-flush-connection-properties vec))
+
+(defun tramp-rpc--cleanup-controlmaster (vec)
+  "Clean up the ControlMaster process and socket for VEC.
+Sends an SSH -O exit command to gracefully close the ControlMaster
+socket, then kills the auth process and buffer."
+  (when tramp-rpc-use-controlmaster
+    (let* ((host (tramp-file-name-host vec))
+           (user (tramp-file-name-user vec))
+           (port (tramp-file-name-port vec))
+           (proxyjump (tramp-rpc--hops-to-proxyjump vec))
+           (socket-path (tramp-rpc--controlmaster-socket-path vec))
+           (auth-process-name (format "*tramp-rpc-auth %s*" host))
+           (auth-buffer-name (format " *tramp-rpc-auth %s*" host))
+           (auth-process (get-process auth-process-name))
+           (auth-buffer (get-buffer auth-buffer-name)))
+      ;; Close the ControlMaster socket gracefully via ssh -O exit.
+      ;; This is a local control message (no network round-trip), so fast.
+      (when (file-exists-p socket-path)
+        (ignore-errors
+          (apply #'call-process "ssh" nil nil nil
+                 (append
+                  (when user (list "-l" user))
+                  (when port (list "-p" (number-to-string port)))
+                  (when proxyjump (list "-J" proxyjump))
+                  (list "-o" (format "ControlPath=%s" socket-path)
+                        "-O" "exit" host)))))
+      ;; Kill the auth process.
+      (when (and auth-process (process-live-p auth-process))
+        (delete-process auth-process))
+      ;; Kill the auth buffer.
+      (when (buffer-live-p auth-buffer)
+        (kill-buffer auth-buffer)))))
 
 ;; ============================================================================
 ;; RPC communication
@@ -2442,15 +2503,99 @@ VEC-OR-FILENAME can be either a tramp-file-name struct or a filename string."
   (advice-remove 'process-send-string #'tramp-rpc--multi-hop-advice))
 
 ;; ============================================================================
+;; Connection cleanup support
+;; ============================================================================
+
+(defun tramp-rpc-cleanup-connection (vec)
+  "Clean up TRAMP-RPC resources for connection VEC.
+This is called from `tramp-cleanup-connection-hook' after TRAMP's
+generic cleanup has already run (passwords cleared, timers cancelled,
+connection buffer killed, TRAMP caches flushed).
+
+Handles RPC-specific state: the connection hash table, async/PTY
+processes, file watches, ControlMaster process/socket, pending RPC
+responses, and RPC-specific caches (direnv, executable, file-exists,
+file-truename)."
+  (when (tramp-rpc-file-name-p vec)
+    ;; Save buffer reference before disconnect removes the connection
+    ;; entry.  The buffer is already killed by TRAMP's generic cleanup,
+    ;; but we need the object to remove its pending-responses hash entry.
+    (let ((conn-buffer (when-let* ((conn (tramp-rpc--get-connection vec)))
+                         (plist-get conn :buffer))))
+      ;; Delegate to disconnect for the common cleanup: async/PTY
+      ;; processes, watches, connection hash, executable cache.
+      ;; The redundant tramp-flush-* calls in disconnect are harmless.
+      (tramp-rpc--disconnect vec)
+      ;; Clean up pending responses keyed by the (now-dead) buffer.
+      (when conn-buffer
+        (remhash conn-buffer tramp-rpc--pending-responses)))
+    ;; Clear RPC-specific caches for this connection.
+    (tramp-rpc--clear-direnv-cache vec)
+    (tramp-rpc--clear-file-caches-for-connection vec)
+    ;; Clean up ControlMaster SSH process and socket.
+    (tramp-rpc--cleanup-controlmaster vec)))
+
+(defun tramp-rpc-cleanup-all-connections ()
+  "Clean up all TRAMP-RPC connections.
+Called from `tramp-cleanup-all-connections-hook' after TRAMP's generic
+cleanup of all connections has run."
+  ;; Collect vecs before clearing connections hash so we can close
+  ;; their ControlMaster sockets afterward.
+  (let ((vecs nil))
+    (maphash (lambda (_key conn)
+               (when-let* ((proc (plist-get conn :process))
+                           (v (process-get proc :tramp-rpc-vec)))
+                 (push v vecs)))
+             tramp-rpc--connections)
+    ;; Clean up all async and PTY processes (no vec = all connections).
+    (tramp-rpc--cleanup-async-processes)
+    (tramp-rpc--cleanup-pty-processes)
+    ;; Clean up all filesystem watches.
+    (clrhash tramp-rpc--watched-directories)
+    ;; Kill any remaining RPC server processes and clear connections hash.
+    (maphash (lambda (_key conn)
+               (let ((process (plist-get conn :process)))
+                 (when (process-live-p process)
+                   (delete-process process))))
+             tramp-rpc--connections)
+    (clrhash tramp-rpc--connections)
+    ;; Close ControlMaster sockets and kill auth processes/buffers.
+    (dolist (vec vecs)
+      (tramp-rpc--cleanup-controlmaster vec))
+    ;; Also kill any orphaned auth buffers not associated with a
+    ;; tracked connection (e.g. from a failed connection attempt).
+    (dolist (buf (buffer-list))
+      (when (string-match-p "\\` \\*tramp-rpc-auth " (buffer-name buf))
+        (when-let* ((proc (get-buffer-process buf)))
+          (when (process-live-p proc)
+            (delete-process proc)))
+        (kill-buffer buf))))
+  ;; Clear all RPC-specific caches.
+  (clrhash tramp-rpc--pending-responses)
+  (clrhash tramp-rpc--async-callbacks)
+  (clrhash tramp-rpc--executable-cache)
+  (tramp-rpc--clear-direnv-cache)
+  (tramp-rpc-clear-file-exists-cache)
+  (tramp-rpc-clear-file-truename-cache))
+
+;; Register cleanup hooks.
+(add-hook 'tramp-cleanup-connection-hook #'tramp-rpc-cleanup-connection)
+(add-hook 'tramp-cleanup-all-connections-hook #'tramp-rpc-cleanup-all-connections)
+
+;; ============================================================================
 ;; Unload support
 ;; ============================================================================
 
 (defun tramp-rpc-unload-function ()
   "Unload function for tramp-rpc.
-Removes advice.  Deletes `tramp-rpc-method' from `tramp-methods', and
-`tramp-rpc-file-name-p' from `tramp-foreign-file-name-handler-alist'."
+Removes advice and cleanup hooks.  Deletes `tramp-rpc-method' from
+`tramp-methods', and `tramp-rpc-file-name-p' from
+`tramp-foreign-file-name-handler-alist'."
   ;; Remove advice.
   (tramp-rpc--multi-hop-advice-remove)
+  ;; Remove cleanup hooks.
+  (remove-hook 'tramp-cleanup-connection-hook #'tramp-rpc-cleanup-connection)
+  (remove-hook 'tramp-cleanup-all-connections-hook #'tramp-rpc-cleanup-all-connections)
   ;; Clean up `tramp-methods' and `tramp-foreign-file-name-handler-alist'.
   (setq tramp-methods (delete (assoc tramp-rpc-method tramp-methods) tramp-methods))
   (setq tramp-foreign-file-name-handler-alist
