@@ -767,7 +767,15 @@ Returns the connection plist.  Signals `remote-file-error' on failure."
         (tramp-rpc--remove-connection vec)
         (signal 'remote-file-error (list "Failed to connect to RPC server on" host))))
 
-    ;; Mark as connected on the process (used by projectile, etc.)
+    ;; Set connection-local variables in the connection buffer.
+    ;; Every TRAMP backend must call this after establishing the connection
+    ;; so that connection-local variable profiles (registered via
+    ;; `connection-local-set-profiles') are applied.  This enables variables
+    ;; like `tramp-direct-async-process', `shell-file-name', `path-separator'
+    ;; etc. to take effect in the connection buffer.
+    (tramp-set-connection-local-variables vec)
+
+    ;; Mark as connected for TRAMP's connectivity checks (used by projectile, etc.)
     (tramp-set-connection-property process "connected" t)
 
     ;; Mark as connected on the vec so `tramp-list-connections' finds
