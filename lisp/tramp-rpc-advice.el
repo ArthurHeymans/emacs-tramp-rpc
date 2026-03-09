@@ -24,6 +24,7 @@
 ;; - process-command / process-tty-name (return stored metadata)
 ;; - vc-call-backend (ensure default-directory for remote VC files)
 ;; - eglot--cmd (bypass shell wrapping for RPC connections)
+;; - hack-dir-local-variables (enable dir-locals for RPC remotes)
 
 ;;; Code:
 
@@ -393,6 +394,29 @@ exited (remote side finished), delete it so the refresh can proceed."
   (funcall orig-fun))
 
 ;; ============================================================================
+;; Dir-locals advice
+;; ============================================================================
+
+;; Emacs's `enable-remote-dir-locals' defaults to nil because looking
+;; for .dir-locals.el on remote hosts can be slow for traditional TRAMP
+;; methods that pipe shell commands over SSH.  TRAMP-RPC uses an
+;; efficient binary protocol with caching, so this concern does not
+;; apply.  Rather than setting the variable globally (which would affect
+;; all TRAMP methods), we advise `hack-dir-local-variables' to enable
+;; it only for buffers visiting files via the RPC method.
+
+(defun tramp-rpc--hack-dir-local-variables-advice (orig-fun)
+  "Enable dir-locals for buffers visiting TRAMP-RPC remote files.
+Let-binds `enable-remote-dir-locals' to t when the current buffer
+is visiting a file (or has `default-directory') on an RPC remote,
+so that .dir-locals.el files are detected and loaded normally."
+  (let ((enable-remote-dir-locals
+         (or enable-remote-dir-locals
+             (when-let* ((file (or (buffer-file-name) default-directory)))
+               (tramp-rpc-file-name-p file)))))
+    (funcall orig-fun)))
+
+;; ============================================================================
 ;; Install and uninstall advice
 ;; ============================================================================
 
@@ -416,7 +440,9 @@ exited (remote side finished), delete it so the refresh can proceed."
     (advice-add 'vc-dir-refresh :around #'tramp-rpc--vc-dir-refresh-advice))
   (with-eval-after-load 'magit-process
     (advice-add 'magit-start-process :around
-                #'tramp-rpc--magit-start-process-advice)))
+                #'tramp-rpc--magit-start-process-advice))
+  (advice-add 'hack-dir-local-variables :around
+              #'tramp-rpc--hack-dir-local-variables-advice))
 
 (defun tramp-rpc-advice-remove ()
   "Remove all process advice installed by tramp-rpc."
@@ -433,7 +459,8 @@ exited (remote side finished), delete it so the refresh can proceed."
     (advice-remove 'tramp-file-name-with-sudo #'tramp-rpc--file-name-with-sudo-advice))
   (advice-remove 'eglot--cmd #'tramp-rpc--eglot-cmd-advice)
   (advice-remove 'vc-dir-refresh #'tramp-rpc--vc-dir-refresh-advice)
-  (advice-remove 'magit-start-process #'tramp-rpc--magit-start-process-advice))
+  (advice-remove 'magit-start-process #'tramp-rpc--magit-start-process-advice)
+  (advice-remove 'hack-dir-local-variables #'tramp-rpc--hack-dir-local-variables-advice))
 
 (defcustom tramp-rpc-install-advice-on-load t
   "Whether to install process advice when tramp-rpc-advice is loaded.
