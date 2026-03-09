@@ -235,10 +235,19 @@ fn list_dir_sync(
 
         // Get file type - std::fs::DirEntry::file_type() uses d_type on Linux
         // (no extra syscall needed unless d_type is DT_UNKNOWN)
-        let file_type = match entry.file_type() {
+        let mut file_type = match entry.file_type() {
             Ok(ft) => file_type_from_metadata_ft(&ft),
             Err(_) => FileType::Unknown,
         };
+
+        // For completion paths (include_attrs=false), treat symlinks to
+        // directories as directories
+        if !include_attrs
+            && file_type == FileType::Symlink
+            && std::fs::metadata(entry.path()).is_ok_and(|m| m.is_dir())
+        {
+            file_type = FileType::Directory;
+        }
 
         let attrs = if include_attrs {
             // Use lstat (follow_symlinks=false) so symlinks show as symlinks
