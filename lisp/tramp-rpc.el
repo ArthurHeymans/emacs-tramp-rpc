@@ -1592,9 +1592,12 @@ TYPE is the file type string."
         (unwind-protect
             (progn
               (rename-file tmpfile newname ok-if-already-exists)
-              (when (or keep-time preserve-permissions)
+              (when keep-time
                 (set-file-times newname (file-attribute-modification-time
-                                         (file-attributes filename)))))
+                                         (file-attributes filename))))
+              (when preserve-permissions
+                (set-file-extended-attributes newname (file-extended-attributes
+						       filename))))
           (when (file-exists-p tmpfile)
             (delete-file tmpfile)))))
      ;; Local source, remote dest - read locally, write via RPC
@@ -1604,9 +1607,12 @@ TYPE is the file type string."
         (set-buffer-multibyte nil)
         (insert-file-contents-literally filename)
         (write-region (point-min) (point-max) newname nil 'nomessage))
-      (when (or keep-time preserve-permissions)
+      (when keep-time
         (set-file-times newname (file-attribute-modification-time
-                                 (file-attributes filename)))))
+                                 (file-attributes filename))))
+      (when preserve-permissions
+        (set-file-extended-attributes newname (file-extended-attributes
+					       filename))))
      ;; Both remote, different hosts - copy via local Emacs buffer.
      ;; This is the universal fallback matching upstream tramp's
      ;; `tramp-do-copy-or-rename-file-via-buffer': read source via its
@@ -1622,9 +1628,12 @@ TYPE is the file type string."
           (set-buffer-multibyte nil)
           (insert-file-contents-literally filename)
           (write-region (point-min) (point-max) newname nil 'nomessage)))
-      (when (or keep-time preserve-permissions)
+      (when keep-time
         (set-file-times newname (file-attribute-modification-time
-                                 (file-attributes filename)))))
+                                 (file-attributes filename))))
+      (when preserve-permissions
+        (set-file-extended-attributs newname (file-extended-attributes
+					      filename))))
      ;; Neither remote - should not reach this handler, but be safe.
      (t
       (tramp-run-real-handler
@@ -1802,7 +1811,7 @@ Caches the result for efficiency."
 (defun tramp-rpc-handle-file-acl (filename)
   "Like `file-acl' for TRAMP-RPC files.
 Returns the ACL string for FILENAME, or nil if ACLs are not supported."
-  (with-parsed-tramp-file-name (expand-file-name filename) nil
+  (with-parsed-tramp-file-name (expand-file-name (file-name-unquote filename)) nil
     (when (tramp-rpc--acl-enabled-p v)
       (let ((result (tramp-rpc--call v "process.run"
                                      `((cmd . "getfacl")
@@ -1814,13 +1823,15 @@ Returns the ACL string for FILENAME, or nil if ACLs are not supported."
                          (alist-get 'stdout_encoding result))))
             ;; Return nil if output is empty or only whitespace
             (when (string-match-p "[^ \t\n]" output)
-              (string-trim output))))))))
+	      ;; By convention, the result string has a trailing
+	      ;; newline.  Don't let tests fail.
+	      (concat (string-trim output) "\n"))))))))
 
 (defun tramp-rpc-handle-set-file-acl (filename acl-string)
   "Like `set-file-acl' for TRAMP-RPC files.
 Set the ACL of FILENAME to ACL-STRING.
 Returns t on success, nil on failure."
-  (with-parsed-tramp-file-name (expand-file-name filename) nil
+  (with-parsed-tramp-file-name (expand-file-name (file-name-unquote filename)) nil
     (when (and (stringp acl-string)
                (tramp-rpc--acl-enabled-p v))
       ;; Use setfacl with --set-file=- to read ACL from stdin
@@ -1850,7 +1861,7 @@ Returns t on success, nil on failure."
 (defun tramp-rpc-handle-file-selinux-context (filename)
   "Like `file-selinux-context' for TRAMP-RPC files.
 Returns a list of (USER ROLE TYPE RANGE), or (nil nil nil nil) if not available."
-  (with-parsed-tramp-file-name (expand-file-name filename) nil
+  (with-parsed-tramp-file-name (expand-file-name (file-name-unquote filename)) nil
     (let ((context '(nil nil nil nil)))
       (when (tramp-rpc--selinux-enabled-p v)
         (let ((result (tramp-rpc--call v "process.run"
@@ -1877,7 +1888,7 @@ Returns a list of (USER ROLE TYPE RANGE), or (nil nil nil nil) if not available.
 Set the SELinux context of FILENAME to CONTEXT.
 CONTEXT is a list of (USER ROLE TYPE RANGE).
 Returns t on success, nil on failure."
-  (with-parsed-tramp-file-name (expand-file-name filename) nil
+  (with-parsed-tramp-file-name (expand-file-name (file-name-unquote filename)) nil
     (when (and (consp context)
                (tramp-rpc--selinux-enabled-p v))
       (let* ((user (and (stringp (nth 0 context)) (nth 0 context)))
