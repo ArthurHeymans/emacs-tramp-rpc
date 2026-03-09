@@ -347,6 +347,10 @@ and handles binary data correctly."
 ;; correctly.  This advice forces pipe mode only for tramp-rpc connections
 ;; when input will be piped, leaving other TRAMP methods untouched.
 
+;; Declared special so the dynamic let-binding in the advice below
+;; is not flagged as an unused lexical variable by the byte-compiler.
+(defvar magit-tramp-pipe-stty-settings)
+
 (defun tramp-rpc--magit-start-process-advice (orig-fun program &optional input &rest args)
   "Force pipe mode for tramp-rpc when INPUT will be piped to the process.
 PTY mode breaks stdin piping because `process-send-eof' sends Ctrl-D
