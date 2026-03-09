@@ -98,12 +98,15 @@
   "Test MessagePack-RPC success response decoding."
   (skip-unless tramp-rpc-mock-test--msgpack-available)
   (let* ((response-data '((version . "2.0") (id . 1) (result . ((exists . t)))))
-         (response-bytes (msgpack-encode response-data))
-         (response (tramp-rpc-protocol-decode-response response-bytes)))
-    (should (plist-get response :id))
-    (should (equal (plist-get response :id) 1))
-    (should (plist-get response :result))
-    (should-not (tramp-rpc-protocol-error-p response))))
+         (response-bytes (msgpack-encode response-data)))
+    (with-temp-buffer
+      (set-buffer-multibyte nil)
+      (insert response-bytes)
+      (let ((response (tramp-rpc-protocol-decode-response (current-buffer) (point-min))))
+        (should (plist-get response :id))
+        (should (equal (plist-get response :id) 1))
+        (should (plist-get response :result))
+        (should-not (tramp-rpc-protocol-error-p response))))))
 
 (ert-deftest tramp-rpc-mock-test-protocol-decode-error ()
   "Test MessagePack-RPC error response decoding."
@@ -111,11 +114,14 @@
   (let* ((response-data '((version . "2.0")
                           (id . 1)
                           (error . ((code . -32001) (message . "File not found")))))
-         (response-bytes (msgpack-encode response-data))
-         (response (tramp-rpc-protocol-decode-response response-bytes)))
-    (should (tramp-rpc-protocol-error-p response))
-    (should (= (tramp-rpc-protocol-error-code response) -32001))
-    (should (equal (tramp-rpc-protocol-error-message response) "File not found"))))
+         (response-bytes (msgpack-encode response-data)))
+    (with-temp-buffer
+      (set-buffer-multibyte nil)
+      (insert response-bytes)
+      (let ((response (tramp-rpc-protocol-decode-response (current-buffer) (point-min))))
+        (should (tramp-rpc-protocol-error-p response))
+        (should (= (tramp-rpc-protocol-error-code response) -32001))
+        (should (equal (tramp-rpc-protocol-error-message response) "File not found"))))))
 
 (ert-deftest tramp-rpc-mock-test-protocol-batch-encode ()
   "Test MessagePack-RPC batch request encoding."
@@ -163,16 +169,22 @@
          (framed (tramp-rpc-protocol--length-prefix payload)))
     ;; Length should be encoded in first 4 bytes
     (should (= (length framed) (+ 4 (length payload))))
-    (should (= (tramp-rpc-protocol-read-length framed) (length payload)))
+    (with-temp-buffer
+      (set-buffer-multibyte nil)
+      (insert framed)
+      (set-marker (mark-marker) (point-min))
+      (should (= (tramp-rpc-protocol-read-length (current-buffer)) (length payload))))
     ;; Try reading a complete message
     (let* ((response '((version . "2.0") (id . 42) (result . t)))
            (response-payload (msgpack-encode response))
-           (response-framed (tramp-rpc-protocol--length-prefix response-payload))
-           (read-result (tramp-rpc-protocol-try-read-message response-framed)))
-      (should read-result)
-      (should (consp read-result))
-      (should (= (plist-get (car read-result) :id) 42))
-      (should (equal (cdr read-result) "")))))
+           (response-framed (tramp-rpc-protocol--length-prefix response-payload)))
+      (with-temp-buffer
+        (set-buffer-multibyte nil)
+        (insert response-framed)
+        (set-marker (mark-marker) (point-min))
+        (let ((read-result (tramp-rpc-protocol-try-read-message (current-buffer))))
+          (should read-result)
+          (should (= (plist-get read-result :id) 42)))))))
 
 (ert-deftest tramp-rpc-mock-test-protocol-incomplete-message ()
   "Test handling of incomplete messages."
@@ -180,9 +192,18 @@
   (let* ((response '((version . "2.0") (id . 1) (result . t)))
          (payload (msgpack-encode response))
          (framed (tramp-rpc-protocol--length-prefix payload)))
-    ;; Truncate the message
-    (should-not (tramp-rpc-protocol-try-read-message (substring framed 0 3)))
-    (should-not (tramp-rpc-protocol-try-read-message (substring framed 0 5)))))
+    ;; Truncate the message - too short for length header
+    (with-temp-buffer
+      (set-buffer-multibyte nil)
+      (insert (substring framed 0 3))
+      (set-marker (mark-marker) (point-min))
+      (should-not (tramp-rpc-protocol-try-read-message (current-buffer))))
+    ;; Truncate the message - has length header but incomplete payload
+    (with-temp-buffer
+      (set-buffer-multibyte nil)
+      (insert (substring framed 0 5))
+      (set-marker (mark-marker) (point-min))
+      (should-not (tramp-rpc-protocol-try-read-message (current-buffer))))))
 
 ;;; ============================================================================
 ;;; MessagePack-RPC ID Generation Tests
@@ -286,15 +307,27 @@
       (error "No RPC server found. Build with 'cargo build --release'"))
     (setq tramp-rpc-mock-test-temp-dir (make-temp-file "tramp-rpc-test" t))
     (setq tramp-rpc-mock-test-server-buffer (generate-new-buffer "*tramp-rpc-test-server*"))
-    ;; Set buffer to unibyte for binary protocol
+    ;; Set buffer to unibyte for binary protocol and init mark for framing
     (with-current-buffer tramp-rpc-mock-test-server-buffer
-      (set-buffer-multibyte nil))
+      (set-buffer-multibyte nil)
+      (set-marker (mark-marker) (point-min)))
     (setq tramp-rpc-mock-test-server-process
           (let ((process-connection-type nil))  ; Use pipes
             (start-process "test-server" tramp-rpc-mock-test-server-buffer server)))
     (set-process-query-on-exit-flag tramp-rpc-mock-test-server-process nil)
     ;; Use binary coding for MessagePack protocol
     (set-process-coding-system tramp-rpc-mock-test-server-process 'binary 'binary)
+    ;; Use an explicit filter to append output with regular `insert'.
+    ;; The default process filter uses `insert-before-markers' which
+    ;; moves ALL markers (including mark-marker) past the inserted text,
+    ;; breaking the mark-based framing used by the protocol functions.
+    (set-process-filter
+     tramp-rpc-mock-test-server-process
+     (lambda (process output)
+       (when (buffer-live-p (process-buffer process))
+         (with-current-buffer (process-buffer process)
+           (goto-char (point-max))
+           (insert output)))))
     ;; Wait for server to be ready
     (sleep-for 0.1)
     tramp-rpc-mock-test-server-process))
@@ -331,13 +364,12 @@ Returns the result or signals an error."
         (while (and (not response) (> timeout 0))
           (accept-process-output tramp-rpc-mock-test-server-process 0.1)
           ;; Try to read a complete message
-          (let ((result (tramp-rpc-protocol-try-read-message
-                         (buffer-substring (point-min) (point-max)))))
+          (let ((result (tramp-rpc-protocol-try-read-message (current-buffer))))
             (when result
-              (setq response (car result))
-              ;; Replace buffer contents with remaining data
-              (erase-buffer)
-              (insert (cdr result))))
+              (setq response result)
+              ;; Remove consumed data
+              (delete-region (point-min) (mark-marker))
+              (set-marker (mark-marker) (point-min))))
           (cl-decf timeout 0.1))
         (unless response
           (error "Timeout waiting for RPC response"))
