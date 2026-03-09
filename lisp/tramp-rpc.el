@@ -1632,7 +1632,7 @@ TYPE is the file type string."
         (set-file-times newname (file-attribute-modification-time
                                  (file-attributes filename))))
       (when preserve-permissions
-        (set-file-extended-attributs newname (file-extended-attributes
+        (set-file-extended-attributes newname (file-extended-attributes
 					      filename))))
      ;; Neither remote - should not reach this handler, but be safe.
      (t
