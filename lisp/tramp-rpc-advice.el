@@ -331,6 +331,36 @@ and handles binary data correctly."
     (funcall orig-fun contact)))
 
 ;; ============================================================================
+;; Magit: force pipe mode for stdin piping
+;; ============================================================================
+
+;; When `magit-tramp-pipe-stty-settings' is `pty', magit forces PTY mode for
+;; all remote processes, including `git apply' which reads a patch from stdin.
+;; On a PTY, `process-send-eof' sends Ctrl-D instead of closing the pipe.
+;; Ctrl-D only signals EOF when the line buffer is empty; if the patch data
+;; doesn't end at a line boundary the first Ctrl-D just flushes the buffer
+;; and git waits for more input — hanging Emacs.
+;;
+;; The `pty' workaround exists for tramp-sh (#4720, #5220) where pipe stty
+;; settings broke hunk staging.  tramp-rpc doesn't need it: stdin data goes
+;; via RPC (pipe processes) or direct SSH pipes, both of which handle EOF
+;; correctly.  This advice forces pipe mode only for tramp-rpc connections
+;; when input will be piped, leaving other TRAMP methods untouched.
+
+(defun tramp-rpc--magit-start-process-advice (orig-fun program &optional input &rest args)
+  "Force pipe mode for tramp-rpc when INPUT will be piped to the process.
+PTY mode breaks stdin piping because `process-send-eof' sends Ctrl-D
+which does not close the pipe — git waits for more input forever."
+  (if (and input
+           (file-remote-p default-directory)
+           (tramp-rpc-file-name-p default-directory))
+      ;; Let-bind magit-tramp-pipe-stty-settings to "" so that
+      ;; magit-start-process sets process-connection-type to nil (pipe).
+      (let ((magit-tramp-pipe-stty-settings ""))
+        (apply orig-fun program input args))
+    (apply orig-fun program input args)))
+
+;; ============================================================================
 ;; vc-dir stale-process guard
 ;; ============================================================================
 
@@ -379,7 +409,10 @@ exited (remote side finished), delete it so the refresh can proceed."
   (with-eval-after-load 'eglot
     (advice-add 'eglot--cmd :around #'tramp-rpc--eglot-cmd-advice))
   (with-eval-after-load 'vc-dir
-    (advice-add 'vc-dir-refresh :around #'tramp-rpc--vc-dir-refresh-advice)))
+    (advice-add 'vc-dir-refresh :around #'tramp-rpc--vc-dir-refresh-advice))
+  (with-eval-after-load 'magit-process
+    (advice-add 'magit-start-process :around
+                #'tramp-rpc--magit-start-process-advice)))
 
 (defun tramp-rpc-advice-remove ()
   "Remove all process advice installed by tramp-rpc."
@@ -395,7 +428,8 @@ exited (remote side finished), delete it so the refresh can proceed."
   (when (fboundp 'tramp-file-name-with-sudo)
     (advice-remove 'tramp-file-name-with-sudo #'tramp-rpc--file-name-with-sudo-advice))
   (advice-remove 'eglot--cmd #'tramp-rpc--eglot-cmd-advice)
-  (advice-remove 'vc-dir-refresh #'tramp-rpc--vc-dir-refresh-advice))
+  (advice-remove 'vc-dir-refresh #'tramp-rpc--vc-dir-refresh-advice)
+  (advice-remove 'magit-start-process #'tramp-rpc--magit-start-process-advice))
 
 (defcustom tramp-rpc-install-advice-on-load t
   "Whether to install process advice when tramp-rpc-advice is loaded.
