@@ -1255,7 +1255,7 @@ the server, since the remote side does not understand it."
 (defun tramp-rpc--encode-path (path)
   "Encode PATH for transmission to the server.
 With MessagePack, paths are sent directly as strings/binary.
-Strips any Emacs file-name quoting (/:) before encoding.
+Strips any Emacs file-name quoting (\"/:\") before encoding.
 Returns an alist with path."
   `((path . ,(tramp-rpc--path-to-bytes path))))
 
@@ -1432,19 +1432,22 @@ TYPE is the file type string."
 (defun tramp-rpc-handle-set-file-modes (filename mode &optional _flag)
   "Like `set-file-modes' for TRAMP-RPC files."
   (with-parsed-tramp-file-name filename nil
-    (tramp-rpc--call v "file.set_modes"
-                     (append (tramp-rpc--encode-path localname)
-                             `((mode . ,mode))))
-    (tramp-flush-file-properties v localname)))
+    (tramp-barf-if-file-missing v filename
+      (tramp-rpc--call v "file.set_modes"
+                       (append (tramp-rpc--encode-path localname)
+                               `((mode . ,mode))))
+      (tramp-flush-file-properties v localname))))
 
 (defun tramp-rpc-handle-set-file-times (filename &optional timestamp _flag)
   "Like `set-file-times' for TRAMP-RPC files."
   (with-parsed-tramp-file-name filename nil
-    (let ((mtime (floor (float-time (or timestamp (current-time))))))
-      (tramp-rpc--call v "file.set_times"
-                       (append (tramp-rpc--encode-path localname)
-                               `((mtime . ,mtime)))))
-    (tramp-flush-file-properties v localname)))
+    (tramp-barf-if-file-missing v filename
+      (prog1
+	  (let ((mtime (floor (float-time (or timestamp (current-time))))))
+	    (tramp-rpc--call v "file.set_times"
+			     (append (tramp-rpc--encode-path localname)
+				     `((mtime . ,mtime)))))
+	(tramp-flush-file-properties v localname)))))
 
 
 ;; ============================================================================
@@ -1814,14 +1817,15 @@ Creates a hard link from NEWNAME to FILENAME."
 Set the ownership of FILENAME to UID and GID.
 Either UID or GID can be nil or -1 to leave that unchanged."
   (with-parsed-tramp-file-name filename nil
-    (let ((uid (or (and (natnump uid) uid)
-                   (tramp-rpc-handle-get-remote-uid v 'integer)))
-          (gid (or (and (natnump gid) gid)
-                   (tramp-rpc-handle-get-remote-gid v 'integer))))
-      (tramp-rpc--call v "file.chown"
-                       (append (tramp-rpc--encode-path localname)
-                               `((uid . ,uid)
-                                 (gid . ,gid)))))))
+    (tramp-barf-if-file-missing v filename
+      (let ((uid (or (and (natnump uid) uid)
+                     (tramp-rpc-handle-get-remote-uid v 'integer)))
+            (gid (or (and (natnump gid) gid)
+                     (tramp-rpc-handle-get-remote-gid v 'integer))))
+	(tramp-rpc--call v "file.chown"
+			 (append (tramp-rpc--encode-path localname)
+				 `((uid . ,uid)
+                                   (gid . ,gid))))))))
 
 (defun tramp-rpc-handle-file-system-info (filename)
   "Like `file-system-info' for TRAMP-RPC files.
