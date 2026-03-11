@@ -156,4 +156,166 @@ mod tests {
         assert!(response.error.is_some());
         assert_eq!(response.error.unwrap().code, RpcError::METHOD_NOT_FOUND);
     }
+
+    /// Test that process.run returns 128+signal for signal-killed processes.
+    /// This is required by Emacs `process-file' (tramp-test28-process-file).
+    #[tokio::test]
+    async fn test_process_run_signal_exit_code() {
+        // SIGINT (signal 2) -> expect exit code 130
+        let params = Value::Map(vec![
+            (
+                Value::String("cmd".into()),
+                Value::String("/bin/sh".into()),
+            ),
+            (
+                Value::String("args".into()),
+                Value::Array(vec![
+                    Value::String("-c".into()),
+                    Value::String("kill -2 $$".into()),
+                ]),
+            ),
+            (
+                Value::String("cwd".into()),
+                Value::String("/tmp".into()),
+            ),
+        ]);
+        let payload = make_request("process.run", params);
+        let response = process_request(&payload).await;
+        assert!(response.error.is_none(), "process.run should not error");
+
+        let result = response.result.expect("should have result");
+        let exit_code = result
+            .as_map()
+            .and_then(|m| {
+                m.iter()
+                    .find(|(k, _)| k.as_str() == Some("exit_code"))
+                    .map(|(_, v)| v.as_i64().unwrap())
+            })
+            .expect("should have exit_code");
+        assert_eq!(exit_code, 130, "SIGINT should produce exit code 128+2=130");
+    }
+
+    /// Test that process.run returns 128+signal for SIGKILL.
+    #[tokio::test]
+    async fn test_process_run_sigkill_exit_code() {
+        // SIGKILL (signal 9) -> expect exit code 137
+        let params = Value::Map(vec![
+            (
+                Value::String("cmd".into()),
+                Value::String("/bin/sh".into()),
+            ),
+            (
+                Value::String("args".into()),
+                Value::Array(vec![
+                    Value::String("-c".into()),
+                    Value::String("kill -9 $$".into()),
+                ]),
+            ),
+            (
+                Value::String("cwd".into()),
+                Value::String("/tmp".into()),
+            ),
+        ]);
+        let payload = make_request("process.run", params);
+        let response = process_request(&payload).await;
+        assert!(response.error.is_none(), "process.run should not error");
+
+        let result = response.result.expect("should have result");
+        let exit_code = result
+            .as_map()
+            .and_then(|m| {
+                m.iter()
+                    .find(|(k, _)| k.as_str() == Some("exit_code"))
+                    .map(|(_, v)| v.as_i64().unwrap())
+            })
+            .expect("should have exit_code");
+        assert_eq!(
+            exit_code, 137,
+            "SIGKILL should produce exit code 128+9=137"
+        );
+    }
+
+    /// Test that process.run returns the correct exit code for normal exit.
+    #[tokio::test]
+    async fn test_process_run_normal_exit_code() {
+        let params = Value::Map(vec![
+            (
+                Value::String("cmd".into()),
+                Value::String("/bin/sh".into()),
+            ),
+            (
+                Value::String("args".into()),
+                Value::Array(vec![
+                    Value::String("-c".into()),
+                    Value::String("exit 42".into()),
+                ]),
+            ),
+            (
+                Value::String("cwd".into()),
+                Value::String("/tmp".into()),
+            ),
+        ]);
+        let payload = make_request("process.run", params);
+        let response = process_request(&payload).await;
+        assert!(response.error.is_none(), "process.run should not error");
+
+        let result = response.result.expect("should have result");
+        let exit_code = result
+            .as_map()
+            .and_then(|m| {
+                m.iter()
+                    .find(|(k, _)| k.as_str() == Some("exit_code"))
+                    .map(|(_, v)| v.as_i64().unwrap())
+            })
+            .expect("should have exit_code");
+        assert_eq!(exit_code, 42, "exit 42 should produce exit code 42");
+    }
+
+    /// Test exit_code_from_status with raw ExitStatus values.
+    #[cfg(unix)]
+    #[test]
+    fn test_exit_code_from_status_signals() {
+        use std::os::unix::process::ExitStatusExt;
+        use std::process::ExitStatus;
+
+        // Normal exit with code 0
+        let status = ExitStatus::from_raw(0 << 8); // WEXITSTATUS=0, WIFEXITED=true
+        assert_eq!(protocol::exit_code_from_status(status), 0);
+
+        // Normal exit with code 42
+        let status = ExitStatus::from_raw(42 << 8);
+        assert_eq!(protocol::exit_code_from_status(status), 42);
+
+        // Signal 2 (SIGINT): raw status = 2 (low byte = signal, no core dump)
+        let status = ExitStatus::from_raw(2);
+        assert_eq!(
+            protocol::exit_code_from_status(status),
+            130,
+            "SIGINT raw status should give 128+2=130"
+        );
+
+        // Signal 9 (SIGKILL): raw status = 9
+        let status = ExitStatus::from_raw(9);
+        assert_eq!(
+            protocol::exit_code_from_status(status),
+            137,
+            "SIGKILL raw status should give 128+9=137"
+        );
+
+        // Signal 15 (SIGTERM): raw status = 15
+        let status = ExitStatus::from_raw(15);
+        assert_eq!(
+            protocol::exit_code_from_status(status),
+            143,
+            "SIGTERM raw status should give 128+15=143"
+        );
+
+        // Signal 2 with core dump: raw status = 2 | 0x80 = 130
+        let status = ExitStatus::from_raw(2 | 0x80);
+        assert_eq!(
+            protocol::exit_code_from_status(status),
+            130,
+            "SIGINT with core dump should still give 128+2=130"
+        );
+    }
 }

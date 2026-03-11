@@ -987,6 +987,29 @@ and returns a valid path."
       (process-file "ls" nil t nil "-la")
       (should (> (buffer-size) 0)))))
 
+(ert-deftest tramp-rpc-test10-process-file-signal-exit ()
+  "Test `process-file' returns 128+signal for signal-killed processes.
+This matches the upstream `tramp-test28-process-file' test."
+  :tags '(:process)
+  (skip-unless (tramp-rpc-test-enabled))
+
+  (let ((default-directory (tramp-rpc-test--remote-directory)))
+    ;; Normal exit code
+    (should (= 42 (process-file "/bin/sh" nil nil nil "-c" "exit 42")))
+
+    ;; Return exit code in case the process is interrupted.
+    ;; Signal 2 (SIGINT) -> exit code 130
+    (let (process-file-return-signal-string)
+      (should (= (+ 128 2)
+                 (process-file "/bin/sh" nil nil nil "-c" "kill -2 $$"))))
+
+    ;; Return string in case the process is interrupted and
+    ;; process-file-return-signal-string is set.
+    (when (boundp 'process-file-return-signal-string)
+      (let ((process-file-return-signal-string t))
+        (should (stringp
+                 (process-file "/bin/sh" nil nil nil "-c" "kill -2 $$")))))))
+
 (ert-deftest tramp-rpc-test10-process-file-with-stdin ()
   "Test `process-file' with stdin input."
   :tags '(:process)

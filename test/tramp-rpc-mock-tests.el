@@ -514,6 +514,48 @@ Returns the result or signals an error."
             (should (string-match-p "hello world" stdout)))))
     (tramp-rpc-mock-test--stop-server)))
 
+(ert-deftest tramp-rpc-mock-test-server-process-signal-exit ()
+  "Test process.run returns 128+signal for signal-killed processes.
+This matches the behavior expected by `tramp-test28-process-file'."
+  :tags '(:server :process)
+  (skip-unless tramp-rpc-mock-test--msgpack-available)
+  (skip-unless (tramp-rpc-mock-test--find-server))
+  (unwind-protect
+      (progn
+        (tramp-rpc-mock-test--start-server)
+        ;; Normal exit code
+        (let ((result (tramp-rpc-mock-test--rpc-call
+                       "process.run" `((cmd . "/bin/sh")
+                                       (args . ["-c" "exit 42"])
+                                       (cwd . "/tmp")))))
+          (should result)
+          (should (= (alist-get 'exit_code result) 42)))
+
+        ;; SIGINT (signal 2) -> exit code 130
+        (let ((result (tramp-rpc-mock-test--rpc-call
+                       "process.run" `((cmd . "/bin/sh")
+                                       (args . ["-c" "kill -2 $$"])
+                                       (cwd . "/tmp")))))
+          (should result)
+          (should (= (alist-get 'exit_code result) (+ 128 2))))
+
+        ;; SIGKILL (signal 9) -> exit code 137
+        (let ((result (tramp-rpc-mock-test--rpc-call
+                       "process.run" `((cmd . "/bin/sh")
+                                       (args . ["-c" "kill -9 $$"])
+                                       (cwd . "/tmp")))))
+          (should result)
+          (should (= (alist-get 'exit_code result) (+ 128 9))))
+
+        ;; SIGTERM (signal 15) -> exit code 143
+        (let ((result (tramp-rpc-mock-test--rpc-call
+                       "process.run" `((cmd . "/bin/sh")
+                                       (args . ["-c" "kill -15 $$"])
+                                       (cwd . "/tmp")))))
+          (should result)
+          (should (= (alist-get 'exit_code result) (+ 128 15)))))
+    (tramp-rpc-mock-test--stop-server)))
+
 ;;; ============================================================================
 ;;; Multi-Hop Tests (No server or SSH required)
 ;;; ============================================================================

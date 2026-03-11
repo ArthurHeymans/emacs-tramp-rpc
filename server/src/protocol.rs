@@ -488,17 +488,34 @@ impl IntoValue for Value {
 /// On Unix, signal-killed processes have `code() == None`.
 /// Convention: return 128 + signal_number (e.g. SIGKILL=9 -> 137).
 pub fn exit_code_from_status(status: std::process::ExitStatus) -> i32 {
-    status.code().unwrap_or_else(|| {
-        #[cfg(unix)]
-        {
-            use std::os::unix::process::ExitStatusExt;
-            status.signal().map(|s| 128 + s).unwrap_or(-1)
+    // Normal exit: code() returns Some(exit_code)
+    if let Some(code) = status.code() {
+        return code;
+    }
+
+    // Signal termination (Unix only)
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::ExitStatusExt;
+
+        // Primary: use signal() API
+        if let Some(sig) = status.signal() {
+            return 128 + sig;
         }
-        #[cfg(not(unix))]
-        {
-            -1
+
+        // Fallback: parse the raw wait status directly.
+        // This handles edge cases where signal() might return None
+        // despite the process being killed by a signal (observed on
+        // some platforms/configurations).
+        let raw = status.into_raw();
+        let termsig = raw & 0x7f;
+        if termsig != 0 && termsig != 0x7f {
+            // WIFSIGNALED: terminated by signal
+            return 128 + termsig;
         }
-    })
+    }
+
+    -1
 }
 
 /// Helper to deserialize from rmpv::Value to a typed struct
