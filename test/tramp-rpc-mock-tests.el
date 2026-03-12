@@ -807,6 +807,108 @@ This matches the behavior expected by `tramp-test28-process-file'."
     (should (equal called-with (expand-file-name filename)))))
 
 ;;; ============================================================================
+;;; Dir-locals advice tests (No server or SSH required)
+;;; ============================================================================
+
+(ert-deftest tramp-rpc-mock-test-dir-locals-enabled-for-rpc-buffer-file ()
+  "Test that dir-locals advice enables remote dir-locals for RPC file buffers."
+  :tags '(:dir-locals)
+  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
+  (let ((enable-remote-dir-locals nil)
+        (observed nil))
+    ;; Simulate a buffer visiting an RPC remote file.
+    (with-temp-buffer
+      (setq buffer-file-name "/rpc:host:/home/user/project/foo.el")
+      (tramp-rpc--hack-dir-local-variables-advice
+       (lambda () (setq observed enable-remote-dir-locals)))
+      (should (eq observed t)))))
+
+(ert-deftest tramp-rpc-mock-test-dir-locals-enabled-for-rpc-default-directory ()
+  "Test that dir-locals advice enables remote dir-locals via default-directory."
+  :tags '(:dir-locals)
+  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
+  (let ((enable-remote-dir-locals nil)
+        (observed nil))
+    ;; Simulate a buffer with an RPC remote default-directory (e.g. dired).
+    (with-temp-buffer
+      (setq default-directory "/rpc:host:/home/user/project/")
+      (tramp-rpc--hack-dir-local-variables-advice
+       (lambda () (setq observed enable-remote-dir-locals)))
+      (should (eq observed t)))))
+
+(ert-deftest tramp-rpc-mock-test-dir-locals-not-enabled-for-ssh ()
+  "Test that dir-locals advice does NOT enable remote dir-locals for SSH files."
+  :tags '(:dir-locals)
+  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
+  (let ((enable-remote-dir-locals nil)
+        (observed nil))
+    (with-temp-buffer
+      (setq buffer-file-name "/ssh:host:/home/user/project/foo.el")
+      (tramp-rpc--hack-dir-local-variables-advice
+       (lambda () (setq observed enable-remote-dir-locals)))
+      (should-not observed))))
+
+(ert-deftest tramp-rpc-mock-test-dir-locals-not-enabled-for-local ()
+  "Test that dir-locals advice does NOT enable remote dir-locals for local files."
+  :tags '(:dir-locals)
+  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
+  (let ((enable-remote-dir-locals nil)
+        (observed nil))
+    (with-temp-buffer
+      (setq buffer-file-name "/home/user/project/foo.el")
+      (tramp-rpc--hack-dir-local-variables-advice
+       (lambda () (setq observed enable-remote-dir-locals)))
+      (should-not observed))))
+
+(ert-deftest tramp-rpc-mock-test-dir-locals-preserves-existing-setting ()
+  "Test that advice preserves `enable-remote-dir-locals' when already t."
+  :tags '(:dir-locals)
+  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
+  (let ((enable-remote-dir-locals t)
+        (observed nil))
+    ;; Even for a non-RPC file, the existing t value should be preserved.
+    (with-temp-buffer
+      (setq buffer-file-name "/ssh:host:/etc/hosts")
+      (tramp-rpc--hack-dir-local-variables-advice
+       (lambda () (setq observed enable-remote-dir-locals)))
+      (should (eq observed t)))))
+
+(ert-deftest tramp-rpc-mock-test-dir-locals-calls-orig-function ()
+  "Test that the advice always calls the original function."
+  :tags '(:dir-locals)
+  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
+  (let ((orig-called nil))
+    ;; RPC file
+    (with-temp-buffer
+      (setq buffer-file-name "/rpc:host:/foo")
+      (tramp-rpc--hack-dir-local-variables-advice
+       (lambda () (setq orig-called t)))
+      (should orig-called))
+    ;; Non-RPC file
+    (setq orig-called nil)
+    (with-temp-buffer
+      (setq buffer-file-name "/home/user/foo")
+      (tramp-rpc--hack-dir-local-variables-advice
+       (lambda () (setq orig-called t)))
+      (should orig-called))))
+
+(ert-deftest tramp-rpc-mock-test-dir-locals-advice-installed ()
+  "Test that the dir-locals advice is installed and removed correctly."
+  :tags '(:dir-locals)
+  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
+  ;; After loading tramp-rpc-advice, the advice should be active.
+  (should (advice-member-p #'tramp-rpc--hack-dir-local-variables-advice
+                           'hack-dir-local-variables))
+  ;; After removing, it should be gone.
+  (unwind-protect
+      (progn
+        (tramp-rpc-advice-remove)
+        (should-not (advice-member-p #'tramp-rpc--hack-dir-local-variables-advice
+                                     'hack-dir-local-variables)))
+    ;; Restore advice for remaining tests.
+    (tramp-rpc-advice-install)))
+
+;;; ============================================================================
 ;;; Test Runner
 ;;; ============================================================================
 
