@@ -163,10 +163,7 @@ mod tests {
     async fn test_process_run_signal_exit_code() {
         // SIGINT (signal 2) -> expect exit code 130
         let params = Value::Map(vec![
-            (
-                Value::String("cmd".into()),
-                Value::String("/bin/sh".into()),
-            ),
+            (Value::String("cmd".into()), Value::String("/bin/sh".into())),
             (
                 Value::String("args".into()),
                 Value::Array(vec![
@@ -174,10 +171,7 @@ mod tests {
                     Value::String("kill -2 $$".into()),
                 ]),
             ),
-            (
-                Value::String("cwd".into()),
-                Value::String("/tmp".into()),
-            ),
+            (Value::String("cwd".into()), Value::String("/tmp".into())),
         ]);
         let payload = make_request("process.run", params);
         let response = process_request(&payload).await;
@@ -200,10 +194,7 @@ mod tests {
     async fn test_process_run_sigkill_exit_code() {
         // SIGKILL (signal 9) -> expect exit code 137
         let params = Value::Map(vec![
-            (
-                Value::String("cmd".into()),
-                Value::String("/bin/sh".into()),
-            ),
+            (Value::String("cmd".into()), Value::String("/bin/sh".into())),
             (
                 Value::String("args".into()),
                 Value::Array(vec![
@@ -211,10 +202,7 @@ mod tests {
                     Value::String("kill -9 $$".into()),
                 ]),
             ),
-            (
-                Value::String("cwd".into()),
-                Value::String("/tmp".into()),
-            ),
+            (Value::String("cwd".into()), Value::String("/tmp".into())),
         ]);
         let payload = make_request("process.run", params);
         let response = process_request(&payload).await;
@@ -229,20 +217,14 @@ mod tests {
                     .map(|(_, v)| v.as_i64().unwrap())
             })
             .expect("should have exit_code");
-        assert_eq!(
-            exit_code, 137,
-            "SIGKILL should produce exit code 128+9=137"
-        );
+        assert_eq!(exit_code, 137, "SIGKILL should produce exit code 128+9=137");
     }
 
     /// Test that process.run returns the correct exit code for normal exit.
     #[tokio::test]
     async fn test_process_run_normal_exit_code() {
         let params = Value::Map(vec![
-            (
-                Value::String("cmd".into()),
-                Value::String("/bin/sh".into()),
-            ),
+            (Value::String("cmd".into()), Value::String("/bin/sh".into())),
             (
                 Value::String("args".into()),
                 Value::Array(vec![
@@ -250,10 +232,7 @@ mod tests {
                     Value::String("exit 42".into()),
                 ]),
             ),
-            (
-                Value::String("cwd".into()),
-                Value::String("/tmp".into()),
-            ),
+            (Value::String("cwd".into()), Value::String("/tmp".into())),
         ]);
         let payload = make_request("process.run", params);
         let response = process_request(&payload).await;
