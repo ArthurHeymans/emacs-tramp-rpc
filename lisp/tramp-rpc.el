@@ -231,6 +231,29 @@ Set to t to enable debugging for hang diagnosis."
   :type 'boolean
   :group 'tramp-rpc)
 
+(defconst tramp-rpc-own-remote-path 'tramp-rpc-own-remote-path
+  "Placeholder in `tramp-rpc-remote-path'.
+Replaced by the PATH from the user's login shell on the remote host.
+The login shell is looked up from system.info (via getpwuid) or
+`getent passwd', and invoked as a login shell to capture PATH.
+This works correctly for bash, zsh, fish, and other shells.")
+
+(defcustom tramp-rpc-remote-path
+  `(tramp-rpc-own-remote-path
+    "/usr/local/bin" "/usr/bin" "/bin" "/usr/local/sbin" "/usr/sbin" "/sbin")
+  "List of directories to search for executables on remote hosts.
+Each element is either a directory string or the symbol
+`tramp-rpc-own-remote-path'.  The symbol is replaced at runtime by
+the directories from the user's login shell PATH on the remote host.
+
+The default value uses the login shell PATH and appends common
+system directories as fallbacks.  Customize this to prepend
+directories like \"~/.local/bin\" or to remove the login shell
+lookup entirely."
+  :type '(repeat (choice (string :tag "Directory")
+                         (const :tag "Login shell PATH" tramp-rpc-own-remote-path)))
+  :group 'tramp-rpc)
+
 (defun tramp-rpc--debug (format-string &rest args)
   "Log a debug message to *tramp-rpc-debug* buffer if debugging is enabled.
 FORMAT-STRING and ARGS are passed to `format'."
@@ -396,6 +419,15 @@ Otherwise clear all entries."
   "Cache of executable paths keyed by (connection-key . program).
 Value is the full path or :not-found.")
 
+;; Forward-declare caches used by tramp-rpc--remove-connection (defined
+;; later in the exec-path section).  The byte-compiler needs to see
+;; these defvars before their first reference.
+(defvar tramp-rpc--exec-path-cache (make-hash-table :test 'equal)
+  "Cache of remote exec-path keyed by connection-key.")
+
+(defvar tramp-rpc--login-shell-cache (make-hash-table :test 'equal)
+  "Cache of remote login shell keyed by connection-key.")
+
 (defun tramp-rpc--clear-executable-cache (&optional vec)
   "Clear the executable cache.
 If VEC is provided, only clear entries for that connection.
@@ -432,15 +464,17 @@ Results are cached per connection."
 (defun tramp-rpc--find-executable (vec program)
   "Find PROGRAM in the remote PATH on VEC.
 Returns the absolute path or nil.
-Uses `command -v` for efficient lookup via login shell.
+Uses `command -v` via the user's login shell for lookup, so that
+executables in shell-specific PATH entries are found.
 Uses a unique marker to separate MOTD/banner text from actual output,
 following the pattern used by standard TRAMP."
   (condition-case err
       (let* (;; Use a unique marker (MD5 hash) to delimit output from MOTD text
              ;; This is the same approach used by tramp-sh.el
              (marker (md5 (format "tramp-rpc-%s-%s" program (float-time))))
+             (shell (tramp-rpc--get-remote-login-shell vec))
              (result (tramp-rpc--call vec "process.run"
-                                       `((cmd . "/bin/sh")
+                                       `((cmd . ,shell)
                                          (args . ["-l" "-c"
                                                   ,(format "echo %s; command -v %s"
                                                            marker (shell-quote-argument program))])
@@ -480,8 +514,11 @@ same host produce distinct connections."
 
 (defun tramp-rpc--remove-connection (vec)
   "Remove the RPC connection for VEC.
-Also clears the executable cache for this connection."
-  (remhash (tramp-rpc--connection-key vec) tramp-rpc--connections)
+Also clears the executable, exec-path, and login shell caches."
+  (let ((key (tramp-rpc--connection-key vec)))
+    (remhash key tramp-rpc--connections)
+    (remhash key tramp-rpc--exec-path-cache)
+    (remhash key tramp-rpc--login-shell-cache))
   (tramp-rpc--clear-executable-cache vec))
 
 (defun tramp-rpc--ensure-connection (vec)
@@ -2172,11 +2209,10 @@ process-file calls from VC backends are routed through our tramp handler."
 ;; Additional handlers to avoid shell dependency
 ;; ============================================================================
 
-(defvar tramp-rpc--exec-path-cache (make-hash-table :test 'equal)
-  "Cache of remote exec-path keyed by connection-key.")
-
 (defun tramp-rpc-handle-exec-path ()
   "Return remote exec-path using RPC.
+Resolves `tramp-rpc-remote-path' by expanding the placeholder
+`tramp-rpc-own-remote-path' with the user's actual login shell PATH.
 Appends the remote working directory as the last element (the equivalent
 of `exec-directory'), matching `tramp-sh-handle-exec-path' behavior.
 Caches the PATH portion per connection."
@@ -2184,7 +2220,7 @@ Caches the PATH portion per connection."
     (let* ((key (tramp-rpc--connection-key v))
            (cached (gethash key tramp-rpc--exec-path-cache))
            (remote-path (or cached
-                            (let ((path (tramp-rpc--fetch-remote-exec-path v)))
+                            (let ((path (tramp-rpc--compute-remote-path v)))
                               (puthash key path tramp-rpc--exec-path-cache)
                               path))))
       ;; Append localname of default-directory as last element,
@@ -2193,12 +2229,86 @@ Caches the PATH portion per connection."
               (list (tramp-file-local-name
                      (expand-file-name default-directory)))))))
 
-(defun tramp-rpc--fetch-remote-exec-path (vec)
-  "Fetch the remote PATH from VEC and split into directories."
+(defun tramp-rpc--compute-remote-path (vec)
+  "Compute the remote exec-path for VEC from `tramp-rpc-remote-path'.
+Replaces `tramp-rpc-own-remote-path' with the directories from the
+user's login shell PATH.  Removes duplicates."
+  (let ((own-path nil)
+        (result nil))
+    (dolist (entry tramp-rpc-remote-path)
+      (if (eq entry 'tramp-rpc-own-remote-path)
+          ;; Expand the placeholder: fetch login shell PATH (once)
+          (progn
+            (unless own-path
+              (setq own-path (or (tramp-rpc--fetch-remote-exec-path vec)
+                                 '())))
+            (dolist (dir own-path)
+              (unless (member dir result)
+                (push dir result))))
+        ;; Literal directory string
+        (unless (member entry result)
+          (push entry result))))
+    (nreverse result)))
+
+(defun tramp-rpc--get-remote-login-shell (vec)
+  "Return the login shell for the remote user on VEC.
+Tries the `shell' field from system.info (populated via getpwuid on
+the server).  Falls back to looking up the user via `getent passwd'
+and extracting field 7.  Returns \"/bin/sh\" if all lookups fail.
+Result is cached per connection."
+  (let* ((key (tramp-rpc--connection-key vec))
+         (cached (gethash key tramp-rpc--login-shell-cache)))
+    (or cached
+        (let ((shell
+               (condition-case nil
+                   (let* ((info (tramp-rpc--call vec "system.info" nil))
+                          (sh (alist-get 'shell info)))
+                     (if (and sh (stringp sh) (> (length sh) 0))
+                         sh
+                       (tramp-rpc--get-remote-login-shell-via-getent vec)))
+                 (error (tramp-rpc--get-remote-login-shell-via-getent vec)))))
+          (puthash key shell tramp-rpc--login-shell-cache)
+          shell))))
+
+(defun tramp-rpc--get-remote-login-shell-via-getent (vec)
+  "Look up the login shell for the remote user on VEC via getent.
+Returns \"/bin/sh\" if the lookup fails."
   (condition-case nil
-      (let* ((result (tramp-rpc--call vec "process.run"
-                                       `((cmd . "/bin/sh")
-                                         (args . ["-l" "-c" "echo $PATH"])
+      (let* ((user (or (tramp-file-name-user vec) ""))
+             ;; If no user in the vec, fall back to system.info user
+             (target-user (if (string-empty-p user)
+                              (tramp-rpc--decode-string
+                               (alist-get 'user
+                                          (tramp-rpc--call vec "system.info" nil)))
+                            user))
+             (result (tramp-rpc--call vec "process.run"
+                                       `((cmd . "getent")
+                                         (args . ["passwd" ,target-user])
+                                         (cwd . "/"))))
+             (exit-code (alist-get 'exit_code result))
+             (stdout (tramp-rpc--decode-output
+                      (alist-get 'stdout result)
+                      (alist-get 'stdout_encoding result))))
+        (if (and (eq exit-code 0) (> (length stdout) 0))
+            ;; getent passwd format: name:x:uid:gid:gecos:home:shell
+            (let* ((fields (split-string (string-trim stdout) ":"))
+                   (shell (and (>= (length fields) 7) (nth 6 fields))))
+              (if (and shell (> (length shell) 0))
+                  shell
+                "/bin/sh"))
+          "/bin/sh"))
+    (error "/bin/sh")))
+
+(defun tramp-rpc--fetch-remote-exec-path (vec)
+  "Fetch the remote PATH from VEC using the user's login shell.
+Invokes the login shell with `-l' to source shell configuration
+files, and uses `printenv PATH' for shell-agnostic output (works
+correctly with bash, zsh, fish, and other shells)."
+  (condition-case nil
+      (let* ((shell (tramp-rpc--get-remote-login-shell vec))
+             (result (tramp-rpc--call vec "process.run"
+                                       `((cmd . ,shell)
+                                         (args . ["-l" "-c" "printenv PATH"])
                                          (cwd . "/"))))
              (exit-code (alist-get 'exit_code result))
              (stdout (tramp-rpc--decode-output
@@ -2206,11 +2316,8 @@ Caches the PATH portion per connection."
                       (alist-get 'stdout_encoding result))))
         (if (and (eq exit-code 0) (> (length stdout) 0))
             (split-string (string-trim stdout) ":" t)
-          ;; Fallback to default paths
-          '("/usr/local/bin" "/usr/bin" "/bin" "/usr/local/sbin" "/usr/sbin" "/sbin")))
-    (error
-     ;; On error, return default paths
-     '("/usr/local/bin" "/usr/bin" "/bin" "/usr/local/sbin" "/usr/sbin" "/sbin"))))
+          nil))
+    (error nil)))
 
 (defun tramp-rpc-handle-file-local-copy (filename)
   "Create a local copy of remote FILENAME using RPC."

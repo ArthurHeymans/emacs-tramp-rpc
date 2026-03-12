@@ -39,8 +39,36 @@ fn system_info() -> HandlerResult {
         "uid" => unsafe { libc::getuid() },
         "gid" => unsafe { libc::getgid() },
         "home" => env::var("HOME").ok().into_value(),
-        "user" => env::var("USER").ok().into_value()
+        "user" => env::var("USER").ok().into_value(),
+        "shell" => login_shell().into_value()
     })
+}
+
+/// Look up the current user's login shell from the passwd database.
+/// Uses getpwuid_r (reentrant) for thread safety, matching the pattern
+/// in file.rs for get_user_name/get_group_name.
+fn login_shell() -> Option<String> {
+    let uid = unsafe { libc::getuid() };
+    let mut buf = vec![0u8; 1024];
+    let mut pwd: libc::passwd = unsafe { std::mem::zeroed() };
+    let mut result_ptr: *mut libc::passwd = std::ptr::null_mut();
+
+    let ret = unsafe {
+        libc::getpwuid_r(
+            uid,
+            &mut pwd,
+            buf.as_mut_ptr() as *mut libc::c_char,
+            buf.len(),
+            &mut result_ptr,
+        )
+    };
+
+    if ret != 0 || result_ptr.is_null() {
+        return None;
+    }
+
+    let shell = unsafe { std::ffi::CStr::from_ptr(pwd.pw_shell) };
+    shell.to_str().ok().map(|s| s.to_string())
 }
 
 use crate::protocol::IntoValue;

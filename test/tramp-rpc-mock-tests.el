@@ -393,7 +393,13 @@ Returns the result or signals an error."
           ;; Check expected fields
           (should (assoc 'uid result))
           (should (assoc 'gid result))
-          (should (assoc 'home result))))
+          (should (assoc 'home result))
+          ;; shell field should be present and be a string
+          (should (assoc 'shell result))
+          (let ((shell (alist-get 'shell result)))
+            (when shell
+              (should (stringp shell))
+              (should (string-prefix-p "/" shell))))))
     (tramp-rpc-mock-test--stop-server)))
 
 (ert-deftest tramp-rpc-mock-test-server-file-operations ()
