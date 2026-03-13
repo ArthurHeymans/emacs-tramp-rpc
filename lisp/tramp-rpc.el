@@ -62,25 +62,7 @@
   (when (boundp 'tramp-rpc-method)
   ;; Register the method
   (add-to-list 'tramp-methods
-               `(,tramp-rpc-method
-                 ;; Direct async process support: tramp-rpc uses direct SSH
-                 ;; PTY connections for async processes, which means stderr
-                 ;; is mixed with stdout (normal PTY behavior).  Setting
-                 ;; tramp-direct-async lets upstream tests know to skip
-                 ;; stderr-separation assertions for async shell-command.
-                 (tramp-direct-async t)))
-
-  ;; Enable direct-async-process for the rpc method.
-  ;; This tells upstream tramp that our async processes are "direct"
-  ;; (i.e., they use a direct SSH PTY connection rather than piping
-  ;; through the control channel).  As a consequence, stderr cannot
-  ;; be separated from stdout in async processes.
-  (connection-local-set-profile-variables
-   'tramp-rpc-connection-local-default-profile
-   '((tramp-direct-async-process . t)))
-  (connection-local-set-profiles
-   `(:application tramp :protocol ,tramp-rpc-method)
-   'tramp-rpc-connection-local-default-profile)
+               `(,tramp-rpc-method))
 
   ;; Define the predicate inline (as defsubst) so it's available without
   ;; loading tramp-rpc.el.  This avoids recursive autoloading: TRAMP calls
@@ -771,7 +753,7 @@ Returns the connection plist.  Signals `remote-file-error' on failure."
     ;; Every TRAMP backend must call this after establishing the connection
     ;; so that connection-local variable profiles (registered via
     ;; `connection-local-set-profiles') are applied.  This enables variables
-    ;; like `tramp-direct-async-process', `shell-file-name', `path-separator'
+    ;; like `shell-file-name', `path-separator'
     ;; etc. to take effect in the connection buffer.
     (tramp-set-connection-local-variables vec)
 
