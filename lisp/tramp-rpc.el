@@ -62,7 +62,28 @@
   (when (boundp 'tramp-rpc-method)
   ;; Register the method
   (add-to-list 'tramp-methods
-               `(,tramp-rpc-method))
+               `(,tramp-rpc-method
+                 ;; Note: tramp-rpc is NOT a "direct async" backend in the
+                 ;; upstream TRAMP sense (we don't shell out via ssh for async
+                 ;; processes).  Our `make-process' handler genuinely separates
+                 ;; stderr from stdout in pipe mode.  However,
+                 ;; `async-shell-command' starts processes in PTY mode (via
+                 ;; comint), and PTY inherently mixes stderr with stdout.
+                 ;; Setting tramp-direct-async is required by upstream
+                 ;; `tramp-direct-async-process-p' (together with the
+                 ;; connection-local variable below) to skip stderr-separation
+                 ;; tests for `async-shell-command' that cannot pass under PTY.
+                 (tramp-direct-async t)))
+
+  ;; Required counterpart for `tramp-direct-async-process-p': upstream
+  ;; checks both the method parameter AND this connection-local variable.
+  ;; See the comment above for rationale.
+  (connection-local-set-profile-variables
+   'tramp-rpc-connection-local-default-profile
+   '((tramp-direct-async-process . t)))
+  (connection-local-set-profiles
+   `(:application tramp :protocol ,tramp-rpc-method)
+   'tramp-rpc-connection-local-default-profile)
 
   ;; Define the predicate inline (as defsubst) so it's available without
   ;; loading tramp-rpc.el.  This avoids recursive autoloading: TRAMP calls
@@ -753,7 +774,7 @@ Returns the connection plist.  Signals `remote-file-error' on failure."
     ;; Every TRAMP backend must call this after establishing the connection
     ;; so that connection-local variable profiles (registered via
     ;; `connection-local-set-profiles') are applied.  This enables variables
-    ;; like `shell-file-name', `path-separator'
+    ;; like `tramp-direct-async-process', `shell-file-name', `path-separator'
     ;; etc. to take effect in the connection buffer.
     (tramp-set-connection-local-variables vec)
 
