@@ -1557,6 +1557,9 @@ TYPE is the file type string."
         (setq entries (seq-take entries count)))
       entries)))
 
+;; Declared in Tramp 2.8.1.3+; forward-declare so byte compiler treats it as dynamic.
+(defvar tramp-fnac-add-trailing-slash)
+
 (defun tramp-rpc-handle-file-name-all-completions (filename directory)
   "Like `file-name-all-completions' for TRAMP-RPC files."
   ;; Suppress check for trailing slash in `tramp-skeleton-file-name-all-completions'.
