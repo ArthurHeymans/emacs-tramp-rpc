@@ -2595,6 +2595,14 @@ VEC-OR-FILENAME can be either a tramp-file-name struct or a filename string."
 ;; Recentf integration
 ;; ============================================================================
 
+;; Declare recentf variables for the byte compiler.  These are defined
+;; with defcustom/defvar in recentf.el which may not be loaded at
+;; compile time.  Without this, the let-binding of recentf-exclude in
+;; tramp-rpc--recentf-cleanup-all is flagged as an unused lexical
+;; variable (the binding is read dynamically by recentf-cleanup).
+(defvar recentf-list)
+(defvar recentf-exclude)
+
 (defun tramp-rpc--recentf-cleanup (vec)
   "Remove file names related to VEC from `recentf-list'.
 An unresponsive remote host could trigger `recentf' to try
