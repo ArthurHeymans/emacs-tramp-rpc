@@ -2602,6 +2602,7 @@ VEC-OR-FILENAME can be either a tramp-file-name struct or a filename string."
 ;; variable (the binding is read dynamically by recentf-cleanup).
 (defvar recentf-list)
 (defvar recentf-exclude)
+(declare-function recentf-cleanup "recentf")
 
 (defun tramp-rpc--recentf-cleanup (vec)
   "Remove file names related to VEC from `recentf-list'.
