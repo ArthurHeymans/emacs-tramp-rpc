@@ -46,6 +46,7 @@
 (declare-function tramp-rpc--decode-output "tramp-rpc")
 (declare-function tramp-rpc--controlmaster-socket-path "tramp-rpc")
 (declare-function tramp-rpc--hops-to-proxyjump "tramp-rpc")
+(declare-function tramp-rpc--ensure-inside-emacs-env "tramp-rpc")
 (declare-function tramp-rpc-file-name-p "tramp-rpc")
 
 ;; Variables from tramp-rpc.el
@@ -394,8 +395,9 @@ Resolves program path and loads direnv environment from working directory."
     (with-parsed-tramp-file-name default-directory nil
       ;; Unquote localname in case of file-name-quoted paths (e.g. /: prefix).
       (setq localname (file-name-unquote localname))
-      ;; Get direnv environment for this directory
-      (let ((direnv-env (tramp-rpc--get-direnv-environment v localname)))
+      ;; Get direnv environment for this directory, with INSIDE_EMACS
+      (let ((direnv-env (tramp-rpc--ensure-inside-emacs-env
+                         (tramp-rpc--get-direnv-environment v localname))))
         (if use-pty
             ;; PTY mode - start async process with PTY
             (tramp-rpc--make-pty-process v name buffer command coding noquery
