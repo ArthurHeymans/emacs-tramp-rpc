@@ -2601,8 +2601,7 @@ An unresponsive remote host could trigger `recentf' to try
 reconnecting repeatedly.  This mirrors `tramp-recentf-cleanup'
 from tramp-integration.el."
   (when (bound-and-true-p recentf-list)
-    (let ((prefix (tramp-make-tramp-file-name vec ""))
-          (recentf-exclude nil))
+    (let ((prefix (tramp-make-tramp-file-name vec "")))
       (setq recentf-list
             (cl-remove-if
              (lambda (f) (string-prefix-p prefix f))
