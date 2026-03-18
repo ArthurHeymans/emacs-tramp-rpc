@@ -63,6 +63,16 @@
   ;; Register the method
   (add-to-list 'tramp-methods
                `(,tramp-rpc-method
+                 ;; Declare that the rpc method uses the host name.
+                 ;; tramp-compute-multi-hops validates that methods without
+                 ;; "%h" in tramp-login-args use a host matching the previous
+                 ;; hop.  Since rpc IS host-directed (it SSH-connects to the
+                 ;; specified host), advertising "%h" here lets rpc appear
+                 ;; as a proxy hop in chains like /rpc:server|sudo:root@server:/path
+                 ;; without triggering the "host does not match" error.
+                 ;; The actual tramp-login-args value is never used for login
+                 ;; because rpc is a foreign (non-tramp-sh) file handler.
+                 (tramp-login-args (("%h")))
                  ;; Direct async process support: tramp-rpc uses direct SSH
                  ;; PTY connections for async processes, which means stderr
                  ;; is mixed with stdout (normal PTY behavior).  Setting
