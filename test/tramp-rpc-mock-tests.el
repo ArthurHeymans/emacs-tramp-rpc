@@ -909,6 +909,100 @@ This matches the behavior expected by `tramp-test28-process-file'."
     (tramp-rpc-advice-install)))
 
 ;;; ============================================================================
+;;; Non-essential / recentf Tests (No server or SSH required)
+;;; ============================================================================
+
+(ert-deftest tramp-rpc-mock-test-ensure-connection-throws-non-essential ()
+  "Test that `tramp-rpc--ensure-connection' throws when non-essential is t.
+With no live connection and `non-essential' bound to t,
+`tramp-connectable-p' returns nil and the function must throw
+`non-essential' rather than attempting a 60s SSH handshake."
+  :tags '(:non-essential)
+  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
+  (let* ((vec (make-tramp-file-name :method "rpc" :host "unreachable-test-host"
+                                    :localname "/tmp"))
+         (non-essential t)
+         (result (catch 'non-essential
+                   (tramp-rpc--ensure-connection vec)
+                   'did-not-throw)))
+    (should (eq result 'non-essential))))
+
+(ert-deftest tramp-rpc-mock-test-ensure-connection-allows-when-essential ()
+  "Test that `tramp-rpc--ensure-connection' does NOT throw when non-essential is nil.
+It should attempt to connect (and fail), not silently bail."
+  :tags '(:non-essential)
+  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
+  (let* ((vec (make-tramp-file-name :method "rpc" :host "unreachable-test-host"
+                                    :localname "/tmp"))
+         (non-essential nil))
+    ;; With non-essential nil, it should try to connect and signal an error
+    ;; (not throw 'non-essential)
+    (should-error
+     (tramp-rpc--ensure-connection vec)
+     :type 'remote-file-error)))
+
+(ert-deftest tramp-rpc-mock-test-handler-catches-non-essential ()
+  "Test that `tramp-rpc-file-name-handler' falls back for non-essential ops.
+When `non-essential' is t and no connection exists, file-exists-p on
+a remote path should return nil (local fallback) instead of signaling."
+  :tags '(:non-essential)
+  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
+  (let ((non-essential t))
+    ;; file-exists-p should return nil (local handler), not signal an error
+    (should-not (file-exists-p "/rpc:unreachable-test-host:/no/such/path"))))
+
+(ert-deftest tramp-rpc-mock-test-handler-file-remote-p-non-essential ()
+  "Test that `file-remote-p' never triggers a connection attempt.
+The handler should bind non-essential to t for file-remote-p,
+so it works even when non-essential was nil."
+  :tags '(:non-essential)
+  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
+  (let ((non-essential nil))
+    ;; file-remote-p should return the remote part without connecting
+    (should (file-remote-p "/rpc:somehost:/path"))))
+
+(ert-deftest tramp-rpc-mock-test-recentf-cleanup ()
+  "Test that `tramp-rpc--recentf-cleanup' removes matching entries."
+  :tags '(:non-essential :recentf)
+  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
+  ;; Ensure recentf-list is a special variable so let-binding works
+  ;; across the setq in tramp-rpc--recentf-cleanup.
+  (require 'recentf)
+  (let* ((vec (make-tramp-file-name :method "rpc" :host "myhost"
+                                    :localname "/dummy"))
+         (recentf-list (list "/rpc:myhost:/foo/bar"
+                             "/rpc:myhost:/baz"
+                             "/rpc:otherhost:/keep"
+                             "/home/user/local-file")))
+    (tramp-rpc--recentf-cleanup vec)
+    ;; Only myhost entries should be removed
+    (should (equal recentf-list
+                   '("/rpc:otherhost:/keep"
+                     "/home/user/local-file")))))
+
+(ert-deftest tramp-rpc-mock-test-recentf-cleanup-all ()
+  "Test that `tramp-rpc--recentf-cleanup-all' removes all remote entries.
+Uses an existing local path so `recentf-cleanup' does not also
+discard it for being unreadable."
+  :tags '(:non-essential :recentf)
+  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
+  (require 'recentf)
+  ;; Use a path that actually exists so recentf-cleanup keeps it.
+  ;; recentf-cleanup removes entries that match recentf-exclude OR
+  ;; that fail the readability check.
+  (let* ((local-file (expand-file-name "test/tramp-rpc-mock-tests.el"
+                                       tramp-rpc-mock-test--project-root))
+         (recentf-list (list "/rpc:host1:/foo"
+                             "/ssh:host2:/bar"
+                             local-file
+                             "/rpc:host3:/baz")))
+    (tramp-rpc--recentf-cleanup-all)
+    ;; All remote entries should be removed, existing local file kept.
+    ;; recentf-cleanup abbreviates paths (~ for home), so compare
+    ;; with abbreviate-file-name.
+    (should (equal recentf-list (list (abbreviate-file-name local-file))))))
+
+;;; ============================================================================
 ;;; Test Runner
 ;;; ============================================================================
 
