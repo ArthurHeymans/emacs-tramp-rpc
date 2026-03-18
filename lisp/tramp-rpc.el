@@ -529,7 +529,11 @@ Also clears the executable cache for this connection."
 
 (defun tramp-rpc--ensure-connection (vec)
   "Ensure we have an active RPC connection to VEC.
-Returns the connection plist."
+Returns the connection plist.
+When `non-essential' is non-nil and no live connection exists,
+throws `non-essential' instead of opening a new connection.
+This prevents background operations (timers, fontification,
+completion) from blocking on unreachable hosts."
   (let ((conn (tramp-rpc--get-connection vec)))
     (if (and conn
              (process-live-p (plist-get conn :process))
@@ -538,6 +542,12 @@ Returns the connection plist."
       ;; Stale connection - remove it before reconnecting
       (when conn
         (tramp-rpc--remove-connection vec))
+      ;; During non-essential operations, don't open new connections.
+      ;; This mirrors the (unless (tramp-connectable-p vec)
+      ;; (throw 'non-essential 'non-essential)) pattern used by every
+      ;; standard TRAMP backend in their maybe-open-connection functions.
+      (unless (tramp-connectable-p vec)
+        (throw 'non-essential 'non-essential))
       ;; Need to establish connection
       (tramp-rpc--connect vec))))
 
@@ -2542,10 +2552,21 @@ Also controls process exit detection latency."
 
 ;;;###autoload
 (defun tramp-rpc-file-name-handler (operation &rest args)
-  "Invoke TRAMP-RPC file name handler for OPERATION with ARGS."
-  (if-let* ((handler (assq operation tramp-rpc-file-name-handler-alist)))
-      (save-match-data (apply (cdr handler) args))
-    (tramp-run-real-handler operation args)))
+  "Invoke TRAMP-RPC file name handler for OPERATION with ARGS.
+Falls back to the local handler when `non-essential' is non-nil and
+a backend function throws `non-essential' (e.g. because no connection
+exists and opening one would block).  This mirrors the catch/throw
+pattern in `tramp-file-name-handler'."
+  ;; `file-remote-p' is called for everything, even for symbolic
+  ;; links which look remote.  We don't want to get an error.
+  (let ((non-essential (or non-essential (eq operation 'file-remote-p))))
+    (if-let* ((handler (assq operation tramp-rpc-file-name-handler-alist)))
+        (let ((result (catch 'non-essential
+                        (save-match-data (apply (cdr handler) args)))))
+          (if (eq result 'non-essential)
+              (tramp-run-real-handler operation args)
+            result))
+      (tramp-run-real-handler operation args))))
 
 ;; ============================================================================
 ;; Method predicate and handler registration
@@ -2569,6 +2590,30 @@ VEC-OR-FILENAME can be either a tramp-file-name struct or a filename string."
 (defun tramp-rpc--multi-hop-advice-remove ()
   "Remove multi-hop advice."
   (advice-remove 'process-send-string #'tramp-rpc--multi-hop-advice))
+
+;; ============================================================================
+;; Recentf integration
+;; ============================================================================
+
+(defun tramp-rpc--recentf-cleanup (vec)
+  "Remove file names related to VEC from `recentf-list'.
+An unresponsive remote host could trigger `recentf' to try
+reconnecting repeatedly.  This mirrors `tramp-recentf-cleanup'
+from tramp-integration.el."
+  (when (bound-and-true-p recentf-list)
+    (let ((prefix (tramp-make-tramp-file-name vec ""))
+          (recentf-exclude nil))
+      (setq recentf-list
+            (cl-remove-if
+             (lambda (f) (string-prefix-p prefix f))
+             recentf-list)))))
+
+(defun tramp-rpc--recentf-cleanup-all ()
+  "Remove all remote file names from `recentf-list'.
+This mirrors `tramp-recentf-cleanup-all' from tramp-integration.el."
+  (when (bound-and-true-p recentf-list)
+    (let ((recentf-exclude '(file-remote-p)))
+      (recentf-cleanup))))
 
 ;; ============================================================================
 ;; Connection cleanup support
@@ -2601,7 +2646,11 @@ file-truename)."
     (tramp-rpc--clear-direnv-cache vec)
     (tramp-rpc--clear-file-caches-for-connection vec)
     ;; Clean up ControlMaster SSH process and socket.
-    (tramp-rpc--cleanup-controlmaster vec)))
+    (tramp-rpc--cleanup-controlmaster vec)
+    ;; Remove this host's entries from recentf-list.  An unresponsive
+    ;; remote host could trigger recentf to try reconnecting repeatedly.
+    ;; This mirrors `tramp-recentf-cleanup' from tramp-integration.el.
+    (tramp-rpc--recentf-cleanup vec)))
 
 (defun tramp-rpc-cleanup-all-connections ()
   "Clean up all TRAMP-RPC connections.
@@ -2644,7 +2693,9 @@ cleanup of all connections has run."
   (clrhash tramp-rpc--executable-cache)
   (tramp-rpc--clear-direnv-cache)
   (tramp-rpc-clear-file-exists-cache)
-  (tramp-rpc-clear-file-truename-cache))
+  (tramp-rpc-clear-file-truename-cache)
+  ;; Remove all remote file names from recentf-list.
+  (tramp-rpc--recentf-cleanup-all))
 
 ;; Register cleanup hooks.
 (add-hook 'tramp-cleanup-connection-hook #'tramp-rpc-cleanup-connection)
