@@ -5,7 +5,7 @@
 ;; Author: Arthur Heymans <arthur@aheymans.xyz>
 ;; Version: 0.7.0
 ;; Keywords: comm, processes, files
-;; Package-Requires: ((emacs "30.1") (msgpack "0"))
+;; Package-Requires: ((emacs "30.1") (msgpack "0") (tramp "2.8.1.3"))
 
 ;; This file is part of tramp-rpc.
 
@@ -1521,12 +1521,8 @@ TYPE is the file type string."
     (let* ((result (tramp-rpc--call v "dir.list"
                                     (append (tramp-rpc--encode-path localname)
                                             '((include_attrs . :msgpack-false)
-                                              (include_hidden . t)))))
-           (files (mapcar #'tramp-rpc--decode-filename result)))
-      ;; Ensure "." and ".." are present (some storage systems omit them)
-      (unless (member "." files) (push "." files))
-      (unless (member ".." files) (push ".." files))
-      files)))
+                                              (include_hidden . t))))))
+      (mapcar #'tramp-rpc--decode-filename result))))
 
 (defun tramp-rpc-handle-directory-files-and-attributes
     (directory &optional full match nosort id-format count)
@@ -1563,27 +1559,25 @@ TYPE is the file type string."
 
 (defun tramp-rpc-handle-file-name-all-completions (filename directory)
   "Like `file-name-all-completions' for TRAMP-RPC files."
-  (tramp-skeleton-file-name-all-completions filename directory
-    (with-parsed-tramp-file-name (expand-file-name directory) nil
-      (when (and (not (string-search "/" filename))
-                 (tramp-connectable-p v))
-        (all-completions
-         filename
-         ;; Get all entries in the directory
-(let* ((result (tramp-rpc--call v "dir.list"
-                                          (append (tramp-rpc--encode-path localname)
-                                                  '((include_attrs . :msgpack-false)
-                                                    (include_hidden . t)))))
-                ;; Convert vector to list if needed
-                (entries (if (vectorp result) (append result nil) result)))
-           ;; Build list of names with trailing / for directories
-           (mapcar (lambda (entry)
-                     (let ((name (tramp-rpc--decode-filename entry))
-                           (file-type (alist-get 'type entry)))
-                       (if (equal file-type "directory")
-                           (concat name "/")
-                         name)))
-                   entries)))))))
+  ;; Suppress check for trailing slash in `tramp-skeleton-file-name-all-completions'.
+  (let (tramp-fnac-add-trailing-slash)
+    (tramp-skeleton-file-name-all-completions filename directory
+      (with-parsed-tramp-file-name (expand-file-name directory) nil
+	;; Get all entries in the directory. Convert vector to list if needed.
+	(let ((entries
+	       (append (tramp-rpc--call v "dir.list"
+				       (append (tramp-rpc--encode-path localname)
+					       '((include_attrs . :msgpack-false)
+                                                 (include_hidden . t))))
+		       nil)))
+          ;; Build list of names with trailing / for directories
+          (mapcar (lambda (entry)
+                    (let ((name (tramp-rpc--decode-filename entry))
+                          (file-type (alist-get 'type entry)))
+                      (if (equal file-type "directory")
+                          (concat name "/")
+			name)))
+                  entries))))))
 
 (defun tramp-rpc-handle-make-directory (dir &optional parents)
   "Like `make-directory' for TRAMP-RPC files."
