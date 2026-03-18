@@ -456,6 +456,15 @@ Otherwise clear all entries."
           (remhash key tramp-rpc--executable-cache)))
     (clrhash tramp-rpc--executable-cache)))
 
+(defun tramp-rpc--ensure-inside-emacs-env (env)
+  "Ensure INSIDE_EMACS is set in environment alist ENV.
+ENV is an alist of (KEY . VALUE) string pairs, or nil.
+If INSIDE_EMACS is not already present, it is added with the value
+from `tramp-inside-emacs'.  Returns the (possibly augmented) alist."
+  (if (assoc "INSIDE_EMACS" env)
+      env
+    (cons (cons "INSIDE_EMACS" (tramp-inside-emacs)) env)))
+
 (defun tramp-rpc--resolve-executable (vec program)
   "Resolve PROGRAM to its full path on VEC.
 Returns the full path if found, otherwise the original PROGRAM.
@@ -2164,19 +2173,19 @@ refresh), git commands are served from the prefetch cache when possible."
             exit-code)
         ;; Cache miss - make actual RPC call
         (let* ((resolved-program (tramp-rpc--resolve-executable v program))
-               (direnv-env (tramp-rpc--get-direnv-environment v localname))
+               (env (tramp-rpc--ensure-inside-emacs-env
+                     (tramp-rpc--get-direnv-environment v localname)))
                (stdin-content (when (and infile (not (eq infile t)))
-                                (with-temp-buffer
-                                  (set-buffer-multibyte nil)
-                                  (insert-file-contents-literally infile)
-                                  (buffer-string))))
+                                 (with-temp-buffer
+                                   (set-buffer-multibyte nil)
+                                   (insert-file-contents-literally infile)
+                                   (buffer-string))))
                (result (condition-case _err
                            (tramp-rpc--call v "process.run"
                                             `((cmd . ,resolved-program)
                                               (args . ,(vconcat args))
                                               (cwd . ,localname)
-                                              ,@(when direnv-env
-                                                  `((env . ,direnv-env)))
+                                              (env . ,env)
                                               ,@(when stdin-content
                                                   `((stdin . ,stdin-content)))))
                          ;; When the binary doesn't exist or can't be
