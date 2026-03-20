@@ -63,18 +63,21 @@
   ;; Register the method
   (add-to-list 'tramp-methods
                `(,tramp-rpc-method
-                 ;; Direct async process support: tramp-rpc uses direct SSH
-                 ;; PTY connections for async processes, which means stderr
-                 ;; is mixed with stdout (normal PTY behavior).  Setting
-                 ;; tramp-direct-async lets upstream tests know to skip
-                 ;; stderr-separation assertions for async shell-command.
+                 ;; Note: tramp-rpc is NOT a "direct async" backend in the
+                 ;; upstream TRAMP sense (we don't shell out via ssh for async
+                 ;; processes).  Our `make-process' handler genuinely separates
+                 ;; stderr from stdout in pipe mode.  However,
+                 ;; `async-shell-command' starts processes in PTY mode (via
+                 ;; comint), and PTY inherently mixes stderr with stdout.
+                 ;; Setting tramp-direct-async is required by upstream
+                 ;; `tramp-direct-async-process-p' (together with the
+                 ;; connection-local variable below) to skip stderr-separation
+                 ;; tests for `async-shell-command' that cannot pass under PTY.
                  (tramp-direct-async t)))
 
-  ;; Enable direct-async-process for the rpc method.
-  ;; This tells upstream tramp that our async processes are "direct"
-  ;; (i.e., they use a direct SSH PTY connection rather than piping
-  ;; through the control channel).  As a consequence, stderr cannot
-  ;; be separated from stdout in async processes.
+  ;; Required counterpart for `tramp-direct-async-process-p': upstream
+  ;; checks both the method parameter AND this connection-local variable.
+  ;; See the comment above for rationale.
   (connection-local-set-profile-variables
    'tramp-rpc-connection-local-default-profile
    '((tramp-direct-async-process . t)))
