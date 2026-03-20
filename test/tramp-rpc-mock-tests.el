@@ -806,6 +806,45 @@ This matches the behavior expected by `tramp-test28-process-file'."
          'passthrough))
     (should (equal called-with (expand-file-name filename)))))
 
+(ert-deftest tramp-rpc-mock-test-rpc-method-advertises-host-arg ()
+  "Test that the rpc method declares %%h in tramp-login-args.
+This is required so `tramp-compute-multi-hops' allows rpc to appear
+as a proxy hop alongside shell methods like sudo/su.  Without %%h,
+the host-check in `tramp-compute-multi-hops' would reject the rpc
+hop with \"Host name does not match\"."
+  :tags '(:multi-hop)
+  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
+  (let* ((vec (make-tramp-file-name :method "rpc" :host "target"))
+         (login-args (tramp-get-method-parameter vec 'tramp-login-args)))
+    (should (member "%h" (flatten-tree login-args)))))
+
+(ert-deftest tramp-rpc-mock-test-compute-multi-hops-rpc-sudo-chain ()
+  "Test that `tramp-compute-multi-hops' accepts rpc as a proxy for sudo.
+Regression test for GitHub issue #123: `sudo-edit' on an rpc-backed
+file produced /rpc:server|sudo:root@server:/path, which then caused
+  user-error: Host name `server' does not match `localhost-regexp'
+because rpc had no tramp-login-args and the host-check in
+`tramp-compute-multi-hops' rejected it."
+  :tags '(:multi-hop)
+  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
+  ;; Manually install the proxy entry that tramp-add-hops would create
+  ;; when processing /rpc:server|sudo:root@server:/path.
+  (let* ((tramp-default-proxies-alist
+          (list (list "^server$" "^root$"
+                      (propertize "/rpc:server:" 'tramp-ad-hoc t))))
+         (sudo-vec (make-tramp-file-name :method "sudo" :user "root"
+                                         :host "server"
+                                         :localname "/var/log/kern.log"))
+         result)
+    ;; Before the fix, tramp-compute-multi-hops would signal:
+    ;;   user-error: Host name `server' does not match `localhost-regexp'
+    ;; because the rpc item in target-alist had no %h in tramp-login-args.
+    (should (setq result (tramp-compute-multi-hops sudo-vec)))
+    ;; The chain should contain 2 elements: rpc proxy hop + sudo destination.
+    (should (= (length result) 2))
+    ;; The first element (gateway hop) should be the rpc method.
+    (should (string= (tramp-file-name-method (car result)) "rpc"))))
+
 ;;; ============================================================================
 ;;; Dir-locals advice tests (No server or SSH required)
 ;;; ============================================================================
