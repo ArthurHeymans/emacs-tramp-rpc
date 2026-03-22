@@ -2474,12 +2474,12 @@ signalling an error.
 `tramp-verbose' is suppressed during the first attempt because
 `tramp-error' logs a level-1 message before signalling, which
 would otherwise flood the echo area with \"Cannot expand tilde\"."
-  ;; When NAME has an empty localname (e.g. "/rpc:host:"), replace it
-  ;; with "~" so that the generic handler expands to the home directory.
   ;; The generic `tramp-handle-expand-file-name' defaults non-absolute
   ;; localnames to "/" (root), but the ssh handler
   ;; (`tramp-sh-handle-expand-file-name') defaults to "~/" instead.
-  ;; This matches that behavior when a connection is available.
+  ;; Match that behavior: empty localnames get "~", and non-absolute
+  ;; localnames (e.g. ".config/") get "~/" prepended so they resolve
+  ;; relative to the home directory rather than the filesystem root.
   ;; Guard with `tramp-connectable-p' so that the tilde substitution is
   ;; skipped during completion when no connection exists, avoiding a
   ;; blocking connection attempt when `non-essential' is t.  When not
@@ -2489,9 +2489,19 @@ would otherwise flood the echo area with \"Cannot expand tilde\"."
   ;; instead of `file-remote-p' to avoid re-entering expand-file-name.
   (when (tramp-tramp-file-p name)
     (let ((v (tramp-dissect-file-name name)))
-      (when (and (tramp-string-empty-or-nil-p (tramp-file-name-localname v))
-                 (tramp-connectable-p v))
-        (setq name (tramp-make-tramp-file-name v "~")))))
+      (when (tramp-connectable-p v)
+        (let ((localname (tramp-file-name-localname v)))
+          (cond
+           ;; Empty localname (e.g. "/rpc:host:") -> expand to home.
+           ((tramp-string-empty-or-nil-p localname)
+            (setq name (tramp-make-tramp-file-name v "~")))
+           ;; Non-absolute localname (e.g. ".config/") -> make relative
+           ;; to home, matching tramp-sh-handle-expand-file-name behavior.
+           ;; Without this, the generic handler prepends "/" (root).
+           ((not (tramp-run-real-handler
+                  #'file-name-absolute-p (list localname)))
+            (setq name (tramp-make-tramp-file-name
+                        v (concat "~/" localname)))))))))
   (condition-case nil
       (let ((tramp-verbose 0))
         (tramp-handle-expand-file-name name dir))
