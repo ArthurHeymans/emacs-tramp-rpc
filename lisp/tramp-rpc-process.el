@@ -514,6 +514,15 @@ DIRENV-ENV is an optional alist of environment variables from direnv."
          (port (tramp-file-name-port vec))
          (program (car command))
          (program-args (cdr command))
+         ;; Quote localname for shell, preserving tilde for shell expansion.
+         ;; shell-quote-argument escapes ~, so handle tilde-prefixed paths
+         ;; specially: leave ~ or ~user unquoted and quote only the rest.
+         (quoted-localname
+          (cond
+           ((string-prefix-p "~/" localname)
+            (concat "~/" (shell-quote-argument (substring localname 2))))
+           ((string-equal "~" localname) "~")
+           (t (shell-quote-argument localname))))
          ;; Build environment exports for the remote command
          (env-exports (mapconcat
                        (lambda (pair)
@@ -525,7 +534,7 @@ DIRENV-ENV is an optional alist of environment variables from direnv."
                        " "))
          ;; Build the remote command - cd to dir, export env, exec program
          (remote-cmd (format "cd %s && %s exec %s %s"
-                             (shell-quote-argument localname)
+                             quoted-localname
                              env-exports
                              (shell-quote-argument program)
                              (mapconcat #'shell-quote-argument program-args " ")))
