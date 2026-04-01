@@ -1009,6 +1009,41 @@ discard it for being unreadable."
     (should (equal recentf-list (list (abbreviate-file-name local-file))))))
 
 ;;; ============================================================================
+;;; Tilde Quoting Tests
+;;; ============================================================================
+
+;; Verify that paths passed to shell commands use `tramp-shell-quote-argument'
+;; (which preserves tilde expansion) rather than raw `shell-quote-argument'
+;; (which escapes the tilde and breaks cd ~/... on the remote).
+
+(ert-deftest tramp-rpc-mock-test-shell-quote-preserves-tilde ()
+  "Test that `tramp-shell-quote-argument' preserves leading tilde."
+  ;; tramp-shell-quote-argument is defined in tramp.el, always available.
+  (should (string-prefix-p "~/" (tramp-shell-quote-argument "~/projects")))
+  (should (equal "~" (tramp-shell-quote-argument "~")))
+  (should (string-prefix-p "~user/" (tramp-shell-quote-argument "~user/dir"))))
+
+(ert-deftest tramp-rpc-mock-test-shell-quote-tilde-vs-raw ()
+  "Demonstrate the bug: raw `shell-quote-argument' escapes tilde."
+  ;; raw shell-quote-argument escapes tilde (the bug this fix addresses)
+  (should (string-prefix-p "\\~" (shell-quote-argument "~/projects")))
+  ;; tramp-shell-quote-argument does not
+  (should-not (string-prefix-p "\\~" (tramp-shell-quote-argument "~/projects"))))
+
+(ert-deftest tramp-rpc-mock-test-shell-quote-absolute-path ()
+  "Test that absolute paths are quoted normally by both functions."
+  (should (equal (shell-quote-argument "/home/user/projects")
+                 (tramp-shell-quote-argument "/home/user/projects"))))
+
+(ert-deftest tramp-rpc-mock-test-shell-quote-path-with-spaces ()
+  "Test that paths with spaces after tilde are properly quoted."
+  (let ((quoted (tramp-shell-quote-argument "~/my projects")))
+    ;; Tilde should be preserved
+    (should (string-prefix-p "~/" quoted))
+    ;; The space should be escaped (backslash-space on Unix)
+    (should (string-match-p "\\\\ " quoted))))
+
+;;; ============================================================================
 ;;; Test Runner
 ;;; ============================================================================
 

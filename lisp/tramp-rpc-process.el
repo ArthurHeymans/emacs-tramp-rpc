@@ -525,7 +525,7 @@ DIRENV-ENV is an optional alist of environment variables from direnv."
                        " "))
          ;; Build the remote command - cd to dir, export env, exec program
          (remote-cmd (format "cd %s && %s exec %s %s"
-                             (shell-quote-argument localname)
+                             (tramp-shell-quote-argument localname)
                              env-exports
                              (shell-quote-argument program)
                              (mapconcat #'shell-quote-argument program-args " ")))

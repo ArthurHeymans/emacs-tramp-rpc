@@ -408,7 +408,7 @@ See `tramp-rpc-direnv-essential-vars' for the list of variables."
       (let* ((result (tramp-rpc--call vec "process.run"
                                        `((cmd . "/bin/sh")
                                          (args . ["-l" "-c"
-                                                  ,(concat "cd " (shell-quote-argument directory)
+                                                  ,(concat "cd " (tramp-shell-quote-argument directory)
                                                            " && direnv export json 2>/dev/null")])
                                          (cwd . "/"))))
              (exit-code (alist-get 'exit_code result))

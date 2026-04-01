@@ -891,10 +891,10 @@ This helps troubleshoot deployment issues."
         (let* ((dir tramp-rpc-deploy-remote-directory)
                (ssh-cmd (append
                          (list "ssh" "-o" "BatchMode=yes")
-                         (when user (list "-l" user))
-                         (list host (format "mkdir -p %s && test -w %s && echo 'WRITABLE'"
-                                            (shell-quote-argument dir)
-                                            (shell-quote-argument dir)))))
+                          (when user (list "-l" user))
+                          (list host (format "mkdir -p %s && test -w %s && echo 'WRITABLE'"
+                                             (tramp-shell-quote-argument dir)
+                                             (tramp-shell-quote-argument dir)))))
                (output (with-temp-buffer
                          (apply #'call-process (car ssh-cmd) nil t nil (cdr ssh-cmd))
                          (buffer-string))))
