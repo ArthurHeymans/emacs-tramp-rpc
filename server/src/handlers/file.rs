@@ -365,10 +365,7 @@ mod tests {
     #[test]
     fn test_get_group_name_root() {
         let name = get_group_name(0);
-        assert!(
-            name.is_some(),
-            "gid 0 should always have a group entry"
-        );
+        assert!(name.is_some(), "gid 0 should always have a group entry");
     }
 
     /// Repeated lookups should hit the cache and return the same value.
