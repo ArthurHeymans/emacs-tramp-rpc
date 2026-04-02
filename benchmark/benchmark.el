@@ -93,8 +93,8 @@
 
 ;;; Setup and teardown
 
-(defun tramp-rpc-benchmark--setup (method)
-  "Set up test environment for METHOD."
+(defun tramp-rpc-benchmark--setup (method tests)
+  "Set up test environment for METHOD based on selected TESTS."
   (let ((dir (tramp-rpc-benchmark--make-path method)))
     ;; Clear any existing tramp connections
     (tramp-cleanup-all-connections)
@@ -108,31 +108,51 @@
           (insert (format "Test file %d\n" i))
           (insert (make-string 1000 ?x))
           (write-region (point-min) (point-max) file))))
-    ;; Create a 10MB fixture for large read benchmark.
-    (let ((file (tramp-rpc-benchmark--make-path method "file-large-10mb.txt")))
-      (with-temp-buffer
-        (let* ((chunk-size 8192)
-               (chunk (make-string chunk-size ?L))
-               (target-size (* 10 1024 1024))
-               (chunk-count (/ target-size chunk-size)))
-          (dotimes (_ chunk-count)
-            (insert chunk)))
-        (write-region (point-min) (point-max) file)))
-    ;; Create a 10MB high-entropy fixture (intentionally hard to compress).
-    ;; Keep it printable ASCII so both sshx and rpc can write it reliably.
-    (let ((file (tramp-rpc-benchmark--make-path method "file-large-10mb-random.bin")))
-      (with-temp-buffer
-        (let* ((chunk-size 8192)
-               (alphabet "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/")
-               (alphabet-len (length alphabet))
-               (chunk (make-string chunk-size ?A))
-               (target-size (* 10 1024 1024))
-               (chunk-count (/ target-size chunk-size)))
-          (dotimes (_ chunk-count)
-            (dotimes (i chunk-size)
-              (aset chunk i (aref alphabet (random alphabet-len))))
-            (insert chunk)))
-        (write-region (point-min) (point-max) file)))))
+    (let ((selected (mapcar #'car tests)))
+      ;; Create a 10MB fixture only when selected benchmarks need it.
+      (when (member "file-read-10mb" selected)
+        (let ((file (tramp-rpc-benchmark--make-path method "file-large-10mb.txt")))
+          (with-temp-buffer
+            (let* ((chunk-size 8192)
+                   (chunk (make-string chunk-size ?L))
+                   (target-size (* 10 1024 1024))
+                   (chunk-count (/ target-size chunk-size)))
+              (dotimes (_ chunk-count)
+                (insert chunk)))
+            (write-region (point-min) (point-max) file))))
+      ;; Create a 10MB high-entropy fixture only when needed.
+      (when (member "file-read-10mb-random" selected)
+        (let ((file (tramp-rpc-benchmark--make-path method "file-large-10mb-random.bin")))
+          (with-temp-buffer
+            (let* ((chunk-size 8192)
+                   (alphabet "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/")
+                   (alphabet-len (length alphabet))
+                   (chunk (make-string chunk-size ?A))
+                   (target-size (* 10 1024 1024))
+                   (chunk-count (/ target-size chunk-size)))
+              (dotimes (_ chunk-count)
+                (dotimes (i chunk-size)
+                  (aset chunk i (aref alphabet (random alphabet-len))))
+                (insert chunk)))
+            (write-region (point-min) (point-max) file))))
+      ;; Create nested traversal fixture only for relevant tests.
+      (when (or (member "locate-dominating-file" selected)
+                (member "dir-locals-find-file" selected))
+        (let* ((project-root (tramp-rpc-benchmark--make-path method "project"))
+               (git-marker (tramp-rpc-benchmark--make-path method "project/.git"))
+               (nested-file (tramp-rpc-benchmark--make-path method
+                                                            tramp-rpc-benchmark--deep-relative-file))
+               (nested-dir (file-name-directory nested-file))
+               (dir-locals-file (tramp-rpc-benchmark--make-path method "project/.dir-locals.el")))
+          (make-directory project-root t)
+          (make-directory git-marker t)
+          (make-directory nested-dir t)
+          (with-temp-buffer
+            (insert "deep fixture\n")
+            (write-region (point-min) (point-max) nested-file))
+          (with-temp-buffer
+            (insert "((nil . ((fill-column . 80))))\n")
+            (write-region (point-min) (point-max) dir-locals-file)))))))
 
 (defun tramp-rpc-benchmark--teardown (method)
   "Clean up test environment for METHOD."
@@ -325,17 +345,60 @@ Same operations as batch-mixed-ops but done one at a time."
     ("batch-mixed-ops"    . tramp-rpc-benchmark--batch-mixed-ops))
   "Alist of RPC-only benchmark tests for batch operations.")
 
-(defun tramp-rpc-benchmark--run-method (method)
-  "Run all benchmarks for METHOD."
+(defun tramp-rpc-benchmark--resolve-test-selection (selected tests)
+  "Resolve SELECTED benchmark names from TESTS.
+SELECTED accepts nil (all), :all, or a list of strings/symbols.
+Return filtered tests as an alist in the same shape as TESTS."
+  (cond
+   ((or (null selected) (eq selected :all))
+    tests)
+   ((listp selected)
+    (let* ((names (mapcar (lambda (x)
+                            (if (symbolp x) (symbol-name x) x))
+                          selected))
+           (filtered (seq-filter (lambda (test)
+                                  (member (car test) names))
+                                tests))
+           (missing (seq-remove (lambda (name)
+                                  (assoc name tests))
+                                names)))
+      (when missing
+        (error "Unknown benchmark(s): %s"
+               (mapconcat #'identity missing ", ")))
+      filtered))
+   (t
+    (error "SELECTED benchmarks must be nil, :all, or a list"))))
+
+(defun tramp-rpc-benchmark--resolve-method-selection (selected)
+  "Resolve SELECTED benchmark methods.
+SELECTED accepts nil (all), :all, or a list of \"sshx\", \"ssh\", and/or \"rpc\"."
+  (cond
+   ((or (null selected) (eq selected :all))
+    '("sshx" "rpc"))
+   ((listp selected)
+    (mapcar (lambda (method)
+              (let ((name (if (symbolp method) (symbol-name method) method)))
+                (cond
+                 ((string= name "ssh") "sshx")
+                 ((or (string= name "sshx")
+                      (string= name "rpc"))
+                  name)
+                 (t
+                  (error "Unknown benchmark method: %s" name)))))
+            selected))
+   (t
+    (error "METHODS must be nil, :all, or a list"))))
+
+(defun tramp-rpc-benchmark--run-method (method tests)
+  "Run selected TESTS for METHOD."
   (message "Setting up for %s..." method)
-  (tramp-rpc-benchmark--setup method)
+  (tramp-rpc-benchmark--setup method tests)
   
   ;; Warm up the connection
   (message "Warming up connection for %s..." method)
   (ignore (file-exists-p (tramp-rpc-benchmark--make-path method "file0.txt")))
   
-  ;; Run common tests
-  (dolist (test tramp-rpc-benchmark--tests)
+  (dolist (test tests)
     (let* ((name (car test))
            (func (cdr test))
            (is-connection-test (string= name "connection-setup")))
@@ -351,22 +414,6 @@ Same operations as batch-mixed-ops but done one at a time."
             (tramp-rpc-benchmark--record name method times))
         (error
          (message "    ERROR in %s/%s: %s" method name err)))))
-  
-  ;; Run RPC-only batch tests
-  (when (string= method "rpc")
-    (message "  Running RPC-only batch tests...")
-    (dolist (test tramp-rpc-benchmark--rpc-only-tests)
-      (let* ((name (car test))
-             (func (cdr test)))
-        (message "  Running %s for %s (%d iterations)..."
-                 name method tramp-rpc-benchmark-iterations)
-        (condition-case err
-            (let ((times (tramp-rpc-benchmark--run-n-times
-                          tramp-rpc-benchmark-iterations
-                          (lambda () (funcall func method)))))
-              (tramp-rpc-benchmark--record name method times))
-          (error
-           (message "    ERROR in %s/%s: %s" method name err))))))
   
   (message "Cleaning up for %s..." method)
   (tramp-rpc-benchmark--teardown method))
@@ -467,28 +514,49 @@ Same operations as batch-mixed-ops but done one at a time."
                               (tramp-rpc-benchmark--format-time (plist-get stats :max)))))))))
     
     (goto-char (point-min))
-    (display-buffer (current-buffer))))
+    (if noninteractive
+        (princ (buffer-string))
+      (display-buffer (current-buffer)))))
+
+(defun tramp-rpc-benchmark-run-subset (&optional benchmark-names methods)
+  "Run selected TRAMP benchmarks.
+BENCHMARK-NAMES accepts nil/:all for all tests or a list of test names.
+METHODS accepts nil/:all for both methods or a list with \"sshx\", \"ssh\", and/or \"rpc\".
+
+Batch mode example:
+  emacs -Q --batch -l benchmark/benchmark.el \\
+    --eval '(add-to-list (quote load-path) \"/path/to/msgpack\")' \\
+    --eval '(add-to-list (quote load-path) (expand-file-name \"lisp\" default-directory))' \\
+    --eval '(require (quote tramp-rpc))' \\
+    --eval '(setq tramp-rpc-benchmark-host \"server\" tramp-rpc-benchmark-iterations 5)' \\
+    --eval '(tramp-rpc-benchmark-run-subset (quote (\"file-exists\" \"file-read\")) (quote (\"rpc\")))'"
+  (interactive)
+  (let* ((selected-tests
+          (tramp-rpc-benchmark--resolve-test-selection
+           benchmark-names tramp-rpc-benchmark--tests))
+         (selected-methods
+          (tramp-rpc-benchmark--resolve-method-selection methods)))
+    (when (null selected-tests)
+      (error "No benchmarks selected"))
+    (setq tramp-rpc-benchmark-results nil)
+    (message "Starting TRAMP benchmarks on %s..." tramp-rpc-benchmark-host)
+    (message "Methods: %s" (mapconcat #'identity selected-methods ", "))
+    (message "Tests: %s" (mapconcat #'car selected-tests ", "))
+    (message "This may take a few minutes...\n")
+    (dolist (method selected-methods)
+      (message "\n=== Benchmarking %s ===\n" method)
+      (condition-case err
+          (tramp-rpc-benchmark--run-method method selected-tests)
+        (error
+         (message "Error running benchmarks for %s: %s" method err))))
+    (tramp-rpc-benchmark--report)
+    (message "\nBenchmarks complete! See *TRAMP Benchmark Results* buffer.")))
 
 ;;;###autoload
 (defun tramp-rpc-benchmark-run ()
   "Run TRAMP RPC vs SSH benchmarks."
   (interactive)
-  (setq tramp-rpc-benchmark-results nil)
-  
-  (message "Starting TRAMP benchmarks on %s..." tramp-rpc-benchmark-host)
-  (message "This may take a few minutes...\n")
-  
-  ;; Run benchmarks for each method
-  (dolist (method '("sshx" "rpc"))
-    (message "\n=== Benchmarking %s ===\n" method)
-    (condition-case err
-        (tramp-rpc-benchmark--run-method method)
-      (error
-       (message "Error running benchmarks for %s: %s" method err))))
-  
-  ;; Display results
-  (tramp-rpc-benchmark--report)
-  (message "\nBenchmarks complete! See *TRAMP Benchmark Results* buffer."))
+  (tramp-rpc-benchmark-run-subset nil nil))
 
 ;;;###autoload
 (defun tramp-rpc-benchmark-quick ()
