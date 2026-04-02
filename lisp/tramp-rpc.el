@@ -507,6 +507,26 @@ from `tramp-inside-emacs'.  Returns the (possibly augmented) alist."
       env
     (cons (cons "INSIDE_EMACS" (tramp-inside-emacs)) env)))
 
+(defun tramp-rpc--caller-environment ()
+  "Extract environment variable overrides from `process-environment'.
+Emacs packages dynamically bind env vars via `with-environment-variables'
+or `setenv' (e.g. magit sets GIT_INDEX_FILE for temp-index operations).
+These additions/changes land in `process-environment' but are not forwarded
+by `tramp-rpc-handle-process-file' unless we explicitly extract them.
+
+Compares the current `process-environment' against the toplevel default.
+Entries that are only present in the current dynamic scope (e.g. added
+by `with-environment-variables') are returned as an alist of
+\(NAME . VALUE) pairs."
+  (let ((toplevel (default-toplevel-value 'process-environment))
+        (env nil))
+    (dolist (elt process-environment)
+      (when (and (stringp elt)
+                 (not (member elt toplevel))
+                 (string-match "\\`\\([^=]+\\)=\\(.*\\)\\'" elt))
+        (push (cons (match-string 1 elt) (match-string 2 elt)) env)))
+    (nreverse env)))
+
 (defun tramp-rpc--resolve-executable (vec program)
   "Resolve PROGRAM to its full path on VEC.
 Returns the full path if found, otherwise the original PROGRAM.
@@ -2221,7 +2241,12 @@ refresh), git commands are served from the prefetch cache when possible."
         ;; Cache miss - make actual RPC call
         (let* ((resolved-program (tramp-rpc--resolve-executable v program))
                (env (tramp-rpc--ensure-inside-emacs-env
-                     (tramp-rpc--get-direnv-environment v localname)))
+                     ;; Merge: direnv base + caller overrides (e.g. GIT_INDEX_FILE).
+                     ;; Caller overrides take priority -- append last so
+                     ;; duplicate keys resolve to the caller's value when
+                     ;; the server iterates the map.
+                     (append (tramp-rpc--get-direnv-environment v localname)
+                             (tramp-rpc--caller-environment))))
                (stdin-content (when (and infile (not (eq infile t)))
                                  (with-temp-buffer
                                    (set-buffer-multibyte nil)

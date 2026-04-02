@@ -47,6 +47,7 @@
 (declare-function tramp-rpc--controlmaster-socket-path "tramp-rpc")
 (declare-function tramp-rpc--hops-to-proxyjump "tramp-rpc")
 (declare-function tramp-rpc--ensure-inside-emacs-env "tramp-rpc")
+(declare-function tramp-rpc--caller-environment "tramp-rpc")
 (declare-function tramp-rpc-file-name-p "tramp-rpc")
 
 ;; Variables from tramp-rpc.el
@@ -149,8 +150,32 @@ This prevents race conditions where later messages arrive before earlier ones."
                                             tramp-rpc--process-write-queues))
                                  (tramp-rpc--process-write-queue queue-key))))))))
 
+(defun tramp-rpc--drain-write-queue (pid)
+  "Wait for all pending writes to PID to complete.
+Spins the event loop so that async RPC write callbacks fire and the
+queue drains.  Returns once no writes are pending or in-flight, or
+after a safety timeout of 5 seconds."
+  (let ((deadline (+ (float-time) 5.0)))
+    (while (let ((queue (gethash pid tramp-rpc--process-write-queues)))
+             (and queue
+                  (or (plist-get queue :writing)
+                      (plist-get queue :pending))
+                  (< (float-time) deadline)))
+      ;; Let the event loop process async RPC responses (write callbacks)
+      (accept-process-output nil 0.01))))
+
 (defun tramp-rpc--close-remote-stdin (vec pid)
-  "Close stdin of remote process PID on VEC."
+  "Close stdin of remote process PID on VEC.
+Drains the write queue first so that all pending data reaches the
+remote process before the pipe is closed.  Without this, the
+server may process close_stdin before process.write when they
+arrive as concurrent RPC requests."
+  ;; Ensure all queued writes have been acknowledged by the server
+  ;; before we send close_stdin.  Both requests are dispatched as
+  ;; separate concurrent tokio tasks on the server; without draining,
+  ;; close_stdin can win the process-map lock race and drop the stdin
+  ;; handle before the write task delivers the data.
+  (tramp-rpc--drain-write-queue pid)
   (tramp-rpc--call vec "process.close_stdin" `((pid . ,pid))))
 
 (defun tramp-rpc--kill-remote-process (vec pid &optional signal)
@@ -395,9 +420,11 @@ Resolves program path and loads direnv environment from working directory."
     (with-parsed-tramp-file-name default-directory nil
       ;; Unquote localname in case of file-name-quoted paths (e.g. /: prefix).
       (setq localname (file-name-unquote localname))
-      ;; Get direnv environment for this directory, with INSIDE_EMACS
+      ;; Get direnv environment for this directory, with INSIDE_EMACS,
+      ;; plus any caller-set env vars (e.g. GIT_INDEX_FILE from magit).
       (let ((direnv-env (tramp-rpc--ensure-inside-emacs-env
-                         (tramp-rpc--get-direnv-environment v localname))))
+                         (append (tramp-rpc--get-direnv-environment v localname)
+                                 (tramp-rpc--caller-environment)))))
         (if use-pty
             ;; PTY mode - start async process with PTY
             (tramp-rpc--make-pty-process v name buffer command coding noquery
