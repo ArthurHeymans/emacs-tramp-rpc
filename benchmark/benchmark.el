@@ -81,8 +81,18 @@
                          (nth (1- (/ n 2)) sorted))
                       2.0)))
          (min (car sorted))
-         (max (car (last sorted))))
-    (list :mean mean :median median :min min :max max :n n)))
+         (max (car (last sorted)))
+         ;; Use sample standard deviation (n-1) when n > 1.
+         (variance (if (> n 1)
+                       (/ (apply #'+
+                                 (mapcar (lambda (x)
+                                           (let ((d (- x mean)))
+                                             (* d d)))
+                                         times))
+                          (1- n))
+                     0.0))
+         (stddev (sqrt variance)))
+    (list :mean mean :median median :stddev stddev :min min :max max :n n)))
 
 (defun tramp-rpc-benchmark--record (name method times)
   "Record benchmark TIMES for NAME and METHOD."
@@ -459,10 +469,11 @@ Same operations as batch-mixed-ops but done one at a time."
             (let* ((method (car method-result))
                    (times (cdr method-result))
                    (stats (tramp-rpc-benchmark--stats times)))
-              (insert (format "  %s: mean=%s median=%s min=%s max=%s\n"
+              (insert (format "  %s: mean=%s median=%s stddev=%s min=%s max=%s\n"
                               method
                               (tramp-rpc-benchmark--format-time (plist-get stats :mean))
                               (tramp-rpc-benchmark--format-time (plist-get stats :median))
+                              (tramp-rpc-benchmark--format-time (plist-get stats :stddev))
                               (tramp-rpc-benchmark--format-time (plist-get stats :min))
                               (tramp-rpc-benchmark--format-time (plist-get stats :max)))))))))
     
