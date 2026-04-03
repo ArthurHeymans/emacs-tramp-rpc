@@ -1271,6 +1271,53 @@ This matches the upstream `tramp-test28-process-file' test."
       (ignore-errors (delete-file file)))))
 
 ;;; ============================================================================
+;;; Test 19: High-level operations parity
+;;; ============================================================================
+
+(ert-deftest tramp-rpc-test19-locate-dominating-file ()
+  "Ensure optimized `locate-dominating-file' matches baseline behavior."
+  (skip-unless (tramp-rpc-test-enabled))
+  (tramp-rpc-test--with-temp-dir root
+    (let* ((deep (concat root "/a/b/c/d"))
+           (target (concat deep "/target.txt")))
+      (make-directory deep t)
+      (make-directory (concat root "/.git") t)
+      (write-region "x" nil target)
+      (let ((expected (tramp-run-real-handler #'locate-dominating-file
+                                              (list target ".git")))
+            (actual (locate-dominating-file target ".git")))
+        (should (equal expected actual))))))
+
+(ert-deftest tramp-rpc-test19-dir-locals-all-files ()
+  "Ensure optimized `dir-locals--all-files' matches baseline behavior."
+  (skip-unless (tramp-rpc-test-enabled))
+  (tramp-rpc-test--with-temp-dir root
+    (let ((deep (concat root "/p/q/r")))
+      (make-directory deep t)
+      (write-region "((nil . ((fill-column . 90))))\n" nil (concat root "/" dir-locals-file))
+      (write-region "((nil . ((tab-width . 8))))\n" nil
+                    (concat root "/" (string-replace ".el" "-2.el" dir-locals-file)))
+      (let ((expected (tramp-run-real-handler #'dir-locals--all-files (list deep)))
+            (actual (dir-locals--all-files deep)))
+        (should (equal expected actual))))))
+
+(ert-deftest tramp-rpc-test19-dir-locals-find-file ()
+  "Ensure optimized `dir-locals-find-file' matches baseline behavior."
+  (skip-unless (tramp-rpc-test-enabled))
+  (tramp-rpc-test--with-temp-dir root
+    (let* ((deep (concat root "/alpha/beta/gamma"))
+           (missing (concat deep "/new-file.txt")))
+      (make-directory deep t)
+      (write-region "((nil . ((fill-column . 100))))\n" nil (concat root "/" dir-locals-file))
+      (let ((dir-locals-directory-cache nil)
+            (dir-locals-class-alist nil))
+        (let ((expected (tramp-run-real-handler #'dir-locals-find-file (list missing))))
+          (setq dir-locals-directory-cache nil
+                dir-locals-class-alist nil)
+          (let ((actual (dir-locals-find-file missing)))
+            (should (equal expected actual))))))))
+
+;;; ============================================================================
 ;;; Test Runner
 ;;; ============================================================================
 

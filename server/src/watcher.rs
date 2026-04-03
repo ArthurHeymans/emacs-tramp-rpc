@@ -199,12 +199,10 @@ async fn debounce_loop(mut rx: mpsc::Receiver<Event>, writer: WriterHandle) {
         }
 
         // Phase 3: Send notification with all collected paths
-        if !pending_paths.is_empty() {
-            if send_notification(&writer, &pending_paths).await.is_err() {
-                // Stdout is broken (Emacs disconnected), stop the loop.
-                // Cannot use eprintln! as SSH merges stderr with stdout.
-                break;
-            }
+        if !pending_paths.is_empty() && send_notification(&writer, &pending_paths).await.is_err() {
+            // Stdout is broken (Emacs disconnected), stop the loop.
+            // Cannot use eprintln! as SSH merges stderr with stdout.
+            break;
         }
     }
 }

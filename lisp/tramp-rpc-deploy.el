@@ -782,6 +782,39 @@ is missing, signals an error."
     (delete-directory tramp-rpc-deploy-local-cache-directory t)
     (message "Cleared tramp-rpc binary cache")))
 
+(defun tramp-rpc-deploy-show-binary-paths (vec)
+  "Show resolved deployment paths for remote VEC.
+Reports remote architecture and the paths used for local cache, bundled
+binary lookup, and remote installation target."
+  (interactive
+   (list (tramp-dissect-file-name
+          (read-file-name "Remote host: " "/rpc:"))))
+  (let* ((bootstrap-vec (tramp-rpc-deploy--bootstrap-vec vec))
+         (arch (tramp-rpc-deploy--detect-remote-arch bootstrap-vec))
+         (cache (tramp-rpc-deploy--local-cache-path arch))
+         (bundled (tramp-rpc-deploy--bundled-binary-path arch))
+         (remote (tramp-rpc-deploy--remote-binary-path bootstrap-vec))
+         (buf (get-buffer-create "*tramp-rpc-deploy-paths*")))
+    (with-current-buffer buf
+      (erase-buffer)
+      (insert "TRAMP-RPC Binary Path Resolution\n")
+      (insert "===============================\n\n")
+      (insert (format "Host:    %s\n" (tramp-file-name-host bootstrap-vec)))
+      (insert (format "User:    %s\n" (or (tramp-file-name-user bootstrap-vec) "<default>")))
+      (insert (format "Method:  %s (bootstrap)\n" (tramp-file-name-method bootstrap-vec)))
+      (insert (format "Arch:    %s\n\n" arch))
+      (insert (format "Cache:   %s\n" cache))
+      (insert (format "Bundled: %s\n"
+                      (or bundled "<none>")))
+      (insert (format "Remote:  %s\n" (tramp-file-local-name remote))))
+    (display-buffer buf)
+    (message "Resolved binary paths for %s (arch=%s)"
+             (tramp-file-name-host bootstrap-vec) arch)
+    `((arch . ,arch)
+      (cache . ,cache)
+      (bundled . ,bundled)
+      (remote . ,(tramp-file-local-name remote)))))
+
 (defun tramp-rpc-deploy-status ()
   "Show the status of tramp-rpc-server binaries."
   (interactive)
