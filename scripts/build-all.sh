@@ -82,6 +82,8 @@ build() {
                 export CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER=x86_64-unknown-linux-musl-gcc
             elif command -v musl-gcc &> /dev/null; then
                 export CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER=musl-gcc
+            else
+                export CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER=rust-lld
             fi
             ;;
         aarch64-unknown-linux-musl)
@@ -90,6 +92,8 @@ build() {
                 export CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER=aarch64-unknown-linux-musl-gcc
             elif command -v aarch64-linux-musl-gcc &> /dev/null; then
                 export CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER=aarch64-linux-musl-gcc
+            else
+                export CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER=rust-lld
             fi
             ;;
         *-apple-darwin)
