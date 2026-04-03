@@ -780,8 +780,8 @@ This matches the behavior expected by `tramp-test28-process-file'."
       (should (string-match-p "ssh:" hop))
       (should-not (string-match-p "rpc:" hop)))))
 
-(ert-deftest tramp-rpc-mock-test-zz-file-name-with-sudo-rpc-via-ssh ()
-  "Test that RPC sudo elevation is rewritten through an SSH hop."
+(ert-deftest tramp-rpc-mock-test-zz-file-name-with-sudo-rpc-via-rpc ()
+  "Test that RPC sudo elevation produces an rpc+sudo path."
   :tags '(:multi-hop)
   (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
   (skip-unless (tramp-rpc-mock-test--sudo-helper-available-p))
@@ -791,10 +791,13 @@ This matches the behavior expected by `tramp-test28-process-file'."
          (hop (tramp-file-name-hop vec)))
     (should (tramp-tramp-file-p filename))
     (should (equal (tramp-file-name-localname vec) "/etc/hosts"))
+    ;; The hop should be an rpc hop (not ssh)
     (should hop)
-    (should (string-match-p (rx bos "ssh:") hop))
-    (should-not (string-match-p "rpc:" hop))
-    (should-not (string-match-p (rx bos "/rpc:") filename))))
+    (should (string-match-p "rpc:" hop))
+    ;; The final method should be sudo
+    (should (string= (tramp-file-name-method vec) "sudo"))
+    ;; The host should be preserved
+    (should (string= (tramp-file-name-host vec) "target"))))
 
 (ert-deftest tramp-rpc-mock-test-zz-file-name-with-sudo-non-rpc-passthrough ()
   "Test that non-RPC sudo elevation still calls the original function."
@@ -826,11 +829,8 @@ hop with \"Host name does not match\"."
 
 (ert-deftest tramp-rpc-mock-test-compute-multi-hops-rpc-sudo-chain ()
   "Test that `tramp-compute-multi-hops' accepts rpc as a proxy for sudo.
-Regression test for GitHub issue #123: `sudo-edit' on an rpc-backed
-file produced /rpc:server|sudo:root@server:/path, which then caused
-  user-error: Host name `server' does not match `localhost-regexp'
-because rpc had no tramp-login-args and the host-check in
-`tramp-compute-multi-hops' rejected it."
+The rpc method inherits all ssh connection parameters, so
+`tramp-maybe-open-connection' can process rpc hops using SSH."
   :tags '(:multi-hop)
   (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
   ;; Manually install the proxy entry that tramp-add-hops would create
@@ -842,14 +842,112 @@ because rpc had no tramp-login-args and the host-check in
                                          :host "server"
                                          :localname "/var/log/kern.log"))
          result)
-    ;; Before the fix, tramp-compute-multi-hops would signal:
-    ;;   user-error: Host name `server' does not match `localhost-regexp'
-    ;; because the rpc item in target-alist had no %h in tramp-login-args.
     (should (setq result (tramp-compute-multi-hops sudo-vec)))
     ;; The chain should contain 2 elements: rpc proxy hop + sudo destination.
     (should (= (length result) 2))
-    ;; The first element (gateway hop) should be the rpc method.
-    (should (string= (tramp-file-name-method (car result)) "rpc"))))
+    ;; The rpc hop keeps its method name; it works because the rpc
+    ;; method entry has ssh's tramp-login-program and tramp-login-args.
+    (should (string= (tramp-file-name-method (car result)) "rpc"))
+    (should (string= (tramp-file-name-host (car result)) "server"))))
+
+(ert-deftest tramp-rpc-mock-test-rpc-method-has-ssh-login-program ()
+  "Test that the rpc method inherits ssh's tramp-login-program.
+This is needed for `tramp-maybe-open-connection' to process rpc
+as a hop in multi-hop chains."
+  :tags '(:multi-hop)
+  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
+  (let ((vec (make-tramp-file-name :method "rpc" :host "target")))
+    (should (string= (tramp-get-method-parameter vec 'tramp-login-program) "ssh"))
+    (should (tramp-get-method-parameter vec 'tramp-remote-shell))))
+
+;;; ============================================================================
+;;; Sudo-via-RPC tests (No server or SSH required)
+;;; ============================================================================
+
+(ert-deftest tramp-rpc-mock-test-detect-sudo-elevation-basic ()
+  "Test sudo elevation detection for /rpc:user@host|sudo:root@host:/path."
+  :tags '(:multi-hop :sudo)
+  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
+  (let ((vec (tramp-dissect-file-name
+              "/rpc:alice@server|sudo:root@server:/etc/shadow")))
+    (should (equal (tramp-rpc--detect-sudo-elevation vec) "alice"))))
+
+(ert-deftest tramp-rpc-mock-test-detect-sudo-elevation-no-hop ()
+  "Test that normal rpc paths return nil for sudo detection."
+  :tags '(:multi-hop :sudo)
+  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
+  (let ((vec (make-tramp-file-name :method "rpc" :user "root"
+                                   :host "server" :localname "/root")))
+    (should-not (tramp-rpc--detect-sudo-elevation vec))))
+
+(ert-deftest tramp-rpc-mock-test-detect-sudo-elevation-different-host ()
+  "Test that proxy hops to different hosts don't trigger sudo detection."
+  :tags '(:multi-hop :sudo)
+  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
+  (let ((vec (tramp-dissect-file-name
+              "/rpc:user@gateway|sudo:root@server:/root")))
+    ;; gateway != server, so no sudo elevation
+    (should-not (tramp-rpc--detect-sudo-elevation vec))))
+
+(ert-deftest tramp-rpc-mock-test-sudo-file-name-predicate ()
+  "Test the sudo+rpc handler predicate."
+  :tags '(:multi-hop :sudo)
+  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
+  ;; rpc+sudo should match
+  (should (tramp-rpc--sudo-file-name-p
+           (tramp-dissect-file-name
+            "/rpc:user@server|sudo:root@server:/root")))
+  ;; plain rpc should not match
+  (should-not (tramp-rpc--sudo-file-name-p
+               (tramp-dissect-file-name "/rpc:user@server:/home")))
+  ;; ssh+sudo should not match (no rpc in hop)
+  (should-not (tramp-rpc--sudo-file-name-p
+               (tramp-dissect-file-name
+                "/ssh:user@server|sudo:root@server:/root"))))
+
+(ert-deftest tramp-rpc-mock-test-proxy-hop-string-sudo ()
+  "Test that same-host sudo hops are excluded from proxy hop string."
+  :tags '(:multi-hop :sudo)
+  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
+  ;; Simple sudo: /rpc:user@host|sudo:root@host:/path -> no proxy hops
+  (let ((vec (tramp-dissect-file-name
+              "/rpc:user@server|sudo:root@server:/root")))
+    (should-not (tramp-rpc--proxy-hop-string vec)))
+  ;; With gateway: /rpc:gw|rpc:user@host|sudo:root@host:/path -> "rpc:gw|"
+  (let ((vec (tramp-dissect-file-name
+              "/rpc:gw|rpc:user@server|sudo:root@server:/root")))
+    (should (string-match-p "rpc:gw" (tramp-rpc--proxy-hop-string vec)))
+    ;; The same-host hop should be excluded
+    (should-not (string-match-p "rpc:user@server"
+                                (tramp-rpc--proxy-hop-string vec)))))
+
+(ert-deftest tramp-rpc-mock-test-hops-to-proxyjump-skips-sudo ()
+  "Test that hops-to-proxyjump skips same-host sudo hops."
+  :tags '(:multi-hop :sudo)
+  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
+  ;; Simple sudo: no proxy jumps needed
+  (let ((vec (tramp-dissect-file-name
+              "/rpc:user@server|sudo:root@server:/root")))
+    (should-not (tramp-rpc--hops-to-proxyjump vec)))
+  ;; With gateway: only gateway in proxyjump
+  (let ((vec (tramp-dissect-file-name
+              "/rpc:gw|rpc:user@server|sudo:root@server:/root")))
+    (let ((pj (tramp-rpc--hops-to-proxyjump vec)))
+      (should pj)
+      (should (string-match-p "gw" pj))
+      (should-not (string-match-p "server" pj)))))
+
+(ert-deftest tramp-rpc-mock-test-controlmaster-socket-shared ()
+  "Test that sudo and normal connections share the ControlMaster socket."
+  :tags '(:multi-hop :sudo)
+  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
+  (let ((normal-vec (make-tramp-file-name :method "rpc" :user "alice"
+                                          :host "server" :localname "/home"))
+        (sudo-vec (tramp-dissect-file-name
+                   "/rpc:alice@server|sudo:root@server:/root")))
+    ;; Both should produce the same ControlMaster socket path
+    (should (equal (tramp-rpc--controlmaster-socket-path normal-vec)
+                   (tramp-rpc--controlmaster-socket-path sudo-vec)))))
 
 ;;; ============================================================================
 ;;; Dir-locals advice tests (No server or SSH required)

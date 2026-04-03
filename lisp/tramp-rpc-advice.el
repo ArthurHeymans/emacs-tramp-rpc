@@ -280,19 +280,23 @@ process-file calls are routed through the TRAMP handler."
 ;; ============================================================================
 
 ;; `tramp-file-name-with-sudo' assumes the current TRAMP method can participate
-;; directly in the elevated multi-hop path.  That does not hold for `rpc:'.
-;; Rewrite RPC-backed paths to elevate through an SSH hop instead.
+;; directly in the elevated multi-hop path.  For `rpc:', we build an
+;; /rpc:user@host|sudo:root@host:/path path that the tramp-rpc handler
+;; intercepts.  The RPC server is started via sudo, giving full RPC
+;; performance for privilege-elevated file operations.
 
-(defun tramp-rpc--file-name-with-sudo-via-ssh (filename)
-  "Build an elevated TRAMP file name for RPC-backed FILENAME via SSH."
+(defun tramp-rpc--file-name-with-sudo-via-rpc (filename)
+  "Build an elevated TRAMP file name for RPC-backed FILENAME.
+Produces /rpc:user@host|sudo:root@host:/path which is intercepted
+by the tramp-rpc handler and served via a sudo-launched RPC server."
   (with-parsed-tramp-file-name (expand-file-name filename) nil
     (let* ((sudo-method
             (or (and (boundp 'tramp-file-name-with-method)
                      tramp-file-name-with-method)
                 "sudo"))
-           (ssh-hop
+           (rpc-hop
             (tramp-make-tramp-hop-name
-             (make-tramp-file-name :method "ssh" :user user :host host))))
+             (make-tramp-file-name :method "rpc" :user user :host host))))
       (let ((tramp-show-ad-hoc-proxies t))
         (tramp-make-tramp-file-name
          (make-tramp-file-name
@@ -300,15 +304,15 @@ process-file calls are routed through the TRAMP handler."
           :user (tramp-find-user sudo-method nil host)
           :host (tramp-find-host sudo-method nil host)
           :localname localname
-          :hop ssh-hop))))))
+          :hop rpc-hop))))))
 
 (defun tramp-rpc--file-name-with-sudo-advice (orig-fun filename)
-  "Route RPC-backed sudo elevation through SSH for FILENAME."
+  "Route RPC-backed sudo elevation through RPC for FILENAME."
   (let ((filename (expand-file-name filename)))
     (if (and (tramp-tramp-file-p filename)
              (with-parsed-tramp-file-name filename nil
                (string= method "rpc")))
-        (tramp-rpc--file-name-with-sudo-via-ssh filename)
+        (tramp-rpc--file-name-with-sudo-via-rpc filename)
       (funcall orig-fun filename))))
 
 ;; ============================================================================
