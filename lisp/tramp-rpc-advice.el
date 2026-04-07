@@ -45,6 +45,9 @@
 (declare-function tramp-rpc--call "tramp-rpc")
 (declare-function tramp-rpc--call-async "tramp-rpc")
 (declare-function tramp-rpc-file-name-p "tramp-rpc")
+(declare-function tramp-rpc-handle-locate-dominating-file "tramp-rpc")
+(declare-function tramp-rpc-handle-dir-locals-find-file "tramp-rpc")
+(declare-function tramp-rpc-handle-dir-locals--all-files "tramp-rpc")
 
 ;; Variables from tramp-rpc.el / tramp-rpc-process.el
 (defvar tramp-rpc--delivering-output)
@@ -416,6 +419,39 @@ so that .dir-locals.el files are detected and loaded normally."
                (tramp-rpc-file-name-p file)))))
     (funcall orig-fun)))
 
+;; `locate-dominating-file', `dir-locals-find-file', and
+;; `dir-locals--all-files' are advised for TRAMP versions without external
+;; operation registration APIs.
+(defun tramp-rpc--locate-dominating-file-advice (orig-fun file name)
+  "Use RPC fast-path for remote `locate-dominating-file'."
+  (if (and (stringp file)
+           (tramp-rpc-file-name-p
+            (if (file-name-absolute-p file)
+                file
+              (file-name-concat default-directory file))))
+      (tramp-rpc-handle-locate-dominating-file file name)
+    (funcall orig-fun file name)))
+
+(defun tramp-rpc--dir-locals-find-file-advice (orig-fun file)
+  "Use RPC fast-path for remote `dir-locals-find-file'."
+  (if (and (stringp file)
+           (tramp-rpc-file-name-p
+            (if (file-name-absolute-p file)
+                file
+              (file-name-concat default-directory file))))
+      (tramp-rpc-handle-dir-locals-find-file file)
+    (funcall orig-fun file)))
+
+(defun tramp-rpc--dir-locals--all-files-advice (orig-fun directory &optional base-el-only)
+  "Use RPC fast-path for remote `dir-locals--all-files'."
+  (if (and (stringp directory)
+           (tramp-rpc-file-name-p
+            (if (file-name-absolute-p directory)
+                directory
+              (file-name-concat default-directory directory))))
+      (tramp-rpc-handle-dir-locals--all-files directory base-el-only)
+    (funcall orig-fun directory base-el-only)))
+
 ;; ============================================================================
 ;; Install and uninstall advice
 ;; ============================================================================
@@ -441,6 +477,12 @@ so that .dir-locals.el files are detected and loaded normally."
   (with-eval-after-load 'magit-process
     (advice-add 'magit-start-process :around
                 #'tramp-rpc--magit-start-process-advice))
+  (advice-add 'locate-dominating-file :around
+              #'tramp-rpc--locate-dominating-file-advice)
+  (advice-add 'dir-locals-find-file :around
+              #'tramp-rpc--dir-locals-find-file-advice)
+  (advice-add 'dir-locals--all-files :around
+              #'tramp-rpc--dir-locals--all-files-advice)
   (advice-add 'hack-dir-local-variables :around
               #'tramp-rpc--hack-dir-local-variables-advice))
 
@@ -460,6 +502,9 @@ so that .dir-locals.el files are detected and loaded normally."
   (advice-remove 'eglot--cmd #'tramp-rpc--eglot-cmd-advice)
   (advice-remove 'vc-dir-refresh #'tramp-rpc--vc-dir-refresh-advice)
   (advice-remove 'magit-start-process #'tramp-rpc--magit-start-process-advice)
+  (advice-remove 'locate-dominating-file #'tramp-rpc--locate-dominating-file-advice)
+  (advice-remove 'dir-locals-find-file #'tramp-rpc--dir-locals-find-file-advice)
+  (advice-remove 'dir-locals--all-files #'tramp-rpc--dir-locals--all-files-advice)
   (advice-remove 'hack-dir-local-variables #'tramp-rpc--hack-dir-local-variables-advice))
 
 (defcustom tramp-rpc-install-advice-on-load t
