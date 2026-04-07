@@ -802,8 +802,10 @@ Returns the connection plist.  Signals `remote-file-error' on failure."
                     (when port (list "-p" (number-to-string port)))
                     ;; Multi-hop via ProxyJump
                     (when proxyjump (list "-J" proxyjump))
-                    ;; Default options
-                    (list "-o" "BatchMode=yes")
+                    ;; Only use BatchMode=yes when ControlMaster handles auth;
+                    ;; without it, BatchMode=yes prevents password prompts.
+                    (when tramp-rpc-use-controlmaster
+                      (list "-o" "BatchMode=yes"))
                     (list "-o" "StrictHostKeyChecking=accept-new")
                     ;; User-specified SSH options
                     (mapcan (lambda (opt) (list "-o" opt))
