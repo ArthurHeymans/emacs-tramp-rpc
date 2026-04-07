@@ -544,9 +544,9 @@ DIRENV-ENV is an optional alist of environment variables from direnv."
          ;; Build environment exports for the remote command
          (env-exports (mapconcat
                        (lambda (pair)
-                         (format "export %s=%s;"
-                                 (car pair)
-                                 (shell-quote-argument (cdr pair))))
+                          (format "export %s=%s;"
+                                  (car pair)
+                                  (tramp-shell-quote-argument (cdr pair))))
                        (append direnv-env
                                `(("TERM" . ,(or (getenv "TERM") "xterm-256color"))))
                        " "))
@@ -554,8 +554,8 @@ DIRENV-ENV is an optional alist of environment variables from direnv."
          (remote-cmd (format "cd %s && %s exec %s %s"
                              (tramp-shell-quote-argument localname)
                              env-exports
-                             (shell-quote-argument program)
-                             (mapconcat #'shell-quote-argument program-args " ")))
+                              (tramp-shell-quote-argument program)
+                              (mapconcat #'tramp-shell-quote-argument program-args " ")))
          (proxyjump (tramp-rpc--hops-to-proxyjump vec))
          ;; Build SSH arguments for direct PTY connection
          (ssh-args (append
