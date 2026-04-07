@@ -909,6 +909,45 @@ This matches the behavior expected by `tramp-test28-process-file'."
          'passthrough))
     (should (equal called-with (expand-file-name filename)))))
 
+(ert-deftest tramp-rpc-mock-test-rpc-method-advertises-host-arg ()
+  "Test that the rpc method declares %%h in tramp-login-args.
+This is required so `tramp-compute-multi-hops' allows rpc to appear
+as a proxy hop alongside shell methods like sudo/su.  Without %%h,
+the host-check in `tramp-compute-multi-hops' would reject the rpc
+hop with \"Host name does not match\"."
+  :tags '(:multi-hop)
+  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
+  (let* ((vec (make-tramp-file-name :method "rpc" :host "target"))
+         (login-args (tramp-get-method-parameter vec 'tramp-login-args)))
+    (should (member "%h" (flatten-tree login-args)))))
+
+(ert-deftest tramp-rpc-mock-test-compute-multi-hops-rpc-sudo-chain ()
+  "Test that `tramp-compute-multi-hops' accepts rpc as a proxy for sudo.
+Regression test for GitHub issue #123: `sudo-edit' on an rpc-backed
+file produced /rpc:server|sudo:root@server:/path, which then caused
+  user-error: Host name `server' does not match `localhost-regexp'
+because rpc had no tramp-login-args and the host-check in
+`tramp-compute-multi-hops' rejected it."
+  :tags '(:multi-hop)
+  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
+  ;; Manually install the proxy entry that tramp-add-hops would create
+  ;; when processing /rpc:server|sudo:root@server:/path.
+  (let* ((tramp-default-proxies-alist
+          (list (list "^server$" "^root$"
+                      (propertize "/rpc:server:" 'tramp-ad-hoc t))))
+         (sudo-vec (make-tramp-file-name :method "sudo" :user "root"
+                                         :host "server"
+                                         :localname "/var/log/kern.log"))
+         result)
+    ;; Before the fix, tramp-compute-multi-hops would signal:
+    ;;   user-error: Host name `server' does not match `localhost-regexp'
+    ;; because the rpc item in target-alist had no %h in tramp-login-args.
+    (should (setq result (tramp-compute-multi-hops sudo-vec)))
+    ;; The chain should contain 2 elements: rpc proxy hop + sudo destination.
+    (should (= (length result) 2))
+    ;; The first element (gateway hop) should be the rpc method.
+    (should (string= (tramp-file-name-method (car result)) "rpc"))))
+
 ;;; ============================================================================
 ;;; Dir-locals advice tests (No server or SSH required)
 ;;; ============================================================================
@@ -1104,6 +1143,41 @@ discard it for being unreadable."
     ;; recentf-cleanup abbreviates paths (~ for home), so compare
     ;; with abbreviate-file-name.
     (should (equal recentf-list (list (abbreviate-file-name local-file))))))
+
+;;; ============================================================================
+;;; Tilde Quoting Tests
+;;; ============================================================================
+
+;; Verify that paths passed to shell commands use `tramp-shell-quote-argument'
+;; (which preserves tilde expansion) rather than raw `shell-quote-argument'
+;; (which escapes the tilde and breaks cd ~/... on the remote).
+
+(ert-deftest tramp-rpc-mock-test-shell-quote-preserves-tilde ()
+  "Test that `tramp-shell-quote-argument' preserves leading tilde."
+  ;; tramp-shell-quote-argument is defined in tramp.el, always available.
+  (should (string-prefix-p "~/" (tramp-shell-quote-argument "~/projects")))
+  (should (equal "~" (tramp-shell-quote-argument "~")))
+  (should (string-prefix-p "~user/" (tramp-shell-quote-argument "~user/dir"))))
+
+(ert-deftest tramp-rpc-mock-test-shell-quote-tilde-vs-raw ()
+  "Demonstrate the bug: raw `shell-quote-argument' escapes tilde."
+  ;; raw shell-quote-argument escapes tilde (the bug this fix addresses)
+  (should (string-prefix-p "\\~" (shell-quote-argument "~/projects")))
+  ;; tramp-shell-quote-argument does not
+  (should-not (string-prefix-p "\\~" (tramp-shell-quote-argument "~/projects"))))
+
+(ert-deftest tramp-rpc-mock-test-shell-quote-absolute-path ()
+  "Test that absolute paths are quoted normally by both functions."
+  (should (equal (shell-quote-argument "/home/user/projects")
+                 (tramp-shell-quote-argument "/home/user/projects"))))
+
+(ert-deftest tramp-rpc-mock-test-shell-quote-path-with-spaces ()
+  "Test that paths with spaces after tilde are properly quoted."
+  (let ((quoted (tramp-shell-quote-argument "~/my projects")))
+    ;; Tilde should be preserved
+    (should (string-prefix-p "~/" quoted))
+    ;; The space should be escaped (backslash-space on Unix)
+    (should (string-match-p "\\\\ " quoted))))
 
 ;;; ============================================================================
 ;;; Test Runner
