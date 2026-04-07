@@ -5,7 +5,7 @@
 ;; Author: Arthur Heymans <arthur@aheymans.xyz>
 ;; Version: 0.7.0
 ;; Keywords: comm, processes, files
-;; Package-Requires: ((emacs "30.1") (msgpack "0"))
+;; Package-Requires: ((emacs "30.1") (msgpack "0") (tramp "2.8.1.3"))
 
 ;; This file is part of tramp-rpc.
 
@@ -63,6 +63,16 @@
   ;; Register the method
   (add-to-list 'tramp-methods
                `(,tramp-rpc-method
+                 ;; Declare that the rpc method uses the host name.
+                 ;; tramp-compute-multi-hops validates that methods without
+                 ;; "%h" in tramp-login-args use a host matching the previous
+                 ;; hop.  Since rpc IS host-directed (it SSH-connects to the
+                 ;; specified host), advertising "%h" here lets rpc appear
+                 ;; as a proxy hop in chains like /rpc:server|sudo:root@server:/path
+                 ;; without triggering the "host does not match" error.
+                 ;; The actual tramp-login-args value is never used for login
+                 ;; because rpc is a foreign (non-tramp-sh) file handler.
+                 (tramp-login-args (("%h")))
                  ;; Direct async process support: tramp-rpc uses direct SSH
                  ;; PTY connections for async processes, which means stderr
                  ;; is mixed with stdout (normal PTY behavior).  Setting
@@ -408,7 +418,7 @@ See `tramp-rpc-direnv-essential-vars' for the list of variables."
       (let* ((result (tramp-rpc--call vec "process.run"
                                        `((cmd . "/bin/sh")
                                          (args . ["-l" "-c"
-                                                  ,(concat "cd " (shell-quote-argument directory)
+                                                  ,(concat "cd " (tramp-shell-quote-argument directory)
                                                            " && direnv export json 2>/dev/null")])
                                          (cwd . "/"))))
              (exit-code (alist-get 'exit_code result))
@@ -496,6 +506,26 @@ from `tramp-inside-emacs'.  Returns the (possibly augmented) alist."
   (if (assoc "INSIDE_EMACS" env)
       env
     (cons (cons "INSIDE_EMACS" (tramp-inside-emacs)) env)))
+
+(defun tramp-rpc--caller-environment ()
+  "Extract environment variable overrides from `process-environment'.
+Emacs packages dynamically bind env vars via `with-environment-variables'
+or `setenv' (e.g. magit sets GIT_INDEX_FILE for temp-index operations).
+These additions/changes land in `process-environment' but are not forwarded
+by `tramp-rpc-handle-process-file' unless we explicitly extract them.
+
+Compares the current `process-environment' against the toplevel default.
+Entries that are only present in the current dynamic scope (e.g. added
+by `with-environment-variables') are returned as an alist of
+\(NAME . VALUE) pairs."
+  (let ((toplevel (default-toplevel-value 'process-environment))
+        (env nil))
+    (dolist (elt process-environment)
+      (when (and (stringp elt)
+                 (not (member elt toplevel))
+                 (string-match "\\`\\([^=]+\\)=\\(.*\\)\\'" elt))
+        (push (cons (match-string 1 elt) (match-string 2 elt)) env)))
+    (nreverse env)))
 
 (defun tramp-rpc--resolve-executable (vec program)
   "Resolve PROGRAM to its full path on VEC.
@@ -1685,12 +1715,8 @@ to the built-in implementation."
     (let* ((result (tramp-rpc--call v "dir.list"
                                     (append (tramp-rpc--encode-path localname)
                                             '((include_attrs . :msgpack-false)
-                                              (include_hidden . t)))))
-           (files (mapcar #'tramp-rpc--decode-filename result)))
-      ;; Ensure "." and ".." are present (some storage systems omit them)
-      (unless (member "." files) (push "." files))
-      (unless (member ".." files) (push ".." files))
-      files)))
+                                              (include_hidden . t))))))
+      (mapcar #'tramp-rpc--decode-filename result))))
 
 (defun tramp-rpc-handle-directory-files-and-attributes
     (directory &optional full match nosort id-format count)
@@ -1725,29 +1751,30 @@ to the built-in implementation."
         (setq entries (seq-take entries count)))
       entries)))
 
+;; Declared in Tramp 2.8.1.3+; forward-declare so byte compiler treats it as dynamic.
+(defvar tramp-fnac-add-trailing-slash)
+
 (defun tramp-rpc-handle-file-name-all-completions (filename directory)
   "Like `file-name-all-completions' for TRAMP-RPC files."
-  (tramp-skeleton-file-name-all-completions filename directory
-    (with-parsed-tramp-file-name (expand-file-name directory) nil
-      (when (and (not (string-search "/" filename))
-                 (tramp-connectable-p v))
-        (all-completions
-         filename
-         ;; Get all entries in the directory
-(let* ((result (tramp-rpc--call v "dir.list"
-                                          (append (tramp-rpc--encode-path localname)
-                                                  '((include_attrs . :msgpack-false)
-                                                    (include_hidden . t)))))
-                ;; Convert vector to list if needed
-                (entries (if (vectorp result) (append result nil) result)))
-           ;; Build list of names with trailing / for directories
-           (mapcar (lambda (entry)
-                     (let ((name (tramp-rpc--decode-filename entry))
-                           (file-type (alist-get 'type entry)))
-                       (if (equal file-type "directory")
-                           (concat name "/")
-                         name)))
-                   entries)))))))
+  ;; Suppress check for trailing slash in `tramp-skeleton-file-name-all-completions'.
+  (let (tramp-fnac-add-trailing-slash)
+    (tramp-skeleton-file-name-all-completions filename directory
+      (with-parsed-tramp-file-name (expand-file-name directory) nil
+	;; Get all entries in the directory. Convert vector to list if needed.
+	(let ((entries
+	       (append (tramp-rpc--call v "dir.list"
+				       (append (tramp-rpc--encode-path localname)
+					       '((include_attrs . :msgpack-false)
+                                                 (include_hidden . t))))
+		       nil)))
+          ;; Build list of names with trailing / for directories
+          (mapcar (lambda (entry)
+                    (let ((name (tramp-rpc--decode-filename entry))
+                          (file-type (alist-get 'type entry)))
+                      (if (equal file-type "directory")
+                          (concat name "/")
+			name)))
+                  entries))))))
 
 (defun tramp-rpc-handle-make-directory (dir &optional parents)
   "Like `make-directory' for TRAMP-RPC files."
@@ -2329,7 +2356,12 @@ refresh), git commands are served from the prefetch cache when possible."
         ;; Cache miss - make actual RPC call
         (let* ((resolved-program (tramp-rpc--resolve-executable v program))
                (env (tramp-rpc--ensure-inside-emacs-env
-                     (tramp-rpc--get-direnv-environment v localname)))
+                     ;; Merge: direnv base + caller overrides (e.g. GIT_INDEX_FILE).
+                     ;; Caller overrides take priority -- append last so
+                     ;; duplicate keys resolve to the caller's value when
+                     ;; the server iterates the map.
+                     (append (tramp-rpc--get-direnv-environment v localname)
+                             (tramp-rpc--caller-environment))))
                (stdin-content (when (and infile (not (eq infile t)))
                                  (with-temp-buffer
                                    (set-buffer-multibyte nil)

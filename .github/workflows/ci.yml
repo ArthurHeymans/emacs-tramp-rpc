@@ -74,6 +74,8 @@ jobs:
               --eval "(add-to-list 'package-archives '(\"melpa\" . \"https://melpa.org/packages/\") t)" \
               --eval "(package-initialize)" \
               --eval "(package-refresh-contents)" \
+              --eval "(setq package-install-upgrade-built-in t)" \
+              --eval "(package-install 'tramp)" \
               --eval "(package-install 'msgpack)" && break
             echo "Attempt $attempt failed, retrying in 10s..."
             sleep 10
@@ -117,6 +119,8 @@ jobs:
               --eval "(add-to-list 'package-archives '(\"melpa\" . \"https://melpa.org/packages/\") t)" \
               --eval "(package-initialize)" \
               --eval "(package-refresh-contents)" \
+              --eval "(setq package-install-upgrade-built-in t)" \
+              --eval "(package-install 'tramp)" \
               --eval "(package-install 'msgpack)" && break
             echo "Attempt $attempt failed, retrying in 10s..."
             sleep 10
@@ -147,6 +151,8 @@ jobs:
               --eval "(add-to-list 'package-archives '(\"melpa\" . \"https://melpa.org/packages/\") t)" \
               --eval "(package-initialize)" \
               --eval "(package-refresh-contents)" \
+              --eval "(setq package-install-upgrade-built-in t)" \
+              --eval "(package-install 'tramp)" \
               --eval "(package-install 'msgpack)" && break
             echo "Attempt $attempt failed, retrying in 10s..."
             sleep 10
@@ -184,6 +190,8 @@ jobs:
               --eval "(add-to-list 'package-archives '(\"melpa\" . \"https://melpa.org/packages/\") t)" \
               --eval "(package-initialize)" \
               --eval "(package-refresh-contents)" \
+              --eval "(setq package-install-upgrade-built-in t)" \
+              --eval "(package-install 'tramp)" \
               --eval "(package-install 'msgpack)" && break
             echo "Attempt $attempt failed, retrying in 10s..."
             sleep 10
@@ -230,6 +238,8 @@ jobs:
               --eval "(add-to-list 'package-archives '(\"melpa\" . \"https://melpa.org/packages/\") t)" \
               --eval "(package-initialize)" \
               --eval "(package-refresh-contents)" \
+              --eval "(setq package-install-upgrade-built-in t)" \
+              --eval "(package-install 'tramp)" \
               --eval "(package-install 'msgpack)" && break
             echo "Attempt $attempt failed, retrying in 10s..."
             sleep 10
@@ -303,6 +313,8 @@ jobs:
               --eval "(add-to-list 'package-archives '(\"melpa\" . \"https://melpa.org/packages/\") t)" \
               --eval "(package-initialize)" \
               --eval "(package-refresh-contents)" \
+              --eval "(setq package-install-upgrade-built-in t)" \
+              --eval "(package-install 'tramp)" \
               --eval "(package-install 'msgpack)" && break
             echo "Attempt $attempt failed, retrying in 10s..."
             sleep 10

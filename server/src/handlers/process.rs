@@ -324,8 +324,14 @@ pub async fn close_stdin(params: Value) -> HandlerResult {
         .get_mut(&params.pid)
         .ok_or_else(|| RpcError::process_error(format!("Process not found: {}", params.pid)))?;
 
-    // Drop stdin to close it
-    managed.child.stdin.take();
+    // Flush any buffered data before closing stdin, then drop to close the pipe.
+    // This is a defensive measure: the client should drain its write queue before
+    // calling close_stdin, but flushing here guards against data loss if a
+    // concurrent process.write task wrote data that hasn't been flushed yet.
+    if let Some(mut stdin) = managed.child.stdin.take() {
+        let _ = stdin.flush().await;
+        // stdin is dropped here, closing the pipe
+    }
 
     Ok(Value::Boolean(true))
 }
