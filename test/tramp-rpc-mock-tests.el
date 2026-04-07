@@ -224,18 +224,17 @@
 ;;; ============================================================================
 
 (ert-deftest tramp-rpc-mock-test-mode-to-string ()
-  "Test mode integer to string conversion."
-  ;; This tests the internal function if available
-  (when (fboundp 'tramp-rpc--mode-to-string)
-    ;; Regular file with 644 permissions
-    (let ((mode-str (tramp-rpc--mode-to-string #o644 "file")))
-      (should (equal mode-str "-rw-r--r--")))
-    ;; Directory with 755 permissions
-    (let ((mode-str (tramp-rpc--mode-to-string #o755 "directory")))
-      (should (equal mode-str "drwxr-xr-x")))
-    ;; Symlink
-    (let ((mode-str (tramp-rpc--mode-to-string #o777 "symlink")))
-      (should (string-prefix-p "l" mode-str)))))
+  "Test mode integer to string conversion using `tramp-file-mode-from-int'.
+The server sends the full st_mode value including file type bits."
+  ;; Regular file with 644 permissions (S_IFREG = #o100000)
+  (let ((mode-str (tramp-file-mode-from-int (logior #o100000 #o644))))
+    (should (equal mode-str "-rw-r--r--")))
+  ;; Directory with 755 permissions (S_IFDIR = #o040000)
+  (let ((mode-str (tramp-file-mode-from-int (logior #o040000 #o755))))
+    (should (equal mode-str "drwxr-xr-x")))
+  ;; Symlink (S_IFLNK = #o120000)
+  (let ((mode-str (tramp-file-mode-from-int (logior #o120000 #o777))))
+    (should (string-prefix-p "l" mode-str))))
 
 ;;; ============================================================================
 ;;; File Attributes Conversion Tests
@@ -244,9 +243,9 @@
 (ert-deftest tramp-rpc-mock-test-convert-file-attributes ()
   "Test conversion of stat result to Emacs attributes."
   (when (fboundp 'tramp-rpc--convert-file-attributes)
-    (let* ((stat-result '((type . "file")
+    (let* ((stat-result `((type . "file")
                           (size . 1234)
-                          (mode . 420)  ; #o644
+                          (mode . ,(logior #o100000 #o644))  ; S_IFREG | 0644
                           (nlinks . 1)
                           (uid . 1000)
                           (gid . 1000)
@@ -1007,26 +1006,34 @@ so it works even when non-essential was nil."
     (should (file-remote-p "/rpc:somehost:/path"))))
 
 (ert-deftest tramp-rpc-mock-test-recentf-cleanup ()
-  "Test that `tramp-rpc--recentf-cleanup' removes matching entries."
+  "Test that upstream `tramp-recentf-cleanup' removes matching entries.
+tramp-rpc delegates recentf cleanup to the upstream function from
+tramp-integration.el, registered on `tramp-cleanup-connection-hook'.
+Uses an existing local path so `recentf-cleanup' does not also
+discard it for being unreadable."
   :tags '(:non-essential :recentf)
   (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
-  ;; Ensure recentf-list is a special variable so let-binding works
-  ;; across the setq in tramp-rpc--recentf-cleanup.
   (require 'recentf)
   (let* ((vec (make-tramp-file-name :method "rpc" :host "myhost"
                                     :localname "/dummy"))
+         (local-file (expand-file-name "test/tramp-rpc-mock-tests.el"
+                                       tramp-rpc-mock-test--project-root))
          (recentf-list (list "/rpc:myhost:/foo/bar"
-                             "/rpc:myhost:/baz"
-                             "/rpc:otherhost:/keep"
-                             "/home/user/local-file")))
-    (tramp-rpc--recentf-cleanup vec)
-    ;; Only myhost entries should be removed
+                              "/rpc:myhost:/baz"
+                              "/rpc:otherhost:/keep"
+                              local-file)))
+    (tramp-recentf-cleanup vec)
+    ;; Only myhost entries should be removed; other remote and local kept.
+    ;; recentf-cleanup abbreviates paths (~ for home), so compare
+    ;; with abbreviate-file-name.
     (should (equal recentf-list
-                   '("/rpc:otherhost:/keep"
-                     "/home/user/local-file")))))
+                   (list "/rpc:otherhost:/keep"
+                         (abbreviate-file-name local-file))))))
 
 (ert-deftest tramp-rpc-mock-test-recentf-cleanup-all ()
-  "Test that `tramp-rpc--recentf-cleanup-all' removes all remote entries.
+  "Test that upstream `tramp-recentf-cleanup-all' removes all remote entries.
+tramp-rpc delegates recentf cleanup to the upstream function from
+tramp-integration.el, registered on `tramp-cleanup-all-connections-hook'.
 Uses an existing local path so `recentf-cleanup' does not also
 discard it for being unreadable."
   :tags '(:non-essential :recentf)
@@ -1038,10 +1045,10 @@ discard it for being unreadable."
   (let* ((local-file (expand-file-name "test/tramp-rpc-mock-tests.el"
                                        tramp-rpc-mock-test--project-root))
          (recentf-list (list "/rpc:host1:/foo"
-                             "/ssh:host2:/bar"
-                             local-file
-                             "/rpc:host3:/baz")))
-    (tramp-rpc--recentf-cleanup-all)
+                              "/ssh:host2:/bar"
+                              local-file
+                              "/rpc:host3:/baz")))
+    (tramp-recentf-cleanup-all)
     ;; All remote entries should be removed, existing local file kept.
     ;; recentf-cleanup abbreviates paths (~ for home), so compare
     ;; with abbreviate-file-name.

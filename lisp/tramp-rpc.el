@@ -559,7 +559,7 @@ following the pattern used by standard TRAMP."
                                        `((cmd . ,shell)
                                          (args . ["-l" "-c"
                                                   ,(format "echo %s; command -v %s"
-                                                           marker (shell-quote-argument program))])
+                                                            marker (tramp-shell-quote-argument program))])
                                          (cwd . "/"))))
              (exit-code (alist-get 'exit_code result))
              (stdout (tramp-rpc--decode-output
@@ -851,7 +851,19 @@ Returns the connection plist.  Signals `remote-file-error' on failure."
     (let ((response (tramp-rpc--call vec "system.info" nil)))
       (unless response
         (tramp-rpc--remove-connection vec)
-        (signal 'remote-file-error (list "Failed to connect to RPC server on" host))))
+        (signal 'remote-file-error (list "Failed to connect to RPC server on" host)))
+
+      ;; Store remote uname so `tramp-check-remote-uname' works.
+      ;; The server returns "linux" or "macos"; map to the kernel name
+      ;; that tramp-sh expects ("Linux", "Darwin", etc.).
+      (let ((os (alist-get 'os response)))
+        (when os
+          (tramp-set-connection-property
+           vec "uname"
+           (pcase os
+             ("macos" "Darwin")
+             ("linux" "Linux")
+             (_ os))))))
 
     ;; Set connection-local variables in the connection buffer.
     ;; Every TRAMP backend must call this after establishing the connection
@@ -1525,7 +1537,7 @@ ID-FORMAT specifies whether to use numeric or string IDs."
          (mtime (seconds-to-time (alist-get 'mtime stat)))
          (ctime (seconds-to-time (alist-get 'ctime stat)))
          (size (alist-get 'size stat))
-         (mode (tramp-rpc--mode-to-string (alist-get 'mode stat) type-str))
+         (mode (tramp-file-mode-from-int (alist-get 'mode stat)))
          (inode (alist-get 'inode stat))
          (dev (alist-get 'dev stat)))
     ;; Return in file-attributes format
@@ -1535,56 +1547,23 @@ ID-FORMAT specifies whether to use numeric or string IDs."
           atime mtime ctime
           size mode nil inode dev)))
 
-(defun tramp-rpc--mode-to-string (mode type)
-  "Convert numeric MODE to a string like \"drwxr-xr-x\".
-TYPE is the file type string."
-  (let ((type-char (pcase type
-                     ("directory" ?d)
-                     ("symlink" ?l)
-                     ("file" ?-)
-                     ("chardevice" ?c)
-                     ("blockdevice" ?b)
-                     ("fifo" ?p)
-                     ("socket" ?s)
-                     (_ ?-))))
-    (format "%c%c%c%c%c%c%c%c%c%c"
-            type-char
-            (if (> (logand mode #o400) 0) ?r ?-)
-            (if (> (logand mode #o200) 0) ?w ?-)
-            (if (> (logand mode #o4000) 0)
-                (if (> (logand mode #o100) 0) ?s ?S)
-              (if (> (logand mode #o100) 0) ?x ?-))
-            (if (> (logand mode #o040) 0) ?r ?-)
-            (if (> (logand mode #o020) 0) ?w ?-)
-            (if (> (logand mode #o2000) 0)
-                (if (> (logand mode #o010) 0) ?s ?S)
-              (if (> (logand mode #o010) 0) ?x ?-))
-            (if (> (logand mode #o004) 0) ?r ?-)
-            (if (> (logand mode #o002) 0) ?w ?-)
-            (if (> (logand mode #o1000) 0)
-                (if (> (logand mode #o001) 0) ?t ?T)
-              (if (> (logand mode #o001) 0) ?x ?-)))))
+
 
 
 (defun tramp-rpc-handle-set-file-modes (filename mode &optional _flag)
   "Like `set-file-modes' for TRAMP-RPC files."
-  (with-parsed-tramp-file-name filename nil
-    (tramp-barf-if-file-missing v filename
-      (tramp-rpc--call v "file.set_modes"
-                       (append (tramp-rpc--encode-path localname)
-                               `((mode . ,mode))))
-      (tramp-flush-file-properties v localname))))
+  (tramp-skeleton-set-file-modes-times-uid-gid filename
+    (tramp-rpc--call v "file.set_modes"
+                     (append (tramp-rpc--encode-path localname)
+                             `((mode . ,mode))))))
 
 (defun tramp-rpc-handle-set-file-times (filename &optional timestamp _flag)
   "Like `set-file-times' for TRAMP-RPC files."
-  (with-parsed-tramp-file-name filename nil
-    (tramp-barf-if-file-missing v filename
-      (prog1
-	  (let ((mtime (floor (float-time (or timestamp (current-time))))))
-	    (tramp-rpc--call v "file.set_times"
-			     (append (tramp-rpc--encode-path localname)
-				     `((mtime . ,mtime)))))
-	(tramp-flush-file-properties v localname)))))
+  (tramp-skeleton-set-file-modes-times-uid-gid filename
+    (let ((mtime (floor (float-time (or timestamp (current-time))))))
+      (tramp-rpc--call v "file.set_times"
+                       (append (tramp-rpc--encode-path localname)
+                               `((mtime . ,mtime)))))))
 
 
 ;; ============================================================================
@@ -1950,16 +1929,15 @@ Creates a hard link from NEWNAME to FILENAME."
   "Like `tramp-set-file-uid-gid' for TRAMP-RPC files.
 Set the ownership of FILENAME to UID and GID.
 Either UID or GID can be nil or -1 to leave that unchanged."
-  (with-parsed-tramp-file-name filename nil
-    (tramp-barf-if-file-missing v filename
-      (let ((uid (or (and (natnump uid) uid)
-                     (tramp-rpc-handle-get-remote-uid v 'integer)))
-            (gid (or (and (natnump gid) gid)
-                     (tramp-rpc-handle-get-remote-gid v 'integer))))
-	(tramp-rpc--call v "file.chown"
-			 (append (tramp-rpc--encode-path localname)
-				 `((uid . ,uid)
-                                   (gid . ,gid))))))))
+  (tramp-skeleton-set-file-modes-times-uid-gid filename
+    (let ((uid (or (and (natnump uid) uid)
+                   (tramp-rpc-handle-get-remote-uid v 'integer)))
+          (gid (or (and (natnump gid) gid)
+                   (tramp-rpc-handle-get-remote-gid v 'integer))))
+      (tramp-rpc--call v "file.chown"
+                       (append (tramp-rpc--encode-path localname)
+                               `((uid . ,uid)
+                                 (gid . ,gid)))))))
 
 (defun tramp-rpc-handle-file-system-info (filename)
   "Like `file-system-info' for TRAMP-RPC files.
@@ -2485,16 +2463,22 @@ If GROUP is non-nil, also check that group would be preserved.
 Uses cached `file-attributes' and connection-cached remote uid/gid,
 so this typically requires no RPC calls."
   (with-parsed-tramp-file-name (expand-file-name filename) nil
-    (let ((attributes (file-attributes filename 'integer)))
-      ;; Return t if the file doesn't exist, since it's true that no
-      ;; information would be lost by an (attempted) delete and create.
-      (or (null attributes)
-          (and
-           (= (file-attribute-user-id attributes)
-              (tramp-get-remote-uid v 'integer))
-           (or (not group)
-               (= (file-attribute-group-id attributes)
-                   (tramp-get-remote-gid v 'integer))))))))
+    (with-tramp-file-property
+        v localname
+        (format "file-ownership-preserved-p%s" (if group "-group" ""))
+      (let ((attributes (file-attributes filename 'integer)))
+        ;; Return t if the file doesn't exist, since it's true that no
+        ;; information would be lost by an (attempted) delete and create.
+        (or (null attributes)
+            (and
+             (= (file-attribute-user-id attributes)
+                (tramp-get-remote-uid v 'integer))
+             (or (not group)
+                 ;; On BSD-derived systems files always inherit the
+                 ;; parent directory's group, so skip the group-gid test.
+                 (tramp-check-remote-uname v tramp-bsd-unames)
+                 (= (file-attribute-group-id attributes)
+                    (tramp-get-remote-gid v 'integer)))))))))
 
 (defun tramp-rpc-handle-expand-file-name (name &optional dir)
   "Like `expand-file-name' for TRAMP-RPC files.
@@ -2753,33 +2737,7 @@ VEC-OR-FILENAME can be either a tramp-file-name struct or a filename string."
 ;; Recentf integration
 ;; ============================================================================
 
-;; Declare recentf variables for the byte compiler.  These are defined
-;; with defcustom/defvar in recentf.el which may not be loaded at
-;; compile time.  Without this, the let-binding of recentf-exclude in
-;; tramp-rpc--recentf-cleanup-all is flagged as an unused lexical
-;; variable (the binding is read dynamically by recentf-cleanup).
-(defvar recentf-list)
-(defvar recentf-exclude)
-(declare-function recentf-cleanup "recentf")
 
-(defun tramp-rpc--recentf-cleanup (vec)
-  "Remove file names related to VEC from `recentf-list'.
-An unresponsive remote host could trigger `recentf' to try
-reconnecting repeatedly.  This mirrors `tramp-recentf-cleanup'
-from tramp-integration.el."
-  (when (bound-and-true-p recentf-list)
-    (let ((prefix (tramp-make-tramp-file-name vec "")))
-      (setq recentf-list
-            (cl-remove-if
-             (lambda (f) (string-prefix-p prefix f))
-             recentf-list)))))
-
-(defun tramp-rpc--recentf-cleanup-all ()
-  "Remove all remote file names from `recentf-list'.
-This mirrors `tramp-recentf-cleanup-all' from tramp-integration.el."
-  (when (bound-and-true-p recentf-list)
-    (let ((recentf-exclude '(file-remote-p)))
-      (recentf-cleanup))))
 
 ;; ============================================================================
 ;; Connection cleanup support
@@ -2813,10 +2771,10 @@ file-truename)."
     (tramp-rpc--clear-file-caches-for-connection vec)
     ;; Clean up ControlMaster SSH process and socket.
     (tramp-rpc--cleanup-controlmaster vec)
-    ;; Remove this host's entries from recentf-list.  An unresponsive
-    ;; remote host could trigger recentf to try reconnecting repeatedly.
-    ;; This mirrors `tramp-recentf-cleanup' from tramp-integration.el.
-    (tramp-rpc--recentf-cleanup vec)))
+    ;; Note: recentf cleanup is handled by `tramp-recentf-cleanup' from
+    ;; tramp-integration.el, which is registered on the same
+    ;; `tramp-cleanup-connection-hook'.
+    ))
 
 (defun tramp-rpc-cleanup-all-connections ()
   "Clean up all TRAMP-RPC connections.
@@ -2860,8 +2818,10 @@ cleanup of all connections has run."
   (tramp-rpc--clear-direnv-cache)
   (tramp-rpc-clear-file-exists-cache)
   (tramp-rpc-clear-file-truename-cache)
-  ;; Remove all remote file names from recentf-list.
-  (tramp-rpc--recentf-cleanup-all))
+  ;; Note: recentf cleanup is handled by `tramp-recentf-cleanup-all'
+  ;; from tramp-integration.el, registered on the same
+  ;; `tramp-cleanup-all-connections-hook'.
+  )
 
 ;; Register cleanup hooks.
 (add-hook 'tramp-cleanup-connection-hook #'tramp-rpc-cleanup-connection)
