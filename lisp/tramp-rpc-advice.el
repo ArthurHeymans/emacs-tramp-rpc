@@ -270,7 +270,7 @@ process-file calls are routed through the TRAMP handler."
                               (stringp file)
                               (tramp-tramp-file-p file)
                               ;; Operations that take a file and may call process-file
-                              (memq function-name '(state state-heuristic dir-status-files
+                              (memq function-name '(registered state state-heuristic dir-status-files
                                                     working-revision previous-revision next-revision
                                                     responsible-p)))))
     (if should-set-dir
@@ -450,7 +450,12 @@ so that .dir-locals.el files are detected and loaded normally."
                 directory
               (file-name-concat default-directory directory))))
       (tramp-rpc-handle-dir-locals--all-files directory base-el-only)
-    (funcall orig-fun directory base-el-only)))
+    ;; Emacs versions differ in accepted arity for `dir-locals--all-files'.
+    ;; Try the 2-arg form first and fall back for older 1-arg variants.
+    (condition-case nil
+        (funcall orig-fun directory base-el-only)
+      (wrong-number-of-arguments
+       (funcall orig-fun directory)))))
 
 ;; ============================================================================
 ;; Install and uninstall advice
