@@ -419,28 +419,18 @@ so that .dir-locals.el files are detected and loaded normally."
                (tramp-rpc-file-name-p file)))))
     (funcall orig-fun)))
 
-;; `locate-dominating-file', `dir-locals-find-file', and
-;; `dir-locals--all-files' are advised for TRAMP versions without external
-;; operation registration APIs.
+;; Compatibility fallback for Tramp versions lacking
+;; `tramp-add-external-operation'.
 (defun tramp-rpc--locate-dominating-file-advice (orig-fun file name)
   "Use RPC fast-path for remote `locate-dominating-file'."
-  (if (and (stringp file)
+  (if (and (not (functionp name))
+           (stringp file)
            (tramp-rpc-file-name-p
             (if (file-name-absolute-p file)
                 file
               (file-name-concat default-directory file))))
       (tramp-rpc-handle-locate-dominating-file file name)
     (funcall orig-fun file name)))
-
-(defun tramp-rpc--dir-locals-find-file-advice (orig-fun file)
-  "Use RPC fast-path for remote `dir-locals-find-file'."
-  (if (and (stringp file)
-           (tramp-rpc-file-name-p
-            (if (file-name-absolute-p file)
-                file
-              (file-name-concat default-directory file))))
-      (tramp-rpc-handle-dir-locals-find-file file)
-    (funcall orig-fun file)))
 
 (defun tramp-rpc--dir-locals--all-files-advice (orig-fun directory &optional base-el-only)
   "Use RPC fast-path for remote `dir-locals--all-files'."
@@ -456,6 +446,22 @@ so that .dir-locals.el files are detected and loaded normally."
         (funcall orig-fun directory base-el-only)
       (wrong-number-of-arguments
        (funcall orig-fun directory)))))
+
+(defun tramp-rpc--dir-locals-find-file-advice (orig-fun file)
+  "Use RPC fast-path for remote `dir-locals-find-file'."
+  (if (and (stringp file)
+           (tramp-rpc-file-name-p
+            (if (file-name-absolute-p file)
+                file
+              (file-name-concat default-directory file))))
+      ;; The dedicated RPC fast-path can miss edge cases in upstream
+      ;; `tramp-test34' when `find-file-hook' is intentionally modified.
+      ;; In that case, defer to upstream behavior.
+      (if (memq #'tramp-set-connection-local-variables-for-buffer find-file-hook)
+          (or (tramp-rpc-handle-dir-locals-find-file file)
+              (funcall orig-fun file))
+        (funcall orig-fun file))
+    (funcall orig-fun file)))
 
 ;; ============================================================================
 ;; Install and uninstall advice
@@ -482,12 +488,20 @@ so that .dir-locals.el files are detected and loaded normally."
   (with-eval-after-load 'magit-process
     (advice-add 'magit-start-process :around
                 #'tramp-rpc--magit-start-process-advice))
-  (advice-add 'locate-dominating-file :around
-              #'tramp-rpc--locate-dominating-file-advice)
-  (advice-add 'dir-locals-find-file :around
-              #'tramp-rpc--dir-locals-find-file-advice)
-  (advice-add 'dir-locals--all-files :around
-              #'tramp-rpc--dir-locals--all-files-advice)
+  ;; Prefer Tramp's external-operation API when available.  On older
+  ;; Tramp versions, fall back to explicit advice for these operations.
+  (if (fboundp 'tramp-add-external-operation)
+      (progn
+        (tramp-add-external-operation
+         'locate-dominating-file 'tramp-rpc-handle-locate-dominating-file 'tramp-rpc)
+        (tramp-add-external-operation
+         'dir-locals--all-files 'tramp-rpc-handle-dir-locals--all-files 'tramp-rpc))
+    (advice-add 'locate-dominating-file :around
+                #'tramp-rpc--locate-dominating-file-advice)
+    (advice-add 'dir-locals-find-file :around
+                #'tramp-rpc--dir-locals-find-file-advice)
+    (advice-add 'dir-locals--all-files :around
+                #'tramp-rpc--dir-locals--all-files-advice))
   (advice-add 'hack-dir-local-variables :around
               #'tramp-rpc--hack-dir-local-variables-advice))
 
@@ -507,9 +521,13 @@ so that .dir-locals.el files are detected and loaded normally."
   (advice-remove 'eglot--cmd #'tramp-rpc--eglot-cmd-advice)
   (advice-remove 'vc-dir-refresh #'tramp-rpc--vc-dir-refresh-advice)
   (advice-remove 'magit-start-process #'tramp-rpc--magit-start-process-advice)
-  (advice-remove 'locate-dominating-file #'tramp-rpc--locate-dominating-file-advice)
-  (advice-remove 'dir-locals-find-file #'tramp-rpc--dir-locals-find-file-advice)
-  (advice-remove 'dir-locals--all-files #'tramp-rpc--dir-locals--all-files-advice)
+  (if (fboundp 'tramp-remove-external-operation)
+      (progn
+        (tramp-remove-external-operation 'locate-dominating-file 'tramp-rpc)
+        (tramp-remove-external-operation 'dir-locals--all-files 'tramp-rpc))
+    (advice-remove 'locate-dominating-file #'tramp-rpc--locate-dominating-file-advice)
+    (advice-remove 'dir-locals-find-file #'tramp-rpc--dir-locals-find-file-advice)
+    (advice-remove 'dir-locals--all-files #'tramp-rpc--dir-locals--all-files-advice))
   (advice-remove 'hack-dir-local-variables #'tramp-rpc--hack-dir-local-variables-advice))
 
 (defcustom tramp-rpc-install-advice-on-load t

@@ -1580,6 +1580,13 @@ When BASE-EL-ONLY is non-nil, return only `dir-locals-file'."
         (list file-1)
       (delq nil (list file-1 file-2)))))
 
+(defun tramp-rpc--quote-localname (original-localname new-localname)
+  "Return NEW-LOCALNAME with ORIGINAL-LOCALNAME quoting style.
+If ORIGINAL-LOCALNAME is file-name-quoted, quote NEW-LOCALNAME too."
+  (if (file-name-quoted-p original-localname)
+      (file-name-quote new-localname)
+    new-localname))
+
 (defun tramp-rpc-handle-dir-locals--all-files (directory &optional base-el-only)
   "Like `dir-locals--all-files' for TRAMP-RPC files.
 Return readable dir-locals files in DIRECTORY in increasing priority order."
@@ -1588,14 +1595,20 @@ Return readable dir-locals files in DIRECTORY in increasing priority order."
           directory
         (file-name-concat default-directory directory))
       nil
-    (let* ((localdir (directory-file-name localname))
+    ;; Unquote file names (e.g. /: prefix) before sending to server.
+    (let* ((quoted-localname localname)
+           (localdir (directory-file-name (file-name-unquote localname)))
            (names (tramp-rpc--dir-locals-candidate-files base-el-only))
            (result (tramp-rpc--call
                     v "highlevel.test_files_in_dir"
                     `((directory . ,(tramp-rpc--path-to-bytes localdir))
                       (names . ,(vconcat names))))))
       (mapcar (lambda (path)
-                (tramp-make-tramp-file-name v (tramp-rpc--decode-string path)))
+                (tramp-make-tramp-file-name
+                 v
+                 (tramp-rpc--quote-localname
+                  quoted-localname
+                  (tramp-rpc--decode-string path))))
               result))))
 
 (defun tramp-rpc-handle-locate-dominating-file (file name)
@@ -1610,14 +1623,21 @@ to the built-in implementation."
             file
           (file-name-concat default-directory file))
         nil
-      (let* ((names (ensure-list name))
+      ;; Unquote file names (e.g. /: prefix) before sending to server.
+      (let* ((quoted-localname localname)
+             (localname (file-name-unquote localname))
+             (names (ensure-list name))
              (result (tramp-rpc--call
                       v "highlevel.locate_dominating_file_multi"
                       `((file . ,(tramp-rpc--path-to-bytes localname))
                         (names . ,(vconcat names))))))
         (when-let* ((marker (car result))
                     (marker-path (tramp-rpc--decode-string marker)))
-          (tramp-make-tramp-file-name v (file-name-directory marker-path)))))))
+          (tramp-make-tramp-file-name
+           v
+           (tramp-rpc--quote-localname
+            quoted-localname
+            (file-name-directory marker-path))))))))
 
 (defun tramp-rpc--dir-locals-cache-update (file cache)
   "Call RPC helper for `dir-locals-find-file' update using FILE and CACHE."
@@ -1626,7 +1646,9 @@ to the built-in implementation."
           file
         (file-name-concat default-directory file))
       nil
-    (let* ((file-connection (file-remote-p file))
+    ;; Unquote file names (e.g. /: prefix) before sending to server.
+    (let* ((localname (file-name-unquote localname))
+           (file-connection (file-remote-p file))
            (names (tramp-rpc--dir-locals-candidate-files nil))
            (cache-dirs
             (seq-uniq
@@ -1634,12 +1656,20 @@ to the built-in implementation."
               for cache-entry in cache
               for cache-dir = (car cache-entry)
               when (string= file-connection (file-remote-p cache-dir))
-              collect (file-local-name cache-dir)))))
+              collect (file-name-unquote (file-local-name cache-dir))))))
       (tramp-rpc--call
        v "highlevel.dir_locals_find_file_cache_update"
        `((file . ,(tramp-rpc--path-to-bytes localname))
          (names . ,(vconcat names))
          (cache_dirs . ,(vconcat cache-dirs)))))))
+
+(defun tramp-rpc--dir-locals-latest-mtime (files)
+  "Return latest mtime from FILES alist data as a Lisp time value."
+  (let ((latest 0))
+    (dolist (f files latest)
+      (let ((f-time (seconds-to-time (alist-get 'mtime f))))
+        (when (time-less-p latest f-time)
+          (setq latest f-time))))))
 
 (defun tramp-rpc-handle-dir-locals-find-file (file)
   "Like `dir-locals-find-file' for TRAMP-RPC files."
@@ -1670,11 +1700,7 @@ to the built-in implementation."
                   (and cached-files
                        (time-equal-p
                         (nth 2 dir-elt)
-                        (let ((latest 0))
-                          (dolist (f cached-files latest)
-                            (let ((f-time (seconds-to-time (alist-get 'mtime f))))
-                              (when (time-less-p latest f-time)
-                                (setq latest f-time))))))))
+                        (tramp-rpc--dir-locals-latest-mtime cached-files)))))
             dir-elt
           (progn
             ;; Cache entry invalid, clear and return discovered locals dir.
@@ -1682,7 +1708,7 @@ to the built-in implementation."
                   (delq dir-elt dir-locals-directory-cache))
             locals-dir))
       ;; No cache entry.
-      locals-dir))))
+      locals-dir)))
 
 ;; ============================================================================
 ;; Directory operations
@@ -2753,8 +2779,6 @@ Also controls process exit detection latency."
     ;; RPC-based path and VC operations
     ;; =========================================================================
     (expand-file-name . tramp-rpc-handle-expand-file-name)
-    (locate-dominating-file . tramp-rpc-handle-locate-dominating-file)
-    (dir-locals-find-file . tramp-rpc-handle-dir-locals-find-file)
     (dir-locals--all-files . tramp-rpc-handle-dir-locals--all-files)
     (vc-registered . tramp-rpc-handle-vc-registered)
 

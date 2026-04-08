@@ -1033,6 +1033,42 @@ because rpc had no tramp-login-args and the host-check in
        (lambda () (setq orig-called t)))
       (should orig-called))))
 
+(ert-deftest tramp-rpc-mock-test-locate-dominating-file-unquotes-and-requotes-paths ()
+  "Ensure locate-dominating handler unquotes RPC paths for transport.
+Quoted RPC localnames (/: prefix) must be unquoted for server filesystem
+operations and re-quoted on the way back."
+  :tags '(:dir-locals)
+  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
+  (let (captured-file)
+    (cl-letf (((symbol-function 'tramp-rpc--call)
+               (lambda (_vec method params)
+                 (should (string= method "highlevel.locate_dominating_file_multi"))
+                 (setq captured-file
+                       (decode-coding-string (alist-get 'file params) 'utf-8 t))
+                 (list (encode-coding-string "/tmp/tramp-rpc-root/.git" 'utf-8 t)))))
+      (let* ((default-directory "/rpc:host:/:/tmp/tramp-rpc-root/subdir/")
+             (result (tramp-rpc-handle-locate-dominating-file "foo" ".git")))
+        (should (equal captured-file "/tmp/tramp-rpc-root/subdir/foo"))
+        (should (equal result "/rpc:host:/:/tmp/tramp-rpc-root/"))))))
+
+(ert-deftest tramp-rpc-mock-test-dir-locals-all-files-unquotes-and-requotes-paths ()
+  "Ensure dir-locals-all-files handler preserves quoted RPC localnames."
+  :tags '(:dir-locals)
+  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
+  (let (captured-directory)
+    (cl-letf (((symbol-function 'tramp-rpc--call)
+               (lambda (_vec method params)
+                 (should (string= method "highlevel.test_files_in_dir"))
+                 (setq captured-directory
+                       (decode-coding-string (alist-get 'directory params) 'utf-8 t))
+                 (list (encode-coding-string "/tmp/tramp-rpc-root/.dir-locals.el"
+                                             'utf-8 t)))))
+      (let ((result (tramp-rpc-handle-dir-locals--all-files
+                     "/rpc:host:/:/tmp/tramp-rpc-root/" nil)))
+        (should (equal captured-directory "/tmp/tramp-rpc-root"))
+        (should (equal result
+                       '("/rpc:host:/:/tmp/tramp-rpc-root/.dir-locals.el")))))))
+
 (ert-deftest tramp-rpc-mock-test-dir-locals-advice-installed ()
   "Test that the dir-locals advice is installed and removed correctly."
   :tags '(:dir-locals)
