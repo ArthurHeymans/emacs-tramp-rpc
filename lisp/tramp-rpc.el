@@ -131,6 +131,8 @@
 
 ;; Silence byte-compiler warning for function defined in with-eval-after-load
 (declare-function tramp-rpc--multi-hop-advice "tramp-rpc")
+;; From tramp-rpc-advice.el (loaded at runtime)
+(declare-function tramp-rpc-advice-remove "tramp-rpc-advice")
 (require 'tramp-rpc-deploy)
 
 ;; Silence byte-compiler warnings for functions defined elsewhere
@@ -2693,7 +2695,11 @@ Also controls process exit detection latency."
 ;; Process support, advice functions, and magit integration are now in
 ;; separate modules for better organization and maintainability.
 (require 'tramp-rpc-process)
-(require 'tramp-rpc-advice)
+;; Loading tramp-rpc-advice while this file is being byte-compiled can
+;; recurse on some Emacs/TRAMP combinations.  Advice is still loaded at
+;; runtime when `tramp-rpc' is required normally.
+(unless (bound-and-true-p byte-compile-current-file)
+  (require 'tramp-rpc-advice))
 (require 'tramp-rpc-magit)
 
 ;; ============================================================================
