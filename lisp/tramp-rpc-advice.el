@@ -488,20 +488,15 @@ so that .dir-locals.el files are detected and loaded normally."
   (with-eval-after-load 'magit-process
     (advice-add 'magit-start-process :around
                 #'tramp-rpc--magit-start-process-advice))
-  ;; Prefer Tramp's external-operation API when available.  On older
-  ;; Tramp versions, fall back to explicit advice for these operations.
-  (if (fboundp 'tramp-add-external-operation)
-      (progn
-        (tramp-add-external-operation
-         'locate-dominating-file 'tramp-rpc-handle-locate-dominating-file 'tramp-rpc)
-        (tramp-add-external-operation
-         'dir-locals--all-files 'tramp-rpc-handle-dir-locals--all-files 'tramp-rpc))
-    (advice-add 'locate-dominating-file :around
-                #'tramp-rpc--locate-dominating-file-advice)
-    (advice-add 'dir-locals-find-file :around
-                #'tramp-rpc--dir-locals-find-file-advice)
-    (advice-add 'dir-locals--all-files :around
-                #'tramp-rpc--dir-locals--all-files-advice))
+  ;; Always use explicit advice for these operations.  Using
+  ;; `tramp-add-external-operation' here can recurse while the
+  ;; `tramp-rpc' feature is still loading.
+  (advice-add 'locate-dominating-file :around
+              #'tramp-rpc--locate-dominating-file-advice)
+  (advice-add 'dir-locals-find-file :around
+              #'tramp-rpc--dir-locals-find-file-advice)
+  (advice-add 'dir-locals--all-files :around
+              #'tramp-rpc--dir-locals--all-files-advice)
   (advice-add 'hack-dir-local-variables :around
               #'tramp-rpc--hack-dir-local-variables-advice))
 
@@ -521,13 +516,9 @@ so that .dir-locals.el files are detected and loaded normally."
   (advice-remove 'eglot--cmd #'tramp-rpc--eglot-cmd-advice)
   (advice-remove 'vc-dir-refresh #'tramp-rpc--vc-dir-refresh-advice)
   (advice-remove 'magit-start-process #'tramp-rpc--magit-start-process-advice)
-  (if (fboundp 'tramp-remove-external-operation)
-      (progn
-        (tramp-remove-external-operation 'locate-dominating-file 'tramp-rpc)
-        (tramp-remove-external-operation 'dir-locals--all-files 'tramp-rpc))
-    (advice-remove 'locate-dominating-file #'tramp-rpc--locate-dominating-file-advice)
-    (advice-remove 'dir-locals-find-file #'tramp-rpc--dir-locals-find-file-advice)
-    (advice-remove 'dir-locals--all-files #'tramp-rpc--dir-locals--all-files-advice))
+  (advice-remove 'locate-dominating-file #'tramp-rpc--locate-dominating-file-advice)
+  (advice-remove 'dir-locals-find-file #'tramp-rpc--dir-locals-find-file-advice)
+  (advice-remove 'dir-locals--all-files #'tramp-rpc--dir-locals--all-files-advice)
   (advice-remove 'hack-dir-local-variables #'tramp-rpc--hack-dir-local-variables-advice))
 
 (defcustom tramp-rpc-install-advice-on-load t
