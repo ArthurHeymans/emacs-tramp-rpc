@@ -1090,6 +1090,43 @@ discard it for being unreadable."
     (should (string-match-p "\\\\ " quoted))))
 
 ;;; ============================================================================
+;;; Direnv Cache Path Normalization Tests (No server or SSH required)
+;;; ============================================================================
+
+(ert-deftest tramp-rpc-mock-test-direnv-cache-key-deduplicates-tilde ()
+  "Test that ~/project and /home/user/project produce the same cache key."
+  :tags '(:direnv)
+  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
+  (let ((vec (make-tramp-file-name :method "rpc" :host "host" :user "user"
+                                   :localname "/")))
+    (cl-letf (((symbol-function 'tramp-get-home-directory)
+               (lambda (_vec &optional _user) "/home/user")))
+      (should (equal (tramp-rpc--direnv-cache-key vec "~/project")
+                     (tramp-rpc--direnv-cache-key vec "/home/user/project"))))))
+
+(ert-deftest tramp-rpc-mock-test-direnv-cache-no-duplicate-entries ()
+  "Test that accessing ~/project and /home/user/project shares one cache entry."
+  :tags '(:direnv)
+  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
+  (let* ((vec (make-tramp-file-name :method "rpc" :host "host" :user "user"
+                                    :localname "/"))
+         ;; Local direnv cache to avoid polluting global state
+         (tramp-rpc--direnv-cache (make-hash-table :test 'equal))
+         (fetch-count 0))
+    (cl-letf (((symbol-function 'tramp-get-home-directory)
+               (lambda (_vec &optional _user) "/home/user"))
+              ((symbol-function 'tramp-rpc--fetch-direnv-environment)
+               (lambda (_vec _dir)
+                 (cl-incf fetch-count)
+                 '(("PATH" . "/usr/bin")))))
+      ;; First access via tilde path - should call fetch
+      (tramp-rpc--get-direnv-environment vec "~/project")
+      (should (= fetch-count 1))
+      ;; Second access via absolute path - should hit the cache, not fetch again
+      (tramp-rpc--get-direnv-environment vec "/home/user/project")
+      (should (= fetch-count 1)))))
+
+;;; ============================================================================
 ;;; Test Runner
 ;;; ============================================================================
 

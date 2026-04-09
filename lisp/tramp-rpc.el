@@ -368,8 +368,13 @@ Set to 0 to disable caching (not recommended)."
   :group 'tramp-rpc)
 
 (defun tramp-rpc--direnv-cache-key (vec directory)
-  "Generate cache key for direnv environment on VEC in DIRECTORY."
-  (cons (tramp-rpc--connection-key vec) directory))
+  "Generate cache key for direnv environment on VEC in DIRECTORY.
+Normalizes DIRECTORY via `expand-file-name' so that ~ and the expanded
+home path map to the same cache key."
+  (cons (tramp-rpc--connection-key vec)
+        (tramp-file-local-name
+         (expand-file-name
+          (tramp-make-tramp-file-name vec directory)))))
 
 (defun tramp-rpc--get-direnv-environment (vec directory)
   "Get direnv environment for DIRECTORY on VEC.
