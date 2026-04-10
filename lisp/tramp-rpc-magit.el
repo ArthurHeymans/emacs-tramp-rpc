@@ -41,8 +41,6 @@
 ;; Silence byte-compiler warnings for external functions
 (declare-function projectile-dir-files-alien "projectile")
 (declare-function projectile-time-seconds "projectile")
-(declare-function magit-status-setup-buffer "magit-status")
-(declare-function magit-get-mode-buffer "magit-mode")
 
 ;; ============================================================================
 ;; Cache infrastructure
@@ -255,7 +253,7 @@ When RECURSIVE is non-nil, watch subdirectories too."
 
 (defcustom tramp-rpc-magit-optimize t
   "Whether to enable magit prefetch optimizations.
-When non-nil, tramp-rpc will automatically install advice on
+When non-nil, tramp-rpc will automatically install handlers on
 `magit-status-setup-buffer' and `magit-status-refresh-buffer' to
 prefetch git commands in parallel, dramatically speeding up
 magit-status on remote repositories."
@@ -621,7 +619,7 @@ Only uses the cache if FILENAME is under the prefetched directory."
   (setq tramp-rpc-magit--prefetch-directory nil))
 
 ;; ============================================================================
-;; Magit advice
+;; Magit handlers
 ;; ============================================================================
 
 (defun tramp-rpc-handle-magit-status-setup-buffer (&optional directory)
@@ -701,60 +699,38 @@ magit-status on remote repositories."
 ;; Projectile optimizations
 ;; ============================================================================
 
-(defvar projectile-git-command)
-(defvar projectile-enable-caching)
 (defvar projectile-projects-cache)
 (defvar projectile-projects-cache-time)
 
-(defun tramp-rpc-projectile--advice-get-ext-command (orig-fun vcs)
-  "Advice to disable fd for remote directories.
+(defun tramp-rpc-handle-projectile-get-ext-command (vcs)
+  "Handler to disable fd for remote directories.
 Projectile checks if fd is available using `executable-find' which
 checks the LOCAL machine, but fd may not be available on the REMOTE.
 This forces git ls-files for remote directories."
-  (if (and (file-remote-p default-directory)
-           (tramp-rpc-file-name-p default-directory)
-           (eq vcs 'git)
-           (boundp 'projectile-git-command))
-      ;; For remote RPC directories, always use git ls-files
-      projectile-git-command
-    ;; Otherwise, use the original function
-    (funcall orig-fun vcs)))
+  (or ;; For remote RPC directories, always use git ls-files
+      (and (eq vcs 'git) (bound-and-true-p projectile-git-command))
+      ;; Otherwise, use the original function
+      (tramp-run-real-handler 'projectile-get-ext-command (list vcs))))
 
-(defun tramp-rpc-projectile--advice-dir-files (orig-fun directory)
-  "Advice to use alien indexing for remote directories.
-Projectile's hybrid indexing calls `file-relative-name' for each file
-which is slow over TRAMP.  For remote directories, we use alien indexing
-directly since git ls-files already returns relative paths."
-  (if (and (file-remote-p directory)
-           (tramp-rpc-file-name-p directory))
-      ;; For remote RPC directories, use alien indexing directly
-      (projectile-dir-files-alien directory)
-    ;; Otherwise, use the original function
-    (funcall orig-fun directory)))
-
-(defun tramp-rpc-projectile--advice-project-files (orig-fun project-root)
-  "Advice to use alien indexing for remote project files.
+(defun tramp-rpc-handle-projectile-project-files (project-root)
+  "Handler to use alien indexing for remote project files.
 This bypasses the expensive `file-relative-name' calls in hybrid mode."
-  (if (and (file-remote-p project-root)
-           (tramp-rpc-file-name-p project-root))
-      ;; For remote RPC directories, use alien indexing directly
-      (let ((files nil))
-        ;; Check cache first (like projectile-project-files does)
-        (when (and (bound-and-true-p projectile-enable-caching)
-                   (boundp 'projectile-projects-cache))
-          (setq files (gethash project-root projectile-projects-cache)))
-        ;; If not cached, fetch and cache
-        (unless files
-          (setq files (projectile-dir-files-alien project-root))
-          (when (and (bound-and-true-p projectile-enable-caching)
-                     (boundp 'projectile-projects-cache)
-                     (boundp 'projectile-projects-cache-time)
-                     (fboundp 'projectile-time-seconds))
-            (puthash project-root files projectile-projects-cache)
-            (puthash project-root (projectile-time-seconds) projectile-projects-cache-time)))
-        files)
-    ;; Otherwise, use the original function
-    (funcall orig-fun project-root)))
+  ;; For remote RPC directories, use alien indexing directly
+  (let ((files nil))
+    ;; Check cache first (like projectile-project-files does)
+    (when (and (bound-and-true-p projectile-enable-caching)
+               (boundp 'projectile-projects-cache))
+      (setq files (gethash project-root projectile-projects-cache)))
+    ;; If not cached, fetch and cache
+    (unless files
+      (setq files (projectile-dir-files-alien project-root))
+      (when (and (bound-and-true-p projectile-enable-caching)
+                 (boundp 'projectile-projects-cache)
+                 (boundp 'projectile-projects-cache-time)
+                 (fboundp 'projectile-time-seconds))
+        (puthash project-root files projectile-projects-cache)
+        (puthash project-root (projectile-time-seconds) projectile-projects-cache-time)))
+    files))
 
 ;;;###autoload
 (defun tramp-rpc-projectile-enable ()
@@ -762,24 +738,24 @@ This bypasses the expensive `file-relative-name' calls in hybrid mode."
 This ensures fd is not used for remote directories where it may not
 be available, and uses alien indexing for better performance."
   (interactive)
-  (advice-add 'projectile-get-ext-command :around
-              #'tramp-rpc-projectile--advice-get-ext-command)
-  (advice-add 'projectile-dir-files :around
-              #'tramp-rpc-projectile--advice-dir-files)
-  (advice-add 'projectile-project-files :around
-              #'tramp-rpc-projectile--advice-project-files)
+  (tramp-add-external-operation
+   'projectile-get-ext-command
+   #'tramp-rpc-handle-get-ext-command 'tramp-rpc)
+  (tramp-add-external-operation
+   'projectile-dir-files
+   #'projectile-dir-files-alien 'tramp-rpc)
+  (tramp-add-external-operation
+   'projectile-project-files
+   #'tramp-rpc-handle-projectile-project-files 'tramp-rpc)
   (message "tramp-rpc projectile optimizations enabled"))
 
 ;;;###autoload
 (defun tramp-rpc-projectile-disable ()
   "Disable tramp-rpc projectile optimizations."
   (interactive)
-  (advice-remove 'projectile-get-ext-command
-                 #'tramp-rpc-projectile--advice-get-ext-command)
-  (advice-remove 'projectile-dir-files
-                 #'tramp-rpc-projectile--advice-dir-files)
-  (advice-remove 'projectile-project-files
-                 #'tramp-rpc-projectile--advice-project-files)
+  (tramp-remove-external-operation 'projectile-get-ext-command 'tramp-rpc)
+  (tramp-remove-external-operation 'projectile-dir-files 'tramp-rpc)
+  (tramp-remove-external-operation 'projectile-project-files 'tramp-rpc)
   (message "tramp-rpc projectile optimizations disabled"))
 
 ;; Auto-enable when projectile is loaded
@@ -792,8 +768,8 @@ be available, and uses alien indexing for better performance."
 
 (defun tramp-rpc-magit-unload-function ()
   "Unload function for tramp-rpc-magit.
-Removes advices."
-  ;; Remove all advices.
+Removes handlers."
+  ;; Remove all handlers.
   (tramp-rpc-magit-disable)
   (tramp-rpc-projectile-disable)
   ;; Return nil to allow normal unload to proceed
