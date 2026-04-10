@@ -740,7 +740,7 @@ be available, and uses alien indexing for better performance."
   (interactive)
   (tramp-add-external-operation
    'projectile-get-ext-command
-   #'tramp-rpc-handle-get-ext-command 'tramp-rpc)
+   #'tramp-rpc-handle-projectile-get-ext-command 'tramp-rpc)
   (tramp-add-external-operation
    'projectile-dir-files
    #'projectile-dir-files-alien 'tramp-rpc)
