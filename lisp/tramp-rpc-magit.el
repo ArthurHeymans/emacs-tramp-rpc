@@ -624,34 +624,31 @@ Only uses the cache if FILENAME is under the prefetched directory."
 ;; Magit advice
 ;; ============================================================================
 
-(defun tramp-rpc-magit--advice-setup-buffer (orig-fun directory &rest args)
-  "Advice around `magit-status-setup-buffer' to prefetch data.
+(defun tramp-rpc-handle-magit-status-setup-buffer (&optional directory)
+  "Handler for `magit-status-setup-buffer' to prefetch data.
 Suppresses fs.changed notifications during refresh to prevent
 inotify events (from git commands touching .git/index etc.) from
 clearing caches mid-refresh."
-  (when (and (file-remote-p directory)
-             (tramp-rpc-file-name-p directory))
-    (tramp-rpc-magit--prefetch directory))
-  (let ((tramp-rpc--suppress-fs-notifications t))
+  (let ((directory (or directory default-directory))
+	(tramp-rpc--suppress-fs-notifications t))
+    (tramp-rpc-magit--prefetch directory)
     (unwind-protect
-        (apply orig-fun directory args)
+        (tramp-run-real-handler 'magit-status-setup-buffer (list directory))
       ;; Clear process-file cache - ancestors/prefetch-dir stay for other packages
       (tramp-rpc-magit--clear-status-cache)
       ;; Flush file caches since we suppressed fs.changed during the refresh
       (clrhash tramp-rpc--file-exists-cache)
       (clrhash tramp-rpc--file-truename-cache))))
 
-(defun tramp-rpc-magit--advice-refresh-buffer (orig-fun &rest args)
-  "Advice around `magit-status-refresh-buffer' to prefetch data.
+(defun tramp-rpc-handle-magit-status-refresh-buffer ()
+  "Handler for `magit-status-refresh-buffer' to prefetch data.
 Suppresses fs.changed notifications during refresh to prevent
 inotify events from clearing caches mid-refresh."
-  (when (and (file-remote-p default-directory)
-             (tramp-rpc-file-name-p default-directory)
-             (null (tramp-rpc-magit--get-process-cache)))
+  (when (null (tramp-rpc-magit--get-process-cache))
     (tramp-rpc-magit--prefetch default-directory))
   (let ((tramp-rpc--suppress-fs-notifications t))
     (unwind-protect
-        (apply orig-fun args)
+        (tramp-run-real-handler 'magit-status-refresh-buffer nil)
       ;; Clear process-file cache - ancestors/prefetch-dir stay for other packages
       (tramp-rpc-magit--clear-status-cache)
       ;; Flush file caches since we suppressed fs.changed during the refresh
@@ -664,20 +661,20 @@ inotify events from clearing caches mid-refresh."
 This uses parallel command prefetching to dramatically speed up
 magit-status on remote repositories."
   (interactive)
-  (advice-add 'magit-status-setup-buffer :around
-              #'tramp-rpc-magit--advice-setup-buffer)
-  (advice-add 'magit-status-refresh-buffer :around
-              #'tramp-rpc-magit--advice-refresh-buffer)
+  (tramp-add-external-operation
+   'magit-status-setup-buffer
+   #'tramp-rpc-handle-magit-status-setup-buffer 'tramp-rpc)
+  (tramp-add-external-operation
+   'magit-status-refresh-buffer
+   #'tramp-rpc-handle-magit-status-refresh-buffer 'tramp-rpc)
   (message "tramp-rpc magit optimizations enabled"))
 
 ;;;###autoload
 (defun tramp-rpc-magit-disable ()
   "Disable tramp-rpc magit optimizations."
   (interactive)
-  (advice-remove 'magit-status-setup-buffer
-                 #'tramp-rpc-magit--advice-setup-buffer)
-  (advice-remove 'magit-status-refresh-buffer
-                 #'tramp-rpc-magit--advice-refresh-buffer)
+  (tramp-remove-external-operation 'magit-status-setup-buffer 'tramp-rpc)
+  (tramp-remove-external-operation 'magit-status-refresh-buffer 'tramp-rpc)
   (tramp-rpc-magit--clear-cache)
   (message "tramp-rpc magit optimizations disabled"))
 
