@@ -780,8 +780,13 @@ This matches the behavior expected by `tramp-test28-process-file'."
       (should (string-match-p "ssh:" hop))
       (should-not (string-match-p "rpc:" hop)))))
 
-(ert-deftest tramp-rpc-mock-test-zz-file-name-with-sudo-rpc-via-rpc ()
-  "Test that RPC sudo elevation produces an rpc+sudo path."
+;; With PR #134, the rpc method is multi-hop capable, so the upstream
+;; `tramp-file-name-with-sudo' naturally produces the correct
+;; /rpc:user@host|sudo:root@host:/path path without any advice.
+(ert-deftest tramp-rpc-mock-test-zz-file-name-with-sudo-native ()
+  "Test that tramp-file-name-with-sudo works natively for rpc paths.
+No advice is needed — the multi-hop-capable rpc method means
+tramp-file-name-with-sudo produces /rpc:user@host|sudo:root@host:/path."
   :tags '(:multi-hop)
   (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
   (skip-unless (tramp-rpc-mock-test--sudo-helper-available-p))
@@ -791,29 +796,21 @@ This matches the behavior expected by `tramp-test28-process-file'."
          (hop (tramp-file-name-hop vec)))
     (should (tramp-tramp-file-p filename))
     (should (equal (tramp-file-name-localname vec) "/etc/hosts"))
-    ;; The hop should be an rpc hop (not ssh)
+    ;; The hop should be an rpc hop — upstream tramp-file-name-with-sudo
+    ;; preserves the original method via tramp-make-tramp-hop-name
     (should hop)
     (should (string-match-p "rpc:" hop))
     ;; The final method should be sudo
     (should (string= (tramp-file-name-method vec) "sudo"))
     ;; The host should be preserved
+    (should (string= (tramp-file-name-host vec) "target")))
+  ;; Also verify that non-rpc paths still work correctly (no advice needed)
+  (let* ((tramp-file-name-with-method "sudo")
+         (filename (tramp-file-name-with-sudo "/ssh:user@target:/etc/hosts"))
+         (vec (tramp-dissect-file-name filename)))
+    (should (tramp-tramp-file-p filename))
+    (should (string= (tramp-file-name-method vec) "sudo"))
     (should (string= (tramp-file-name-host vec) "target"))))
-
-(ert-deftest tramp-rpc-mock-test-zz-file-name-with-sudo-non-rpc-passthrough ()
-  "Test that non-RPC sudo elevation still calls the original function."
-  :tags '(:multi-hop)
-  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
-  (skip-unless (tramp-rpc-mock-test--sudo-helper-available-p))
-  (let ((called-with nil)
-        (filename "/ssh:user@target:/etc/hosts"))
-    (should
-     (eq (tramp-rpc--file-name-with-sudo-advice
-          (lambda (arg)
-            (setq called-with arg)
-            'passthrough)
-          filename)
-         'passthrough))
-    (should (equal called-with (expand-file-name filename)))))
 
 (ert-deftest tramp-rpc-mock-test-rpc-method-advertises-host-arg ()
   "Test that the rpc method declares %%h in tramp-login-args.
