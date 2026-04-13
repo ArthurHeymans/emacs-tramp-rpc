@@ -194,7 +194,7 @@
        ;; Not a tramp-rpc process
        (t (funcall orig-fun process))))))
 
-(defun tramp-rpc-handle-signal-process (process sigcode &optional remote)
+(defun tramp-rpc-handle-signal-process (process sigcode &optional _remote)
   "Handler for `signal-process' of TRAMP-RPC processes.
 It will be added to `signal-process-functions'."
   (when-let* ((pid (and (processp process)
@@ -210,7 +210,7 @@ It will be added to `signal-process-functions'."
           0) ; Return 0 for success
       (error
        (message "tramp-rpc: Error signaling process: %s" err)
-       -1)))
+       -1))))
 
 ;; ============================================================================
 ;; Process metadata advice
