@@ -194,23 +194,23 @@
        ;; Not a tramp-rpc process
        (t (funcall orig-fun process))))))
 
-(defun tramp-rpc--signal-process-advice (orig-fun process sigcode &optional remote)
-  "Advice for `signal-process' to handle TRAMP-RPC processes."
-  (if-let* ((pid (and (processp process)
-                     (process-get process :tramp-rpc-pid)))
-           (vec (process-get process :tramp-rpc-vec)))
-      (condition-case err
-          (progn
-            ;; Use PTY kill for PTY processes, regular kill for pipe processes
-            (if (process-get process :tramp-rpc-pty)
-                (tramp-rpc--call vec "process.kill_pty"
-                                 `((pid . ,pid) (signal . ,sigcode)))
-              (tramp-rpc--kill-remote-process vec pid sigcode))
-            0) ; Return 0 for success
-        (error
-         (message "tramp-rpc: Error signaling process: %s" err)
-         -1))
-    (funcall orig-fun process sigcode remote)))
+(defun tramp-rpc-handle-signal-process (process sigcode &optional remote)
+  "Handler for `signal-process' of TRAMP-RPC processes.
+It will be added to `signal-process-functions'."
+  (when-let* ((pid (and (processp process)
+			(process-get process :tramp-rpc-pid)))
+	      (vec (process-get process :tramp-rpc-vec)))
+    (condition-case err
+        (progn
+          ;; Use PTY kill for PTY processes, regular kill for pipe processes
+          (if (process-get process :tramp-rpc-pty)
+              (tramp-rpc--call vec "process.kill_pty"
+                               `((pid . ,pid) (signal . ,sigcode)))
+            (tramp-rpc--kill-remote-process vec pid sigcode))
+          0) ; Return 0 for success
+      (error
+       (message "tramp-rpc: Error signaling process: %s" err)
+       -1)))
 
 ;; ============================================================================
 ;; Process metadata advice
@@ -425,7 +425,9 @@ so that .dir-locals.el files are detected and loaded normally."
   (advice-add 'process-send-string :around #'tramp-rpc--process-send-string-advice)
   (advice-add 'process-send-region :around #'tramp-rpc--process-send-region-advice)
   (advice-add 'process-send-eof :around #'tramp-rpc--process-send-eof-advice)
-  (advice-add 'signal-process :around #'tramp-rpc--signal-process-advice)
+  ;; This must be before `tramp-signal-process'.  Since tramp.el is
+  ;; required, this is guaranteed.
+  (add-hook 'signal-process-functions #'tramp-rpc-handle-signal-process)
   (advice-add 'process-status :around #'tramp-rpc--process-status-advice)
   (advice-add 'process-exit-status :around #'tramp-rpc--process-exit-status-advice)
   (advice-add 'process-command :around #'tramp-rpc--process-command-advice)
@@ -449,7 +451,7 @@ so that .dir-locals.el files are detected and loaded normally."
   (advice-remove 'process-send-string #'tramp-rpc--process-send-string-advice)
   (advice-remove 'process-send-region #'tramp-rpc--process-send-region-advice)
   (advice-remove 'process-send-eof #'tramp-rpc--process-send-eof-advice)
-  (advice-remove 'signal-process #'tramp-rpc--signal-process-advice)
+  (remove-hook 'signal-process-functions #'tramp-rpc-handle-signal-process)
   (advice-remove 'process-status #'tramp-rpc--process-status-advice)
   (advice-remove 'process-exit-status #'tramp-rpc--process-exit-status-advice)
   (advice-remove 'process-command #'tramp-rpc--process-command-advice)
