@@ -1252,10 +1252,118 @@ This matches the upstream `tramp-test28-process-file' test."
       (ignore-errors (delete-file file)))))
 
 ;;; ============================================================================
-;;; Test 18: Empty File Handling
+;;; Test 18: make-process :stderr contract (lsp-mode compatibility)
 ;;; ============================================================================
 
-(ert-deftest tramp-rpc-test18-empty-file ()
+(ert-deftest tramp-rpc-test18-make-process-stderr-buffer-has-process ()
+  "Test that make-process with :stderr creates a process on the stderr buffer.
+Native `make-process' with `:stderr BUFFER' creates a pipe process
+associated with that buffer, so `(get-buffer-process BUFFER)' returns
+a process object.  lsp-mode relies on this contract:
+
+  (set-process-query-on-exit-flag (get-buffer-process stderr-buf) nil)
+
+Without a stderr relay process, `get-buffer-process' returns nil and
+`set-process-query-on-exit-flag' signals `wrong-type-argument processp nil'.
+This is the root cause of the lsp-mode crash reported with tramp-rpc."
+  :tags '(:process :expensive-test)
+  (skip-unless (tramp-rpc-test-enabled))
+
+  (let* ((default-directory (tramp-rpc-test--remote-directory))
+         (stderr-buf (generate-new-buffer "*test-stderr*"))
+         (proc (make-process
+                :name "test-stderr-relay"
+                :command '("sh" "-c" "echo stdout-msg; echo stderr-msg >&2")
+                :connection-type 'pipe
+                :buffer (generate-new-buffer "*test-stdout*")
+                :stderr stderr-buf
+                :noquery t
+                :file-handler t)))
+    (unwind-protect
+        (progn
+          ;; KEY ASSERTION: get-buffer-process must return non-nil,
+          ;; exactly matching native make-process contract
+          (should (get-buffer-process stderr-buf))
+          ;; This is the exact call lsp-mode makes that crashed:
+          (should (progn
+                    (set-process-query-on-exit-flag
+                     (get-buffer-process stderr-buf) nil)
+                    t))
+          ;; Wait for the command to finish
+          (with-timeout (10 (error "Process timeout"))
+            (while (process-live-p proc)
+              (accept-process-output proc 0.1)))
+          ;; Verify stderr output was delivered to the stderr buffer
+          (with-timeout (2 nil)
+            (while (= 0 (buffer-size stderr-buf))
+              (accept-process-output nil 0.1)))
+          (with-current-buffer stderr-buf
+            (should (string-match-p "stderr-msg" (buffer-string)))))
+      (ignore-errors (delete-process proc))
+      (ignore-errors (kill-buffer (process-buffer proc)))
+      (ignore-errors
+        (when-let* ((stderr-proc (get-buffer-process stderr-buf)))
+          (delete-process stderr-proc)))
+      (ignore-errors (kill-buffer stderr-buf)))))
+
+(ert-deftest tramp-rpc-test18-make-process-stderr-string ()
+  "Test that make-process with :stderr as a string also works."
+  :tags '(:process :expensive-test)
+  (skip-unless (tramp-rpc-test-enabled))
+
+  (let* ((default-directory (tramp-rpc-test--remote-directory))
+         (stderr-name "*test-stderr-string*")
+         (proc (make-process
+                :name "test-stderr-string"
+                :command '("sh" "-c" "echo stderr-out >&2; exit 0")
+                :connection-type 'pipe
+                :stderr stderr-name
+                :noquery t
+                :file-handler t)))
+    (unwind-protect
+        (progn
+          ;; Buffer should have been created
+          (should (get-buffer stderr-name))
+          ;; And should have a process
+          (should (get-buffer-process (get-buffer stderr-name)))
+          ;; Wait for completion
+          (with-timeout (10 (error "Process timeout"))
+            (while (process-live-p proc)
+              (accept-process-output proc 0.1))))
+      (ignore-errors (delete-process proc))
+      (ignore-errors
+        (when-let* ((buf (get-buffer stderr-name)))
+          (when-let* ((p (get-buffer-process buf)))
+            (delete-process p))
+          (kill-buffer buf))))))
+
+(ert-deftest tramp-rpc-test18-make-process-no-stderr ()
+  "Test that make-process without :stderr still works (no regression)."
+  :tags '(:process :expensive-test)
+  (skip-unless (tramp-rpc-test-enabled))
+
+  (let* ((default-directory (tramp-rpc-test--remote-directory))
+         (output "")
+         (proc (make-process
+                :name "test-no-stderr"
+                :command '("echo" "hello")
+                :connection-type 'pipe
+                :filter (lambda (_proc str) (setq output (concat output str)))
+                :noquery t
+                :file-handler t)))
+    (unwind-protect
+        (progn
+          (with-timeout (10 (error "Process timeout"))
+            (while (process-live-p proc)
+              (accept-process-output proc 0.1)))
+          (should (string-match-p "hello" output)))
+      (ignore-errors (delete-process proc)))))
+
+;;; ============================================================================
+;;; Test 19: Empty File Handling
+;;; ============================================================================
+
+(ert-deftest tramp-rpc-test19-empty-file ()
   "Test handling of empty files."
   (skip-unless (tramp-rpc-test-enabled))
 
