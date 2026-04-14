@@ -825,7 +825,9 @@ hop so the socket is shared with the normal rpc connection."
     ;; %C = hash of %l%h%p%r (we approximate this)
     (setq path (replace-regexp-in-string "%h" host path t t))
     (setq path (replace-regexp-in-string "%r" user path t t))
-    (setq path (replace-regexp-in-string "%p" (number-to-string port) path t t))
+    (setq path (replace-regexp-in-string "%p" (if (numberp port)
+                                                  (number-to-string port) port)
+                                         path t t))
     ;; For %C, use a simple hash approximation
     ;; Include the hop chain so different multi-hop routes get different sockets
     (setq path (replace-regexp-in-string
@@ -848,7 +850,8 @@ hop so the socket is shared with the normal rpc connection."
          (zerop (apply #'call-process "ssh" nil nil nil
                        (append
                         (when user (list "-l" user))
-                        (when port (list "-p" (number-to-string port)))
+                        (when port (list "-p" (if (numberp port)
+                                                  (number-to-string port) port)))
                         (when proxyjump (list "-J" proxyjump))
                         (list "-o" (format "ControlPath=%s" socket-path)
                               "-O" "check"
@@ -877,7 +880,9 @@ Returns non-nil on success."
                     (list "ssh")
                     tramp-rpc-ssh-args
                     (when user (list "-l" user))
-                    (when port (list "-p" (number-to-string port)))
+                    (when port (list "-p"
+                                     (if (numberp port)
+                                         (number-to-string port) port)))
                     ;; Multi-hop via ProxyJump
                     (when proxyjump (list "-J" proxyjump))
                     ;; NO BatchMode - allow password prompts
@@ -932,7 +937,8 @@ caching for free."
                     (list "ssh")
                     tramp-rpc-ssh-args
                     (when ssh-user (list "-l" ssh-user))
-                    (when port (list "-p" (number-to-string port)))
+                    (when port (list "-p" (if (numberp port)
+                                              (number-to-string port) port)))
                     ;; Multi-hop via ProxyJump
                     (when proxyjump (list "-J" proxyjump))
                     ;; Reuse ControlMaster for the SSH layer
@@ -980,7 +986,8 @@ Returns the connection plist.  Signals `remote-file-error' on failure."
                     ;; Raw SSH arguments (e.g., -v, -F config)
                     tramp-rpc-ssh-args
                     (when user (list "-l" user))
-                    (when port (list "-p" (number-to-string port)))
+                    (when port (list "-p" (if (numberp port)
+                                              (number-to-string port) port)))
                     ;; Multi-hop via ProxyJump
                     (when proxyjump (list "-J" proxyjump))
                     ;; Only use BatchMode=yes when ControlMaster handles auth;
@@ -1179,7 +1186,8 @@ socket, then kills the auth process and buffer."
           (apply #'call-process "ssh" nil nil nil
                  (append
                   (when user (list "-l" user))
-                  (when port (list "-p" (number-to-string port)))
+                  (when port (list "-p" (if (numberp port)
+                                            (number-to-string port) port)))
                   (when proxyjump (list "-J" proxyjump))
                   (list "-o" (format "ControlPath=%s" socket-path)
                         "-O" "exit" host)))))
