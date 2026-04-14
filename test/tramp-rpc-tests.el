@@ -394,7 +394,7 @@ The directory is deleted after BODY completes."
   ;; Test directory
   ;; Measure on a fresh path to avoid cache hits.
   (let ((missing (tramp-rpc-test--make-temp-name)))
-    (should-not (tramp-rpc-test--with-call-count 2
+    (should-not (tramp-rpc-test--with-call-count 1
                   (file-directory-p missing))))
 
   ;; Test file
@@ -731,7 +731,7 @@ signal `file-already-exists'.  With trailing slash (via
   (let ((file (tramp-rpc-test--make-temp-name)))
     (write-region "to be deleted" nil file)
     (should (file-exists-p file))
-    (tramp-rpc-test--with-call-count 3
+    (tramp-rpc-test--with-call-count 2
       (delete-file file))
     (should-not (file-exists-p file))))
 
@@ -828,7 +828,7 @@ This exercises copy-then-delete for cross-remote renames."
   (let ((dir (concat (tramp-rpc-test--make-temp-name) "/nested/path")))
     (unwind-protect
         (progn
-          (tramp-rpc-test--with-call-count 11
+          (tramp-rpc-test--with-call-count 9
             (make-directory dir t))
           (should (file-directory-p dir)))
       (ignore-errors (delete-directory
@@ -868,7 +868,7 @@ This exercises copy-then-delete for cross-remote renames."
     (write-region "b" nil (concat dir "/file2.txt"))
     (write-region "c" nil (concat dir "/other.log"))
 
-    (let ((files (tramp-rpc-test--with-call-count 3
+    (let ((files (tramp-rpc-test--with-call-count 2
                   (directory-files dir))))
       ;; Should contain . and .. plus our files
       (should (member "." files))
@@ -1172,7 +1172,7 @@ This matches the upstream `tramp-test28-process-file' test."
     (write-region "" nil (concat dir "/file-aab.txt"))
     (write-region "" nil (concat dir "/other.txt"))
 
-    (let ((completions (tramp-rpc-test--with-call-count 3
+    (let ((completions (tramp-rpc-test--with-call-count 2
                          (file-name-all-completions "file-" dir))))
       (should (member "file-aaa.txt" completions))
       (should (member "file-aab.txt" completions))
@@ -1187,7 +1187,7 @@ This matches the upstream `tramp-test28-process-file' test."
           (link-dir (concat dir "/link-dir")))
       (make-directory real-dir t)
       (make-symbolic-link "real-dir" link-dir)
-      (let ((completions (tramp-rpc-test--with-call-count 3
+      (let ((completions (tramp-rpc-test--with-call-count 2
                            (file-name-all-completions "" dir))))
         (should (member "real-dir/" completions))
         (should (member "link-dir/" completions))))))

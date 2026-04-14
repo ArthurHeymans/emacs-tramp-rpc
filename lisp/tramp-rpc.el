@@ -1732,6 +1732,18 @@ path unchanged (after resolving any symlinks in parent directories)."
         (when result
           (tramp-rpc--convert-file-attributes result id-format))))))
 
+(defun tramp-rpc-handle-file-directory-p (filename)
+  "Like `file-directory-p' for TRAMP-RPC files.
+Uses a single `file.stat' call instead of the generic TRAMP path
+which resolves truename and then stats."
+  (or
+   ;; Preserve TRAMP's completion-time fast path semantics.
+   (tramp-string-empty-or-nil-p (tramp-file-local-name filename))
+   (string-equal (tramp-file-local-name filename) "/")
+   (with-parsed-tramp-file-name (expand-file-name filename) nil
+     (let ((stat (tramp-rpc--call-file-stat v localname)))
+       (and stat (equal (alist-get 'type stat) "directory"))))))
+
 (defun tramp-rpc--convert-file-attributes (stat id-format)
   "Convert STAT result to Emacs file-attributes format.
 ID-FORMAT specifies whether to use numeric or string IDs."
@@ -2975,7 +2987,7 @@ Also controls process exit detection latency."
     (file-readable-p . tramp-handle-file-readable-p)
     (file-writable-p . tramp-handle-file-writable-p)
     (file-executable-p . tramp-rpc-handle-file-executable-p)
-    (file-directory-p . tramp-handle-file-directory-p)
+    (file-directory-p . tramp-rpc-handle-file-directory-p)
     (file-regular-p . tramp-handle-file-regular-p)
     (file-symlink-p . tramp-handle-file-symlink-p)
     (file-truename . tramp-rpc-handle-file-truename)
