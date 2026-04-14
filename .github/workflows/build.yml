@@ -41,10 +41,12 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Install Nix
-        uses: cachix/install-nix-action@v20
+      - name: Restore binary from cache
+        id: cache-binary
+        uses: actions/cache/restore@v4
         with:
-          nix_path: nixpkgs=channel:nixos-unstable
+          path: target/${{ inputs.target }}/release/tramp-rpc-server
+          key: rust-binary-${{ inputs.target }}-${{ hashFiles('server/**', 'Cargo.toml', 'Cargo.lock', 'flake.nix', 'flake.lock', '.cargo/**') }}
 
       - name: Determine version
         id: version
@@ -59,7 +61,14 @@ jobs:
             echo "version=ci" >> $GITHUB_OUTPUT
           fi
 
+      - name: Install Nix
+        if: steps.cache-binary.outputs.cache-hit != 'true'
+        uses: cachix/install-nix-action@v20
+        with:
+          nix_path: nixpkgs=channel:nixos-unstable
+
       - name: Build
+        if: steps.cache-binary.outputs.cache-hit != 'true'
         run: |
           nix develop --command bash -c '
           RUSTFLAGS="-D warnings -C target-feature=+crt-static -Zlocation-detail=none -Zunstable-options -Cpanic=immediate-abort" \
@@ -72,10 +81,17 @@ jobs:
           STATIC: ${{ inputs.static }}
 
       - name: Test
-        if: inputs.test
+        if: ${{ inputs.test && steps.cache-binary.outputs.cache-hit != 'true' }}
         run: nix develop --command cargo test --manifest-path server/Cargo.toml
         env:
           RUSTFLAGS: "-D warnings"
+
+      - name: Save binary to cache
+        if: steps.cache-binary.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: target/${{ inputs.target }}/release/tramp-rpc-server
+          key: rust-binary-${{ inputs.target }}-${{ hashFiles('server/**', 'Cargo.toml', 'Cargo.lock', 'flake.nix', 'flake.lock', '.cargo/**') }}
 
       - name: Upload binary for CI
         if: ${{ !inputs.upload }}

@@ -102,6 +102,17 @@
     (when-let* ((vec (tramp-ensure-dissected-file-name vec-or-filename)))
       (string= (tramp-file-name-method vec) tramp-rpc-method)))
 
+  ;; Detect privilege elevation paths with rpc hops, e.g.
+  ;; /rpc:user@host|sudo:root@host:/path.  These are handled by the
+  ;; tramp-rpc handler which starts the RPC server via sudo.
+  (defsubst tramp-rpc--sudo-file-name-p (vec-or-filename)
+    "Check if VEC-OR-FILENAME is a privilege elevation with an rpc hop."
+    (when-let* ((vec (tramp-ensure-dissected-file-name vec-or-filename))
+                (hop (tramp-file-name-hop vec)))
+      (and (string-match-p "rpc:" hop)
+           (member (tramp-file-name-method vec)
+                   '("sudo" "su" "doas" "sg" "run0" "ksu")))))
+
   ;; Register the foreign handler directly in the alist.  We cannot use
   ;; `tramp-register-foreign-file-name-handler' here because it tries to
   ;; read `tramp-rpc-file-name-handler-alist' (defined in the full file),
@@ -109,6 +120,9 @@
   ;; stub that triggers loading of tramp-rpc.el on first use.
   (add-to-list 'tramp-foreign-file-name-handler-alist
                '(tramp-rpc-file-name-p . tramp-rpc-file-name-handler))
+  ;; sudo+rpc handler must be checked, maps to the same handler.
+  (add-to-list 'tramp-foreign-file-name-handler-alist
+               '(tramp-rpc--sudo-file-name-p . tramp-rpc-file-name-handler))
 
   ;; Configure user and host name completion.
   (tramp-set-completion-function "rpc" tramp-completion-function-alist-ssh)
@@ -118,8 +132,13 @@
   ;; which would cause `tramp-dissect-file-name' to reject filenames like
   ;; /rpc:hop|rpc:target:/path.  We advise it to also accept "rpc".
   (defun tramp-rpc--multi-hop-advice (orig-fun vec)
-    "Allow the rpc method in multi-hop chains."
+    "Allow the rpc method and rpc+sudo paths in multi-hop chains."
     (or (string= (tramp-file-name-method vec) tramp-rpc-method)
+        ;; Also allow privilege elevation methods when the hop contains rpc
+        (when-let* ((hop (tramp-file-name-hop vec)))
+          (and (string-match-p "rpc:" hop)
+               (member (tramp-file-name-method vec)
+                       '("sudo" "su" "doas" "sg" "run0" "ksu"))))
         (funcall orig-fun vec)))
   (advice-add 'tramp-multi-hop-p :around #'tramp-rpc--multi-hop-advice)))
 
@@ -129,13 +148,71 @@
 (require 'tramp-sh)
 (require 'tramp-rpc-protocol)
 
-;; Silence byte-compiler warning for function defined in with-eval-after-load
-(declare-function tramp-rpc--multi-hop-advice "tramp-rpc")
-;; From tramp-rpc-advice.el (loaded at runtime)
+;; Give the rpc method all ssh connection parameters so it can serve
+;; as a hop in tramp-sh multi-hop chains (e.g.
+;; /rpc:host|sudo:root@host:/path).  For single-hop rpc, the foreign
+;; handler takes over and these parameters are never used.  This is
+;; future-proof: if ssh's parameters change in future TRAMP versions,
+;; rpc automatically inherits the updates.
+;; Suggested by Michael Albinus.
+(when-let* ((ssh-params (alist-get "ssh" tramp-methods nil nil #'equal))
+            (rpc-entry (assoc tramp-rpc-method tramp-methods)))
+  (setcdr rpc-entry ssh-params))
+
+;; Silence byte-compiler warnings for functions defined in with-eval-after-load
 (declare-function tramp-rpc-advice-remove "tramp-rpc-advice")
-;; Tramp 2.8+ APIs used for external operation registration.
 (declare-function tramp-add-external-operation "tramp")
 (declare-function tramp-remove-external-operation "tramp")
+(declare-function tramp-rpc--multi-hop-advice "tramp-rpc")
+(declare-function tramp-rpc--sudo-file-name-p "tramp-rpc")
+
+;; ============================================================================
+;; Sudo-via-RPC: detect privilege elevation from hop chains
+;; ============================================================================
+
+(defun tramp-rpc--detect-sudo-elevation (vec)
+  "Return the SSH user if VEC needs sudo elevation via RPC, or nil.
+Detects when the hop chain has an rpc hop to the same host as the
+target but with a different user, indicating privilege elevation.
+For /rpc:user@host|sudo:root@host:/path, returns \"user\"."
+  (when-let* ((hop (tramp-file-name-hop vec))
+              (target-host (tramp-file-name-host vec)))
+    (let ((hops (split-string hop tramp-postfix-hop-regexp 'omit))
+          result)
+      ;; Walk hops in reverse (closest to target first) looking for
+      ;; an rpc hop to the same host.
+      (dolist (hop-str (reverse hops))
+        (unless result
+          (let* ((hop-name (concat tramp-prefix-format hop-str
+                                   tramp-postfix-host-format))
+                 (hop-vec (tramp-dissect-file-name hop-name 'nodefault)))
+            (when (and (string= (tramp-file-name-method hop-vec) "rpc")
+                       (string= (tramp-file-name-host hop-vec) target-host))
+              (setq result (or (tramp-file-name-user hop-vec)
+                               (user-login-name)))))))
+      result)))
+
+(defun tramp-rpc--proxy-hop-string (vec)
+  "Return VEC's hop string with same-host sudo hops removed.
+For /rpc:gw|rpc:user@host|sudo:root@host:/path, returns \"rpc:gw|\".
+Returns nil if no proxy hops remain."
+  (when-let* ((hop (tramp-file-name-hop vec))
+              (target-host (tramp-file-name-host vec)))
+    (let ((hops (split-string hop tramp-postfix-hop-regexp 'omit))
+          proxy-hops)
+      (dolist (hop-str hops)
+        (let* ((hop-name (concat tramp-prefix-format hop-str
+                                 tramp-postfix-host-format))
+               (hop-vec (tramp-dissect-file-name hop-name 'nodefault)))
+          ;; Keep hops that are genuine proxies (different host)
+          (unless (and (string= (tramp-file-name-method hop-vec) "rpc")
+                       (string= (tramp-file-name-host hop-vec) target-host))
+            (push hop-str proxy-hops))))
+      (when proxy-hops
+        (concat (mapconcat #'identity (nreverse proxy-hops)
+                           tramp-postfix-hop-format)
+                tramp-postfix-hop-format)))))
+
 (require 'tramp-rpc-deploy)
 
 ;; Silence byte-compiler warnings for functions defined elsewhere
@@ -373,8 +450,13 @@ Set to 0 to disable caching (not recommended)."
   :group 'tramp-rpc)
 
 (defun tramp-rpc--direnv-cache-key (vec directory)
-  "Generate cache key for direnv environment on VEC in DIRECTORY."
-  (cons (tramp-rpc--connection-key vec) directory))
+  "Generate cache key for direnv environment on VEC in DIRECTORY.
+Normalizes DIRECTORY via `expand-file-name' so that ~ and the expanded
+home path map to the same cache key."
+  (cons (tramp-rpc--connection-key vec)
+        (tramp-file-local-name
+         (expand-file-name
+          (tramp-make-tramp-file-name vec directory)))))
 
 (defun tramp-rpc--get-direnv-environment (vec directory)
   "Get direnv environment for DIRECTORY on VEC.
@@ -643,10 +725,54 @@ Creates the directory from `tramp-rpc-controlmaster-path' if needed."
         ;; Set restrictive permissions for security
         (set-file-modes dir #o700)))))
 
-(defvar tramp-rpc--password-prompt-regexp
-  (rx (or "password:" "Password:" "Password for" "passphrase"
-          (seq "Enter passphrase for")))
-  "Regexp matching SSH password/passphrase prompts.")
+;;; ============================================================================
+;;; Authentication via tramp-process-actions
+;;; ============================================================================
+
+;; Reuse upstream TRAMP's `tramp-process-actions' state machine for all
+;; interactive authentication (SSH passwords, sudo, host-key prompts,
+;; OTP, security keys).  This gives us auth-source integration, password
+;; caching, wrong-password detection, and locale-aware prompt matching
+;; for free, instead of reimplementing with a custom regexp + loop.
+
+(defvar tramp-rpc--controlmaster-socket-path nil
+  "Dynamically bound socket path during ControlMaster establishment.
+Used by `tramp-rpc--action-controlmaster-established'.")
+
+(defun tramp-rpc--action-controlmaster-established (proc _vec)
+  "Succeed when the ControlMaster socket file appears, fail on process death.
+The target socket path is read from the dynamic variable
+`tramp-rpc--controlmaster-socket-path'."
+  (cond
+   ((file-exists-p tramp-rpc--controlmaster-socket-path)
+    (throw 'tramp-action 'ok))
+   ((not (process-live-p proc))
+    (while (tramp-accept-process-output proc))
+    (throw 'tramp-action 'process-died))))
+
+(defconst tramp-rpc--controlmaster-actions
+  '((tramp-password-prompt-regexp tramp-action-password)
+    (tramp-wrong-passwd-regexp tramp-action-permission-denied)
+    (tramp-yesno-prompt-regexp tramp-action-yesno)
+    (tramp-yn-prompt-regexp tramp-action-yn)
+    (tramp-process-alive-regexp tramp-rpc--action-controlmaster-established))
+  "Actions for SSH ControlMaster establishment.
+Handles password prompts, host-key verification, and detects the
+ControlMaster socket file appearing as the success condition.")
+
+(defun tramp-rpc--action-sudo-complete (proc _vec)
+  "Succeed when `sudo -v' exits with code 0, fail otherwise."
+  (unless (process-live-p proc)
+    (while (tramp-accept-process-output proc))
+    (throw 'tramp-action
+           (if (zerop (process-exit-status proc)) 'ok 'permission-denied))))
+
+(defconst tramp-rpc--sudo-actions
+  '((tramp-password-prompt-regexp tramp-action-password)
+    (tramp-wrong-passwd-regexp tramp-action-permission-denied)
+    (tramp-process-alive-regexp tramp-rpc--action-sudo-complete))
+  "Actions for `sudo -v' pre-authentication.
+Handles password prompts and detects sudo exit as success.")
 
 ;;; ============================================================================
 ;;; Multi-hop support
@@ -658,29 +784,44 @@ Parses the TRAMP hop field (e.g. \"rpc:user@gateway|\") and converts
 each hop to the SSH ProxyJump format (e.g. \"user@gateway\").
 Returns nil if there are no hops.
 
-Supports mixed methods: both \"rpc:\" and \"ssh:\" hops are accepted
-since ProxyJump only needs host connectivity."
-  (when-let* ((hops (tramp-file-name-hop vec)))
-    (mapconcat
-     (lambda (hop-str)
-       (let* ((hop-name (concat tramp-prefix-format hop-str
-                                tramp-postfix-host-format))
-              (hop-vec (tramp-dissect-file-name hop-name 'nodefault)))
-         (concat
-          (when (tramp-file-name-user hop-vec)
-            (concat (tramp-file-name-user hop-vec) "@"))
-          (tramp-file-name-host hop-vec)
-          (when-let* ((port (tramp-file-name-port hop-vec)))
-            (concat ":" (if (numberp port) (number-to-string port) port))))))
-     (split-string hops tramp-postfix-hop-regexp 'omit)
-     ",")))
+Same-host rpc hops are skipped because they represent sudo elevation,
+not proxy jumps.  Supports mixed methods: both \"rpc:\" and \"ssh:\"
+hops are accepted since ProxyJump only needs host connectivity."
+  (when-let* ((hops (tramp-file-name-hop vec))
+              (target-host (tramp-file-name-host vec)))
+    (let (proxy-parts)
+      (dolist (hop-str (split-string hops tramp-postfix-hop-regexp 'omit))
+        (let* ((hop-name (concat tramp-prefix-format hop-str
+                                 tramp-postfix-host-format))
+               (hop-vec (tramp-dissect-file-name hop-name 'nodefault))
+               (hop-host (tramp-file-name-host hop-vec)))
+          ;; Skip same-host rpc hops (sudo elevation, not proxy)
+          (unless (and (string= (tramp-file-name-method hop-vec) "rpc")
+                       (string= hop-host target-host))
+            (push (concat
+                   (when (tramp-file-name-user hop-vec)
+                     (concat (tramp-file-name-user hop-vec) "@"))
+                   hop-host
+                   (when-let* ((port (tramp-file-name-port hop-vec)))
+                     (concat ":" (if (numberp port)
+                                     (number-to-string port) port))))
+                  proxy-parts))))
+      (when proxy-parts
+        (mapconcat #'identity (nreverse proxy-parts) ",")))))
 
 (defun tramp-rpc--controlmaster-socket-path (vec)
   "Return the ControlMaster socket path for VEC.
-Expands SSH escape sequences in `tramp-rpc-controlmaster-path'."
-  (let* ((host (tramp-file-name-host vec))
-         (user (or (tramp-file-name-user vec) (user-login-name)))
+Expands SSH escape sequences in `tramp-rpc-controlmaster-path'.
+For sudo-via-RPC paths, uses the SSH user and excludes the sudo
+hop so the socket is shared with the normal rpc connection."
+  (let* ((sudo-ssh-user (tramp-rpc--detect-sudo-elevation vec))
+         (host (tramp-file-name-host vec))
+         (user (or sudo-ssh-user (tramp-file-name-user vec) (user-login-name)))
          (port (or (tramp-file-name-port vec) 22))
+         ;; For sudo, use only proxy hops (exclude the same-host sudo hop)
+         (hop (if sudo-ssh-user
+                  (tramp-rpc--proxy-hop-string vec)
+                (tramp-file-name-hop vec)))
          (path tramp-rpc-controlmaster-path))
     ;; Expand common SSH escape sequences
     ;; %h = host, %r = remote user, %p = port
@@ -693,17 +834,18 @@ Expands SSH escape sequences in `tramp-rpc-controlmaster-path'."
     (setq path (replace-regexp-in-string
                 "%C"
                 (md5 (format "%s%s%s%s%s" (system-name) host port user
-                             (or (tramp-file-name-hop vec) "")))
+                             (or hop "")))
                 path t t))
     (expand-file-name path)))
 
 (defun tramp-rpc--controlmaster-active-p (vec)
   "Return non-nil if a ControlMaster connection is active for VEC."
-  (let ((socket-path (tramp-rpc--controlmaster-socket-path vec))
-        (host (tramp-file-name-host vec))
-        (user (tramp-file-name-user vec))
-        (port (tramp-file-name-port vec))
-        (proxyjump (tramp-rpc--hops-to-proxyjump vec)))
+  (let* ((sudo-ssh-user (tramp-rpc--detect-sudo-elevation vec))
+         (socket-path (tramp-rpc--controlmaster-socket-path vec))
+         (host (tramp-file-name-host vec))
+         (user (or sudo-ssh-user (tramp-file-name-user vec)))
+         (port (tramp-file-name-port vec))
+         (proxyjump (tramp-rpc--hops-to-proxyjump vec)))
     (and (file-exists-p socket-path)
          ;; Check if the socket is actually usable via ssh -O check
          (zerop (apply #'call-process "ssh" nil nil nil
@@ -726,8 +868,9 @@ Returns non-nil on success."
     (tramp-rpc--debug "ControlMaster already active for %s" (tramp-file-name-host vec))
     (cl-return-from tramp-rpc--establish-controlmaster t))
   (tramp-rpc--ensure-controlmaster-directory)
-  (let* ((host (tramp-file-name-host vec))
-         (user (tramp-file-name-user vec))
+  (let* ((sudo-ssh-user (tramp-rpc--detect-sudo-elevation vec))
+         (host (tramp-file-name-host vec))
+         (user (or sudo-ssh-user (tramp-file-name-user vec)))
          (port (tramp-file-name-port vec))
          (proxyjump (tramp-rpc--hops-to-proxyjump vec))
          (socket-path (tramp-rpc--controlmaster-socket-path vec))
@@ -756,46 +899,82 @@ Returns non-nil on success."
     (let ((process-connection-type t))  ; Use PTY for password prompts
       (setq process (apply #'start-process process-name buffer ssh-args)))
     (set-process-query-on-exit-flag process nil)
-    ;; Handle password prompts and wait for connection
-    (let ((start-time (current-time))
-          (timeout 60))  ; 60 second timeout for authentication
-      (while (and (process-live-p process)
-                  (not (file-exists-p socket-path))
-                  (< (float-time (time-subtract (current-time) start-time)) timeout))
-        (with-tramp-suspended-timers
-          (accept-process-output process 0.1))
-        (with-current-buffer buffer
-          (goto-char (point-min))
-          (when (re-search-forward tramp-rpc--password-prompt-regexp nil t)
-            ;; Password prompt detected - ask user
-            (let ((password (read-passwd
-                             (format "Password for %s@%s: "
-                                     (or user (user-login-name)) host))))
-              (when password
-                (process-send-string process (concat password "\n"))
-                ;; Clear the buffer to avoid re-matching the same prompt
-                (erase-buffer)))))))
-    ;; Check if authentication succeeded (socket was created)
-    (if (file-exists-p socket-path)
-        (progn
-          ;; Give it a moment to stabilize
-          (sleep-for 0.1)
-          t)
-      ;; Authentication failed
-      (when (process-live-p process)
-        (delete-process process))
-      (let ((output (with-current-buffer buffer (buffer-string))))
-        (signal
-	 'remote-file-error
-	 (list (format
-		"Failed to establish SSH connection to %s: %s" host output)))))))
+    (set-process-sentinel process #'ignore)
+    ;; Set up process properties for tramp-process-actions / tramp-read-passwd.
+    ;; pw-vector tells auth-source where to look up credentials.
+    (process-put process 'tramp-vector vec)
+    (tramp-set-connection-property process "hop-vector" vec)
+    (tramp-set-connection-property
+     process "pw-vector"
+     (make-tramp-file-name :method "ssh" :user user :host host))
+    ;; Use upstream tramp-process-actions for password/host-key handling.
+    ;; The custom action checks for the ControlMaster socket appearing.
+    (let ((tramp-rpc--controlmaster-socket-path socket-path))
+      (tramp-process-actions process vec nil
+                             tramp-rpc--controlmaster-actions 60))
+    ;; tramp-process-actions throws on failure; reaching here means success.
+    (sleep-for 0.1)
+    t))
+
+(defun tramp-rpc--sudo-authenticate (vec ssh-user)
+  "Pre-authenticate sudo on the remote host for VEC.
+Uses the ControlMaster to run `sudo -v' interactively, caching
+credentials so the server can be started with sudo via pipes.
+SSH-USER is the user for the SSH connection (from the rpc hop).
+
+Uses `tramp-process-actions' with `tramp-rpc--sudo-actions' for
+password handling, giving auth-source integration and password
+caching for free."
+  (let* ((host (tramp-file-name-host vec))
+         (port (tramp-file-name-port vec))
+         (proxyjump (tramp-rpc--hops-to-proxyjump vec))
+         (socket-path (tramp-rpc--controlmaster-socket-path vec))
+         (process-name (format "*tramp-rpc-sudo %s*" host))
+         (buffer (get-buffer-create (format " *tramp-rpc-sudo %s*" host)))
+         (ssh-args (append
+                    (list "ssh")
+                    tramp-rpc-ssh-args
+                    (when ssh-user (list "-l" ssh-user))
+                    (when port (list "-p" (number-to-string port)))
+                    ;; Multi-hop via ProxyJump
+                    (when proxyjump (list "-J" proxyjump))
+                    ;; Reuse ControlMaster for the SSH layer
+                    (when (and tramp-rpc-use-controlmaster
+                               (file-exists-p socket-path))
+                      (list "-o" "ControlMaster=auto"
+                            "-o" (format "ControlPath=%s" socket-path)))
+                    (list "-o" "StrictHostKeyChecking=accept-new")
+                    ;; Run sudo -v to cache credentials, then exit
+                    (list host "sudo" "-v")))
+         process)
+    (with-current-buffer buffer (erase-buffer))
+    ;; Use PTY for the sudo password prompt
+    (let ((process-connection-type t))
+      (setq process (apply #'start-process process-name buffer ssh-args)))
+    (set-process-query-on-exit-flag process nil)
+    (set-process-sentinel process #'ignore)
+    ;; Set up process properties for tramp-process-actions / tramp-read-passwd.
+    ;; pw-vector points to the sudo user so auth-source can look up
+    ;; credentials via e.g. "machine host login user port sudo".
+    (process-put process 'tramp-vector vec)
+    (tramp-set-connection-property process "hop-vector" vec)
+    (tramp-set-connection-property
+     process "pw-vector"
+     (make-tramp-file-name :method "sudo" :user ssh-user :host host))
+    ;; Use upstream tramp-process-actions for password handling.
+    ;; tramp-rpc--action-sudo-complete throws 'ok on exit 0,
+    ;; 'permission-denied otherwise.  tramp-process-actions handles
+    ;; timeout, wrong-password cleanup, and error signaling.
+    (tramp-process-actions process vec nil tramp-rpc--sudo-actions 60)))
 
 (defun tramp-rpc--start-server-process (vec binary-path)
   "Start the RPC server on VEC at BINARY-PATH and verify it responds.
 BINARY-PATH is the remote localname of the server binary (may contain ~).
+For sudo-via-RPC paths, the server is started via sudo.
 Returns the connection plist.  Signals `remote-file-error' on failure."
-  (let* ((host (tramp-file-name-host vec))
-         (user (tramp-file-name-user vec))
+  (let* ((sudo-ssh-user (tramp-rpc--detect-sudo-elevation vec))
+         (host (tramp-file-name-host vec))
+         (user (or sudo-ssh-user (tramp-file-name-user vec)))
          (port (tramp-file-name-port vec))
          (proxyjump (tramp-rpc--hops-to-proxyjump vec))
          ;; Build SSH command to run the RPC server
@@ -807,8 +986,10 @@ Returns the connection plist.  Signals `remote-file-error' on failure."
                     (when port (list "-p" (number-to-string port)))
                     ;; Multi-hop via ProxyJump
                     (when proxyjump (list "-J" proxyjump))
-                    ;; Default options
-                    (list "-o" "BatchMode=yes")
+                    ;; Only use BatchMode=yes when ControlMaster handles auth;
+                    ;; without it, BatchMode=yes prevents password prompts.
+                    (when tramp-rpc-use-controlmaster
+                      (list "-o" "BatchMode=yes"))
                     (list "-o" "StrictHostKeyChecking=accept-new")
                     ;; User-specified SSH options
                     (mapcan (lambda (opt) (list "-o" opt))
@@ -821,7 +1002,12 @@ Returns the connection plist.  Signals `remote-file-error' on failure."
                                          (tramp-rpc--controlmaster-socket-path vec))
                             "-o" (format "ControlPersist=%s"
                                          tramp-rpc-controlmaster-persist)))
-                    (list host binary-path)))
+                    ;; For sudo elevation, wrap the binary in sudo
+                    (if sudo-ssh-user
+                        (list host "sudo" "-n"
+                              "-u" (tramp-file-name-user vec)
+                              binary-path)
+                      (list host binary-path))))
          ;; Use TRAMP's standard naming so tramp-get-connection-process works
          (process-name (tramp-get-connection-name vec))
          (buffer-name (tramp-buffer-name vec))
@@ -922,6 +1108,10 @@ accidentally routing file operations through tramp-sh."
   ;; - Password: prompts user, then subsequent connections reuse it
   (when tramp-rpc-use-controlmaster
     (tramp-rpc--establish-controlmaster vec))
+  ;; For sudo-via-RPC, pre-authenticate sudo so the server can be
+  ;; started with `sudo -n' (non-interactive) via pipes.
+  (when-let* ((sudo-ssh-user (tramp-rpc--detect-sudo-elevation vec)))
+    (tramp-rpc--sudo-authenticate vec sudo-ssh-user))
   (if tramp-rpc-deploy-never-deploy
       ;; Never-deploy mode: use the configured path directly, no fallback.
       (let ((binary-path (tramp-rpc-deploy-ensure-binary vec)))
@@ -2894,6 +3084,10 @@ VEC-OR-FILENAME can be either a tramp-file-name struct or a filename string."
 (tramp-register-foreign-file-name-handler
  #'tramp-rpc-file-name-p #'tramp-rpc-file-name-handler)
 
+(defun tramp-rpc--multi-hop-advice-remove ()
+  "Remove multi-hop advice."
+  (advice-remove 'tramp-multi-hop-p #'tramp-rpc--multi-hop-advice))
+
 ;; ============================================================================
 ;; Recentf integration
 ;; ============================================================================
@@ -3012,7 +3206,12 @@ Removes advice and cleans up async processes."
   ;; Remove method registrations.
   (setq tramp-methods (delete (assoc tramp-rpc-method tramp-methods) tramp-methods))
   (setq tramp-foreign-file-name-handler-alist
-	(delete (assoc 'tramp-rpc-file-name-p tramp-foreign-file-name-handler-alist)
+	(delete (assoc 'tramp-rpc--sudo-file-name-p
+			tramp-foreign-file-name-handler-alist)
+		tramp-foreign-file-name-handler-alist))
+  (setq tramp-foreign-file-name-handler-alist
+	(delete (assoc 'tramp-rpc-file-name-p
+			tramp-foreign-file-name-handler-alist)
 		tramp-foreign-file-name-handler-alist))
   ;; Return nil to allow normal unload to proceed
   nil)

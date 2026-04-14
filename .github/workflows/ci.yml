@@ -182,6 +182,11 @@ jobs:
         with:
           version: '30.1'
 
+      - name: Clone upstream tramp
+        run: |
+          git clone --depth 1 https://github.com/emacsmirror/tramp.git ~/src/tramp
+          echo "Tramp commit: $(git -C ~/src/tramp rev-parse HEAD)"
+
       - name: Install dependencies
         run: |
           for attempt in 1 2 3; do
@@ -200,6 +205,8 @@ jobs:
       - name: Run multi-hop tests
         run: |
           emacs -Q --batch \
+            -L lisp \
+            -L ~/src/tramp/lisp \
             --eval "(require 'package)" \
             --eval "(add-to-list 'package-archives '(\"melpa\" . \"https://melpa.org/packages/\") t)" \
             --eval "(package-initialize)" \

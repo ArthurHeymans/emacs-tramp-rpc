@@ -38,7 +38,6 @@
 (declare-function tramp-rpc--cleanup-async-processes "tramp-rpc-process")
 
 ;; Functions from tramp-cmds.el
-(declare-function tramp-file-name-with-sudo "tramp-cmds")
 
 ;; Functions from tramp-rpc.el
 (declare-function tramp-rpc--debug "tramp-rpc")
@@ -194,23 +193,23 @@
        ;; Not a tramp-rpc process
        (t (funcall orig-fun process))))))
 
-(defun tramp-rpc--signal-process-advice (orig-fun process sigcode &optional remote)
-  "Advice for `signal-process' to handle TRAMP-RPC processes."
-  (if-let* ((pid (and (processp process)
-                     (process-get process :tramp-rpc-pid)))
-           (vec (process-get process :tramp-rpc-vec)))
-      (condition-case err
-          (progn
-            ;; Use PTY kill for PTY processes, regular kill for pipe processes
-            (if (process-get process :tramp-rpc-pty)
-                (tramp-rpc--call vec "process.kill_pty"
-                                 `((pid . ,pid) (signal . ,sigcode)))
-              (tramp-rpc--kill-remote-process vec pid sigcode))
-            0) ; Return 0 for success
-        (error
-         (message "tramp-rpc: Error signaling process: %s" err)
-         -1))
-    (funcall orig-fun process sigcode remote)))
+(defun tramp-rpc-handle-signal-process (process sigcode &optional _remote)
+  "Handler for `signal-process' of TRAMP-RPC processes.
+It will be added to `signal-process-functions'."
+  (when-let* ((pid (and (processp process)
+			(process-get process :tramp-rpc-pid)))
+	      (vec (process-get process :tramp-rpc-vec)))
+    (condition-case err
+        (progn
+          ;; Use PTY kill for PTY processes, regular kill for pipe processes
+          (if (process-get process :tramp-rpc-pty)
+              (tramp-rpc--call vec "process.kill_pty"
+                               `((pid . ,pid) (signal . ,sigcode)))
+            (tramp-rpc--kill-remote-process vec pid sigcode))
+          0) ; Return 0 for success
+      (error
+       (message "tramp-rpc: Error signaling process: %s" err)
+       -1))))
 
 ;; ============================================================================
 ;; Process metadata advice
@@ -277,40 +276,6 @@ process-file calls are routed through the TRAMP handler."
 
 ;; ============================================================================
 ;; Privilege elevation integration
-;; ============================================================================
-
-;; `tramp-file-name-with-sudo' assumes the current TRAMP method can participate
-;; directly in the elevated multi-hop path.  That does not hold for `rpc:'.
-;; Rewrite RPC-backed paths to elevate through an SSH hop instead.
-
-(defun tramp-rpc--file-name-with-sudo-via-ssh (filename)
-  "Build an elevated TRAMP file name for RPC-backed FILENAME via SSH."
-  (with-parsed-tramp-file-name (expand-file-name filename) nil
-    (let* ((sudo-method
-            (or (and (boundp 'tramp-file-name-with-method)
-                     tramp-file-name-with-method)
-                "sudo"))
-           (ssh-hop
-            (tramp-make-tramp-hop-name
-             (make-tramp-file-name :method "ssh" :user user :host host))))
-      (let ((tramp-show-ad-hoc-proxies t))
-        (tramp-make-tramp-file-name
-         (make-tramp-file-name
-          :method (tramp-find-method sudo-method nil host)
-          :user (tramp-find-user sudo-method nil host)
-          :host (tramp-find-host sudo-method nil host)
-          :localname localname
-          :hop ssh-hop))))))
-
-(defun tramp-rpc--file-name-with-sudo-advice (orig-fun filename)
-  "Route RPC-backed sudo elevation through SSH for FILENAME."
-  (let ((filename (expand-file-name filename)))
-    (if (and (tramp-tramp-file-p filename)
-             (with-parsed-tramp-file-name filename nil
-               (string= method "rpc")))
-        (tramp-rpc--file-name-with-sudo-via-ssh filename)
-      (funcall orig-fun filename))))
-
 ;; ============================================================================
 ;; Eglot integration
 ;; ============================================================================
@@ -418,15 +383,14 @@ exited (remote side finished), delete it so the refresh can proceed."
   (advice-add 'process-send-string :around #'tramp-rpc--process-send-string-advice)
   (advice-add 'process-send-region :around #'tramp-rpc--process-send-region-advice)
   (advice-add 'process-send-eof :around #'tramp-rpc--process-send-eof-advice)
-  (advice-add 'signal-process :around #'tramp-rpc--signal-process-advice)
+  ;; This must be before `tramp-signal-process'.  Since tramp.el is
+  ;; required, this is guaranteed.
+  (add-hook 'signal-process-functions #'tramp-rpc-handle-signal-process)
   (advice-add 'process-status :around #'tramp-rpc--process-status-advice)
   (advice-add 'process-exit-status :around #'tramp-rpc--process-exit-status-advice)
   (advice-add 'process-command :around #'tramp-rpc--process-command-advice)
   (advice-add 'process-tty-name :around #'tramp-rpc--process-tty-name-advice)
   (advice-add 'vc-call-backend :around #'tramp-rpc--vc-call-backend-advice)
-  (with-eval-after-load 'tramp-cmds
-    (when (fboundp 'tramp-file-name-with-sudo)
-      (advice-add 'tramp-file-name-with-sudo :around #'tramp-rpc--file-name-with-sudo-advice)))
   (with-eval-after-load 'eglot
     (advice-add 'eglot--cmd :around #'tramp-rpc--eglot-cmd-advice))
   (with-eval-after-load 'vc-dir
@@ -442,14 +406,12 @@ exited (remote side finished), delete it so the refresh can proceed."
   (advice-remove 'process-send-string #'tramp-rpc--process-send-string-advice)
   (advice-remove 'process-send-region #'tramp-rpc--process-send-region-advice)
   (advice-remove 'process-send-eof #'tramp-rpc--process-send-eof-advice)
-  (advice-remove 'signal-process #'tramp-rpc--signal-process-advice)
+  (remove-hook 'signal-process-functions #'tramp-rpc-handle-signal-process)
   (advice-remove 'process-status #'tramp-rpc--process-status-advice)
   (advice-remove 'process-exit-status #'tramp-rpc--process-exit-status-advice)
   (advice-remove 'process-command #'tramp-rpc--process-command-advice)
   (advice-remove 'process-tty-name #'tramp-rpc--process-tty-name-advice)
   (advice-remove 'vc-call-backend #'tramp-rpc--vc-call-backend-advice)
-  (when (fboundp 'tramp-file-name-with-sudo)
-    (advice-remove 'tramp-file-name-with-sudo #'tramp-rpc--file-name-with-sudo-advice))
   (advice-remove 'eglot--cmd #'tramp-rpc--eglot-cmd-advice)
   (advice-remove 'vc-dir-refresh #'tramp-rpc--vc-dir-refresh-advice)
   (advice-remove 'magit-start-process #'tramp-rpc--magit-start-process-advice)
