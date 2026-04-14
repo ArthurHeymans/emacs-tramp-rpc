@@ -65,6 +65,9 @@
 (let ((lisp-dir (expand-file-name "lisp" tramp-rpc-test--project-root)))
   (add-to-list 'load-path lisp-dir))
 
+;; Ensure tests exercise updated source, not stale bytecode.
+(setq load-prefer-newer t)
+
 ;; Install msgpack from MELPA if not available (required by tramp-rpc-protocol)
 (unless (require 'msgpack nil t)
   (require 'package)
@@ -119,6 +122,45 @@ When set, cross-remote tests (copy/rename between different hosts) are run.")
 (defvar tramp-rpc-test-enabled-checked nil
   "Cached result of `tramp-rpc-test-enabled'.
 Value is a cons cell (CHECKED . RESULT).")
+
+(defun tramp-rpc-test--run-with-call-count (thunk)
+  "Run THUNK and return (RESULT . RPC-CALL-COUNT)."
+  (let ((count 0)
+        result
+        (orig-call-with-timeout (symbol-function 'tramp-rpc--call-with-timeout))
+        (orig-call-batch (symbol-function 'tramp-rpc--call-batch))
+        (orig-call-async (symbol-function 'tramp-rpc--call-async))
+        (orig-send-requests (symbol-function 'tramp-rpc--send-requests)))
+    (cl-letf (((symbol-function 'tramp-rpc--call-with-timeout)
+               (lambda (vec method params total-timeout poll-interval)
+                 (cl-incf count)
+                 (funcall orig-call-with-timeout
+                          vec method params total-timeout poll-interval)))
+              ((symbol-function 'tramp-rpc--call-batch)
+               (lambda (vec requests)
+                 (cl-incf count)
+                 (funcall orig-call-batch vec requests)))
+              ((symbol-function 'tramp-rpc--call-async)
+               (lambda (vec method params callback)
+                 (cl-incf count)
+                 (funcall orig-call-async vec method params callback)))
+              ((symbol-function 'tramp-rpc--send-requests)
+               (lambda (vec requests)
+                 (cl-incf count (length requests))
+                 (funcall orig-send-requests vec requests))))
+      (setq result (funcall thunk))
+      (cons result count))))
+
+(defmacro tramp-rpc-test--with-call-count (expected &rest body)
+  "Run BODY and assert it makes EXPECTED RPC calls.
+Returns BODY's result."
+  (declare (indent 1) (debug (form body)))
+  (let ((measurement (make-symbol "measurement")))
+    `(let ((,measurement
+            (tramp-rpc-test--run-with-call-count
+             (lambda () ,@body))))
+       (should (= ,expected (cdr ,measurement)))
+       (car ,measurement))))
 
 (defun tramp-rpc-test--make-remote-path (filename)
   "Make a full TRAMP RPC path for FILENAME."
@@ -296,8 +338,10 @@ The directory is deleted after BODY completes."
   (skip-unless (tramp-rpc-test-enabled))
 
   ;; Test directory exists
-  (let ((dir (tramp-rpc-test--remote-directory)))
-    (should (file-exists-p dir)))
+  ;; Measure on a fresh path to avoid cache hits.
+  (let ((missing (tramp-rpc-test--make-temp-name)))
+    (should-not (tramp-rpc-test--with-call-count 1
+                  (file-exists-p missing))))
 
   ;; Test file creation and existence
   (tramp-rpc-test--with-temp-file tmp "test content"
@@ -319,7 +363,8 @@ The directory is deleted after BODY completes."
 
   ;; Existing file
   (tramp-rpc-test--with-temp-file tmp "test content"
-    (should (file-writable-p tmp)))
+    (should (tramp-rpc-test--with-call-count 1
+              (file-writable-p tmp))))
 
   ;; Non-existent file in writable directory
   (let ((new-file (tramp-rpc-test--make-temp-name)))
@@ -334,7 +379,10 @@ The directory is deleted after BODY completes."
   (skip-unless (tramp-rpc-test-enabled))
 
   ;; Test directory
-  (should (file-directory-p (tramp-rpc-test--remote-directory)))
+  ;; Measure on a fresh path to avoid cache hits.
+  (let ((missing (tramp-rpc-test--make-temp-name)))
+    (should-not (tramp-rpc-test--with-call-count 2
+                  (file-directory-p missing))))
 
   ;; Test file
   (tramp-rpc-test--with-temp-file tmp "test content"
@@ -350,7 +398,8 @@ The directory is deleted after BODY completes."
 
   ;; Regular file
   (tramp-rpc-test--with-temp-file tmp "test content"
-    (should (file-regular-p tmp)))
+    (should (tramp-rpc-test--with-call-count 1
+              (file-regular-p tmp))))
 
   ;; Directory is not regular
   (should-not (file-regular-p (tramp-rpc-test--remote-directory))))
@@ -368,7 +417,8 @@ The directory is deleted after BODY completes."
                 (make-symbolic-link target link)
               (file-error (ert-skip "Symlinks not supported")))
             ;; Test symlink detection
-            (should (file-symlink-p link))
+            (should (tramp-rpc-test--with-call-count 1
+                      (file-symlink-p link)))
             ;; Original file is not a symlink
             (should-not (file-symlink-p target)))
         (ignore-errors (delete-file link))))))
@@ -382,7 +432,8 @@ The directory is deleted after BODY completes."
   (skip-unless (tramp-rpc-test-enabled))
 
   (tramp-rpc-test--with-temp-file tmp "test content"
-    (let ((attrs (file-attributes tmp)))
+    (let ((attrs (tramp-rpc-test--with-call-count 1
+                  (file-attributes tmp))))
       (should attrs)
       ;; Check it's a regular file
       (should (null (file-attribute-type attrs)))
@@ -403,7 +454,8 @@ The directory is deleted after BODY completes."
   (skip-unless (tramp-rpc-test-enabled))
 
   (tramp-rpc-test--with-temp-dir subdir
-    (let ((attrs (file-attributes subdir)))
+    (let ((attrs (tramp-rpc-test--with-call-count 1
+                  (file-attributes subdir))))
       (should attrs)
       ;; Check it's a directory
       (should (eq (file-attribute-type attrs) t)))))
@@ -413,7 +465,8 @@ The directory is deleted after BODY completes."
   (skip-unless (tramp-rpc-test-enabled))
 
   (tramp-rpc-test--with-temp-file tmp "test content"
-    (let ((orig-modes (file-modes tmp)))
+    (let ((orig-modes (tramp-rpc-test--with-call-count 1
+                        (file-modes tmp))))
       (should (integerp orig-modes))
       ;; Set new modes
       (set-file-modes tmp #o644)
@@ -564,7 +617,8 @@ This tests Issue #13: Chinese characters decode incorrectly."
 
   (tramp-rpc-test--with-temp-file tmp "test content"
     (with-temp-buffer
-      (insert-file-contents tmp)
+      (tramp-rpc-test--with-call-count 3
+        (insert-file-contents tmp))
       (should (equal (buffer-string) "test content")))))
 
 (ert-deftest tramp-rpc-test05-insert-file-contents-partial ()
@@ -574,7 +628,8 @@ This tests Issue #13: Chinese characters decode incorrectly."
   (tramp-rpc-test--with-temp-file tmp "0123456789"
     ;; Read bytes 2-5
     (with-temp-buffer
-      (insert-file-contents tmp nil 2 6)
+      (tramp-rpc-test--with-call-count 3
+        (insert-file-contents tmp nil 2 6))
       (should (equal (buffer-string) "2345")))))
 
 ;;; ============================================================================
@@ -589,7 +644,8 @@ This tests Issue #13: Chinese characters decode incorrectly."
     (let ((dest (tramp-rpc-test--make-temp-name)))
       (unwind-protect
           (progn
-            (copy-file src dest)
+            (tramp-rpc-test--with-call-count 5
+              (copy-file src dest))
             (should (file-exists-p dest))
             (should (equal (with-temp-buffer
                              (insert-file-contents src)
@@ -621,7 +677,8 @@ signal `file-already-exists'.  With trailing slash (via
             (should-error (copy-file src dest-dir 'ok)
                           :type 'file-error)
             ;; With trailing / (file-name-as-directory), should copy INTO dir
-            (copy-file src (file-name-as-directory dest-dir))
+            (tramp-rpc-test--with-call-count 5
+              (copy-file src (file-name-as-directory dest-dir)))
             ;; File should now exist inside the directory with original name
             (let ((expected-dest (expand-file-name
                                   (file-name-nondirectory src) dest-dir)))
@@ -644,7 +701,8 @@ signal `file-already-exists'.  With trailing slash (via
     (unwind-protect
         (progn
           (write-region content nil src)
-          (rename-file src dest)
+          (tramp-rpc-test--with-call-count 3
+            (rename-file src dest))
           (should-not (file-exists-p src))
           (should (file-exists-p dest))
           (should (equal content (with-temp-buffer
@@ -660,7 +718,8 @@ signal `file-already-exists'.  With trailing slash (via
   (let ((file (tramp-rpc-test--make-temp-name)))
     (write-region "to be deleted" nil file)
     (should (file-exists-p file))
-    (delete-file file)
+    (tramp-rpc-test--with-call-count 3
+      (delete-file file))
     (should-not (file-exists-p file))))
 
 (ert-deftest tramp-rpc-test06-copy-file-cross-remote ()
@@ -744,7 +803,8 @@ This exercises copy-then-delete for cross-remote renames."
   (let ((dir (tramp-rpc-test--make-temp-name)))
     (unwind-protect
         (progn
-          (make-directory dir)
+          (tramp-rpc-test--with-call-count 2
+            (make-directory dir))
           (should (file-directory-p dir)))
       (ignore-errors (delete-directory dir)))))
 
@@ -755,7 +815,8 @@ This exercises copy-then-delete for cross-remote renames."
   (let ((dir (concat (tramp-rpc-test--make-temp-name) "/nested/path")))
     (unwind-protect
         (progn
-          (make-directory dir t)
+          (tramp-rpc-test--with-call-count 11
+            (make-directory dir t))
           (should (file-directory-p dir)))
       (ignore-errors (delete-directory
                       (file-name-directory (directory-file-name dir)) t)))))
@@ -767,7 +828,8 @@ This exercises copy-then-delete for cross-remote renames."
   (let ((dir (tramp-rpc-test--make-temp-name)))
     (make-directory dir)
     (should (file-directory-p dir))
-    (delete-directory dir)
+    (tramp-rpc-test--with-call-count 1
+      (delete-directory dir))
     (should-not (file-exists-p dir))))
 
 (ert-deftest tramp-rpc-test07-delete-directory-recursive ()
@@ -780,7 +842,8 @@ This exercises copy-then-delete for cross-remote renames."
     (make-directory (concat dir "/subdir"))
     (write-region "file2" nil (concat dir "/subdir/file2.txt"))
     (should (file-directory-p dir))
-    (delete-directory dir t)
+    (tramp-rpc-test--with-call-count 1
+      (delete-directory dir t))
     (should-not (file-exists-p dir))))
 
 (ert-deftest tramp-rpc-test07-directory-files ()
@@ -792,7 +855,8 @@ This exercises copy-then-delete for cross-remote renames."
     (write-region "b" nil (concat dir "/file2.txt"))
     (write-region "c" nil (concat dir "/other.log"))
 
-    (let ((files (directory-files dir)))
+    (let ((files (tramp-rpc-test--with-call-count 2
+                  (directory-files dir))))
       ;; Should contain . and .. plus our files
       (should (member "." files))
       (should (member ".." files))
@@ -814,7 +878,8 @@ This exercises copy-then-delete for cross-remote renames."
     (write-region "content" nil (concat dir "/file.txt"))
     (make-directory (concat dir "/subdir"))
 
-    (let ((entries (directory-files-and-attributes dir)))
+    (let ((entries (tramp-rpc-test--with-call-count 1
+                    (directory-files-and-attributes dir))))
       ;; Find file entry
       (let ((file-entry (assoc "file.txt" entries)))
         (should file-entry)
@@ -1094,7 +1159,8 @@ This matches the upstream `tramp-test28-process-file' test."
     (write-region "" nil (concat dir "/file-aab.txt"))
     (write-region "" nil (concat dir "/other.txt"))
 
-    (let ((completions (file-name-all-completions "file-" dir)))
+    (let ((completions (tramp-rpc-test--with-call-count 1
+                         (file-name-all-completions "file-" dir))))
       (should (member "file-aaa.txt" completions))
       (should (member "file-aab.txt" completions))
       (should-not (member "other.txt" completions)))))
@@ -1108,7 +1174,8 @@ This matches the upstream `tramp-test28-process-file' test."
           (link-dir (concat dir "/link-dir")))
       (make-directory real-dir t)
       (make-symbolic-link "real-dir" link-dir)
-      (let ((completions (file-name-all-completions "" dir)))
+      (let ((completions (tramp-rpc-test--with-call-count 1
+                           (file-name-all-completions "" dir))))
         (should (member "real-dir/" completions))
         (should (member "link-dir/" completions))))))
 
@@ -1393,7 +1460,8 @@ This is the root cause of the lsp-mode crash reported with tramp-rpc."
       (write-region "x" nil target)
       (let ((expected (tramp-run-real-handler #'locate-dominating-file
                                               (list target ".git")))
-            (actual (locate-dominating-file target ".git")))
+            (actual (tramp-rpc-test--with-call-count 1
+                      (locate-dominating-file target ".git"))))
         (should (equal expected actual))))))
 
 (ert-deftest tramp-rpc-test19-locate-dominating-file-stop-regexp ()
@@ -1422,7 +1490,8 @@ This is the root cause of the lsp-mode crash reported with tramp-rpc."
       (write-region "((nil . ((tab-width . 8))))\n" nil
                     (concat root "/" (string-replace ".el" "-2.el" dir-locals-file)))
       (let ((expected (tramp-run-real-handler #'dir-locals--all-files (list deep)))
-            (actual (dir-locals--all-files deep)))
+            (actual (tramp-rpc-test--with-call-count 1
+                      (dir-locals--all-files deep))))
         (should (equal expected actual))))))
 
 (ert-deftest tramp-rpc-test19-dir-locals-find-file ()
@@ -1438,7 +1507,8 @@ This is the root cause of the lsp-mode crash reported with tramp-rpc."
         (let ((expected (tramp-run-real-handler #'dir-locals-find-file (list missing))))
           (setq dir-locals-directory-cache nil
                 dir-locals-class-alist nil)
-          (let ((actual (dir-locals-find-file missing)))
+          (let ((actual (tramp-rpc-test--with-call-count 1
+                          (dir-locals-find-file missing))))
             (should (equal expected actual))))))))
 
 ;;; ============================================================================
