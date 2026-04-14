@@ -1685,14 +1685,16 @@ to the built-in implementation."
          (cache-update (tramp-rpc--dir-locals-cache-update file dir-locals-directory-cache))
          (locals-dir-update (alist-get 'locals cache-update))
          (locals-dir (when locals-dir-update
-                       (concat file-connection
-                               (tramp-rpc--decode-string
-                                (alist-get 'dir locals-dir-update)))))
+                       (file-name-as-directory
+                        (concat file-connection
+                                (tramp-rpc--decode-string
+                                 (alist-get 'dir locals-dir-update))))))
          (cache-dir-update (alist-get 'cache cache-update))
          (cache-dir (when cache-dir-update
-                      (concat file-connection
-                              (tramp-rpc--decode-string
-                               (alist-get 'dir cache-dir-update)))))
+                      (file-name-as-directory
+                       (concat file-connection
+                               (tramp-rpc--decode-string
+                                (alist-get 'dir cache-dir-update))))))
          (dir-elt (when cache-dir
                     (seq-find (lambda (elt) (string= (car elt) cache-dir))
                               dir-locals-directory-cache))))
