@@ -148,6 +148,13 @@
 (require 'tramp-sh)
 (require 'tramp-rpc-protocol)
 
+;; Check for minimum Tramp version.  The Package-Requires header declares
+;; (tramp "2.8.1.3") but that is only enforced by package.el at install
+;; time.  Guard at load time so that manual installations fail clearly.
+(when (version< tramp-version "2.8.1.3")
+  (error "tramp-rpc requires Tramp >= 2.8.1.3, but %s is loaded"
+         tramp-version))
+
 ;; Give the rpc method all ssh connection parameters so it can serve
 ;; as a hop in tramp-sh multi-hop chains (e.g.
 ;; /rpc:host|sudo:root@host:/path).  For single-hop rpc, the foreign
