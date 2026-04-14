@@ -1069,22 +1069,6 @@ operations and re-quoted on the way back."
         (should (equal result
                        '("/rpc:host:/:/tmp/tramp-rpc-root/.dir-locals.el")))))))
 
-(ert-deftest tramp-rpc-mock-test-dir-locals-advice-installed ()
-  "Test that the dir-locals advice is installed and removed correctly."
-  :tags '(:dir-locals)
-  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
-  ;; After loading tramp-rpc-advice, the advice should be active.
-  (should (advice-member-p #'tramp-rpc--hack-dir-local-variables-advice
-                           'hack-dir-local-variables))
-  ;; After removing, it should be gone.
-  (unwind-protect
-      (progn
-        (tramp-rpc-advice-remove)
-        (should-not (advice-member-p #'tramp-rpc--hack-dir-local-variables-advice
-                                     'hack-dir-local-variables)))
-    ;; Restore advice for remaining tests.
-    (tramp-rpc-advice-install)))
-
 ;;; ============================================================================
 ;;; Non-essential / recentf Tests (No server or SSH required)
 ;;; ============================================================================

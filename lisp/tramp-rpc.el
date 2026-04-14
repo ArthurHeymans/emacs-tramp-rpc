@@ -133,6 +133,9 @@
 (declare-function tramp-rpc--multi-hop-advice "tramp-rpc")
 ;; From tramp-rpc-advice.el (loaded at runtime)
 (declare-function tramp-rpc-advice-remove "tramp-rpc-advice")
+;; Tramp 2.8+ APIs used for external operation registration.
+(declare-function tramp-add-external-operation "tramp")
+(declare-function tramp-remove-external-operation "tramp")
 (require 'tramp-rpc-deploy)
 
 ;; Silence byte-compiler warnings for functions defined elsewhere
@@ -2785,7 +2788,9 @@ Also controls process exit detection latency."
     ;; RPC-based path and VC operations
     ;; =========================================================================
     (expand-file-name . tramp-rpc-handle-expand-file-name)
+    (locate-dominating-file . tramp-rpc-handle-locate-dominating-file)
     (dir-locals--all-files . tramp-rpc-handle-dir-locals--all-files)
+    (dir-locals-find-file . tramp-rpc-handle-dir-locals-find-file)
     (vc-registered . tramp-rpc-handle-vc-registered)
 
     ;; =========================================================================
@@ -2842,6 +2847,13 @@ Also controls process exit detection latency."
     (unhandled-file-name-directory . ignore) ; Should return nil for TRAMP
     )
   "Alist of handler functions for TRAMP-RPC method.")
+
+;; Defer registration until tramp-rpc is fully loaded so
+;; `tramp-add-external-operation' can safely `(require 'tramp-rpc)'.
+(with-eval-after-load 'tramp-rpc
+  (tramp-add-external-operation 'locate-dominating-file 'tramp-rpc-handle-locate-dominating-file 'tramp-rpc)
+  (tramp-add-external-operation 'dir-locals--all-files 'tramp-rpc-handle-dir-locals--all-files 'tramp-rpc)
+  (tramp-add-external-operation 'dir-locals-find-file 'tramp-rpc-handle-dir-locals-find-file 'tramp-rpc))
 
 ;;;###autoload
 (defun tramp-rpc-file-name-handler (operation &rest args)
@@ -2981,6 +2993,10 @@ cleanup of all connections has run."
 (defun tramp-rpc-unload-function ()
   "Unload function for tramp-rpc.
 Removes advice and cleans up async processes."
+  ;; Remove high-level external operations from tramp-rpc core.
+  (tramp-remove-external-operation 'locate-dominating-file 'tramp-rpc)
+  (tramp-remove-external-operation 'dir-locals--all-files 'tramp-rpc)
+  (tramp-remove-external-operation 'dir-locals-find-file 'tramp-rpc)
   ;; Remove all advice (from tramp-rpc-advice module)
   (tramp-rpc-advice-remove)
   ;; Remove legacy multi-hop advice and cleanup hooks.

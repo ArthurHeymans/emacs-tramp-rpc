@@ -45,9 +45,6 @@
 (declare-function tramp-rpc--call "tramp-rpc")
 (declare-function tramp-rpc--call-async "tramp-rpc")
 (declare-function tramp-rpc-file-name-p "tramp-rpc")
-(declare-function tramp-rpc-handle-locate-dominating-file "tramp-rpc")
-(declare-function tramp-rpc-handle-dir-locals-find-file "tramp-rpc")
-(declare-function tramp-rpc-handle-dir-locals--all-files "tramp-rpc")
 
 ;; Variables from tramp-rpc.el / tramp-rpc-process.el
 (defvar tramp-rpc--delivering-output)
@@ -400,68 +397,17 @@ exited (remote side finished), delete it so the refresh can proceed."
 ;; Dir-locals advice
 ;; ============================================================================
 
-;; Emacs's `enable-remote-dir-locals' defaults to nil because looking
-;; for .dir-locals.el on remote hosts can be slow for traditional TRAMP
-;; methods that pipe shell commands over SSH.  TRAMP-RPC uses an
-;; efficient binary protocol with caching, so this concern does not
-;; apply.  Rather than setting the variable globally (which would affect
-;; all TRAMP methods), we advise `hack-dir-local-variables' to enable
-;; it only for buffers visiting files via the RPC method.
-
+;; Emacs's `enable-remote-dir-locals' defaults to nil because looking for
+;; .dir-locals.el on remote hosts can be slow for traditional TRAMP methods.
+;; TRAMP-RPC uses a fast binary protocol and dedicated high-level operations,
+;; so enable this only for buffers using the rpc method.
 (defun tramp-rpc--hack-dir-local-variables-advice (orig-fun)
-  "Enable dir-locals for buffers visiting TRAMP-RPC remote files.
-Let-binds `enable-remote-dir-locals' to t when the current buffer
-is visiting a file (or has `default-directory') on an RPC remote,
-so that .dir-locals.el files are detected and loaded normally."
+  "Enable remote dir-locals in `hack-dir-local-variables' for RPC files."
   (let ((enable-remote-dir-locals
          (or enable-remote-dir-locals
              (when-let* ((file (or (buffer-file-name) default-directory)))
                (tramp-rpc-file-name-p file)))))
     (funcall orig-fun)))
-
-;; Compatibility fallback for Tramp versions lacking
-;; `tramp-add-external-operation'.
-(defun tramp-rpc--locate-dominating-file-advice (orig-fun file name)
-  "Use RPC fast-path for remote `locate-dominating-file'."
-  (if (and (not (functionp name))
-           (stringp file)
-           (tramp-rpc-file-name-p
-            (if (file-name-absolute-p file)
-                file
-              (file-name-concat default-directory file))))
-      (tramp-rpc-handle-locate-dominating-file file name)
-    (funcall orig-fun file name)))
-
-(defun tramp-rpc--dir-locals--all-files-advice (orig-fun directory &optional base-el-only)
-  "Use RPC fast-path for remote `dir-locals--all-files'."
-  (if (and (stringp directory)
-           (tramp-rpc-file-name-p
-            (if (file-name-absolute-p directory)
-                directory
-              (file-name-concat default-directory directory))))
-      (tramp-rpc-handle-dir-locals--all-files directory base-el-only)
-    ;; Emacs versions differ in accepted arity for `dir-locals--all-files'.
-    ;; Try the 2-arg form first and fall back for older 1-arg variants.
-    (condition-case nil
-        (funcall orig-fun directory base-el-only)
-      (wrong-number-of-arguments
-       (funcall orig-fun directory)))))
-
-(defun tramp-rpc--dir-locals-find-file-advice (orig-fun file)
-  "Use RPC fast-path for remote `dir-locals-find-file'."
-  (if (and (stringp file)
-           (tramp-rpc-file-name-p
-            (if (file-name-absolute-p file)
-                file
-              (file-name-concat default-directory file))))
-      ;; The dedicated RPC fast-path can miss edge cases in upstream
-      ;; `tramp-test34' when `find-file-hook' is intentionally modified.
-      ;; In that case, defer to upstream behavior.
-      (if (memq #'tramp-set-connection-local-variables-for-buffer find-file-hook)
-          (or (tramp-rpc-handle-dir-locals-find-file file)
-              (funcall orig-fun file))
-        (funcall orig-fun file))
-    (funcall orig-fun file)))
 
 ;; ============================================================================
 ;; Install and uninstall advice
@@ -488,15 +434,6 @@ so that .dir-locals.el files are detected and loaded normally."
   (with-eval-after-load 'magit-process
     (advice-add 'magit-start-process :around
                 #'tramp-rpc--magit-start-process-advice))
-  ;; Always use explicit advice for these operations.  Using
-  ;; `tramp-add-external-operation' here can recurse while the
-  ;; `tramp-rpc' feature is still loading.
-  (advice-add 'locate-dominating-file :around
-              #'tramp-rpc--locate-dominating-file-advice)
-  (advice-add 'dir-locals-find-file :around
-              #'tramp-rpc--dir-locals-find-file-advice)
-  (advice-add 'dir-locals--all-files :around
-              #'tramp-rpc--dir-locals--all-files-advice)
   (advice-add 'hack-dir-local-variables :around
               #'tramp-rpc--hack-dir-local-variables-advice))
 
@@ -516,9 +453,6 @@ so that .dir-locals.el files are detected and loaded normally."
   (advice-remove 'eglot--cmd #'tramp-rpc--eglot-cmd-advice)
   (advice-remove 'vc-dir-refresh #'tramp-rpc--vc-dir-refresh-advice)
   (advice-remove 'magit-start-process #'tramp-rpc--magit-start-process-advice)
-  (advice-remove 'locate-dominating-file #'tramp-rpc--locate-dominating-file-advice)
-  (advice-remove 'dir-locals-find-file #'tramp-rpc--dir-locals-find-file-advice)
-  (advice-remove 'dir-locals--all-files #'tramp-rpc--dir-locals--all-files-advice)
   (advice-remove 'hack-dir-local-variables #'tramp-rpc--hack-dir-local-variables-advice))
 
 (defcustom tramp-rpc-install-advice-on-load t
