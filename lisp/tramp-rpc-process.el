@@ -46,6 +46,7 @@
 (declare-function tramp-rpc--decode-output "tramp-rpc")
 (declare-function tramp-rpc--controlmaster-socket-path "tramp-rpc")
 (declare-function tramp-rpc--hops-to-proxyjump "tramp-rpc")
+(declare-function tramp-rpc--port-to-string "tramp-rpc")
 (declare-function tramp-rpc--ensure-inside-emacs-env "tramp-rpc")
 (declare-function tramp-rpc--caller-environment "tramp-rpc")
 (declare-function tramp-rpc-file-name-p "tramp-rpc")
