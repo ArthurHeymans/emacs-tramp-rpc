@@ -680,7 +680,7 @@ This matches the behavior expected by `tramp-test28-process-file'."
   (let ((vec (make-tramp-file-name :method "rpc" :host "target"
                                    :user "user" :localname "/path")))
     (should (equal (tramp-rpc--connection-key vec)
-                   '("target" "user" 22 nil)))))
+                   '("target" "user" "22" nil)))))
 
 (ert-deftest tramp-rpc-mock-test-connection-key-with-hop ()
   "Test connection key includes hop for differentiation."
