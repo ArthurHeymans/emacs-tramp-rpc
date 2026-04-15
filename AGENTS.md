@@ -26,3 +26,21 @@ NEVER use emacsclient. That will interfer with the users configuration
 Always use `emacs -Q --batch --eval <lisp commands>`
 
 When testing updates to the rust server, always copy it to a temporary location and set `tramp-rpc-deploy-remote-directory` to the temporary path so that testing does not interfere with existing sessions.
+
+# Before pushing Elisp changes
+
+Always byte-compile all `.el` files before pushing to catch cross-module reference errors that CI will fail on. The project uses `byte-compile-error-on-warn`, so any missing `declare-function` for cross-module calls will fail the build.
+
+Run:
+
+```bash
+rm -f lisp/*.elc && emacs -Q --batch \
+  --eval "(require 'package)" \
+  --eval "(add-to-list 'package-archives '(\"melpa\" . \"https://melpa.org/packages/\") t)" \
+  --eval "(package-initialize)" \
+  --eval "(setq byte-compile-error-on-warn t)" \
+  --eval "(push \"$(pwd)/lisp\" load-path)" \
+  -f batch-byte-compile lisp/*.el
+```
+
+When adding a function in one module (e.g. `tramp-rpc.el`) and calling it from another (e.g. `tramp-rpc-process.el`), add a `declare-function` in the calling module. See the existing declarations at the top of each file for the pattern.
