@@ -100,7 +100,7 @@ On first connection, the server binary is automatically obtained and deployed:
 1. *Download* from GitHub Releases (fastest, ~850KB download)
 2. *Build from source* if Rust is installed and download fails
 
-The binary is cached locally in =~/.emacs.d/tramp-rpc/= and deployed to =~/.cache/tramp-rpc/= on the remote host.
+The binary is cached locally in =~/.emacs.d/tramp-rpc/= and deployed to =~/.cache/emacs/tramp-rpc/= on the remote host.
 
 ** Deployment Commands
 
