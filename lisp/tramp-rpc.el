@@ -659,13 +659,24 @@ following the pattern used by standard TRAMP."
      (tramp-rpc--debug "find-executable failed for %s: %S" program err)
      nil)))
 
+(defsubst tramp-rpc--port-to-string (port)
+  "Normalize PORT to a string, or return nil.
+PORT may be a number (from defaults), a string (from filename
+parsing via `tramp-dissect-file-name'), or nil (when unset).
+Upstream TRAMP always stores port as a string in the
+`tramp-file-name' struct, but defensive handling of numbers
+avoids breakage if callers supply numeric defaults."
+  (cond ((stringp port) port)
+        ((numberp port) (number-to-string port))
+        (t nil)))
+
 (defun tramp-rpc--connection-key (vec)
   "Generate a connection key for VEC.
 Includes the hop chain so that different multi-hop routes to the
 same host produce distinct connections."
   (list (tramp-file-name-host vec)
         (tramp-file-name-user vec)
-        (or (tramp-file-name-port vec) 22)
+        (or (tramp-rpc--port-to-string (tramp-file-name-port vec)) "22")
         (tramp-file-name-hop vec)))
 
 (defun tramp-rpc--get-connection (vec)
@@ -799,9 +810,9 @@ hops are accepted since ProxyJump only needs host connectivity."
                    (when (tramp-file-name-user hop-vec)
                      (concat (tramp-file-name-user hop-vec) "@"))
                    hop-host
-                   (when-let* ((port (tramp-file-name-port hop-vec)))
-                     (concat ":" (if (numberp port)
-                                     (number-to-string port) port))))
+                   (when-let* ((port (tramp-rpc--port-to-string
+                                      (tramp-file-name-port hop-vec))))
+                     (concat ":" port)))
                   proxy-parts))))
       (when proxy-parts
         (mapconcat #'identity (nreverse proxy-parts) ",")))))
@@ -814,7 +825,7 @@ hop so the socket is shared with the normal rpc connection."
   (let* ((sudo-ssh-user (tramp-rpc--detect-sudo-elevation vec))
          (host (tramp-file-name-host vec))
          (user (or sudo-ssh-user (tramp-file-name-user vec) (user-login-name)))
-         (port (or (tramp-file-name-port vec) 22))
+         (port (or (tramp-rpc--port-to-string (tramp-file-name-port vec)) "22"))
          ;; For sudo, use only proxy hops (exclude the same-host sudo hop)
          (hop (if sudo-ssh-user
                   (tramp-rpc--proxy-hop-string vec)
@@ -825,7 +836,7 @@ hop so the socket is shared with the normal rpc connection."
     ;; %C = hash of %l%h%p%r (we approximate this)
     (setq path (replace-regexp-in-string "%h" host path t t))
     (setq path (replace-regexp-in-string "%r" user path t t))
-    (setq path (replace-regexp-in-string "%p" (number-to-string port) path t t))
+    (setq path (replace-regexp-in-string "%p" port path t t))
     ;; For %C, use a simple hash approximation
     ;; Include the hop chain so different multi-hop routes get different sockets
     (setq path (replace-regexp-in-string
@@ -841,14 +852,14 @@ hop so the socket is shared with the normal rpc connection."
          (socket-path (tramp-rpc--controlmaster-socket-path vec))
          (host (tramp-file-name-host vec))
          (user (or sudo-ssh-user (tramp-file-name-user vec)))
-         (port (tramp-file-name-port vec))
+         (port (tramp-rpc--port-to-string (tramp-file-name-port vec)))
          (proxyjump (tramp-rpc--hops-to-proxyjump vec)))
     (and (file-exists-p socket-path)
          ;; Check if the socket is actually usable via ssh -O check
          (zerop (apply #'call-process "ssh" nil nil nil
                        (append
                         (when user (list "-l" user))
-                        (when port (list "-p" (number-to-string port)))
+                        (when port (list "-p" port))
                         (when proxyjump (list "-J" proxyjump))
                         (list "-o" (format "ControlPath=%s" socket-path)
                               "-O" "check"
@@ -868,7 +879,7 @@ Returns non-nil on success."
   (let* ((sudo-ssh-user (tramp-rpc--detect-sudo-elevation vec))
          (host (tramp-file-name-host vec))
          (user (or sudo-ssh-user (tramp-file-name-user vec)))
-         (port (tramp-file-name-port vec))
+         (port (tramp-rpc--port-to-string (tramp-file-name-port vec)))
          (proxyjump (tramp-rpc--hops-to-proxyjump vec))
          (socket-path (tramp-rpc--controlmaster-socket-path vec))
          (process-name (format "*tramp-rpc-auth %s*" host))
@@ -877,7 +888,7 @@ Returns non-nil on success."
                     (list "ssh")
                     tramp-rpc-ssh-args
                     (when user (list "-l" user))
-                    (when port (list "-p" (number-to-string port)))
+                    (when port (list "-p" port))
                     ;; Multi-hop via ProxyJump
                     (when proxyjump (list "-J" proxyjump))
                     ;; NO BatchMode - allow password prompts
@@ -923,7 +934,7 @@ Uses `tramp-process-actions' with `tramp-rpc--sudo-actions' for
 password handling, giving auth-source integration and password
 caching for free."
   (let* ((host (tramp-file-name-host vec))
-         (port (tramp-file-name-port vec))
+         (port (tramp-rpc--port-to-string (tramp-file-name-port vec)))
          (proxyjump (tramp-rpc--hops-to-proxyjump vec))
          (socket-path (tramp-rpc--controlmaster-socket-path vec))
          (process-name (format "*tramp-rpc-sudo %s*" host))
@@ -932,7 +943,7 @@ caching for free."
                     (list "ssh")
                     tramp-rpc-ssh-args
                     (when ssh-user (list "-l" ssh-user))
-                    (when port (list "-p" (number-to-string port)))
+                    (when port (list "-p" port))
                     ;; Multi-hop via ProxyJump
                     (when proxyjump (list "-J" proxyjump))
                     ;; Reuse ControlMaster for the SSH layer
@@ -972,7 +983,7 @@ Returns the connection plist.  Signals `remote-file-error' on failure."
   (let* ((sudo-ssh-user (tramp-rpc--detect-sudo-elevation vec))
          (host (tramp-file-name-host vec))
          (user (or sudo-ssh-user (tramp-file-name-user vec)))
-         (port (tramp-file-name-port vec))
+         (port (tramp-rpc--port-to-string (tramp-file-name-port vec)))
          (proxyjump (tramp-rpc--hops-to-proxyjump vec))
          ;; Build SSH command to run the RPC server
          (ssh-args (append
@@ -980,7 +991,7 @@ Returns the connection plist.  Signals `remote-file-error' on failure."
                     ;; Raw SSH arguments (e.g., -v, -F config)
                     tramp-rpc-ssh-args
                     (when user (list "-l" user))
-                    (when port (list "-p" (number-to-string port)))
+                    (when port (list "-p" port))
                     ;; Multi-hop via ProxyJump
                     (when proxyjump (list "-J" proxyjump))
                     ;; Only use BatchMode=yes when ControlMaster handles auth;
@@ -1165,7 +1176,7 @@ socket, then kills the auth process and buffer."
   (when tramp-rpc-use-controlmaster
     (let* ((host (tramp-file-name-host vec))
            (user (tramp-file-name-user vec))
-           (port (tramp-file-name-port vec))
+           (port (tramp-rpc--port-to-string (tramp-file-name-port vec)))
            (proxyjump (tramp-rpc--hops-to-proxyjump vec))
            (socket-path (tramp-rpc--controlmaster-socket-path vec))
            (auth-process-name (format "*tramp-rpc-auth %s*" host))
@@ -1179,7 +1190,7 @@ socket, then kills the auth process and buffer."
           (apply #'call-process "ssh" nil nil nil
                  (append
                   (when user (list "-l" user))
-                  (when port (list "-p" (number-to-string port)))
+                  (when port (list "-p" port))
                   (when proxyjump (list "-J" proxyjump))
                   (list "-o" (format "ControlPath=%s" socket-path)
                         "-O" "exit" host)))))
