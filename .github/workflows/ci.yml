@@ -365,7 +365,7 @@ jobs:
           VERSION=$(grep -oP 'AC_INIT\(\[Tramp\],\s*\[\K[^\]]+' ~/src/tramp/configure.ac)
           echo "Upstream Tramp version: $VERSION"
           sed -e "s/@PACKAGE_VERSION@/$VERSION/g" \
-              -e "s/@PACKAGE_BUGREPORT@/bug-gnu-emacs@gnu.org/g" \
+              -e "s/@PACKAGE_BUGREPORT@/tramp-devel@gnu.org/g" \
               -e "s/@EMACS_REQUIRED_VERSION@/28.1/g" \
               -e 's|@PACKAGE_URL@|https://www.gnu.org/software/tramp/|g' \
               -e 's/@TRAMP_EMACS_VERSION_CHECK@/"ok"/g' \
