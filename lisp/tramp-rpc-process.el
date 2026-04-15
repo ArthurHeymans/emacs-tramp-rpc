@@ -46,6 +46,7 @@
 (declare-function tramp-rpc--decode-output "tramp-rpc")
 (declare-function tramp-rpc--controlmaster-socket-path "tramp-rpc")
 (declare-function tramp-rpc--hops-to-proxyjump "tramp-rpc")
+(declare-function tramp-rpc--port-to-string "tramp-rpc")
 (declare-function tramp-rpc--ensure-inside-emacs-env "tramp-rpc")
 (declare-function tramp-rpc--caller-environment "tramp-rpc")
 (declare-function tramp-rpc-file-name-p "tramp-rpc")
@@ -560,7 +561,7 @@ LOCALNAME is the remote working directory.
 DIRENV-ENV is an optional alist of environment variables from direnv."
   (let* ((host (tramp-file-name-host vec))
          (user (tramp-file-name-user vec))
-         (port (tramp-file-name-port vec))
+         (port (tramp-rpc--port-to-string (tramp-file-name-port vec)))
          (program (car command))
          (program-args (cdr command))
          ;; Build environment exports for the remote command
@@ -607,7 +608,7 @@ DIRENV-ENV is an optional alist of environment variables from direnv."
                     tramp-rpc-ssh-args
                     ;; Connection parameters
                     (when user (list "-l" user))
-                    (when port (list "-p" (number-to-string port)))
+                    (when port (list "-p" port))
                     ;; Host and command
                     (list host remote-cmd)))
          ;; Normalize buffer
