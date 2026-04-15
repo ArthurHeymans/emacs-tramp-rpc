@@ -280,7 +280,7 @@ pub async fn read(params: Value) -> HandlerResult {
         "stdout" => stdout_val,
         "stderr" => stderr_val,
         "exited" => exit_status.is_some(),
-        "exit_code" => exit_status.map(|s| crate::protocol::exit_code_from_status(s)).map(|c| Value::Integer(c.into())).unwrap_or(Value::Nil)
+        "exit_code" => exit_status.map(crate::protocol::exit_code_from_status).map(|c| Value::Integer(c.into())).unwrap_or(Value::Nil)
     })
 }
 
@@ -394,7 +394,7 @@ pub async fn list(_params: Value) -> HandlerResult {
                 "os_pid" => managed.child.id().map(|id| Value::Integer((id as i64).into())).unwrap_or(Value::Nil),
                 "cmd" => managed.cmd.clone(),
                 "exited" => exited.is_some(),
-                "exit_code" => exited.map(|s| crate::protocol::exit_code_from_status(s)).map(|c| Value::Integer(c.into())).unwrap_or(Value::Nil)
+                "exit_code" => exited.map(crate::protocol::exit_code_from_status).map(|c| Value::Integer(c.into())).unwrap_or(Value::Nil)
             }
         })
         .collect();
