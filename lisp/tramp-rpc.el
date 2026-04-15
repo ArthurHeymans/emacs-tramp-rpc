@@ -1820,7 +1820,8 @@ If ORIGINAL-LOCALNAME is file-name-quoted, quote NEW-LOCALNAME too."
 
 (defun tramp-rpc--locate-dominating-before-stop-p (search-path dominating-dir)
   "Return non-nil when DOMINATING-DIR is reachable without crossing stop regexp.
-SEARCH-PATH is the lexical path used to start dominating-directory traversal."
+SEARCH-PATH and DOMINATING-DIR must use the same pathname form (remote/local)
+that `locate-dominating-stop-dir-regexp' is expected to match."
   (let ((stop locate-dominating-stop-dir-regexp))
     (if (or (null stop) (equal stop ""))
         t
@@ -1879,13 +1880,18 @@ to the built-in implementation."
                         (names . ,(vconcat names))))))
         (when-let* ((marker (car result))
                     (marker-path (tramp-rpc--decode-string marker)))
-          (let ((dominating-dir (file-name-directory marker-path)))
-            (when (tramp-rpc--locate-dominating-before-stop-p localname dominating-dir)
-              (tramp-make-tramp-file-name
-               v
-               (tramp-rpc--quote-localname
-                quoted-localname
-                dominating-dir)))))))))
+          (let* ((dominating-dir (file-name-directory marker-path))
+                 (search-remote
+                  (tramp-make-tramp-file-name
+                   v
+                   (tramp-rpc--quote-localname quoted-localname localname)))
+                 (dominating-remote
+                  (tramp-make-tramp-file-name
+                   v
+                   (tramp-rpc--quote-localname quoted-localname dominating-dir))))
+            (when (tramp-rpc--locate-dominating-before-stop-p
+                   search-remote dominating-remote)
+              dominating-remote)))))))
 
 (defun tramp-rpc--dir-locals-cache-update (file cache)
   "Call RPC helper for `dir-locals-find-file' update using FILE and CACHE."
