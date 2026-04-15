@@ -312,12 +312,12 @@ async fn dispatch_inner(request: Request) -> Response {
         // Parallel command execution and ancestor scanning
         "commands.run_parallel" => commands::run_parallel(params).await,
         "ancestors.scan" => commands::ancestors_scan(params).await,
-        "highlevel.test_files_in_dir" => commands::highlevel_test_files_in_dir(&params).await,
+        "highlevel.test_files_in_dir" => commands::highlevel_test_files_in_dir(params).await,
         "highlevel.locate_dominating_file_multi" => {
-            commands::highlevel_locate_dominating_file_multi(&params).await
+            commands::highlevel_locate_dominating_file_multi(params).await
         }
         "highlevel.dir_locals_find_file_cache_update" => {
-            commands::highlevel_dir_locals_find_file_cache_update(&params).await
+            commands::highlevel_dir_locals_find_file_cache_update(params).await
         }
 
         // Filesystem watch operations (for cache invalidation)

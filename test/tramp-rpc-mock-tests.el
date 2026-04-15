@@ -596,6 +596,38 @@ Returns the result or signals an error."
             (should (alist-get 'files locals)))))
     (tramp-rpc-mock-test--stop-server)))
 
+(ert-deftest tramp-rpc-mock-test-server-highlevel-dir-locals-cache-update-preserves-symlink-path ()
+  "Ensure dir-locals cache update keeps lexical symlink paths."
+  :tags '(:server)
+  (skip-unless tramp-rpc-mock-test--msgpack-available)
+  (skip-unless (tramp-rpc-mock-test--find-server))
+  (skip-unless (not (memq system-type '(windows-nt ms-dos))))
+  (unwind-protect
+      (progn
+        (tramp-rpc-mock-test--start-server)
+        (let* ((real-root (expand-file-name "highlevel-cache-real" tramp-rpc-mock-test-temp-dir))
+               (link-root (expand-file-name "highlevel-cache-link" tramp-rpc-mock-test-temp-dir))
+               (deep (expand-file-name "a/b/c" link-root))
+               (file (expand-file-name "new-file.txt" deep)))
+          (make-directory (expand-file-name "a/b/c" real-root) t)
+          (with-temp-file (expand-file-name ".dir-locals.el" real-root) (insert "((nil . nil))"))
+          (ignore-errors (delete-file link-root))
+          (make-symbolic-link real-root link-root)
+          (let* ((result (tramp-rpc-mock-test--rpc-call
+                          "highlevel.dir_locals_find_file_cache_update"
+                          `((file . ,(encode-coding-string file 'utf-8))
+                            (names . [".dir-locals.el"])
+                            (cache_dirs . [,(encode-coding-string link-root 'utf-8)]))))
+                 (locals (alist-get 'locals result))
+                 (cache (alist-get 'cache result)))
+            (should (alist-get 'file result))
+            (should (string-match-p "/highlevel-cache-link/" (alist-get 'file result)))
+            (should locals)
+            (should (string-match-p "/highlevel-cache-link\\'" (alist-get 'dir locals)))
+            (should cache)
+            (should (string-match-p "/highlevel-cache-link\\'" (alist-get 'dir cache))))))
+    (tramp-rpc-mock-test--stop-server)))
+
 (ert-deftest tramp-rpc-mock-test-server-process-run ()
   "Test process.run RPC call."
   :tags '(:server :process)
@@ -1122,6 +1154,15 @@ as a hop in multi-hop chains."
        (lambda () (setq orig-called t)))
       (should orig-called))))
 
+(ert-deftest tramp-rpc-mock-test-dir-locals-cache-covers-uses-containment ()
+  "Ensure cache coverage check uses containment, not string length."
+  :tags '(:dir-locals)
+  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
+  (let ((locals "/tmp/a/very-long-dirname/")
+        (cache "/tmp/a/b/c/d/"))
+    ;; String length can disagree with depth here; containment should win.
+    (should (tramp-rpc--dir-locals-cache-covers-p locals cache))))
+
 (ert-deftest tramp-rpc-mock-test-locate-dominating-file-unquotes-and-requotes-paths ()
   "Ensure locate-dominating handler unquotes RPC paths for transport.
 Quoted RPC localnames (/: prefix) must be unquoted for server filesystem
@@ -1139,6 +1180,19 @@ operations and re-quoted on the way back."
              (result (tramp-rpc-handle-locate-dominating-file "foo" ".git")))
         (should (equal captured-file "/tmp/tramp-rpc-root/subdir/foo"))
         (should (equal result "/rpc:host:/:/tmp/tramp-rpc-root/"))))))
+
+(ert-deftest tramp-rpc-mock-test-locate-dominating-file-respects-stop-regexp ()
+  "Ensure locate-dominating handler filters results above stop regexp."
+  :tags '(:dir-locals)
+  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
+  (cl-letf (((symbol-function 'tramp-rpc--call)
+             (lambda (_vec method _params)
+               (should (string= method "highlevel.locate_dominating_file_multi"))
+               (list (encode-coding-string "/tmp/tramp-rpc-root/.git" 'utf-8 t)))))
+    (let* ((default-directory "/rpc:host:/tmp/tramp-rpc-root/a/b/c/")
+           (locate-dominating-stop-dir-regexp
+            (regexp-quote "/tmp/tramp-rpc-root/a/b/")))
+      (should-not (tramp-rpc-handle-locate-dominating-file "foo" ".git")))))
 
 (ert-deftest tramp-rpc-mock-test-dir-locals-all-files-unquotes-and-requotes-paths ()
   "Ensure dir-locals-all-files handler preserves quoted RPC localnames."

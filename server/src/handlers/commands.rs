@@ -247,6 +247,20 @@ fn find_dominating_dir(start_dir: &Path, names: &[String]) -> Option<(PathBuf, V
     }
 }
 
+fn remap_to_lexical_ancestor(start_dir: &Path, found_dir: &Path) -> PathBuf {
+    let canonical_found = canonical_or_original(found_dir);
+    let mut current = start_dir.to_path_buf();
+    loop {
+        if canonical_or_original(&current) == canonical_found {
+            return current;
+        }
+        match current.parent() {
+            Some(parent) if parent != current => current = parent.to_path_buf(),
+            _ => return found_dir.to_path_buf(),
+        }
+    }
+}
+
 fn mtime_seconds(path: &Path) -> Option<i64> {
     let modified = std::fs::metadata(path).ok()?.modified().ok()?;
     let duration = modified.duration_since(UNIX_EPOCH).ok()?;
@@ -254,15 +268,14 @@ fn mtime_seconds(path: &Path) -> Option<i64> {
 }
 
 /// Return readable regular files from a directory for a list of names.
-pub async fn highlevel_test_files_in_dir(params: &Value) -> HandlerResult {
+pub async fn highlevel_test_files_in_dir(params: Value) -> HandlerResult {
     #[derive(Deserialize)]
     struct Params {
         directory: String,
         names: Vec<String>,
     }
 
-    let params: Params =
-        from_value(params.clone()).map_err(|e| RpcError::invalid_params(e.to_string()))?;
+    let params: Params = from_value(params).map_err(|e| RpcError::invalid_params(e.to_string()))?;
 
     tokio::task::spawn_blocking(move || {
         let dir = canonical_or_original(Path::new(&params.directory));
@@ -286,15 +299,14 @@ pub async fn highlevel_test_files_in_dir(params: &Value) -> HandlerResult {
 /// Locate marker files in ancestor directories.
 ///
 /// Returns marker paths from the first ancestor that contains any markers.
-pub async fn highlevel_locate_dominating_file_multi(params: &Value) -> HandlerResult {
+pub async fn highlevel_locate_dominating_file_multi(params: Value) -> HandlerResult {
     #[derive(Deserialize)]
     struct Params {
         file: String,
         names: Vec<String>,
     }
 
-    let params: Params =
-        from_value(params.clone()).map_err(|e| RpcError::invalid_params(e.to_string()))?;
+    let params: Params = from_value(params).map_err(|e| RpcError::invalid_params(e.to_string()))?;
 
     tokio::task::spawn_blocking(move || {
         let path = PathBuf::from(&params.file);
@@ -322,7 +334,7 @@ pub async fn highlevel_locate_dominating_file_multi(params: &Value) -> HandlerRe
 }
 
 /// Prepare dir-locals data in one RPC call.
-pub async fn highlevel_dir_locals_find_file_cache_update(params: &Value) -> HandlerResult {
+pub async fn highlevel_dir_locals_find_file_cache_update(params: Value) -> HandlerResult {
     #[derive(Deserialize)]
     struct Params {
         file: String,
@@ -331,18 +343,13 @@ pub async fn highlevel_dir_locals_find_file_cache_update(params: &Value) -> Hand
         cache_dirs: Vec<String>,
     }
 
-    let params: Params =
-        from_value(params.clone()).map_err(|e| RpcError::invalid_params(e.to_string()))?;
+    let params: Params = from_value(params).map_err(|e| RpcError::invalid_params(e.to_string()))?;
 
     tokio::task::spawn_blocking(move || {
         let file_path = PathBuf::from(&params.file);
-        let resolved_file = if file_path.exists() {
-            canonical_or_original(&file_path)
-        } else {
-            file_path.clone()
-        };
-
-        let file_value = resolved_file.to_string_lossy().to_string().into_value();
+        // Keep lexical (non-canonical) path shape to match locate-dominating behavior.
+        let lexical_file = file_path.clone();
+        let file_value = lexical_file.to_string_lossy().to_string().into_value();
 
         let Some(existing_start) = find_existing_start(&file_path) else {
             return Ok(msgpack_map! {
@@ -351,7 +358,7 @@ pub async fn highlevel_dir_locals_find_file_cache_update(params: &Value) -> Hand
                 "cache" => Value::Nil
             });
         };
-        let Some(start_dir) = as_search_dir(&canonical_or_original(existing_start)) else {
+        let Some(start_dir) = as_search_dir(existing_start) else {
             return Ok(msgpack_map! {
                 "file" => file_value,
                 "locals" => Value::Nil,
@@ -361,6 +368,7 @@ pub async fn highlevel_dir_locals_find_file_cache_update(params: &Value) -> Hand
 
         let locals_value =
             if let Some((locals_dir, _)) = find_dominating_dir(&start_dir, &params.names) {
+                let locals_dir = remap_to_lexical_ancestor(&start_dir, &locals_dir);
                 let local_files: Vec<Value> = params
                     .names
                     .iter()
@@ -390,7 +398,7 @@ pub async fn highlevel_dir_locals_find_file_cache_update(params: &Value) -> Hand
         for cache_dir in &params.cache_dirs {
             let p = PathBuf::from(cache_dir);
             if p.is_dir()
-                && resolved_file.starts_with(&p)
+                && lexical_file.starts_with(&p)
                 && best_cache
                     .as_ref()
                     .map(|best| p.components().count() > best.components().count())

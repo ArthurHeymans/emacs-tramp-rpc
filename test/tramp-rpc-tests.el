@@ -1396,6 +1396,22 @@ This is the root cause of the lsp-mode crash reported with tramp-rpc."
             (actual (locate-dominating-file target ".git")))
         (should (equal expected actual))))))
 
+(ert-deftest tramp-rpc-test19-locate-dominating-file-stop-regexp ()
+  "Ensure stop-dir regexp behavior matches baseline locate-dominating-file."
+  (skip-unless (tramp-rpc-test-enabled))
+  (tramp-rpc-test--with-temp-dir root
+    (let* ((deep (concat root "/a/b/c/d"))
+           (target (concat deep "/target.txt"))
+           (stop-dir (file-name-as-directory (concat root "/a/b")))
+           (locate-dominating-stop-dir-regexp (regexp-quote stop-dir)))
+      (make-directory deep t)
+      (make-directory (concat root "/.git") t)
+      (write-region "x" nil target)
+      (let ((expected (tramp-run-real-handler #'locate-dominating-file
+                                              (list target ".git")))
+            (actual (locate-dominating-file target ".git")))
+        (should (equal expected actual))))))
+
 (ert-deftest tramp-rpc-test19-dir-locals-all-files ()
   "Ensure optimized `dir-locals--all-files' matches baseline behavior."
   (skip-unless (tramp-rpc-test-enabled))
