@@ -227,8 +227,14 @@ fn as_search_dir(path: &Path) -> Option<PathBuf> {
     }
 }
 
-fn find_dominating_dir(start_dir: &Path, names: &[String]) -> Option<(PathBuf, Vec<String>)> {
+const MAX_DOMINATING_DEPTH: usize = 100;
+
+fn find_dominating_dir(
+    start_dir: &Path,
+    names: &[String],
+) -> Result<Option<(PathBuf, Vec<String>)>, RpcError> {
     let mut current = start_dir.to_path_buf();
+    let mut depth = 0usize;
     loop {
         let found: Vec<String> = names
             .iter()
@@ -237,12 +243,21 @@ fn find_dominating_dir(start_dir: &Path, names: &[String]) -> Option<(PathBuf, V
             .collect();
 
         if !found.is_empty() {
-            return Some((current, found));
+            return Ok(Some((current, found)));
         }
 
         match current.parent() {
-            Some(parent) if parent != current => current = parent.to_path_buf(),
-            _ => return None,
+            Some(parent) if parent != current => {
+                if depth >= MAX_DOMINATING_DEPTH {
+                    return Err(RpcError::invalid_params(format!(
+                        "Maximum ancestor traversal depth ({}) exceeded",
+                        MAX_DOMINATING_DEPTH
+                    )));
+                }
+                current = parent.to_path_buf();
+                depth += 1;
+            }
+            _ => return Ok(None),
         }
     }
 }
@@ -319,7 +334,7 @@ pub async fn highlevel_locate_dominating_file_multi(params: Value) -> HandlerRes
             return Ok(Value::Array(vec![]));
         };
 
-        let Some((dir, found_names)) = find_dominating_dir(&start_dir, &params.names) else {
+        let Some((dir, found_names)) = find_dominating_dir(&start_dir, &params.names)? else {
             return Ok(Value::Array(vec![]));
         };
 
@@ -367,7 +382,7 @@ pub async fn highlevel_dir_locals_find_file_cache_update(params: Value) -> Handl
         };
 
         let locals_value =
-            if let Some((locals_dir, _)) = find_dominating_dir(&start_dir, &params.names) {
+            if let Some((locals_dir, _)) = find_dominating_dir(&start_dir, &params.names)? {
                 let locals_dir = remap_to_lexical_ancestor(&start_dir, &locals_dir);
                 let local_files: Vec<Value> = params
                     .names

@@ -550,6 +550,32 @@ Returns the result or signals an error."
             (should (string-match-p "/\\.git\\'" first)))))
     (tramp-rpc-mock-test--stop-server)))
 
+(ert-deftest tramp-rpc-mock-test-server-highlevel-locate-dominating-file-depth-limit ()
+  "Ensure dominating-file helper errors after 100 ancestor levels."
+  :tags '(:server)
+  (skip-unless tramp-rpc-mock-test--msgpack-available)
+  (skip-unless (tramp-rpc-mock-test--find-server))
+  (unwind-protect
+      (progn
+        (tramp-rpc-mock-test--start-server)
+        (let* ((root (expand-file-name "highlevel-depth-limit" tramp-rpc-mock-test-temp-dir))
+               (deep-rel (mapconcat (lambda (n) (format "d%03d" n))
+                                    (number-sequence 1 110) "/"))
+               (deep (expand-file-name deep-rel root))
+               (file (expand-file-name "file.txt" deep)))
+          (make-directory deep t)
+          (make-directory (expand-file-name ".git" root) t)
+          (with-temp-file file (insert "x"))
+          (let ((result (tramp-rpc-mock-test--rpc-call
+                         "highlevel.locate_dominating_file_multi"
+                         `((file . ,(encode-coding-string file 'utf-8))
+                           (names . [".git"])))))
+            (should (stringp (plist-get result :error)))
+            (should (string-match-p
+                     "Maximum ancestor traversal depth (100) exceeded"
+                     (plist-get result :error))))))
+    (tramp-rpc-mock-test--stop-server)))
+
 (ert-deftest tramp-rpc-mock-test-server-highlevel-test-files-in-dir ()
   "Test high-level dir-locals file listing RPC helper."
   :tags '(:server)
@@ -626,6 +652,32 @@ Returns the result or signals an error."
             (should (string-match-p "/highlevel-cache-link\\'" (alist-get 'dir locals)))
             (should cache)
             (should (string-match-p "/highlevel-cache-link\\'" (alist-get 'dir cache))))))
+    (tramp-rpc-mock-test--stop-server)))
+
+(ert-deftest tramp-rpc-mock-test-server-highlevel-dir-locals-cache-update-depth-limit ()
+  "Ensure dir-locals cache helper errors after 100 ancestor levels."
+  :tags '(:server)
+  (skip-unless tramp-rpc-mock-test--msgpack-available)
+  (skip-unless (tramp-rpc-mock-test--find-server))
+  (unwind-protect
+      (progn
+        (tramp-rpc-mock-test--start-server)
+        (let* ((root (expand-file-name "highlevel-cache-depth-limit" tramp-rpc-mock-test-temp-dir))
+               (deep-rel (mapconcat (lambda (n) (format "d%03d" n))
+                                    (number-sequence 1 110) "/"))
+               (deep (expand-file-name deep-rel root))
+               (file (expand-file-name "new-file.txt" deep)))
+          (make-directory deep t)
+          (with-temp-file (expand-file-name ".dir-locals.el" root) (insert "((nil . nil))"))
+          (let ((result (tramp-rpc-mock-test--rpc-call
+                         "highlevel.dir_locals_find_file_cache_update"
+                         `((file . ,(encode-coding-string file 'utf-8))
+                           (names . [".dir-locals.el"])
+                           (cache_dirs . [])))))
+            (should (stringp (plist-get result :error)))
+            (should (string-match-p
+                     "Maximum ancestor traversal depth (100) exceeded"
+                     (plist-get result :error))))))
     (tramp-rpc-mock-test--stop-server)))
 
 (ert-deftest tramp-rpc-mock-test-server-process-run ()
