@@ -724,7 +724,8 @@ This bypasses the expensive `file-relative-name' calls in hybrid mode."
       (setq files (gethash project-root projectile-projects-cache)))
     ;; If not cached, fetch and cache
     (unless files
-      (setq files (projectile-dir-files-alien project-root))
+      (setq files (let ((projectile-git-use-fd nil))
+              (projectile-dir-files-alien project-root)))
       (when (and (bound-and-true-p projectile-enable-caching)
                  (boundp 'projectile-projects-cache)
                  (boundp 'projectile-projects-cache-time)
