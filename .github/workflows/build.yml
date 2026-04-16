@@ -39,11 +39,11 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Restore binary from cache
         id: cache-binary
-        uses: actions/cache/restore@v4
+        uses: actions/cache/restore@v5
         with:
           path: target/${{ inputs.target }}/release/tramp-rpc-server
           key: rust-binary-${{ inputs.target }}-${{ hashFiles('server/**', 'Cargo.toml', 'Cargo.lock', 'flake.nix', 'flake.lock', '.cargo/**') }}
@@ -63,7 +63,7 @@ jobs:
 
       - name: Install Nix
         if: steps.cache-binary.outputs.cache-hit != 'true'
-        uses: cachix/install-nix-action@v20
+        uses: cachix/install-nix-action@v31
         with:
           nix_path: nixpkgs=channel:nixos-unstable
 
@@ -88,14 +88,14 @@ jobs:
 
       - name: Save binary to cache
         if: steps.cache-binary.outputs.cache-hit != 'true'
-        uses: actions/cache/save@v4
+        uses: actions/cache/save@v5
         with:
           path: target/${{ inputs.target }}/release/tramp-rpc-server
           key: rust-binary-${{ inputs.target }}-${{ hashFiles('server/**', 'Cargo.toml', 'Cargo.lock', 'flake.nix', 'flake.lock', '.cargo/**') }}
 
       - name: Upload binary for CI
         if: ${{ !inputs.upload }}
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: tramp-rpc-server-${{ inputs.target }}
           path: target/${{ inputs.target }}/release/tramp-rpc-server
@@ -118,7 +118,7 @@ jobs:
 
       - name: Upload artifacts
         if: inputs.upload
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: tramp-rpc-server-${{ inputs.target }}
           path: |
