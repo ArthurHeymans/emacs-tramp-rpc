@@ -706,10 +706,10 @@ magit-status on remote repositories."
 
 (defun tramp-rpc-handle-projectile-dir-files (directory)
   "Handler to use alien indexing for remote project files.
-Disables fd for remote directories because `projectile-get-ext-command'
-checks fd availability via `executable-find' on the LOCAL machine,
-but fd may not be available on the REMOTE.  Binding
-`projectile-git-use-fd' to nil forces git ls-files instead."
+`projectile-dir-files-alien' (via `projectile-get-ext-command') checks
+fd availability via `executable-find' on the LOCAL machine, but fd may
+not be available on the REMOTE.  Binding `projectile-git-use-fd' to nil
+forces git ls-files instead."
   (let ((projectile-git-use-fd nil))
     (projectile-dir-files-alien directory)))
 
@@ -724,8 +724,7 @@ This bypasses the expensive `file-relative-name' calls in hybrid mode."
       (setq files (gethash project-root projectile-projects-cache)))
     ;; If not cached, fetch and cache
     (unless files
-      (setq files (let ((projectile-git-use-fd nil))
-              (projectile-dir-files-alien project-root)))
+      (setq files (tramp-rpc-handle-projectile-dir-files project-root))
       (when (and (bound-and-true-p projectile-enable-caching)
                  (boundp 'projectile-projects-cache)
                  (boundp 'projectile-projects-cache-time)
