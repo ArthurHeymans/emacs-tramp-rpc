@@ -1800,40 +1800,37 @@ If ORIGINAL-LOCALNAME is file-name-quoted, quote NEW-LOCALNAME too."
       (file-name-quote new-localname)
     new-localname))
 
-(defun tramp-rpc--parent-directory (directory)
-  "Return parent directory for DIRECTORY, or nil at filesystem root."
-  (let* ((current (directory-file-name directory))
-         (parent (file-name-directory current)))
-    (when parent
-      (let ((parent (directory-file-name parent)))
-        (unless (equal parent current)
-          parent)))))
-
-(defun tramp-rpc--locate-search-directory (path)
-  "Return lexical search directory for locate-dominating PATH."
-  (if (string-suffix-p "/" path)
-      (directory-file-name path)
-    (let ((normalized (directory-file-name path)))
-      (or (and (file-name-directory normalized)
-               (directory-file-name (file-name-directory normalized)))
-          normalized))))
-
 (defun tramp-rpc--locate-dominating-before-stop-p (search-path dominating-dir)
   "Return non-nil when DOMINATING-DIR is reachable without crossing stop regexp.
-SEARCH-PATH and DOMINATING-DIR must use the same pathname form (remote/local)
-that `locate-dominating-stop-dir-regexp' is expected to match."
+
+Mirrors the stop-regexp loop in stock `locate-dominating-file': the regexp
+is matched against every path visited during the walk, INCLUSIVE of the
+starting path and the dominating directory itself, in whatever form each
+path naturally takes as the walk peels off trailing components.
+
+SEARCH-PATH and DOMINATING-DIR must use the same pathname form (remote
+or local) that `locate-dominating-stop-dir-regexp' is expected to match."
   (let ((stop locate-dominating-stop-dir-regexp))
     (if (or (null stop) (equal stop ""))
         t
-      (let ((current (tramp-rpc--locate-search-directory search-path))
-            (target (directory-file-name dominating-dir))
-            (blocked nil))
-        (while (and current (not blocked) (not (equal current target)))
-          (when (string-match-p stop (file-name-as-directory current))
-            (setq blocked t))
-          (setq current (tramp-rpc--parent-directory current)))
-        (and (not blocked)
-             (equal current target))))))
+      (let ((current search-path)
+            (target (file-name-as-directory dominating-dir))
+            (result nil))
+        (catch 'done
+          (while current
+            ;; Stock `locate-dominating-file' runs `string-match' at every
+            ;; step before looking for the marker, including on the
+            ;; dominating directory when the walk arrives there.
+            (when (string-match stop current)
+              (throw 'done nil))
+            (when (equal (file-name-as-directory current) target)
+              (setq result t)
+              (throw 'done t))
+            (let ((parent (file-name-directory (directory-file-name current))))
+              (if (or (null parent) (equal parent current))
+                  (throw 'done nil)
+                (setq current parent)))))
+        result))))
 
 (defun tramp-rpc-handle-dir-locals--all-files (directory &optional base-el-only)
   "Like `dir-locals--all-files' for TRAMP-RPC files.
@@ -1926,52 +1923,71 @@ to the built-in implementation."
           (setq latest f-time))))))
 
 (defun tramp-rpc--dir-locals-cache-covers-p (locals-dir cache-dir)
-  "Return non-nil when CACHE-DIR is at or below LOCALS-DIR."
-  (let ((locals (directory-file-name locals-dir))
-        (cache (directory-file-name cache-dir)))
-    (or (equal locals cache)
-        (file-in-directory-p cache locals))))
+  "Return non-nil when CACHE-DIR is at or below LOCALS-DIR.
+This is a purely lexical comparison -- unlike `file-in-directory-p' it
+does not require LOCALS-DIR to exist on the filesystem and does not
+issue any remote calls through TRAMP.  Both arguments must already be
+absolute, normalised paths in the same form (e.g. both remote TRAMP
+paths or both local)."
+  (let ((locals (file-name-as-directory locals-dir))
+        (cache (file-name-as-directory cache-dir)))
+    ;; `file-name-as-directory' ensures a boundary slash, so the prefix
+    ;; check correctly rejects siblings like `/tmp/a/' vs `/tmp/a-b/'.
+    (string-prefix-p locals cache)))
 
 (defun tramp-rpc-handle-dir-locals-find-file (file)
   "Like `dir-locals-find-file' for TRAMP-RPC files."
-  (let* ((file (if (file-name-absolute-p file)
-                   file
-                 (file-name-concat default-directory file)))
-         (file-connection (file-remote-p file))
-         (cache-update (tramp-rpc--dir-locals-cache-update file dir-locals-directory-cache))
-         (locals-dir-update (alist-get 'locals cache-update))
-         (locals-dir (when locals-dir-update
-                       (file-name-as-directory
-                        (concat file-connection
-                                (tramp-rpc--decode-string
-                                 (alist-get 'dir locals-dir-update))))))
-         (cache-dir-update (alist-get 'cache cache-update))
-         (cache-dir (when cache-dir-update
-                      (file-name-as-directory
-                       (concat file-connection
-                               (tramp-rpc--decode-string
-                                (alist-get 'dir cache-dir-update))))))
-         (dir-elt (when cache-dir
-                    (seq-find (lambda (elt) (string= (car elt) cache-dir))
-                              dir-locals-directory-cache))))
-    (if (and dir-elt
-             (or (null locals-dir)
-                 (tramp-rpc--dir-locals-cache-covers-p locals-dir (car dir-elt))))
-        ;; Potential cache hit, verify mtimes.
-        (if (or (null (nth 2 dir-elt))
-                (let ((cached-files (alist-get 'files cache-dir-update)))
-                  (and cached-files
-                       (time-equal-p
-                        (nth 2 dir-elt)
-                        (tramp-rpc--dir-locals-latest-mtime cached-files)))))
-            dir-elt
-          (progn
-            ;; Cache entry invalid, clear and return discovered locals dir.
-            (setq dir-locals-directory-cache
-                  (delq dir-elt dir-locals-directory-cache))
-            locals-dir))
-      ;; No cache entry.
-      locals-dir)))
+  (let ((file (if (file-name-absolute-p file)
+                  file
+                (file-name-concat default-directory file))))
+    (with-parsed-tramp-file-name file nil
+      ;; Preserve file-name-quoted (/: prefix) shape when reconstructing
+      ;; returned TRAMP paths, so cache lookups in
+      ;; `dir-locals-directory-cache' match entries populated through the
+      ;; same quoted access path.
+      (let* ((quoted-localname localname)
+             (cache-update (tramp-rpc--dir-locals-cache-update
+                            file dir-locals-directory-cache))
+             (locals-dir-update (alist-get 'locals cache-update))
+             (locals-dir
+              (when locals-dir-update
+                (file-name-as-directory
+                 (tramp-make-tramp-file-name
+                  v
+                  (tramp-rpc--quote-localname
+                   quoted-localname
+                   (tramp-rpc--decode-string
+                    (alist-get 'dir locals-dir-update)))))))
+             (cache-dir-update (alist-get 'cache cache-update))
+             (cache-dir
+              (when cache-dir-update
+                (file-name-as-directory
+                 (tramp-make-tramp-file-name
+                  v
+                  (tramp-rpc--quote-localname
+                   quoted-localname
+                   (tramp-rpc--decode-string
+                    (alist-get 'dir cache-dir-update)))))))
+             (dir-elt (when cache-dir
+                        (seq-find (lambda (elt) (string= (car elt) cache-dir))
+                                  dir-locals-directory-cache))))
+        (if (and dir-elt
+                 (or (null locals-dir)
+                     (tramp-rpc--dir-locals-cache-covers-p locals-dir (car dir-elt))))
+            ;; Potential cache hit, verify mtimes.
+            (if (or (null (nth 2 dir-elt))
+                    (let ((cached-files (alist-get 'files cache-dir-update)))
+                      (and cached-files
+                           (time-equal-p
+                            (nth 2 dir-elt)
+                            (tramp-rpc--dir-locals-latest-mtime cached-files)))))
+                dir-elt
+              ;; Cache entry invalid, clear and return discovered locals dir.
+              (setq dir-locals-directory-cache
+                    (delq dir-elt dir-locals-directory-cache))
+              locals-dir)
+          ;; No cache entry.
+          locals-dir)))))
 
 ;; ============================================================================
 ;; Directory operations
@@ -3046,10 +3062,14 @@ Also controls process exit detection latency."
     ;; RPC-based path and VC operations
     ;; =========================================================================
     (expand-file-name . tramp-rpc-handle-expand-file-name)
-    (locate-dominating-file . tramp-rpc-handle-locate-dominating-file)
-    (dir-locals--all-files . tramp-rpc-handle-dir-locals--all-files)
-    (dir-locals-find-file . tramp-rpc-handle-dir-locals-find-file)
     (vc-registered . tramp-rpc-handle-vc-registered)
+
+    ;; Note: `locate-dominating-file', `dir-locals--all-files', and
+    ;; `dir-locals-find-file' are registered via
+    ;; `tramp-add-external-operation' below (after `(provide 'tramp-rpc)').
+    ;; That API adds the handler to this alist AND installs the advice that
+    ;; dispatches these non-magic operations through TRAMP's handler
+    ;; machinery, so a literal entry here would be redundant.
 
     ;; =========================================================================
     ;; Generic TRAMP handlers (work with any backend, no remote I/O needed)
