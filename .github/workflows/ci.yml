@@ -35,6 +35,26 @@ jobs:
             os: macos-latest
             target: aarch64-apple-darwin
 
+  rust-extra:
+    name: Build ${{ matrix.name }}
+    uses: ./.github/workflows/build.yml
+    with:
+      target: ${{ matrix.target }}
+      os: ubuntu-latest
+      test: false
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Linux i686
+            target: i686-unknown-linux-musl
+          - name: Linux armv7 (Allwinner A20/H3)
+            target: armv7-unknown-linux-musleabihf
+          - name: Linux armv5te (AST2500)
+            target: armv5te-unknown-linux-musleabi
+          - name: Linux arm/ARMv6 (Raspberry Pi 1)
+            target: arm-unknown-linux-musleabihf
+
   format:
     name: Rust Format Check
     runs-on: ubuntu-latest
@@ -434,7 +454,7 @@ jobs:
   summary:
     name: Test Summary
     runs-on: ubuntu-latest
-    needs: [rust, elisp, test-autoload, test-protocol, test-multi-hop, test-server, test-full-suite, test-upstream-tramp]
+    needs: [rust, rust-extra, elisp, test-autoload, test-protocol, test-multi-hop, test-server, test-full-suite, test-upstream-tramp]
     if: always()
 
     steps:
@@ -442,6 +462,7 @@ jobs:
         run: |
           echo "=== CI Summary ==="
           echo "Rust: ${{ needs.rust.result }}"
+          echo "Rust Extra: ${{ needs.rust-extra.result }}"
           echo "Elisp: ${{ needs.elisp.result }}"
           echo "Autoload Tests: ${{ needs.test-autoload.result }}"
           echo "Protocol Tests: ${{ needs.test-protocol.result }}"
@@ -451,6 +472,7 @@ jobs:
           echo "Upstream Tramp Tests: ${{ needs.test-upstream-tramp.result }}"
 
           if [[ "${{ needs.rust.result }}" != "success" ]] || \
+             [[ "${{ needs.rust-extra.result }}" != "success" ]] || \
              [[ "${{ needs.elisp.result }}" != "success" ]] || \
              [[ "${{ needs.test-autoload.result }}" != "success" ]] || \
              [[ "${{ needs.test-protocol.result }}" != "success" ]] || \
