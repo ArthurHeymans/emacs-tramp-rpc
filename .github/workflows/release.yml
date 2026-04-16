@@ -103,16 +103,21 @@ jobs:
           VERSION=${{ steps.version.outputs.version }}
           TAG=${{ steps.version.outputs.tag }}
 
-          # Find the previous tag
-          PREV_TAG=$(git tag --sort=-v:refname | grep -v "^${TAG}$" | head -1)
+          # Use the tag annotation if present, otherwise fall back to commit log
+          TAG_ANNOTATION=$(git tag -l --format='%(contents)' "${TAG}")
 
-          # Generate changelog from commits
-          if [ -n "$PREV_TAG" ]; then
-            CHANGELOG=$(git log ${PREV_TAG}..${TAG} --oneline --no-merges --pretty=format:"- %s" | grep -v "^- Bump tramp-rpc-deploy version")
-            RANGE="${PREV_TAG}...${TAG}"
-          else
-            CHANGELOG=$(git log --oneline --no-merges --pretty=format:"- %s" | head -20)
+          if [ -n "$TAG_ANNOTATION" ]; then
+            CHANGELOG="${TAG_ANNOTATION}"
             RANGE=""
+          else
+            PREV_TAG=$(git tag --sort=-v:refname | grep -v "^${TAG}$" | head -1)
+            if [ -n "$PREV_TAG" ]; then
+              CHANGELOG=$(git log ${PREV_TAG}..${TAG} --oneline --no-merges --pretty=format:"- %s" | grep -v "^- Bump tramp-rpc-deploy version")
+              RANGE="${PREV_TAG}...${TAG}"
+            else
+              CHANGELOG=$(git log --oneline --no-merges --pretty=format:"- %s" | head -20)
+              RANGE=""
+            fi
           fi
 
           # Write the release body
@@ -122,8 +127,6 @@ jobs:
           ### What's Changed
 
           ${CHANGELOG}
-
-          **Full Changelog**: https://github.com/${{ github.repository }}/compare/${RANGE}
 
           ### Installation
 
