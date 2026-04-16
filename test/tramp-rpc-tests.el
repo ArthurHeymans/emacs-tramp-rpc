@@ -123,6 +123,18 @@ When set, cross-remote tests (copy/rename between different hosts) are run.")
   "Cached result of `tramp-rpc-test-enabled'.
 Value is a cons cell (CHECKED . RESULT).")
 
+(defun tramp-rpc-test--clear-call-count-caches ()
+  "Clear TRAMP/TRAMP-RPC caches before call-count measurement."
+  (maphash
+   (lambda (_key conn)
+     (let* ((proc (plist-get conn :process))
+            (vec (and proc (process-get proc :tramp-rpc-vec))))
+       (when vec
+         (tramp-flush-directory-properties vec "/")
+         (tramp-flush-connection-properties vec)
+         (tramp-rpc--clear-file-caches-for-connection vec))))
+   tramp-rpc--connections))
+
 (defun tramp-rpc-test--run-with-call-count (thunk)
   "Run THUNK and return (RESULT . RPC-CALL-COUNT)."
   (let ((count 0)
@@ -131,6 +143,7 @@ Value is a cons cell (CHECKED . RESULT).")
         (orig-call-batch (symbol-function 'tramp-rpc--call-batch))
         (orig-call-async (symbol-function 'tramp-rpc--call-async))
         (orig-send-requests (symbol-function 'tramp-rpc--send-requests)))
+    (tramp-rpc-test--clear-call-count-caches)
     (cl-letf (((symbol-function 'tramp-rpc--call-with-timeout)
                (lambda (vec method params total-timeout poll-interval)
                  (cl-incf count)
@@ -363,7 +376,7 @@ The directory is deleted after BODY completes."
 
   ;; Existing file
   (tramp-rpc-test--with-temp-file tmp "test content"
-    (should (tramp-rpc-test--with-call-count 1
+    (should (tramp-rpc-test--with-call-count 3
               (file-writable-p tmp))))
 
   ;; Non-existent file in writable directory
@@ -855,7 +868,7 @@ This exercises copy-then-delete for cross-remote renames."
     (write-region "b" nil (concat dir "/file2.txt"))
     (write-region "c" nil (concat dir "/other.log"))
 
-    (let ((files (tramp-rpc-test--with-call-count 2
+    (let ((files (tramp-rpc-test--with-call-count 3
                   (directory-files dir))))
       ;; Should contain . and .. plus our files
       (should (member "." files))
@@ -1159,7 +1172,7 @@ This matches the upstream `tramp-test28-process-file' test."
     (write-region "" nil (concat dir "/file-aab.txt"))
     (write-region "" nil (concat dir "/other.txt"))
 
-    (let ((completions (tramp-rpc-test--with-call-count 1
+    (let ((completions (tramp-rpc-test--with-call-count 3
                          (file-name-all-completions "file-" dir))))
       (should (member "file-aaa.txt" completions))
       (should (member "file-aab.txt" completions))
@@ -1174,7 +1187,7 @@ This matches the upstream `tramp-test28-process-file' test."
           (link-dir (concat dir "/link-dir")))
       (make-directory real-dir t)
       (make-symbolic-link "real-dir" link-dir)
-      (let ((completions (tramp-rpc-test--with-call-count 1
+      (let ((completions (tramp-rpc-test--with-call-count 3
                            (file-name-all-completions "" dir))))
         (should (member "real-dir/" completions))
         (should (member "link-dir/" completions))))))
