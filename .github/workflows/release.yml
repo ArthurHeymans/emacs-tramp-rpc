@@ -104,7 +104,7 @@ jobs:
           TAG=${{ steps.version.outputs.tag }}
 
           # Use the tag annotation if present, otherwise fall back to commit log
-          TAG_ANNOTATION=$(git tag -l --format='%(contents)' "${TAG}")
+          TAG_ANNOTATION=$(git tag -l --format='%(contents:subject)%0a%0a%(contents:body)' "${TAG}")
 
           if [ -n "$TAG_ANNOTATION" ]; then
             CHANGELOG="${TAG_ANNOTATION}"
