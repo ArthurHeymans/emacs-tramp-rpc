@@ -215,7 +215,7 @@ Writes to the local cat relay process, which triggers proper I/O events
 that satisfy accept-process-output.
 STDERR-BUFFER is the separate stderr buffer, or nil to mix with stdout."
   (when (and (processp local-process) (process-live-p local-process))
-    ;; Set flag to bypass our advice - we're writing TO the local process,
+    ;; Set flag to bypass our handler - we're writing TO the local process,
     ;; not sending data to the remote process
     (let ((tramp-rpc--delivering-output t))
       ;; Deliver stdout by writing to the cat relay process
@@ -339,7 +339,7 @@ before the cat relay drains its pipe causes a stale FD that makes
         (remhash pid tramp-rpc--process-write-queues))
       ;; Store exit code (the sentinel reads this to construct the event
       ;; string).  Do NOT set :tramp-rpc-exited yet — the process-status
-      ;; advice returns 'exit when that flag is set, which makes
+      ;; handler returns 'exit when that flag is set, which makes
       ;; `process-live-p' return nil and would prevent the EOF below
       ;; from being sent.
       (process-put local-process :tramp-rpc-exit-code (or exit-code 0))
@@ -349,7 +349,7 @@ before the cat relay drains its pipe causes a stale FD that makes
           (ignore-errors (process-send-eof stderr-process))))
       ;; Send EOF to the LOCAL cat relay (not the remote process).
       ;; Bind `tramp-rpc--closing-local-relay' so the `process-send-eof'
-      ;; advice calls the original function instead of routing to the
+      ;; handler calls the original function instead of routing to the
       ;; remote stdin (which has already exited).  Cat will flush any
       ;; remaining data to stdout, then exit naturally on EOF.  Emacs
       ;; fires the sentinel chain; the cleanup installed by
@@ -357,7 +357,7 @@ before the cat relay drains its pipe causes a stale FD that makes
       (when (process-live-p local-process)
         (let ((tramp-rpc--closing-local-relay t))
           (ignore-errors (process-send-eof local-process))))
-      ;; Now mark as exited so process-status advice returns 'exit.
+      ;; Now mark as exited so process-status handler returns 'exit.
       (process-put local-process :tramp-rpc-exited t))))
 
 ;; ============================================================================
@@ -475,6 +475,7 @@ Resolves program path and loads direnv environment from working directory."
 
           (process-put local-process :tramp-rpc-vec v)
           (process-put local-process :tramp-rpc-pid remote-pid)
+          (process-put local-process 'tramp-vector v)
           (process-put local-process 'remote-command command)
 
           (when filter
@@ -648,6 +649,7 @@ DIRENV-ENV is an optional alist of environment variables from direnv."
     (process-put process :tramp-rpc-command command)
     ;; Standard tramp property expected by tests and upstream code
     (process-put process 'remote-command command)
+    (process-put process 'tramp-vector vec)
 
     process))
 
@@ -711,6 +713,7 @@ DIRENV-ENV is an optional alist of environment variables from direnv."
     (process-put local-process :tramp-rpc-tty-name tty-name)
     ;; Standard tramp property expected by tests and upstream code
     (process-put local-process 'remote-command command)
+    (process-put local-process 'tramp-vector vec)
 
     ;; Set up window size adjustment function
     (process-put local-process 'adjust-window-size-function
@@ -910,15 +913,16 @@ Returns the final (width . height) cons, or nil if resize was not handled."
                   (funcall display-updater width height))
                 (cons width height)))))))))
 
-(defun tramp-rpc--vterm-window-adjust-process-window-size-advice (orig-fun process windows)
-  "Advice for vterm's window adjust function to handle TRAMP-RPC PTY processes.
+(defun tramp-rpc-handle-vterm--window-adjust-process-window-size (process windows)
+  "Handler for vterm's window adjust function to handle TRAMP-RPC PTY processes.
 For tramp-rpc processes, resize the remote PTY and update vterm's display.
 For direct SSH PTY, let the original function handle it (SSH handles resize)."
   (cond
    ;; Direct SSH PTY - let original function handle it
    ((and (processp process)
          (process-get process :tramp-rpc-direct-ssh))
-    (funcall orig-fun process windows))
+    (tramp-run-real-handler
+     'vterm--window-adjust-process-window-size (list process windows)))
    ;; RPC-based PTY - resize via RPC
    ((and (processp process)
          (process-get process :tramp-rpc-pty))
@@ -936,17 +940,19 @@ For direct SSH PTY, let the original function handle it (SSH handles resize)."
                     (fboundp 'vterm--set-size))
              (vterm--set-size vterm--term height width))))))
    ;; Not our process, call original
-   (t (funcall orig-fun process windows))))
+   (t (tramp-run-real-handler
+       'vterm--window-adjust-process-window-size (list process windows)))))
 
-(defun tramp-rpc--eat-adjust-process-window-size-advice (orig-fun process windows)
-  "Advice for eat's window adjust function to handle TRAMP-RPC PTY processes.
+(defun tramp-rpc-handle-eat--adjust-process-window-size (process windows)
+  "Handler for eat's window adjust function to handle TRAMP-RPC PTY processes.
 For tramp-rpc processes, resize the remote PTY and update eat's display.
 For direct SSH PTY, let the original function handle it (SSH handles resize)."
   (cond
    ;; Direct SSH PTY - let original function handle it
    ((and (processp process)
          (process-get process :tramp-rpc-direct-ssh))
-    (funcall orig-fun process windows))
+    (tramp-run-real-handler
+     'eat--adjust-process-window-size (list process windows)))
    ;; RPC-based PTY - resize via RPC
    ((and (processp process)
          (process-get process :tramp-rpc-pty))
@@ -966,7 +972,8 @@ For direct SSH PTY, let the original function handle it (SSH handles resize)."
            ('eat-mode (run-hooks 'eat-update-hook))
            ('eshell-mode (run-hooks 'eat-eshell-update-hook))))))
    ;; Not our process, call original
-   (t (funcall orig-fun process windows))))
+   (t (tramp-run-real-handler
+       'eat--adjust-process-window-size (list process windows)))))
 
 ;; ============================================================================
 ;; Process cleanup
@@ -1016,21 +1023,25 @@ For direct SSH PTY, let the original function handle it (SSH handles resize)."
 ;; Forward declare for cleanup
 (declare-function tramp-rpc--connection-key "tramp-rpc")
 
-;; Install terminal emulator advice
+;; Install terminal emulator handler
 (with-eval-after-load 'vterm
-  (advice-add 'vterm--window-adjust-process-window-size :around
-              #'tramp-rpc--vterm-window-adjust-process-window-size-advice))
+  (tramp-add-external-operation
+   'vterm--window-adjust-process-window-size
+   #'tramp-rpc-handle-vterm--window-adjust-process-window-size
+   'tramp-rpc 'process))
 
 (with-eval-after-load 'eat
-  (advice-add 'eat--adjust-process-window-size :around
-              #'tramp-rpc--eat-adjust-process-window-size-advice))
+  (tramp-add-external-operation
+   'eat--adjust-process-window-size
+   #'tramp-rpc-handle-eat--adjust-process-window-size
+   'tramp-rpc 'process))
 
-(defun tramp-rpc--process-advice-remove ()
-  "Remove advices."
-  (advice-remove 'vterm--window-adjust-process-window-size
-              #'tramp-rpc--vterm-window-adjust-process-window-size-advice)
-  (advice-remove 'eat--adjust-process-window-size
-              #'tramp-rpc--eat-adjust-process-window-size-advice))
+(defun tramp-rpc--process-handler-remove ()
+  "Remove handlers."
+  (tramp-remove-external-operation
+   'vterm--window-adjust-process-window-size 'tramp-rpc)
+  (tramp-remove-external-operation
+   'eat--adjust-process-window-size 'tramp-rpc))
 
 ;; ============================================================================
 ;; Unload support
@@ -1038,9 +1049,9 @@ For direct SSH PTY, let the original function handle it (SSH handles resize)."
 
 (defun tramp-rpc-process-unload-function ()
   "Unload function for tramp-rpc-process.
-Removes advices and cleans up async processes."
-  ;; Remove all advices
-  (tramp-rpc--process-advice-remove)
+Removes handlers and cleans up async processes."
+  ;; Remove all handlers
+  (tramp-rpc--process-handler-remove)
   ;; Clean up all async processes.
   (tramp-rpc--cleanup-async-processes)
   ;; Clean up PTY processes.

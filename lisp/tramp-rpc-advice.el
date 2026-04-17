@@ -1,4 +1,4 @@
-;;; tramp-rpc-advice.el --- Process advice for TRAMP-RPC -*- lexical-binding: t; -*-
+;;; tramp-rpc-advice.el --- Process handlers for TRAMP-RPC -*- lexical-binding: t; -*-
 
 ;; Copyright (C) 2026 Arthur Heymans <arthur@aheymans.xyz>
 
@@ -15,7 +15,7 @@
 
 ;;; Commentary:
 
-;; This file provides all the :around advice functions that tramp-rpc
+;; This file provides all the own Tramp handlers that tramp-rpc
 ;; installs on Emacs built-in process functions:
 ;; - process-send-string / process-send-region (route to remote stdin)
 ;; - process-send-eof (close remote stdin or send Ctrl-D to PTY)
@@ -37,8 +37,6 @@
 (declare-function tramp-rpc--kill-remote-process "tramp-rpc-process")
 (declare-function tramp-rpc--cleanup-async-processes "tramp-rpc-process")
 
-;; Functions from tramp-cmds.el
-
 ;; Functions from tramp-rpc.el
 (declare-function tramp-rpc--debug "tramp-rpc")
 (declare-function tramp-rpc--call "tramp-rpc")
@@ -51,18 +49,18 @@
 (defvar tramp-rpc--pty-processes)
 (defvar tramp-rpc--async-processes)
 
-;; Variables from vc-dir.el (used in vc-dir-refresh advice)
+;; Variables from vc-dir.el (used in vc-dir-refresh handler)
 (defvar vc-dir-process-buffer)
 
 ;; ============================================================================
-;; Process I/O advice
+;; Process I/O handler
 ;; ============================================================================
 
-(defun tramp-rpc--process-send-string-advice (orig-fun process string)
-  "Advice for `process-send-string' to handle TRAMP-RPC processes."
-  ;; If we're delivering output to the local relay, bypass this advice
+(defun tramp-rpc-handle-process-send-string (process string)
+  "Handler for `process-send-string' for TRAMP-RPC processes."
+  ;; If we're delivering output to the local relay, bypass this handler
   (if tramp-rpc--delivering-output
-      (funcall orig-fun process string)
+      (tramp-run-real-handler #'process-send-string (list process string))
     ;; process-send-string can receive a buffer/buffer-name instead of process
     (let ((proc (cond
                  ((processp process) process)
@@ -72,7 +70,7 @@
       (cond
        ;; Direct SSH PTY - use normal process-send-string (low latency)
        ((and proc (process-get proc :tramp-rpc-direct-ssh))
-        (funcall orig-fun process string))
+        (tramp-run-real-handler #'process-send-string (list process string)))
        ;; RPC-based PTY process - use PTY write (async, fire-and-forget)
        ((and proc (process-get proc :tramp-rpc-pty)
              (process-get proc :tramp-rpc-pid))
@@ -103,13 +101,13 @@
         (error
          (message "tramp-rpc: Error writing to process: %s" err))))
        ;; Not an RPC process, use original function
-       (t (funcall orig-fun process string))))))
+       (t (tramp-run-real-handler #'process-send-string (list process string)))))))
 
-(defun tramp-rpc--process-send-region-advice (orig-fun process start end)
-  "Advice for `process-send-region' to handle TRAMP-RPC processes."
-  ;; If we're delivering output to the local relay, bypass this advice
+(defun tramp-rpc-handle-process-send-region (process start end)
+  "Handler for `process-send-region' for TRAMP-RPC processes."
+  ;; If we're delivering output to the local relay, bypass this handler
   (if tramp-rpc--delivering-output
-      (funcall orig-fun process start end)
+      (tramp-run-real-handler #'process-send-region (list process start end))
     (let ((proc (cond
                  ((processp process) process)
                  ((or (bufferp process) (stringp process))
@@ -118,7 +116,7 @@
       (cond
        ;; Direct SSH PTY - use normal process-send-region (low latency)
        ((and proc (process-get proc :tramp-rpc-direct-ssh))
-        (funcall orig-fun process start end))
+        (tramp-run-real-handler #'process-send-region (list process start end)))
        ;; RPC-based PTY process - use PTY write
        ((and proc (process-get proc :tramp-rpc-pty)
              (process-get proc :tramp-rpc-pid))
@@ -150,19 +148,19 @@
             (error
              (message "tramp-rpc: Error writing to process: %s" err)))))
        ;; Not an RPC process, use original function
-       (t (funcall orig-fun process start end))))))
+       (t (tramp-run-real-handler #'process-send-region (list process start end)))))))
 
-(defun tramp-rpc--process-send-eof-advice (orig-fun &optional process)
-  "Advice for `process-send-eof' to handle TRAMP-RPC processes."
-  ;; When closing a local cat relay, bypass this advice entirely so
+(defun tramp-rpc-handle-process-send-eof (&optional process)
+  "Handler for `process-send-eof' for TRAMP-RPC processes."
+  ;; When closing a local cat relay, bypass this handler entirely so
   ;; the EOF reaches the local process rather than the remote one.
   (if tramp-rpc--closing-local-relay
-      (funcall orig-fun process)
+      (tramp-run-real-handler #'process-send-eof (and process (list process)))
     (let ((proc (or process (get-buffer-process (current-buffer)))))
       (cond
        ;; Direct SSH PTY - use normal process-send-eof
        ((and proc (process-get proc :tramp-rpc-direct-ssh))
-        (funcall orig-fun process))
+         (tramp-run-real-handler #'process-send-eof (and process (list process))))
        ;; RPC-managed process
        ((and proc
              (process-get proc :tramp-rpc-pid)
@@ -177,7 +175,7 @@
             (condition-case err
                 (if (process-get proc :tramp-rpc-pty)
                     ;; PTY processes: send Ctrl-D (EOF character) via the PTY
-                    (let ((eof-char (string 4))) ; ASCII 4 = Ctrl-D
+                    (let ((eof-char (string ?\C-d))) ; ASCII 4 = Ctrl-D
                       (tramp-rpc--call-async vec "process.write_pty"
                                              `((pid . ,pid)
                                                (data . ,(msgpack-bin-make eof-char)))
@@ -191,7 +189,7 @@
                (unless (string-match-p "Process not found" (error-message-string err))
                  (message "tramp-rpc: Error closing stdin: %s" err)))))))
        ;; Not a tramp-rpc process
-       (t (funcall orig-fun process))))))
+       (t (tramp-run-real-handler #'process-send-eof (and process (list process))))))))
 
 (defun tramp-rpc-handle-signal-process (process sigcode &optional _remote)
   "Handler for `signal-process' of TRAMP-RPC processes.
@@ -212,43 +210,45 @@ It will be added to `signal-process-functions'."
        -1))))
 
 ;; ============================================================================
-;; Process metadata advice
+;; Process metadata handlers
 ;; ============================================================================
 
-(defun tramp-rpc--process-status-advice (orig-fun process)
-  "Advice for `process-status' to handle TRAMP-RPC processes."
+(defun tramp-rpc-handle-process-status (process)
+  "Handler for `process-status' for TRAMP-RPC processes."
   (if (and (processp process) (process-get process :tramp-rpc-pid))
       (cond
        ((process-get process :tramp-rpc-exited) 'exit)
        ;; Use orig-fun to check live status, not process-live-p (which would recurse)
-       ((memq (funcall orig-fun process) '(run open listen connect)) 'run)
+       ((memq (tramp-run-real-handler #'process-status (list process))
+	      '(run open listen connect))
+	'run)
        (t 'exit))
-    (funcall orig-fun process)))
+    (tramp-run-real-handler #'process-status (list process))))
 
-(defun tramp-rpc--process-exit-status-advice (orig-fun process)
-  "Advice for `process-exit-status' to handle TRAMP-RPC processes."
+(defun tramp-rpc-handle-process-exit-status (process)
+  "Handler for `process-exit-status' for TRAMP-RPC processes."
   (if (and (processp process) (process-get process :tramp-rpc-pid))
       (or (process-get process :tramp-rpc-exit-code) 0)
-    (funcall orig-fun process)))
+    (tramp-run-real-handler #'process-exit-status (list process))))
 
-(defun tramp-rpc--process-command-advice (orig-fun process)
-  "Advice for `process-command' to return stored command for PTY processes."
+(defun tramp-rpc-handle-process-command (process)
+  "Handler for `process-command' to return stored command for PTY processes."
   (if (and (processp process) (process-get process :tramp-rpc-command))
       (process-get process :tramp-rpc-command)
-    (funcall orig-fun process)))
+    (tramp-run-real-handler #'process-command (list process))))
 
-(defun tramp-rpc--process-tty-name-advice (orig-fun process &optional stream)
-  "Advice for `process-tty-name' to return stored TTY name for PTY processes.
+(defun tramp-rpc-handle-process-tty-name (process &optional stream)
+  "Handler for `process-tty-name' to return stored TTY name for PTY processes.
 For TRAMP-RPC PTY processes, return the remote TTY name stored during creation.
 For direct SSH PTY processes, use the original function (returns local PTY)."
   (if (and (processp process)
            (process-get process :tramp-rpc-pty)
            (not (process-get process :tramp-rpc-direct-ssh)))
       (process-get process :tramp-rpc-tty-name)
-    (funcall orig-fun process stream)))
+    (tramp-run-real-handler #'process-tty-name (list process stream))))
 
 ;; ============================================================================
-;; VC integration advice
+;; VC integration handler
 ;; ============================================================================
 
 ;; VC backends like vc-git-state use process-file internally, but they don't
@@ -256,23 +256,24 @@ For direct SSH PTY processes, use the original function (returns local PTY)."
 ;; runs locally instead of going through our tramp handler. We fix this by
 ;; advising vc-call-backend to set default-directory when the file is remote.
 
-(defun tramp-rpc--vc-call-backend-advice (orig-fun backend function-name &rest args)
-  "Advice for `vc-call-backend' to handle TRAMP files correctly.
+(defun tramp-rpc--vc-call-backend-file-name-for-operation
+    (_operation _backend function-name &rest args)
+  "Helper function for `vc-call-backend' handler."
+  (or (and ;; Operations that take a file and may call process-file
+           (memq function-name '(registered state state-heuristic dir-status-files
+                                 working-revision previous-revision next-revision
+                                 responsible-p))
+	   (stringp (car args)) (car args))
+      ""))
+
+(defun tramp-rpc-handle-vc-call-backend (backend function-name &rest args)
+  "Handler for `vc-call-backend' for TRAMP files correctly.
 When FUNCTION-NAME is an operation that takes a file argument and that file is
 a TRAMP path, ensure `default-directory' is set to the file's directory so that
 process-file calls are routed through the TRAMP handler."
-  (let* ((file (car args))
-         (should-set-dir (and file
-                              (stringp file)
-                              (tramp-tramp-file-p file)
-                              ;; Operations that take a file and may call process-file
-                              (memq function-name '(registered state state-heuristic dir-status-files
-                                                    working-revision previous-revision next-revision
-                                                    responsible-p)))))
-    (if should-set-dir
-        (let ((default-directory (file-name-directory file)))
-          (apply orig-fun backend function-name args))
-      (apply orig-fun backend function-name args))))
+  (let ((default-directory (file-name-directory (car args))))
+    (tramp-run-real-handler
+     #'vc-call-backend (append `(,backend ,function-name) args))))
 
 ;; ============================================================================
 ;; Privilege elevation integration
@@ -285,16 +286,16 @@ process-file calls are routed through the TRAMP handler."
 ;; 1. Our pipe processes don't have a TTY, so stty fails
 ;; 2. We don't need this workaround - our RPC handles binary data correctly
 ;;
-;; This advice bypasses the shell wrapper for tramp-rpc connections.
+;; This handler bypasses the shell wrapper for tramp-rpc connections.
 
-(defun tramp-rpc--eglot-cmd-advice (orig-fun contact)
-  "Advice for `eglot--cmd' to avoid shell wrapping for tramp-rpc.
+(defun tramp-rpc-handle-eglot--cmd (contact)
+  "Handler for `eglot--cmd' to avoid shell wrapping for tramp-rpc.
 For tramp-rpc connections, return CONTACT directly without wrapping
-in a shell command. This is safe because tramp-rpc uses pipes (not PTYs)
+in a shell command.  This is safe because tramp-rpc uses pipes (not PTYs)
 and handles binary data correctly."
   (if (tramp-rpc-file-name-p default-directory)
       contact
-    (funcall orig-fun contact)))
+    (tramp-run-real-handler 'eglot--cmd (list contact))))
 
 ;; ============================================================================
 ;; Magit: force pipe mode for stdin piping
@@ -310,25 +311,25 @@ and handles binary data correctly."
 ;; The `pty' workaround exists for tramp-sh (#4720, #5220) where pipe stty
 ;; settings broke hunk staging.  tramp-rpc doesn't need it: stdin data goes
 ;; via RPC (pipe processes) or direct SSH pipes, both of which handle EOF
-;; correctly.  This advice forces pipe mode only for tramp-rpc connections
+;; correctly.  This handler forces pipe mode only for tramp-rpc connections
 ;; when input will be piped, leaving other TRAMP methods untouched.
 
-;; Declared special so the dynamic let-binding in the advice below
+;; Declared special so the dynamic let-binding in the handler below
 ;; is not flagged as an unused lexical variable by the byte-compiler.
 (defvar magit-tramp-pipe-stty-settings)
 
-(defun tramp-rpc--magit-start-process-advice (orig-fun program &optional input &rest args)
+(defun tramp-rpc-handle-magit-start-process (program &optional input &rest args)
   "Force pipe mode for tramp-rpc when INPUT will be piped to the process.
 PTY mode breaks stdin piping because `process-send-eof' sends Ctrl-D
 which does not close the pipe — git waits for more input forever."
-  (if (and input
-           (file-remote-p default-directory)
-           (tramp-rpc-file-name-p default-directory))
+  (if input
       ;; Let-bind magit-tramp-pipe-stty-settings to "" so that
       ;; magit-start-process sets process-connection-type to nil (pipe).
       (let ((magit-tramp-pipe-stty-settings ""))
-        (apply orig-fun program input args))
-    (apply orig-fun program input args)))
+	(tramp-run-real-handler
+	 'magit-start-process (append `(,program ,input) args)))
+    (tramp-run-real-handler
+     'magit-start-process (append `(,program ,input) args))))
 
 ;; ============================================================================
 ;; vc-dir stale-process guard
@@ -340,23 +341,29 @@ which does not close the pipe — git waits for more input forever."
 ;; been called.  Normally our deferred `tramp-rpc--install-process-cleanup'
 ;; handles this, but if the timer hasn't fired yet (or if the cat relay got
 ;; stuck), the stale process causes "Another update process is in progress".
-;; This advice acts as a safety net: before `vc-dir-refresh' checks the
+;; This handler acts as a safety net: before `vc-dir-refresh' checks the
 ;; busy flag, we delete any exited tramp-rpc relay process from the buffer.
 
-(defun tramp-rpc--vc-dir-refresh-advice (orig-fun)
-  "Advice for `vc-dir-refresh' to clean up stale TRAMP-RPC relay processes.
+(defun tramp-rpc--vc-dir-refresh-file-name-for-operation
+    (_operation)
+  "Helper function for `vc-dir-refresh' handler."
+  (if (and (bound-and-true-p vc-dir-process-buffer)
+           (buffer-live-p vc-dir-process-buffer))
+      (tramp-get-default-directory vc-dir-process-buffer)
+      ""))
+
+(defun tramp-rpc-handle-vc-dir-refresh ()
+  "Handler for `vc-dir-refresh' to clean up stale TRAMP-RPC relay processes.
 If the vc-dir process buffer has a tramp-rpc cat relay that has already
 exited (remote side finished), delete it so the refresh can proceed."
-  (when (and (bound-and-true-p vc-dir-process-buffer)
-             (buffer-live-p vc-dir-process-buffer))
-    (let ((proc (get-buffer-process vc-dir-process-buffer)))
-      (when (and proc
-                 (process-get proc :tramp-rpc-pid)
-                 (or (process-get proc :tramp-rpc-exited)
-                     (not (process-live-p proc))))
-        (remhash proc tramp-rpc--async-processes)
-        (ignore-errors (delete-process proc)))))
-  (funcall orig-fun))
+  (let ((proc (get-buffer-process vc-dir-process-buffer)))
+    (when (and proc
+               (process-get proc :tramp-rpc-pid)
+               (or (process-get proc :tramp-rpc-exited)
+                   (not (process-live-p proc))))
+      (remhash proc tramp-rpc--async-processes)
+      (ignore-errors (delete-process proc))))
+  (tramp-run-real-handler 'vc-dir-refresh nil))
 
 ;; ============================================================================
 ;; Dir-locals advice
@@ -375,57 +382,87 @@ exited (remote side finished), delete it so the refresh can proceed."
     (funcall orig-fun)))
 
 ;; ============================================================================
-;; Install and uninstall advice
+;; Install and uninstall handler
 ;; ============================================================================
 
-(defun tramp-rpc-advice-install ()
-  "Install all process advice for tramp-rpc."
-  (advice-add 'process-send-string :around #'tramp-rpc--process-send-string-advice)
-  (advice-add 'process-send-region :around #'tramp-rpc--process-send-region-advice)
-  (advice-add 'process-send-eof :around #'tramp-rpc--process-send-eof-advice)
+(defun tramp-rpc-handler-install ()
+  "Install all process handler for tramp-rpc."
+  (with-eval-after-load 'tramp-rpc
+    (tramp-add-external-operation
+     'process-send-string
+     #'tramp-rpc-handle-process-send-string 'tramp-rpc 'process)
+    (tramp-add-external-operation
+     'process-send-region
+     #'tramp-rpc-handle-process-send-region 'tramp-rpc 'process)
+    (tramp-add-external-operation
+     'process-send-eof
+     #'tramp-rpc-handle-process-send-eof 'tramp-rpc 'process))
   ;; This must be before `tramp-signal-process'.  Since tramp.el is
   ;; required, this is guaranteed.
   (add-hook 'signal-process-functions #'tramp-rpc-handle-signal-process)
-  (advice-add 'process-status :around #'tramp-rpc--process-status-advice)
-  (advice-add 'process-exit-status :around #'tramp-rpc--process-exit-status-advice)
-  (advice-add 'process-command :around #'tramp-rpc--process-command-advice)
-  (advice-add 'process-tty-name :around #'tramp-rpc--process-tty-name-advice)
-  (advice-add 'vc-call-backend :around #'tramp-rpc--vc-call-backend-advice)
+  (with-eval-after-load 'tramp-rpc
+    (tramp-add-external-operation
+     'process-status
+     #'tramp-rpc-handle-process-status 'tramp-rpc 'process)
+    (tramp-add-external-operation
+     'process-exit-status
+     #'tramp-rpc-handle-process-exit-status 'tramp-rpc 'process)
+    (tramp-add-external-operation
+     'process-command
+     #'tramp-rpc-handle-process-command 'tramp-rpc 'process)
+    (tramp-add-external-operation
+     'process-tty-name
+     #'tramp-rpc-handle-process-tty-name 'tramp-rpc 'process))
+  (with-eval-after-load 'tramp-rpc
+    (tramp-add-external-operation
+     'vc-call-backend
+     #'tramp-rpc-handle-vc-call-backend 'tramp-rpc
+     #'tramp-rpc--vc-call-backend-file-name-for-operation))
   (with-eval-after-load 'eglot
-    (advice-add 'eglot--cmd :around #'tramp-rpc--eglot-cmd-advice))
-  (with-eval-after-load 'vc-dir
-    (advice-add 'vc-dir-refresh :around #'tramp-rpc--vc-dir-refresh-advice))
+    (tramp-add-external-operation
+     'eglot--cmd
+     #'tramp-rpc-handle-eglot--cmd 'tramp-rpc 'default-directory))
   (with-eval-after-load 'magit-process
-    (advice-add 'magit-start-process :around
-                #'tramp-rpc--magit-start-process-advice))
+    (tramp-add-external-operation
+     'magit-start-process
+     #'tramp-rpc-handle-magit-start-process 'tramp-rpc 'default-directory))
+  (with-eval-after-load 'tramp-rpc
+    (tramp-add-external-operation
+     'vc-dir-refresh
+     #'tramp-rpc-handle-vc-dir-refresh 'tramp-rpc
+     #'tramp-rpc--vc-dir-refresh-file-name-for-operation))
   (advice-add 'hack-dir-local-variables :around
               #'tramp-rpc--hack-dir-local-variables-advice))
 
-(defun tramp-rpc-advice-remove ()
-  "Remove all process advice installed by tramp-rpc."
-  (advice-remove 'process-send-string #'tramp-rpc--process-send-string-advice)
-  (advice-remove 'process-send-region #'tramp-rpc--process-send-region-advice)
-  (advice-remove 'process-send-eof #'tramp-rpc--process-send-eof-advice)
+(defun tramp-rpc-handler-remove ()
+  "Remove all process handler installed by tramp-rpc."
+  (tramp-remove-external-operation 'process-send-string 'tramp-rpc)
+  (tramp-remove-external-operation 'process-send-region 'tramp-rpc)
+  (tramp-remove-external-operation 'process-send-eof 'tramp-rpc)
   (remove-hook 'signal-process-functions #'tramp-rpc-handle-signal-process)
-  (advice-remove 'process-status #'tramp-rpc--process-status-advice)
-  (advice-remove 'process-exit-status #'tramp-rpc--process-exit-status-advice)
-  (advice-remove 'process-command #'tramp-rpc--process-command-advice)
-  (advice-remove 'process-tty-name #'tramp-rpc--process-tty-name-advice)
-  (advice-remove 'vc-call-backend #'tramp-rpc--vc-call-backend-advice)
-  (advice-remove 'eglot--cmd #'tramp-rpc--eglot-cmd-advice)
-  (advice-remove 'vc-dir-refresh #'tramp-rpc--vc-dir-refresh-advice)
-  (advice-remove 'magit-start-process #'tramp-rpc--magit-start-process-advice)
+  (tramp-remove-external-operation 'process-status 'tramp-rpc)
+  (tramp-remove-external-operation 'process-exit-status 'tramp-rpc)
+  (tramp-remove-external-operation 'process-command 'tramp-rpc)
+  (tramp-remove-external-operation 'process-tty-name 'tramp-rpc)
+  (tramp-remove-external-operation 'vc-call-backend 'tramp-rpc)
+  (tramp-remove-external-operation 'eglot--cmd 'tramp-rpc)
+  (tramp-remove-external-operation 'magit-start-process 'tramp-rpc)
+  (tramp-remove-external-operation 'vc-dir-refresh 'tramp-rpc)
   (advice-remove 'hack-dir-local-variables #'tramp-rpc--hack-dir-local-variables-advice))
 
-(defcustom tramp-rpc-install-advice-on-load t
-  "Whether to install process advice when tramp-rpc-advice is loaded.
-Set to nil before loading to prevent automatic advice installation."
+;; FIXME: Do we need this?
+(define-obsolete-variable-alias
+  'tramp-rpc-install-advice-on-load 'tramp-rpc-install-handler-on-load "0.8.0")
+
+(defcustom tramp-rpc-install-handler-on-load t
+  "Whether to install process handler when tramp-rpc-advice is loaded.
+Set to nil before loading to prevent automatic handler installation."
   :type 'boolean
   :group 'tramp-rpc)
 
-;; Install advice when loaded (if enabled)
-(when tramp-rpc-install-advice-on-load
-  (tramp-rpc-advice-install))
+;; Install handler when loaded (if enabled)
+(when tramp-rpc-install-handler-on-load
+  (tramp-rpc-handler-install))
 
 ;; ============================================================================
 ;; Unload support
@@ -433,9 +470,9 @@ Set to nil before loading to prevent automatic advice installation."
 
 (defun tramp-rpc-advice-unload-function ()
   "Unload function for tramp-rpc-advice.
-Removes advices."
-  ;; Remove all advices.
-  (tramp-rpc-advice-remove)
+Removes handler."
+  ;; Remove all handler.
+  (tramp-rpc-handler-remove)
   ;; Return nil to allow normal unload to proceed
   nil)
 

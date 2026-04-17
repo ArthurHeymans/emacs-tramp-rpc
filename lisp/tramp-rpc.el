@@ -5,7 +5,7 @@
 ;; Author: Arthur Heymans <arthur@aheymans.xyz>
 ;; Version: 0.8.0
 ;; Keywords: comm, processes, files
-;; Package-Requires: ((emacs "30.1") (msgpack "0") (tramp "2.8.1.3"))
+;; Package-Requires: ((emacs "30.1") (msgpack "0") (tramp "2.8.1.4"))
 
 ;; This file is part of tramp-rpc.
 
@@ -149,10 +149,10 @@
 (require 'tramp-rpc-protocol)
 
 ;; Check for minimum Tramp version.  The Package-Requires header declares
-;; (tramp "2.8.1.3") but that is only enforced by package.el at install
+;; (tramp "2.8.1.4") but that is only enforced by package.el at install
 ;; time.  Guard at load time so that manual installations fail clearly.
-(when (version< tramp-version "2.8.1.3")
-  (error "tramp-rpc requires Tramp >= 2.8.1.3, but %s is loaded"
+(when (version< tramp-version "2.8.1.4")
+  (error "tramp-rpc requires Tramp >= 2.8.1.4, but %s is loaded"
          tramp-version))
 
 ;; Give the rpc method all ssh connection parameters so it can serve
@@ -167,7 +167,7 @@
   (setcdr rpc-entry ssh-params))
 
 ;; Silence byte-compiler warnings for functions defined in with-eval-after-load
-(declare-function tramp-rpc-advice-remove "tramp-rpc-advice")
+;; (declare-function tramp-rpc-handler-remove "tramp-rpc-advice")
 (declare-function tramp-add-external-operation "tramp")
 (declare-function tramp-remove-external-operation "tramp")
 (declare-function tramp-rpc--multi-hop-advice "tramp-rpc")
@@ -1055,6 +1055,7 @@ Returns the connection plist.  Signals `remote-file-error' on failure."
 
     ;; Store vec on the process so notifications can identify the connection
     (process-put process :tramp-rpc-vec vec)
+    (process-put process 'tramp-vector vec)
 
     ;; Wait for server to be ready by sending a ping
     (let ((response (tramp-rpc--call vec "system.info" nil)))
@@ -3046,9 +3047,10 @@ Also controls process exit detection latency."
     ;; RPC-based path and VC operations
     ;; =========================================================================
     (expand-file-name . tramp-rpc-handle-expand-file-name)
-    (locate-dominating-file . tramp-rpc-handle-locate-dominating-file)
-    (dir-locals--all-files . tramp-rpc-handle-dir-locals--all-files)
-    (dir-locals-find-file . tramp-rpc-handle-dir-locals-find-file)
+    ;; Not needed.  They are added by `tramp-add-external-operation'.
+    ;; (locate-dominating-file . tramp-rpc-handle-locate-dominating-file)
+    ;; (dir-locals--all-files . tramp-rpc-handle-dir-locals--all-files)
+    ;; (dir-locals-find-file . tramp-rpc-handle-dir-locals-find-file)
     (vc-registered . tramp-rpc-handle-vc-registered)
 
     ;; =========================================================================
@@ -3260,7 +3262,8 @@ Removes advice and cleans up async processes."
   (tramp-remove-external-operation 'dir-locals--all-files 'tramp-rpc)
   (tramp-remove-external-operation 'dir-locals-find-file 'tramp-rpc)
   ;; Remove all advice (from tramp-rpc-advice module)
-  (tramp-rpc-advice-remove)
+  ;; Not needed. This is called in `tramp-rpc-advice-unload-function'.
+  ;; (tramp-rpc-handler-remove)
   ;; Remove legacy multi-hop advice and cleanup hooks.
   (advice-remove 'tramp-multi-hop-p #'tramp-rpc--multi-hop-advice)
   (remove-hook 'tramp-cleanup-connection-hook #'tramp-rpc-cleanup-connection)
