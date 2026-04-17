@@ -227,12 +227,23 @@ fn as_search_dir(path: &Path) -> Option<PathBuf> {
     }
 }
 
-const MAX_DOMINATING_DEPTH: usize = 100;
+/// Default maximum ancestor traversal depth for dominating-file searches.
+///
+/// This is a defensive upper bound to protect against pathological
+/// filesystem layouts (e.g. symlink loops that `Path::parent` would not
+/// detect because it walks the lexical path).  Real filesystems rarely
+/// exceed 30-40 levels; 1024 is effectively unlimited in practice.
+///
+/// When the limit is reached the search returns `Ok(None)` rather than
+/// an error, matching the stock Emacs `locate-dominating-file' behavior
+/// of silently returning nil when no marker is found.
+const DEFAULT_MAX_DOMINATING_DEPTH: usize = 1024;
 
 fn find_dominating_dir(
     start_dir: &Path,
     names: &[String],
-) -> Result<Option<(PathBuf, Vec<String>)>, RpcError> {
+    max_depth: usize,
+) -> Option<(PathBuf, Vec<String>)> {
     let mut current = start_dir.to_path_buf();
     let mut depth = 0usize;
     loop {
@@ -243,35 +254,21 @@ fn find_dominating_dir(
             .collect();
 
         if !found.is_empty() {
-            return Ok(Some((current, found)));
+            return Some((current, found));
+        }
+
+        if depth >= max_depth {
+            // Defensive cap: treat as "no marker found" rather than walking
+            // forever through a pathological path (e.g. symlink loop).
+            return None;
         }
 
         match current.parent() {
             Some(parent) if parent != current => {
-                if depth >= MAX_DOMINATING_DEPTH {
-                    return Err(RpcError::invalid_params(format!(
-                        "Maximum ancestor traversal depth ({}) exceeded",
-                        MAX_DOMINATING_DEPTH
-                    )));
-                }
                 current = parent.to_path_buf();
                 depth += 1;
             }
-            _ => return Ok(None),
-        }
-    }
-}
-
-fn remap_to_lexical_ancestor(start_dir: &Path, found_dir: &Path) -> PathBuf {
-    let canonical_found = canonical_or_original(found_dir);
-    let mut current = start_dir.to_path_buf();
-    loop {
-        if canonical_or_original(&current) == canonical_found {
-            return current;
-        }
-        match current.parent() {
-            Some(parent) if parent != current => current = parent.to_path_buf(),
-            _ => return found_dir.to_path_buf(),
+            _ => return None,
         }
     }
 }
@@ -311,6 +308,10 @@ pub async fn highlevel_test_files_in_dir(params: Value) -> HandlerResult {
     .map_err(|e| RpcError::internal_error(format!("Task join error: {}", e)))?
 }
 
+fn default_max_dominating_depth() -> usize {
+    DEFAULT_MAX_DOMINATING_DEPTH
+}
+
 /// Locate marker files in ancestor directories.
 ///
 /// Returns marker paths from the first ancestor that contains any markers.
@@ -319,6 +320,10 @@ pub async fn highlevel_locate_dominating_file_multi(params: Value) -> HandlerRes
     struct Params {
         file: String,
         names: Vec<String>,
+        /// Maximum ancestor levels to walk (optional, defaults to 1024).
+        /// Primarily for testing; real callers can omit this.
+        #[serde(default = "default_max_dominating_depth")]
+        max_depth: usize,
     }
 
     let params: Params = from_value(params).map_err(|e| RpcError::invalid_params(e.to_string()))?;
@@ -334,7 +339,9 @@ pub async fn highlevel_locate_dominating_file_multi(params: Value) -> HandlerRes
             return Ok(Value::Array(vec![]));
         };
 
-        let Some((dir, found_names)) = find_dominating_dir(&start_dir, &params.names)? else {
+        let Some((dir, found_names)) =
+            find_dominating_dir(&start_dir, &params.names, params.max_depth)
+        else {
             return Ok(Value::Array(vec![]));
         };
 
@@ -356,6 +363,10 @@ pub async fn highlevel_dir_locals_find_file_cache_update(params: Value) -> Handl
         names: Vec<String>,
         #[serde(default)]
         cache_dirs: Vec<String>,
+        /// Maximum ancestor levels to walk (optional, defaults to 1024).
+        /// Primarily for testing; real callers can omit this.
+        #[serde(default = "default_max_dominating_depth")]
+        max_depth: usize,
     }
 
     let params: Params = from_value(params).map_err(|e| RpcError::invalid_params(e.to_string()))?;
@@ -381,33 +392,37 @@ pub async fn highlevel_dir_locals_find_file_cache_update(params: Value) -> Handl
             });
         };
 
-        let locals_value =
-            if let Some((locals_dir, _)) = find_dominating_dir(&start_dir, &params.names)? {
-                let locals_dir = remap_to_lexical_ancestor(&start_dir, &locals_dir);
-                let local_files: Vec<Value> = params
-                    .names
-                    .iter()
-                    .filter_map(|name| {
-                        let p = locals_dir.join(name);
-                        if p.is_file() {
-                            mtime_seconds(&p).map(|mtime| {
-                                msgpack_map! {
-                                    "name" => name.clone(),
-                                    "mtime" => mtime
-                                }
-                            })
-                        } else {
-                            None
-                        }
-                    })
-                    .collect();
-                msgpack_map! {
-                    "dir" => locals_dir.to_string_lossy().to_string(),
-                    "files" => Value::Array(local_files)
-                }
-            } else {
-                Value::Nil
-            };
+        let locals_value = if let Some((locals_dir, _)) =
+            find_dominating_dir(&start_dir, &params.names, params.max_depth)
+        {
+            // `find_dominating_dir` walks the lexical `start_dir` with
+            // `Path::parent()` and never canonicalizes, so `locals_dir` is
+            // already a lexical ancestor of `start_dir`.  No symlink
+            // rewriting is required here.
+            let local_files: Vec<Value> = params
+                .names
+                .iter()
+                .filter_map(|name| {
+                    let p = locals_dir.join(name);
+                    if p.is_file() {
+                        mtime_seconds(&p).map(|mtime| {
+                            msgpack_map! {
+                                "name" => name.clone(),
+                                "mtime" => mtime
+                            }
+                        })
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+            msgpack_map! {
+                "dir" => locals_dir.to_string_lossy().to_string(),
+                "files" => Value::Array(local_files)
+            }
+        } else {
+            Value::Nil
+        };
 
         let mut best_cache: Option<PathBuf> = None;
         for cache_dir in &params.cache_dirs {
