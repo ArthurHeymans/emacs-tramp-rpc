@@ -5,7 +5,7 @@
 ;; Author: Arthur Heymans <arthur@aheymans.xyz>
 ;; Version: 0.8.0
 ;; Keywords: comm, processes, files
-;; Package-Requires: ((emacs "30.1") (msgpack "0") (tramp "2.8.1.3"))
+;; Package-Requires: ((emacs "30.1") (msgpack "0") (tramp "2.8.1.4"))
 
 ;; This file is part of tramp-rpc.
 
@@ -149,10 +149,10 @@
 (require 'tramp-rpc-protocol)
 
 ;; Check for minimum Tramp version.  The Package-Requires header declares
-;; (tramp "2.8.1.3") but that is only enforced by package.el at install
+;; (tramp "2.8.1.4") but that is only enforced by package.el at install
 ;; time.  Guard at load time so that manual installations fail clearly.
-(when (version< tramp-version "2.8.1.3")
-  (error "tramp-rpc requires Tramp >= 2.8.1.3, but %s is loaded"
+(when (version< tramp-version "2.8.1.4")
+  (error "tramp-rpc requires Tramp >= 2.8.1.4, but %s is loaded"
          tramp-version))
 
 ;; Give the rpc method all ssh connection parameters so it can serve
@@ -167,7 +167,7 @@
   (setcdr rpc-entry ssh-params))
 
 ;; Silence byte-compiler warnings for functions defined in with-eval-after-load
-(declare-function tramp-rpc-advice-remove "tramp-rpc-advice")
+;; (declare-function tramp-rpc-handler-remove "tramp-rpc-advice")
 (declare-function tramp-add-external-operation "tramp")
 (declare-function tramp-remove-external-operation "tramp")
 (declare-function tramp-rpc--multi-hop-advice "tramp-rpc")
@@ -911,6 +911,12 @@ Returns non-nil on success."
                     ;; Connect and immediately exit, leaving ControlMaster running
                     (list "-N" host)))
          process)
+    ;; If the socket file exists but `tramp-rpc--controlmaster-active-p' did
+    ;; not accept it, it is stale.  OpenSSH exits immediately when asked to
+    ;; create a ControlMaster on top of a stale ControlPath, which later shows
+    ;; up as a generic "Tramp failed to connect" during unrelated file ops.
+    (when (file-exists-p socket-path)
+      (ignore-errors (delete-file socket-path)))
     (with-current-buffer buffer
       (erase-buffer))
     ;; Start SSH with PTY for interactive password prompt
@@ -1055,6 +1061,7 @@ Returns the connection plist.  Signals `remote-file-error' on failure."
 
     ;; Store vec on the process so notifications can identify the connection
     (process-put process :tramp-rpc-vec vec)
+    (process-put process 'tramp-vector vec)
 
     ;; Wait for server to be ready by sending a ping
     (let ((response (tramp-rpc--call vec "system.info" nil)))
@@ -1125,7 +1132,20 @@ accidentally routing file operations through tramp-sh."
   ;; - Key-based: connects silently
   ;; - Password: prompts user, then subsequent connections reuse it
   (when tramp-rpc-use-controlmaster
-    (tramp-rpc--establish-controlmaster vec))
+    (condition-case err
+        (tramp-rpc--establish-controlmaster vec)
+      (remote-file-error
+       ;; A stale ControlMaster socket can make OpenSSH exit immediately while
+       ;; TRAMP reports only a generic connection failure.  Remove the socket
+       ;; and retry once before surfacing the error.
+       (let ((socket-path (tramp-rpc--controlmaster-socket-path vec)))
+         (when (file-exists-p socket-path)
+           (ignore-errors (delete-file socket-path)))
+         (sleep-for 0.1)
+         (condition-case nil
+             (tramp-rpc--establish-controlmaster vec)
+           (remote-file-error
+            (signal (car err) (cdr err))))))))
   ;; For sudo-via-RPC, pre-authenticate sudo so the server can be
   ;; started with `sudo -n' (non-interactive) via pipes.
   (when-let* ((sudo-ssh-user (tramp-rpc--detect-sudo-elevation vec)))
@@ -1938,11 +1958,12 @@ to the built-in implementation."
           (setq latest f-time))))))
 
 (defun tramp-rpc--dir-locals-cache-covers-p (locals-dir cache-dir)
-  "Return non-nil when CACHE-DIR is at or below LOCALS-DIR."
-  (let ((locals (directory-file-name locals-dir))
-        (cache (directory-file-name cache-dir)))
+  "Return non-nil when CACHE-DIR is at or below LOCALS-DIR.
+This is a lexical path check: the directories can be remote or not yet exist."
+  (let ((locals (file-name-as-directory (directory-file-name locals-dir)))
+        (cache (file-name-as-directory (directory-file-name cache-dir))))
     (or (equal locals cache)
-        (file-in-directory-p cache locals))))
+        (string-prefix-p locals cache))))
 
 (defun tramp-rpc-handle-dir-locals-find-file (file)
   "Like `dir-locals-find-file' for TRAMP-RPC files."
@@ -3246,9 +3267,10 @@ Also controls process exit detection latency."
     ;; RPC-based path and VC operations
     ;; =========================================================================
     (expand-file-name . tramp-rpc-handle-expand-file-name)
-    (locate-dominating-file . tramp-rpc-handle-locate-dominating-file)
-    (dir-locals--all-files . tramp-rpc-handle-dir-locals--all-files)
-    (dir-locals-find-file . tramp-rpc-handle-dir-locals-find-file)
+    ;; Not needed.  They are added by `tramp-add-external-operation'.
+    ;; (locate-dominating-file . tramp-rpc-handle-locate-dominating-file)
+    ;; (dir-locals--all-files . tramp-rpc-handle-dir-locals--all-files)
+    ;; (dir-locals-find-file . tramp-rpc-handle-dir-locals-find-file)
     (vc-registered . tramp-rpc-handle-vc-registered)
 
     ;; =========================================================================
@@ -3460,7 +3482,8 @@ Removes advice and cleans up async processes."
   (tramp-remove-external-operation 'dir-locals--all-files 'tramp-rpc)
   (tramp-remove-external-operation 'dir-locals-find-file 'tramp-rpc)
   ;; Remove all advice (from tramp-rpc-advice module)
-  (tramp-rpc-advice-remove)
+  ;; Not needed. This is called in `tramp-rpc-advice-unload-function'.
+  ;; (tramp-rpc-handler-remove)
   ;; Remove legacy multi-hop advice and cleanup hooks.
   (advice-remove 'tramp-multi-hop-p #'tramp-rpc--multi-hop-advice)
   (remove-hook 'tramp-cleanup-connection-hook #'tramp-rpc-cleanup-connection)

@@ -1121,12 +1121,12 @@ as a hop in multi-hop chains."
                    (tramp-rpc--controlmaster-socket-path sudo-vec)))))
 
 ;;; ============================================================================
-;;; VC advice tests (No server or SSH required)
+;;; VC handler tests (No server or SSH required)
 ;;; ============================================================================
 
 (ert-deftest tramp-rpc-mock-test-vc-exec-after-logical-exit-runs-code ()
-  "Test `vc-exec-after' advice treats exited TRAMP-RPC relays as done."
-  :tags '(:vc-advice)
+  "Test `vc-exec-after' handler treats exited TRAMP-RPC relays as done."
+  :tags '(:vc-handler)
   (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
   (let* ((buffer (generate-new-buffer " *tramp-rpc-vc-exec-after-test*"))
          (proc (make-process :name "tramp-rpc-vc-exec-after-test"
@@ -1138,17 +1138,18 @@ as a hop in multi-hop chains."
         (with-current-buffer buffer
           (process-put proc :tramp-rpc-pid 123)
           (process-put proc :tramp-rpc-exited t)
-          (tramp-rpc--vc-exec-after-advice
-           (lambda (&rest _) (error "Unexpected process state"))
-           (lambda () (setq ran t)))
+          (cl-letf (((symbol-function 'tramp-run-real-handler)
+                     (lambda (&rest _) (error "Unexpected process state"))))
+            (tramp-rpc-handle-vc-exec-after
+             (lambda () (setq ran t))))
           (should ran))
       (when (process-live-p proc)
         (delete-process proc))
       (kill-buffer buffer))))
 
 (ert-deftest tramp-rpc-mock-test-vc-exec-after-raw-closed-state-runs-code ()
-  "Test `vc-exec-after' advice handles raw non-run relay states."
-  :tags '(:vc-advice)
+  "Test `vc-exec-after' handler handles raw non-run relay states."
+  :tags '(:vc-handler)
   (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
   (let* ((buffer (generate-new-buffer " *tramp-rpc-vc-exec-after-test*"))
          (proc (make-process :name "tramp-rpc-vc-exec-after-test"
@@ -1160,11 +1161,12 @@ as a hop in multi-hop chains."
         (with-current-buffer buffer
           (process-put proc :tramp-rpc-pid 123)
           ;; Simulate native-compiled VC observing a raw relay state such as
-          ;; `closed' rather than the logical state from TRAMP-RPC advice.
+          ;; `closed' rather than the logical state from TRAMP-RPC handler.
           (cl-letf (((symbol-function 'process-status)
-                     (lambda (_process) 'closed)))
-            (tramp-rpc--vc-exec-after-advice
-             (lambda (&rest _) (error "Unexpected process state"))
+                     (lambda (_process) 'closed))
+                    ((symbol-function 'tramp-run-real-handler)
+                     (lambda (&rest _) (error "Unexpected process state"))))
+            (tramp-rpc-handle-vc-exec-after
              (lambda () (setq ran t))))
           (should ran))
       (when (process-live-p proc)
@@ -1261,10 +1263,14 @@ as a hop in multi-hop chains."
   "Ensure cache coverage check uses containment, not string length."
   :tags '(:dir-locals)
   (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
-  (let ((locals "/tmp/a/very-long-dirname/")
-        (cache "/tmp/a/b/c/d/"))
-    ;; String length can disagree with depth here; containment should win.
-    (should (tramp-rpc--dir-locals-cache-covers-p locals cache))))
+  (let ((locals "/tmp/a/b/")
+        (cache "/tmp/a/b/c/d/")
+        (sibling "/tmp/a/very-long-dirname/"))
+    ;; These directories need not exist; this is a lexical containment check.
+    (should (tramp-rpc--dir-locals-cache-covers-p locals locals))
+    (should (tramp-rpc--dir-locals-cache-covers-p locals cache))
+    ;; A sibling with a longer string must not be treated as contained.
+    (should-not (tramp-rpc--dir-locals-cache-covers-p locals sibling))))
 
 (ert-deftest tramp-rpc-mock-test-locate-dominating-file-unquotes-and-requotes-paths ()
   "Ensure locate-dominating handler unquotes RPC paths for transport.
