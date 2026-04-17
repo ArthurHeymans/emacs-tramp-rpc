@@ -63,18 +63,18 @@ jobs:
 
       - name: Install Nix
         if: steps.cache-binary.outputs.cache-hit != 'true'
-        uses: cachix/install-nix-action@v31
-        with:
-          nix_path: nixpkgs=channel:nixos-unstable
+        uses: DeterminateSystems/nix-installer-action@main
 
       - name: Cache Nix store
         if: steps.cache-binary.outputs.cache-hit != 'true'
         uses: nix-community/cache-nix-action@v6
         with:
-          primary-key: nix-${{ runner.os }}-${{ hashFiles('**/*.nix', '**/flake.lock') }}
-          restore-prefixes-first-match: nix-${{ runner.os }}-
+          primary-key: nix-v2-${{ runner.os }}-${{ hashFiles('**/*.nix', '**/flake.lock') }}
+          restore-prefixes-first-match: nix-v2-${{ runner.os }}-
           gc-max-store-size-linux: 4294967296
           gc-max-store-size-macos: 4294967296
+          # Only the nix-setup job needs to write the cache; arch jobs only restore.
+          save: false
 
       - name: Build
         if: steps.cache-binary.outputs.cache-hit != 'true'
