@@ -7,3 +7,15 @@ rustflags = ["-C", "target-feature=+crt-static"]
 
 [target.aarch64-unknown-linux-musl]
 rustflags = ["-C", "target-feature=+crt-static"]
+
+[target.i686-unknown-linux-musl]
+rustflags = ["-C", "target-feature=+crt-static"]
+
+[target.armv7-unknown-linux-musleabihf]
+rustflags = ["-C", "target-feature=+crt-static"]
+
+[target.armv5te-unknown-linux-musleabi]
+rustflags = ["-C", "target-feature=+crt-static"]
+
+[target.arm-unknown-linux-musleabihf]
+rustflags = ["-C", "target-feature=+crt-static"]

@@ -11,29 +11,79 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  rust:
+  nix-setup:
+    name: Build Nix dev shell (Linux)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Install Nix
+        uses: DeterminateSystems/nix-installer-action@main
+
+      - name: Cache Nix store
+        uses: nix-community/cache-nix-action@v6
+        with:
+          primary-key: nix-v2-${{ runner.os }}-${{ hashFiles('**/*.nix', '**/flake.lock') }}
+          restore-prefixes-first-match: nix-v2-${{ runner.os }}-
+          gc-max-store-size-linux: 4294967296
+
+      - name: Build dev shell
+        run: nix develop --command true
+
+  rust-linux:
     name: Rust ${{ matrix.name }}
+    needs: nix-setup
     uses: ./.github/workflows/build.yml
     with:
       target: ${{ matrix.target }}
-      os: ${{ matrix.os }}
+      os: ubuntu-latest
       test: true
     strategy:
       fail-fast: false
       matrix:
         include:
           - name: Linux x86_64
-            os: ubuntu-latest
             target: x86_64-unknown-linux-musl
           - name: Linux aarch64
-            os: ubuntu-latest
             target: aarch64-unknown-linux-musl
+
+  rust-macos:
+    name: Rust ${{ matrix.name }}
+    uses: ./.github/workflows/build.yml
+    with:
+      target: ${{ matrix.target }}
+      os: macos-latest
+      test: true
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
           - name: macOS x86_64
-            os: macos-latest
             target: x86_64-apple-darwin
           - name: macOS aarch64
-            os: macos-latest
             target: aarch64-apple-darwin
+
+  rust-extra:
+    name: Build ${{ matrix.name }}
+    needs: nix-setup
+    uses: ./.github/workflows/build.yml
+    with:
+      target: ${{ matrix.target }}
+      os: ubuntu-latest
+      test: false
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Linux i686
+            target: i686-unknown-linux-musl
+          - name: Linux armv7 (Allwinner A20/H3)
+            target: armv7-unknown-linux-musleabihf
+          - name: Linux armv5te (AST2500)
+            target: armv5te-unknown-linux-musleabi
+          - name: Linux arm/ARMv6 (Raspberry Pi 1)
+            target: arm-unknown-linux-musleabihf
 
   format:
     name: Rust Format Check
@@ -217,7 +267,7 @@ jobs:
   test-server:
     name: Server Integration Tests
     runs-on: ubuntu-latest
-    needs: [rust, elisp]
+    needs: [rust-linux, elisp]
 
     steps:
       - name: Checkout
@@ -265,7 +315,7 @@ jobs:
   test-full-suite:
     name: Full Test Suite (with SSH)
     runs-on: ubuntu-latest
-    needs: [rust, elisp]
+    needs: [rust-linux, elisp]
 
     steps:
       - name: Checkout
@@ -343,7 +393,7 @@ jobs:
   test-upstream-tramp:
     name: Upstream Tramp Tests
     runs-on: ubuntu-latest
-    needs: [rust, elisp]
+    needs: [rust-linux, elisp]
 
     steps:
       - name: Checkout
@@ -434,14 +484,16 @@ jobs:
   summary:
     name: Test Summary
     runs-on: ubuntu-latest
-    needs: [rust, elisp, test-autoload, test-protocol, test-multi-hop, test-server, test-full-suite, test-upstream-tramp]
+    needs: [rust-linux, rust-macos, rust-extra, elisp, test-autoload, test-protocol, test-multi-hop, test-server, test-full-suite, test-upstream-tramp]
     if: always()
 
     steps:
       - name: Check results
         run: |
           echo "=== CI Summary ==="
-          echo "Rust: ${{ needs.rust.result }}"
+          echo "Rust Linux: ${{ needs.rust-linux.result }}"
+          echo "Rust macOS: ${{ needs.rust-macos.result }}"
+          echo "Rust Extra: ${{ needs.rust-extra.result }}"
           echo "Elisp: ${{ needs.elisp.result }}"
           echo "Autoload Tests: ${{ needs.test-autoload.result }}"
           echo "Protocol Tests: ${{ needs.test-protocol.result }}"
@@ -450,7 +502,9 @@ jobs:
           echo "Full Test Suite: ${{ needs.test-full-suite.result }}"
           echo "Upstream Tramp Tests: ${{ needs.test-upstream-tramp.result }}"
 
-          if [[ "${{ needs.rust.result }}" != "success" ]] || \
+          if [[ "${{ needs.rust-linux.result }}" != "success" ]] || \
+             [[ "${{ needs.rust-macos.result }}" != "success" ]] || \
+             [[ "${{ needs.rust-extra.result }}" != "success" ]] || \
              [[ "${{ needs.elisp.result }}" != "success" ]] || \
              [[ "${{ needs.test-autoload.result }}" != "success" ]] || \
              [[ "${{ needs.test-protocol.result }}" != "success" ]] || \
