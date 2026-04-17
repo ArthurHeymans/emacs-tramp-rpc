@@ -512,11 +512,11 @@ fn set_file_times_sync(path: &str, atime: i64, mtime: i64) -> Result<(), RpcErro
 
     let times = [
         libc::timespec {
-            tv_sec: atime,
+            tv_sec: atime as _,
             tv_nsec: 0,
         },
         libc::timespec {
-            tv_sec: mtime,
+            tv_sec: mtime as _,
             tv_nsec: 0,
         },
     ];
@@ -544,11 +544,11 @@ fn set_file_times_sync_path(
 
     let times = [
         libc::timespec {
-            tv_sec: atime,
+            tv_sec: atime as _,
             tv_nsec: 0,
         },
         libc::timespec {
-            tv_sec: mtime,
+            tv_sec: mtime as _,
             tv_nsec: 0,
         },
     ];
