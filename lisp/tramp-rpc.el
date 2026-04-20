@@ -109,7 +109,8 @@
     "Check if VEC-OR-FILENAME is a privilege elevation with an rpc hop."
     (when-let* ((vec (tramp-ensure-dissected-file-name vec-or-filename))
                 (hop (tramp-file-name-hop vec)))
-      (and (string-match-p "rpc:" hop)
+      (and (string= (tramp-file-name-method (tramp-dissect-hop-name hop))
+		    tramp-rpc-method)
            (member (tramp-file-name-method vec)
                    '("sudo" "su" "doas" "sg" "run0" "ksu")))))
 
@@ -130,17 +131,18 @@
   ;; Allow the "rpc" method in multi-hop filename syntax.
   ;; TRAMP's `tramp-multi-hop-p' only returns t for tramp-sh methods,
   ;; which would cause `tramp-dissect-file-name' to reject filenames like
-  ;; /rpc:hop|rpc:target:/path.  We advise it to also accept "rpc".
-  (defun tramp-rpc--multi-hop-advice (orig-fun vec)
-    "Allow the rpc method and rpc+sudo paths in multi-hop chains."
+  ;; /rpc:hop|rpc:target:/path.  We extend it via `tramp-multi-hop-p-hook'.
+  (defun tramp-rpc-multi-hop-p (vec)
+    "Allow the rpc method and rpc+sudo paths in multi-hop chains.
+This is called from `tramp-multi-hop-p-hook'."
     (or (string= (tramp-file-name-method vec) tramp-rpc-method)
         ;; Also allow privilege elevation methods when the hop contains rpc
         (when-let* ((hop (tramp-file-name-hop vec)))
-          (and (string-match-p "rpc:" hop)
+          (and (string= (tramp-file-name-method (tramp-dissect-hop-name hop))
+			tramp-rpc-method)
                (member (tramp-file-name-method vec)
-                       '("sudo" "su" "doas" "sg" "run0" "ksu"))))
-        (funcall orig-fun vec)))
-  (advice-add 'tramp-multi-hop-p :around #'tramp-rpc--multi-hop-advice)))
+                       '("sudo" "su" "doas" "sg" "run0" "ksu"))))))
+  (add-hook 'tramp-multi-hop-p-hook #'tramp-rpc-multi-hop-p)))
 
 ;; Now the actual implementation
 (require 'cl-lib)
@@ -170,8 +172,8 @@
 ;; (declare-function tramp-rpc-handler-remove "tramp-rpc-advice")
 (declare-function tramp-add-external-operation "tramp")
 (declare-function tramp-remove-external-operation "tramp")
-(declare-function tramp-rpc--multi-hop-advice "tramp-rpc")
 (declare-function tramp-rpc--sudo-file-name-p "tramp-rpc")
+(declare-function tramp-rpc-multi-hop-p "tramp-rpc")
 
 ;; ============================================================================
 ;; Sudo-via-RPC: detect privilege elevation from hop chains
@@ -3372,16 +3374,6 @@ VEC-OR-FILENAME can be either a tramp-file-name struct or a filename string."
 (tramp-register-foreign-file-name-handler
  #'tramp-rpc-file-name-p #'tramp-rpc-file-name-handler)
 
-(defun tramp-rpc--multi-hop-advice-remove ()
-  "Remove multi-hop advice."
-  (advice-remove 'tramp-multi-hop-p #'tramp-rpc--multi-hop-advice))
-
-;; ============================================================================
-;; Recentf integration
-;; ============================================================================
-
-
-
 ;; ============================================================================
 ;; Connection cleanup support
 ;; ============================================================================
@@ -3484,8 +3476,8 @@ Removes advice and cleans up async processes."
   ;; Remove all advice (from tramp-rpc-advice module)
   ;; Not needed. This is called in `tramp-rpc-advice-unload-function'.
   ;; (tramp-rpc-handler-remove)
-  ;; Remove legacy multi-hop advice and cleanup hooks.
-  (advice-remove 'tramp-multi-hop-p #'tramp-rpc--multi-hop-advice)
+  ;; Remove multi-hop hook and cleanup hooks.
+  (remove-hook 'tramp-multi-hop-p-hook #'tramp-rpc-multi-hop-p)
   (remove-hook 'tramp-cleanup-connection-hook #'tramp-rpc-cleanup-connection)
   (remove-hook 'tramp-cleanup-all-connections-hook #'tramp-rpc-cleanup-all-connections)
   ;; Clean up all async processes (from tramp-rpc-process module)
