@@ -381,6 +381,28 @@ pub async fn kill(params: Value) -> HandlerResult {
     Ok(Value::Boolean(true))
 }
 
+/// Return status of an async process without consuming stdout/stderr.
+pub async fn status(params: Value) -> HandlerResult {
+    #[derive(Deserialize)]
+    struct Params {
+        pid: u32,
+    }
+
+    let params: Params = from_value(params).map_err(|e| RpcError::invalid_params(e.to_string()))?;
+
+    let mut processes = get_process_map().lock().await;
+    let managed = processes
+        .get_mut(&params.pid)
+        .ok_or_else(|| RpcError::process_error(format!("Process not found: {}", params.pid)))?;
+
+    let exit_status = managed.child.try_wait().ok().flatten();
+
+    Ok(msgpack_map! {
+        "exited" => exit_status.is_some(),
+        "exit_code" => exit_status.map(crate::protocol::exit_code_from_status).map(|c| Value::Integer(c.into())).unwrap_or(Value::Nil)
+    })
+}
+
 /// List all managed async processes
 pub async fn list(_params: Value) -> HandlerResult {
     let mut processes = get_process_map().lock().await;

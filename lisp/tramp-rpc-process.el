@@ -107,19 +107,19 @@ Returns plist with :stdout, :stderr, :exited, :exit-code."
 
 (defun tramp-rpc--write-remote-process (vec pid data)
   "Write DATA to stdin of remote process PID on VEC.
-Uses async RPC with queuing to ensure writes are serialized.
-This prevents race conditions where later messages arrive before earlier ones."
-  (let* ((queue-key pid)
-         (queue (gethash queue-key tramp-rpc--process-write-queues))
-         (pending (plist-get queue :pending))
-         (writing (plist-get queue :writing)))
-    ;; Add to pending queue
-    (setq pending (append pending (list (list :vec vec :pid pid :data data))))
-    (puthash queue-key (list :pending pending :writing writing)
-             tramp-rpc--process-write-queues)
-    ;; If not currently writing, start processing the queue
-    (unless writing
-      (tramp-rpc--process-write-queue queue-key))))
+Performs a synchronous RPC call so that callers like
+`start-file-process-shell-command' can rely on write visibility before
+the next `accept-process-output' poll."
+  ;; Native `process-send-string' writes into a local pipe synchronously.
+  ;; For parity, avoid fire-and-forget async writes here: tests and callers
+  ;; may perform immediate follow-up checks (file existence, process output)
+  ;; after sending input.
+  (let ((data-bytes (if (multibyte-string-p data)
+                        (encode-coding-string data 'utf-8-unix)
+                      data)))
+    (tramp-rpc--call vec "process.write"
+                     `((pid . ,pid)
+                       (data . ,(msgpack-bin-make data-bytes))))))
 
 (defun tramp-rpc--process-write-queue (queue-key)
   "Process the next pending write for QUEUE-KEY (remote PID)."
@@ -304,15 +304,27 @@ RESPONSE is the decoded RPC response plist."
                            (if stderr (length stderr) "nil")
                            exited)
 
-          ;; Deliver output - use run-at-time to ensure event loop processes it
-          ;; This is critical for accept-process-output to work correctly
-          (when (or stdout stderr)
-            (run-at-time 0 nil #'tramp-rpc--deliver-process-output
-                         local-process stdout stderr stderr-buffer))
+          ;; Deliver output.  When the remote process reports EXITED, flush
+          ;; data immediately before sending EOF to the local relay; otherwise
+          ;; the deferred delivery can race with relay shutdown and lose output.
+          (if exited
+              (when (or stdout stderr)
+                (tramp-rpc--deliver-process-output
+                 local-process stdout stderr stderr-buffer))
+            ;; Keep deferred delivery for the non-exit hot path so
+            ;; accept-process-output observes normal I/O activity.
+            (when (or stdout stderr)
+              (run-at-time 0 nil #'tramp-rpc--deliver-process-output
+                           local-process stdout stderr stderr-buffer)))
 
           ;; Handle process exit or chain next read
           (if exited
-              (run-at-time 0 nil #'tramp-rpc--handle-process-exit local-process exit-code)
+              ;; Handle exit immediately so `process-live-p' flips to nil
+              ;; before callers can issue another round of remote operations.
+              ;; Deferring this via `run-at-time 0' leaves a small window where
+              ;; loops that poll `process-live-p' can observe a stale live
+              ;; process and run one extra iteration.
+              (tramp-rpc--handle-process-exit local-process exit-code)
             ;; Chain another read - use run-at-time to avoid stack overflow
             (run-at-time 0 nil #'tramp-rpc--start-async-read local-process)))
       (error
@@ -520,10 +532,16 @@ Resolves program path and loads direnv environment from working directory."
   "Start async process on remote host.
 NAME is the process name, BUFFER is the output buffer,
 PROGRAM is the command to run, ARGS are its arguments."
-  (tramp-rpc-handle-make-process
-   :name name
-   :buffer buffer
-   :command (cons program args)))
+  (let ((proc
+         (tramp-rpc-handle-make-process
+          :name name
+          :buffer buffer
+          :command (cons program args))))
+    ;; Only start-file-process style workloads need aggressive remote
+    ;; liveness probing to avoid async race windows in process-status.
+    (when (processp proc)
+      (process-put proc :tramp-rpc-probe-remote-status t))
+    proc))
 
 ;; ============================================================================
 ;; PTY Process Support

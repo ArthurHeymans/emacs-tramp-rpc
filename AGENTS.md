@@ -28,7 +28,9 @@ NEVER use emacsclient. That will interfer with the users configuration
 
 Always use `emacs -Q --batch --eval <lisp commands>`
 
-When testing updates to the rust server, always copy it to a temporary location and set `tramp-rpc-deploy-remote-directory` to the temporary path so that testing does not interfere with existing sessions. Always test changes to the code.
+When testing updates to the rust server, always copy it to a temporary location and set `tramp-rpc-deploy-remote-directory` to the temporary path so that testing does not interfere with existing sessions. Use `scripts/build_all.sh` to rebuild the server binary. Then SCP it to a new location and set the variable.
+
+Always test changes to the code.
 
 ## Test Example
 

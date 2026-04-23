@@ -289,6 +289,7 @@ async fn dispatch_inner(request: Request) -> Response {
         "process.start" => process::start(params).await,
         "process.write" => process::write(params).await,
         "process.read" => process::read(params).await,
+        "process.status" => process::status(params).await,
         "process.close_stdin" => process::close_stdin(params).await,
         "process.kill" => process::kill(params).await,
         "process.list" => process::list(params).await,

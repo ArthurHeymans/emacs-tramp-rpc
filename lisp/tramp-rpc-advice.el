@@ -36,6 +36,7 @@
 (declare-function tramp-rpc--close-remote-stdin "tramp-rpc-process")
 (declare-function tramp-rpc--kill-remote-process "tramp-rpc-process")
 (declare-function tramp-rpc--cleanup-async-processes "tramp-rpc-process")
+(declare-function tramp-rpc--handle-process-exit "tramp-rpc-process")
 
 ;; Functions from tramp-cmds.el
 
@@ -220,6 +221,31 @@ It will be added to `signal-process-functions'."
   (if (and (processp process) (process-get process :tramp-rpc-pid))
       (cond
        ((process-get process :tramp-rpc-exited) 'exit)
+       ;; Remote process can exit in the gap before our async read callback
+       ;; marks :tramp-rpc-exited. Probe explicit remote status to avoid
+       ;; stale `process-live-p' true results that trigger extra iterations.
+       ((when-let* ((vec (and (process-get process :tramp-rpc-probe-remote-status)
+                              (process-get process :tramp-rpc-vec)))
+                    (pid (process-get process :tramp-rpc-pid)))
+          (let* ((status (tramp-rpc--call vec "process.status" `((pid . ,pid))))
+                 (exited (alist-get 'exited status))
+                 (exit-code (alist-get 'exit_code status)))
+            (when status
+                (when exited
+                  (unless (null exit-code)
+                    (process-put process :tramp-rpc-exit-code exit-code))
+                  ;; Schedule exit handling soon, but keep reporting local
+                  ;; relay liveness until it drains pending output.
+                  (unless (process-get process :tramp-rpc-exit-scheduled)
+                    (process-put process :tramp-rpc-exit-scheduled t)
+                    (run-at-time
+                     0 nil
+                     (lambda ()
+                       (when (processp process)
+                         (process-put process :tramp-rpc-exit-scheduled nil)
+                         (unless (process-get process :tramp-rpc-exited)
+                           (tramp-rpc--handle-process-exit process exit-code)))))))
+                nil))))
        ;; Use orig-fun to check live status, not process-live-p (which would recurse)
        ((memq (funcall orig-fun process) '(run open listen connect)) 'run)
        (t 'exit))
