@@ -376,7 +376,7 @@ The directory is deleted after BODY completes."
 
   ;; Existing file
   (tramp-rpc-test--with-temp-file tmp "test content"
-    (should (tramp-rpc-test--with-call-count 3
+    (should (tramp-rpc-test--with-call-count 1
               (file-writable-p tmp))))
 
   ;; Non-existent file in writable directory
@@ -630,7 +630,7 @@ This tests Issue #13: Chinese characters decode incorrectly."
 
   (tramp-rpc-test--with-temp-file tmp "test content"
     (with-temp-buffer
-      (tramp-rpc-test--with-call-count 3
+      (tramp-rpc-test--with-call-count 1
         (insert-file-contents tmp))
       (should (equal (buffer-string) "test content")))))
 
@@ -641,7 +641,7 @@ This tests Issue #13: Chinese characters decode incorrectly."
   (tramp-rpc-test--with-temp-file tmp "0123456789"
     ;; Read bytes 2-5
     (with-temp-buffer
-      (tramp-rpc-test--with-call-count 3
+      (tramp-rpc-test--with-call-count 1
         (insert-file-contents tmp nil 2 6))
       (should (equal (buffer-string) "2345")))))
 
@@ -657,7 +657,7 @@ This tests Issue #13: Chinese characters decode incorrectly."
     (let ((dest (tramp-rpc-test--make-temp-name)))
       (unwind-protect
           (progn
-            (tramp-rpc-test--with-call-count 5
+            (tramp-rpc-test--with-call-count 2
               (copy-file src dest))
             (should (file-exists-p dest))
             (should (equal (with-temp-buffer
@@ -690,7 +690,7 @@ signal `file-already-exists'.  With trailing slash (via
             (should-error (copy-file src dest-dir 'ok)
                           :type 'file-error)
             ;; With trailing / (file-name-as-directory), should copy INTO dir
-            (tramp-rpc-test--with-call-count 5
+            (tramp-rpc-test--with-call-count 2
               (copy-file src (file-name-as-directory dest-dir)))
             ;; File should now exist inside the directory with original name
             (let ((expected-dest (expand-file-name
@@ -714,7 +714,7 @@ signal `file-already-exists'.  With trailing slash (via
     (unwind-protect
         (progn
           (write-region content nil src)
-          (tramp-rpc-test--with-call-count 3
+          (tramp-rpc-test--with-call-count 2
             (rename-file src dest))
           (should-not (file-exists-p src))
           (should (file-exists-p dest))
@@ -816,7 +816,7 @@ This exercises copy-then-delete for cross-remote renames."
   (let ((dir (tramp-rpc-test--make-temp-name)))
     (unwind-protect
         (progn
-          (tramp-rpc-test--with-call-count 2
+          (tramp-rpc-test--with-call-count 1
             (make-directory dir))
           (should (file-directory-p dir)))
       (ignore-errors (delete-directory dir)))))
@@ -828,7 +828,7 @@ This exercises copy-then-delete for cross-remote renames."
   (let ((dir (concat (tramp-rpc-test--make-temp-name) "/nested/path")))
     (unwind-protect
         (progn
-          (tramp-rpc-test--with-call-count 9
+          (tramp-rpc-test--with-call-count 1
             (make-directory dir t))
           (should (file-directory-p dir)))
       (ignore-errors (delete-directory
@@ -868,7 +868,7 @@ This exercises copy-then-delete for cross-remote renames."
     (write-region "b" nil (concat dir "/file2.txt"))
     (write-region "c" nil (concat dir "/other.log"))
 
-    (let ((files (tramp-rpc-test--with-call-count 2
+    (let ((files (tramp-rpc-test--with-call-count 1
                   (directory-files dir))))
       ;; Should contain . and .. plus our files
       (should (member "." files))

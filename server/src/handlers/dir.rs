@@ -9,7 +9,7 @@ use crate::protocol::{from_value, DirEntry, FileAttributes, FileType, RpcError};
 use rmpv::Value;
 use serde::Deserialize;
 use std::os::unix::ffi::OsStrExt;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use tokio::fs;
 
 use super::file::{bytes_to_path, map_io_error};
@@ -292,6 +292,23 @@ fn file_type_from_metadata_ft(ft: &std::fs::FileType) -> FileType {
     }
 }
 
+/// Return the directory components that do not exist yet, from top to bottom.
+fn missing_directory_chain(path: &Path) -> Vec<PathBuf> {
+    let mut missing = Vec::new();
+    let mut current = Some(path);
+
+    while let Some(component) = current {
+        if component.exists() {
+            break;
+        }
+        missing.push(component.to_path_buf());
+        current = component.parent();
+    }
+
+    missing.reverse();
+    missing
+}
+
 /// Create a directory
 pub async fn create(params: Value) -> HandlerResult {
     #[derive(Deserialize)]
@@ -315,6 +332,12 @@ pub async fn create(params: Value) -> HandlerResult {
     let path = bytes_to_path(&params.path);
     let path_str = path.to_string_lossy().into_owned();
 
+    let created_paths = if params.parents {
+        missing_directory_chain(&path)
+    } else {
+        vec![path.clone()]
+    };
+
     let result = if params.parents {
         fs::create_dir_all(&path).await
     } else {
@@ -323,17 +346,24 @@ pub async fn create(params: Value) -> HandlerResult {
 
     result.map_err(|e| map_io_error(e, &path_str))?;
 
-    // Set permissions
+    // Set permissions only on directories created by this request.  This keeps
+    // the previous RPC behavior for new parent components while avoiding chmod
+    // side effects when `make-directory DIR t' is called for an existing dir.
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
         let perms = std::fs::Permissions::from_mode(params.mode);
-        fs::set_permissions(&path, perms)
-            .await
-            .map_err(|e| map_io_error(e, &path_str))?;
+        for created_path in &created_paths {
+            fs::set_permissions(created_path, perms.clone())
+                .await
+                .map_err(|e| map_io_error(e, &created_path.to_string_lossy()))?;
+        }
     }
 
-    Ok(Value::Boolean(true))
+    // Return whether this call created PATH.  Existing clients ignored the old
+    // unconditional `true'; the Lisp handler now uses false to preserve the
+    // `make-directory DIR t' return value when DIR already exists.
+    Ok(Value::Boolean(!created_paths.is_empty()))
 }
 
 /// Remove a directory

@@ -26,11 +26,33 @@ pub async fn stat(params: Value) -> HandlerResult {
     let params: Params = from_value(params).map_err(|e| RpcError::invalid_params(e.to_string()))?;
 
     let path = bytes_to_path(&params.path);
-    match get_file_attributes(&path, params.lstat).await {
+    match get_file_attributes(path.as_path(), params.lstat).await {
         Ok(attrs) => Ok(attrs.to_value()),
         Err(e) if e.code == RpcError::FILE_NOT_FOUND => Ok(Value::Nil),
         Err(e) => Err(e),
     }
+}
+
+/// Check path accessibility.
+pub async fn access(params: Value) -> HandlerResult {
+    #[derive(Deserialize)]
+    struct Params {
+        #[serde(with = "path_or_bytes")]
+        path: Vec<u8>,
+        /// One of: "exists", "readable", "writable", "executable".
+        mode: String,
+    }
+
+    let params: Params = from_value(params).map_err(|e| RpcError::invalid_params(e.to_string()))?;
+
+    let path = bytes_to_path(&params.path);
+    let mode = params.mode;
+
+    let accessible = tokio::task::spawn_blocking(move || access_sync(path.as_path(), &mode))
+        .await
+        .map_err(|e| RpcError::internal_error(format!("Task join error: {}", e)))??;
+
+    Ok(Value::Boolean(accessible))
 }
 
 /// Get the true name of a file (resolve symlinks)
@@ -280,6 +302,40 @@ use std::path::PathBuf;
 pub fn bytes_to_path(bytes: &[u8]) -> PathBuf {
     let path = PathBuf::from(OsStr::from_bytes(bytes));
     expand_tilde_path(&path)
+}
+
+fn access_sync(path: &Path, mode: &str) -> Result<bool, RpcError> {
+    let flags = match mode {
+        "exists" => libc::F_OK,
+        "readable" => libc::R_OK,
+        "writable" => {
+            if path.exists() {
+                libc::W_OK
+            } else {
+                // Creating a missing file requires write and search access on
+                // the containing directory.
+                return Ok(path
+                    .parent()
+                    .is_some_and(|parent| access_path(parent, libc::W_OK | libc::X_OK)));
+            }
+        }
+        "executable" => libc::X_OK,
+        _ => {
+            return Err(RpcError::invalid_params(format!(
+                "Invalid access mode: {mode}"
+            )))
+        }
+    };
+
+    Ok(access_path(path, flags))
+}
+
+fn access_path(path: &Path, flags: libc::c_int) -> bool {
+    let Ok(path_cstr) = std::ffi::CString::new(path.as_os_str().as_bytes()) else {
+        return false;
+    };
+
+    unsafe { libc::access(path_cstr.as_ptr(), flags) == 0 }
 }
 
 /// Expand ~ to home directory in a PathBuf.

@@ -265,6 +265,7 @@ async fn dispatch_inner(request: Request) -> Response {
     let result = match method.as_str() {
         // File metadata operations
         "file.stat" => file::stat(params).await,
+        "file.access" => file::access(params).await,
         "file.truename" => file::truename(params).await,
 
         // Directory operations

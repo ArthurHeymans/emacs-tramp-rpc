@@ -1625,6 +1625,26 @@ Returns an alist with path."
 ;; File name handler operations
 ;; ============================================================================
 
+(defun tramp-rpc-handle-file-readable-p (filename)
+  "Like `file-readable-p' for TRAMP-RPC files.
+Uses the remote server's access check, avoiding the generic TRAMP
+permission logic and its extra metadata round-trips."
+  (with-parsed-tramp-file-name (expand-file-name filename) nil
+    (with-tramp-file-property v localname "file-readable-p"
+      (tramp-rpc--call v "file.access"
+                       (append (tramp-rpc--encode-path localname)
+                               '((mode . "readable")))))))
+
+(defun tramp-rpc-handle-file-writable-p (filename)
+  "Like `file-writable-p' for TRAMP-RPC files.
+For a missing file, writability is checked on the containing directory on the
+remote host, matching `file-writable-p' creation semantics in one RPC."
+  (with-parsed-tramp-file-name (expand-file-name filename) nil
+    (with-tramp-file-property v localname "file-writable-p"
+      (tramp-rpc--call v "file.access"
+                       (append (tramp-rpc--encode-path localname)
+                               '((mode . "writable")))))))
+
 (defun tramp-rpc-handle-file-executable-p (filename)
   "Like `file-executable-p' for TRAMP-RPC files.
 Checks execute permission from `file-attributes' mode string and
@@ -1990,13 +2010,34 @@ to the built-in implementation."
 ;; ============================================================================
 
 (defun tramp-rpc-handle-directory-files (directory &optional full match nosort count)
-  "Like `directory-files' for TRAMP-RPC files."
-  (tramp-skeleton-directory-files directory full match nosort count
-    (let* ((result (tramp-rpc--call v "dir.list"
-                                    (append (tramp-rpc--encode-path localname)
-                                            '((include_attrs . :msgpack-false)
-                                              (include_hidden . t))))))
-      (mapcar #'tramp-rpc--decode-filename result))))
+  "Like `directory-files' for TRAMP-RPC files.
+
+Use the server's `dir.list' result directly instead of the generic
+TRAMP skeleton.  The skeleton first checks `file-exists-p' and
+`file-directory-p', which costs extra network round-trips on high-latency
+links.  `dir.list' already reports missing or non-directory paths as errors,
+so a single RPC can both validate and list the directory."
+  (let* ((directory (file-name-as-directory (expand-file-name directory)))
+         result)
+    (with-parsed-tramp-file-name directory nil
+      (setq result
+            (with-tramp-file-property v localname "directory-files"
+              (mapcar #'tramp-rpc--decode-filename
+                      (tramp-rpc--call v "dir.list"
+                                       (append (tramp-rpc--encode-path localname)
+                                               '((include_attrs . :msgpack-false)
+                                                 (include_hidden . t))))))))
+    (when match
+      (setq result (cl-remove-if-not
+                    (lambda (name) (string-match-p match name))
+                    result)))
+    (unless nosort
+      (setq result (sort (copy-sequence result) #'string<)))
+    (when (and (natnump count) (> count 0))
+      (setq result (seq-take result count)))
+    (if full
+        (mapcar (lambda (name) (concat directory name)) result)
+      result)))
 
 (defun tramp-rpc-handle-directory-files-and-attributes
     (directory &optional full match nosort id-format count)
@@ -2057,17 +2098,29 @@ to the built-in implementation."
                   entries))))))
 
 (defun tramp-rpc-handle-make-directory (dir &optional parents)
-  "Like `make-directory' for TRAMP-RPC files."
-  (tramp-skeleton-make-directory dir parents
-    (tramp-rpc--call v "dir.create"
-                     (append (tramp-rpc--encode-path localname)
-                             ;; Don't pass parents here - the skeleton
-                             ;; handles the recursive parent creation.
-                             `((parents . :msgpack-false)
-                               (mode . ,(default-file-modes)))))
-    ;; Flush parent directory properties so file-exists-p sees the new dir.
-    (tramp-flush-directory-properties v (file-name-directory localname))
-    (tramp-rpc--invalidate-cache-for-path dir)))
+  "Like `make-directory' for TRAMP-RPC files.
+
+Delegate parent creation to the server instead of using
+`tramp-skeleton-make-directory'.  The generic skeleton probes each path
+component with separate `file-exists-p' / `file-directory-p' calls before the
+actual mkdir.  Server-side `create_dir_all' performs the same validation in one
+network round-trip."
+  (let* ((dir (directory-file-name (expand-file-name dir)))
+         (parent (file-name-directory dir)))
+    (with-parsed-tramp-file-name dir nil
+      (let ((created
+             (tramp-rpc--call v "dir.create"
+                              (append (tramp-rpc--encode-path localname)
+                                      `((parents . ,(if parents t :msgpack-false))
+                                        (mode . ,(default-file-modes)))))))
+        ;; Flush parent directory properties so file-exists-p sees the new dir.
+        (tramp-flush-directory-properties v (file-name-directory localname))
+        (when parent
+          (tramp-rpc--invalidate-cache-for-path parent))
+        (tramp-rpc--invalidate-cache-for-path dir)
+        ;; Match `make-directory' return convention: nil when a directory was
+        ;; created, t when PARENTS was non-nil and the directory already existed.
+        (and parents (not created))))))
 
 (defun tramp-rpc-handle-delete-directory (directory &optional recursive trash)
   "Like `delete-directory' for TRAMP-RPC files."
@@ -2134,12 +2187,75 @@ to the built-in implementation."
       ;; from our `coding' variable instead.
       (setq coding-system-used coding))))
 
-(defun tramp-rpc-handle-copy-file
+(defun tramp-rpc--stat-type (stat)
+  "Return file type string from STAT, or nil."
+  (and stat (alist-get 'type stat)))
+
+(cl-defun tramp-rpc--copy-file-same-remote
+    (filename newname ok-if-already-exists keep-time preserve-permissions)
+  "Copy FILENAME to NEWNAME on one TRAMP-RPC remote with fewer round-trips."
+  (with-parsed-tramp-file-name filename v1
+    (with-parsed-tramp-file-name newname v2
+      (let* ((stats (tramp-rpc--call-batch
+                     v1
+                     `(("file.stat" . ,(append (tramp-rpc--encode-path v1-localname)
+                                                '((lstat . t))))
+                       ("file.stat" . ,(append (tramp-rpc--encode-path v2-localname)
+                                                '((lstat . t)))))))
+             (source-stat (nth 0 stats))
+             (dest-stat (nth 1 stats))
+             (source-type (tramp-rpc--stat-type source-stat))
+             (dest-type (tramp-rpc--stat-type dest-stat)))
+        (unless source-stat
+          (signal 'file-missing (list "Opening input file" "No such file" filename)))
+        (when (and (directory-name-p newname)
+                   (equal dest-type "directory"))
+          (cl-return-from tramp-rpc--copy-file-same-remote
+            (tramp-rpc--copy-file-same-remote
+             filename
+             (expand-file-name (file-name-nondirectory filename) newname)
+             ok-if-already-exists keep-time preserve-permissions)))
+        (unless ok-if-already-exists
+          (when dest-stat
+            (signal 'file-already-exists (list newname))))
+        (when (and (equal dest-type "directory")
+                   (not (directory-name-p newname)))
+          (signal 'file-error (list "File is a directory" newname)))
+        (cond
+         ((equal source-type "directory")
+          (copy-directory filename newname keep-time t))
+         ((equal source-type "symlink")
+          (make-symbolic-link
+           (tramp-rpc--decode-string (alist-get 'link_target source-stat))
+           newname ok-if-already-exists))
+         (t
+          (tramp-rpc--call v1 "file.copy"
+                           `((src . ,(tramp-rpc--path-to-bytes
+                                      (file-name-unquote v1-localname)))
+                             (dest . ,(tramp-rpc--path-to-bytes
+                                       (file-name-unquote v2-localname)))
+                             (preserve . ,(if (or keep-time preserve-permissions)
+                                              t :msgpack-false))))))
+        (tramp-flush-file-properties v1 v1-localname)
+        (tramp-flush-file-properties v2 v2-localname)
+        (tramp-flush-directory-properties v2 v2-localname)
+        (tramp-rpc--invalidate-cache-for-path newname)))))
+
+(cl-defun tramp-rpc-handle-copy-file
     (filename newname &optional ok-if-already-exists keep-time
               preserve-uid-gid preserve-permissions)
   "Like `copy-file' for TRAMP-RPC files."
   (setq filename (expand-file-name filename)
         newname (expand-file-name newname))
+  ;; Fast path for same-remote copies: batch source/destination stats, then do
+  ;; the server-side copy.  This avoids the generic preflight predicates each
+  ;; costing their own network round-trip.
+  (when (and (tramp-tramp-file-p filename)
+             (tramp-tramp-file-p newname)
+             (tramp-equal-remote filename newname))
+    (cl-return-from tramp-rpc-handle-copy-file
+      (tramp-rpc--copy-file-same-remote
+       filename newname ok-if-already-exists keep-time preserve-permissions)))
   ;; When NEWNAME is a directory name (trailing /), copy INTO it.
   (when (and (directory-name-p newname)
              (file-directory-p newname))
@@ -2241,10 +2357,59 @@ to the built-in implementation."
         (tramp-flush-directory-properties v2 v2-localname))
       (tramp-rpc--invalidate-cache-for-path newname))))
 
-(defun tramp-rpc-handle-rename-file (filename newname &optional ok-if-already-exists)
+(cl-defun tramp-rpc--rename-file-same-remote
+    (filename newname ok-if-already-exists)
+  "Rename FILENAME to NEWNAME on one TRAMP-RPC remote with fewer round-trips."
+  (with-parsed-tramp-file-name filename v1
+    (with-parsed-tramp-file-name newname v2
+      (let* ((stats (tramp-rpc--call-batch
+                     v1
+                     `(("file.stat" . ,(append (tramp-rpc--encode-path v1-localname)
+                                                '((lstat . t))))
+                       ("file.stat" . ,(append (tramp-rpc--encode-path v2-localname)
+                                                '((lstat . t)))))))
+             (source-stat (nth 0 stats))
+             (dest-stat (nth 1 stats))
+             (source-type (tramp-rpc--stat-type source-stat))
+             (dest-type (tramp-rpc--stat-type dest-stat)))
+        (when dest-stat
+          (unless ok-if-already-exists
+            (signal 'file-already-exists (list newname)))
+          (when (and (equal dest-type "directory")
+                     (not (directory-name-p newname))
+                     (not (equal source-type "directory")))
+            (signal 'file-error (list "File is a directory" newname))))
+        (when (and (equal dest-type "directory")
+                   (directory-name-p newname))
+          (cl-return-from tramp-rpc--rename-file-same-remote
+            (tramp-rpc--rename-file-same-remote
+             filename
+             (expand-file-name (file-name-nondirectory filename) newname)
+             ok-if-already-exists)))
+        (tramp-rpc--call v1 "file.rename"
+                         `((src . ,(tramp-rpc--path-to-bytes
+                                    (file-name-unquote v1-localname)))
+                           (dest . ,(tramp-rpc--path-to-bytes
+                                     (file-name-unquote v2-localname)))
+                           (overwrite . ,(if ok-if-already-exists
+                                             t :msgpack-false))))
+        (tramp-flush-file-properties v1 v1-localname)
+        (tramp-rpc--invalidate-cache-for-path filename)
+        (tramp-flush-file-properties v2 v2-localname)
+        (tramp-flush-directory-properties v2 v2-localname)
+        (tramp-rpc--invalidate-cache-for-path newname)))))
+
+(cl-defun tramp-rpc-handle-rename-file (filename newname &optional ok-if-already-exists)
   "Like `rename-file' for TRAMP-RPC files."
   (setq filename (expand-file-name filename)
         newname (expand-file-name newname))
+  ;; Fast path for same-remote renames: one batched preflight plus the rename.
+  (when (and (tramp-tramp-file-p filename)
+             (tramp-tramp-file-p newname)
+             (tramp-equal-remote filename newname))
+    (cl-return-from tramp-rpc-handle-rename-file
+      (tramp-rpc--rename-file-same-remote
+       filename newname ok-if-already-exists)))
   ;; Check ok-if-already-exists BEFORE any directory rewriting.
   (when (file-exists-p newname)
     (unless ok-if-already-exists
@@ -2290,10 +2455,19 @@ to the built-in implementation."
       (tramp-rpc--invalidate-cache-for-path newname))))
 
 (defun tramp-rpc-handle-delete-file (filename &optional trash)
-  "Like `delete-file' for TRAMP-RPC files."
-  (tramp-skeleton-delete-file filename trash
-    (tramp-rpc--call v "file.delete" (tramp-rpc--encode-path localname)))
-  (tramp-rpc--invalidate-cache-for-path filename))
+  "Like `delete-file' for TRAMP-RPC files.
+Calls `file.delete' directly; the server's unlink error is sufficient for the
+missing-file check, so no separate preflight stat is needed."
+  (with-parsed-tramp-file-name (expand-file-name filename) nil
+    (let ((delete-by-moving-to-trash
+           (and delete-by-moving-to-trash
+                (not (bound-and-true-p
+                      remote-file-name-inhibit-delete-by-moving-to-trash)))))
+      (if (and delete-by-moving-to-trash trash)
+          (move-file-to-trash filename)
+        (tramp-rpc--call v "file.delete" (tramp-rpc--encode-path localname)))
+      (tramp-flush-file-properties v localname)
+      (tramp-rpc--invalidate-cache-for-path filename))))
 
 (defun tramp-rpc-handle-make-symbolic-link (target linkname &optional ok-if-already-exists)
   "Like `make-symbolic-link' for TRAMP-RPC files."
@@ -2818,6 +2992,41 @@ correctly with bash, zsh, fish, and other shells)."
           nil))
     (error nil)))
 
+(defun tramp-rpc-handle-insert-file-contents
+    (filename &optional visit beg end replace)
+  "Like `insert-file-contents' for TRAMP-RPC files.
+Reads directly through `file.read' instead of going through
+`file-local-copy', avoiding the generic TRAMP temp-file path and its extra
+round-trips for the common non-VISIT case."
+  (barf-if-buffer-read-only)
+  (setq filename (expand-file-name filename))
+  (if visit
+      ;; Visiting a file has extra buffer-state and not-found semantics.  Keep
+      ;; the battle-tested generic TRAMP path there; the latency-sensitive
+      ;; optimization is for ordinary reads (the common programmatic case).
+      (tramp-handle-insert-file-contents filename visit beg end replace)
+    (let ((start (point))
+          result)
+      (with-parsed-tramp-file-name filename nil
+        (when replace
+          (delete-region (point-min) (point-max))
+          (setq start (point)))
+        (let* ((params (tramp-rpc--file-read-params localname)))
+          (when beg
+            (push `(offset . ,beg) params))
+          (when end
+            (push `(length . ,(- end (or beg 0))) params))
+          (let* ((rpc-result (tramp-rpc--call v "file.read" params))
+                 (content (tramp-rpc--extract-file-read-content rpc-result))
+                 (decoded-content
+                  (if enable-multibyte-characters
+                      (decode-coding-string
+                       content (or coding-system-for-read 'undecided))
+                    content)))
+            (insert decoded-content)
+            (setq result (cons filename (- (point) start))))))
+      result)))
+
 (defun tramp-rpc-handle-file-local-copy (filename)
   "Create a local copy of remote FILENAME using RPC."
   (tramp-skeleton-file-local-copy filename
@@ -2984,8 +3193,8 @@ Also controls process exit detection latency."
     ;; RPC-based file attribute operations
     ;; =========================================================================
     (file-exists-p . tramp-handle-file-exists-p)
-    (file-readable-p . tramp-handle-file-readable-p)
-    (file-writable-p . tramp-handle-file-writable-p)
+    (file-readable-p . tramp-rpc-handle-file-readable-p)
+    (file-writable-p . tramp-rpc-handle-file-writable-p)
     (file-executable-p . tramp-rpc-handle-file-executable-p)
     (file-directory-p . tramp-rpc-handle-file-directory-p)
     (file-regular-p . tramp-handle-file-regular-p)
@@ -3018,7 +3227,7 @@ Also controls process exit detection latency."
     ;; =========================================================================
     ;; RPC-based file I/O operations
     ;; =========================================================================
-    (insert-file-contents . tramp-handle-insert-file-contents)
+    (insert-file-contents . tramp-rpc-handle-insert-file-contents)
     (write-region . tramp-rpc-handle-write-region)
     (copy-file . tramp-rpc-handle-copy-file)
     (rename-file . tramp-rpc-handle-rename-file)
