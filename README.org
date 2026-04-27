@@ -37,7 +37,7 @@ TRAMP-RPC replaces this with a lightweight Rust server that runs on the remote h
 
 - Emacs 30.1 or later
 - Tramp 2.8.1.4 or later (install from GNU ELPA if your Emacs bundles an older version)
-- =msgpack.el= package (installed automatically from MELPA)
+- =msgpack.el= package (installed automatically from NonGNU ELPA or MELPA)
 - SSH access to remote hosts
 - Remote host running Linux or macOS (x86_64 or aarch64)
 
@@ -49,6 +49,21 @@ TRAMP-RPC replaces this with a lightweight Rust server that runs on the remote h
 (use-package tramp-rpc
   :ensure t)
 #+end_src
+
+** From NonGNU ELPA
+
+After the package is available from NonGNU ELPA, install it with:
+
+#+begin_src elisp
+(use-package tramp-rpc
+  :ensure t)
+#+end_src
+
+ELPA package builds include the Rust server sources.  On first use,
+tramp-rpc can build the server locally when Rust/cargo and the relevant target
+are installed.  If a local build is not available, tramp-rpc asks before
+downloading pre-built server binaries from GitHub.  Alternatively, install
+=tramp-rpc-server= with your system package manager or build it separately.
 
 ** From Git (Emacs 30+)
 
@@ -138,7 +153,7 @@ Access remote files using the ~rpc~ method:
 
 On first connection, the server binary is automatically obtained and deployed:
 
-1. *Release/package installs*: download from GitHub Releases first (fastest, ~850KB download), then build from source if Rust is installed and download fails.
+1. *Release/package installs*: use an existing cached/bundled binary, then build from included source when possible.  If a local build is not available, ask before downloading from GitHub Releases (fastest, ~850KB download).
 2. *Git checkout installs*: build from the checked-out source by default and cache the result under a source-tree keyed id.  This avoids reusing a stale release binary when latest git contains server changes without a version bump.
 
 The binary is cached locally in =~/.emacs.d/tramp-rpc/= and deployed to =~/.cache/emacs/tramp-rpc/= on the remote host.
@@ -321,6 +336,9 @@ cargo build --release --target aarch64-unknown-linux-gnu
 ;; Prefer building from source over downloading (default: nil)
 (setq tramp-rpc-deploy-prefer-build t)
 
+;; Whether to allow pre-built binary downloads (default: ask)
+(setq tramp-rpc-deploy-allow-download 'ask)
+
 ;; Local cache directory (default: ~/.emacs.d/tramp-rpc/)
 (setq tramp-rpc-deploy-local-cache-directory "~/.cache/emacs/tramp-rpc-binaries")
 
@@ -368,12 +386,9 @@ ssh -o BatchMode=yes user@host echo success
 
 If GitHub downloads fail (corporate firewall, etc.), you can:
 
-1. Install Rust and let tramp-rpc build locally:
-   #+begin_src bash
-   curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
-   #+end_src
+1. Install Rust/cargo with your system package manager and let tramp-rpc build locally.
 
-2. Download manually and place in the cache directory (see above)
+2. Download manually and place in the cache directory (see above), if you have opted in to release downloads.
 
 3. Pre-deploy to remote hosts using your own method
 

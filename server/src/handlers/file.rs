@@ -1,3 +1,6 @@
+// Copyright (C) 2026 Arthur Heymans <arthur@aheymans.xyz>
+// SPDX-License-Identifier: GPL-3.0-or-later
+
 //! File metadata operations
 
 use crate::protocol::{from_value, FileAttributes, FileType, RpcError};

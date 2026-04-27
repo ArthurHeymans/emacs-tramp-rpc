@@ -1,3 +1,6 @@
+// Copyright (C) 2026 Arthur Heymans <arthur@aheymans.xyz>
+// SPDX-License-Identifier: GPL-3.0-or-later
+
 //! TRAMP-RPC Server
 //!
 //! A MessagePack-RPC server for TRAMP remote file access.
