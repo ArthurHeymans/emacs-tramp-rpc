@@ -376,7 +376,7 @@ The directory is deleted after BODY completes."
 
   ;; Existing file
   (tramp-rpc-test--with-temp-file tmp "test content"
-    (should (tramp-rpc-test--with-call-count 1
+    (should (tramp-rpc-test--with-call-count 3
               (file-writable-p tmp))))
 
   ;; Non-existent file in writable directory

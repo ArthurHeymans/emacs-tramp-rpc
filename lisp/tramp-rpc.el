@@ -1625,26 +1625,6 @@ Returns an alist with path."
 ;; File name handler operations
 ;; ============================================================================
 
-(defun tramp-rpc-handle-file-readable-p (filename)
-  "Like `file-readable-p' for TRAMP-RPC files.
-Uses the remote server's access check, avoiding the generic TRAMP
-permission logic and its extra metadata round-trips."
-  (with-parsed-tramp-file-name (expand-file-name filename) nil
-    (with-tramp-file-property v localname "file-readable-p"
-      (tramp-rpc--call v "file.access"
-                       (append (tramp-rpc--encode-path localname)
-                               '((mode . "readable")))))))
-
-(defun tramp-rpc-handle-file-writable-p (filename)
-  "Like `file-writable-p' for TRAMP-RPC files.
-For a missing file, writability is checked on the containing directory on the
-remote host, matching `file-writable-p' creation semantics in one RPC."
-  (with-parsed-tramp-file-name (expand-file-name filename) nil
-    (with-tramp-file-property v localname "file-writable-p"
-      (tramp-rpc--call v "file.access"
-                       (append (tramp-rpc--encode-path localname)
-                               '((mode . "writable")))))))
-
 (defun tramp-rpc-handle-file-executable-p (filename)
   "Like `file-executable-p' for TRAMP-RPC files.
 Checks execute permission from `file-attributes' mode string and
@@ -3193,8 +3173,8 @@ Also controls process exit detection latency."
     ;; RPC-based file attribute operations
     ;; =========================================================================
     (file-exists-p . tramp-handle-file-exists-p)
-    (file-readable-p . tramp-rpc-handle-file-readable-p)
-    (file-writable-p . tramp-rpc-handle-file-writable-p)
+    (file-readable-p . tramp-handle-file-readable-p)
+    (file-writable-p . tramp-handle-file-writable-p)
     (file-executable-p . tramp-rpc-handle-file-executable-p)
     (file-directory-p . tramp-rpc-handle-file-directory-p)
     (file-regular-p . tramp-handle-file-regular-p)
