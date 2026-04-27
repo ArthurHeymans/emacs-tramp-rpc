@@ -2980,17 +2980,15 @@ Reads directly through `file.read' instead of going through
 round-trips for the common non-VISIT case."
   (barf-if-buffer-read-only)
   (setq filename (expand-file-name filename))
-  (if visit
-      ;; Visiting a file has extra buffer-state and not-found semantics.  Keep
-      ;; the battle-tested generic TRAMP path there; the latency-sensitive
-      ;; optimization is for ordinary reads (the common programmatic case).
+  (if (or visit replace)
+      ;; Visiting a file and REPLACE have extra buffer-state and return-value
+      ;; semantics.  Keep the battle-tested generic TRAMP path there; the
+      ;; latency-sensitive optimization is for ordinary reads (the common
+      ;; programmatic case).
       (tramp-handle-insert-file-contents filename visit beg end replace)
     (let ((start (point))
           result)
       (with-parsed-tramp-file-name filename nil
-        (when replace
-          (delete-region (point-min) (point-max))
-          (setq start (point)))
         (let* ((params (tramp-rpc--file-read-params localname)))
           (when beg
             (push `(offset . ,beg) params))
@@ -3004,7 +3002,8 @@ round-trips for the common non-VISIT case."
                        content (or coding-system-for-read 'undecided))
                     content)))
             (insert decoded-content)
-            (setq result (cons filename (- (point) start))))))
+            (setq result (list filename (- (point) start)))
+            (goto-char start))))
       result)))
 
 (defun tramp-rpc-handle-file-local-copy (filename)
