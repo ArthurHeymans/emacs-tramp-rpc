@@ -960,6 +960,88 @@ This matches the behavior expected by `tramp-test28-process-file'."
       (should (string-match-p "ssh:" hop))
       (should-not (string-match-p "rpc:" hop)))))
 
+(ert-deftest tramp-rpc-mock-test-deploy-binary-id-release-default ()
+  "Test that non-git installs keep using the release version as binary id."
+  :tags '(:deploy)
+  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
+  (let ((tramp-rpc-deploy-source-directory nil)
+        (tramp-rpc-deploy-git-build-policy 'auto))
+    (should (equal (tramp-rpc-deploy--binary-id)
+                   tramp-rpc-deploy-version))
+    (should (string-suffix-p
+             (format "tramp-rpc-server-%s" tramp-rpc-deploy-version)
+             (tramp-rpc-deploy-expected-binary-localname)))))
+
+(ert-deftest tramp-rpc-mock-test-deploy-binary-id-source-hash ()
+  "Test that git checkouts key binary ids by server source content."
+  :tags '(:deploy)
+  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
+  (let ((dir (make-temp-file "tramp-rpc-source" t)))
+    (unwind-protect
+        (progn
+          (make-directory (expand-file-name ".git" dir))
+          (make-directory (expand-file-name "server/src" dir) t)
+          (with-temp-file (expand-file-name "Cargo.toml" dir)
+            (insert "[package]\nname = \"tramp-rpc-server\"\n"))
+          (with-temp-file (expand-file-name "server/src/main.rs" dir)
+            (insert "fn main() {}\n"))
+          (let ((tramp-rpc-deploy-source-directory dir)
+                (tramp-rpc-deploy-git-build-policy 'auto))
+            (cl-letf (((symbol-function 'tramp-rpc-deploy--git-revision)
+                       (lambda () "abcdef123456")))
+              (let ((id1 (tramp-rpc-deploy--binary-id)))
+                (should (string-prefix-p "git-abcdef123456-" id1))
+                (should (string-match-p
+                         (concat "tramp-rpc-server-" (regexp-quote id1))
+                         (tramp-rpc-deploy-expected-binary-localname)))
+                (with-temp-file (expand-file-name "server/src/main.rs" dir)
+                  (insert "fn main() { println!(\"changed\"); }\n"))
+                (should-not (equal id1 (tramp-rpc-deploy--binary-id)))))))
+      (delete-directory dir t))))
+
+(ert-deftest tramp-rpc-mock-test-deploy-binary-id-release-policy ()
+  "Test that release policy keeps version-keyed ids for git checkouts."
+  :tags '(:deploy)
+  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
+  (let ((dir (make-temp-file "tramp-rpc-source" t)))
+    (unwind-protect
+        (progn
+          (make-directory (expand-file-name ".git" dir))
+          (make-directory (expand-file-name "server/src" dir) t)
+          (with-temp-file (expand-file-name "Cargo.toml" dir)
+            (insert "[workspace]\nmembers = [\"server\"]\n"))
+          (with-temp-file (expand-file-name "server/src/main.rs" dir)
+            (insert "fn main() {}\n"))
+          (let ((tramp-rpc-deploy-source-directory dir)
+                (tramp-rpc-deploy-git-build-policy 'release))
+            (should (equal (tramp-rpc-deploy--binary-id)
+                           tramp-rpc-deploy-version))))
+      (delete-directory dir t))))
+
+(ert-deftest tramp-rpc-mock-test-deploy-binary-id-ignores-lisp-files ()
+  "Test that git binary ids only include files affecting the server build."
+  :tags '(:deploy)
+  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
+  (let ((dir (make-temp-file "tramp-rpc-source" t)))
+    (unwind-protect
+        (progn
+          (make-directory (expand-file-name ".git" dir))
+          (make-directory (expand-file-name "server/src" dir) t)
+          (make-directory (expand-file-name "lisp" dir) t)
+          (with-temp-file (expand-file-name "Cargo.toml" dir)
+            (insert "[workspace]\nmembers = [\"server\"]\n"))
+          (with-temp-file (expand-file-name "server/src/main.rs" dir)
+            (insert "fn main() {}\n"))
+          (let ((tramp-rpc-deploy-source-directory dir)
+                (tramp-rpc-deploy-git-build-policy 'auto))
+            (cl-letf (((symbol-function 'tramp-rpc-deploy--git-revision)
+                       (lambda () "abcdef123456")))
+              (let ((id1 (tramp-rpc-deploy--binary-id)))
+                (with-temp-file (expand-file-name "lisp/tramp-rpc.el" dir)
+                  (insert ";; lisp-only change\n"))
+                (should (equal id1 (tramp-rpc-deploy--binary-id)))))))
+      (delete-directory dir t))))
+
 ;; With latest tramp, tramp-file-name-with-sudo natively produces
 ;; /rpc:user@host|sudo:root@host:/path for rpc paths since the rpc
 ;; method is now multi-hop capable (inherits ssh connection params).

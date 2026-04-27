@@ -138,6 +138,25 @@ By default, downloading is attempted first as it's faster."
   :type 'boolean
   :group 'tramp-rpc-deploy)
 
+(defcustom tramp-rpc-deploy-git-build-policy 'auto
+  "How to obtain server binaries when running from a git checkout.
+This only applies when `tramp-rpc-deploy-source-directory' points at a
+git checkout that contains the Rust server sources.
+
+`auto' means use release binaries for release/package installs, but build
+from source for git checkouts.  This keeps latest-git users from using a
+stale release binary whose version number has not been bumped yet.
+
+`release' always uses the release-oriented versioned binary id and obtain
+order, preserving the historical behavior.
+
+`build' always uses a source-tree keyed binary id for git checkouts and
+only builds from source; release downloads are not used as a fallback."
+  :type '(choice (const :tag "Auto" auto)
+                 (const :tag "Release binaries" release)
+                 (const :tag "Build from source" build))
+  :group 'tramp-rpc-deploy)
+
 (defcustom tramp-rpc-deploy-bootstrap-method "scpx"
   "TRAMP method to use for bootstrapping (deploying the binary).
 This controls how the server binary is transferred to the remote host
@@ -190,8 +209,13 @@ FORMAT-STRING and ARGS are passed to `format'."
     (with-current-buffer (get-buffer-create "*tramp-rpc-deploy*")
       (goto-char (point-max))
       (insert (format-time-string "[%Y-%m-%d %H:%M:%S] ")
-              (apply #'format format-string args)
-              "\n"))))
+               (apply #'format format-string args)
+               "\n"))))
+
+(defvar tramp-rpc-deploy--source-tree-hash-cache nil
+  "Cache for the source tree hash.
+The value is a list (ROOT FINGERPRINT HASH), where FINGERPRINT is derived
+from source file names, mtimes, and sizes.")
 
 ;;; ============================================================================
 ;;; Architecture detection and path helpers
@@ -281,6 +305,113 @@ Linux targets use musl for fully static binaries."
     ("aarch64-darwin" "aarch64-apple-darwin")
     (_ (signal 'remote-file-error (list "Unknown architecture" arch)))))
 
+(defun tramp-rpc-deploy--source-root ()
+  "Return the configured source root as a directory name, or nil."
+  (when tramp-rpc-deploy-source-directory
+    (file-name-as-directory (expand-file-name tramp-rpc-deploy-source-directory))))
+
+(defun tramp-rpc-deploy--source-has-server-p ()
+  "Return non-nil if the configured source directory has Rust server sources."
+  (let ((root (tramp-rpc-deploy--source-root)))
+    (and root
+         (file-exists-p (expand-file-name "Cargo.toml" root))
+         (file-directory-p (expand-file-name "server" root)))))
+
+(defun tramp-rpc-deploy--git-checkout-p ()
+  "Return non-nil if the source directory is inside a git checkout."
+  (let ((root (tramp-rpc-deploy--source-root)))
+    (and root (locate-dominating-file root ".git"))))
+
+(defun tramp-rpc-deploy--source-file-list ()
+  "Return files that affect the server build, relative to source root."
+  (let* ((root (tramp-rpc-deploy--source-root))
+         (files nil))
+    (when root
+      (dolist (name '("Cargo.toml" "Cargo.lock"))
+        (let ((file (expand-file-name name root)))
+          (when (file-regular-p file)
+            (push file files))))
+      (dolist (name '("server" ".cargo"))
+        (let ((dir (expand-file-name name root)))
+          (when (file-directory-p dir)
+            (dolist (file (directory-files-recursively dir ""))
+              (when (and (file-regular-p file)
+                         (not (backup-file-name-p file))
+                         (not (string-prefix-p
+                               ".#" (file-name-nondirectory file))))
+                (push file files)))))))
+    (sort files #'string<)))
+
+(defun tramp-rpc-deploy--source-file-fingerprint (root files)
+  "Return a cache fingerprint for FILES under ROOT."
+  (mapcar (lambda (file)
+            (let ((attrs (file-attributes file)))
+              (list (file-relative-name file root)
+                    (file-attribute-modification-time attrs)
+                    (file-attribute-size attrs))))
+          files))
+
+(defun tramp-rpc-deploy--source-tree-hash ()
+  "Return a SHA256 hash for files that affect the server build, or nil."
+  (let ((root (tramp-rpc-deploy--source-root))
+        (files (tramp-rpc-deploy--source-file-list)))
+    (when (and root files)
+      (let ((fingerprint (tramp-rpc-deploy--source-file-fingerprint root files)))
+        (if (and tramp-rpc-deploy--source-tree-hash-cache
+                 (equal root (nth 0 tramp-rpc-deploy--source-tree-hash-cache))
+                 (equal fingerprint (nth 1 tramp-rpc-deploy--source-tree-hash-cache)))
+            (nth 2 tramp-rpc-deploy--source-tree-hash-cache)
+          (let ((hash
+                 (with-temp-buffer
+                   (set-buffer-multibyte nil)
+                   (dolist (file files)
+                     (insert (file-relative-name file root) "\0")
+                     (let ((coding-system-for-read 'binary))
+                       (insert-file-contents-literally file))
+                     (insert "\0"))
+                   (secure-hash 'sha256 (current-buffer)))))
+            (setq tramp-rpc-deploy--source-tree-hash-cache
+                  (list root fingerprint hash))
+            hash))))))
+
+(defun tramp-rpc-deploy--git-revision ()
+  "Return the short git revision for the source checkout, or nil."
+  (let ((root (tramp-rpc-deploy--source-root)))
+    (when (and root
+               (tramp-rpc-deploy--git-checkout-p)
+               (executable-find "git"))
+      (with-temp-buffer
+        (if (zerop (call-process "git" nil t nil
+                                 "-C" root "rev-parse" "--short=12" "HEAD"))
+            (string-trim (buffer-string))
+          (tramp-rpc-deploy--log "git rev-parse failed: %s"
+                                 (string-trim (buffer-string)))
+          nil)))))
+
+(defun tramp-rpc-deploy--use-source-binary-id-p ()
+  "Return non-nil when binaries should be keyed by source content."
+  (and (memq tramp-rpc-deploy-git-build-policy '(auto build))
+       (tramp-rpc-deploy--source-has-server-p)
+       (tramp-rpc-deploy--git-checkout-p)
+       t))
+
+(defun tramp-rpc-deploy--source-binary-id ()
+  "Return a binary id derived from the current git checkout contents."
+  (let ((hash (tramp-rpc-deploy--source-tree-hash)))
+    (when hash
+      (format "git-%s-%s"
+              (or (tramp-rpc-deploy--git-revision) "unknown")
+              (substring hash 0 12)))))
+
+(defun tramp-rpc-deploy--binary-id ()
+  "Return the id used for cache and remote binary paths.
+Release installs use `tramp-rpc-deploy-version'.  Git checkouts use a
+source-tree keyed id so latest-git users do not reuse stale release
+artifacts when the Rust server changes without a version bump."
+  (or (and (tramp-rpc-deploy--use-source-binary-id-p)
+           (tramp-rpc-deploy--source-binary-id))
+      tramp-rpc-deploy-version))
+
 (defun tramp-rpc-deploy--local-cache-path (arch)
   "Return the local cache path for binary of ARCH."
   (expand-file-name
@@ -288,7 +419,7 @@ Linux targets use musl for fully static binaries."
    (expand-file-name
     arch
     (expand-file-name
-     tramp-rpc-deploy-version
+     (tramp-rpc-deploy--binary-id)
      tramp-rpc-deploy-local-cache-directory))))
 
 (defun tramp-rpc-deploy--bundled-binary-path (arch)
@@ -302,6 +433,33 @@ This is useful for development - run scripts/build-all.sh to populate."
       (when (and (file-exists-p path) (file-executable-p path))
         path))))
 
+(defun tramp-rpc-deploy--newer-than-source-p (file)
+  "Return non-nil if FILE is newer than all known server source files."
+  (let ((file-time (file-attribute-modification-time (file-attributes file)))
+        (sources (tramp-rpc-deploy--source-file-list)))
+    (cl-loop for source in sources
+             always (not (time-less-p
+                          file-time
+                          (file-attribute-modification-time
+                           (file-attributes source)))))))
+
+(defun tramp-rpc-deploy--source-build-output-path (arch)
+  "Return an existing source-tree build output for ARCH, or nil.
+This lets CI and developers reuse an already-built/downloaded artifact in
+TARGET/release without requiring a rebuild, while skipping obviously stale
+outputs whose mtime predates the source files."
+  (when (and (tramp-rpc-deploy--source-root)
+             (tramp-rpc-deploy--source-has-server-p))
+    (let* ((target (tramp-rpc-deploy--arch-to-rust-target arch))
+           (path (expand-file-name
+                  (format "target/%s/release/%s"
+                          target tramp-rpc-deploy-binary-name)
+                  (tramp-rpc-deploy--source-root))))
+      (when (and (file-exists-p path)
+                 (file-executable-p path)
+                 (tramp-rpc-deploy--newer-than-source-p path))
+        path))))
+
 (defun tramp-rpc-deploy--remote-binary-path (vec)
   "Return the remote path where the binary should be installed for VEC."
   (tramp-make-tramp-file-name
@@ -310,7 +468,9 @@ This is useful for development - run scripts/build-all.sh to populate."
    ;; expand-file-name would expand ~ to the LOCAL user's home directory,
    ;; causing failures when local and remote usernames differ.
    (concat (file-name-as-directory tramp-rpc-deploy-remote-directory)
-           (format "%s-%s" tramp-rpc-deploy-binary-name tramp-rpc-deploy-version))))
+           (format "%s-%s"
+                   tramp-rpc-deploy-binary-name
+                   (tramp-rpc-deploy--binary-id)))))
 
 ;;; ============================================================================
 ;;; Download from GitHub Releases
@@ -492,16 +652,33 @@ Returns the path to the binary on success, nil on failure."
 ;;; Main logic: ensure local binary exists
 ;;; ============================================================================
 
+(defun tramp-rpc-deploy--obtain-methods ()
+  "Return the methods to use for obtaining a missing local binary."
+  (cond
+   ;; Git checkouts should not silently fall back to release artifacts: the
+   ;; release binary may be stale when the lisp/server protocol changed without
+   ;; a version bump.
+   ((tramp-rpc-deploy--use-source-binary-id-p)
+    '(build))
+   (tramp-rpc-deploy-prefer-build
+    '(build download))
+   (t
+    '(download build))))
+
 (defun tramp-rpc-deploy--ensure-local-binary (arch)
   "Ensure a local binary exists for ARCH.
 Tries in order:
 1. Check bundled binaries (useful for development)
-2. Check local cache
-3. Download from GitHub releases
-4. Build from source (if on same architecture)
+2. Check source-tree build output for source-build policies
+3. Check local cache
+4. Download from GitHub releases or build from source according to policy
 
 Returns the path to the local binary."
   (let ((bundled-path (tramp-rpc-deploy--bundled-binary-path arch))
+        (source-build-path
+         (when (or (tramp-rpc-deploy--use-source-binary-id-p)
+                   tramp-rpc-deploy-prefer-build)
+           (tramp-rpc-deploy--source-build-output-path arch)))
         (cache-path (tramp-rpc-deploy--local-cache-path arch)))
     (cond
      ;; Check bundled binaries first (useful for development - run
@@ -509,6 +686,12 @@ Returns the path to the local binary."
      (bundled-path
       (message "Using bundled binary for %s" arch)
       bundled-path)
+
+     ;; Check source-tree build output.  This supports CI jobs that download a
+     ;; just-built server artifact into target/<triple>/release/.
+     (source-build-path
+      (message "Using source-tree build output for %s" arch)
+      source-build-path)
 
      ;; Check cache
      ((and (file-exists-p cache-path)
@@ -518,9 +701,7 @@ Returns the path to the local binary."
 
      ;; Need to obtain binary
      (t
-      (let ((methods (if tramp-rpc-deploy-prefer-build
-                         '(build download)
-                       '(download build)))
+      (let ((methods (tramp-rpc-deploy--obtain-methods))
             (result nil)
             (errors nil))
 
@@ -532,10 +713,7 @@ Returns the path to the local binary."
                         ('download
                          (tramp-rpc-deploy--download-binary arch))
                         ('build
-                         (when (and tramp-rpc-deploy-source-directory
-                                    (tramp-rpc-deploy--cargo-available-p)
-                                    (tramp-rpc-deploy--can-build-for-arch-p arch))
-                           (tramp-rpc-deploy--build-binary arch)))))
+                         (tramp-rpc-deploy--build-binary arch))))
               (error
                (push (cons method (error-message-string err)) errors)))))
 
@@ -554,21 +732,40 @@ Returns the path to the local binary."
 (defun tramp-rpc-deploy--help-message (arch)
   "Return a help message for obtaining binary for ARCH."
   (let ((local-arch (tramp-rpc-deploy--detect-local-arch)))
-    (concat
-     "To resolve this, you can:\n\n"
-     (format "1. Download manually from:\n   %s\n\n"
-             (tramp-rpc-deploy--download-url arch))
-     (if (string= arch local-arch)
-         (concat
-          "2. Install Rust and build from source:\n"
-          "   curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh\n"
-          "   Then restart Emacs and try again.\n\n")
-       (format
-        "2. Build on a %s machine and copy to:\n   %s\n\n"
-        arch
-        (tramp-rpc-deploy--local-cache-path arch)))
-     (format "Binary should be placed at:\n   %s"
-             (tramp-rpc-deploy--local-cache-path arch)))))
+    (if (tramp-rpc-deploy--use-source-binary-id-p)
+        (concat
+         "This installation is using a git-checkout binary id, so release\n"
+         "artifacts are not used as a fallback.  This avoids running a stale\n"
+         "server binary when latest-git Lisp changed without a version bump.\n\n"
+         "To resolve this, you can:\n\n"
+         (if (string= arch local-arch)
+             (concat
+              "1. Install Rust and build from source:\n"
+              "   curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh\n"
+              "   Then restart Emacs and try again.\n\n")
+           (format
+            "1. Build on a %s machine and copy to:\n   %s\n\n"
+            arch
+            (tramp-rpc-deploy--local-cache-path arch)))
+         "2. To force release artifacts instead, customize:\n"
+         "   (setq tramp-rpc-deploy-git-build-policy 'release)\n\n"
+         (format "Binary should be placed at:\n   %s"
+                 (tramp-rpc-deploy--local-cache-path arch)))
+      (concat
+       "To resolve this, you can:\n\n"
+       (format "1. Download manually from:\n   %s\n\n"
+               (tramp-rpc-deploy--download-url arch))
+       (if (string= arch local-arch)
+           (concat
+            "2. Install Rust and build from source:\n"
+            "   curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh\n"
+            "   Then restart Emacs and try again.\n\n")
+         (format
+          "2. Build on a %s machine and copy to:\n   %s\n\n"
+          arch
+          (tramp-rpc-deploy--local-cache-path arch)))
+       (format "Binary should be placed at:\n   %s"
+               (tramp-rpc-deploy--local-cache-path arch))))))
 
 ;;; ============================================================================
 ;;; Remote deployment
@@ -721,7 +918,9 @@ This computes the path deterministically from customization variables,
 allowing `tramp-rpc--connect' to try connecting directly without
 opening a bootstrap (scpx) connection for the deploy check."
   (concat (file-name-as-directory tramp-rpc-deploy-remote-directory)
-          (format "%s-%s" tramp-rpc-deploy-binary-name tramp-rpc-deploy-version)))
+          (format "%s-%s"
+                  tramp-rpc-deploy-binary-name
+                  (tramp-rpc-deploy--binary-id))))
 
 (defun tramp-rpc-deploy-ensure-binary (vec)
   "Ensure the tramp-rpc-server binary is available on remote VEC.
@@ -802,7 +1001,9 @@ binary lookup, and remote installation target."
       (insert (format "Host:    %s\n" (tramp-file-name-host bootstrap-vec)))
       (insert (format "User:    %s\n" (or (tramp-file-name-user bootstrap-vec) "<default>")))
       (insert (format "Method:  %s (bootstrap)\n" (tramp-file-name-method bootstrap-vec)))
-      (insert (format "Arch:    %s\n\n" arch))
+      (insert (format "Arch:    %s\n" arch))
+      (insert (format "Binary id: %s\n" (tramp-rpc-deploy--binary-id)))
+      (insert (format "Git build policy: %s\n\n" tramp-rpc-deploy-git-build-policy))
       (insert (format "Cache:   %s\n" cache))
       (insert (format "Bundled: %s\n"
                       (or bundled "<none>")))
@@ -824,6 +1025,10 @@ binary lookup, and remote installation target."
       (insert "TRAMP-RPC Server Deployment Status\n")
       (insert "===================================\n\n")
       (insert (format "Version: %s\n" tramp-rpc-deploy-version))
+      (insert (format "Binary id: %s\n" (tramp-rpc-deploy--binary-id)))
+      (insert (format "Git build policy: %s\n" tramp-rpc-deploy-git-build-policy))
+      (insert (format "Git checkout with server sources: %s\n"
+                      (if (tramp-rpc-deploy--use-source-binary-id-p) "yes" "no")))
       (insert (format "Never deploy: %s\n" (if tramp-rpc-deploy-never-deploy "yes" "no")))
       (when tramp-rpc-deploy-never-deploy
         (insert (format "Remote binary path: %s\n"

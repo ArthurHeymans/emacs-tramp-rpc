@@ -97,8 +97,8 @@ Access remote files using the ~rpc~ method:
 
 On first connection, the server binary is automatically obtained and deployed:
 
-1. *Download* from GitHub Releases (fastest, ~850KB download)
-2. *Build from source* if Rust is installed and download fails
+1. *Release/package installs*: download from GitHub Releases first (fastest, ~850KB download), then build from source if Rust is installed and download fails.
+2. *Git checkout installs*: build from the checked-out source by default and cache the result under a source-tree keyed id.  This avoids reusing a stale release binary when latest git contains server changes without a version bump.
 
 The binary is cached locally in =~/.emacs.d/tramp-rpc/= and deployed to =~/.cache/emacs/tramp-rpc/= on the remote host.
 
