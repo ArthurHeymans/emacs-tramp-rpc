@@ -23,6 +23,7 @@
 ;; - process-status / process-exit-status (return remote process state)
 ;; - process-command / process-tty-name (return stored metadata)
 ;; - vc-call-backend (ensure default-directory for remote VC files)
+;; - vc-exec-after (handle native-compiled VC process state races)
 ;; - eglot--cmd (bypass shell wrapping for RPC connections)
 ;; - hack-dir-local-variables (enable dir-locals for RPC remotes)
 
@@ -51,6 +52,10 @@
 (defvar tramp-rpc--closing-local-relay)
 (defvar tramp-rpc--pty-processes)
 (defvar tramp-rpc--async-processes)
+
+;; Functions from vc-dispatcher.el (used by vc-exec-after advice)
+(declare-function vc-set-mode-line-busy-indicator "vc-dispatcher")
+(declare-function vc--process-sentinel "vc-dispatcher")
 
 ;; Variables from vc-dir.el (used in vc-dir-refresh advice)
 (defvar vc-dir-process-buffer)
@@ -300,6 +305,45 @@ process-file calls are routed through the TRAMP handler."
           (apply orig-fun backend function-name args))
       (apply orig-fun backend function-name args))))
 
+(defun tramp-rpc--vc-exec-after-advice (orig-fun code &optional success)
+  "Advice for `vc-exec-after' to handle TRAMP-RPC relay processes.
+
+Some native-compiled VC functions can observe the raw local relay process
+state instead of the logical state provided by `process-status' advice.  A
+short-lived remote command can leave the local cat relay in a non-`run' and
+non-`exit' state while TRAMP-RPC has already recorded the remote exit.  The
+stock `vc-exec-after' then signals \"Unexpected process state\".  For
+TRAMP-RPC processes, reproduce `vc-exec-after' using the logical process
+state."
+  (let ((proc (get-buffer-process (current-buffer))))
+    (if (and (processp proc)
+             (process-get proc :tramp-rpc-pid))
+        (let ((status (cond
+                       ((process-get proc :tramp-rpc-exited) 'exit)
+                       ((memq (process-status proc) '(run open listen connect)) 'run)
+                       (t 'exit))))
+          (cond
+           ((eq status 'exit)
+            ;; Match `vc-exec-after': drain pending output before the next VC
+            ;; stage.  Use zero-timeout accepts so we drain what is immediately
+            ;; available without blocking callers such as Dired/diff-hl that
+            ;; run with `inhibit-quit' bound; Emacs 30 warns about blocking
+            ;; `accept-process-output' in that context.
+            (while (accept-process-output proc 0 nil t))
+            (when (or (not success)
+                      (zerop (process-exit-status success)))
+              (if (functionp code) (funcall code) (eval code t))))
+           ((eq status 'run)
+            (vc-set-mode-line-busy-indicator)
+            (letrec ((fun (lambda (p _msg)
+                            (remove-function (process-sentinel p) fun)
+                            (vc--process-sentinel p code success))))
+              (add-function :after (process-sentinel proc) fun)))
+           (t
+            (funcall orig-fun code success))))
+      (funcall orig-fun code success)))
+  nil)
+
 ;; ============================================================================
 ;; Privilege elevation integration
 ;; ============================================================================
@@ -417,6 +461,7 @@ exited (remote side finished), delete it so the refresh can proceed."
   (advice-add 'process-command :around #'tramp-rpc--process-command-advice)
   (advice-add 'process-tty-name :around #'tramp-rpc--process-tty-name-advice)
   (advice-add 'vc-call-backend :around #'tramp-rpc--vc-call-backend-advice)
+  (advice-add 'vc-exec-after :around #'tramp-rpc--vc-exec-after-advice)
   (with-eval-after-load 'eglot
     (advice-add 'eglot--cmd :around #'tramp-rpc--eglot-cmd-advice))
   (with-eval-after-load 'vc-dir
@@ -438,6 +483,7 @@ exited (remote side finished), delete it so the refresh can proceed."
   (advice-remove 'process-command #'tramp-rpc--process-command-advice)
   (advice-remove 'process-tty-name #'tramp-rpc--process-tty-name-advice)
   (advice-remove 'vc-call-backend #'tramp-rpc--vc-call-backend-advice)
+  (advice-remove 'vc-exec-after #'tramp-rpc--vc-exec-after-advice)
   (advice-remove 'eglot--cmd #'tramp-rpc--eglot-cmd-advice)
   (advice-remove 'vc-dir-refresh #'tramp-rpc--vc-dir-refresh-advice)
   (advice-remove 'magit-start-process #'tramp-rpc--magit-start-process-advice)

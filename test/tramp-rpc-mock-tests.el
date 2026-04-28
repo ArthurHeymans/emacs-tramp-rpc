@@ -1121,6 +1121,57 @@ as a hop in multi-hop chains."
                    (tramp-rpc--controlmaster-socket-path sudo-vec)))))
 
 ;;; ============================================================================
+;;; VC advice tests (No server or SSH required)
+;;; ============================================================================
+
+(ert-deftest tramp-rpc-mock-test-vc-exec-after-logical-exit-runs-code ()
+  "Test `vc-exec-after' advice treats exited TRAMP-RPC relays as done."
+  :tags '(:vc-advice)
+  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
+  (let* ((buffer (generate-new-buffer " *tramp-rpc-vc-exec-after-test*"))
+         (proc (make-process :name "tramp-rpc-vc-exec-after-test"
+                             :buffer buffer
+                             :command '("sh" "-c" "sleep 60")
+                             :noquery t))
+         (ran nil))
+    (unwind-protect
+        (with-current-buffer buffer
+          (process-put proc :tramp-rpc-pid 123)
+          (process-put proc :tramp-rpc-exited t)
+          (tramp-rpc--vc-exec-after-advice
+           (lambda (&rest _) (error "Unexpected process state"))
+           (lambda () (setq ran t)))
+          (should ran))
+      (when (process-live-p proc)
+        (delete-process proc))
+      (kill-buffer buffer))))
+
+(ert-deftest tramp-rpc-mock-test-vc-exec-after-raw-closed-state-runs-code ()
+  "Test `vc-exec-after' advice handles raw non-run relay states."
+  :tags '(:vc-advice)
+  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
+  (let* ((buffer (generate-new-buffer " *tramp-rpc-vc-exec-after-test*"))
+         (proc (make-process :name "tramp-rpc-vc-exec-after-test"
+                             :buffer buffer
+                             :command '("sh" "-c" "sleep 60")
+                             :noquery t))
+         (ran nil))
+    (unwind-protect
+        (with-current-buffer buffer
+          (process-put proc :tramp-rpc-pid 123)
+          ;; Simulate native-compiled VC observing a raw relay state such as
+          ;; `closed' rather than the logical state from TRAMP-RPC advice.
+          (cl-letf (((symbol-function 'process-status)
+                     (lambda (_process) 'closed)))
+            (tramp-rpc--vc-exec-after-advice
+             (lambda (&rest _) (error "Unexpected process state"))
+             (lambda () (setq ran t))))
+          (should ran))
+      (when (process-live-p proc)
+        (delete-process proc))
+      (kill-buffer buffer))))
+
+;;; ============================================================================
 ;;; Dir-locals advice tests (No server or SSH required)
 ;;; ============================================================================
 
