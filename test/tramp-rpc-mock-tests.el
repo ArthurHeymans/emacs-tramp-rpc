@@ -972,6 +972,80 @@ This matches the behavior expected by `tramp-test28-process-file'."
              (format "tramp-rpc-server-%s" tramp-rpc-deploy-version)
              (tramp-rpc-deploy-expected-binary-localname)))))
 
+(ert-deftest tramp-rpc-mock-test-deploy-source-directory-warning ()
+  "Test source directory warnings explain release-id fallback."
+  :tags '(:deploy)
+  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
+  (let ((dir (make-temp-file "tramp-rpc-build" t)))
+    (unwind-protect
+        (let ((tramp-rpc-deploy-source-directory dir)
+              (tramp-rpc-deploy-git-build-policy 'auto))
+          (should (string-match-p
+                   "does not contain Cargo.toml and server/"
+                   (tramp-rpc-deploy--source-directory-warning))))
+      (delete-directory dir t))))
+
+(ert-deftest tramp-rpc-mock-test-deploy-default-source-follows-elc-source-symlink ()
+  "Test default source directory follows straight-style .el symlinks."
+  :tags '(:deploy)
+  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
+  (let* ((dir (make-temp-file "tramp-rpc-straight" t))
+         (repo (expand-file-name "straight/repos/emacs-tramp-rpc" dir))
+         (build (expand-file-name "straight/build/tramp-rpc" dir))
+         (repo-lisp (expand-file-name "lisp" repo))
+         (repo-file (expand-file-name "tramp-rpc-deploy.el" repo-lisp))
+         (build-el (expand-file-name "tramp-rpc-deploy.el" build))
+         (build-elc (expand-file-name "tramp-rpc-deploy.elc" build)))
+    (unwind-protect
+        (progn
+          (make-directory repo-lisp t)
+          (make-directory build t)
+          (with-temp-file repo-file
+            (insert ";; source\n"))
+          (make-symbolic-link repo-file build-el)
+          (with-temp-file build-elc
+            (insert ";; compiled\n"))
+          (let ((load-file-name build-elc))
+            (should (equal (file-name-as-directory
+                            (tramp-rpc-deploy--default-source-directory))
+                           (file-name-as-directory repo)))))
+      (delete-directory dir t))))
+
+(ert-deftest tramp-rpc-mock-test-deploy-skips-stale-bundled-source-binary ()
+  "Test source-id mode does not deploy stale bundled binaries."
+  :tags '(:deploy)
+  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
+  (let* ((dir (make-temp-file "tramp-rpc-source" t))
+         (bundled-dir (expand-file-name "lisp/binaries" dir))
+         (bundled (expand-file-name "x86_64-linux/tramp-rpc-server" bundled-dir))
+         (built (expand-file-name "built-server" dir)))
+    (unwind-protect
+        (progn
+          (make-directory (expand-file-name ".git" dir))
+          (make-directory (expand-file-name "server/src" dir) t)
+          (make-directory (file-name-directory bundled) t)
+          (with-temp-file (expand-file-name "Cargo.toml" dir)
+            (insert "[workspace]\nmembers = [\"server\"]\n"))
+          (with-temp-file (expand-file-name "server/src/main.rs" dir)
+            (insert "fn main() {}\n"))
+          (with-temp-file bundled
+            (insert "stale bundled binary\n"))
+          (set-file-modes bundled #o755)
+          (set-file-times bundled (seconds-to-time 0))
+          (let ((tramp-rpc-deploy-source-directory dir)
+                (tramp-rpc-deploy-git-build-policy 'auto)
+                (tramp-rpc-deploy-bundled-binary-directory bundled-dir)
+                (tramp-rpc-deploy-local-cache-directory
+                 (expand-file-name "cache" dir)))
+            (cl-letf (((symbol-function 'tramp-rpc-deploy--git-revision)
+                       (lambda () "abcdef123456"))
+                      ((symbol-function 'tramp-rpc-deploy--build-binary)
+                       (lambda (_arch) built)))
+              (should (equal (tramp-rpc-deploy--ensure-local-binary
+                              "x86_64-linux")
+                             built)))))
+      (delete-directory dir t))))
+
 (ert-deftest tramp-rpc-mock-test-deploy-binary-id-source-hash ()
   "Test that git checkouts key binary ids by server source content."
   :tags '(:deploy)

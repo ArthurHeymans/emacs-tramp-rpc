@@ -33,6 +33,27 @@
 ;;; Customization
 ;;; ============================================================================
 
+(defun tramp-rpc-deploy--load-source-file-name ()
+  "Return the Elisp source file corresponding to `load-file-name'.
+When packages are byte-compiled, `load-file-name' points at the .elc in the
+build directory.  Package managers such as straight.el keep an adjacent .el
+symlink to the real checkout, so prefer that source file and follow symlinks
+before deriving the project root."
+  (when load-file-name
+    (let* ((base (file-name-sans-extension load-file-name))
+           (source (concat base ".el"))
+           (file (if (file-exists-p source) source load-file-name)))
+      (file-truename file))))
+
+(defun tramp-rpc-deploy--default-source-directory ()
+  "Return the default tramp-rpc source directory.
+This is usually the parent of the lisp directory.  Following source-file
+symlinks is important for straight.el/Doom builds: the loaded .elc lives in
+straight/build..., while the adjacent .el symlink points back to
+straight/repos..., which contains Cargo.toml and the Rust server sources."
+  (when-let* ((file (tramp-rpc-deploy--load-source-file-name)))
+    (expand-file-name ".." (file-name-directory file))))
+
 (defgroup tramp-rpc-deploy nil
   "Deployment settings for TRAMP-RPC."
   :group 'tramp)
@@ -64,8 +85,7 @@ Binaries are stored as CACHE-DIR/VERSION/ARCH/tramp-rpc-server."
   :group 'tramp-rpc-deploy)
 
 (defcustom tramp-rpc-deploy-source-directory
-  (when load-file-name
-    (expand-file-name ".." (file-name-directory load-file-name)))
+  (tramp-rpc-deploy--default-source-directory)
   "Directory containing the tramp-rpc source code.
 Used for building from source.  Set to nil to disable source builds."
   :type '(choice directory (const nil))
@@ -395,6 +415,15 @@ Linux targets use musl for fully static binaries."
        (tramp-rpc-deploy--git-checkout-p)
        t))
 
+(defun tramp-rpc-deploy--source-directory-warning ()
+  "Return a warning string when source-build auto-detection looks suspicious."
+  (when (and (memq tramp-rpc-deploy-git-build-policy '(auto build))
+             tramp-rpc-deploy-source-directory
+             (not (tramp-rpc-deploy--source-has-server-p)))
+    (format "Source directory %s does not contain Cargo.toml and server/; using release binary id %s.  Set `tramp-rpc-deploy-source-directory' to the package checkout if this is a git install."
+            (abbreviate-file-name (tramp-rpc-deploy--source-root))
+            tramp-rpc-deploy-version)))
+
 (defun tramp-rpc-deploy--source-binary-id ()
   "Return a binary id derived from the current git checkout contents."
   (let ((hash (tramp-rpc-deploy--source-tree-hash)))
@@ -682,8 +711,13 @@ Returns the path to the local binary."
         (cache-path (tramp-rpc-deploy--local-cache-path arch)))
     (cond
      ;; Check bundled binaries first (useful for development - run
-     ;; scripts/build-all.sh to populate lisp/binaries/)
-     (bundled-path
+     ;; scripts/build-all.sh to populate lisp/binaries/).  In git-checkout
+     ;; source-id mode, only trust a bundled binary when it is newer than the
+     ;; source files; otherwise a stale bundled artifact can be deployed under
+     ;; the fresh git hash and recreate the exact mismatch source-id mode avoids.
+     ((and bundled-path
+           (or (not (tramp-rpc-deploy--use-source-binary-id-p))
+               (tramp-rpc-deploy--newer-than-source-p bundled-path)))
       (message "Using bundled binary for %s" arch)
       bundled-path)
 
@@ -1029,6 +1063,8 @@ binary lookup, and remote installation target."
       (insert (format "Git build policy: %s\n" tramp-rpc-deploy-git-build-policy))
       (insert (format "Git checkout with server sources: %s\n"
                       (if (tramp-rpc-deploy--use-source-binary-id-p) "yes" "no")))
+      (when-let* ((warning (tramp-rpc-deploy--source-directory-warning)))
+        (insert (format "WARNING: %s\n" warning)))
       (insert (format "Never deploy: %s\n" (if tramp-rpc-deploy-never-deploy "yes" "no")))
       (when tramp-rpc-deploy-never-deploy
         (insert (format "Remote binary path: %s\n"
