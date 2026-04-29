@@ -1,5 +1,9 @@
 name: Build
 
+permissions:
+  contents: read
+  id-token: write
+
 on:
   workflow_call:
     inputs:
@@ -67,10 +71,10 @@ jobs:
 
       - name: Cache Nix store
         if: steps.cache-binary.outputs.cache-hit != 'true'
-        uses: nix-community/cache-nix-action@v6
+        uses: nix-community/cache-nix-action@v7
         with:
-          primary-key: nix-v2-${{ runner.os }}-${{ hashFiles('**/*.nix', '**/flake.lock') }}
-          restore-prefixes-first-match: nix-v2-${{ runner.os }}-
+          primary-key: nix-v3-${{ runner.os }}-${{ hashFiles('**/*.nix', '**/flake.lock') }}
+          restore-prefixes-first-match: nix-v3-${{ runner.os }}-
           gc-max-store-size-linux: 4294967296
           gc-max-store-size-macos: 4294967296
           # Only the nix-setup job needs to write the cache; arch jobs only restore.
@@ -79,7 +83,7 @@ jobs:
       - name: Build
         if: steps.cache-binary.outputs.cache-hit != 'true'
         run: |
-          nix develop --command bash -c '
+          nix develop .#${{ inputs.target }} --command bash -c '
           RUSTFLAGS="-D warnings -C target-feature=+crt-static -Zlocation-detail=none -Zunstable-options -Cpanic=immediate-abort" \
           cargo build --release --target ${{ inputs.target }} \
             --manifest-path server/Cargo.toml \
@@ -91,7 +95,7 @@ jobs:
 
       - name: Test
         if: ${{ inputs.test && steps.cache-binary.outputs.cache-hit != 'true' }}
-        run: nix develop --command cargo test --manifest-path server/Cargo.toml
+        run: nix develop .#${{ inputs.target }} --command cargo test --manifest-path server/Cargo.toml
         env:
           RUSTFLAGS: "-D warnings"
 

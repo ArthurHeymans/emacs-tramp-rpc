@@ -7,6 +7,10 @@ on:
     branches: [main, master]
   workflow_dispatch:
 
+permissions:
+  contents: read
+  id-token: write
+
 env:
   CARGO_TERM_COLOR: always
 
@@ -22,14 +26,16 @@ jobs:
         uses: DeterminateSystems/nix-installer-action@main
 
       - name: Cache Nix store
-        uses: nix-community/cache-nix-action@v6
+        uses: nix-community/cache-nix-action@v7
         with:
-          primary-key: nix-v2-${{ runner.os }}-${{ hashFiles('**/*.nix', '**/flake.lock') }}
-          restore-prefixes-first-match: nix-v2-${{ runner.os }}-
+          primary-key: nix-v3-${{ runner.os }}-${{ hashFiles('**/*.nix', '**/flake.lock') }}
+          restore-prefixes-first-match: nix-v3-${{ runner.os }}-
           gc-max-store-size-linux: 4294967296
 
-      - name: Build dev shell
-        run: nix develop --command true
+      - name: Build Linux CI dev shells
+        run: |
+          nix develop .#x86_64-unknown-linux-musl --command true
+          nix develop .#aarch64-unknown-linux-musl --command true
 
   rust-linux:
     name: Rust ${{ matrix.name }}
