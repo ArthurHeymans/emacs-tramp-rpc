@@ -14,8 +14,9 @@ use std::ffi::CString;
 use std::io::ErrorKind;
 use std::os::fd::{AsRawFd, BorrowedFd, RawFd};
 use std::process::Stdio;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::process::{Child, Command};
+use std::sync::{Arc, OnceLock};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
+use tokio::process::{Child, ChildStderr, ChildStdin, ChildStdout, Command};
 use tokio::sync::Mutex;
 
 use super::HandlerResult;
@@ -23,8 +24,6 @@ use super::HandlerResult;
 // ============================================================================
 // Process management for async processes
 // ============================================================================
-
-use std::sync::OnceLock;
 
 static PROCESS_MAP: OnceLock<Mutex<HashMap<u32, ManagedProcess>>> = OnceLock::new();
 static PID_COUNTER: OnceLock<Mutex<u32>> = OnceLock::new();
@@ -43,6 +42,9 @@ async fn get_next_pid() -> u32 {
 
 struct ManagedProcess {
     child: Child,
+    stdin: Arc<Mutex<Option<ChildStdin>>>,
+    stdout: Arc<Mutex<Option<ChildStdout>>>,
+    stderr: Arc<Mutex<Option<ChildStderr>>>,
     cmd: String,
 }
 
@@ -170,13 +172,16 @@ pub async fn start(params: Value) -> HandlerResult {
     cmd.stdout(Stdio::piped());
     cmd.stderr(Stdio::piped());
 
-    let child = cmd
+    let mut child = cmd
         .spawn()
         .map_err(|e| RpcError::process_error(format!("Failed to spawn process: {}", e)))?;
 
     let pid = get_next_pid().await;
 
     let managed = ManagedProcess {
+        stdin: Arc::new(Mutex::new(child.stdin.take())),
+        stdout: Arc::new(Mutex::new(child.stdout.take())),
+        stderr: Arc::new(Mutex::new(child.stderr.take())),
         child,
         cmd: params.cmd.clone(),
     };
@@ -203,12 +208,17 @@ pub async fn write(params: Value) -> HandlerResult {
     // Data is already binary, no decoding needed!
     let data = params.data;
 
-    let mut processes = get_process_map().lock().await;
-    let managed = processes
-        .get_mut(&params.pid)
-        .ok_or_else(|| RpcError::process_error(format!("Process not found: {}", params.pid)))?;
+    let stdin = {
+        let processes = get_process_map().lock().await;
+        processes
+            .get(&params.pid)
+            .ok_or_else(|| RpcError::process_error(format!("Process not found: {}", params.pid)))?
+            .stdin
+            .clone()
+    };
 
-    if let Some(stdin) = managed.child.stdin.as_mut() {
+    let mut stdin_guard = stdin.lock().await;
+    if let Some(stdin) = stdin_guard.as_mut() {
         stdin
             .write_all(&data)
             .await
@@ -241,27 +251,32 @@ pub async fn read(params: Value) -> HandlerResult {
 
     let timeout = params.timeout_ms.unwrap_or(0);
 
-    let mut processes = get_process_map().lock().await;
-    let managed = processes
-        .get_mut(&params.pid)
-        .ok_or_else(|| RpcError::process_error(format!("Process not found: {}", params.pid)))?;
-
-    // Try to read stdout (with optional blocking timeout)
-    let stdout_data = if let Some(stdout) = managed.child.stdout.as_mut() {
-        try_read_async_with_timeout(stdout, params.max_bytes, timeout).await
-    } else {
-        vec![]
+    let (stdout, stderr) = {
+        let processes = get_process_map().lock().await;
+        let managed = processes
+            .get(&params.pid)
+            .ok_or_else(|| RpcError::process_error(format!("Process not found: {}", params.pid)))?;
+        (managed.stdout.clone(), managed.stderr.clone())
     };
 
-    // Try to read stderr (with optional blocking timeout)
-    let stderr_data = if let Some(stderr) = managed.child.stderr.as_mut() {
-        try_read_async_with_timeout(stderr, params.max_bytes, timeout).await
-    } else {
-        vec![]
-    };
+    // Try to read stdout/stderr (with optional blocking timeout) without
+    // holding the global process map lock.  `process.read` is long-polled by
+    // the Emacs client; holding that lock here makes concurrent
+    // `process.write` calls wait behind the read timeout, which turns LSP
+    // typing into a synchronous round-trip bottleneck.
+    let (stdout_data, stderr_data) = tokio::join!(
+        try_read_optional_stream(stdout, params.max_bytes, timeout),
+        try_read_optional_stream(stderr, params.max_bytes, timeout)
+    );
 
-    // Check if process has exited
-    let exit_status = managed.child.try_wait().ok().flatten();
+    // Check if process has exited.  Reacquire the map briefly; do not hold it
+    // across any await points above.
+    let exit_status = {
+        let mut processes = get_process_map().lock().await;
+        processes
+            .get_mut(&params.pid)
+            .and_then(|managed| managed.child.try_wait().ok().flatten())
+    };
 
     // Return binary data directly (no encoding!)
     let stdout_val = if stdout_data.is_empty() {
@@ -284,8 +299,25 @@ pub async fn read(params: Value) -> HandlerResult {
     })
 }
 
-/// Try to read from an async reader with configurable timeout
-async fn try_read_async_with_timeout<R: tokio::io::AsyncRead + Unpin>(
+/// Try to read from an optional async reader with configurable timeout.
+async fn try_read_optional_stream<R>(
+    stream: Arc<Mutex<Option<R>>>,
+    max_bytes: usize,
+    timeout_ms: u64,
+) -> Vec<u8>
+where
+    R: AsyncRead + Unpin,
+{
+    let mut stream_guard = stream.lock().await;
+    if let Some(reader) = stream_guard.as_mut() {
+        try_read_async_with_timeout(reader, max_bytes, timeout_ms).await
+    } else {
+        vec![]
+    }
+}
+
+/// Try to read from an async reader with configurable timeout.
+async fn try_read_async_with_timeout<R: AsyncRead + Unpin>(
     reader: &mut R,
     max_bytes: usize,
     timeout_ms: u64,
@@ -319,16 +351,21 @@ pub async fn close_stdin(params: Value) -> HandlerResult {
 
     let params: Params = from_value(params).map_err(|e| RpcError::invalid_params(e.to_string()))?;
 
-    let mut processes = get_process_map().lock().await;
-    let managed = processes
-        .get_mut(&params.pid)
-        .ok_or_else(|| RpcError::process_error(format!("Process not found: {}", params.pid)))?;
+    let stdin = {
+        let processes = get_process_map().lock().await;
+        processes
+            .get(&params.pid)
+            .ok_or_else(|| RpcError::process_error(format!("Process not found: {}", params.pid)))?
+            .stdin
+            .clone()
+    };
 
     // Flush any buffered data before closing stdin, then drop to close the pipe.
     // This is a defensive measure: the client should drain its write queue before
     // calling close_stdin, but flushing here guards against data loss if a
     // concurrent process.write task wrote data that hasn't been flushed yet.
-    if let Some(mut stdin) = managed.child.stdin.take() {
+    let mut stdin_guard = stdin.lock().await;
+    if let Some(mut stdin) = stdin_guard.take() {
         let _ = stdin.flush().await;
         // stdin is dropped here, closing the pipe
     }

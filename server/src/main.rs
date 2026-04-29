@@ -157,6 +157,84 @@ mod tests {
         assert_eq!(response.error.unwrap().code, RpcError::METHOD_NOT_FOUND);
     }
 
+    fn map_get<'a>(value: &'a Value, key: &str) -> Option<&'a Value> {
+        value.as_map().and_then(|m| {
+            m.iter()
+                .find(|(k, _)| k.as_str() == Some(key))
+                .map(|(_, v)| v)
+        })
+    }
+
+    #[tokio::test]
+    async fn test_process_write_not_blocked_by_long_poll_read() {
+        let start_params = Value::Map(vec![
+            (
+                Value::String("cmd".into()),
+                Value::String("/bin/cat".into()),
+            ),
+            (Value::String("cwd".into()), Value::String("/tmp".into())),
+        ]);
+        let start_payload = make_request("process.start", start_params);
+        let start_response = process_request(&start_payload).await;
+        assert!(
+            start_response.error.is_none(),
+            "process.start should not error"
+        );
+        let pid = map_get(start_response.result.as_ref().unwrap(), "pid")
+            .and_then(Value::as_u64)
+            .expect("process.start should return pid") as u32;
+
+        let read_payload = make_request(
+            "process.read",
+            Value::Map(vec![
+                (Value::String("pid".into()), Value::Integer(pid.into())),
+                (
+                    Value::String("timeout_ms".into()),
+                    Value::Integer(1_000.into()),
+                ),
+            ]),
+        );
+        let read_task = tokio::spawn(async move { process_request(&read_payload).await });
+
+        // Give the long-polling read request time to enter the handler.  If it
+        // holds the global process map lock across the read timeout,
+        // process.write below will be delayed by roughly timeout_ms.
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        let write_payload = make_request(
+            "process.write",
+            Value::Map(vec![
+                (Value::String("pid".into()), Value::Integer(pid.into())),
+                (
+                    Value::String("data".into()),
+                    Value::Binary(b"ping\n".to_vec()),
+                ),
+            ]),
+        );
+        let start = std::time::Instant::now();
+        let write_response = process_request(&write_payload).await;
+        let elapsed = start.elapsed();
+        assert!(
+            write_response.error.is_none(),
+            "process.write should not error"
+        );
+        assert!(
+            elapsed < std::time::Duration::from_millis(500),
+            "process.write was blocked behind process.read for {:?}",
+            elapsed
+        );
+
+        let _ = read_task.await;
+        let kill_payload = make_request(
+            "process.kill",
+            Value::Map(vec![
+                (Value::String("pid".into()), Value::Integer(pid.into())),
+                (Value::String("signal".into()), Value::Integer(9.into())),
+            ]),
+        );
+        let _ = process_request(&kill_payload).await;
+    }
+
     /// Test that process.run returns 128+signal for signal-killed processes.
     /// This is required by Emacs `process-file' (tramp-test28-process-file).
     #[tokio::test]
