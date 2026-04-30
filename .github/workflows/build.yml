@@ -78,9 +78,9 @@ jobs:
         if: ${{ steps.cache-binary.outputs.cache-hit != 'true' && !contains(inputs.target, 'apple-darwin') }}
         uses: nix-community/cache-nix-action@v7
         with:
-          primary-key: nix-v3-${{ runner.os }}-${{ hashFiles('**/*.nix', '**/flake.lock') }}
-          restore-prefixes-first-match: nix-v3-${{ runner.os }}-
-          gc-max-store-size-linux: 4294967296
+          primary-key: nix-v4-${{ runner.os }}-${{ hashFiles('**/*.nix', '**/flake.lock') }}
+          restore-prefixes-first-match: nix-v4-${{ runner.os }}-
+          gc-max-store-size-linux: 8589934592
           gc-max-store-size-macos: 4294967296
           # Only the nix-setup job needs to write the cache; arch jobs only restore.
           save: false
