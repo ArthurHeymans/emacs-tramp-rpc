@@ -169,7 +169,7 @@ jobs:
 
           Extract and place the binary in:
           \`\`\`
-          ~/.cache/tramp-rpc/tramp-rpc-server-${VERSION}
+          ~/.cache/emacs/tramp-rpc/tramp-rpc-server-${VERSION}
           \`\`\`
 
           ### Checksums
