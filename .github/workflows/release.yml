@@ -79,6 +79,9 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+          fetch-tags: true
 
       - name: Download all artifacts
         uses: actions/download-artifact@v8
@@ -119,11 +122,12 @@ jobs:
           VERSION=${{ steps.version.outputs.version }}
           TAG=${{ steps.version.outputs.tag }}
 
-          # Use the tag annotation if present, otherwise fall back to commit log
-          TAG_ANNOTATION=$(git tag -l --format='%(contents:subject)%0a%0a%(contents:body)' "${TAG}")
-
-          if [ -n "$TAG_ANNOTATION" ]; then
-            CHANGELOG="${TAG_ANNOTATION}"
+          # Use the annotated tag message if present, otherwise fall back to commit log.
+          # actions/checkout may leave only a commit checkout for tag-triggered workflows,
+          # so fetch the tag object explicitly before checking its type.
+          git fetch --force origin "refs/tags/${TAG}:refs/tags/${TAG}" || true
+          if [ "$(git cat-file -t "${TAG}" 2>/dev/null)" = "tag" ]; then
+            CHANGELOG=$(git for-each-ref --format='%(contents:subject)%0a%0a%(contents:body)' "refs/tags/${TAG}")
             RANGE=""
           else
             PREV_TAG=$(git tag --sort=-v:refname | grep -v "^${TAG}$" | head -1)
