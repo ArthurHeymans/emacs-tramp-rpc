@@ -219,20 +219,24 @@ Error with helpful instructions
 |----------------+--------------+--------|
 | Linux          | x86_64       | ✓      |
 | Linux          | aarch64      | ✓      |
+| Linux          | i686         | ✓      |
+| Linux          | armv7        | ✓      |
+| Linux          | armv5te      | ✓      |
+| Linux          | arm/ARMv6    | ✓      |
 | macOS          | x86_64       | ✓      |
 | macOS (Apple Silicon) | aarch64 | ✓   |
 
 ** Manual Binary Installation
 
-If automatic deployment fails, download manually from [[https://github.com/ArthurHeymans/emacs-tramp-rpc/releases][GitHub Releases]] and extract to:
+If automatic deployment fails, download manually from [[https://github.com/ArthurHeymans/emacs-tramp-rpc/releases][GitHub Releases]], extract the archive, and place the binary on the remote host at:
 
 #+begin_example
-~/.emacs.d/tramp-rpc/VERSION/ARCH/tramp-rpc-server
+~/.cache/emacs/tramp-rpc/tramp-rpc-server-VERSION
 #+end_example
 
 For example:
 #+begin_example
-~/.emacs.d/tramp-rpc/0.1.0/x86_64-linux/tramp-rpc-server
+~/.cache/emacs/tramp-rpc/tramp-rpc-server-0.9.0
 #+end_example
 
 * Building from Source
@@ -279,7 +283,7 @@ cargo build --release --target aarch64-unknown-linux-gnu
 ;; Local cache directory (default: ~/.emacs.d/tramp-rpc/)
 (setq tramp-rpc-deploy-local-cache-directory "~/.cache/tramp-rpc-binaries")
 
-;; Remote installation directory (default: ~/.cache/tramp-rpc)
+;; Remote installation directory (default: ~/.cache/emacs/tramp-rpc)
 (setq tramp-rpc-deploy-remote-directory "~/.local/bin/tramp-rpc")
 
 ;; Disable automatic deployment (default: t)
