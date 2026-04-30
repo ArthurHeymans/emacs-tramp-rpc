@@ -32,6 +32,10 @@
 (require 'tramp)
 (require 'msgpack)
 
+;; Functions from tramp.el
+(declare-function tramp-add-external-operation "tramp")
+(declare-function tramp-remove-external-operation "tramp")
+
 ;; Functions from tramp-rpc-process.el
 (declare-function tramp-rpc--write-remote-process "tramp-rpc-process")
 (declare-function tramp-rpc--close-remote-stdin "tramp-rpc-process")
@@ -470,14 +474,19 @@ exited (remote side finished), delete it so the refresh can proceed."
     (tramp-add-external-operation
      'vc-exec-after
      #'tramp-rpc-handle-vc-exec-after 'tramp-rpc 'default-directory))
+  ;; If eglot/magit-process is already loaded while `tramp-rpc' is being
+  ;; required, defer registration until `tramp-rpc' is provided; otherwise
+  ;; `tramp-add-external-operation' calls `(require 'tramp-rpc)' recursively.
   (with-eval-after-load 'eglot
-    (tramp-add-external-operation
-     'eglot--cmd
-     #'tramp-rpc-handle-eglot--cmd 'tramp-rpc 'default-directory))
+    (with-eval-after-load 'tramp-rpc
+      (tramp-add-external-operation
+       'eglot--cmd
+       #'tramp-rpc-handle-eglot--cmd 'tramp-rpc 'default-directory)))
   (with-eval-after-load 'magit-process
-    (tramp-add-external-operation
-     'magit-start-process
-     #'tramp-rpc-handle-magit-start-process 'tramp-rpc 'default-directory))
+    (with-eval-after-load 'tramp-rpc
+      (tramp-add-external-operation
+       'magit-start-process
+       #'tramp-rpc-handle-magit-start-process 'tramp-rpc 'default-directory)))
   (with-eval-after-load 'tramp-rpc
     (tramp-add-external-operation
      'vc-dir-refresh

@@ -30,6 +30,10 @@
 (require 'tramp)
 (require 'tramp-rpc-protocol)
 
+;; Functions from tramp.el
+(declare-function tramp-add-external-operation "tramp")
+(declare-function tramp-remove-external-operation "tramp")
+
 ;; Silence byte-compiler warnings for variables defined in vterm
 (defvar vterm-copy-mode)
 (defvar vterm-min-window-width)
@@ -1036,18 +1040,22 @@ For direct SSH PTY, let the original function handle it (SSH handles resize)."
 ;; Forward declare for cleanup
 (declare-function tramp-rpc--connection-key "tramp-rpc")
 
-;; Install terminal emulator handler
+;; Install terminal emulator handler.  When vterm/eat is already loaded while
+;; `tramp-rpc' is being required, defer until `tramp-rpc' is provided; otherwise
+;; `tramp-add-external-operation' calls `(require 'tramp-rpc)' recursively.
 (with-eval-after-load 'vterm
-  (tramp-add-external-operation
-   'vterm--window-adjust-process-window-size
-   #'tramp-rpc-handle-vterm--window-adjust-process-window-size
-   'tramp-rpc 'process))
+  (with-eval-after-load 'tramp-rpc
+    (tramp-add-external-operation
+     'vterm--window-adjust-process-window-size
+     #'tramp-rpc-handle-vterm--window-adjust-process-window-size
+     'tramp-rpc 'process)))
 
 (with-eval-after-load 'eat
-  (tramp-add-external-operation
-   'eat--adjust-process-window-size
-   #'tramp-rpc-handle-eat--adjust-process-window-size
-   'tramp-rpc 'process))
+  (with-eval-after-load 'tramp-rpc
+    (tramp-add-external-operation
+     'eat--adjust-process-window-size
+     #'tramp-rpc-handle-eat--adjust-process-window-size
+     'tramp-rpc 'process)))
 
 (defun tramp-rpc--process-handler-remove ()
   "Remove handlers."

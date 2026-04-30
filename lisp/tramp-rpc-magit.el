@@ -31,6 +31,10 @@
 (require 'cl-lib)
 (require 'tramp)
 
+;; Functions from tramp.el
+(declare-function tramp-add-external-operation "tramp")
+(declare-function tramp-remove-external-operation "tramp")
+
 ;; Functions from tramp-rpc.el
 (declare-function tramp-rpc--debug "tramp-rpc")
 (declare-function tramp-rpc--call "tramp-rpc")
