@@ -50,27 +50,32 @@ jobs:
         uses: actions/cache/restore@v5
         with:
           path: target/${{ inputs.target }}/release/tramp-rpc-server
-          key: rust-binary-${{ inputs.target }}-${{ hashFiles('server/**', 'Cargo.toml', 'Cargo.lock', 'flake.nix', 'flake.lock', '.cargo/**') }}
+          key: rust-binary-${{ inputs.target }}-${{ hashFiles('server/**', 'Cargo.toml', 'Cargo.lock', 'flake.nix', 'flake.lock', '.cargo/**', '.github/workflows/build.yml') }}
 
       - name: Determine version
         id: version
+        env:
+          INPUT_VERSION: ${{ inputs.version }}
+          DISPATCH_VERSION: ${{ github.event.inputs.version }}
+          EVENT_NAME: ${{ github.event_name }}
+          REF: ${{ github.ref }}
         run: |
-          if [ -n "${{ inputs.version }}" ]; then
-            echo "version=${{ inputs.version }}" >> $GITHUB_OUTPUT
-          elif [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
-            echo "version=${{ github.event.inputs.version }}" >> $GITHUB_OUTPUT
-          elif [[ "${{ github.ref }}" == refs/tags/v* ]]; then
-            echo "version=${GITHUB_REF#refs/tags/v}" >> $GITHUB_OUTPUT
+          if [ -n "$INPUT_VERSION" ]; then
+            echo "version=$INPUT_VERSION" >> "$GITHUB_OUTPUT"
+          elif [ "$EVENT_NAME" = "workflow_dispatch" ]; then
+            echo "version=$DISPATCH_VERSION" >> "$GITHUB_OUTPUT"
+          elif [[ "$REF" == refs/tags/v* ]]; then
+            echo "version=${REF#refs/tags/v}" >> "$GITHUB_OUTPUT"
           else
-            echo "version=ci" >> $GITHUB_OUTPUT
+            echo "version=ci" >> "$GITHUB_OUTPUT"
           fi
 
       - name: Install Nix
-        if: steps.cache-binary.outputs.cache-hit != 'true'
+        if: ${{ steps.cache-binary.outputs.cache-hit != 'true' && !contains(inputs.target, 'apple-darwin') }}
         uses: DeterminateSystems/nix-installer-action@main
 
       - name: Cache Nix store
-        if: steps.cache-binary.outputs.cache-hit != 'true'
+        if: ${{ steps.cache-binary.outputs.cache-hit != 'true' && !contains(inputs.target, 'apple-darwin') }}
         uses: nix-community/cache-nix-action@v7
         with:
           primary-key: nix-v3-${{ runner.os }}-${{ hashFiles('**/*.nix', '**/flake.lock') }}
@@ -80,8 +85,17 @@ jobs:
           # Only the nix-setup job needs to write the cache; arch jobs only restore.
           save: false
 
-      - name: Build
-        if: steps.cache-binary.outputs.cache-hit != 'true'
+      # Build macOS outside Nix so Darwin system libraries (for example
+      # libiconv) resolve to /usr/lib paths instead of absolute /nix/store
+      # paths that do not exist on user machines.
+      - name: Set up Rust for macOS
+        if: ${{ steps.cache-binary.outputs.cache-hit != 'true' && contains(inputs.target, 'apple-darwin') }}
+        run: |
+          rustup toolchain install nightly --profile minimal --component rust-src
+          rustup +nightly target add ${{ inputs.target }}
+
+      - name: Build with Nix
+        if: ${{ steps.cache-binary.outputs.cache-hit != 'true' && !contains(inputs.target, 'apple-darwin') }}
         run: |
           nix develop .#${{ inputs.target }} --command bash -c '
           RUSTFLAGS="-D warnings -C target-feature=+crt-static -Zlocation-detail=none -Zunstable-options -Cpanic=immediate-abort" \
@@ -93,9 +107,34 @@ jobs:
         env:
           STATIC: ${{ inputs.static }}
 
-      - name: Test
-        if: ${{ inputs.test && steps.cache-binary.outputs.cache-hit != 'true' }}
+      - name: Build macOS with rustup
+        if: ${{ steps.cache-binary.outputs.cache-hit != 'true' && contains(inputs.target, 'apple-darwin') }}
+        run: |
+          RUSTFLAGS="-D warnings -Zlocation-detail=none -Zunstable-options -Cpanic=immediate-abort" \
+          cargo +nightly build --release --target ${{ inputs.target }} \
+            --manifest-path server/Cargo.toml \
+            -Z build-std=std,panic_abort \
+            -Z build-std-features="optimize_for_size"
+
+      - name: Verify macOS dynamic libraries
+        if: ${{ contains(inputs.target, 'apple-darwin') }}
+        run: |
+          binary="target/${{ inputs.target }}/release/tramp-rpc-server"
+          otool -L "$binary"
+          if otool -L "$binary" | grep -q '/nix/store'; then
+            echo "::error::macOS binary must not reference Nix store libraries"
+            exit 1
+          fi
+
+      - name: Test with Nix
+        if: ${{ inputs.test && steps.cache-binary.outputs.cache-hit != 'true' && !contains(inputs.target, 'apple-darwin') }}
         run: nix develop .#${{ inputs.target }} --command cargo test --manifest-path server/Cargo.toml
+        env:
+          RUSTFLAGS: "-D warnings"
+
+      - name: Test macOS with rustup
+        if: ${{ inputs.test && steps.cache-binary.outputs.cache-hit != 'true' && contains(inputs.target, 'apple-darwin') }}
+        run: cargo +nightly test --manifest-path server/Cargo.toml
         env:
           RUSTFLAGS: "-D warnings"
 
@@ -104,7 +143,7 @@ jobs:
         uses: actions/cache/save@v5
         with:
           path: target/${{ inputs.target }}/release/tramp-rpc-server
-          key: rust-binary-${{ inputs.target }}-${{ hashFiles('server/**', 'Cargo.toml', 'Cargo.lock', 'flake.nix', 'flake.lock', '.cargo/**') }}
+          key: rust-binary-${{ inputs.target }}-${{ hashFiles('server/**', 'Cargo.toml', 'Cargo.lock', 'flake.nix', 'flake.lock', '.cargo/**', '.github/workflows/build.yml') }}
 
       - name: Upload binary for CI
         if: ${{ !inputs.upload }}
