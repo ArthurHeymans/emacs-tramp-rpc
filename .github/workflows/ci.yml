@@ -28,14 +28,18 @@ jobs:
       - name: Cache Nix store
         uses: nix-community/cache-nix-action@v7
         with:
-          primary-key: nix-v3-${{ runner.os }}-${{ hashFiles('**/*.nix', '**/flake.lock') }}
-          restore-prefixes-first-match: nix-v3-${{ runner.os }}-
-          gc-max-store-size-linux: 4294967296
+          primary-key: nix-v4-${{ runner.os }}-${{ hashFiles('**/*.nix', '**/flake.lock') }}
+          restore-prefixes-first-match: nix-v4-${{ runner.os }}-
+          gc-max-store-size-linux: 8589934592
 
       - name: Build Linux CI dev shells
         run: |
           nix develop .#x86_64-unknown-linux-musl --command true
           nix develop .#aarch64-unknown-linux-musl --command true
+          nix develop .#i686-unknown-linux-musl --command true
+          nix develop .#arm-unknown-linux-musleabihf --command true
+          nix develop .#armv7-unknown-linux-musleabihf --command true
+          nix develop .#armv5te-unknown-linux-musleabi --command true
 
   rust-linux:
     name: Rust ${{ matrix.name }}
