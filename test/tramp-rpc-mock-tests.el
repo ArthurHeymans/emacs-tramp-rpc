@@ -551,7 +551,10 @@ Returns the result or signals an error."
     (tramp-rpc-mock-test--stop-server)))
 
 (ert-deftest tramp-rpc-mock-test-server-highlevel-locate-dominating-file-depth-limit ()
-  "Ensure dominating-file helper errors after 100 ancestor levels."
+  "Ensure dominating-file helper stops silently at configured depth.
+With MAX_DEPTH set below the distance to the marker, the walk returns
+an empty result (matching stock `locate-dominating-file' behavior when
+no marker is found) rather than signalling an error."
   :tags '(:server)
   (skip-unless tramp-rpc-mock-test--msgpack-available)
   (skip-unless (tramp-rpc-mock-test--find-server))
@@ -560,20 +563,32 @@ Returns the result or signals an error."
         (tramp-rpc-mock-test--start-server)
         (let* ((root (expand-file-name "highlevel-depth-limit" tramp-rpc-mock-test-temp-dir))
                (deep-rel (mapconcat (lambda (n) (format "d%03d" n))
-                                    (number-sequence 1 110) "/"))
+                                    (number-sequence 1 20) "/"))
                (deep (expand-file-name deep-rel root))
                (file (expand-file-name "file.txt" deep)))
           (make-directory deep t)
           (make-directory (expand-file-name ".git" root) t)
           (with-temp-file file (insert "x"))
+          ;; max_depth=5 stops the walk well before reaching the .git marker
+          ;; at the 20-deep root.  The server should return an empty array,
+          ;; not a protocol error.
+          (let ((result (tramp-rpc-mock-test--rpc-call
+                         "highlevel.locate_dominating_file_multi"
+                         `((file . ,(encode-coding-string file 'utf-8))
+                           (names . [".git"])
+                           (max_depth . 5)))))
+            (should-not (plist-get result :error))
+            (should (listp result))
+            (should (null result)))
+          ;; Sanity check: without the limit, the same call finds the marker.
           (let ((result (tramp-rpc-mock-test--rpc-call
                          "highlevel.locate_dominating_file_multi"
                          `((file . ,(encode-coding-string file 'utf-8))
                            (names . [".git"])))))
-            (should (stringp (plist-get result :error)))
-            (should (string-match-p
-                     "Maximum ancestor traversal depth (100) exceeded"
-                     (plist-get result :error))))))
+            (should-not (plist-get result :error))
+            (should (= 1 (length result)))
+            (should (string-match-p "/highlevel-depth-limit/\\.git\\'"
+                                    (car result))))))
     (tramp-rpc-mock-test--stop-server)))
 
 (ert-deftest tramp-rpc-mock-test-server-highlevel-test-files-in-dir ()
@@ -655,7 +670,9 @@ Returns the result or signals an error."
     (tramp-rpc-mock-test--stop-server)))
 
 (ert-deftest tramp-rpc-mock-test-server-highlevel-dir-locals-cache-update-depth-limit ()
-  "Ensure dir-locals cache helper errors after 100 ancestor levels."
+  "Ensure dir-locals cache helper stops silently at configured depth.
+With MAX_DEPTH below the distance to .dir-locals.el, the server returns
+`locals => nil' rather than signalling an error."
   :tags '(:server)
   (skip-unless tramp-rpc-mock-test--msgpack-available)
   (skip-unless (tramp-rpc-mock-test--find-server))
@@ -664,7 +681,7 @@ Returns the result or signals an error."
         (tramp-rpc-mock-test--start-server)
         (let* ((root (expand-file-name "highlevel-cache-depth-limit" tramp-rpc-mock-test-temp-dir))
                (deep-rel (mapconcat (lambda (n) (format "d%03d" n))
-                                    (number-sequence 1 110) "/"))
+                                    (number-sequence 1 20) "/"))
                (deep (expand-file-name deep-rel root))
                (file (expand-file-name "new-file.txt" deep)))
           (make-directory deep t)
@@ -673,11 +690,11 @@ Returns the result or signals an error."
                          "highlevel.dir_locals_find_file_cache_update"
                          `((file . ,(encode-coding-string file 'utf-8))
                            (names . [".dir-locals.el"])
-                           (cache_dirs . [])))))
-            (should (stringp (plist-get result :error)))
-            (should (string-match-p
-                     "Maximum ancestor traversal depth (100) exceeded"
-                     (plist-get result :error))))))
+                           (cache_dirs . [])
+                           (max_depth . 5)))))
+            (should-not (plist-get result :error))
+            (should (alist-get 'file result))
+            (should-not (alist-get 'locals result)))))
     (tramp-rpc-mock-test--stop-server)))
 
 (ert-deftest tramp-rpc-mock-test-server-process-run ()
@@ -1207,13 +1224,43 @@ as a hop in multi-hop chains."
       (should orig-called))))
 
 (ert-deftest tramp-rpc-mock-test-dir-locals-cache-covers-uses-containment ()
-  "Ensure cache coverage check uses containment, not string length."
+  "Ensure cache coverage check uses containment, not string length.
+A length-based `<=' proxy would false-positive whenever LOCALS-DIR
+happens to have a shorter string than CACHE-DIR even if they share no
+ancestor relationship.  Containment must return nil in that case."
   :tags '(:dir-locals)
   (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
-  (let ((locals "/tmp/a/very-long-dirname/")
-        (cache "/tmp/a/b/c/d/"))
-    ;; String length can disagree with depth here; containment should win.
-    (should (tramp-rpc--dir-locals-cache-covers-p locals cache))))
+  ;; Negative case: unrelated paths where LOCALS is lexically shorter
+  ;; than CACHE.  A `<=' length proxy would incorrectly say "covers".
+  (should-not (tramp-rpc--dir-locals-cache-covers-p
+               "/tmp/short/"
+               "/tmp/different-unrelated-path/"))
+  ;; Positive case: CACHE truly at or below LOCALS.
+  (should (tramp-rpc--dir-locals-cache-covers-p
+           "/tmp/locals/"
+           "/tmp/locals/sub/"))
+  ;; Positive case: same directory (equal).
+  (should (tramp-rpc--dir-locals-cache-covers-p
+           "/tmp/same/"
+           "/tmp/same/")))
+
+(ert-deftest tramp-rpc-mock-test-dir-locals-advice-install-remove-cycle ()
+  "Test that `hack-dir-local-variables' advice install/remove works.
+Guards against `tramp-rpc-advice-install' or `tramp-rpc-advice-remove'
+accidentally dropping the advice during future refactors."
+  :tags '(:dir-locals)
+  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
+  ;; After loading tramp-rpc-advice, the advice should be active.
+  (should (advice-member-p #'tramp-rpc--hack-dir-local-variables-advice
+                           'hack-dir-local-variables))
+  ;; After removing, it should be gone.
+  (unwind-protect
+      (progn
+        (tramp-rpc-advice-remove)
+        (should-not (advice-member-p #'tramp-rpc--hack-dir-local-variables-advice
+                                     'hack-dir-local-variables)))
+    ;; Restore advice for remaining tests.
+    (tramp-rpc-advice-install)))
 
 (ert-deftest tramp-rpc-mock-test-locate-dominating-file-unquotes-and-requotes-paths ()
   "Ensure locate-dominating handler unquotes RPC paths for transport.
@@ -1246,6 +1293,22 @@ operations and re-quoted on the way back."
             (regexp-quote "/tmp/tramp-rpc-root/a/b/")))
       (should-not (tramp-rpc-handle-locate-dominating-file "foo" ".git")))))
 
+(ert-deftest tramp-rpc-mock-test-locate-dominating-file-stop-regexp-matches-target ()
+  "Stop regexp that matches the dominating directory itself should block.
+Stock `locate-dominating-file' runs `string-match' at every step of the
+walk, including on the dominating directory, so a regexp matching the
+dominating dir causes the lookup to return nil."
+  :tags '(:dir-locals)
+  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
+  (cl-letf (((symbol-function 'tramp-rpc--call)
+             (lambda (_vec method _params)
+               (should (string= method "highlevel.locate_dominating_file_multi"))
+               (list (encode-coding-string "/tmp/tramp-rpc-root/.git" 'utf-8 t)))))
+    (let* ((default-directory "/rpc:host:/tmp/tramp-rpc-root/a/b/")
+           (locate-dominating-stop-dir-regexp
+            (concat "\\`" (regexp-quote "/rpc:host:/tmp/tramp-rpc-root/") "\\'")))
+      (should-not (tramp-rpc-handle-locate-dominating-file "foo" ".git")))))
+
 (ert-deftest tramp-rpc-mock-test-dir-locals-all-files-unquotes-and-requotes-paths ()
   "Ensure dir-locals-all-files handler preserves quoted RPC localnames."
   :tags '(:dir-locals)
@@ -1263,6 +1326,54 @@ operations and re-quoted on the way back."
         (should (equal captured-directory "/tmp/tramp-rpc-root"))
         (should (equal result
                        '("/rpc:host:/:/tmp/tramp-rpc-root/.dir-locals.el")))))))
+
+(ert-deftest tramp-rpc-mock-test-dir-locals-find-file-preserves-quoting ()
+  "Ensure dir-locals-find-file handler preserves file-name-quoted paths.
+When the input FILE has a `/:' prefix, the returned locals directory
+must also carry the prefix so that `dir-locals-directory-cache' lookups
+via `string=' find the matching entry."
+  :tags '(:dir-locals)
+  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
+  (cl-letf (((symbol-function 'tramp-rpc--call)
+             (lambda (_vec method _params)
+               (should (string= method "highlevel.dir_locals_find_file_cache_update"))
+               `((file . ,(encode-coding-string "/tmp/tramp-rpc-root/subdir/foo"
+                                                'utf-8 t))
+                 (locals . ((dir . ,(encode-coding-string
+                                     "/tmp/tramp-rpc-root"
+                                     'utf-8 t))
+                            (files . ())))
+                 (cache . nil)))))
+    (let* ((dir-locals-directory-cache nil)
+           (result (tramp-rpc-handle-dir-locals-find-file
+                    "/rpc:host:/:/tmp/tramp-rpc-root/subdir/foo")))
+      (should (stringp result))
+      (should (equal result "/rpc:host:/:/tmp/tramp-rpc-root/")))))
+
+(ert-deftest tramp-rpc-mock-test-dir-locals-find-file-cache-hit-with-quoting ()
+  "Ensure dir-locals-find-file finds cache entries populated via quoted paths.
+A cache entry keyed by `/rpc:host:/:/...' must be discoverable when the
+current call comes through the same quoted access path."
+  :tags '(:dir-locals)
+  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
+  (cl-letf (((symbol-function 'tramp-rpc--call)
+             (lambda (_vec method _params)
+               (should (string= method "highlevel.dir_locals_find_file_cache_update"))
+               `((file . ,(encode-coding-string "/tmp/root/subdir/foo"
+                                                'utf-8 t))
+                 (locals . ((dir . ,(encode-coding-string "/tmp/root"
+                                                          'utf-8 t))
+                            (files . ())))
+                 (cache . ((dir . ,(encode-coding-string "/tmp/root"
+                                                         'utf-8 t))
+                           (files . ())))))))
+    (let* ((cache-entry '("/rpc:host:/:/tmp/root/" nil nil))
+           (dir-locals-directory-cache (list cache-entry))
+           (result (tramp-rpc-handle-dir-locals-find-file
+                    "/rpc:host:/:/tmp/root/subdir/foo")))
+      ;; The handler should find the existing cache entry via `string='
+      ;; against the re-quoted cache-dir reconstruction.
+      (should (eq result cache-entry)))))
 
 ;;; ============================================================================
 ;;; Non-essential / recentf Tests (No server or SSH required)
