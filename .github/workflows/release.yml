@@ -38,6 +38,18 @@ jobs:
           - target: aarch64-unknown-linux-musl
             arch: aarch64-linux
 
+          - target: i686-unknown-linux-musl
+            arch: i686-linux
+
+          - target: armv7-unknown-linux-musleabihf
+            arch: armv7-linux
+
+          - target: armv5te-unknown-linux-musleabi
+            arch: armv5te-linux
+
+          - target: arm-unknown-linux-musleabihf
+            arch: armv6-linux
+
   build-macos:
     name: Build macOS ${{ matrix.arch }}
     uses: ./.github/workflows/build.yml
@@ -140,10 +152,14 @@ jobs:
 
           | Architecture | File | Notes |
           |-------------|------|-------|
-          | Linux x86_64 | \`tramp-rpc-server-x86_64-linux-${VERSION}.tar.gz\` | Static musl binary |
-          | Linux aarch64 | \`tramp-rpc-server-aarch64-linux-${VERSION}.tar.gz\` | Static musl binary |
-          | macOS x86_64 | \`tramp-rpc-server-x86_64-darwin-${VERSION}.tar.gz\` | |
-          | macOS aarch64 (Apple Silicon) | \`tramp-rpc-server-aarch64-darwin-${VERSION}.tar.gz\` | |
+          | Linux x86_64 | \`tramp-rpc-server-x86_64-unknown-linux-musl-${VERSION}.tar.gz\` | Static musl binary |
+          | Linux aarch64 | \`tramp-rpc-server-aarch64-unknown-linux-musl-${VERSION}.tar.gz\` | Static musl binary |
+          | Linux i686 | \`tramp-rpc-server-i686-unknown-linux-musl-${VERSION}.tar.gz\` | Static musl binary |
+          | Linux armv7 (Allwinner A20/H3) | \`tramp-rpc-server-armv7-unknown-linux-musleabihf-${VERSION}.tar.gz\` | Static musl binary |
+          | Linux armv5te (AST2500) | \`tramp-rpc-server-armv5te-unknown-linux-musleabi-${VERSION}.tar.gz\` | Static musl binary |
+          | Linux arm/ARMv6 (Raspberry Pi 1) | \`tramp-rpc-server-arm-unknown-linux-musleabihf-${VERSION}.tar.gz\` | Static musl binary |
+          | macOS x86_64 | \`tramp-rpc-server-x86_64-apple-darwin-${VERSION}.tar.gz\` | |
+          | macOS aarch64 (Apple Silicon) | \`tramp-rpc-server-aarch64-apple-darwin-${VERSION}.tar.gz\` | |
 
           Linux binaries are fully statically linked and will work on any Linux distribution.
 
