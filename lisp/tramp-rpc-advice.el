@@ -503,10 +503,6 @@ exited (remote side finished), delete it so the refresh can proceed."
   (tramp-remove-external-operation 'vc-dir-refresh 'tramp-rpc)
   (advice-remove 'hack-dir-local-variables #'tramp-rpc--hack-dir-local-variables-advice))
 
-;; FIXME: Do we need this?
-(define-obsolete-variable-alias
-  'tramp-rpc-install-advice-on-load 'tramp-rpc-install-handler-on-load "0.9.0")
-
 (defcustom tramp-rpc-install-handler-on-load t
   "Whether to install process handler when tramp-rpc-advice is loaded.
 Set to nil before loading to prevent automatic handler installation."
