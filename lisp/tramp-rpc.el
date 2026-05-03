@@ -169,7 +169,6 @@ This is called from `tramp-multi-hop-p-hook'."
   (setcdr rpc-entry ssh-params))
 
 ;; Silence byte-compiler warnings for functions defined in with-eval-after-load
-;; (declare-function tramp-rpc-handler-remove "tramp-rpc-advice")
 (declare-function tramp-add-external-operation "tramp")
 (declare-function tramp-remove-external-operation "tramp")
 (declare-function tramp-rpc--sudo-file-name-p "tramp-rpc")
@@ -3269,10 +3268,6 @@ Also controls process exit detection latency."
     ;; RPC-based path and VC operations
     ;; =========================================================================
     (expand-file-name . tramp-rpc-handle-expand-file-name)
-    ;; Not needed.  They are added by `tramp-add-external-operation'.
-    ;; (locate-dominating-file . tramp-rpc-handle-locate-dominating-file)
-    ;; (dir-locals--all-files . tramp-rpc-handle-dir-locals--all-files)
-    ;; (dir-locals-find-file . tramp-rpc-handle-dir-locals-find-file)
     (vc-registered . tramp-rpc-handle-vc-registered)
 
     ;; =========================================================================
@@ -3475,7 +3470,6 @@ Removes advice and cleans up async processes."
   (tramp-remove-external-operation 'dir-locals-find-file 'tramp-rpc)
   ;; Remove all advice (from tramp-rpc-advice module)
   ;; Not needed. This is called in `tramp-rpc-advice-unload-function'.
-  ;; (tramp-rpc-handler-remove)
   ;; Remove multi-hop hook and cleanup hooks.
   (remove-hook 'tramp-multi-hop-p-hook #'tramp-rpc-multi-hop-p)
   (remove-hook 'tramp-cleanup-connection-hook #'tramp-rpc-cleanup-connection)

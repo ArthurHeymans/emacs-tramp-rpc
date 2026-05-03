@@ -25,7 +25,8 @@
 ;; - vc-call-backend (ensure default-directory for remote VC files)
 ;; - vc-exec-after (handle native-compiled VC process state races)
 ;; - eglot--cmd (bypass shell wrapping for RPC connections)
-;; - hack-dir-local-variables (enable dir-locals for RPC remotes)
+;; - magit-start-process (force pipe mode when INPUT will be piped to the process)
+;; - vc-dir-refresh (clean up stale processes)
 
 ;;; Code:
 
@@ -419,22 +420,6 @@ exited (remote side finished), delete it so the refresh can proceed."
   (tramp-run-real-handler 'vc-dir-refresh nil))
 
 ;; ============================================================================
-;; Dir-locals advice
-;; ============================================================================
-
-;; Emacs's `enable-remote-dir-locals' defaults to nil because looking for
-;; .dir-locals.el on remote hosts can be slow for traditional TRAMP methods.
-;; TRAMP-RPC uses a fast binary protocol and dedicated high-level operations,
-;; so enable this only for buffers using the rpc method.
-(defun tramp-rpc--hack-dir-local-variables-advice (orig-fun)
-  "Enable remote dir-locals in `hack-dir-local-variables' for RPC files."
-  (let ((enable-remote-dir-locals
-         (or enable-remote-dir-locals
-             (when-let* ((file (or (buffer-file-name) default-directory)))
-               (tramp-rpc-file-name-p file)))))
-    (funcall orig-fun)))
-
-;; ============================================================================
 ;; Install and uninstall handler
 ;; ============================================================================
 
@@ -491,9 +476,7 @@ exited (remote side finished), delete it so the refresh can proceed."
     (tramp-add-external-operation
      'vc-dir-refresh
      #'tramp-rpc-handle-vc-dir-refresh 'tramp-rpc
-     #'tramp-rpc--vc-dir-refresh-file-name-for-operation))
-  (advice-add 'hack-dir-local-variables :around
-              #'tramp-rpc--hack-dir-local-variables-advice))
+     #'tramp-rpc--vc-dir-refresh-file-name-for-operation)))
 
 (defun tramp-rpc-handler-remove ()
   "Remove all process handler installed by tramp-rpc."
@@ -509,8 +492,7 @@ exited (remote side finished), delete it so the refresh can proceed."
   (tramp-remove-external-operation 'vc-exec-after 'tramp-rpc)
   (tramp-remove-external-operation 'eglot--cmd 'tramp-rpc)
   (tramp-remove-external-operation 'magit-start-process 'tramp-rpc)
-  (tramp-remove-external-operation 'vc-dir-refresh 'tramp-rpc)
-  (advice-remove 'hack-dir-local-variables #'tramp-rpc--hack-dir-local-variables-advice))
+  (tramp-remove-external-operation 'vc-dir-refresh 'tramp-rpc))
 
 (defcustom tramp-rpc-install-handler-on-load t
   "Whether to install process handler when tramp-rpc-advice is loaded.

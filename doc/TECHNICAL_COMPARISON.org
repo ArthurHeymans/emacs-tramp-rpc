@@ -366,7 +366,7 @@ On first connection, TRAMP-RPC:
 2. Selects appropriate pre-compiled binary (from local cache or GitHub Releases)
 3. Transfers via scp (scpx method) with retry support
 4. Verifies SHA256 checksum
-5. Makes executable and stores in ~/.cache/tramp-rpc/
+5. Makes executable and stores in ~/.cache/emacs/tramp-rpc/
 
 #+begin_src elisp
 (defun tramp-rpc-deploy-ensure-binary (vec)

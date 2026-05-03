@@ -43,7 +43,7 @@ TRAMP-RPC replaces this with a lightweight Rust server that runs on the remote h
 
 * Installation
 
-** From MELPA (coming soon)
+** From NonGNU ELPA (coming soon)
 
 #+begin_src elisp
 (use-package tramp-rpc
@@ -281,7 +281,7 @@ cargo build --release --target aarch64-unknown-linux-gnu
 (setq tramp-rpc-deploy-prefer-build t)
 
 ;; Local cache directory (default: ~/.emacs.d/tramp-rpc/)
-(setq tramp-rpc-deploy-local-cache-directory "~/.cache/tramp-rpc-binaries")
+(setq tramp-rpc-deploy-local-cache-directory "~/.cache/emacs/tramp-rpc-binaries")
 
 ;; Remote installation directory (default: ~/.cache/emacs/tramp-rpc)
 (setq tramp-rpc-deploy-remote-directory "~/.local/bin/tramp-rpc")
