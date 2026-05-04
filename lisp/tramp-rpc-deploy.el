@@ -251,7 +251,8 @@ Preserves the trailing \"|\" that TRAMP uses in canonical hop format."
      (mapconcat
       (lambda (hop-str)
         (replace-regexp-in-string
-         (rx bos "rpc:") "ssh:" hop-str))
+         (rx bos "rpc" (literal tramp-postfix-method-format))
+	 (concat "ssh" tramp-postfix-method-format) hop-str))
       (split-string hop-string tramp-postfix-hop-regexp 'omit)
       tramp-postfix-hop-format)
      tramp-postfix-hop-format)))
@@ -973,7 +974,10 @@ is missing, signals an error."
         (message "tramp-rpc: never-deploy mode, using %s on remote" path)
         path)
     ;; Normal deployment flow
-    (let ((bootstrap-vec (tramp-rpc-deploy--bootstrap-vec vec)))
+    (let* ((bootstrap-vec (tramp-rpc-deploy--bootstrap-vec vec))
+	   ;; For simplified Tramp syntax.
+	   (tramp-default-method (tramp-file-name-method bootstrap-vec))
+	   tramp-default-method-alist)
       (if (tramp-rpc-deploy--remote-binary-exists-p bootstrap-vec)
           ;; Binary already exists
           (tramp-file-local-name (tramp-rpc-deploy--remote-binary-path bootstrap-vec))
@@ -1110,12 +1114,13 @@ This helps troubleshoot deployment issues."
     (setq user nil))
   (let ((buf (get-buffer-create "*tramp-rpc-diagnose*")))
     (with-current-buffer buf
-      (erase-buffer)
-      (insert (format "TRAMP-RPC Deployment Diagnostics for %s%s\n"
-                      (if user (concat user "@") "") host))
-      (insert "=" (make-string 50 ?=) "\n\n")
-
-      (let ((test-num 1))
+      (special-mode) ; For "q" and alike.
+      (let ((test-num 1)
+	    (inhibit-read-only t))
+	(erase-buffer)
+	(insert (format "TRAMP-RPC Deployment Diagnostics for %s%s\n"
+			(if user (concat user "@") "") host))
+	(insert "=" (make-string 50 ?=) "\n\n")
         ;; Bootstrap method
         (insert (format "%d. Bootstrap method configuration...\n" test-num))
         (insert (format "   Bootstrap method: %s\n" tramp-rpc-deploy-bootstrap-method))
