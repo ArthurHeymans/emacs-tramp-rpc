@@ -45,13 +45,14 @@
 (declare-function tramp-rpc--call "tramp-rpc")
 (declare-function tramp-rpc--call-fast "tramp-rpc")
 (declare-function tramp-rpc--call-async "tramp-rpc")
-(declare-function tramp-rpc--resolve-executable "tramp-rpc")
 (declare-function tramp-rpc--get-direnv-environment "tramp-rpc")
 (declare-function tramp-rpc--decode-output "tramp-rpc")
 (declare-function tramp-rpc--controlmaster-socket-path "tramp-rpc")
 (declare-function tramp-rpc--hops-to-proxyjump "tramp-rpc")
 (declare-function tramp-rpc--port-to-string "tramp-rpc")
 (declare-function tramp-rpc--ensure-inside-emacs-env "tramp-rpc")
+(declare-function tramp-rpc--merge-environments "tramp-rpc")
+(declare-function tramp-rpc--remote-path-environment "tramp-rpc")
 (declare-function tramp-rpc--caller-environment "tramp-rpc")
 (declare-function tramp-rpc-file-name-p "tramp-rpc")
 
@@ -447,21 +448,25 @@ Resolves program path and loads direnv environment from working directory."
     (with-parsed-tramp-file-name default-directory nil
       ;; Unquote localname in case of file-name-quoted paths (e.g. /: prefix).
       (setq localname (file-name-unquote localname))
-      ;; Get direnv environment for this directory, with INSIDE_EMACS,
-      ;; plus any caller-set env vars (e.g. GIT_INDEX_FILE from magit).
-      (let ((direnv-env (tramp-rpc--ensure-inside-emacs-env
-                         (append (tramp-rpc--get-direnv-environment v localname)
-                                 (tramp-rpc--caller-environment)))))
+      ;; Get the remote process environment: PATH from `tramp-remote-path'
+      ;; (or deprecated `tramp-rpc-remote-path'), direnv for this directory,
+      ;; INSIDE_EMACS, and caller-set env vars (e.g. GIT_INDEX_FILE from magit).
+      (let ((process-env (tramp-rpc--ensure-inside-emacs-env
+                          (tramp-rpc--merge-environments
+                           (tramp-rpc--remote-path-environment v)
+                           (tramp-rpc--get-direnv-environment v localname)
+                           (tramp-rpc--caller-environment)))))
         (if use-pty
             ;; PTY mode - start async process with PTY
             (tramp-rpc--make-pty-process v name buffer command coding noquery
-                                          filter sentinel localname direnv-env)
+                                          filter sentinel localname process-env)
           ;; Pipe mode - use a local cat process as relay for proper I/O events
           ;; This is needed because accept-process-output waits for actual I/O,
           ;; not just filter calls
-          (let* ((remote-program (tramp-rpc--resolve-executable v program))
-                 (remote-pid (tramp-rpc--start-remote-process
-                              v remote-program program-args localname direnv-env))
+          ;; Leave relative PROGRAM names unresolved so the server's process
+          ;; launcher searches the PATH we pass in PROCESS-ENV.
+          (let* ((remote-pid (tramp-rpc--start-remote-process
+                              v program program-args localname process-env))
                  ;; Use a local cat process as relay - we write output to its stdin
                  ;; and it echoes to stdout, triggering proper I/O events
                  (local-process (let ((process-connection-type nil)) ; Use pipes, not PTY
@@ -512,7 +517,7 @@ Resolves program path and loads direnv environment from working directory."
                    tramp-rpc--async-processes)
 
           (tramp-rpc--debug "MAKE-PROCESS created local=%s remote-pid=%s program=%s"
-                           local-process remote-pid remote-program)
+                           local-process remote-pid program)
 
           ;; Start async read loop
           (tramp-rpc--start-async-read local-process)
@@ -678,20 +683,19 @@ This is the fallback when direct SSH PTY is disabled.
 VEC is the tramp connection vector.
 NAME, BUFFER, COMMAND, CODING, NOQUERY, FILTER, SENTINEL are process params.
 LOCALNAME is the remote working directory.
-DIRENV-ENV is an optional alist of environment variables from direnv."
+DIRENV-ENV is an optional alist of environment variables for the process."
   (let* ((program (car command))
          (program-args (cdr command))
-         (remote-program (tramp-rpc--resolve-executable vec program))
          ;; Get terminal dimensions from buffer or use defaults
          (size (tramp-rpc--get-terminal-size buffer))
          (rows (cdr size))
          (cols (car size))
-         ;; Build environment - merge direnv env with TERM
+         ;; Build environment - add TERM after caller/remote env so it wins.
          (term-env (or (getenv "TERM") "xterm-256color"))
          (full-env (append direnv-env `(("TERM" . ,term-env))))
          ;; Start the PTY process on remote
          (result (tramp-rpc--call vec "process.start_pty"
-                                   `((cmd . ,remote-program)
+                                   `((cmd . ,program)
                                      (args . ,(vconcat program-args))
                                      (cwd . ,localname)
                                      (rows . ,rows)
