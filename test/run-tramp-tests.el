@@ -114,6 +114,14 @@
     (error "Upstream tramp-tests.el not found at %s.\nSet TRAMP_TEST_SOURCE to the tramp source tree" test-file))
   (load test-file))
 
+;; The upstream availability test computes its `:expected-result' while the
+;; file is loaded.  With tramp-rpc this can be pessimistic during first-contact
+;; deployment, even though the actual test subsequently succeeds.  CI treats a
+;; successful test with an expected failure as an unexpected result, so force the
+;; availability smoke test to be expected to pass for this adapter.
+(when-let* ((test (ert-get-test 'tramp-test00-availability)))
+  (setf (ert-test-expected-result-type test) :passed))
+
 ;; ============================================================================
 ;; Predicate overrides
 ;; ============================================================================

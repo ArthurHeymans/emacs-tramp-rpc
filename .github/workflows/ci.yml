@@ -110,6 +110,35 @@ jobs:
       - name: Check formatting
         run: cargo fmt --all --check
 
+  upstream-tramp:
+    name: Prepare upstream Tramp
+    runs-on: ubuntu-latest
+    steps:
+      - name: Clone upstream tramp
+        run: |
+          git clone --depth 1 https://github.com/emacsmirror/tramp.git upstream-tramp
+          echo "Tramp commit: $(git -C upstream-tramp rev-parse HEAD)"
+          # Generate trampver.el from the autoconf template.  The git
+          # repo only ships trampver.el.in; without a generated
+          # trampver.el Emacs falls back to its bundled copy whose
+          # version string is too old for tramp-rpc.
+          VERSION=$(grep -oP 'AC_INIT\(\[Tramp\],\s*\[\K[^\]]+' upstream-tramp/configure.ac)
+          echo "Upstream Tramp version: $VERSION"
+          sed -e "s/@PACKAGE_VERSION@/$VERSION/g" \
+              -e "s/@PACKAGE_BUGREPORT@/tramp-devel@gnu.org/g" \
+              -e "s/@EMACS_REQUIRED_VERSION@/28.1/g" \
+              -e 's|@PACKAGE_URL@|https://www.gnu.org/software/tramp/|g' \
+              -e 's/@TRAMP_EMACS_VERSION_CHECK@/"ok"/g' \
+              -e 's/@configure_input@/Generated from trampver.el.in for CI/g' \
+              upstream-tramp/lisp/trampver.el.in > upstream-tramp/lisp/trampver.el
+
+      - name: Upload upstream tramp
+        uses: actions/upload-artifact@v7
+        with:
+          name: upstream-tramp-source
+          path: upstream-tramp/
+          retention-days: 1
+
   elisp:
     name: Emacs Lisp
     runs-on: ubuntu-latest
@@ -231,7 +260,7 @@ jobs:
   test-multi-hop:
     name: Multi-Hop Tests
     runs-on: ubuntu-latest
-    needs: elisp
+    needs: [elisp, upstream-tramp]
 
     steps:
       - name: Checkout
@@ -242,10 +271,11 @@ jobs:
         with:
           version: '30.1'
 
-      - name: Clone upstream tramp
-        run: |
-          git clone --depth 1 https://github.com/emacsmirror/tramp.git ~/src/tramp
-          echo "Tramp commit: $(git -C ~/src/tramp rev-parse HEAD)"
+      - name: Download upstream tramp
+        uses: actions/download-artifact@v8
+        with:
+          name: upstream-tramp-source
+          path: upstream-tramp/
 
       - name: Install dependencies
         run: |
@@ -266,7 +296,7 @@ jobs:
         run: |
           emacs -Q --batch \
             -L lisp \
-            -L ~/src/tramp/lisp \
+            -L upstream-tramp/lisp \
             --eval "(require 'package)" \
             --eval "(add-to-list 'package-archives '(\"melpa\" . \"https://melpa.org/packages/\") t)" \
             --eval "(package-initialize)" \
@@ -325,7 +355,7 @@ jobs:
   test-full-suite:
     name: Full Test Suite (with SSH)
     runs-on: ubuntu-latest
-    needs: [rust-linux, elisp]
+    needs: [rust-linux, elisp, upstream-tramp]
 
     steps:
       - name: Checkout
@@ -335,6 +365,12 @@ jobs:
         uses: purcell/setup-emacs@master
         with:
           version: '30.1'
+
+      - name: Download upstream tramp
+        uses: actions/download-artifact@v8
+        with:
+          name: upstream-tramp-source
+          path: upstream-tramp/
 
       - name: Download server binary
         uses: actions/download-artifact@v8
@@ -392,6 +428,7 @@ jobs:
           TRAMP_RPC_TEST_HOST: localhost
         run: |
           emacs -Q --batch \
+            -L upstream-tramp/lisp \
             --eval "(require 'package)" \
             --eval "(add-to-list 'package-archives '(\"melpa\" . \"https://melpa.org/packages/\") t)" \
             --eval "(package-initialize)" \
@@ -403,7 +440,7 @@ jobs:
   test-upstream-tramp:
     name: Upstream Tramp Tests
     runs-on: ubuntu-latest
-    needs: [rust-linux, elisp]
+    needs: [rust-linux, elisp, upstream-tramp]
 
     steps:
       - name: Checkout
@@ -414,23 +451,11 @@ jobs:
         with:
           version: '30.1'
 
-      - name: Clone upstream tramp
-        run: |
-          git clone --depth 1 https://github.com/emacsmirror/tramp.git ~/src/tramp
-          echo "Tramp commit: $(git -C ~/src/tramp rev-parse HEAD)"
-          # Generate trampver.el from the autoconf template.  The git
-          # repo only ships trampver.el.in; without a generated
-          # trampver.el Emacs falls back to its bundled copy whose
-          # version string is too old for tramp-rpc.
-          VERSION=$(grep -oP 'AC_INIT\(\[Tramp\],\s*\[\K[^\]]+' ~/src/tramp/configure.ac)
-          echo "Upstream Tramp version: $VERSION"
-          sed -e "s/@PACKAGE_VERSION@/$VERSION/g" \
-              -e "s/@PACKAGE_BUGREPORT@/tramp-devel@gnu.org/g" \
-              -e "s/@EMACS_REQUIRED_VERSION@/28.1/g" \
-              -e 's|@PACKAGE_URL@|https://www.gnu.org/software/tramp/|g' \
-              -e 's/@TRAMP_EMACS_VERSION_CHECK@/"ok"/g' \
-              -e 's/@configure_input@/Generated from trampver.el.in for CI/g' \
-              ~/src/tramp/lisp/trampver.el.in > ~/src/tramp/lisp/trampver.el
+      - name: Download upstream tramp
+        uses: actions/download-artifact@v8
+        with:
+          name: upstream-tramp-source
+          path: upstream-tramp/
 
       - name: Download server binary
         uses: actions/download-artifact@v8
@@ -479,7 +504,7 @@ jobs:
       - name: Run upstream tramp tests
         env:
           TRAMP_RPC_TEST_HOST: localhost
-          TRAMP_TEST_SOURCE: ~/src/tramp
+          TRAMP_TEST_SOURCE: ${{ github.workspace }}/upstream-tramp
         run: |
           # Exclude known unfixable tests:
           #   :unstable: not recommended by upstream Tramp
@@ -496,7 +521,7 @@ jobs:
   summary:
     name: Test Summary
     runs-on: ubuntu-latest
-    needs: [rust-linux, rust-macos, rust-extra, elisp, test-autoload, test-protocol, test-multi-hop, test-server, test-full-suite, test-upstream-tramp]
+    needs: [rust-linux, rust-macos, rust-extra, format, upstream-tramp, elisp, test-autoload, test-protocol, test-multi-hop, test-server, test-full-suite, test-upstream-tramp]
     if: always()
 
     steps:
@@ -506,6 +531,8 @@ jobs:
           echo "Rust Linux: ${{ needs.rust-linux.result }}"
           echo "Rust macOS: ${{ needs.rust-macos.result }}"
           echo "Rust Extra: ${{ needs.rust-extra.result }}"
+          echo "Rust Format: ${{ needs.format.result }}"
+          echo "Upstream Tramp Prep: ${{ needs.upstream-tramp.result }}"
           echo "Elisp: ${{ needs.elisp.result }}"
           echo "Autoload Tests: ${{ needs.test-autoload.result }}"
           echo "Protocol Tests: ${{ needs.test-protocol.result }}"
@@ -517,6 +544,8 @@ jobs:
           if [[ "${{ needs.rust-linux.result }}" != "success" ]] || \
              [[ "${{ needs.rust-macos.result }}" != "success" ]] || \
              [[ "${{ needs.rust-extra.result }}" != "success" ]] || \
+             [[ "${{ needs.format.result }}" != "success" ]] || \
+             [[ "${{ needs.upstream-tramp.result }}" != "success" ]] || \
              [[ "${{ needs.elisp.result }}" != "success" ]] || \
              [[ "${{ needs.test-autoload.result }}" != "success" ]] || \
              [[ "${{ needs.test-protocol.result }}" != "success" ]] || \

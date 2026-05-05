@@ -417,6 +417,8 @@ Key is (host user port hop), value is a plist with :process and :buffer.")
 
 ;; tramp-rpc--async-processes and tramp-rpc--pty-processes are defined in
 ;; tramp-rpc-process.el (loaded via require below)
+(declare-function tramp-rpc--cleanup-async-processes "tramp-rpc-process")
+(declare-function tramp-rpc--cleanup-pty-processes "tramp-rpc-process")
 
 (defvar tramp-rpc--async-callbacks (make-hash-table :test 'eql)
   "Hash table mapping request IDs to callback functions for async RPC calls.")
@@ -709,6 +711,56 @@ Also clears the executable, exec-path, and login shell caches."
     (remhash key tramp-rpc--login-shell-cache))
   (tramp-rpc--clear-executable-cache vec))
 
+(defun tramp-rpc--connection-lost (vec &optional process event)
+  "Clean up VEC after its RPC transport PROCESS is lost.
+EVENT is a diagnostic string from the process sentinel or timeout.
+
+This is intentionally stronger than just removing the RPC server
+connection: remote child processes (for example gopls started by
+lsp-mode) are tied to that server instance.  If the SSH/RPC transport
+is gone, their remote PIDs are no longer meaningful, so the local relay
+processes must be terminated as well.  That lets process clients observe
+an abnormal process exit and restart instead of keeping a live but
+silent relay around."
+  (let ((conn (tramp-rpc--get-connection vec))
+        (connecting (and process (process-get process :tramp-rpc-connecting))))
+    ;; If PROCESS is provided, only act when it is still the connection we
+    ;; know about.  A late sentinel from an old SSH process must not tear down
+    ;; a freshly reconnected session for the same TRAMP vector.
+    (when (or (null process)
+              (and conn (eq process (plist-get conn :process))))
+      (tramp-rpc--debug "CONNECTION-LOST host=%s event=%s"
+                        (tramp-file-name-host vec) (or event "unknown"))
+      (let ((conn-buffer (or (and conn (plist-get conn :buffer))
+                             (and process (process-buffer process)))))
+        (when (and process (process-live-p process))
+          (process-put process :tramp-rpc-disconnecting t)
+          (ignore-errors (delete-process process)))
+        ;; Remove connection state before cleaning children so accidental
+        ;; remote cleanup attempts cannot reuse the broken transport.
+        (tramp-rpc--remove-connection vec)
+        (when conn-buffer
+          (remhash conn-buffer tramp-rpc--pending-responses)))
+      (unless connecting
+        ;; Terminate local relay processes without trying to kill remote PIDs
+        ;; through the broken connection.  Their sentinels will notify clients
+        ;; (LSP, compilation, etc.) that the process died abnormally.
+        (tramp-rpc--cleanup-async-processes vec 'connection-lost)
+        (tramp-rpc--cleanup-pty-processes vec 'connection-lost)
+        (tramp-rpc--cleanup-watches-for-connection vec)
+        (tramp-rpc--clear-direnv-cache vec)
+        (tramp-rpc--clear-file-caches-for-connection vec)
+        (ignore-errors (tramp-flush-directory-properties vec "/"))
+        (ignore-errors (tramp-flush-connection-properties vec))
+        (tramp-rpc--cleanup-controlmaster vec)))))
+
+(defun tramp-rpc--connection-sentinel (process event)
+  "Sentinel for the SSH process carrying the RPC server connection."
+  (when (and (memq (process-status process) '(exit signal))
+             (not (process-get process :tramp-rpc-disconnecting)))
+    (when-let* ((vec (process-get process :tramp-rpc-vec)))
+      (tramp-rpc--connection-lost vec process event))))
+
 (defun tramp-rpc--ensure-connection (vec)
   "Ensure we have an active RPC connection to VEC.
 Returns the connection plist.
@@ -721,9 +773,12 @@ completion) from blocking on unreachable hosts."
              (process-live-p (plist-get conn :process))
              (buffer-live-p (plist-get conn :buffer)))
         conn
-      ;; Stale connection - remove it before reconnecting
+      ;; Stale connection - clean up the whole RPC session before reconnecting.
+      ;; Remote child processes belong to the old server instance; keeping their
+      ;; local relays alive makes clients such as lsp-mode think the process is
+      ;; still running even though it can never answer again.
       (when conn
-        (tramp-rpc--remove-connection vec))
+        (tramp-rpc--connection-lost vec (plist-get conn :process) "stale connection"))
       ;; During non-essential operations, don't open new connections.
       ;; This mirrors the (unless (tramp-connectable-p vec)
       ;; (throw 'non-essential 'non-essential)) pattern used by every
@@ -1060,9 +1115,14 @@ Returns the connection plist.  Signals `remote-file-error' on failure."
     ;; Store connection
     (tramp-rpc--set-connection vec process buffer)
 
-    ;; Store vec on the process so notifications can identify the connection
+    ;; Store vec on the process so notifications can identify the connection.
+    ;; Keep startup failures distinct from an established transport loss: the
+    ;; expected-path probe deliberately starts a possibly-missing binary and
+    ;; should fall back to deployment without killing the ControlMaster or
+    ;; unrelated child processes.
     (process-put process :tramp-rpc-vec vec)
     (process-put process 'tramp-vector vec)
+    (process-put process :tramp-rpc-connecting t)
 
     ;; Wait for server to be ready by sending a ping
     (let ((response (tramp-rpc--call vec "system.info" nil)))
@@ -1081,6 +1141,11 @@ Returns the connection plist.  Signals `remote-file-error' on failure."
              ("macos" "Darwin")
              ("linux" "Linux")
              (_ os))))))
+
+    ;; From this point on, process death means an established transport was
+    ;; lost and dependent remote child processes must be cleaned up.
+    (process-put process :tramp-rpc-connecting nil)
+    (set-process-sentinel process #'tramp-rpc--connection-sentinel)
 
     ;; Set connection-local variables in the connection buffer.
     ;; Every TRAMP backend must call this after establishing the connection
@@ -1111,6 +1176,7 @@ Kills the process if still alive and removes the connection entry."
     (when conn
       (let ((proc (plist-get conn :process)))
         (when (process-live-p proc)
+          (process-put proc :tramp-rpc-disconnecting t)
           (delete-process proc)))
       (tramp-rpc--remove-connection vec))))
 
@@ -1194,6 +1260,7 @@ accidentally routing file operations through tramp-sh."
     (when conn
       (let ((process (plist-get conn :process)))
         (when (process-live-p process)
+          (process-put process :tramp-rpc-disconnecting t)
           (delete-process process)))
       (tramp-rpc--remove-connection vec)))
   ;; Flush TRAMP caches so a reconnect gets fresh data (home dir, uid, etc.)
@@ -1286,7 +1353,15 @@ Returns the request ID."
     ;; Register callback
     (puthash id callback tramp-rpc--async-callbacks)
     ;; Send request (binary data with length prefix, no newline)
-    (process-send-string process request)
+    (condition-case err
+        (process-send-string process request)
+      (error
+       (remhash id tramp-rpc--async-callbacks)
+       (tramp-rpc--connection-lost
+        vec process (format "send failed for %s: %s" method err))
+       (signal 'remote-file-error
+               (list (format "Failed to send RPC request %s: %s"
+                             method (error-message-string err))))))
     id))
 
 (defun tramp-rpc--call (vec method params)
@@ -1331,7 +1406,14 @@ Returns the result or signals an error."
     (tramp-rpc--debug "SEND id=%s method=%s" expected-id method)
 
     ;; Send request (binary data with length prefix, no newline)
-    (process-send-string process request)
+    (condition-case err
+        (process-send-string process request)
+      (error
+       (tramp-rpc--connection-lost
+        vec process (format "send failed for %s: %s" method err))
+       (signal 'remote-file-error
+               (list (format "Failed to send RPC request %s: %s"
+                             method (error-message-string err))))))
 
     ;; Wait for response with matching ID using wall-clock deadline.
     ;; NOTE: We use (float-time) instead of decrementing a counter because
@@ -1385,6 +1467,8 @@ Returns the result or signals an error."
             (tramp-rpc--debug
              "TIMEOUT id=%s method=%s elapsed=%.1fs buffer-size=%d process-live=%s"
              expected-id method elapsed (buffer-size) (process-live-p process))
+            (tramp-rpc--connection-lost
+             vec process (format "timeout waiting for %s" method))
             (signal
 	     'remote-file-error
 	     (list (format
@@ -1448,7 +1532,14 @@ Returns:
     (tramp-rpc--debug "SEND-BATCH id=%s count=%d" expected-id (length requests))
 
     ;; Send batch request (binary data with length prefix, no newline)
-    (process-send-string process request)
+    (condition-case err
+        (process-send-string process request)
+      (error
+       (tramp-rpc--connection-lost
+        vec process (format "send failed for batch RPC: %s" err))
+       (signal 'remote-file-error
+               (list (format "Failed to send batch RPC request: %s"
+                             (error-message-string err))))))
 
     ;; Wait for response with matching ID using wall-clock deadline
     (with-current-buffer buffer
@@ -1484,6 +1575,8 @@ Returns:
             (tramp-rpc--debug
              "TIMEOUT-BATCH id=%s elapsed=%.1fs buffer-size=%d process-live=%s"
              expected-id elapsed (buffer-size) (process-live-p process))
+            (tramp-rpc--connection-lost
+             vec process "timeout waiting for batch RPC")
             (signal
 	     'remote-file-error
 	     (list (format
@@ -1520,7 +1613,15 @@ Returns a list of request IDs in the same order."
         (tramp-rpc--debug "SEND-PIPE id=%s method=%s" id (car req))
         (push id ids)
         ;; Send binary data with length prefix, no newline
-        (process-send-string process bytes)))
+        (condition-case err
+            (process-send-string process bytes)
+          (error
+           (tramp-rpc--connection-lost
+            vec process (format "send failed for pipelined RPC %s: %s"
+                                (car req) err))
+           (signal 'remote-file-error
+                   (list (format "Failed to send pipelined RPC request %s: %s"
+                                 (car req) (error-message-string err))))))))
     (nreverse ids)))
 
 (defun tramp-rpc--receive-responses (vec ids &optional timeout)
@@ -1530,6 +1631,7 @@ TIMEOUT is the maximum time to wait in seconds (default 30)."
   (let* ((conn (tramp-rpc--ensure-connection vec))
          (process (plist-get conn :process))
          (buffer (plist-get conn :buffer))
+         (start-time (float-time))
          (deadline (+ (float-time) (or timeout 30)))
          (remaining-ids (copy-sequence ids))
          (responses (make-hash-table :test 'eql)))
@@ -1571,7 +1673,16 @@ TIMEOUT is the maximum time to wait in seconds (default 30)."
             (tramp-rpc--debug "RECV-PIPE quit (user interrupted)")
             (keyboard-quit)))))
     (when remaining-ids
-      (tramp-rpc--debug "RECV-PIPE timeout, missing ids: %S" remaining-ids))
+      (let ((elapsed (- (float-time) start-time)))
+        (tramp-rpc--debug
+         "RECV-PIPE timeout after %.1fs, missing ids: %S process-live=%s"
+         elapsed remaining-ids (process-live-p process))
+        (tramp-rpc--connection-lost
+         vec process "timeout waiting for pipelined RPC responses")
+        (signal 'remote-file-error
+                (list (format
+                       "Timeout waiting for pipelined RPC responses from %s (missing ids=%S, waited %.1fs)"
+                       (tramp-file-name-host vec) remaining-ids elapsed)))))
     ;; Convert hash table to alist in original order
     (mapcar (lambda (id)
               (cons id (gethash id responses)))
@@ -3427,6 +3538,7 @@ cleanup of all connections has run."
     (maphash (lambda (_key conn)
                (let ((process (plist-get conn :process)))
                  (when (process-live-p process)
+                   (process-put process :tramp-rpc-disconnecting t)
                    (delete-process process))))
              tramp-rpc--connections)
     (clrhash tramp-rpc--connections)
