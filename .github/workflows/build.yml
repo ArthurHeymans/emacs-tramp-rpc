@@ -101,6 +101,7 @@ jobs:
           RUSTFLAGS="-D warnings -C target-feature=+crt-static -Zlocation-detail=none -Zunstable-options -Cpanic=immediate-abort" \
           cargo build --release --target ${{ inputs.target }} \
             --manifest-path server/Cargo.toml \
+            --locked \
             -Z build-std=std,panic_abort \
             -Z build-std-features="optimize_for_size"
           '
@@ -113,6 +114,7 @@ jobs:
           RUSTFLAGS="-D warnings -Zlocation-detail=none -Zunstable-options -Cpanic=immediate-abort" \
           cargo +nightly build --release --target ${{ inputs.target }} \
             --manifest-path server/Cargo.toml \
+            --locked \
             -Z build-std=std,panic_abort \
             -Z build-std-features="optimize_for_size"
 
@@ -128,15 +130,22 @@ jobs:
 
       - name: Test with Nix
         if: ${{ inputs.test && steps.cache-binary.outputs.cache-hit != 'true' && !contains(inputs.target, 'apple-darwin') }}
-        run: nix develop .#${{ inputs.target }} --command cargo test --manifest-path server/Cargo.toml
+        run: nix develop .#${{ inputs.target }} --command cargo test --manifest-path server/Cargo.toml --locked
         env:
           RUSTFLAGS: "-D warnings"
 
       - name: Test macOS with rustup
         if: ${{ inputs.test && steps.cache-binary.outputs.cache-hit != 'true' && contains(inputs.target, 'apple-darwin') }}
-        run: cargo +nightly test --manifest-path server/Cargo.toml
+        run: cargo +nightly test --manifest-path server/Cargo.toml --locked
         env:
           RUSTFLAGS: "-D warnings"
+
+      - name: Verify Cargo.lock was not modified
+        run: |
+          if ! git diff --exit-code -- Cargo.lock; then
+            echo "::error::Cargo.lock changed during the build. Commit the updated lockfile or build with --locked."
+            exit 1
+          fi
 
       - name: Save binary to cache
         if: steps.cache-binary.outputs.cache-hit != 'true'
