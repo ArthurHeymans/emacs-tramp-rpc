@@ -1615,6 +1615,108 @@ discard it for being unreadable."
     (should (string-match-p "\\\\ " quoted))))
 
 ;;; ============================================================================
+;;; Remote Process Environment Tests (No server or SSH required)
+;;; ============================================================================
+
+(ert-deftest tramp-rpc-mock-test-remote-path-environment-uses-tramp-remote-path ()
+  "Test that `tramp-remote-path' becomes a PATH environment entry."
+  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
+  (let ((tramp-rpc-remote-path nil)
+        (tramp-remote-path '(tramp-default-remote-path
+                             "~/.cargo/bin"
+                             tramp-own-remote-path
+                             "/usr/bin"
+                             unsupported-entry))
+        (tramp-rpc--exec-path-cache (make-hash-table :test 'equal))
+        (vec (make-tramp-file-name :method "rpc" :host "host" :user "user"
+                                   :localname "/")))
+    (cl-letf (((symbol-function 'tramp-rpc--fetch-default-remote-path)
+               (lambda (_vec) '("/bin" "/usr/bin")))
+              ((symbol-function 'tramp-rpc--fetch-remote-exec-path)
+               (lambda (_vec) '("/home/user/.local/bin" "/usr/bin")))
+              ((symbol-function 'tramp-get-home-directory)
+               (lambda (_vec &optional _user) "/home/user")))
+      (should (equal (tramp-rpc--remote-path-environment vec)
+                     '(("PATH" . "/bin:/usr/bin:/home/user/.cargo/bin:/home/user/.local/bin")))))))
+
+(ert-deftest tramp-rpc-mock-test-remote-path-environment-compat-override ()
+  "Test deprecated `tramp-rpc-remote-path' still overrides `tramp-remote-path'."
+  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
+  (let ((tramp-rpc-remote-path '(tramp-rpc-own-remote-path "/custom/bin"))
+        (tramp-remote-path '("/ignored/bin"))
+        (tramp-rpc--exec-path-cache (make-hash-table :test 'equal))
+        (vec (make-tramp-file-name :method "rpc" :host "host" :user "user"
+                                   :localname "/")))
+    (cl-letf (((symbol-function 'tramp-rpc--fetch-remote-exec-path)
+               (lambda (_vec) '("/login/bin"))))
+      (should (equal (tramp-rpc--remote-path-environment vec)
+                     '(("PATH" . "/login/bin:/custom/bin")))))))
+
+(ert-deftest tramp-rpc-mock-test-fetch-remote-exec-path-ignores-banner ()
+  "Test login shell PATH parsing ignores startup output before the marker."
+  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
+  (let ((vec (make-tramp-file-name :method "rpc" :host "host" :user "user"
+                                   :localname "/")))
+    (cl-letf (((symbol-function 'tramp-rpc--get-remote-login-shell)
+               (lambda (_vec) "/bin/zsh"))
+              ((symbol-function 'tramp-rpc--decode-output)
+               (lambda (output _encoding) output))
+              ((symbol-function 'tramp-rpc--call)
+               (lambda (_vec method params)
+                 (should (equal method "process.run"))
+                 (let* ((args (alist-get 'args params))
+                        (command (aref args 2)))
+                   (should (equal (alist-get 'cmd params) "/bin/zsh"))
+                   (should (equal (aref args 0) "-l"))
+                   (should (equal (aref args 1) "-c"))
+                   (should (string-match "echo \\([0-9a-f]+\\);" command))
+                   `((exit_code . 0)
+                     (stdout . ,(concat "banner text\n"
+                                        (match-string 1 command)
+                                        "\n/home/user/bin:/usr/bin\n")))))))
+      (should (equal (tramp-rpc--fetch-remote-exec-path vec)
+                     '("/home/user/bin" "/usr/bin"))))))
+
+(ert-deftest tramp-rpc-mock-test-merge-environments-keeps-overrides ()
+  "Test env merging preserves direnv/caller override semantics."
+  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
+  (should (equal (tramp-rpc--merge-environments
+                  '(("PATH" . "/remote/bin") ("A" . "remote"))
+                  '(("PATH" . "/direnv/bin") ("B" . "direnv"))
+                  '(("GIT_INDEX_FILE" . "/tmp/index") ("A" . "caller")))
+                 '(("PATH" . "/direnv/bin")
+                   ("A" . "caller")
+                   ("B" . "direnv")
+                   ("GIT_INDEX_FILE" . "/tmp/index")))))
+
+(ert-deftest tramp-rpc-mock-test-process-file-passes-path-and-unresolved-command ()
+  "Test `process-file' searches commands with `tramp-remote-path' PATH."
+  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
+  (let ((default-directory "/rpc:user@host:/work/")
+        (captured-params nil)
+        (tramp-rpc--exec-path-cache (make-hash-table :test 'equal)))
+    (cl-letf (((symbol-function 'tramp-rpc--cached-remote-path)
+               (lambda (_vec) '("/home/user/.cargo/bin" "/usr/bin" "/bin")))
+              ((symbol-function 'tramp-rpc--get-direnv-environment)
+               (lambda (&rest _) nil))
+              ((symbol-function 'tramp-rpc--caller-environment)
+               (lambda () nil))
+              ((symbol-function 'tramp-rpc-magit--process-cache-lookup)
+               (lambda (&rest _) nil))
+              ((symbol-function 'tramp-rpc--decode-output)
+               (lambda (output _encoding) output))
+              ((symbol-function 'tramp-rpc--call)
+               (lambda (_vec method params)
+                 (should (equal method "process.run"))
+                 (setq captured-params params)
+                 '((exit_code . 0) (stdout . "") (stderr . "")))))
+      (should (= (tramp-rpc-handle-process-file "rg" nil nil nil "pattern") 0))
+      (should (equal (alist-get 'cmd captured-params) "rg"))
+      (should (equal (alist-get 'args captured-params) ["pattern"]))
+      (should (equal (assoc "PATH" (alist-get 'env captured-params))
+                     '("PATH" . "/home/user/.cargo/bin:/usr/bin:/bin"))))))
+
+;;; ============================================================================
 ;;; Direnv Cache Path Normalization Tests (No server or SSH required)
 ;;; ============================================================================
 
