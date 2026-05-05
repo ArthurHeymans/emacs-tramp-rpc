@@ -39,11 +39,13 @@
                   msgpack,
                 }:
                 let
-                  version = builtins.readFile (
-                    super.runCommand "get-package-version" { } ''
-                      ${lib.getExe' emacs "emacs"} --batch -Q --eval "(progn (require 'lisp-mnt) (with-temp-buffer (insert-file-contents \"${self}/lisp/tramp-rpc.el\") (princ (lm-header \"version\"))))" > $out
-                    ''
+                  versionPrefix = ";; Version: ";
+                  version = lib.removePrefix versionPrefix (
+                    lib.findFirst (lib.hasPrefix versionPrefix)
+                      (throw "Could not find Version header in lisp/tramp-rpc.el")
+                      (lib.splitString "\n" (builtins.readFile "${self}/lisp/tramp-rpc.el"))
                   );
+                  serverFor = arch: arch.callPackage ./default.nix { };
                 in
                 melpaBuild rec {
                   pname = "tramp-rpc";
@@ -52,7 +54,7 @@
                   files = ''("lisp/*")'';
 
                   postInstall = lib.concatMapStringsSep "\n" (arch: ''
-                    install -m755 -D ${arch.emacs-tramp-rpc-server}/bin/tramp-rpc-server $out/share/emacs/site-lisp/elpa/${pname}-${version}/binaries/${arch.stdenv.hostPlatform.system}/tramp-rpc-server
+                    install -m755 -D ${serverFor arch}/bin/tramp-rpc-server $out/share/emacs/site-lisp/elpa/${pname}-${version}/binaries/${arch.stdenv.hostPlatform.system}/tramp-rpc-server
                   '') archs;
 
                   packageRequires = [

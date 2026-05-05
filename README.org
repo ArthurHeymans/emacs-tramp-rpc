@@ -91,35 +91,41 @@ TRAMP-RPC replaces this with a lightweight Rust server that runs on the remote h
 1. Include this repository as a flake input and add its overlay to nixpkgs:
    #+begin_src nix
    inputs = {
+     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
      emacs-tramp-rpc.url = "github:ArthurHeymans/emacs-tramp-rpc";
    };
 
-   outputs = inputs@{ self, ... }:
+   outputs = inputs@{ nixpkgs, emacs-tramp-rpc, ... }:
      let
+       system = "x86_64-linux";
+       inherit (nixpkgs) lib;
        pkgs = import nixpkgs {
-         overlays = [ inputs.emacs-tramp-rpc.overlays.default ];
+         inherit system;
+         overlays = [ emacs-tramp-rpc.overlays.default ];
        };
      in ...;
    #+end_src
 
 2. Include ~tramp-rpc~ as you would any Elisp package from the ~emacsPackages~ scope, e.g. in Home Manager's ~programs.emacs.extraPackages~:
    #+begin_src nix
-   programs.emacs.extraPackages = epkgs: [ tramp-rpc ];
+   programs.emacs.extraPackages = epkgs: [ epkgs.tramp-rpc ];
    #+end_src
 
-4. Server binaries for =x86_64-linux= and =aarch64-linux= are automatically built and included in the Emacs package derivation; if you would like to change which systems are built, override the ~archs~ input:
+3. Server binaries for =x86_64-linux= and =aarch64-linux= are automatically built and included in the Emacs package derivation; if you would like to change which systems are built, override the ~archs~ input:
    #+begin_src nix
-   tramp-rpc.override {
-     archs = [
-       pkgs.pkgsCross.riscv64-musl
-       (import nixpkgs {
-         inherit system;
-         crossSystem = lib.systems.elaborate {
-           config = "armv6l-unknown-linux-musleabihf";
-         };
-       })
-     ];
-   }
+   programs.emacs.extraPackages = epkgs: [
+     (epkgs.tramp-rpc.override {
+       archs = [
+         pkgs.pkgsCross.riscv64-musl
+         (import nixpkgs {
+           inherit system;
+           crossSystem = lib.systems.elaborate {
+             config = "armv6l-unknown-linux-musleabihf";
+           };
+         })
+       ];
+     })
+   ];
    #+end_src
 
 * Usage
