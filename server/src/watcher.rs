@@ -41,12 +41,85 @@ fn lock_or_recover<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(|e| e.into_inner())
 }
 
+/// Wraps a `RecommendedWatcher` with .gitignore-aware recursive watching.
+///
+/// This wrapper intercepts recursive watches: walks the tree honoring .gitignore and
+/// registers each non-ignored directory individually in NonRecursive mode.
+/// Unwatch then tears down all sub-watches owned by that recursive root.
+///
+/// To callers it looks just like a `notify::Watcher`.
+struct FilteredWatcher {
+    inner: RecommendedWatcher,
+    recursive_subwatches: HashMap<PathBuf, Vec<PathBuf>>,
+}
+
+impl FilteredWatcher {
+    fn new<F>(handler: F) -> Result<Self, notify::Error>
+    where
+        F: notify::EventHandler,
+    {
+        Ok(Self {
+            inner: RecommendedWatcher::new(handler, Config::default())?,
+            recursive_subwatches: HashMap::new(),
+        })
+    }
+
+    fn watch(&mut self, path: &Path, mode: RecursiveMode) -> Result<(), notify::Error> {
+        match mode {
+            RecursiveMode::NonRecursive => self.inner.watch(path, mode),
+            RecursiveMode::Recursive => {
+                // hidden(false): include .git/, magit cares about it.
+                // standard_filters honors .gitignore, .git/info/exclude, global ignore.
+                // parents(false): only walk down from root.
+                let walker = ignore::WalkBuilder::new(path)
+                    .standard_filters(true)
+                    .hidden(false)
+                    .parents(false)
+                    .build();
+
+                let mut subs: Vec<PathBuf> = Vec::new();
+                for entry in walker {
+                    let entry = match entry {
+                        Ok(e) => e,
+                        Err(_) => continue, // skip unreadable, keep walking
+                    };
+                    if !entry.file_type().is_some_and(|ft| ft.is_dir()) {
+                        continue;
+                    }
+                    let p = entry.path();
+                    if let Err(err) = self.inner.watch(p, RecursiveMode::NonRecursive) {
+                        for already in &subs {
+                            let _ = self.inner.unwatch(already);
+                        }
+                        return Err(err);
+                    }
+                    subs.push(p.to_path_buf());
+                }
+                self.recursive_subwatches.insert(path.to_path_buf(), subs);
+                Ok(())
+            }
+        }
+    }
+
+    fn unwatch(&mut self, path: &Path) -> Result<(), notify::Error> {
+        if let Some(subs) = self.recursive_subwatches.remove(path) {
+            // Best-effort: a deleted subtree shouldn't block removing the rest.
+            for p in &subs {
+                let _ = self.inner.unwatch(p);
+            }
+            Ok(())
+        } else {
+            self.inner.unwatch(path)
+        }
+    }
+}
+
 /// Manages filesystem watchers and sends change notifications to the client.
 pub struct WatchManager {
     /// The underlying OS watcher (inotify/kqueue).
     /// Protected by std::sync::Mutex because notify's callback runs on its
     /// own thread, not a tokio thread.
-    watcher: Mutex<RecommendedWatcher>,
+    watcher: Mutex<FilteredWatcher>,
 
     /// Currently watched paths: maps the canonical path used for the watch
     /// to its recursive mode. We store the canonical path from watch() so
@@ -64,23 +137,20 @@ impl WatchManager {
     pub fn new(writer: WriterHandle) -> Result<Arc<Self>, notify::Error> {
         let (tx, rx) = mpsc::channel(10_000);
 
-        let watcher = RecommendedWatcher::new(
-            move |event: notify::Result<Event>| {
-                if let Ok(event) = event {
-                    // Only forward events that indicate filesystem mutations
-                    match event.kind {
-                        EventKind::Create(_) | EventKind::Modify(_) | EventKind::Remove(_) => {
-                            // Use try_send to drop events on overflow rather than blocking.
-                            // The debounce window coalesces events anyway, so dropped events
-                            // during extremely high-frequency bursts are acceptable.
-                            let _ = tx.try_send(event);
-                        }
-                        _ => {} // Ignore Access, Other events
+        let watcher = FilteredWatcher::new(move |event: notify::Result<Event>| {
+            if let Ok(event) = event {
+                // Only forward events that indicate filesystem mutations
+                match event.kind {
+                    EventKind::Create(_) | EventKind::Modify(_) | EventKind::Remove(_) => {
+                        // Use try_send to drop events on overflow rather than blocking.
+                        // The debounce window coalesces events anyway, so dropped events
+                        // during extremely high-frequency bursts are acceptable.
+                        let _ = tx.try_send(event);
                     }
+                    _ => {} // Ignore Access, Other events
                 }
-            },
-            Config::default(),
-        )?;
+            }
+        })?;
 
         let manager = Arc::new(Self {
             watcher: Mutex::new(watcher),
