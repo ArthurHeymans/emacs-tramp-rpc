@@ -2284,7 +2284,9 @@ network round-trip."
                              (dest . ,(tramp-rpc--path-to-bytes
                                        (file-name-unquote v2-localname)))
                              (preserve . ,(if (or keep-time preserve-permissions)
-                                              t :msgpack-false))))))
+                                              t :msgpack-false))
+                             (overwrite . ,(if ok-if-already-exists
+                                               t :msgpack-false))))))
         (tramp-flush-file-properties v1 v1-localname)
         (tramp-flush-file-properties v2 v2-localname)
         (tramp-flush-directory-properties v2 v2-localname)
@@ -2340,7 +2342,8 @@ network round-trip."
                                       (file-name-unquote v1-localname)))
                              (dest . ,(tramp-rpc--path-to-bytes
                                        (file-name-unquote v2-localname)))
-                             (preserve . ,(if (or keep-time preserve-permissions) t :msgpack-false)))))))
+                             (preserve . ,(if (or keep-time preserve-permissions) t :msgpack-false))
+                             (overwrite . ,(if ok-if-already-exists t :msgpack-false)))))))
      ;; Remote source, local dest - read via RPC, write locally
      ((and source-remote (not dest-remote))
       ;; Use file-local-copy to get a temp local copy, then rename

@@ -180,6 +180,9 @@ pub async fn copy(params: Value) -> HandlerResult {
         /// Preserve file attributes
         #[serde(default)]
         preserve: bool,
+        /// Overwrite existing destination entries where possible.
+        #[serde(default)]
+        overwrite: bool,
     }
 
     let params: Params = from_value(params).map_err(|e| RpcError::invalid_params(e.to_string()))?;
@@ -202,7 +205,7 @@ pub async fn copy(params: Value) -> HandlerResult {
 
     let bytes_copied = if src_metadata.is_dir() {
         // Recursive directory copy
-        copy_dir_recursive(&src_path, &dest_path, params.preserve)
+        copy_dir_recursive(&src_path, &dest_path, params.preserve, params.overwrite)
             .await
             .map_err(|e| map_io_error(e, &src_str))?
     } else {
@@ -234,7 +237,12 @@ pub async fn copy(params: Value) -> HandlerResult {
 }
 
 /// Recursively copy a directory and its contents.
-async fn copy_dir_recursive(src: &Path, dest: &Path, preserve: bool) -> std::io::Result<u64> {
+async fn copy_dir_recursive(
+    src: &Path,
+    dest: &Path,
+    preserve: bool,
+    overwrite: bool,
+) -> std::io::Result<u64> {
     // Create destination directory
     fs::create_dir_all(dest).await?;
 
@@ -253,12 +261,24 @@ async fn copy_dir_recursive(src: &Path, dest: &Path, preserve: bool) -> std::io:
         let file_type = entry.file_type().await?;
 
         if file_type.is_dir() {
-            total += Box::pin(copy_dir_recursive(&entry_path, &dest_child, preserve)).await?;
+            total += Box::pin(copy_dir_recursive(
+                &entry_path,
+                &dest_child,
+                preserve,
+                overwrite,
+            ))
+            .await?;
         } else if file_type.is_symlink() {
             // Preserve symlinks as symlinks
             let link_target = fs::read_link(&entry_path).await?;
+            if overwrite && fs::symlink_metadata(&dest_child).await.is_ok() {
+                remove_path_for_overwrite(&dest_child).await?;
+            }
             tokio::fs::symlink(&link_target, &dest_child).await?;
         } else {
+            if overwrite && fs::symlink_metadata(&dest_child).await.is_ok() {
+                remove_path_for_overwrite(&dest_child).await?;
+            }
             let n = fs::copy(&entry_path, &dest_child).await?;
             total += n;
 
@@ -282,6 +302,15 @@ async fn copy_dir_recursive(src: &Path, dest: &Path, preserve: bool) -> std::io:
     }
 
     Ok(total)
+}
+
+async fn remove_path_for_overwrite(path: &Path) -> std::io::Result<()> {
+    let meta = fs::symlink_metadata(path).await?;
+    if meta.is_dir() && !meta.file_type().is_symlink() {
+        fs::remove_dir_all(path).await
+    } else {
+        fs::remove_file(path).await
+    }
 }
 
 /// Rename/move a file
@@ -567,4 +596,94 @@ fn set_file_times_sync_path(
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rmpv::Value;
+    use std::os::unix::ffi::OsStrExt;
+
+    fn path_value(path: &Path) -> Value {
+        Value::Binary(path.as_os_str().as_bytes().to_vec())
+    }
+
+    #[tokio::test]
+    async fn copy_directory_overwrites_existing_entries() {
+        let tmp = tempfile::tempdir().expect("create tempdir");
+        let src = tmp.path().join("src");
+        let dest = tmp.path().join("dest");
+
+        fs::create_dir_all(src.join("subdir")).await.unwrap();
+        fs::write(src.join("file.txt"), b"new file").await.unwrap();
+        fs::write(src.join("subdir/nested.txt"), b"new nested")
+            .await
+            .unwrap();
+        tokio::fs::symlink("file.txt", src.join("link.txt"))
+            .await
+            .unwrap();
+
+        let copied_dest = dest.join("src");
+        fs::create_dir_all(copied_dest.join("subdir"))
+            .await
+            .unwrap();
+        fs::write(copied_dest.join("file.txt"), b"old file")
+            .await
+            .unwrap();
+        fs::write(copied_dest.join("subdir/nested.txt"), b"old nested")
+            .await
+            .unwrap();
+        fs::write(copied_dest.join("link.txt"), b"old link placeholder")
+            .await
+            .unwrap();
+
+        copy(msgpack_map! {
+            "src" => path_value(&src),
+            "dest" => path_value(&dest),
+            "overwrite" => true,
+        })
+        .await
+        .expect("copy should succeed with overwrite");
+
+        assert_eq!(
+            fs::read(copied_dest.join("file.txt")).await.unwrap(),
+            b"new file"
+        );
+        assert_eq!(
+            fs::read(copied_dest.join("subdir/nested.txt"))
+                .await
+                .unwrap(),
+            b"new nested"
+        );
+        assert_eq!(
+            fs::read_link(copied_dest.join("link.txt")).await.unwrap(),
+            Path::new("file.txt")
+        );
+    }
+
+    #[tokio::test]
+    async fn copy_directory_without_overwrite_rejects_existing_symlink_dest() {
+        let tmp = tempfile::tempdir().expect("create tempdir");
+        let src = tmp.path().join("src");
+        let dest = tmp.path().join("dest");
+
+        fs::create_dir_all(&src).await.unwrap();
+        let copied_dest = dest.join("src");
+        fs::create_dir_all(&copied_dest).await.unwrap();
+        tokio::fs::symlink("target", src.join("link.txt"))
+            .await
+            .unwrap();
+        fs::write(copied_dest.join("link.txt"), b"already here")
+            .await
+            .unwrap();
+
+        let err = copy(msgpack_map! {
+            "src" => path_value(&src),
+            "dest" => path_value(&dest),
+        })
+        .await
+        .expect_err("copy should fail without overwrite");
+
+        assert!(err.message.contains("File exists") || err.message.contains("exists"));
+    }
 }
