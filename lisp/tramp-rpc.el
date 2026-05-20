@@ -3003,7 +3003,8 @@ A non-nil deprecated `tramp-rpc-remote-path' overrides
 `tramp-remote-path'.  Supports the standard TRAMP placeholders
 `tramp-default-remote-path' and `tramp-own-remote-path'.  The old
 `tramp-rpc-own-remote-path' placeholder is treated like
-`tramp-own-remote-path'.  Duplicate and unsupported entries are removed."
+`tramp-own-remote-path'.  Duplicate, unsupported, and nonexistent
+entries are removed."
   (let ((own-path nil)
         (default-path nil)
         (result nil))
@@ -3022,7 +3023,13 @@ A non-nil deprecated `tramp-rpc-remote-path' overrides
         (setq result (tramp-rpc--append-path-entries (list entry) result)))
        (t
         (tramp-rpc--debug "Ignoring unsupported remote PATH entry: %S" entry))))
-    result))
+    ;; Remove non-existing directories (matches tramp-sh behavior).
+    (delq nil (mapcar (lambda (x)
+                        (and (stringp x)
+                             (file-directory-p
+                              (tramp-make-tramp-file-name vec x))
+                             x))
+                      result)))
 
 (defun tramp-rpc--get-remote-login-shell (vec)
   "Return the login shell for the remote user on VEC.
