@@ -3029,7 +3029,7 @@ entries are removed."
                              (file-directory-p
                               (tramp-make-tramp-file-name vec x))
                              x))
-                      result)))
+                      result))))
 
 (defun tramp-rpc--get-remote-login-shell (vec)
   "Return the login shell for the remote user on VEC.
