@@ -144,7 +144,7 @@ jobs:
     runs-on: ubuntu-latest
     strategy:
       matrix:
-        emacs_version: ['30.1']
+        emacs_version: ["30.1"]
 
     steps:
       - name: Checkout
@@ -198,7 +198,7 @@ jobs:
       - name: Set up Emacs
         uses: purcell/setup-emacs@master
         with:
-          version: '30.1'
+          version: "30.1"
 
       - name: Install dependencies
         run: |
@@ -230,7 +230,7 @@ jobs:
       - name: Set up Emacs
         uses: purcell/setup-emacs@master
         with:
-          version: '30.1'
+          version: "30.1"
 
       - name: Install dependencies
         run: |
@@ -269,7 +269,7 @@ jobs:
       - name: Set up Emacs
         uses: purcell/setup-emacs@master
         with:
-          version: '30.1'
+          version: "30.1"
 
       - name: Download upstream tramp
         uses: actions/download-artifact@v8
@@ -304,6 +304,18 @@ jobs:
             -l test/tramp-rpc-mock-tests.el \
             --eval "(ert-run-tests-batch-and-exit '(tag :multi-hop))"
 
+      - name: Run connection cleanup tests
+        run: |
+          emacs -Q --batch \
+            -L lisp \
+            -L upstream-tramp/lisp \
+            --eval "(require 'package)" \
+            --eval "(add-to-list 'package-archives '(\"melpa\" . \"https://melpa.org/packages/\") t)" \
+            --eval "(package-initialize)" \
+            --eval "(setq debug-on-error t)" \
+            -l test/tramp-rpc-mock-tests.el \
+            --eval "(ert-run-tests-batch-and-exit '(tag :connection-cleanup))"
+
   test-server:
     name: Server Integration Tests
     runs-on: ubuntu-latest
@@ -316,7 +328,7 @@ jobs:
       - name: Set up Emacs
         uses: purcell/setup-emacs@master
         with:
-          version: '30.1'
+          version: "30.1"
 
       - name: Download server binary
         uses: actions/download-artifact@v8
@@ -364,7 +376,7 @@ jobs:
       - name: Set up Emacs
         uses: purcell/setup-emacs@master
         with:
-          version: '30.1'
+          version: "30.1"
 
       - name: Download upstream tramp
         uses: actions/download-artifact@v8
@@ -449,7 +461,7 @@ jobs:
       - name: Set up Emacs
         uses: purcell/setup-emacs@master
         with:
-          version: '30.1'
+          version: "30.1"
 
       - name: Download upstream tramp
         uses: actions/download-artifact@v8
@@ -521,7 +533,21 @@ jobs:
   summary:
     name: Test Summary
     runs-on: ubuntu-latest
-    needs: [rust-linux, rust-macos, rust-extra, format, upstream-tramp, elisp, test-autoload, test-protocol, test-multi-hop, test-server, test-full-suite, test-upstream-tramp]
+    needs:
+      [
+        rust-linux,
+        rust-macos,
+        rust-extra,
+        format,
+        upstream-tramp,
+        elisp,
+        test-autoload,
+        test-protocol,
+        test-multi-hop,
+        test-server,
+        test-full-suite,
+        test-upstream-tramp,
+      ]
     if: always()
 
     steps:

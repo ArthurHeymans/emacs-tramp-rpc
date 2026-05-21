@@ -1182,13 +1182,20 @@ Kills the process if still alive and removes the connection entry."
 
 (defun tramp-rpc--cleanup-bootstrap-connection (vec)
   "Close the scpx/scp bootstrap connection for VEC if it exists.
-The bootstrap connection is only needed during deploy and should be
-closed afterward to prevent other packages (vc, diff-hl) from
-accidentally routing file operations through tramp-sh."
-  (let* ((bootstrap-vec (tramp-rpc-deploy--bootstrap-vec vec))
-         (proc (tramp-get-connection-process bootstrap-vec)))
-    (when (and proc (process-live-p proc))
-      (delete-process proc))))
+The bootstrap connection is only needed during deploy.  Leaving it in
+TRAMP's connection cache lets unrelated timers (vc, diff-hl, etc.) keep
+using tramp-sh for the same host while tramp-rpc is active.  In
+particular, tramp-sh's periodic `echo are you awake' liveness probe can
+interleave with timer driven file operations and corrupt the Lisp-reader
+protocol buffer.  Remove the cached connection completely, not just the
+process, so subsequent operations use the rpc handler instead."
+  (let ((bootstrap-vec (tramp-rpc-deploy--bootstrap-vec vec)))
+    (when (or (process-live-p (tramp-get-connection-process bootstrap-vec))
+              (tramp-connection-property-p bootstrap-vec "process-buffer")
+              (tramp-connection-property-p bootstrap-vec " process-buffer")
+              (tramp-connection-property-p bootstrap-vec " connected"))
+      (tramp-cleanup-connection
+       bootstrap-vec 'keep-debug 'keep-password 'keep-processes))))
 
 (defun tramp-rpc--connect (vec)
   "Establish an RPC connection to VEC."
@@ -1221,7 +1228,12 @@ accidentally routing file operations through tramp-sh."
       ;; Never-deploy mode: use the configured path directly, no fallback.
       (let ((binary-path (tramp-rpc-deploy-ensure-binary vec)))
         (condition-case err
-            (tramp-rpc--start-server-process vec binary-path)
+            (progn
+              ;; No deployment is happening in this mode; remove any stale
+              ;; bootstrap shell before the RPC startup probe exchanges
+              ;; `system.info' with the server.
+              (tramp-rpc--cleanup-bootstrap-connection vec)
+              (tramp-rpc--start-server-process vec binary-path))
           (remote-file-error
            (tramp-rpc--cleanup-failed-connection vec)
            (signal 'remote-file-error
@@ -1237,17 +1249,27 @@ accidentally routing file operations through tramp-sh."
     ;; version bump), SSH exits immediately, we catch the error, deploy
     ;; via scpx, and retry.
     (condition-case nil
-        (tramp-rpc--start-server-process
-         vec (tramp-rpc-deploy-expected-binary-localname))
+        (progn
+          ;; A bootstrap connection may exist from an earlier deployment in
+          ;; this Emacs session.  Remove it before the direct RPC startup probe
+          ;; so tramp-sh timers cannot interleave with the `system.info'
+          ;; exchange performed by `tramp-rpc--start-server-process'.
+          (tramp-rpc--cleanup-bootstrap-connection vec)
+          (tramp-rpc--start-server-process
+           vec (tramp-rpc-deploy-expected-binary-localname)))
       (remote-file-error
        ;; Connection failed - binary likely missing.  Clean up and deploy.
        (tramp-rpc--cleanup-failed-connection vec)
-       (let ((binary-path (tramp-rpc-deploy-ensure-binary vec)))
-         ;; Close the bootstrap connection - it's no longer needed and
-         ;; leaving it alive can cause vc/diff-hl sentinels to route
-         ;; file operations through tramp-sh instead of tramp-rpc.
-         (tramp-rpc--cleanup-bootstrap-connection vec)
-         (tramp-rpc--start-server-process vec binary-path))))))
+       ;; Close the bootstrap connection after any deploy attempt - it's no
+       ;; longer needed and leaving it alive can cause vc/diff-hl sentinels to
+       ;; route file operations through tramp-sh instead of tramp-rpc.  Cover
+       ;; both deploy failures and retry startup failures, and clean it before
+       ;; the retry startup probe if deployment succeeded.
+       (unwind-protect
+           (let ((binary-path (tramp-rpc-deploy-ensure-binary vec)))
+             (tramp-rpc--cleanup-bootstrap-connection vec)
+             (tramp-rpc--start-server-process vec binary-path))
+         (tramp-rpc--cleanup-bootstrap-connection vec))))))
 
 (defun tramp-rpc--disconnect (vec)
   "Disconnect the RPC connection to VEC."
