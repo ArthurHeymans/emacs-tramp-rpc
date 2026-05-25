@@ -6,11 +6,12 @@
 
 use crate::protocol::{Notification, RpcError};
 use crate::{msgpack_map, WriterHandle};
+use notify::event::{ModifyKind, RemoveKind};
 use notify::{Config, Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 use rmpv::Value;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock, Weak};
 use tokio::io::AsyncWriteExt;
 use tokio::sync::mpsc;
 use tokio::time::{self, Duration};
@@ -50,7 +51,9 @@ fn lock_or_recover<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 /// To callers it looks just like a `notify::Watcher`.
 struct FilteredWatcher {
     inner: RecommendedWatcher,
-    recursive_subwatches: HashMap<PathBuf, Vec<PathBuf>>,
+    recursive_roots: HashMap<PathBuf, HashSet<PathBuf>>,
+    direct_watches: HashSet<PathBuf>,
+    path_watch_counts: HashMap<PathBuf, usize>,
 }
 
 impl FilteredWatcher {
@@ -60,57 +63,152 @@ impl FilteredWatcher {
     {
         Ok(Self {
             inner: RecommendedWatcher::new(handler, Config::default())?,
-            recursive_subwatches: HashMap::new(),
+            recursive_roots: HashMap::new(),
+            direct_watches: HashSet::new(),
+            path_watch_counts: HashMap::new(),
         })
     }
 
     fn watch(&mut self, path: &Path, mode: RecursiveMode) -> Result<(), notify::Error> {
         match mode {
-            RecursiveMode::NonRecursive => self.inner.watch(path, mode),
-            RecursiveMode::Recursive => {
-                // hidden(false): include .git/, magit cares about it.
-                // standard_filters honors .gitignore, .git/info/exclude, global ignore.
-                // parents(false): only walk down from root.
-                let walker = ignore::WalkBuilder::new(path)
-                    .standard_filters(true)
-                    .hidden(false)
-                    .parents(false)
-                    .build();
-
-                let mut subs: Vec<PathBuf> = Vec::new();
-                for entry in walker {
-                    let entry = match entry {
-                        Ok(e) => e,
-                        Err(_) => continue, // skip unreadable, keep walking
-                    };
-                    if !entry.file_type().is_some_and(|ft| ft.is_dir()) {
-                        continue;
-                    }
-                    let p = entry.path();
-                    if let Err(err) = self.inner.watch(p, RecursiveMode::NonRecursive) {
-                        for already in &subs {
-                            let _ = self.inner.unwatch(already);
-                        }
-                        return Err(err);
-                    }
-                    subs.push(p.to_path_buf());
-                }
-                self.recursive_subwatches.insert(path.to_path_buf(), subs);
-                Ok(())
-            }
+            RecursiveMode::NonRecursive => self.watch_nonrecursive(path),
+            RecursiveMode::Recursive => self.watch_recursive(path),
         }
     }
 
     fn unwatch(&mut self, path: &Path) -> Result<(), notify::Error> {
-        if let Some(subs) = self.recursive_subwatches.remove(path) {
-            // Best-effort: a deleted subtree shouldn't block removing the rest.
-            for p in &subs {
-                let _ = self.inner.unwatch(p);
+        if let Some(dirs) = self.recursive_roots.remove(path) {
+            for p in &dirs {
+                let _ = self.remove_path_watch(p);
             }
             Ok(())
+        } else if self.direct_watches.remove(path) {
+            self.remove_path_watch(path)
         } else {
             self.inner.unwatch(path)
         }
+    }
+
+    fn watch_nonrecursive(&mut self, path: &Path) -> Result<(), notify::Error> {
+        let path = path.to_path_buf();
+        if !self.direct_watches.insert(path.clone()) {
+            return Ok(());
+        }
+
+        if let Err(err) = self.add_path_watch(&path) {
+            self.direct_watches.remove(&path);
+            return Err(err);
+        }
+        Ok(())
+    }
+
+    fn watch_recursive(&mut self, path: &Path) -> Result<(), notify::Error> {
+        let dirs = Self::collect_recursive_dirs(path);
+        if self.recursive_roots.contains_key(path) {
+            return self.apply_recursive_dirs(path, dirs);
+        }
+
+        // Seed the root with an empty set so initial registration can use the
+        // same diff-and-rollback path as later refreshes.
+        self.recursive_roots
+            .insert(path.to_path_buf(), HashSet::new());
+        if let Err(err) = self.apply_recursive_dirs(path, dirs) {
+            self.recursive_roots.remove(path);
+            return Err(err);
+        }
+
+        Ok(())
+    }
+
+    fn recursive_roots_for_paths(&self, paths: &[PathBuf]) -> Vec<PathBuf> {
+        self.recursive_roots
+            .iter()
+            .filter(|(root, dirs)| {
+                paths
+                    .iter()
+                    .any(|path| path.starts_with(root) && (path.is_dir() || dirs.contains(path)))
+            })
+            .map(|(root, _)| root.clone())
+            .collect()
+    }
+
+    fn apply_recursive_dirs(
+        &mut self,
+        root: &Path,
+        next: HashSet<PathBuf>,
+    ) -> Result<(), notify::Error> {
+        let Some(current) = self.recursive_roots.get(root) else {
+            return Ok(());
+        };
+
+        let to_add: Vec<_> = next.difference(current).cloned().collect();
+        let to_remove: Vec<_> = current.difference(&next).cloned().collect();
+        let mut added: Vec<PathBuf> = Vec::new();
+
+        for dir in &to_add {
+            if let Err(err) = self.add_path_watch(dir) {
+                for added_dir in &added {
+                    let _ = self.remove_path_watch(added_dir);
+                }
+                return Err(err);
+            }
+            added.push(dir.clone());
+        }
+
+        for dir in &to_remove {
+            let _ = self.remove_path_watch(dir);
+        }
+
+        self.recursive_roots.insert(root.to_path_buf(), next);
+        Ok(())
+    }
+
+    fn add_path_watch(&mut self, path: &Path) -> Result<(), notify::Error> {
+        let path = path.to_path_buf();
+        if let Some(count) = self.path_watch_counts.get_mut(&path) {
+            *count += 1;
+            return Ok(());
+        }
+
+        self.inner.watch(&path, RecursiveMode::NonRecursive)?;
+        self.path_watch_counts.insert(path, 1);
+        Ok(())
+    }
+
+    fn remove_path_watch(&mut self, path: &Path) -> Result<(), notify::Error> {
+        match self.path_watch_counts.get_mut(path) {
+            Some(count) if *count > 1 => {
+                *count -= 1;
+                Ok(())
+            }
+            Some(_) => {
+                self.path_watch_counts.remove(path);
+                self.inner.unwatch(path)
+            }
+            None => self.inner.unwatch(path),
+        }
+    }
+
+    fn collect_recursive_dirs(root: &Path) -> HashSet<PathBuf> {
+        // hidden(false): include .git/, magit cares about it.
+        // standard_filters honors .gitignore, .git/info/exclude, global ignore,
+        // including ignore files from parent directories.
+        let walker = ignore::WalkBuilder::new(root)
+            .standard_filters(true)
+            .hidden(false)
+            .build();
+
+        let mut dirs = HashSet::new();
+        for entry in walker {
+            let entry = match entry {
+                Ok(e) => e,
+                Err(_) => continue, // skip unreadable paths, keep walking
+            };
+            if entry.file_type().is_some_and(|ft| ft.is_dir()) {
+                dirs.insert(entry.path().to_path_buf());
+            }
+        }
+        dirs
     }
 }
 
@@ -158,7 +256,7 @@ impl WatchManager {
         });
 
         // Spawn the debounce background task
-        tokio::spawn(debounce_loop(rx, writer));
+        tokio::spawn(debounce_loop(rx, writer, Arc::downgrade(&manager)));
 
         Ok(manager)
     }
@@ -179,6 +277,16 @@ impl WatchManager {
         })?;
 
         let mut watcher = lock_or_recover(&self.watcher);
+        {
+            let paths = lock_or_recover(&self.watched_paths);
+            if paths.contains_key(&canonical) {
+                return Err(notify::Error::generic(&format!(
+                    "Path already being watched: {}",
+                    canonical.display()
+                )));
+            }
+        }
+
         watcher.watch(&canonical, mode)?;
 
         let mut paths = lock_or_recover(&self.watched_paths);
@@ -224,6 +332,52 @@ impl WatchManager {
             .map(|(p, m)| (p.clone(), matches!(m, RecursiveMode::Recursive)))
             .collect()
     }
+
+    fn refresh_recursive_watches_for_event(&self, event: &Event) {
+        let refresh_paths = directory_tree_refresh_paths(event);
+        if refresh_paths.is_empty() {
+            return;
+        }
+
+        let roots_to_refresh = {
+            let watcher = lock_or_recover(&self.watcher);
+            watcher.recursive_roots_for_paths(&refresh_paths)
+        };
+
+        if roots_to_refresh.is_empty() {
+            return;
+        }
+
+        let refreshed_roots: Vec<_> = roots_to_refresh
+            .into_iter()
+            .map(|root| {
+                let dirs = FilteredWatcher::collect_recursive_dirs(&root);
+                (root, dirs)
+            })
+            .collect();
+
+        let mut watcher = lock_or_recover(&self.watcher);
+        for (root, dirs) in refreshed_roots {
+            let _ = watcher.apply_recursive_dirs(&root, dirs);
+        }
+    }
+}
+
+fn directory_tree_refresh_paths(event: &Event) -> Vec<PathBuf> {
+    match event.kind {
+        EventKind::Create(_) | EventKind::Modify(ModifyKind::Any | ModifyKind::Other) => {
+            existing_directory_paths(&event.paths)
+        }
+        EventKind::Modify(ModifyKind::Name(_)) => event.paths.clone(),
+        EventKind::Remove(RemoveKind::Any | RemoveKind::Folder | RemoveKind::Other) => {
+            event.paths.clone()
+        }
+        _ => Vec::new(),
+    }
+}
+
+fn existing_directory_paths(paths: &[PathBuf]) -> Vec<PathBuf> {
+    paths.iter().filter(|path| path.is_dir()).cloned().collect()
 }
 
 /// Background task: receives raw inotify events, debounces them, and sends
@@ -235,13 +389,20 @@ impl WatchManager {
 /// 3. Collect all events that arrive during the timer window
 /// 4. When the timer fires, send one notification with all unique paths
 /// 5. Go back to step 1
-async fn debounce_loop(mut rx: mpsc::Receiver<Event>, writer: WriterHandle) {
+async fn debounce_loop(
+    mut rx: mpsc::Receiver<Event>,
+    writer: WriterHandle,
+    manager: Weak<WatchManager>,
+) {
     loop {
         // Phase 1: Wait for the first event
         let event = match rx.recv().await {
             Some(e) => e,
             None => break, // Channel closed, watcher dropped
         };
+        if let Some(manager) = manager.upgrade() {
+            manager.refresh_recursive_watches_for_event(&event);
+        }
 
         let mut pending_paths: HashSet<PathBuf> = HashSet::new();
         for path in event.paths {
@@ -258,6 +419,9 @@ async fn debounce_loop(mut rx: mpsc::Receiver<Event>, writer: WriterHandle) {
                 event = rx.recv() => {
                     match event {
                         Some(e) => {
+                            if let Some(manager) = manager.upgrade() {
+                                manager.refresh_recursive_watches_for_event(&e);
+                            }
                             for path in e.paths {
                                 pending_paths.insert(path);
                             }
@@ -381,4 +545,243 @@ pub fn handle_list(_params: Value) -> HandlerResult {
         .collect();
 
     Ok(Value::Array(watches))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use notify::event::{CreateKind, RenameMode};
+    use std::fs;
+
+    fn test_manager() -> WatchManager {
+        WatchManager {
+            watcher: Mutex::new(FilteredWatcher::new(|_: notify::Result<Event>| {}).unwrap()),
+            watched_paths: Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// Verify .gitignore patterns exclude their target directories from a recursive scan.
+    #[test]
+    fn test_recursive_scan_skips_gitignored_directories() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        fs::create_dir(root.join(".git")).unwrap();
+        fs::write(root.join(".gitignore"), "ignored/\n").unwrap();
+        fs::create_dir_all(root.join("ignored/nested")).unwrap();
+        fs::create_dir_all(root.join("src")).unwrap();
+
+        let dirs = FilteredWatcher::collect_recursive_dirs(&root);
+
+        assert!(dirs.contains(&root));
+        assert!(dirs.contains(&root.join("src")));
+        assert!(!dirs.contains(&root.join("ignored")));
+        assert!(!dirs.contains(&root.join("ignored/nested")));
+    }
+
+    /// Verify .gitignore files above the walk root still apply to descendant paths.
+    #[test]
+    fn test_recursive_scan_honors_parent_gitignore() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let sub = root.join("sub");
+        fs::create_dir(root.join(".git")).unwrap();
+        fs::write(root.join(".gitignore"), "sub/ignored/\n").unwrap();
+        fs::create_dir_all(sub.join("ignored")).unwrap();
+        fs::create_dir_all(sub.join("tracked")).unwrap();
+
+        let dirs = FilteredWatcher::collect_recursive_dirs(&sub);
+
+        assert!(dirs.contains(&sub));
+        assert!(dirs.contains(&sub.join("tracked")));
+        assert!(!dirs.contains(&sub.join("ignored")));
+    }
+
+    /// Verify a Create event for a new directory under a recursive root adds a watch.
+    #[test]
+    fn test_refresh_adds_new_directory_under_recursive_root() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let src = root.join("src");
+        let new_dir = src.join("new");
+        fs::create_dir_all(&src).unwrap();
+
+        let manager = test_manager();
+        manager.watch(&root, true).unwrap();
+
+        {
+            let watcher = lock_or_recover(&manager.watcher);
+            assert!(!watcher.recursive_roots[&root].contains(&new_dir));
+        }
+
+        fs::create_dir_all(&new_dir).unwrap();
+        let event = Event::new(EventKind::Create(CreateKind::Folder)).add_path(new_dir.clone());
+        manager.refresh_recursive_watches_for_event(&event);
+
+        {
+            let watcher = lock_or_recover(&manager.watcher);
+            assert!(watcher.recursive_roots[&root].contains(&new_dir));
+            assert_eq!(watcher.path_watch_counts.get(&new_dir), Some(&1));
+        }
+        manager.unwatch(&root).unwrap();
+    }
+
+    /// Verify a Create event for a gitignored directory does not add a watch.
+    #[test]
+    fn test_refresh_does_not_watch_new_gitignored_directory() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        fs::create_dir(root.join(".git")).unwrap();
+        fs::write(root.join(".gitignore"), "ignored/\n").unwrap();
+
+        let ignored_dir = root.join("ignored");
+        let manager = test_manager();
+        manager.watch(&root, true).unwrap();
+
+        fs::create_dir_all(&ignored_dir).unwrap();
+        let event = Event::new(EventKind::Create(CreateKind::Folder)).add_path(ignored_dir.clone());
+        manager.refresh_recursive_watches_for_event(&event);
+
+        {
+            let watcher = lock_or_recover(&manager.watcher);
+            assert!(!watcher.recursive_roots[&root].contains(&ignored_dir));
+            assert!(!watcher.path_watch_counts.contains_key(&ignored_dir));
+        }
+        manager.unwatch(&root).unwrap();
+    }
+
+    /// Verify Remove events clear stale watch state so a same-name recreation can re-register.
+    #[test]
+    fn test_refresh_removes_deleted_directory_and_rewatches_recreated_path() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let removed_dir = root.join("removed");
+        fs::create_dir_all(&removed_dir).unwrap();
+
+        let manager = test_manager();
+        manager.watch(&root, true).unwrap();
+        {
+            let watcher = lock_or_recover(&manager.watcher);
+            assert!(watcher.recursive_roots[&root].contains(&removed_dir));
+            assert_eq!(watcher.path_watch_counts.get(&removed_dir), Some(&1));
+        }
+
+        fs::remove_dir_all(&removed_dir).unwrap();
+        let remove_event =
+            Event::new(EventKind::Remove(RemoveKind::Folder)).add_path(removed_dir.clone());
+        manager.refresh_recursive_watches_for_event(&remove_event);
+        {
+            let watcher = lock_or_recover(&manager.watcher);
+            assert!(!watcher.recursive_roots[&root].contains(&removed_dir));
+            assert!(!watcher.path_watch_counts.contains_key(&removed_dir));
+        }
+
+        fs::create_dir_all(&removed_dir).unwrap();
+        let create_event =
+            Event::new(EventKind::Create(CreateKind::Folder)).add_path(removed_dir.clone());
+        manager.refresh_recursive_watches_for_event(&create_event);
+        {
+            let watcher = lock_or_recover(&manager.watcher);
+            assert!(watcher.recursive_roots[&root].contains(&removed_dir));
+            assert_eq!(watcher.path_watch_counts.get(&removed_dir), Some(&1));
+        }
+
+        manager.unwatch(&root).unwrap();
+    }
+
+    /// Verify a Modify(Name) rename event moves the watch from the old path to the new path.
+    #[test]
+    fn test_refresh_handles_directory_rename() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let old_dir = root.join("old");
+        let new_dir = root.join("new");
+        fs::create_dir_all(&old_dir).unwrap();
+
+        let manager = test_manager();
+        manager.watch(&root, true).unwrap();
+        {
+            let watcher = lock_or_recover(&manager.watcher);
+            assert!(watcher.recursive_roots[&root].contains(&old_dir));
+            assert_eq!(watcher.path_watch_counts.get(&old_dir), Some(&1));
+        }
+
+        fs::rename(&old_dir, &new_dir).unwrap();
+        let event = Event::new(EventKind::Modify(ModifyKind::Name(RenameMode::Both)))
+            .add_path(old_dir.clone())
+            .add_path(new_dir.clone());
+        manager.refresh_recursive_watches_for_event(&event);
+
+        {
+            let watcher = lock_or_recover(&manager.watcher);
+            assert!(!watcher.recursive_roots[&root].contains(&old_dir));
+            assert!(watcher.recursive_roots[&root].contains(&new_dir));
+            assert!(!watcher.path_watch_counts.contains_key(&old_dir));
+            assert_eq!(watcher.path_watch_counts.get(&new_dir), Some(&1));
+        }
+        manager.unwatch(&root).unwrap();
+    }
+
+    /// Verify the API rejects a second watch on an already-watched canonical path.
+    #[test]
+    fn test_watch_rejects_same_path_registered_with_different_mode() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+
+        let manager = test_manager();
+        manager.watch(&root, true).unwrap();
+        assert!(manager.watch(&root, false).is_err());
+
+        {
+            let watcher = lock_or_recover(&manager.watcher);
+            assert!(watcher.recursive_roots.contains_key(&root));
+            assert!(!watcher.direct_watches.contains(&root));
+            assert_eq!(watcher.path_watch_counts.get(&root), Some(&1));
+        }
+
+        manager.unwatch(&root).unwrap();
+        let watcher = lock_or_recover(&manager.watcher);
+        assert!(!watcher.path_watch_counts.contains_key(&root));
+    }
+
+    /// Verify refcounting keeps a non-recursive watch alive when its recursive parent is unwatched.
+    #[test]
+    fn test_recursive_unwatch_preserves_overlapping_direct_watch() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let sub = root.join("sub");
+        fs::create_dir_all(&sub).unwrap();
+
+        let mut watcher = FilteredWatcher::new(|_: notify::Result<Event>| {}).unwrap();
+        watcher.watch(&sub, RecursiveMode::NonRecursive).unwrap();
+        watcher.watch(&root, RecursiveMode::Recursive).unwrap();
+
+        assert_eq!(watcher.path_watch_counts.get(&sub), Some(&2));
+        watcher.unwatch(&root).unwrap();
+        assert!(watcher.direct_watches.contains(&sub));
+        assert_eq!(watcher.path_watch_counts.get(&sub), Some(&1));
+
+        watcher.unwatch(&sub).unwrap();
+        assert!(!watcher.path_watch_counts.contains_key(&sub));
+    }
+
+    /// Verify refcounting keeps a nested recursive watch alive when the outer recursive watch is unwatched.
+    #[test]
+    fn test_recursive_unwatch_preserves_overlapping_recursive_watch() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let sub = root.join("sub");
+        fs::create_dir_all(&sub).unwrap();
+
+        let mut watcher = FilteredWatcher::new(|_: notify::Result<Event>| {}).unwrap();
+        watcher.watch(&root, RecursiveMode::Recursive).unwrap();
+        watcher.watch(&sub, RecursiveMode::Recursive).unwrap();
+
+        assert_eq!(watcher.path_watch_counts.get(&sub), Some(&2));
+        watcher.unwatch(&root).unwrap();
+        assert!(watcher.recursive_roots.contains_key(&sub));
+        assert_eq!(watcher.path_watch_counts.get(&sub), Some(&1));
+
+        watcher.unwatch(&sub).unwrap();
+        assert!(!watcher.path_watch_counts.contains_key(&sub));
+    }
 }
