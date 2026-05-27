@@ -1625,6 +1625,398 @@ discard it for being unreadable."
     (should (equal recentf-list (list (abbreviate-file-name local-file))))))
 
 ;;; ============================================================================
+;;; Connection Loss Cleanup Tests (No server or SSH required)
+;;; ============================================================================
+
+(ert-deftest tramp-rpc-mock-test-connection-loss-cleans-async-processes ()
+  "A lost RPC transport should kill dependent async relay processes.
+This covers LSP servers: if the server-side RPC process dies, the local
+cat relay for gopls must exit so lsp-mode can offer to restart it."
+  :tags '(:connection-cleanup)
+  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
+  (let* ((vec (make-tramp-file-name :method "rpc" :host "lost-host"
+                                    :localname "/tmp"))
+         (conn-buffer (generate-new-buffer " *tramp-rpc-test-conn*"))
+         (conn-process (start-process "tramp-rpc-test-conn" conn-buffer
+                                      "sleep" "60"))
+         (relay-process (start-process "tramp-rpc-test-relay" nil "cat"))
+         (sentinel-event nil)
+         (remote-kill-called nil))
+    (unwind-protect
+        (progn
+          (set-process-query-on-exit-flag conn-process nil)
+          (set-process-query-on-exit-flag relay-process nil)
+          (process-put conn-process :tramp-rpc-vec vec)
+          (process-put conn-process 'tramp-vector vec)
+          (tramp-rpc--set-connection vec conn-process conn-buffer)
+          (process-put relay-process :tramp-rpc-vec vec)
+          (process-put relay-process :tramp-rpc-pid 4242)
+          (process-put relay-process 'tramp-vector vec)
+          (set-process-sentinel
+           relay-process
+           (lambda (proc event)
+             (tramp-rpc--pipe-process-sentinel
+              proc event
+              (lambda (_proc user-event)
+                (setq sentinel-event user-event)))))
+          (puthash relay-process
+                   (list :vec vec :pid 4242)
+                   tramp-rpc--async-processes)
+
+          (cl-letf (((symbol-function 'tramp-rpc--kill-remote-process)
+                     (lambda (&rest _args)
+                       (setq remote-kill-called t))))
+            (tramp-rpc--connection-lost vec conn-process "test connection loss")
+            (accept-process-output relay-process 0.1))
+
+          (should-not remote-kill-called)
+          (should-not (tramp-rpc--get-connection vec))
+          (should-not (gethash relay-process tramp-rpc--async-processes))
+          (should-not (process-live-p relay-process))
+          (should (equal sentinel-event "exited abnormally with code 255\n")))
+      (when (process-live-p conn-process)
+        (delete-process conn-process))
+      (when (process-live-p relay-process)
+        (delete-process relay-process))
+      (when (buffer-live-p conn-buffer)
+        (kill-buffer conn-buffer))
+      (remhash relay-process tramp-rpc--async-processes)
+      (tramp-rpc--remove-connection vec))))
+
+(ert-deftest tramp-rpc-mock-test-connection-sentinel-cleans-async-processes ()
+  "The RPC transport sentinel should clean dependent async relay processes."
+  :tags '(:connection-cleanup)
+  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
+  (let* ((vec (make-tramp-file-name :method "rpc" :host "sentinel-host"
+                                    :localname "/tmp"))
+         (conn-buffer (generate-new-buffer " *tramp-rpc-test-sentinel-conn*"))
+         (conn-process (start-process "tramp-rpc-test-sentinel-conn"
+                                      conn-buffer "sleep" "60"))
+         (relay-process (start-process "tramp-rpc-test-sentinel-relay" nil
+                                       "cat"))
+         (sentinel-event nil)
+         (remote-kill-called nil))
+    (unwind-protect
+        (progn
+          (set-process-query-on-exit-flag conn-process nil)
+          (set-process-query-on-exit-flag relay-process nil)
+          (process-put conn-process :tramp-rpc-vec vec)
+          (process-put conn-process 'tramp-vector vec)
+          (set-process-sentinel conn-process #'tramp-rpc--connection-sentinel)
+          (tramp-rpc--set-connection vec conn-process conn-buffer)
+          (process-put relay-process :tramp-rpc-vec vec)
+          (process-put relay-process :tramp-rpc-pid 4243)
+          (process-put relay-process 'tramp-vector vec)
+          (set-process-sentinel
+           relay-process
+           (lambda (proc event)
+             (tramp-rpc--pipe-process-sentinel
+              proc event
+              (lambda (_proc user-event)
+                (setq sentinel-event user-event)))))
+          (puthash relay-process
+                   (list :vec vec :pid 4243)
+                   tramp-rpc--async-processes)
+
+          (cl-letf (((symbol-function 'tramp-rpc--kill-remote-process)
+                     (lambda (&rest _args)
+                       (setq remote-kill-called t))))
+            (delete-process conn-process)
+            (accept-process-output relay-process 0.1))
+
+          (should-not remote-kill-called)
+          (should-not (tramp-rpc--get-connection vec))
+          (should-not (gethash relay-process tramp-rpc--async-processes))
+          (should-not (process-live-p relay-process))
+          (should (equal sentinel-event "exited abnormally with code 255\n")))
+      (when (process-live-p conn-process)
+        (delete-process conn-process))
+      (when (process-live-p relay-process)
+        (delete-process relay-process))
+      (when (buffer-live-p conn-buffer)
+        (kill-buffer conn-buffer))
+      (remhash relay-process tramp-rpc--async-processes)
+      (tramp-rpc--remove-connection vec))))
+
+(defun tramp-rpc-mock-test--cleanup-bootstrap-with-state (state)
+  "Run `tramp-rpc--cleanup-bootstrap-connection' with mocked bootstrap STATE.
+STATE is one of `live-process', `process-buffer', `process-buffer-nil',
+`connected', `connected-nil' or nil.  Return the arguments passed to
+`tramp-cleanup-connection', or nil when cleanup was not called."
+  (let* ((vec (make-tramp-file-name :method "rpc" :host "bootstrap-host"
+                                    :localname "/tmp"))
+         (proc (when (eq state 'live-process)
+                 (start-process "tramp-rpc-test-bootstrap-cleanup" nil
+                                "sleep" "60")))
+         (cleanup-args nil))
+    (unwind-protect
+        (progn
+          (when proc
+            (set-process-query-on-exit-flag proc nil))
+          (cl-letf (((symbol-function 'tramp-get-connection-process)
+                     (lambda (_vec) proc))
+                    ((symbol-function 'tramp-connection-property-p)
+                     (lambda (_vec prop)
+                       (or (and (memq state '(process-buffer process-buffer-nil))
+                                (equal prop "process-buffer"))
+                           (and (memq state '(connected connected-nil))
+                                (equal prop " connected")))))
+                    ((symbol-function 'tramp-cleanup-connection)
+                     (lambda (&rest args)
+                       (setq cleanup-args args))))
+            (tramp-rpc--cleanup-bootstrap-connection vec))
+          cleanup-args)
+      (when (process-live-p proc)
+        (delete-process proc)))))
+
+(defun tramp-rpc-mock-test--check-bootstrap-cleanup-args (cleanup-args)
+  "Assert that CLEANUP-ARGS preserve non-bootstrap password/process state."
+  (should cleanup-args)
+  (let ((bootstrap-vec (car cleanup-args)))
+    (should (equal (tramp-file-name-method bootstrap-vec)
+                   tramp-rpc-deploy-bootstrap-method))
+    (should (equal (tramp-file-name-host bootstrap-vec) "bootstrap-host")))
+  (should (equal (cdr cleanup-args)
+                 '(keep-debug keep-password keep-processes))))
+
+(ert-deftest tramp-rpc-mock-test-cleanup-bootstrap-uses-tramp-cleanup ()
+  "Bootstrap shell cleanup must clear TRAMP's cached connection state."
+  :tags '(:connection-cleanup)
+  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
+  (tramp-rpc-mock-test--check-bootstrap-cleanup-args
+   (tramp-rpc-mock-test--cleanup-bootstrap-with-state 'live-process)))
+
+(ert-deftest tramp-rpc-mock-test-cleanup-bootstrap-process-buffer-cache ()
+  "Bootstrap cleanup should run when only `process-buffer' cache remains."
+  :tags '(:connection-cleanup)
+  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
+  (tramp-rpc-mock-test--check-bootstrap-cleanup-args
+   (tramp-rpc-mock-test--cleanup-bootstrap-with-state 'process-buffer)))
+
+(ert-deftest tramp-rpc-mock-test-cleanup-bootstrap-process-buffer-nil-cache ()
+  "Bootstrap cleanup should run for a nil-valued `process-buffer' marker."
+  :tags '(:connection-cleanup)
+  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
+  (tramp-rpc-mock-test--check-bootstrap-cleanup-args
+   (tramp-rpc-mock-test--cleanup-bootstrap-with-state 'process-buffer-nil)))
+
+(ert-deftest tramp-rpc-mock-test-cleanup-bootstrap-connected-cache ()
+  "Bootstrap cleanup should run when only ` connected' cache remains."
+  :tags '(:connection-cleanup)
+  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
+  (tramp-rpc-mock-test--check-bootstrap-cleanup-args
+   (tramp-rpc-mock-test--cleanup-bootstrap-with-state 'connected)))
+
+(ert-deftest tramp-rpc-mock-test-cleanup-bootstrap-connected-nil-cache ()
+  "Bootstrap cleanup should run for a nil-valued ` connected' marker."
+  :tags '(:connection-cleanup)
+  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
+  (tramp-rpc-mock-test--check-bootstrap-cleanup-args
+   (tramp-rpc-mock-test--cleanup-bootstrap-with-state 'connected-nil)))
+
+(ert-deftest tramp-rpc-mock-test-cleanup-bootstrap-no-state ()
+  "Bootstrap cleanup should not run without process or cached state."
+  :tags '(:connection-cleanup)
+  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
+  (should-not (tramp-rpc-mock-test--cleanup-bootstrap-with-state nil)))
+
+(ert-deftest tramp-rpc-mock-test-connect-direct-success-cleans-bootstrap-before-start ()
+  "Direct RPC startup cleans stale bootstrap state before system.info startup."
+  :tags '(:connection-cleanup)
+  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
+  (let ((vec (make-tramp-file-name :method "rpc" :host "direct-success-host"
+                                   :localname "/tmp"))
+        (tramp-rpc-use-controlmaster nil)
+        (tramp-rpc-deploy-never-deploy nil)
+        (events nil))
+    (cl-letf (((symbol-function 'tramp-rpc--ensure-controlmaster-directory)
+               #'ignore)
+              ((symbol-function 'tramp-rpc--detect-sudo-elevation)
+               (lambda (_vec) nil))
+              ((symbol-function 'tramp-rpc--start-server-process)
+               (lambda (_vec binary-path)
+                 (push (if (equal binary-path "/expected/tramp-rpc-server")
+                           'start-expected
+                         'start-deployed)
+                       events)
+                 'connection))
+              ((symbol-function 'tramp-rpc-deploy-expected-binary-localname)
+               (lambda () "/expected/tramp-rpc-server"))
+              ((symbol-function 'tramp-rpc--cleanup-bootstrap-connection)
+               (lambda (_vec) (push 'cleanup-bootstrap events))))
+      (should (eq (tramp-rpc--connect vec) 'connection))
+      (should (equal (nreverse events)
+                     '(cleanup-bootstrap start-expected))))))
+
+(ert-deftest tramp-rpc-mock-test-connect-never-deploy-cleans-bootstrap-before-start ()
+  "Never-deploy startup cleans stale bootstrap state before system.info startup."
+  :tags '(:connection-cleanup)
+  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
+  (let ((vec (make-tramp-file-name :method "rpc" :host "never-deploy-host"
+                                   :localname "/tmp"))
+        (tramp-rpc-use-controlmaster nil)
+        (tramp-rpc-deploy-never-deploy t)
+        (events nil))
+    (cl-letf (((symbol-function 'tramp-rpc--ensure-controlmaster-directory)
+               #'ignore)
+              ((symbol-function 'tramp-rpc--detect-sudo-elevation)
+               (lambda (_vec) nil))
+              ((symbol-function 'tramp-rpc-deploy-ensure-binary)
+               (lambda (_vec)
+                 (push 'ensure-binary events)
+                 "/configured/tramp-rpc-server"))
+              ((symbol-function 'tramp-rpc--start-server-process)
+               (lambda (_vec binary-path)
+                 (should (equal binary-path "/configured/tramp-rpc-server"))
+                 (push 'start-configured events)
+                 'connection))
+              ((symbol-function 'tramp-rpc--cleanup-bootstrap-connection)
+               (lambda (_vec) (push 'cleanup-bootstrap events))))
+      (should (eq (tramp-rpc--connect vec) 'connection))
+      (should (equal (nreverse events)
+                     '(ensure-binary cleanup-bootstrap start-configured))))))
+
+(ert-deftest tramp-rpc-mock-test-connect-fallback-cleans-before-retry-start ()
+  "Deploy fallback cleanup runs after deploy and before retry startup."
+  :tags '(:connection-cleanup)
+  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
+  (let ((vec (make-tramp-file-name :method "rpc" :host "retry-success-host"
+                                   :localname "/tmp"))
+        (tramp-rpc-use-controlmaster nil)
+        (tramp-rpc-deploy-never-deploy nil)
+        (events nil))
+    (cl-letf (((symbol-function 'tramp-rpc--ensure-controlmaster-directory)
+               #'ignore)
+              ((symbol-function 'tramp-rpc--detect-sudo-elevation)
+               (lambda (_vec) nil))
+              ((symbol-function 'tramp-rpc--start-server-process)
+               (lambda (_vec binary-path)
+                 (push (if (equal binary-path "/expected/tramp-rpc-server")
+                           'start-expected
+                         'start-deployed)
+                       events)
+                 (if (equal binary-path "/expected/tramp-rpc-server")
+                     (signal 'remote-file-error (list "mock start failure"))
+                   'connection)))
+              ((symbol-function 'tramp-rpc--cleanup-failed-connection)
+               (lambda (_vec) (push 'cleanup-failed events)))
+              ((symbol-function 'tramp-rpc-deploy-expected-binary-localname)
+               (lambda () "/expected/tramp-rpc-server"))
+              ((symbol-function 'tramp-rpc-deploy-ensure-binary)
+               (lambda (_vec) (push 'deploy events) "/deployed/tramp-rpc-server"))
+              ((symbol-function 'tramp-rpc--cleanup-bootstrap-connection)
+               (lambda (_vec) (push 'cleanup-bootstrap events))))
+      (should (eq (tramp-rpc--connect vec) 'connection))
+      (should (equal (nreverse events)
+                     '(cleanup-bootstrap start-expected cleanup-failed
+                       deploy cleanup-bootstrap start-deployed
+                       cleanup-bootstrap))))))
+
+(ert-deftest tramp-rpc-mock-test-connect-fallback-cleans-bootstrap-on-retry-failure ()
+  "Deploy fallback cleanup runs even when the post-deploy RPC retry fails."
+  :tags '(:connection-cleanup)
+  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
+  (let ((vec (make-tramp-file-name :method "rpc" :host "retry-fail-host"
+                                   :localname "/tmp"))
+        (tramp-rpc-use-controlmaster nil)
+        (tramp-rpc-deploy-never-deploy nil)
+        (start-calls 0)
+        (events nil))
+    (cl-letf (((symbol-function 'tramp-rpc--ensure-controlmaster-directory)
+               #'ignore)
+              ((symbol-function 'tramp-rpc--detect-sudo-elevation)
+               (lambda (_vec) nil))
+              ((symbol-function 'tramp-rpc--start-server-process)
+               (lambda (_vec binary-path)
+                 (setq start-calls (1+ start-calls))
+                 (push (if (equal binary-path "/expected/tramp-rpc-server")
+                           'start-expected
+                         'start-deployed)
+                       events)
+                 (signal 'remote-file-error (list "mock start failure"))))
+              ((symbol-function 'tramp-rpc--cleanup-failed-connection)
+               (lambda (_vec) (push 'cleanup-failed events)))
+              ((symbol-function 'tramp-rpc-deploy-expected-binary-localname)
+               (lambda () "/expected/tramp-rpc-server"))
+              ((symbol-function 'tramp-rpc-deploy-ensure-binary)
+               (lambda (_vec) (push 'deploy events) "/deployed/tramp-rpc-server"))
+              ((symbol-function 'tramp-rpc--cleanup-bootstrap-connection)
+               (lambda (_vec) (push 'cleanup-bootstrap events))))
+      (should-error (tramp-rpc--connect vec) :type 'remote-file-error)
+      (should (= start-calls 2))
+      (should (equal (nreverse events)
+                     '(cleanup-bootstrap start-expected cleanup-failed
+                       deploy cleanup-bootstrap start-deployed
+                       cleanup-bootstrap))))))
+
+(ert-deftest tramp-rpc-mock-test-connect-fallback-cleans-bootstrap-on-deploy-failure ()
+  "Deploy fallback cleanup runs even when deployment itself fails."
+  :tags '(:connection-cleanup)
+  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
+  (let ((vec (make-tramp-file-name :method "rpc" :host "deploy-fail-host"
+                                   :localname "/tmp"))
+        (tramp-rpc-use-controlmaster nil)
+        (tramp-rpc-deploy-never-deploy nil)
+        (start-calls 0)
+        (events nil))
+    (cl-letf (((symbol-function 'tramp-rpc--ensure-controlmaster-directory)
+               #'ignore)
+              ((symbol-function 'tramp-rpc--detect-sudo-elevation)
+               (lambda (_vec) nil))
+              ((symbol-function 'tramp-rpc--start-server-process)
+               (lambda (_vec binary-path)
+                 (setq start-calls (1+ start-calls))
+                 (push (if (equal binary-path "/expected/tramp-rpc-server")
+                           'start-expected
+                         'start-deployed)
+                       events)
+                 (signal 'remote-file-error (list "mock start failure"))))
+              ((symbol-function 'tramp-rpc--cleanup-failed-connection)
+               (lambda (_vec) (push 'cleanup-failed events)))
+              ((symbol-function 'tramp-rpc-deploy-expected-binary-localname)
+               (lambda () "/expected/tramp-rpc-server"))
+              ((symbol-function 'tramp-rpc-deploy-ensure-binary)
+               (lambda (_vec)
+                 (push 'deploy events)
+                 (signal 'remote-file-error (list "mock deploy failure"))))
+              ((symbol-function 'tramp-rpc--cleanup-bootstrap-connection)
+               (lambda (_vec) (push 'cleanup-bootstrap events))))
+      (should-error (tramp-rpc--connect vec) :type 'remote-file-error)
+      (should (= start-calls 1))
+      (should (equal (nreverse events)
+                     '(cleanup-bootstrap start-expected cleanup-failed
+                       deploy cleanup-bootstrap))))))
+
+(ert-deftest tramp-rpc-mock-test-cleanup-all-does-not-trigger-connection-lost ()
+  "Manual cleanup-all should not be mistaken for transport loss."
+  :tags '(:connection-cleanup)
+  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
+  (let* ((vec (make-tramp-file-name :method "rpc" :host "cleanup-all-host"
+                                    :localname "/tmp"))
+         (conn-buffer (generate-new-buffer " *tramp-rpc-test-cleanup-all*"))
+         (conn-process (start-process "tramp-rpc-test-cleanup-all"
+                                      conn-buffer "sleep" "60"))
+         (connection-lost-called nil))
+    (unwind-protect
+        (progn
+          (set-process-query-on-exit-flag conn-process nil)
+          (process-put conn-process :tramp-rpc-vec vec)
+          (process-put conn-process 'tramp-vector vec)
+          (set-process-sentinel conn-process #'tramp-rpc--connection-sentinel)
+          (tramp-rpc--set-connection vec conn-process conn-buffer)
+          (cl-letf (((symbol-function 'tramp-rpc--connection-lost)
+                     (lambda (&rest _args)
+                       (setq connection-lost-called t))))
+            (tramp-rpc-cleanup-all-connections))
+          (should-not connection-lost-called)
+          (should-not (tramp-rpc--get-connection vec)))
+      (when (process-live-p conn-process)
+        (delete-process conn-process))
+      (when (buffer-live-p conn-buffer)
+        (kill-buffer conn-buffer))
+      (tramp-rpc--remove-connection vec))))
+
+;;; ============================================================================
 ;;; Tilde Quoting Tests
 ;;; ============================================================================
 
