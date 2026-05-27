@@ -2173,6 +2173,9 @@ network round-trip."
 
 (defun tramp-rpc-handle-delete-directory (directory &optional recursive trash)
   "Like `delete-directory' for TRAMP-RPC files."
+  ;; Follow TRAMP's skeleton semantics for TRASH.  Callers that want
+  ;; direct deletion can bind
+  ;; `remote-file-name-inhibit-delete-by-moving-to-trash'.
   (tramp-skeleton-delete-directory directory recursive trash
     (tramp-rpc--call v "dir.remove"
                      (append (tramp-rpc--encode-path localname)
@@ -2510,16 +2513,9 @@ network round-trip."
   "Like `delete-file' for TRAMP-RPC files.
 Calls `file.delete' directly; the server's unlink error is sufficient for the
 missing-file check, so no separate preflight stat is needed."
-  (with-parsed-tramp-file-name (expand-file-name filename) nil
-    (let ((delete-by-moving-to-trash
-           (and delete-by-moving-to-trash
-                (not (bound-and-true-p
-                      remote-file-name-inhibit-delete-by-moving-to-trash)))))
-      (if (and delete-by-moving-to-trash trash)
-          (move-file-to-trash filename)
-        (tramp-rpc--call v "file.delete" (tramp-rpc--encode-path localname)))
-      (tramp-flush-file-properties v localname)
-      (tramp-rpc--invalidate-cache-for-path filename))))
+  (tramp-skeleton-delete-file filename trash
+    (tramp-rpc--call v "file.delete" (tramp-rpc--encode-path localname)))
+  (tramp-rpc--invalidate-cache-for-path filename))
 
 (defun tramp-rpc-handle-make-symbolic-link (target linkname &optional ok-if-already-exists)
   "Like `make-symbolic-link' for TRAMP-RPC files."
