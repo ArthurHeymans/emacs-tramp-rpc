@@ -3,7 +3,7 @@ resolver = "2"
 members = ["server"]
 
 [workspace.package]
-version = "0.9.1"
+version = "0.10.0"
 edition = "2021"
 license = "GPL-3.0-or-later"
 authors = ["Arthur Heymans <arthur@aheymans.xyz>"]
