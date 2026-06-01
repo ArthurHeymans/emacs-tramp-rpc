@@ -708,11 +708,45 @@ mod tests {
     use super::*;
     use notify::event::{CreateKind, RenameMode};
     use std::fs;
+    #[cfg(target_os = "linux")]
+    use std::sync::mpsc as std_mpsc;
+    #[cfg(target_os = "linux")]
+    use std::time::{Duration, Instant};
 
     fn test_manager() -> WatchManager {
         WatchManager {
             watcher: Mutex::new(FilteredWatcher::new(|_: notify::Result<Event>| {}).unwrap()),
             watched_paths: Mutex::new(HashMap::new()),
+        }
+    }
+
+    fn refresh_for_event(manager: &WatchManager, event: &Event) {
+        let roots = manager.recursive_roots_for_event(event);
+        manager.refresh_recursive_roots(roots);
+    }
+
+    #[cfg(target_os = "linux")]
+    fn drain_events(rx: &std_mpsc::Receiver<Event>) {
+        while rx.try_recv().is_ok() {}
+    }
+
+    #[cfg(target_os = "linux")]
+    fn recv_event_matching<F>(rx: &std_mpsc::Receiver<Event>, timeout: Duration, mut matches: F)
+    where
+        F: FnMut(&Event) -> bool,
+    {
+        let deadline = Instant::now() + timeout;
+        loop {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                panic!("timed out waiting for matching notify event");
+            }
+
+            match rx.recv_timeout(remaining) {
+                Ok(event) if matches(&event) => return,
+                Ok(_) => {}
+                Err(err) => panic!("timed out waiting for notify event: {err}"),
+            }
         }
     }
 
@@ -771,7 +805,7 @@ mod tests {
 
         fs::create_dir_all(&new_dir).unwrap();
         let event = Event::new(EventKind::Create(CreateKind::Folder)).add_path(new_dir.clone());
-        manager.refresh_recursive_watches_for_event(&event);
+        refresh_for_event(&manager, &event);
 
         {
             let watcher = lock_or_recover(&manager.watcher);
@@ -795,8 +829,48 @@ mod tests {
 
         fs::create_dir_all(&ignored_dir).unwrap();
         let event = Event::new(EventKind::Create(CreateKind::Folder)).add_path(ignored_dir.clone());
-        manager.refresh_recursive_watches_for_event(&event);
+        refresh_for_event(&manager, &event);
 
+        {
+            let watcher = lock_or_recover(&manager.watcher);
+            assert!(!watcher.recursive_roots[&root].contains(&ignored_dir));
+            assert!(!watcher.path_watch_counts.contains_key(&ignored_dir));
+        }
+        manager.unwatch(&root).unwrap();
+    }
+
+    /// Verify ignore rule file changes refresh the filtered recursive watch set.
+    #[test]
+    fn test_refresh_handles_gitignore_change() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let ignored_dir = root.join("ignored");
+        let gitignore = root.join(".gitignore");
+        fs::create_dir(root.join(".git")).unwrap();
+        fs::create_dir_all(&ignored_dir).unwrap();
+        fs::write(&gitignore, "ignored/\n").unwrap();
+
+        let manager = test_manager();
+        manager.watch(&root, true).unwrap();
+        {
+            let watcher = lock_or_recover(&manager.watcher);
+            assert!(!watcher.recursive_roots[&root].contains(&ignored_dir));
+        }
+
+        fs::write(&gitignore, "").unwrap();
+        let unignore_event =
+            Event::new(EventKind::Modify(ModifyKind::Any)).add_path(gitignore.clone());
+        refresh_for_event(&manager, &unignore_event);
+        {
+            let watcher = lock_or_recover(&manager.watcher);
+            assert!(watcher.recursive_roots[&root].contains(&ignored_dir));
+            assert_eq!(watcher.path_watch_counts.get(&ignored_dir), Some(&1));
+        }
+
+        fs::write(&gitignore, "ignored/\n").unwrap();
+        let ignore_event =
+            Event::new(EventKind::Modify(ModifyKind::Any)).add_path(gitignore.clone());
+        refresh_for_event(&manager, &ignore_event);
         {
             let watcher = lock_or_recover(&manager.watcher);
             assert!(!watcher.recursive_roots[&root].contains(&ignored_dir));
@@ -824,7 +898,7 @@ mod tests {
         fs::remove_dir_all(&removed_dir).unwrap();
         let remove_event =
             Event::new(EventKind::Remove(RemoveKind::Folder)).add_path(removed_dir.clone());
-        manager.refresh_recursive_watches_for_event(&remove_event);
+        refresh_for_event(&manager, &remove_event);
         {
             let watcher = lock_or_recover(&manager.watcher);
             assert!(!watcher.recursive_roots[&root].contains(&removed_dir));
@@ -834,7 +908,7 @@ mod tests {
         fs::create_dir_all(&removed_dir).unwrap();
         let create_event =
             Event::new(EventKind::Create(CreateKind::Folder)).add_path(removed_dir.clone());
-        manager.refresh_recursive_watches_for_event(&create_event);
+        refresh_for_event(&manager, &create_event);
         {
             let watcher = lock_or_recover(&manager.watcher);
             assert!(watcher.recursive_roots[&root].contains(&removed_dir));
@@ -865,7 +939,7 @@ mod tests {
         let event = Event::new(EventKind::Modify(ModifyKind::Name(RenameMode::Both)))
             .add_path(old_dir.clone())
             .add_path(new_dir.clone());
-        manager.refresh_recursive_watches_for_event(&event);
+        refresh_for_event(&manager, &event);
 
         {
             let watcher = lock_or_recover(&manager.watcher);
@@ -877,15 +951,159 @@ mod tests {
         manager.unwatch(&root).unwrap();
     }
 
-    /// Verify the API rejects a second watch on an already-watched canonical path.
+    /// Verify a renamed directory receives real inotify events after the refresh.
+    /// Linux-only: it guards inotify watch-descriptor reuse, which does not occur
+    /// on macOS FSEvents, and FSEvents delivery is too latency-dependent to assert
+    /// reliably in a unit test.
+    #[cfg(target_os = "linux")]
     #[test]
-    fn test_watch_rejects_same_path_registered_with_different_mode() {
+    fn test_refresh_rewatches_renamed_directory_for_real_events() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let old_dir = root.join("old");
+        let new_dir = root.join("new");
+        let new_file = new_dir.join("file");
+        fs::create_dir_all(&old_dir).unwrap();
+
+        let (tx, rx) = std_mpsc::channel();
+        let mut watcher = FilteredWatcher::new(move |event: notify::Result<Event>| {
+            if let Ok(event) = event {
+                let _ = tx.send(event);
+            }
+        })
+        .unwrap();
+
+        watcher.watch(&root, RecursiveMode::Recursive).unwrap();
+        std::thread::sleep(Duration::from_millis(100));
+        drain_events(&rx);
+
+        fs::rename(&old_dir, &new_dir).unwrap();
+        let dirs = FilteredWatcher::collect_recursive_dirs(&root);
+        watcher.apply_recursive_dirs(&root, dirs).unwrap();
+        std::thread::sleep(Duration::from_millis(100));
+        drain_events(&rx);
+
+        fs::write(&new_file, "changed").unwrap();
+        recv_event_matching(&rx, Duration::from_secs(2), |event| {
+            event.paths.iter().any(|path| path.starts_with(&new_dir))
+        });
+
+        watcher.unwatch(&root).unwrap();
+    }
+
+    /// Verify two overlapping recursive roots keep delivering real events for a
+    /// shared subdirectory after it is renamed. Coverage for refcounted re-watch
+    /// of the renamed path across both roots' refreshes (the renamed dir's parent
+    /// is watched, so notify remaps it; this guards that the refresh bookkeeping
+    /// stays consistent and events keep flowing).
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn test_overlapping_roots_rewatch_renamed_dir_for_real_events() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let sub = root.join("sub");
+        let old_dir = sub.join("old");
+        let new_dir = sub.join("new");
+        let new_file = new_dir.join("file");
+        fs::create_dir_all(&old_dir).unwrap();
+
+        let (tx, rx) = std_mpsc::channel();
+        let mut watcher = FilteredWatcher::new(move |event: notify::Result<Event>| {
+            if let Ok(event) = event {
+                let _ = tx.send(event);
+            }
+        })
+        .unwrap();
+
+        // Two overlapping recursive roots; sub/old is shared (refcount 2).
+        watcher.watch(&root, RecursiveMode::Recursive).unwrap();
+        watcher.watch(&sub, RecursiveMode::Recursive).unwrap();
+        assert_eq!(watcher.path_watch_counts.get(&old_dir), Some(&2));
+
+        std::thread::sleep(Duration::from_millis(100));
+        drain_events(&rx);
+
+        fs::rename(&old_dir, &new_dir).unwrap();
+        // Refresh both roots, as refresh_recursive_roots does for a rename event.
+        for r in [&root, &sub] {
+            let dirs = FilteredWatcher::collect_recursive_dirs(r);
+            watcher.apply_recursive_dirs(r, dirs).unwrap();
+        }
+        assert_eq!(watcher.path_watch_counts.get(&new_dir), Some(&2));
+        assert!(!watcher.path_watch_counts.contains_key(&old_dir));
+
+        std::thread::sleep(Duration::from_millis(100));
+        drain_events(&rx);
+
+        fs::write(&new_file, "changed").unwrap();
+        recv_event_matching(&rx, Duration::from_secs(2), |event| {
+            event.paths.iter().any(|path| path.starts_with(&new_dir))
+        });
+
+        watcher.unwatch(&root).unwrap();
+        watcher.unwatch(&sub).unwrap();
+    }
+
+    /// Verify deleting then recreating a directory covered by two overlapping
+    /// watches re-arms a real OS watch. Regression test: the kernel drops a
+    /// deleted directory's watch on its own, so a count-trusting re-add would
+    /// never reinstall it, leaving the recreated directory silent.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn test_overlap_delete_recreate_rewatches_for_real_events() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let sub = root.join("sub");
+        let sub_file = sub.join("file");
+        fs::create_dir_all(&sub).unwrap();
+
+        let (tx, rx) = std_mpsc::channel();
+        let mut watcher = FilteredWatcher::new(move |event: notify::Result<Event>| {
+            if let Ok(event) = event {
+                let _ = tx.send(event);
+            }
+        })
+        .unwrap();
+
+        // Overlapping direct + recursive watch on sub -> refcount 2.
+        watcher.watch(&sub, RecursiveMode::NonRecursive).unwrap();
+        watcher.watch(&root, RecursiveMode::Recursive).unwrap();
+        assert_eq!(watcher.path_watch_counts.get(&sub), Some(&2));
+
+        std::thread::sleep(Duration::from_millis(100));
+        drain_events(&rx);
+
+        // Delete sub (the kernel auto-drops its watch) then refresh root's set.
+        fs::remove_dir_all(&sub).unwrap();
+        let dirs = FilteredWatcher::collect_recursive_dirs(&root);
+        watcher.apply_recursive_dirs(&root, dirs).unwrap();
+
+        // Recreate the same path (new inode, no kernel watch yet) and refresh.
+        fs::create_dir(&sub).unwrap();
+        let dirs = FilteredWatcher::collect_recursive_dirs(&root);
+        watcher.apply_recursive_dirs(&root, dirs).unwrap();
+
+        std::thread::sleep(Duration::from_millis(100));
+        drain_events(&rx);
+
+        fs::write(&sub_file, "changed").unwrap();
+        recv_event_matching(&rx, Duration::from_secs(2), |event| {
+            event.paths.iter().any(|path| path.starts_with(&sub))
+        });
+
+        let _ = watcher.unwatch(&root);
+    }
+
+    /// Verify repeated watch.add calls for the same canonical path are idempotent.
+    #[test]
+    fn test_watch_is_idempotent_for_same_path_and_upgrades_to_recursive() {
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path().canonicalize().unwrap();
 
         let manager = test_manager();
+        manager.watch(&root, false).unwrap();
         manager.watch(&root, true).unwrap();
-        assert!(manager.watch(&root, false).is_err());
+        manager.watch(&root, false).unwrap();
 
         {
             let watcher = lock_or_recover(&manager.watcher);
