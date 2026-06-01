@@ -79,11 +79,13 @@ impl FilteredWatcher {
     fn unwatch(&mut self, path: &Path) -> Result<(), notify::Error> {
         if let Some(dirs) = self.recursive_roots.remove(path) {
             for p in &dirs {
-                let _ = self.remove_path_watch(p);
+                self.remove_path_watch_best_effort(p);
             }
             Ok(())
-        } else if self.direct_watches.remove(path) {
-            self.remove_path_watch(path)
+        } else if self.direct_watches.contains(path) {
+            self.remove_path_watch(path)?;
+            self.direct_watches.remove(path);
+            Ok(())
         } else {
             self.inner.unwatch(path)
         }
@@ -132,31 +134,70 @@ impl FilteredWatcher {
             .collect()
     }
 
+    /// Recursive roots whose watched set may change when the ignore file at
+    /// `path` changes.
+    ///
+    /// Known limitation: this only fires for ignore files inside a watched tree,
+    /// since events are only delivered for watched directories. When a subdirectory
+    /// is watched recursively without its repository root (e.g. a manual recursive
+    /// watch of `/repo/sub`), changes to an ignore file *above* the root such as
+    /// `/repo/.gitignore` are never observed, so ignore rules can go stale. The
+    /// common case (watching a git worktree root) is unaffected.
+    fn recursive_roots_for_ignore_rule(&self, path: &Path) -> Vec<PathBuf> {
+        let Some(scope) = ignore_rule_scope(path) else {
+            return Vec::new();
+        };
+
+        self.recursive_roots
+            .keys()
+            .filter(|root| root.starts_with(&scope) || scope.starts_with(root))
+            .cloned()
+            .collect()
+    }
+
+    /// Reconcile a recursive root's watched-directory set to `next`, adding and
+    /// removing per-directory watches to match.
+    ///
+    /// Known limitation: the diff is by path string against the post-window
+    /// snapshot. If a watched directory is renamed out of the tree (or deleted)
+    /// and a same-named directory is recreated within the same debounce window,
+    /// `current` and `next` are byte-identical, so the recreated (new-inode)
+    /// directory is not re-watched. Fixing this needs inode/descriptor-level
+    /// tracking rather than path-set diffing.
     fn apply_recursive_dirs(
         &mut self,
         root: &Path,
         next: HashSet<PathBuf>,
     ) -> Result<(), notify::Error> {
-        let Some(current) = self.recursive_roots.get(root) else {
+        let Some(current) = self.recursive_roots.get(root).cloned() else {
             return Ok(());
         };
 
-        let to_add: Vec<_> = next.difference(current).cloned().collect();
         let to_remove: Vec<_> = current.difference(&next).cloned().collect();
+        let to_add: Vec<_> = next.difference(&current).cloned().collect();
+        let mut applied = current;
         let mut added: Vec<PathBuf> = Vec::new();
+
+        // Apply removals before additions. For a rename old -> new this yields
+        // to_remove={old}, to_add={new}; removing first lets the backend release
+        // old's descriptor before new re-registers, so new cannot attach to a
+        // descriptor still bound to old's (now renamed) inode.
+        for dir in &to_remove {
+            self.remove_path_watch_best_effort(dir);
+            applied.remove(dir);
+        }
 
         for dir in &to_add {
             if let Err(err) = self.add_path_watch(dir) {
                 for added_dir in &added {
-                    let _ = self.remove_path_watch(added_dir);
+                    self.remove_path_watch_best_effort(added_dir);
+                    applied.remove(added_dir);
                 }
+                self.recursive_roots.insert(root.to_path_buf(), applied);
                 return Err(err);
             }
             added.push(dir.clone());
-        }
-
-        for dir in &to_remove {
-            let _ = self.remove_path_watch(dir);
+            applied.insert(dir.clone());
         }
 
         self.recursive_roots.insert(root.to_path_buf(), next);
@@ -164,28 +205,57 @@ impl FilteredWatcher {
     }
 
     fn add_path_watch(&mut self, path: &Path) -> Result<(), notify::Error> {
-        let path = path.to_path_buf();
-        if let Some(count) = self.path_watch_counts.get_mut(&path) {
-            *count += 1;
-            return Ok(());
-        }
-
-        self.inner.watch(&path, RecursiveMode::NonRecursive)?;
-        self.path_watch_counts.insert(path, 1);
+        // Always (re-)issue the OS watch, even when the refcount is already
+        // positive: a path's count can outlive its kernel watch. inotify drops a
+        // directory's watch when the directory is deleted, so after a
+        // delete+recreate under an overlapping watch the surviving count would
+        // otherwise skip re-arming and the recreated directory would go silent
+        // (see test_overlap_delete_recreate_rewatches_for_real_events). Re-adding
+        // is cheap and idempotent: inotify_add_watch returns the same descriptor
+        // and merges the mask; on macOS FSEvents the duplicate path is removed
+        // wholesale on unwatch.
+        self.inner.watch(path, RecursiveMode::NonRecursive)?;
+        *self
+            .path_watch_counts
+            .entry(path.to_path_buf())
+            .or_insert(0) += 1;
         Ok(())
     }
 
     fn remove_path_watch(&mut self, path: &Path) -> Result<(), notify::Error> {
-        match self.path_watch_counts.get_mut(path) {
-            Some(count) if *count > 1 => {
-                *count -= 1;
+        match self.path_watch_counts.get(path).copied() {
+            Some(count) if count > 1 => {
+                if let Some(count) = self.path_watch_counts.get_mut(path) {
+                    *count -= 1;
+                }
                 Ok(())
             }
             Some(_) => {
+                self.inner.unwatch(path)?;
                 self.path_watch_counts.remove(path);
-                self.inner.unwatch(path)
+                Ok(())
             }
             None => self.inner.unwatch(path),
+        }
+    }
+
+    /// Like `remove_path_watch`, but for teardown: it drops the refcount even
+    /// when the backend unwatch fails (e.g. notify already forgot a deleted
+    /// directory), so a torn-down root never leaves a phantom count behind.
+    fn remove_path_watch_best_effort(&mut self, path: &Path) {
+        match self.path_watch_counts.get(path).copied() {
+            Some(count) if count > 1 => {
+                if let Some(count) = self.path_watch_counts.get_mut(path) {
+                    *count -= 1;
+                }
+            }
+            Some(_) => {
+                let _ = self.inner.unwatch(path);
+                self.path_watch_counts.remove(path);
+            }
+            None => {
+                let _ = self.inner.unwatch(path);
+            }
         }
     }
 
@@ -233,17 +303,21 @@ impl WatchManager {
     /// short window, and writes `fs.changed` notifications to the client
     /// via the shared stdout writer.
     pub fn new(writer: WriterHandle) -> Result<Arc<Self>, notify::Error> {
-        let (tx, rx) = mpsc::channel(10_000);
+        let (tx, rx) = mpsc::unbounded_channel();
 
         let watcher = FilteredWatcher::new(move |event: notify::Result<Event>| {
             if let Ok(event) = event {
                 // Only forward events that indicate filesystem mutations
                 match event.kind {
                     EventKind::Create(_) | EventKind::Modify(_) | EventKind::Remove(_) => {
-                        // Use try_send to drop events on overflow rather than blocking.
-                        // The debounce window coalesces events anyway, so dropped events
-                        // during extremely high-frequency bursts are acceptable.
-                        let _ = tx.try_send(event);
+                        // These directory create/rename/remove events drive the recursive
+                        // watch topology, so they must not be dropped. The channel is
+                        // unbounded rather than bounded: this closure runs on notify's
+                        // single event-loop thread, which also services watch()/unwatch(),
+                        // so a bounded blocking_send would deadlock against a refresh's
+                        // inner.watch() (and try_send would drop topology events). send()
+                        // never blocks; the queue is drained once per debounce window.
+                        let _ = tx.send(event);
                     }
                     _ => {} // Ignore Access, Other events
                 }
@@ -265,6 +339,12 @@ impl WatchManager {
     ///
     /// If `recursive` is true, all subdirectories are also watched.
     /// Returns an error if the path doesn't exist or watch limits are exceeded.
+    ///
+    /// Idempotent: re-adding an already-watched path with the same mode is a
+    /// no-op success. A non-recursive watch is upgraded to recursive on request,
+    /// but an existing recursive watch is never downgraded to non-recursive (that
+    /// request is also a no-op success). It is not refcounted at this layer: one
+    /// `unwatch` removes the path regardless of how many times it was added.
     pub fn watch(&self, path: &Path, recursive: bool) -> Result<(), notify::Error> {
         let mode = if recursive {
             RecursiveMode::Recursive
@@ -277,20 +357,29 @@ impl WatchManager {
         })?;
 
         let mut watcher = lock_or_recover(&self.watcher);
-        {
-            let paths = lock_or_recover(&self.watched_paths);
-            if paths.contains_key(&canonical) {
-                return Err(notify::Error::generic(&format!(
-                    "Path already being watched: {}",
-                    canonical.display()
-                )));
+        let mut paths = lock_or_recover(&self.watched_paths);
+
+        match paths.get(&canonical).copied() {
+            Some(existing) if existing == mode => return Ok(()),
+            Some(RecursiveMode::Recursive) => return Ok(()),
+            Some(RecursiveMode::NonRecursive) => {
+                watcher.unwatch(&canonical)?;
+                if let Err(err) = watcher.watch(&canonical, RecursiveMode::Recursive) {
+                    if watcher
+                        .watch(&canonical, RecursiveMode::NonRecursive)
+                        .is_err()
+                    {
+                        paths.remove(&canonical);
+                    }
+                    return Err(err);
+                }
+                paths.insert(canonical, RecursiveMode::Recursive);
+            }
+            None => {
+                watcher.watch(&canonical, mode)?;
+                paths.insert(canonical, mode);
             }
         }
-
-        watcher.watch(&canonical, mode)?;
-
-        let mut paths = lock_or_recover(&self.watched_paths);
-        paths.insert(canonical, mode);
 
         Ok(())
     }
@@ -333,17 +422,27 @@ impl WatchManager {
             .collect()
     }
 
-    fn refresh_recursive_watches_for_event(&self, event: &Event) {
+    fn recursive_roots_for_event(&self, event: &Event) -> HashSet<PathBuf> {
         let refresh_paths = directory_tree_refresh_paths(event);
-        if refresh_paths.is_empty() {
-            return;
+        let ignore_paths = ignore_rule_paths(event);
+        if refresh_paths.is_empty() && ignore_paths.is_empty() {
+            return HashSet::new();
         }
 
-        let roots_to_refresh = {
-            let watcher = lock_or_recover(&self.watcher);
-            watcher.recursive_roots_for_paths(&refresh_paths)
-        };
+        let watcher = lock_or_recover(&self.watcher);
+        let mut roots_to_refresh: HashSet<_> = watcher
+            .recursive_roots_for_paths(&refresh_paths)
+            .into_iter()
+            .collect();
 
+        for path in ignore_paths {
+            roots_to_refresh.extend(watcher.recursive_roots_for_ignore_rule(&path));
+        }
+
+        roots_to_refresh
+    }
+
+    fn refresh_recursive_roots(&self, roots_to_refresh: HashSet<PathBuf>) {
         if roots_to_refresh.is_empty() {
             return;
         }
@@ -380,6 +479,55 @@ fn existing_directory_paths(paths: &[PathBuf]) -> Vec<PathBuf> {
     paths.iter().filter(|path| path.is_dir()).cloned().collect()
 }
 
+fn ignore_rule_paths(event: &Event) -> Vec<PathBuf> {
+    if !matches!(
+        event.kind,
+        EventKind::Create(_) | EventKind::Modify(_) | EventKind::Remove(_)
+    ) {
+        return Vec::new();
+    }
+
+    event
+        .paths
+        .iter()
+        .filter(|path| is_ignore_rule_path(path))
+        .cloned()
+        .collect()
+}
+
+fn is_ignore_rule_path(path: &Path) -> bool {
+    if path.file_name().is_some_and(|name| name == ".gitignore") {
+        return true;
+    }
+
+    path.file_name().is_some_and(|name| name == "exclude")
+        && path
+            .parent()
+            .and_then(Path::file_name)
+            .is_some_and(|name| name == "info")
+        && path
+            .parent()
+            .and_then(Path::parent)
+            .and_then(Path::file_name)
+            .is_some_and(|name| name == ".git")
+}
+
+fn ignore_rule_scope(path: &Path) -> Option<PathBuf> {
+    if path.file_name().is_some_and(|name| name == ".gitignore") {
+        return path.parent().map(Path::to_path_buf);
+    }
+
+    if is_ignore_rule_path(path) {
+        return path
+            .parent()
+            .and_then(Path::parent)
+            .and_then(Path::parent)
+            .map(Path::to_path_buf);
+    }
+
+    None
+}
+
 /// Background task: receives raw inotify events, debounces them, and sends
 /// batched `fs.changed` notifications to the Emacs client.
 ///
@@ -390,7 +538,7 @@ fn existing_directory_paths(paths: &[PathBuf]) -> Vec<PathBuf> {
 /// 4. When the timer fires, send one notification with all unique paths
 /// 5. Go back to step 1
 async fn debounce_loop(
-    mut rx: mpsc::Receiver<Event>,
+    mut rx: mpsc::UnboundedReceiver<Event>,
     writer: WriterHandle,
     manager: Weak<WatchManager>,
 ) {
@@ -400,14 +548,10 @@ async fn debounce_loop(
             Some(e) => e,
             None => break, // Channel closed, watcher dropped
         };
-        if let Some(manager) = manager.upgrade() {
-            manager.refresh_recursive_watches_for_event(&event);
-        }
 
         let mut pending_paths: HashSet<PathBuf> = HashSet::new();
-        for path in event.paths {
-            pending_paths.insert(path);
-        }
+        let mut roots_to_refresh: HashSet<PathBuf> = HashSet::new();
+        collect_event(event, &manager, &mut pending_paths, &mut roots_to_refresh);
 
         // Phase 2: Collect more events during the debounce window
         let deadline = time::Instant::now() + DEBOUNCE_DURATION;
@@ -419,17 +563,16 @@ async fn debounce_loop(
                 event = rx.recv() => {
                     match event {
                         Some(e) => {
-                            if let Some(manager) = manager.upgrade() {
-                                manager.refresh_recursive_watches_for_event(&e);
-                            }
-                            for path in e.paths {
-                                pending_paths.insert(path);
-                            }
+                            collect_event(e, &manager, &mut pending_paths, &mut roots_to_refresh);
                         }
                         None => return, // Channel closed
                     }
                 }
             }
+        }
+
+        if let Some(manager) = manager.upgrade() {
+            manager.refresh_recursive_roots(roots_to_refresh);
         }
 
         // Phase 3: Send notification with all collected paths
@@ -439,6 +582,19 @@ async fn debounce_loop(
             break;
         }
     }
+}
+
+fn collect_event(
+    event: Event,
+    manager: &Weak<WatchManager>,
+    pending_paths: &mut HashSet<PathBuf>,
+    roots_to_refresh: &mut HashSet<PathBuf>,
+) {
+    if let Some(manager) = manager.upgrade() {
+        roots_to_refresh.extend(manager.recursive_roots_for_event(&event));
+    }
+
+    pending_paths.extend(event.paths);
 }
 
 /// Serialize and send an `fs.changed` notification over the stdout writer.
