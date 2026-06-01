@@ -164,6 +164,40 @@ Value is a cons cell (CHECKED . RESULT).")
       (setq result (funcall thunk))
       (cons result count))))
 
+(defun tramp-rpc-test--run-with-call-count-capturing-error (thunk)
+  "Run THUNK and return a plist with :result, :error, and :count.
+Unlike `tramp-rpc-test--run-with-call-count', this preserves the call count
+when THUNK signals so tests can assert error-path roundtrips."
+  (let ((count 0)
+        result
+        error
+        (orig-call-with-timeout (symbol-function 'tramp-rpc--call-with-timeout))
+        (orig-call-batch (symbol-function 'tramp-rpc--call-batch))
+        (orig-call-async (symbol-function 'tramp-rpc--call-async))
+        (orig-send-requests (symbol-function 'tramp-rpc--send-requests)))
+    (tramp-rpc-test--clear-call-count-caches)
+    (cl-letf (((symbol-function 'tramp-rpc--call-with-timeout)
+               (lambda (vec method params total-timeout poll-interval)
+                 (cl-incf count)
+                 (funcall orig-call-with-timeout
+                          vec method params total-timeout poll-interval)))
+              ((symbol-function 'tramp-rpc--call-batch)
+               (lambda (vec requests)
+                 (cl-incf count)
+                 (funcall orig-call-batch vec requests)))
+              ((symbol-function 'tramp-rpc--call-async)
+               (lambda (vec method params callback)
+                 (cl-incf count)
+                 (funcall orig-call-async vec method params callback)))
+              ((symbol-function 'tramp-rpc--send-requests)
+               (lambda (vec requests)
+                 (cl-incf count (length requests))
+                 (funcall orig-send-requests vec requests))))
+      (condition-case err
+          (setq result (funcall thunk))
+        (error (setq error err)))
+      (list :result result :error error :count count))))
+
 (defmacro tramp-rpc-test--with-call-count (expected &rest body)
   "Run BODY and assert it makes EXPECTED RPC calls.
 Returns BODY's result."
@@ -174,6 +208,22 @@ Returns BODY's result."
              (lambda () ,@body))))
        (should (= ,expected (cdr ,measurement)))
        (car ,measurement))))
+
+(defmacro tramp-rpc-test--with-call-count-error (expected error-type &rest body)
+  "Run BODY, assert ERROR-TYPE is signaled, and count EXPECTED RPC calls."
+  (declare (indent 2) (debug (form symbolp body)))
+  (let ((measurement (make-symbol "measurement"))
+        (err (make-symbol "err")))
+    `(should-error
+      (let* ((,measurement
+              (tramp-rpc-test--run-with-call-count-capturing-error
+               (lambda () ,@body)))
+             (,err (plist-get ,measurement :error)))
+        (should (= ,expected (plist-get ,measurement :count)))
+        (if ,err
+            (signal (car ,err) (cdr ,err))
+          (ert-fail "Expected an error, but body returned normally")))
+      :type ',error-type)))
 
 (defun tramp-rpc-test--make-remote-path (filename)
   "Make a full TRAMP RPC path for FILENAME."
@@ -306,6 +356,19 @@ The directory is deleted after BODY completes."
 ;;; Test 00: Availability
 ;;; ============================================================================
 
+(ert-deftest tramp-rpc-test00-system-info-shared-cache ()
+  "UID, GID, and home directory share one system.info RPC."
+  (skip-unless (tramp-rpc-test-enabled))
+
+  (let ((vec (tramp-dissect-file-name (tramp-rpc-test--remote-directory))))
+    (let ((result (tramp-rpc-test--with-call-count 1
+                    (list (tramp-get-remote-uid vec 'integer)
+                          (tramp-get-remote-gid vec 'integer)
+                          (tramp-get-home-directory vec)))))
+      (should (integerp (nth 0 result)))
+      (should (integerp (nth 1 result)))
+      (should (stringp (nth 2 result))))))
+
 (ert-deftest tramp-rpc-test00-availability ()
   "Test availability of TRAMP RPC functions."
   (skip-unless (tramp-rpc-test-enabled))
@@ -374,9 +437,10 @@ The directory is deleted after BODY completes."
   "Test `file-writable-p' for TRAMP RPC files."
   (skip-unless (tramp-rpc-test-enabled))
 
-  ;; Existing file
+  ;; Existing file.  This should be one access check plus one file stat; the
+  ;; connection setup system.info response is cached and reused.
   (tramp-rpc-test--with-temp-file tmp "test content"
-    (should (tramp-rpc-test--with-call-count 3
+    (should (tramp-rpc-test--with-call-count 2
               (file-writable-p tmp))))
 
   ;; Non-existent file in writable directory
@@ -395,7 +459,12 @@ The directory is deleted after BODY completes."
   ;; Measure on a fresh path to avoid cache hits.
   (let ((missing (tramp-rpc-test--make-temp-name)))
     (should-not (tramp-rpc-test--with-call-count 1
-                  (file-directory-p missing))))
+                  (file-directory-p missing)))
+    ;; Negative results are cached too.
+    (should (equal (tramp-rpc-test--with-call-count 1
+                     (list (file-directory-p missing)
+                           (file-directory-p missing)))
+                   '(nil nil))))
 
   ;; Test file
   (tramp-rpc-test--with-temp-file tmp "test content"
@@ -403,7 +472,35 @@ The directory is deleted after BODY completes."
 
   ;; Test subdirectory
   (tramp-rpc-test--with-temp-dir subdir
-    (should (file-directory-p subdir))))
+    (should (file-directory-p subdir))
+    (should (tramp-rpc-test--with-call-count 1
+              (and (file-directory-p subdir)
+                   (file-directory-p subdir))))))
+
+(ert-deftest tramp-rpc-test03-file-directory-p-cache-invalidated-by-mkdir ()
+  "A cached negative `file-directory-p' result is invalidated by mkdir."
+  (skip-unless (tramp-rpc-test-enabled))
+
+  (let ((dir (tramp-rpc-test--make-temp-name)))
+    (unwind-protect
+        (progn
+          (should-not (file-directory-p dir))
+          (make-directory dir)
+          (should (file-directory-p dir)))
+      (ignore-errors (delete-directory dir t)))))
+
+(ert-deftest tramp-rpc-test03-file-directory-p-cache-invalidated-by-mkdir-parents ()
+  "Parent mkdir invalidates stale negative `file-directory-p' prefix caches."
+  (skip-unless (tramp-rpc-test-enabled))
+
+  (let* ((top (tramp-rpc-test--make-temp-name))
+         (deep (concat top "/b/c")))
+    (unwind-protect
+        (progn
+          (should-not (file-directory-p top))
+          (make-directory deep t)
+          (should (file-directory-p top)))
+      (ignore-errors (delete-directory top t)))))
 
 (ert-deftest tramp-rpc-test03-file-regular-p ()
   "Test `file-regular-p' for TRAMP RPC files."
@@ -471,7 +568,11 @@ The directory is deleted after BODY completes."
                   (file-attributes subdir))))
       (should attrs)
       ;; Check it's a directory
-      (should (eq (file-attribute-type attrs) t)))))
+      (should (eq (file-attribute-type attrs) t)))
+    ;; Directory attributes populate the `file-directory-p' cache.
+    (should (tramp-rpc-test--with-call-count 1
+              (and (file-attributes subdir)
+                   (file-directory-p subdir))))))
 
 (ert-deftest tramp-rpc-test04-file-modes ()
   "Test `file-modes' and `set-file-modes' for TRAMP RPC files."
@@ -481,12 +582,23 @@ The directory is deleted after BODY completes."
     (let ((orig-modes (tramp-rpc-test--with-call-count 1
                         (file-modes tmp))))
       (should (integerp orig-modes))
-      ;; Set new modes
-      (set-file-modes tmp #o644)
+      ;; Set new modes.  The mutation itself should be one RPC; the server can
+      ;; report ENOENT/permission errors without a preflight stat.
+      (tramp-rpc-test--with-call-count 1
+        (set-file-modes tmp #o644))
       (should (= (logand (file-modes tmp) #o777) #o644))
       ;; Set executable
-      (set-file-modes tmp #o755)
+      (tramp-rpc-test--with-call-count 1
+        (set-file-modes tmp #o755))
       (should (= (logand (file-modes tmp) #o777) #o755)))))
+
+(ert-deftest tramp-rpc-test04-set-file-modes-missing-file ()
+  "`set-file-modes' reports a missing file without a preflight stat."
+  (skip-unless (tramp-rpc-test-enabled))
+
+  (let ((missing (tramp-rpc-test--make-temp-name)))
+    (tramp-rpc-test--with-call-count-error 1 file-missing
+      (set-file-modes missing #o644))))
 
 ;;; ============================================================================
 ;;; Test 05: File Content Operations
@@ -1036,10 +1148,19 @@ and returns a valid path."
 
   (tramp-rpc-test--with-temp-file tmp "content"
     (let ((new-time (encode-time 0 0 12 1 1 2020)))
-      (set-file-times tmp new-time)
+      (tramp-rpc-test--with-call-count 1
+        (set-file-times tmp new-time))
       (let ((mtime (file-attribute-modification-time (file-attributes tmp))))
         ;; Check the time was set (allow some tolerance)
         (should (< (abs (- (float-time new-time) (float-time mtime))) 2))))))
+
+(ert-deftest tramp-rpc-test09-set-file-times-missing-file ()
+  "`set-file-times' reports a missing file without a preflight stat."
+  (skip-unless (tramp-rpc-test-enabled))
+
+  (let ((missing (tramp-rpc-test--make-temp-name)))
+    (tramp-rpc-test--with-call-count-error 1 file-missing
+      (set-file-times missing (current-time)))))
 
 ;;; ============================================================================
 ;;; Test 10: Process Execution

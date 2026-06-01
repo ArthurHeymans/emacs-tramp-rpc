@@ -1165,23 +1165,13 @@ Returns the connection plist.  Signals `remote-file-error' on failure."
     (process-put process :tramp-rpc-vec vec)
     (process-put process 'tramp-vector vec)
 
-    ;; Wait for server to be ready by sending a ping
-    (let ((response (tramp-rpc--call vec "system.info" nil)))
+    ;; Wait for server to be ready by sending a ping, and seed the
+    ;; connection-local system.info cache for later uid/gid/home/shell lookups.
+    (let ((response (tramp-rpc--cache-system-info
+                     vec (tramp-rpc--call vec "system.info" nil))))
       (unless response
         (tramp-rpc--remove-connection vec)
-        (signal 'remote-file-error (list "Failed to connect to RPC server on" host)))
-
-      ;; Store remote uname so `tramp-check-remote-uname' works.
-      ;; The server returns "linux" or "macos"; map to the kernel name
-      ;; that tramp-sh expects ("Linux", "Darwin", etc.).
-      (let ((os (alist-get 'os response)))
-        (when os
-          (tramp-set-connection-property
-           vec "uname"
-           (pcase os
-             ("macos" "Darwin")
-             ("linux" "Linux")
-             (_ os))))))
+        (signal 'remote-file-error (list "Failed to connect to RPC server on" host))))
 
     ;; Set connection-local variables in the connection buffer.
     ;; Every TRAMP backend must call this after establishing the connection
@@ -1535,6 +1525,8 @@ Returns the result or signals an error."
                 (signal 'permission-denied (list "RPC" "Permission denied" msg)))
                ;; Map OS errno values to appropriate Emacs error symbols.
                ;; The server includes the raw errno in the error data field.
+               ((eql os-errno 2) ;; ENOENT
+                (signal 'file-missing (list "RPC" "No such file" msg)))
                ((eql os-errno 17) ;; EEXIST
                 (signal 'file-already-exists (list "RPC" msg)))
                ((eql os-errno 39) ;; ENOTEMPTY
@@ -1889,6 +1881,14 @@ path unchanged (after resolving any symlinks in parent directories)."
         (let ((expanded (expand-file-name filename)))
           (tramp-rpc--cache-put tramp-rpc--file-exists-cache
                                 expanded (if result t nil)))
+        ;; `file-attributes' uses lstat, while `file-directory-p' follows
+        ;; symlinks.  Only populate the directory predicate cache when the
+        ;; lstat answer is definitive for the follow case too.
+        (pcase (alist-get 'type result)
+          ("directory"
+           (tramp-set-file-property v localname "file-directory-p" t))
+          ((or "file" (pred null))
+           (tramp-set-file-property v localname "file-directory-p" nil)))
         (when result
           (tramp-rpc--convert-file-attributes result id-format))))))
 
@@ -1901,8 +1901,9 @@ which resolves truename and then stats."
    (tramp-string-empty-or-nil-p (tramp-file-local-name filename))
    (string-equal (tramp-file-local-name filename) "/")
    (with-parsed-tramp-file-name (expand-file-name filename) nil
-     (let ((stat (tramp-rpc--call-file-stat v localname)))
-       (and stat (equal (alist-get 'type stat) "directory"))))))
+     (with-tramp-file-property v localname "file-directory-p"
+       (let ((stat (tramp-rpc--call-file-stat v localname)))
+         (and stat (equal (alist-get 'type stat) "directory")))))))
 
 (defun tramp-rpc--convert-file-attributes (stat id-format)
   "Convert STAT result to Emacs file-attributes format.
@@ -1935,16 +1936,36 @@ ID-FORMAT specifies whether to use numeric or string IDs."
 
 
 
+(defmacro tramp-rpc--with-set-file-attributes-rpc (filename &rest body)
+  "Run BODY for a file attribute mutation on FILENAME without preflight stat.
+This mirrors `tramp-skeleton-set-file-modes-times-uid-gid' cache flushing and
+error handling, but lets the RPC server report missing-file and permission
+errors instead of probing first."
+  (declare (indent 1) (debug (form body)))
+  `(with-parsed-tramp-file-name (expand-file-name ,filename) nil
+     (with-tramp-saved-file-properties
+         v localname
+         ;; Keep the same properties TRAMP's skeleton preserves.  These are not
+         ;; changed by chmod/touch/chown, while attributes and predicate caches
+         ;; that depend on modes/timestamps must be recomputed.
+         '("file-directory-p" "file-exists-p" "file-symlink-p" "file-truename")
+       (tramp-flush-file-properties v localname))
+     (condition-case err
+         (progn ,@body)
+       (error (if tramp-inhibit-errors-if-setting-file-attributes-fail
+                  (display-warning 'tramp (error-message-string err))
+                (signal (car err) (cdr err)))))))
+
 (defun tramp-rpc-handle-set-file-modes (filename mode &optional _flag)
   "Like `set-file-modes' for TRAMP-RPC files."
-  (tramp-skeleton-set-file-modes-times-uid-gid filename
+  (tramp-rpc--with-set-file-attributes-rpc filename
     (tramp-rpc--call v "file.set_modes"
                      (append (tramp-rpc--encode-path localname)
                              `((mode . ,mode))))))
 
 (defun tramp-rpc-handle-set-file-times (filename &optional timestamp _flag)
   "Like `set-file-times' for TRAMP-RPC files."
-  (tramp-skeleton-set-file-modes-times-uid-gid filename
+  (tramp-rpc--with-set-file-attributes-rpc filename
     (let ((mtime (floor (float-time (or timestamp (current-time))))))
       (tramp-rpc--call v "file.set_times"
                        (append (tramp-rpc--encode-path localname)
@@ -2238,6 +2259,37 @@ so a single RPC can both validate and list the directory."
 			name)))
                   entries))))))
 
+(defun tramp-rpc--localname-prefixes (localname)
+  "Return non-root path prefixes for absolute LOCALNAME.
+For example, /tmp/a/b returns /tmp, /tmp/a, and /tmp/a/b."
+  (let ((prefixes nil)
+        (current nil))
+    (dolist (component (split-string (directory-file-name localname) "/" t))
+      (setq current (if current
+                        (concat current "/" component)
+                      (concat "/" component)))
+      (push current prefixes))
+    (nreverse prefixes)))
+
+(defun tramp-rpc--invalidate-mkdir-caches (vec filename localname parents)
+  "Invalidate caches after mkdir of FILENAME / LOCALNAME on VEC.
+When PARENTS is non-nil, the server may create any missing path prefix, so
+flush every prefix to avoid stale negative predicate results."
+  (if parents
+      (dolist (prefix (tramp-rpc--localname-prefixes localname))
+        (tramp-flush-file-properties vec prefix)
+        (when-let* ((parent (file-name-directory prefix)))
+          (tramp-flush-directory-properties vec parent))
+        (tramp-rpc--invalidate-cache-for-path
+         (tramp-make-tramp-file-name vec prefix)))
+    ;; Preserve the non-PARENTS invalidation shape: only the created directory,
+    ;; its parent directory properties, and the custom caches for FILENAME.
+    (tramp-flush-directory-properties vec (file-name-directory localname))
+    (tramp-flush-file-properties vec localname)
+    (when-let* ((parent (file-name-directory filename)))
+      (tramp-rpc--invalidate-cache-for-path parent))
+    (tramp-rpc--invalidate-cache-for-path filename)))
+
 (defun tramp-rpc-handle-make-directory (dir &optional parents)
   "Like `make-directory' for TRAMP-RPC files.
 
@@ -2246,19 +2298,14 @@ Delegate parent creation to the server instead of using
 component with separate `file-exists-p' / `file-directory-p' calls before the
 actual mkdir.  Server-side `create_dir_all' performs the same validation in one
 network round-trip."
-  (let* ((dir (directory-file-name (expand-file-name dir)))
-         (parent (file-name-directory dir)))
+  (let ((dir (directory-file-name (expand-file-name dir))))
     (with-parsed-tramp-file-name dir nil
       (let ((created
              (tramp-rpc--call v "dir.create"
                               (append (tramp-rpc--encode-path localname)
                                       `((parents . ,(if parents t :msgpack-false))
                                         (mode . ,(default-file-modes)))))))
-        ;; Flush parent directory properties so file-exists-p sees the new dir.
-        (tramp-flush-directory-properties v (file-name-directory localname))
-        (when parent
-          (tramp-rpc--invalidate-cache-for-path parent))
-        (tramp-rpc--invalidate-cache-for-path dir)
+        (tramp-rpc--invalidate-mkdir-caches v dir localname parents)
         ;; Match `make-directory' return convention: nil when a directory was
         ;; created, t when PARENTS was non-nil and the directory already existed.
         (and parents (not created))))))
@@ -3330,7 +3377,7 @@ Result is cached per connection."
     (or cached
         (let ((shell
                (condition-case nil
-                   (let* ((info (tramp-rpc--call vec "system.info" nil))
+                   (let* ((info (tramp-rpc--system-info vec))
                           (sh (alist-get 'shell info)))
                      (if (and sh (stringp sh) (> (length sh) 0))
                          sh
@@ -3347,8 +3394,7 @@ Returns \"/bin/sh\" if the lookup fails."
              ;; If no user in the vec, fall back to system.info user
              (target-user (if (string-empty-p user)
                               (tramp-rpc--decode-string
-                               (alist-get 'user
-                                          (tramp-rpc--call vec "system.info" nil)))
+                               (alist-get 'user (tramp-rpc--system-info vec)))
                             user))
              (result (tramp-rpc--call vec "process.run"
                                        `((cmd . "getent")
@@ -3436,6 +3482,44 @@ round-trips for the common non-VISIT case."
         (set-buffer-multibyte nil)
         (insert content)))))
 
+(defconst tramp-rpc--system-info-property "tramp-rpc-system-info"
+  "TRAMP connection property storing the cached system.info response.")
+
+(defun tramp-rpc--cache-system-info (vec info)
+  "Store system.info INFO for VEC and seed related TRAMP properties."
+  (when info
+    (tramp-set-connection-property vec tramp-rpc--system-info-property info)
+    ;; Store remote uname so `tramp-check-remote-uname' works.  The server
+    ;; returns "linux" or "macos"; map to the kernel names tramp-sh expects.
+    (when-let* ((os (alist-get 'os info)))
+      (tramp-set-connection-property
+       vec "uname"
+       (pcase os
+         ("macos" "Darwin")
+         ("linux" "Linux")
+         (_ os))))
+    ;; Match this backend's existing string uid/gid behavior: string format is
+    ;; the numeric id rendered as text, not the login/group name.
+    (when-let* ((uid (alist-get 'uid info)))
+      (tramp-set-connection-property vec "uid-integer" uid)
+      (tramp-set-connection-property vec "uid-string" (number-to-string uid)))
+    (when-let* ((gid (alist-get 'gid info)))
+      (tramp-set-connection-property vec "gid-integer" gid)
+      (tramp-set-connection-property vec "gid-string" (number-to-string gid)))
+    (when-let* ((home (tramp-rpc--decode-string (alist-get 'home info))))
+      ;; `tramp-get-home-directory' caches under "~" when USER is nil and
+      ;; under "~USER" when USER is explicit.  Seed both current-user forms.
+      (tramp-set-connection-property vec "~" home)
+      (when-let* ((user (tramp-file-name-user vec)))
+        (unless (string-empty-p user)
+          (tramp-set-connection-property vec (concat "~" user) home)))))
+  info)
+
+(defun tramp-rpc--system-info (vec)
+  "Return cached system.info for VEC, fetching it at most once per connection."
+  (with-tramp-connection-property vec tramp-rpc--system-info-property
+    (tramp-rpc--cache-system-info vec (tramp-rpc--call vec "system.info" nil))))
+
 (defun tramp-rpc-handle-get-home-directory (vec &optional user)
   "Return home directory for USER on remote host VEC using RPC.
 If USER is nil or matches the connection user, returns the current user's
@@ -3449,7 +3533,7 @@ Signals an error rather than returning nil, so that
             (equal target-user conn-user))
         ;; Current user - use system.info (errors propagate, not cached)
         (or (tramp-rpc--decode-string
-             (alist-get 'home (tramp-rpc--call vec "system.info" nil)))
+             (alist-get 'home (tramp-rpc--system-info vec)))
             (tramp-error vec 'file-error
                          "Remote home directory not available"))
       ;; Different user - look up via getent passwd
@@ -3469,19 +3553,19 @@ Signals an error rather than returning nil, so that
 
 (defun tramp-rpc-handle-get-remote-uid (vec id-format)
   "Return remote UID using RPC."
-  (let ((result (tramp-rpc--call vec "system.info" nil)))
-    (let ((uid (alist-get 'uid result)))
-      (if (eq id-format 'integer)
-          uid
-        (number-to-string uid)))))
+  (let* ((result (tramp-rpc--system-info vec))
+         (uid (alist-get 'uid result)))
+    (if (eq id-format 'integer)
+        uid
+      (number-to-string uid))))
 
 (defun tramp-rpc-handle-get-remote-gid (vec id-format)
   "Return remote GID using RPC."
-  (let ((result (tramp-rpc--call vec "system.info" nil)))
-    (let ((gid (alist-get 'gid result)))
-      (if (eq id-format 'integer)
-          gid
-        (number-to-string gid)))))
+  (let* ((result (tramp-rpc--system-info vec))
+         (gid (alist-get 'gid result)))
+    (if (eq id-format 'integer)
+        gid
+      (number-to-string gid))))
 
 (defun tramp-rpc-handle-file-ownership-preserved-p (filename &optional group)
   "Like `file-ownership-preserved-p' for TRAMP-RPC files.
