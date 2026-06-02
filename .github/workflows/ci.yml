@@ -491,7 +491,7 @@ jobs:
             --eval "(add-to-list 'package-archives '(\"melpa\" . \"https://melpa.org/packages/\") t)" \
             --eval "(package-initialize)" \
             -l test/run-tramp-tests.el \
-            --eval "(ert-run-tests-batch-and-exit '(and (not (tag :unstable)) (not tramp-test45-asynchronous-requests)))"
+            --eval "(tramp-rpc-test-run-tests-batch-and-exit '(and (not (tag :unstable)) (not tramp-test45-asynchronous-requests)))"
 
   summary:
     name: Test Summary

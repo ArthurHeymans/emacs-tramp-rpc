@@ -95,6 +95,69 @@
 (when (getenv "TRAMP_VERBOSE")
   (setq tramp-verbose (string-to-number (getenv "TRAMP_VERBOSE"))))
 
+(defvar tramp-rpc-test-debug
+  (or (member (getenv "TRAMP_RPC_DEBUG") '("1" "true" "TRUE" "yes" "YES"))
+      ;; GitHub Actions sets RUNNER_DEBUG=1 when step debug logging is enabled
+      ;; via the ACTIONS_STEP_DEBUG repository secret.
+      (string= (getenv "RUNNER_DEBUG") "1"))
+  "Non-nil enables TRAMP-RPC debug logging for upstream TRAMP tests.")
+
+(defvar tramp-rpc-test-debug-directory
+  (expand-file-name
+   (or (getenv "TRAMP_RPC_DEBUG_DIR")
+       "tramp-rpc-debug")
+   default-directory)
+  "Directory where debug buffers are written when `tramp-rpc-test-debug' is set.")
+
+(defun tramp-rpc-test--debug-file-name (buffer-name)
+  "Return a safe debug log file name for BUFFER-NAME."
+  (concat
+   (replace-regexp-in-string
+    "[^[:alnum:]._-]+" "_"
+    (replace-regexp-in-string "\\`[ *]+\\|[ *]+\\'" "" buffer-name))
+   ".log"))
+
+(defun tramp-rpc-test--write-debug-buffers ()
+  "Write TRAMP-RPC debug buffers to `tramp-rpc-test-debug-directory'."
+  (when tramp-rpc-test-debug
+    (make-directory tramp-rpc-test-debug-directory t)
+    (with-temp-file (expand-file-name "debug-enabled.txt" tramp-rpc-test-debug-directory)
+      (insert (format "RUNNER_DEBUG=%S\n" (getenv "RUNNER_DEBUG")))
+      (insert (format "TRAMP_RPC_DEBUG=%S\n" (getenv "TRAMP_RPC_DEBUG")))
+      (insert (format "TRAMP_VERBOSE=%S\n" tramp-verbose)))
+    (dolist (buffer (buffer-list))
+      (let ((name (buffer-name buffer)))
+        (when (or (member name '("*tramp-rpc-debug*" "*tramp-rpc-deploy*"))
+                  (string-match-p "tramp-rpc" name))
+          (with-current-buffer buffer
+            (write-region
+             (point-min) (point-max)
+             (expand-file-name
+              (tramp-rpc-test--debug-file-name name)
+              tramp-rpc-test-debug-directory)
+             nil 'silent)))))))
+
+(when tramp-rpc-test-debug
+  (setq tramp-rpc-debug t
+        tramp-rpc-deploy-debug t)
+  (message "TRAMP-RPC debug logging enabled; logs will be written to %s"
+           tramp-rpc-test-debug-directory))
+
+(defun tramp-rpc-test-run-tests-batch-and-exit (&optional selector)
+  "Run ERT tests matching SELECTOR, write debug logs, then exit Emacs.
+This mirrors `ert-run-tests-batch-and-exit', but writes TRAMP-RPC debug logs
+before exiting.  Do not use `kill-emacs-hook' for this: upstream
+`tramp-test52-unload' asserts that no Tramp-related function remains on hooks."
+  (or noninteractive
+      (user-error "This function is only for use in batch mode"))
+  (let ((exit-code 2))
+    (unwind-protect
+        (let ((stats (ert-run-tests-batch selector)))
+          (setq exit-code
+                (if (zerop (ert-stats-completed-unexpected stats)) 0 1)))
+      (tramp-rpc-test--write-debug-buffers)
+      (kill-emacs exit-code))))
+
 ;; ============================================================================
 ;; Load the upstream test suite
 ;; ============================================================================

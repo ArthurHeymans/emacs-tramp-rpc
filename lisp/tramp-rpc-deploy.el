@@ -226,11 +226,21 @@ Messages are logged to *tramp-rpc-deploy* buffer."
   "Log a debug message if `tramp-rpc-deploy-debug' is non-nil.
 FORMAT-STRING and ARGS are passed to `format'."
   (when tramp-rpc-deploy-debug
-    (with-current-buffer (get-buffer-create "*tramp-rpc-deploy*")
-      (goto-char (point-max))
-      (insert (format-time-string "[%Y-%m-%d %H:%M:%S] ")
-               (apply #'format format-string args)
-               "\n"))))
+    (let* ((line (concat (format-time-string "[%Y-%m-%d %H:%M:%S] ")
+                         (apply #'format format-string args)
+                         "\n"))
+           (log-file (or (getenv "TRAMP_RPC_DEPLOY_DEBUG_LOG")
+                         (when-let* ((dir (getenv "TRAMP_RPC_DEBUG_DIR")))
+                           (expand-file-name "tramp-rpc-deploy-live.log" dir)))))
+      (with-current-buffer (get-buffer-create "*tramp-rpc-deploy*")
+        (goto-char (point-max))
+        (insert line))
+      (when log-file
+        (condition-case nil
+            (progn
+              (make-directory (file-name-directory log-file) t)
+              (write-region line nil log-file 'append 'silent))
+          (error nil))))))
 
 (defvar tramp-rpc-deploy--source-tree-hash-cache nil
   "Cache for the source tree hash.
