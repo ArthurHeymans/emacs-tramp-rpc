@@ -2517,6 +2517,205 @@ missing-file check, so no separate preflight stat is needed."
     (tramp-rpc--call v "file.delete" (tramp-rpc--encode-path localname)))
   (tramp-rpc--invalidate-cache-for-path filename))
 
+(defun tramp-rpc--batch-error-p (value)
+  "Return non-nil when VALUE is an error object from `tramp-rpc--call-batch'."
+  (and (consp value) (plist-get value :error)))
+
+(defun tramp-rpc--signal-batch-error (operation filename error)
+  "Signal ERROR returned by a batched RPC for OPERATION on FILENAME."
+  (let ((message (or (plist-get error :message) "RPC batch subrequest failed")))
+    (signal 'remote-file-error (list operation filename message))))
+
+(defconst tramp-rpc--trash-read-batch-size 16
+  "Maximum regular files to read in one optimized trash batch.")
+
+(defun tramp-rpc--apply-local-trash-attributes (filename stat)
+  "Apply mode and mtime from remote STAT to local FILENAME when possible."
+  (when-let* ((mode (alist-get 'mode stat)))
+    ;; The server sends full st_mode, including file type bits.  Local
+    ;; `set-file-modes' wants only the permission/special bits.
+    (set-file-modes filename (logand mode #o7777)))
+  (when-let* ((mtime (alist-get 'mtime stat)))
+    (set-file-times filename (seconds-to-time mtime))))
+
+(defun tramp-rpc--write-local-trash-file (filename content stat)
+  "Write CONTENT as binary data to local trash FILENAME and apply STAT."
+  (let ((coding-system-for-write 'binary))
+    (with-temp-buffer
+      (set-buffer-multibyte nil)
+      (insert content)
+      (write-region (point-min) (point-max) filename nil 'quiet)))
+  (tramp-rpc--apply-local-trash-attributes filename stat))
+
+(defun tramp-rpc--copy-remote-trash-entry-to-local (vec localname dest stat)
+  "Copy remote LOCALNAME on VEC to local trash DEST using STAT metadata."
+  (pcase (tramp-rpc--stat-type stat)
+    ("file"
+     (let ((result (tramp-rpc--call vec "file.read"
+                                    (tramp-rpc--file-read-params localname t))))
+       (tramp-rpc--write-local-trash-file
+        dest (tramp-rpc--extract-file-read-content result) stat)))
+    ("symlink"
+     (make-symbolic-link
+      (or (tramp-rpc--decode-string (alist-get 'link_target stat)) "") dest)
+     ;; Do not call `tramp-rpc--apply-local-trash-attributes' for symlinks:
+     ;; Emacs' local setters follow links on most systems.
+     )
+    ("directory"
+     (tramp-rpc--copy-remote-trash-directory-to-local vec localname dest stat))
+    (_
+     ;; FIFOs/devices/sockets are intentionally not optimized yet.  Falling
+     ;; back before deleting the source is safer than creating the wrong local
+     ;; object in the trash.
+     (throw 'tramp-rpc-trash-unsupported localname))))
+
+(defun tramp-rpc--copy-remote-trash-directory-to-local (vec localname dest stat)
+  "Recursively copy remote directory LOCALNAME on VEC to local trash DEST."
+  (make-directory dest)
+  (let* ((entries (tramp-rpc--call
+                   vec "dir.list"
+                   (append (tramp-rpc--encode-path localname)
+                           '((include_attrs . t)
+                             (include_hidden . t)))))
+         regulars directories)
+    (dolist (entry entries)
+      (let* ((name (tramp-rpc--decode-filename entry))
+             (entry-stat (alist-get 'attrs entry))
+             (type (or (tramp-rpc--stat-type entry-stat)
+                       (alist-get 'type entry))))
+        (unless (member name '("." ".."))
+          (unless entry-stat
+            (setq entry-stat
+                  (tramp-rpc--call-file-stat
+                   vec (file-name-concat localname name) t)
+                  type (or type (tramp-rpc--stat-type entry-stat))))
+          (pcase type
+            ("file"
+             (push (list name entry-stat) regulars))
+            ("symlink"
+             (make-symbolic-link
+              (or (tramp-rpc--decode-string (alist-get 'link_target entry-stat)) "")
+              (expand-file-name name (file-name-as-directory dest))))
+            ("directory"
+             (push (list name entry-stat) directories))
+            (_
+             (throw 'tramp-rpc-trash-unsupported
+                    (file-name-concat localname name)))))))
+    ;; Batch regular file contents per directory.  Directories are then handled
+    ;; recursively so the implementation stays small while avoiding the generic
+    ;; TRAMP copy-file/stat/truename path for the common tiny test trees.
+    (when regulars
+      (let ((remaining (nreverse regulars)))
+        (while remaining
+          (let ((chunk nil)
+                (count 0))
+            (while (and remaining (< count tramp-rpc--trash-read-batch-size))
+              (push (pop remaining) chunk)
+              (setq count (1+ count)))
+            (setq chunk (nreverse chunk))
+            (let ((reads (tramp-rpc--call-batch
+                          vec
+                          (mapcar
+                           (lambda (item)
+                             (cons "file.read"
+                                   (tramp-rpc--file-read-params
+                                    (file-name-concat localname (car item)) t)))
+                           chunk))))
+              (cl-mapc
+               (lambda (item result)
+                 (when (tramp-rpc--batch-error-p result)
+                   (tramp-rpc--signal-batch-error
+                    "file.read" (file-name-concat localname (car item)) result))
+                 (tramp-rpc--write-local-trash-file
+                  (expand-file-name (car item) (file-name-as-directory dest))
+                  (tramp-rpc--extract-file-read-content result)
+                  (cadr item)))
+               chunk reads))))))
+    (dolist (item (nreverse directories))
+      (tramp-rpc--copy-remote-trash-directory-to-local
+       vec
+       (file-name-concat localname (car item))
+       (expand-file-name (car item) (file-name-as-directory dest))
+       (cadr item))))
+  ;; Apply directory attributes after creating children, because recursive file
+  ;; creation updates the directory mtime.
+  (tramp-rpc--apply-local-trash-attributes dest stat))
+
+(defun tramp-rpc--local-trash-destination (filename)
+  "Return local `trash-directory' destination for FILENAME, or nil.
+This mirrors the `trash-directory' branch of `move-file-to-trash'.  It only
+returns a destination when that branch resolves to a local directory."
+  (unless (fboundp 'system-move-file-to-trash)
+    (when-let* ((trash-directory (connection-local-value trash-directory))
+                (trash-dir (expand-file-name trash-directory))
+                ((not (file-remote-p trash-dir))))
+      (let* ((fn (directory-file-name (expand-file-name filename)))
+             (new-fn (concat (file-name-as-directory trash-dir)
+                             (file-name-nondirectory fn))))
+        ;; Match `move-file-to-trash' for this branch.
+        (when (string-prefix-p fn trash-dir)
+          (error "Trash directory `%s' is a subdirectory of `%s'"
+                 trash-dir filename))
+        (unless (file-directory-p trash-dir)
+          (make-directory trash-dir t))
+        (when (file-attributes new-fn)
+          (let ((version-control t)
+                (backup-directory-alist nil))
+            (setq new-fn (car (find-backup-file-name new-fn)))))
+        new-fn))))
+
+(defun tramp-rpc--fallback-move-file-to-trash (filename)
+  "Run the real `move-file-to-trash' for FILENAME without this external op."
+  (let ((inhibit-file-name-handlers
+         (cons #'tramp-rpc-file-name-handler inhibit-file-name-handlers))
+        (inhibit-file-name-operation 'move-file-to-trash))
+    (move-file-to-trash filename)))
+
+(defun tramp-rpc--delete-local-trash-copy (filename)
+  "Best-effort removal of a partial local trash copy at FILENAME."
+  (condition-case nil
+      (cond
+       ((file-symlink-p filename) (delete-file filename))
+       ((file-directory-p filename) (delete-directory filename t))
+       ((file-exists-p filename) (delete-file filename)))
+    (error nil)))
+
+(defun tramp-rpc-handle-move-file-to-trash (filename)
+  "Like `move-file-to-trash' for TRAMP-RPC files.
+Optimize the common `trash-directory' case where a remote file is moved to a
+local trash directory.  Unsupported trash modes fall back to Emacs' real
+implementation, which will use the normal TRAMP-RPC file handlers underneath."
+  (if-let* ((dest (tramp-rpc--local-trash-destination filename)))
+      (with-parsed-tramp-file-name (directory-file-name (expand-file-name filename)) nil
+        (let ((stat (tramp-rpc--call-file-stat v localname t)))
+          (unless stat
+            (signal 'file-missing (list "Opening input file" "No such file" filename)))
+          (if (eq (condition-case err
+                      (catch 'tramp-rpc-trash-unsupported
+                        (tramp-rpc--copy-remote-trash-entry-to-local v localname dest stat)
+                        'copied)
+                    (error
+                     (tramp-rpc--delete-local-trash-copy dest)
+                     (signal (car err) (cdr err))))
+                  'copied)
+              (progn
+                (condition-case err
+                    (if (equal (tramp-rpc--stat-type stat) "directory")
+                        (tramp-rpc--call v "dir.remove"
+                                         (append (tramp-rpc--encode-path localname)
+                                                 '((recursive . t))))
+                      (tramp-rpc--call v "file.delete" (tramp-rpc--encode-path localname)))
+                  (error
+                   (tramp-rpc--delete-local-trash-copy dest)
+                   (signal (car err) (cdr err))))
+                (tramp-flush-file-properties v localname)
+                (tramp-flush-directory-properties v (file-name-directory localname))
+                (tramp-rpc--invalidate-cache-for-path filename)
+                nil)
+            (tramp-rpc--delete-local-trash-copy dest)
+            (tramp-rpc--fallback-move-file-to-trash filename))))
+    (tramp-rpc--fallback-move-file-to-trash filename)))
+
 (defun tramp-rpc-handle-make-symbolic-link (target linkname &optional ok-if-already-exists)
   "Like `make-symbolic-link' for TRAMP-RPC files."
   (tramp-skeleton-make-symbolic-link target linkname ok-if-already-exists
@@ -3436,7 +3635,8 @@ Also controls process exit detection latency."
 (with-eval-after-load 'tramp-rpc
   (tramp-add-external-operation 'locate-dominating-file 'tramp-rpc-handle-locate-dominating-file 'tramp-rpc)
   (tramp-add-external-operation 'dir-locals--all-files 'tramp-rpc-handle-dir-locals--all-files 'tramp-rpc)
-  (tramp-add-external-operation 'dir-locals-find-file 'tramp-rpc-handle-dir-locals-find-file 'tramp-rpc))
+  (tramp-add-external-operation 'dir-locals-find-file 'tramp-rpc-handle-dir-locals-find-file 'tramp-rpc)
+  (tramp-add-external-operation 'move-file-to-trash 'tramp-rpc-handle-move-file-to-trash 'tramp-rpc 'file))
 
 ;;;###autoload
 (defun tramp-rpc-file-name-handler (operation &rest args)
@@ -3574,6 +3774,7 @@ Removes advice and cleans up async processes."
   (tramp-remove-external-operation 'locate-dominating-file 'tramp-rpc)
   (tramp-remove-external-operation 'dir-locals--all-files 'tramp-rpc)
   (tramp-remove-external-operation 'dir-locals-find-file 'tramp-rpc)
+  (tramp-remove-external-operation 'move-file-to-trash 'tramp-rpc)
   ;; Remove all advice (from tramp-rpc-advice module)
   ;; Not needed. This is called in `tramp-rpc-advice-unload-function'.
   ;; Remove multi-hop hook and cleanup hooks.
