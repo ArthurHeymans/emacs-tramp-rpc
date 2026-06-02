@@ -755,10 +755,10 @@ same host produce distinct connections."
   "Get the RPC connection for VEC, or nil if not connected."
   (gethash (tramp-rpc--connection-key vec) tramp-rpc--connections))
 
-(defun tramp-rpc--set-connection (vec process buffer)
+(defun tramp-rpc--set-connection (vec process buffer &optional stderr-buffer)
   "Store the RPC connection for VEC."
   (puthash (tramp-rpc--connection-key vec)
-           (list :process process :buffer buffer)
+           (list :process process :buffer buffer :stderr-buffer stderr-buffer)
            tramp-rpc--connections))
 
 (defun tramp-rpc--remove-connection (vec)
@@ -1098,28 +1098,38 @@ Returns the connection plist.  Signals `remote-file-error' on failure."
          (process-name (tramp-get-connection-name vec))
          (buffer-name (tramp-buffer-name vec))
          (buffer (get-buffer-create buffer-name))
+         (stderr-buffer (get-buffer-create (concat buffer-name " stderr")))
          process)
 
-    ;; Clear buffer - use unibyte for binary MessagePack framing
+    ;; Clear buffers.  The main buffer must be unibyte for binary MessagePack
+    ;; framing.  Keep SSH stderr in a separate buffer: OpenSSH diagnostics (for
+    ;; example ControlMaster mux messages) are not part of the RPC protocol, and
+    ;; if they are mixed into the stdout buffer the length-prefixed reader loses
+    ;; framing and every call waits for the full RPC timeout.
     (with-current-buffer buffer
       (erase-buffer)
       (set-buffer-multibyte nil)
       (set-marker (mark-marker) (point-min)))
+    (with-current-buffer stderr-buffer
+      (erase-buffer))
 
-    ;; Start the process with pipe connection (not PTY)
-    ;; PTY has line buffering and ~4KB line length limits that break large JSON-RPC requests
-    (let ((process-connection-type nil))  ; Use pipes, not PTY
-      (setq process (apply #'start-process process-name buffer ssh-args)))
-
-    ;; Configure process
-    (set-process-query-on-exit-flag process nil)
-    (set-process-coding-system process 'binary 'binary)
-
-    ;; Set up filter for async response handling
-    (set-process-filter process #'tramp-rpc--connection-filter)
+    ;; Start the process with pipe connection (not PTY).  PTYs have line
+    ;; buffering and ~4KB line length limits that break large MessagePack
+    ;; requests.  Use `make-process' rather than `start-process' so local SSH
+    ;; stderr can be separated from the binary stdout protocol stream.
+    (setq process
+          (make-process
+           :name process-name
+           :buffer buffer
+           :command ssh-args
+           :connection-type 'pipe
+           :coding 'binary
+           :noquery t
+           :stderr stderr-buffer
+           :filter #'tramp-rpc--connection-filter))
 
     ;; Store connection
-    (tramp-rpc--set-connection vec process buffer)
+    (tramp-rpc--set-connection vec process buffer stderr-buffer)
 
     ;; Store vec on the process so notifications can identify the connection
     (process-put process :tramp-rpc-vec vec)
@@ -1377,6 +1387,28 @@ Returns nil if the process is locked to a different thread."
     (or (null locked-thread)
         (eq locked-thread (current-thread)))))
 
+(defun tramp-rpc--drain-connection-stderr (conn)
+  "Drain pending stderr output for CONN's SSH process.
+`make-process' with `:stderr' creates a separate stderr process.  The RPC
+wait loops accept output with JUST-THIS-ONE for the stdout protocol process,
+so explicitly service stderr as well to prevent the stderr pipe from filling
+and blocking SSH or the remote server."
+  (when-let* ((stderr-buffer (plist-get conn :stderr-buffer))
+              ((buffer-live-p stderr-buffer))
+              (stderr-process (get-buffer-process stderr-buffer))
+              ((tramp-rpc--process-accessible-p stderr-process)))
+    (while (accept-process-output stderr-process 0 nil t))))
+
+(defun tramp-rpc--connection-stderr-tail (conn &optional max-bytes)
+  "Return a diagnostic tail from CONN's stderr buffer, or nil."
+  (when-let* ((stderr-buffer (plist-get conn :stderr-buffer))
+              ((buffer-live-p stderr-buffer)))
+    (with-current-buffer stderr-buffer
+      (when (> (buffer-size) 0)
+        (buffer-substring-no-properties
+         (max (point-min) (- (point-max) (or max-bytes 1024)))
+         (point-max))))))
+
 (defun tramp-rpc--call-with-timeout (vec method params total-timeout poll-interval)
   "Call METHOD with PARAMS on the RPC server for VEC.
 TOTAL-TIMEOUT is maximum seconds to wait.
@@ -1433,7 +1465,9 @@ Returns the result or signals an error."
             ;;   command loop.  (Mirrors tramp-accept-process-output.)
             (if (with-tramp-suspended-timers
                   (with-local-quit
+                    (tramp-rpc--drain-connection-stderr conn)
                     (accept-process-output process poll-interval nil t)
+                    (tramp-rpc--drain-connection-stderr conn)
                     t))
                 ;; Check if our response arrived in pending responses
                 (setq response (tramp-rpc--find-response-by-id expected-id))
@@ -1442,15 +1476,20 @@ Returns the result or signals an error."
               (keyboard-quit))))
 
         (unless response
-          (let ((elapsed (- (float-time) start-time)))
+          (let ((elapsed (- (float-time) start-time))
+                (stderr-tail (tramp-rpc--connection-stderr-tail conn)))
             (tramp-rpc--debug
-             "TIMEOUT id=%s method=%s elapsed=%.1fs buffer-size=%d process-live=%s"
-             expected-id method elapsed (buffer-size) (process-live-p process))
+             "TIMEOUT id=%s method=%s elapsed=%.1fs buffer-size=%d process-live=%s stderr-tail=%S"
+             expected-id method elapsed (buffer-size) (process-live-p process)
+             stderr-tail)
             (signal
 	     'remote-file-error
-	     (list (format
-		    "Timeout waiting for RPC response from %s (id=%s, method=%s, waited %.1fs)"
-                    (tramp-file-name-host vec) expected-id method elapsed)))))
+	     (list (concat
+                    (format
+		     "Timeout waiting for RPC response from %s (id=%s, method=%s, waited %.1fs)"
+                     (tramp-file-name-host vec) expected-id method elapsed)
+                    (when stderr-tail
+                      (format "; SSH stderr: %s" stderr-tail)))))))
 
         (tramp-rpc--debug "RECV id=%s (found)" expected-id)
         (if (tramp-rpc-protocol-error-p response)
@@ -1533,7 +1572,9 @@ Returns:
             ;; Process is accessible
             (if (with-tramp-suspended-timers
                   (with-local-quit
+                    (tramp-rpc--drain-connection-stderr conn)
                     (accept-process-output process 0.1 nil t)
+                    (tramp-rpc--drain-connection-stderr conn)
                     t))
                 ;; Check if our response arrived in pending responses
                 (setq response (tramp-rpc--find-response-by-id expected-id))
@@ -1541,15 +1582,20 @@ Returns:
               (keyboard-quit))))
 
         (unless response
-          (let ((elapsed (- (float-time) start-time)))
+          (let ((elapsed (- (float-time) start-time))
+                (stderr-tail (tramp-rpc--connection-stderr-tail conn)))
             (tramp-rpc--debug
-             "TIMEOUT-BATCH id=%s elapsed=%.1fs buffer-size=%d process-live=%s"
-             expected-id elapsed (buffer-size) (process-live-p process))
+             "TIMEOUT-BATCH id=%s elapsed=%.1fs buffer-size=%d process-live=%s stderr-tail=%S"
+             expected-id elapsed (buffer-size) (process-live-p process)
+             stderr-tail)
             (signal
 	     'remote-file-error
-	     (list (format
-		    "Timeout waiting for batch RPC response from %s (id=%s, waited %.1fs)"
-		    (tramp-file-name-host vec) expected-id elapsed)))))
+	     (list (concat
+                    (format
+		     "Timeout waiting for batch RPC response from %s (id=%s, waited %.1fs)"
+		     (tramp-file-name-host vec) expected-id elapsed)
+                    (when stderr-tail
+                      (format "; SSH stderr: %s" stderr-tail)))))))
 
         (tramp-rpc--debug "RECV-BATCH id=%s (found)" expected-id)
         (if (tramp-rpc-protocol-error-p response)
@@ -1618,7 +1664,9 @@ TIMEOUT is the maximum time to wait in seconds (default 30)."
           ;; Process is accessible
           (if (with-tramp-suspended-timers
                 (with-local-quit
+                  (tramp-rpc--drain-connection-stderr conn)
                   (accept-process-output process 0.1 nil t)
+                  (tramp-rpc--drain-connection-stderr conn)
                   t))
               ;; Check for each remaining ID in pending responses
               (dolist (id remaining-ids)
