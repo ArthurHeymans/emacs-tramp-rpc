@@ -365,13 +365,27 @@ treated like `tramp-own-remote-path'."
 
 (defun tramp-rpc--debug (format-string &rest args)
   "Log a debug message to *tramp-rpc-debug* buffer if debugging is enabled.
-FORMAT-STRING and ARGS are passed to `format'."
+FORMAT-STRING and ARGS are passed to `format'.
+
+When TRAMP_RPC_DEBUG_LOG or TRAMP_RPC_DEBUG_DIR is set in the environment,
+also append each line directly to a local log file.  This preserves CI
+telemetry even when later tests unload TRAMP and remove debug buffers."
   (when tramp-rpc-debug
-    (with-current-buffer (get-buffer-create "*tramp-rpc-debug*")
-      (goto-char (point-max))
-      (insert (format-time-string "[%Y-%m-%d %H:%M:%S.%3N] ")
-              (apply #'format format-string args)
-              "\n"))))
+    (let* ((line (concat (format-time-string "[%Y-%m-%d %H:%M:%S.%3N] ")
+                         (apply #'format format-string args)
+                         "\n"))
+           (log-file (or (getenv "TRAMP_RPC_DEBUG_LOG")
+                         (when-let* ((dir (getenv "TRAMP_RPC_DEBUG_DIR")))
+                           (expand-file-name "tramp-rpc-debug-live.log" dir)))))
+      (with-current-buffer (get-buffer-create "*tramp-rpc-debug*")
+        (goto-char (point-max))
+        (insert line))
+      (when log-file
+        (condition-case nil
+            (progn
+              (make-directory (file-name-directory log-file) t)
+              (write-region line nil log-file 'append 'silent))
+          (error nil))))))
 
 (defun tramp-rpc--extract-file-read-content (rpc-result)
   "Extract and optionally decompress content from FILE.READ RPC-RESULT.
