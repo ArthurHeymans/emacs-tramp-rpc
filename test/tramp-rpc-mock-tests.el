@@ -763,6 +763,52 @@ This matches the behavior expected by `tramp-test28-process-file'."
   (and (require 'tramp-cmds nil t)
        (fboundp 'tramp-file-name-with-sudo)))
 
+(ert-deftest tramp-rpc-mock-test-connection-stderr-drain-prevents-block ()
+  "Test separated connection stderr is drained while waiting for stdout."
+  :tags '(:connection)
+  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
+  (skip-unless (executable-find "python3"))
+  (let* ((stdout-buffer (generate-new-buffer " *tramp-rpc-stderr-stdout*"))
+         (stderr-buffer (generate-new-buffer " *tramp-rpc-stderr-stderr*"))
+         (process
+          (make-process
+           :name "tramp-rpc-stderr-drain-test"
+           :buffer stdout-buffer
+           :command
+           (list "python3" "-c"
+                 (concat
+                  "import sys; "
+                  "sys.stderr.buffer.write(b'E' * 200000); "
+                  "sys.stderr.flush(); "
+                  "sys.stdout.buffer.write(b'DONE'); "
+                  "sys.stdout.flush()"))
+           :connection-type 'pipe
+           :coding 'binary
+           :noquery t
+           :stderr stderr-buffer))
+         (conn (list :process process
+                     :buffer stdout-buffer
+                     :stderr-buffer stderr-buffer)))
+    (unwind-protect
+        (let ((deadline (+ (float-time) 2.0)))
+          (while (and (< (float-time) deadline)
+                      (= (with-current-buffer stdout-buffer (buffer-size)) 0)
+                      (process-live-p process))
+            (tramp-rpc--drain-connection-stderr conn)
+            (accept-process-output process 0.05 nil t)
+            (tramp-rpc--drain-connection-stderr conn))
+          (should (string-match-p
+                   "DONE"
+                   (with-current-buffer stdout-buffer (buffer-string))))
+          (should (> (with-current-buffer stderr-buffer (buffer-size)) 100000)))
+      (when (process-live-p process)
+        (delete-process process))
+      (ignore-errors
+        (when-let* ((stderr-process (get-buffer-process stderr-buffer)))
+          (delete-process stderr-process)))
+      (kill-buffer stdout-buffer)
+      (kill-buffer stderr-buffer))))
+
 (ert-deftest tramp-rpc-mock-test-multi-hop-advice ()
   "Test that tramp-multi-hop-p returns t for the rpc method."
   :tags '(:multi-hop)
