@@ -158,12 +158,12 @@ impl FilteredWatcher {
     /// Reconcile a recursive root's watched-directory set to `next`, adding and
     /// removing per-directory watches to match.
     ///
-    /// Known limitation: the diff is by path string against the post-window
-    /// snapshot. If a watched directory is renamed out of the tree (or deleted)
-    /// and a same-named directory is recreated within the same debounce window,
-    /// `current` and `next` are byte-identical, so the recreated (new-inode)
-    /// directory is not re-watched. Fixing this needs inode/descriptor-level
-    /// tracking rather than path-set diffing.
+    /// The diff is by path string. A delete+recreate (or rename-into-place) of a
+    /// watched directory that coalesces inside one debounce window leaves
+    /// `current` and `next` byte-identical, so the diff is a no-op even though the
+    /// kernel watch now points at a stale inode. That case is handled out of band
+    /// by [`WatchManager::rearm_suspect_paths`], which force-rebinds paths that
+    /// saw a remove/rename event during the window.
     fn apply_recursive_dirs(
         &mut self,
         root: &Path,
@@ -222,6 +222,39 @@ impl FilteredWatcher {
         Ok(())
     }
 
+    /// Re-arm the kernel watch for a path we already believe is watched,
+    /// rebinding it to whatever inode currently lives there. This is a REBIND,
+    /// not an add: it must NOT touch `path_watch_counts` or any ownership
+    /// bookkeeping (the shared watch's logical-owner count is unchanged).
+    ///
+    /// It recovers from inotify dropping a directory's watch on a delete+recreate
+    /// that coalesces inside one debounce window: the post-scan path set is
+    /// unchanged, so `apply_recursive_dirs` is a no-op and never re-issues the
+    /// watch for the new inode. The best-effort `unwatch` clears any stale
+    /// backend state that still refers to the old inode; the following `watch`
+    /// binds the current inode. The count check skips paths the scan already
+    /// pruned (genuine deletes / renames-away); callers gate on the path still
+    /// existing.
+    fn rearm_existing_watch(&mut self, path: &Path) -> Result<(), notify::Error> {
+        if !self.path_watch_counts.contains_key(path) {
+            return Ok(());
+        }
+        let _ = self.inner.unwatch(path);
+        self.inner.watch(path, RecursiveMode::NonRecursive)
+    }
+
+    fn watched_paths_under(&self, roots: &[PathBuf]) -> Vec<PathBuf> {
+        let mut paths: Vec<_> = self
+            .path_watch_counts
+            .keys()
+            .filter(|path| roots.iter().any(|root| path.starts_with(root)))
+            .cloned()
+            .collect();
+        paths.sort();
+        paths.dedup();
+        paths
+    }
+
     fn remove_path_watch(&mut self, path: &Path) -> Result<(), notify::Error> {
         match self.path_watch_counts.get(path).copied() {
             Some(count) if count > 1 => {
@@ -260,11 +293,15 @@ impl FilteredWatcher {
     }
 
     fn collect_recursive_dirs(root: &Path) -> HashSet<PathBuf> {
+        // Git-aware only: honor .gitignore, .git/info/exclude, the global
+        // gitignore and parent-directory ignore files, but NOT generic
+        // `.ignore`/`.rgignore` files (`ignore(false)`). Those are not a Git
+        // ignore source, so honoring them would hide directories Git/Magit still
+        // track, and ignore-rule refresh detection only recognizes Git sources.
         // hidden(false): include .git/, magit cares about it.
-        // standard_filters honors .gitignore, .git/info/exclude, global ignore,
-        // including ignore files from parent directories.
         let walker = ignore::WalkBuilder::new(root)
             .standard_filters(true)
+            .ignore(false)
             .hidden(false)
             .build();
 
@@ -460,6 +497,45 @@ impl WatchManager {
             let _ = watcher.apply_recursive_dirs(&root, dirs);
         }
     }
+
+    /// Force-rebind watches for directories that saw a remove/rename event during
+    /// the debounce window and still exist. This recovers the coalesced
+    /// delete+recreate (or rename-into-place) case that `apply_recursive_dirs`'s
+    /// path-set diff misses (unchanged set -> no-op, leaving the watch on a stale
+    /// inode). A replaced directory invalidates watches for the whole subtree, so
+    /// every still-existing watched descendant is rebound. Must run AFTER
+    /// `refresh_recursive_roots`, so genuine deletes are already pruned from the
+    /// refcounts and thus skipped here.
+    fn rearm_suspect_paths(&self, suspect_paths: HashSet<PathBuf>) {
+        let existing_roots: Vec<PathBuf> = suspect_paths
+            .into_iter()
+            .filter(|path| path.is_dir())
+            .collect();
+        if existing_roots.is_empty() {
+            return;
+        }
+
+        let candidates = {
+            let watcher = lock_or_recover(&self.watcher);
+            watcher.watched_paths_under(&existing_roots)
+        };
+        let existing: Vec<PathBuf> = candidates
+            .into_iter()
+            .filter(|path| path.is_dir())
+            .collect();
+        if existing.is_empty() {
+            return;
+        }
+
+        let mut watcher = lock_or_recover(&self.watcher);
+        for path in &existing {
+            // Best effort repair path: if the directory disappears again or the
+            // backend refuses the watch, leave logical ownership intact. A later
+            // topology refresh can prune missing paths; watch-limit errors are
+            // equivalent to refresh add failures, which are also non-fatal here.
+            let _ = watcher.rearm_existing_watch(path);
+        }
+    }
 }
 
 fn directory_tree_refresh_paths(event: &Event) -> Vec<PathBuf> {
@@ -477,6 +553,19 @@ fn directory_tree_refresh_paths(event: &Event) -> Vec<PathBuf> {
 
 fn existing_directory_paths(paths: &[PathBuf]) -> Vec<PathBuf> {
     paths.iter().filter(|path| path.is_dir()).cloned().collect()
+}
+
+/// Paths from events that drop or rebind a directory's kernel-watch inode:
+/// inotify frees a directory's watch descriptor on delete and rebinds the name
+/// to a new inode on rename. When a delete+recreate (or rename-into-place)
+/// coalesces inside one debounce window, the post-window path set is unchanged,
+/// so `apply_recursive_dirs`'s diff is a no-op and never re-arms the new inode;
+/// these paths are force-rebound afterward by `WatchManager::rearm_suspect_paths`.
+fn inode_replacing_paths(event: &Event) -> Vec<PathBuf> {
+    match event.kind {
+        EventKind::Remove(_) | EventKind::Modify(ModifyKind::Name(_)) => event.paths.clone(),
+        _ => Vec::new(),
+    }
 }
 
 fn ignore_rule_paths(event: &Event) -> Vec<PathBuf> {
@@ -551,7 +640,14 @@ async fn debounce_loop(
 
         let mut pending_paths: HashSet<PathBuf> = HashSet::new();
         let mut roots_to_refresh: HashSet<PathBuf> = HashSet::new();
-        collect_event(event, &manager, &mut pending_paths, &mut roots_to_refresh);
+        let mut suspect_paths: HashSet<PathBuf> = HashSet::new();
+        collect_event(
+            event,
+            &manager,
+            &mut pending_paths,
+            &mut roots_to_refresh,
+            &mut suspect_paths,
+        );
 
         // Phase 2: Collect more events during the debounce window
         let deadline = time::Instant::now() + DEBOUNCE_DURATION;
@@ -563,7 +659,13 @@ async fn debounce_loop(
                 event = rx.recv() => {
                     match event {
                         Some(e) => {
-                            collect_event(e, &manager, &mut pending_paths, &mut roots_to_refresh);
+                            collect_event(
+                                e,
+                                &manager,
+                                &mut pending_paths,
+                                &mut roots_to_refresh,
+                                &mut suspect_paths,
+                            );
                         }
                         None => return, // Channel closed
                     }
@@ -573,6 +675,7 @@ async fn debounce_loop(
 
         if let Some(manager) = manager.upgrade() {
             manager.refresh_recursive_roots(roots_to_refresh);
+            manager.rearm_suspect_paths(suspect_paths);
         }
 
         // Phase 3: Send notification with all collected paths
@@ -589,11 +692,13 @@ fn collect_event(
     manager: &Weak<WatchManager>,
     pending_paths: &mut HashSet<PathBuf>,
     roots_to_refresh: &mut HashSet<PathBuf>,
+    suspect_paths: &mut HashSet<PathBuf>,
 ) {
     if let Some(manager) = manager.upgrade() {
         roots_to_refresh.extend(manager.recursive_roots_for_event(&event));
     }
 
+    suspect_paths.extend(inode_replacing_paths(&event));
     pending_paths.extend(event.paths);
 }
 
@@ -784,6 +889,26 @@ mod tests {
         assert!(dirs.contains(&sub));
         assert!(dirs.contains(&sub.join("tracked")));
         assert!(!dirs.contains(&sub.join("ignored")));
+    }
+
+    /// Verify the scan is Git-aware only: a plain `.ignore` file does NOT exclude
+    /// directories (only Git ignore sources do), since Git/Magit still track them.
+    #[test]
+    fn test_recursive_scan_ignores_dot_ignore_files() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        fs::create_dir(root.join(".git")).unwrap();
+        fs::write(root.join(".ignore"), "build/\n").unwrap();
+        fs::write(root.join(".gitignore"), "gitignored/\n").unwrap();
+        fs::create_dir_all(root.join("build")).unwrap();
+        fs::create_dir_all(root.join("gitignored")).unwrap();
+
+        let dirs = FilteredWatcher::collect_recursive_dirs(&root);
+
+        // `.ignore` is not honored: build/ stays watched.
+        assert!(dirs.contains(&root.join("build")));
+        // `.gitignore` is still honored.
+        assert!(!dirs.contains(&root.join("gitignored")));
     }
 
     /// Verify a Create event for a new directory under a recursive root adds a watch.
@@ -1092,6 +1217,80 @@ mod tests {
         });
 
         let _ = watcher.unwatch(&root);
+    }
+
+    /// Verify a directory deleted and recreated within ONE debounce window is
+    /// re-armed and keeps delivering real events. This is the coalesced case the
+    /// production path actually hits: the post-window scan sees an unchanged path
+    /// set, so `apply_recursive_dirs` is a no-op and only the suspect-path re-arm
+    /// rebinds the new inode. (The overlap test above does two separate refreshes,
+    /// which masks this.)
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn test_coalesced_delete_recreate_within_window_rewatches_for_real_events() {
+        use notify::event::CreateKind;
+
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let sub = root.join("sub");
+        let nested = sub.join("nested");
+        let nested_file = nested.join("file");
+        fs::create_dir_all(&nested).unwrap();
+
+        let (tx, rx) = std_mpsc::channel();
+        let manager = WatchManager {
+            watcher: Mutex::new(
+                FilteredWatcher::new(move |event: notify::Result<Event>| {
+                    if let Ok(event) = event {
+                        let _ = tx.send(event);
+                    }
+                })
+                .unwrap(),
+            ),
+            watched_paths: Mutex::new(HashMap::new()),
+        };
+        manager.watch(&root, true).unwrap();
+
+        std::thread::sleep(Duration::from_millis(100));
+        drain_events(&rx);
+
+        // Delete and recreate within one window: the kernel drops sub's whole
+        // watched subtree on delete; the recreated dirs have new inodes but the
+        // same paths.
+        fs::remove_dir_all(&sub).unwrap();
+        fs::create_dir_all(&nested).unwrap();
+
+        // Drive debounce_loop's post-window block for the coalesced Remove+Create.
+        let remove_event = Event::new(EventKind::Remove(RemoveKind::Folder)).add_path(sub.clone());
+        let create_event = Event::new(EventKind::Create(CreateKind::Folder)).add_path(sub.clone());
+        let mut roots: HashSet<PathBuf> = HashSet::new();
+        let mut suspects: HashSet<PathBuf> = HashSet::new();
+        for event in [&remove_event, &create_event] {
+            roots.extend(manager.recursive_roots_for_event(event));
+            suspects.extend(inode_replacing_paths(event));
+        }
+        manager.refresh_recursive_roots(roots);
+        manager.rearm_suspect_paths(suspects);
+
+        // The scan's diff was a no-op (sub still present at the same path), so
+        // without the suspect re-arm the watch would point at the deleted inode.
+        {
+            let watcher = lock_or_recover(&manager.watcher);
+            assert!(watcher.recursive_roots[&root].contains(&sub));
+            assert!(watcher.recursive_roots[&root].contains(&nested));
+            assert_eq!(watcher.path_watch_counts.get(&sub), Some(&1));
+            assert_eq!(watcher.path_watch_counts.get(&nested), Some(&1));
+        }
+
+        std::thread::sleep(Duration::from_millis(100));
+        drain_events(&rx);
+
+        fs::write(&nested_file, "changed").unwrap();
+        recv_event_matching(&rx, Duration::from_secs(2), |event| {
+            event.paths.iter().any(|path| path.starts_with(&nested))
+        });
+
+        manager.unwatch(&root).unwrap();
     }
 
     /// Verify repeated watch.add calls for the same canonical path are idempotent.
