@@ -28,9 +28,7 @@ nix = { version = "0.29", features = ["term", "process", "signal", "fs"] }
 # For filesystem watching (inotify on Linux, kqueue on macOS)
 notify = "7.0"
 
-# For .gitignore-aware directory walking when registering recursive watches.
-# Without this, recursing into the worktree blows past the OS inotify limit
-# on projects with large gitignored trees (.venv, node_modules, ...).
+# For Git-aware recursive watch discovery.
 ignore = "0.4"
 
 [dev-dependencies]

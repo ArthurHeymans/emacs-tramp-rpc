@@ -42,13 +42,9 @@ fn lock_or_recover<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(|e| e.into_inner())
 }
 
-/// Wraps a `RecommendedWatcher` with .gitignore-aware recursive watching.
+/// .gitignore-aware wrapper around `RecommendedWatcher`.
 ///
-/// This wrapper intercepts recursive watches: walks the tree honoring .gitignore and
-/// registers each non-ignored directory individually in NonRecursive mode.
-/// Unwatch then tears down all sub-watches owned by that recursive root.
-///
-/// To callers it looks just like a `notify::Watcher`.
+/// Recursive watches are registered as per-directory non-recursive watches.
 struct FilteredWatcher {
     inner: RecommendedWatcher,
     recursive_roots: HashMap<PathBuf, HashSet<PathBuf>>,
@@ -134,15 +130,7 @@ impl FilteredWatcher {
             .collect()
     }
 
-    /// Recursive roots whose watched set may change when the ignore file at
-    /// `path` changes.
-    ///
-    /// Known limitation: this only fires for ignore files inside a watched tree,
-    /// since events are only delivered for watched directories. When a subdirectory
-    /// is watched recursively without its repository root (e.g. a manual recursive
-    /// watch of `/repo/sub`), changes to an ignore file *above* the root such as
-    /// `/repo/.gitignore` are never observed, so ignore rules can go stale. The
-    /// common case (watching a git worktree root) is unaffected.
+    /// Recursive roots affected by an observed Git ignore-file change.
     fn recursive_roots_for_ignore_rule(&self, path: &Path) -> Vec<PathBuf> {
         let Some(scope) = ignore_rule_scope(path) else {
             return Vec::new();
@@ -155,12 +143,7 @@ impl FilteredWatcher {
             .collect()
     }
 
-    /// Reconcile a recursive root's watched-directory set to `next`, adding and
-    /// removing per-directory watches to match.
-    ///
-    /// The diff is by path string, so a coalesced delete+recreate (or
-    /// rename-into-place) within one debounce window is a no-op here and leaves the
-    /// watch on a stale inode; [`WatchManager::rearm_suspect_paths`] repairs that.
+    /// Reconcile one recursive root to a freshly scanned directory set.
     fn apply_recursive_dirs(
         &mut self,
         root: &Path,
@@ -175,10 +158,7 @@ impl FilteredWatcher {
         let mut applied = current;
         let mut added: Vec<PathBuf> = Vec::new();
 
-        // Apply removals before additions. For a rename old -> new this yields
-        // to_remove={old}, to_add={new}; removing first lets the backend release
-        // old's descriptor before new re-registers, so new cannot attach to a
-        // descriptor still bound to old's (now renamed) inode.
+        // Remove first so rename old -> new cannot reuse old's descriptor.
         for dir in &to_remove {
             self.remove_path_watch_best_effort(dir);
             applied.remove(dir);
@@ -202,15 +182,7 @@ impl FilteredWatcher {
     }
 
     fn add_path_watch(&mut self, path: &Path) -> Result<(), notify::Error> {
-        // Always (re-)issue the OS watch, even when the refcount is already
-        // positive: a path's count can outlive its kernel watch. inotify drops a
-        // directory's watch when the directory is deleted, so after a
-        // delete+recreate under an overlapping watch the surviving count would
-        // otherwise skip re-arming and the recreated directory would go silent
-        // (see test_overlap_delete_recreate_rewatches_for_real_events). Re-adding
-        // is cheap and idempotent: inotify_add_watch returns the same descriptor
-        // and merges the mask; on macOS FSEvents the duplicate path is removed
-        // wholesale on unwatch.
+        // The logical refcount can outlive the backend watch after inode replacement.
         self.inner.watch(path, RecursiveMode::NonRecursive)?;
         *self
             .path_watch_counts
@@ -219,11 +191,7 @@ impl FilteredWatcher {
         Ok(())
     }
 
-    /// Re-arm the kernel watch for a path we already believe is watched, rebinding
-    /// it to whatever inode currently lives there. This is a REBIND, not an add: it
-    /// must NOT touch `path_watch_counts` (the shared watch's logical-owner count is
-    /// unchanged). No-ops for paths the scan already pruned; callers gate on the
-    /// path still existing. See [`WatchManager::rearm_suspect_paths`] for why.
+    /// Rebind an existing backend watch without changing logical ownership.
     fn rearm_existing_watch(&mut self, path: &Path) -> Result<(), notify::Error> {
         if !self.path_watch_counts.contains_key(path) {
             return Ok(());
@@ -261,9 +229,7 @@ impl FilteredWatcher {
         }
     }
 
-    /// Like `remove_path_watch`, but for teardown: it drops the refcount even
-    /// when the backend unwatch fails (e.g. notify already forgot a deleted
-    /// directory), so a torn-down root never leaves a phantom count behind.
+    /// Teardown variant: drop logical ownership even if backend unwatch fails.
     fn remove_path_watch_best_effort(&mut self, path: &Path) {
         match self.path_watch_counts.get(path).copied() {
             Some(count) if count > 1 => {
@@ -282,12 +248,8 @@ impl FilteredWatcher {
     }
 
     fn collect_recursive_dirs(root: &Path) -> HashSet<PathBuf> {
-        // Git-aware only: honor .gitignore, .git/info/exclude, the global
-        // gitignore and parent-directory ignore files, but NOT generic `.ignore`
-        // files (`ignore(false)`). `.ignore` is not a Git ignore source, so
-        // honoring it would hide directories Git/Magit still track, and the
-        // ignore-rule refresh detection only recognizes Git sources.
-        // hidden(false): include .git/, magit cares about it.
+        // Git-aware only: ignore Git sources, not generic `.ignore` files.
+        // hidden(false): include .git/, which Magit cares about.
         let walker = ignore::WalkBuilder::new(root)
             .standard_filters(true)
             .ignore(false)
@@ -336,13 +298,8 @@ impl WatchManager {
                 // Only forward events that indicate filesystem mutations
                 match event.kind {
                     EventKind::Create(_) | EventKind::Modify(_) | EventKind::Remove(_) => {
-                        // These directory create/rename/remove events drive the recursive
-                        // watch topology, so they must not be dropped. The channel is
-                        // unbounded rather than bounded: this closure runs on notify's
-                        // single event-loop thread, which also services watch()/unwatch(),
-                        // so a bounded blocking_send would deadlock against a refresh's
-                        // inner.watch() (and try_send would drop topology events). send()
-                        // never blocks; the queue is drained once per debounce window.
+                        // Topology events cannot be dropped, and blocking here can
+                        // deadlock notify's watch/unwatch event loop.
                         let _ = tx.send(event);
                     }
                     _ => {} // Ignore Access, Other events
@@ -366,11 +323,7 @@ impl WatchManager {
     /// If `recursive` is true, all subdirectories are also watched.
     /// Returns an error if the path doesn't exist or watch limits are exceeded.
     ///
-    /// Idempotent: re-adding an already-watched path with the same mode is a
-    /// no-op success. A non-recursive watch is upgraded to recursive on request,
-    /// but an existing recursive watch is never downgraded to non-recursive (that
-    /// request is also a no-op success). It is not refcounted at this layer: one
-    /// `unwatch` removes the path regardless of how many times it was added.
+    /// Repeated watches are idempotent; non-recursive watches can be upgraded.
     pub fn watch(&self, path: &Path, recursive: bool) -> Result<(), notify::Error> {
         let mode = if recursive {
             RecursiveMode::Recursive
@@ -487,14 +440,10 @@ impl WatchManager {
         }
     }
 
-    /// Force-rebind watches for directories that saw a remove/rename event during
-    /// the debounce window and still exist. This recovers the coalesced
-    /// delete+recreate (or rename-into-place) case that `apply_recursive_dirs`'s
-    /// path-set diff misses (unchanged set -> no-op, leaving the watch on a stale
-    /// inode). A replaced directory invalidates watches for the whole subtree, so
-    /// every still-existing watched descendant is rebound. Must run AFTER
-    /// `refresh_recursive_roots`, so genuine deletes are already pruned from the
-    /// refcounts and thus skipped here.
+    /// Rebind still-existing watches after Linux/inotify inode replacement.
+    ///
+    /// Must run after `refresh_recursive_roots`, so genuine deletes are already
+    /// pruned and only path-identical replacements remain.
     fn rearm_suspect_paths(&self, suspect_paths: HashSet<PathBuf>) {
         let existing_roots: Vec<PathBuf> = suspect_paths
             .into_iter()
@@ -518,10 +467,7 @@ impl WatchManager {
 
         let mut watcher = lock_or_recover(&self.watcher);
         for path in &existing {
-            // Best effort repair path: if the directory disappears again or the
-            // backend refuses the watch, leave logical ownership intact. A later
-            // topology refresh can prune missing paths; watch-limit errors are
-            // equivalent to refresh add failures, which are also non-fatal here.
+            // Best effort: keep logical ownership even if the backend refuses.
             let _ = watcher.rearm_existing_watch(path);
         }
     }
@@ -544,14 +490,7 @@ fn existing_directory_paths(paths: &[PathBuf]) -> Vec<PathBuf> {
     paths.iter().filter(|path| path.is_dir()).cloned().collect()
 }
 
-/// Paths from events that drop or rebind a directory's kernel-watch inode (a
-/// delete frees the watch descriptor; a rename rebinds the name to a new inode).
-/// Collected during the debounce window and force-rebound afterward by
-/// [`WatchManager::rearm_suspect_paths`].
-///
-/// inotify-only: macOS FSEvents is path-based and keeps delivering to the
-/// recreated path, so there is nothing to re-arm. Returning empty off Linux keeps
-/// `suspect_paths` empty and skips the unwatch/rewatch churn entirely.
+/// Linux/inotify inputs for [`WatchManager::rearm_suspect_paths`].
 #[cfg(target_os = "linux")]
 fn inode_replacing_paths(event: &Event) -> Vec<PathBuf> {
     match event.kind {
@@ -852,7 +791,6 @@ mod tests {
         }
     }
 
-    /// Verify .gitignore patterns exclude their target directories from a recursive scan.
     #[test]
     fn test_recursive_scan_skips_gitignored_directories() {
         let temp = tempfile::tempdir().unwrap();
@@ -870,7 +808,6 @@ mod tests {
         assert!(!dirs.contains(&root.join("ignored/nested")));
     }
 
-    /// Verify .gitignore files above the walk root still apply to descendant paths.
     #[test]
     fn test_recursive_scan_honors_parent_gitignore() {
         let temp = tempfile::tempdir().unwrap();
@@ -888,8 +825,6 @@ mod tests {
         assert!(!dirs.contains(&sub.join("ignored")));
     }
 
-    /// Verify the scan is Git-aware only: a plain `.ignore` file does NOT exclude
-    /// directories (only Git ignore sources do), since Git/Magit still track them.
     #[test]
     fn test_recursive_scan_ignores_dot_ignore_files() {
         let temp = tempfile::tempdir().unwrap();
@@ -902,13 +837,10 @@ mod tests {
 
         let dirs = FilteredWatcher::collect_recursive_dirs(&root);
 
-        // `.ignore` is not honored: build/ stays watched.
         assert!(dirs.contains(&root.join("build")));
-        // `.gitignore` is still honored.
         assert!(!dirs.contains(&root.join("gitignored")));
     }
 
-    /// Verify a Create event for a new directory under a recursive root adds a watch.
     #[test]
     fn test_refresh_adds_new_directory_under_recursive_root() {
         let temp = tempfile::tempdir().unwrap();
@@ -937,7 +869,6 @@ mod tests {
         manager.unwatch(&root).unwrap();
     }
 
-    /// Verify a Create event for a gitignored directory does not add a watch.
     #[test]
     fn test_refresh_does_not_watch_new_gitignored_directory() {
         let temp = tempfile::tempdir().unwrap();
@@ -961,7 +892,6 @@ mod tests {
         manager.unwatch(&root).unwrap();
     }
 
-    /// Verify ignore rule file changes refresh the filtered recursive watch set.
     #[test]
     fn test_refresh_handles_gitignore_change() {
         let temp = tempfile::tempdir().unwrap();
@@ -1001,7 +931,6 @@ mod tests {
         manager.unwatch(&root).unwrap();
     }
 
-    /// Verify Remove events clear stale watch state so a same-name recreation can re-register.
     #[test]
     fn test_refresh_removes_deleted_directory_and_rewatches_recreated_path() {
         let temp = tempfile::tempdir().unwrap();
@@ -1040,7 +969,6 @@ mod tests {
         manager.unwatch(&root).unwrap();
     }
 
-    /// Verify a Modify(Name) rename event moves the watch from the old path to the new path.
     #[test]
     fn test_refresh_handles_directory_rename() {
         let temp = tempfile::tempdir().unwrap();
@@ -1073,10 +1001,6 @@ mod tests {
         manager.unwatch(&root).unwrap();
     }
 
-    /// Verify a renamed directory receives real inotify events after the refresh.
-    /// Linux-only: it guards inotify watch-descriptor reuse, which does not occur
-    /// on macOS FSEvents, and FSEvents delivery is too latency-dependent to assert
-    /// reliably in a unit test.
     #[cfg(target_os = "linux")]
     #[test]
     fn test_refresh_rewatches_renamed_directory_for_real_events() {
@@ -1113,11 +1037,6 @@ mod tests {
         watcher.unwatch(&root).unwrap();
     }
 
-    /// Verify two overlapping recursive roots keep delivering real events for a
-    /// shared subdirectory after it is renamed. Coverage for refcounted re-watch
-    /// of the renamed path across both roots' refreshes (the renamed dir's parent
-    /// is watched, so notify remaps it; this guards that the refresh bookkeeping
-    /// stays consistent and events keep flowing).
     #[cfg(target_os = "linux")]
     #[test]
     fn test_overlapping_roots_rewatch_renamed_dir_for_real_events() {
@@ -1137,7 +1056,6 @@ mod tests {
         })
         .unwrap();
 
-        // Two overlapping recursive roots; sub/old is shared (refcount 2).
         watcher.watch(&root, RecursiveMode::Recursive).unwrap();
         watcher.watch(&sub, RecursiveMode::Recursive).unwrap();
         assert_eq!(watcher.path_watch_counts.get(&old_dir), Some(&2));
@@ -1146,7 +1064,6 @@ mod tests {
         drain_events(&rx);
 
         fs::rename(&old_dir, &new_dir).unwrap();
-        // Refresh both roots, as refresh_recursive_roots does for a rename event.
         for r in [&root, &sub] {
             let dirs = FilteredWatcher::collect_recursive_dirs(r);
             watcher.apply_recursive_dirs(r, dirs).unwrap();
@@ -1166,10 +1083,6 @@ mod tests {
         watcher.unwatch(&sub).unwrap();
     }
 
-    /// Verify deleting then recreating a directory covered by two overlapping
-    /// watches re-arms a real OS watch. Regression test: the kernel drops a
-    /// deleted directory's watch on its own, so a count-trusting re-add would
-    /// never reinstall it, leaving the recreated directory silent.
     #[cfg(target_os = "linux")]
     #[test]
     fn test_overlap_delete_recreate_rewatches_for_real_events() {
@@ -1187,7 +1100,6 @@ mod tests {
         })
         .unwrap();
 
-        // Overlapping direct + recursive watch on sub -> refcount 2.
         watcher.watch(&sub, RecursiveMode::NonRecursive).unwrap();
         watcher.watch(&root, RecursiveMode::Recursive).unwrap();
         assert_eq!(watcher.path_watch_counts.get(&sub), Some(&2));
@@ -1195,12 +1107,10 @@ mod tests {
         std::thread::sleep(Duration::from_millis(100));
         drain_events(&rx);
 
-        // Delete sub (the kernel auto-drops its watch) then refresh root's set.
         fs::remove_dir_all(&sub).unwrap();
         let dirs = FilteredWatcher::collect_recursive_dirs(&root);
         watcher.apply_recursive_dirs(&root, dirs).unwrap();
 
-        // Recreate the same path (new inode, no kernel watch yet) and refresh.
         fs::create_dir(&sub).unwrap();
         let dirs = FilteredWatcher::collect_recursive_dirs(&root);
         watcher.apply_recursive_dirs(&root, dirs).unwrap();
@@ -1216,12 +1126,6 @@ mod tests {
         let _ = watcher.unwatch(&root);
     }
 
-    /// Verify a directory deleted and recreated within ONE debounce window is
-    /// re-armed and keeps delivering real events. This is the coalesced case the
-    /// production path actually hits: the post-window scan sees an unchanged path
-    /// set, so `apply_recursive_dirs` is a no-op and only the suspect-path re-arm
-    /// rebinds the new inode. (The overlap test above does two separate refreshes,
-    /// which masks this.)
     #[cfg(target_os = "linux")]
     #[test]
     fn test_coalesced_delete_recreate_within_window_rewatches_for_real_events() {
@@ -1251,13 +1155,10 @@ mod tests {
         std::thread::sleep(Duration::from_millis(100));
         drain_events(&rx);
 
-        // Delete and recreate within one window: the kernel drops sub's whole
-        // watched subtree on delete; the recreated dirs have new inodes but the
-        // same paths.
         fs::remove_dir_all(&sub).unwrap();
         fs::create_dir_all(&nested).unwrap();
 
-        // Drive debounce_loop's post-window block for the coalesced Remove+Create.
+        // Drive debounce_loop's post-window refresh for coalesced Remove+Create.
         let remove_event = Event::new(EventKind::Remove(RemoveKind::Folder)).add_path(sub.clone());
         let create_event = Event::new(EventKind::Create(CreateKind::Folder)).add_path(sub.clone());
         let mut roots: HashSet<PathBuf> = HashSet::new();
@@ -1269,8 +1170,6 @@ mod tests {
         manager.refresh_recursive_roots(roots);
         manager.rearm_suspect_paths(suspects);
 
-        // The scan's diff was a no-op (sub still present at the same path), so
-        // without the suspect re-arm the watch would point at the deleted inode.
         {
             let watcher = lock_or_recover(&manager.watcher);
             assert!(watcher.recursive_roots[&root].contains(&sub));
@@ -1290,7 +1189,67 @@ mod tests {
         manager.unwatch(&root).unwrap();
     }
 
-    /// Verify repeated watch.add calls for the same canonical path are idempotent.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn test_coalesced_rename_into_place_within_window_rewatches_for_real_events() {
+        use notify::event::RenameMode;
+
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let sub = root.join("sub");
+        let sub_file = sub.join("file");
+        fs::create_dir(&sub).unwrap();
+
+        let staging_temp = tempfile::tempdir().unwrap();
+        let staging = staging_temp.path().join("staging");
+        fs::create_dir(&staging).unwrap();
+
+        let (tx, rx) = std_mpsc::channel();
+        let manager = WatchManager {
+            watcher: Mutex::new(
+                FilteredWatcher::new(move |event: notify::Result<Event>| {
+                    if let Ok(event) = event {
+                        let _ = tx.send(event);
+                    }
+                })
+                .unwrap(),
+            ),
+            watched_paths: Mutex::new(HashMap::new()),
+        };
+        manager.watch(&root, true).unwrap();
+
+        std::thread::sleep(Duration::from_millis(100));
+        drain_events(&rx);
+
+        fs::rename(&staging, &sub).unwrap();
+
+        // Drive debounce_loop's post-window refresh for rename-into-place.
+        let rename_event =
+            Event::new(EventKind::Modify(ModifyKind::Name(RenameMode::To))).add_path(sub.clone());
+        let mut roots: HashSet<PathBuf> = HashSet::new();
+        let mut suspects: HashSet<PathBuf> = HashSet::new();
+        roots.extend(manager.recursive_roots_for_event(&rename_event));
+        suspects.extend(inode_replacing_paths(&rename_event));
+        manager.refresh_recursive_roots(roots);
+        manager.rearm_suspect_paths(suspects);
+
+        {
+            let watcher = lock_or_recover(&manager.watcher);
+            assert!(watcher.recursive_roots[&root].contains(&sub));
+            assert_eq!(watcher.path_watch_counts.get(&sub), Some(&1));
+        }
+
+        std::thread::sleep(Duration::from_millis(100));
+        drain_events(&rx);
+
+        fs::write(&sub_file, "changed").unwrap();
+        recv_event_matching(&rx, Duration::from_secs(2), |event| {
+            event.paths.iter().any(|path| path.starts_with(&sub))
+        });
+
+        manager.unwatch(&root).unwrap();
+    }
+
     #[test]
     fn test_watch_is_idempotent_for_same_path_and_upgrades_to_recursive() {
         let temp = tempfile::tempdir().unwrap();
@@ -1313,7 +1272,6 @@ mod tests {
         assert!(!watcher.path_watch_counts.contains_key(&root));
     }
 
-    /// Verify refcounting keeps a non-recursive watch alive when its recursive parent is unwatched.
     #[test]
     fn test_recursive_unwatch_preserves_overlapping_direct_watch() {
         let temp = tempfile::tempdir().unwrap();
@@ -1334,7 +1292,6 @@ mod tests {
         assert!(!watcher.path_watch_counts.contains_key(&sub));
     }
 
-    /// Verify refcounting keeps a nested recursive watch alive when the outer recursive watch is unwatched.
     #[test]
     fn test_recursive_unwatch_preserves_overlapping_recursive_watch() {
         let temp = tempfile::tempdir().unwrap();
