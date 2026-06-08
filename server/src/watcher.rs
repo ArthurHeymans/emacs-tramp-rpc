@@ -158,12 +158,9 @@ impl FilteredWatcher {
     /// Reconcile a recursive root's watched-directory set to `next`, adding and
     /// removing per-directory watches to match.
     ///
-    /// The diff is by path string. A delete+recreate (or rename-into-place) of a
-    /// watched directory that coalesces inside one debounce window leaves
-    /// `current` and `next` byte-identical, so the diff is a no-op even though the
-    /// kernel watch now points at a stale inode. That case is handled out of band
-    /// by [`WatchManager::rearm_suspect_paths`], which force-rebinds paths that
-    /// saw a remove/rename event during the window.
+    /// The diff is by path string, so a coalesced delete+recreate (or
+    /// rename-into-place) within one debounce window is a no-op here and leaves the
+    /// watch on a stale inode; [`WatchManager::rearm_suspect_paths`] repairs that.
     fn apply_recursive_dirs(
         &mut self,
         root: &Path,
@@ -222,19 +219,11 @@ impl FilteredWatcher {
         Ok(())
     }
 
-    /// Re-arm the kernel watch for a path we already believe is watched,
-    /// rebinding it to whatever inode currently lives there. This is a REBIND,
-    /// not an add: it must NOT touch `path_watch_counts` or any ownership
-    /// bookkeeping (the shared watch's logical-owner count is unchanged).
-    ///
-    /// It recovers from inotify dropping a directory's watch on a delete+recreate
-    /// that coalesces inside one debounce window: the post-scan path set is
-    /// unchanged, so `apply_recursive_dirs` is a no-op and never re-issues the
-    /// watch for the new inode. The best-effort `unwatch` clears any stale
-    /// backend state that still refers to the old inode; the following `watch`
-    /// binds the current inode. The count check skips paths the scan already
-    /// pruned (genuine deletes / renames-away); callers gate on the path still
-    /// existing.
+    /// Re-arm the kernel watch for a path we already believe is watched, rebinding
+    /// it to whatever inode currently lives there. This is a REBIND, not an add: it
+    /// must NOT touch `path_watch_counts` (the shared watch's logical-owner count is
+    /// unchanged). No-ops for paths the scan already pruned; callers gate on the
+    /// path still existing. See [`WatchManager::rearm_suspect_paths`] for why.
     fn rearm_existing_watch(&mut self, path: &Path) -> Result<(), notify::Error> {
         if !self.path_watch_counts.contains_key(path) {
             return Ok(());
@@ -294,10 +283,10 @@ impl FilteredWatcher {
 
     fn collect_recursive_dirs(root: &Path) -> HashSet<PathBuf> {
         // Git-aware only: honor .gitignore, .git/info/exclude, the global
-        // gitignore and parent-directory ignore files, but NOT generic
-        // `.ignore`/`.rgignore` files (`ignore(false)`). Those are not a Git
-        // ignore source, so honoring them would hide directories Git/Magit still
-        // track, and ignore-rule refresh detection only recognizes Git sources.
+        // gitignore and parent-directory ignore files, but NOT generic `.ignore`
+        // files (`ignore(false)`). `.ignore` is not a Git ignore source, so
+        // honoring it would hide directories Git/Magit still track, and the
+        // ignore-rule refresh detection only recognizes Git sources.
         // hidden(false): include .git/, magit cares about it.
         let walker = ignore::WalkBuilder::new(root)
             .standard_filters(true)
@@ -555,17 +544,25 @@ fn existing_directory_paths(paths: &[PathBuf]) -> Vec<PathBuf> {
     paths.iter().filter(|path| path.is_dir()).cloned().collect()
 }
 
-/// Paths from events that drop or rebind a directory's kernel-watch inode:
-/// inotify frees a directory's watch descriptor on delete and rebinds the name
-/// to a new inode on rename. When a delete+recreate (or rename-into-place)
-/// coalesces inside one debounce window, the post-window path set is unchanged,
-/// so `apply_recursive_dirs`'s diff is a no-op and never re-arms the new inode;
-/// these paths are force-rebound afterward by `WatchManager::rearm_suspect_paths`.
+/// Paths from events that drop or rebind a directory's kernel-watch inode (a
+/// delete frees the watch descriptor; a rename rebinds the name to a new inode).
+/// Collected during the debounce window and force-rebound afterward by
+/// [`WatchManager::rearm_suspect_paths`].
+///
+/// inotify-only: macOS FSEvents is path-based and keeps delivering to the
+/// recreated path, so there is nothing to re-arm. Returning empty off Linux keeps
+/// `suspect_paths` empty and skips the unwatch/rewatch churn entirely.
+#[cfg(target_os = "linux")]
 fn inode_replacing_paths(event: &Event) -> Vec<PathBuf> {
     match event.kind {
         EventKind::Remove(_) | EventKind::Modify(ModifyKind::Name(_)) => event.paths.clone(),
         _ => Vec::new(),
     }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn inode_replacing_paths(_event: &Event) -> Vec<PathBuf> {
+    Vec::new()
 }
 
 fn ignore_rule_paths(event: &Event) -> Vec<PathBuf> {
