@@ -24,6 +24,7 @@
 ;; - process-command / process-tty-name (return stored metadata)
 ;; - vc-call-backend (ensure default-directory for remote VC files)
 ;; - vc-exec-after (handle native-compiled VC process state races)
+;; - python-shell--tramp-with-environment (avoid sending shell commands to the RPC server)
 ;; - eglot--cmd (bypass shell wrapping for RPC connections)
 ;; - magit-start-process (force pipe mode when INPUT will be piped to the process)
 ;; - vc-dir-refresh (clean up stale processes)
@@ -60,8 +61,12 @@
 (declare-function vc-set-mode-line-busy-indicator "vc-dispatcher")
 (declare-function vc--process-sentinel "vc-dispatcher")
 
-;; Variables from vc-dir.el (used in vc-dir-refresh handler)
+;; Functions from python.el (used by python-shell integration)
+(declare-function python-shell--tramp-with-environment "python")
+
+;; Variables from vc-dir.el / tramp.el (used in integration handlers)
 (defvar vc-dir-process-buffer)
+(defvar tramp-remote-process-environment)
 
 ;; ============================================================================
 ;; Process I/O handler
@@ -330,7 +335,28 @@ state."
   nil)
 
 ;; ============================================================================
-;; Privilege elevation integration
+;; Python shell integration
+;; ============================================================================
+
+(defun tramp-rpc-handle-python-shell--tramp-with-environment
+    (orig-fun vec extraenv bodyfun)
+  "Run Python shell BODYFUN without tramp-sh environment refresh for RPC.
+
+`python-shell--tramp-with-environment' assumes that every TRAMP connection
+has an interactive shell and refreshes environment variables by calling
+`tramp-send-command'.  A tramp-rpc connection process is the MessagePack RPC
+server, not a shell, so sending shell snippets to it can block commands such as
+`run-python'.  For rpc connections, keep the requested environment in a
+dynamic `tramp-remote-process-environment' binding and let tramp-rpc's process
+handlers pass it directly to the server."
+  (if (tramp-rpc-file-name-p vec)
+      (let ((tramp-remote-process-environment
+             (append extraenv
+                     (and (boundp 'tramp-remote-process-environment)
+                          tramp-remote-process-environment))))
+        (funcall bodyfun))
+    (funcall orig-fun vec extraenv bodyfun)))
+
 ;; ============================================================================
 ;; Eglot integration
 ;; ============================================================================
@@ -462,6 +488,12 @@ exited (remote side finished), delete it so the refresh can proceed."
   ;; If eglot/magit-process is already loaded while `tramp-rpc' is being
   ;; required, defer registration until `tramp-rpc' is provided; otherwise
   ;; `tramp-add-external-operation' calls `(require 'tramp-rpc)' recursively.
+  (with-eval-after-load 'python
+    (unless (advice-member-p
+             #'tramp-rpc-handle-python-shell--tramp-with-environment
+             'python-shell--tramp-with-environment)
+      (advice-add 'python-shell--tramp-with-environment :around
+                  #'tramp-rpc-handle-python-shell--tramp-with-environment)))
   (with-eval-after-load 'eglot
     (with-eval-after-load 'tramp-rpc
       (tramp-add-external-operation
@@ -490,6 +522,9 @@ exited (remote side finished), delete it so the refresh can proceed."
   (tramp-remove-external-operation 'process-tty-name 'tramp-rpc)
   (tramp-remove-external-operation 'vc-call-backend 'tramp-rpc)
   (tramp-remove-external-operation 'vc-exec-after 'tramp-rpc)
+  (when (fboundp 'python-shell--tramp-with-environment)
+    (advice-remove 'python-shell--tramp-with-environment
+                   #'tramp-rpc-handle-python-shell--tramp-with-environment))
   (tramp-remove-external-operation 'eglot--cmd 'tramp-rpc)
   (tramp-remove-external-operation 'magit-start-process 'tramp-rpc)
   (tramp-remove-external-operation 'vc-dir-refresh 'tramp-rpc))

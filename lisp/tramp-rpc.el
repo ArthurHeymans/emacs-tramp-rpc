@@ -663,6 +663,36 @@ Uses `tramp-remote-path' by default.  A non-nil deprecated
     (when remote-path
       `(("PATH" . ,(mapconcat #'identity remote-path ":"))))))
 
+(defvar tramp-remote-process-environment)
+
+(defun tramp-rpc--environment-list-to-alist (environment)
+  "Convert ENVIRONMENT strings of the form NAME=VALUE to an alist.
+Entries without an equals sign are ignored because they request unsetting a
+variable in Emacs process APIs, while tramp-rpc sends an explicit environment
+map to the remote server."
+  (let (alist)
+    (dolist (elt environment)
+      (when (and (stringp elt)
+                 (string-match "\\`\\([^=]+\\)=\\(.*\\)\\'" elt))
+        (push (cons (match-string 1 elt) (match-string 2 elt)) alist)))
+    (nreverse alist)))
+
+(defun tramp-rpc--tramp-remote-process-environment ()
+  "Return dynamic `tramp-remote-process-environment' entries as an alist.
+This includes dynamic bindings made by packages such as python.el for remote
+processes.  The baseline `tramp-remote-process-environment' entries are shell
+setup snippets for tramp-sh (for example, LC_CTYPE set to two single quotes),
+not a direct exec environment.  Do not pass those defaults to RPC child
+processes, because they can leak shell-only quoting and produce warnings on
+stdout/stderr."
+  (when (boundp 'tramp-remote-process-environment)
+    (let ((baseline (default-toplevel-value 'tramp-remote-process-environment))
+          dynamic)
+      (dolist (elt tramp-remote-process-environment)
+        (unless (member elt baseline)
+          (push elt dynamic)))
+      (tramp-rpc--environment-list-to-alist (nreverse dynamic)))))
+
 (defun tramp-rpc--caller-environment ()
   "Extract environment variable overrides from `process-environment'.
 Emacs packages dynamically bind env vars via `with-environment-variables'
@@ -3125,6 +3155,7 @@ refresh), git commands are served from the prefetch cache when possible."
                (env (tramp-rpc--ensure-inside-emacs-env
                      (tramp-rpc--merge-environments
                       (tramp-rpc--remote-path-environment v)
+                      (tramp-rpc--tramp-remote-process-environment)
                       (tramp-rpc--get-direnv-environment v localname)
                       (tramp-rpc--caller-environment))))
                (stdin-content (when (and infile (not (eq infile t)))

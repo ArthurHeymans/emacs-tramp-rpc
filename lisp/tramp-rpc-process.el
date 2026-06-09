@@ -53,6 +53,7 @@
 (declare-function tramp-rpc--ensure-inside-emacs-env "tramp-rpc")
 (declare-function tramp-rpc--merge-environments "tramp-rpc")
 (declare-function tramp-rpc--remote-path-environment "tramp-rpc")
+(declare-function tramp-rpc--tramp-remote-process-environment "tramp-rpc")
 (declare-function tramp-rpc--caller-environment "tramp-rpc")
 (declare-function tramp-rpc-file-name-p "tramp-rpc")
 
@@ -454,6 +455,7 @@ Resolves program path and loads direnv environment from working directory."
       (let ((process-env (tramp-rpc--ensure-inside-emacs-env
                           (tramp-rpc--merge-environments
                            (tramp-rpc--remote-path-environment v)
+                           (tramp-rpc--tramp-remote-process-environment)
                            (tramp-rpc--get-direnv-environment v localname)
                            (tramp-rpc--caller-environment)))))
         (if use-pty

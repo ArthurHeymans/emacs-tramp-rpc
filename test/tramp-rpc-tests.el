@@ -1255,6 +1255,52 @@ This matches the upstream `tramp-test28-process-file' test."
           (should (string-match-p "test-input" output)))
       (ignore-errors (delete-process proc)))))
 
+(ert-deftest tramp-rpc-test14-python-shell-make-comint ()
+  "Test `python-shell-make-comint' on an existing TRAMP RPC connection."
+  :tags '(:process :expensive-test)
+  (skip-unless (tramp-rpc-test-enabled))
+  (require 'python)
+
+  (let* ((default-directory (tramp-rpc-test--remote-directory))
+         (python-shell-completion-native-enable nil)
+         (python-shell-font-lock-enable nil)
+         (buf nil)
+         proc)
+    (let* ((probe-buffer (generate-new-buffer "*tramp-rpc-python-probe*"))
+           (process-connection-type t)
+           (probe (start-file-process "tramp-rpc-python-probe" probe-buffer
+                                      "python3" "--version")))
+      (unwind-protect
+          (progn
+            (with-timeout (10 (error "Python probe timeout"))
+              (while (process-live-p probe)
+                (accept-process-output probe 0.1)))
+            (skip-unless (= 0 (process-exit-status probe))))
+        (ignore-errors (delete-process probe))
+        (kill-buffer probe-buffer)))
+    ;; Ensure the RPC connection exists before python.el tries to adjust its
+    ;; remote environment.  This used to hang because python.el sent shell
+    ;; snippets to the RPC server process via `tramp-send-command'.
+    (should (file-directory-p default-directory))
+    (unwind-protect
+        (with-timeout (15 (error "Python shell timeout"))
+          (setq buf (python-shell-make-comint "python3 -i" "Python-Test"))
+          (setq proc (get-buffer-process buf))
+          (while (and (process-live-p proc)
+                      (not (with-current-buffer buf
+                             (save-excursion
+                               (goto-char (point-min))
+                               (search-forward ">>>" nil t)))))
+            (accept-process-output proc 0.1))
+          (should (with-current-buffer buf
+                    (save-excursion
+                      (goto-char (point-min))
+                      (search-forward ">>>" nil t)))))
+      (when (processp proc)
+        (ignore-errors (delete-process proc)))
+      (when (and (bufferp buf) (buffer-live-p buf))
+        (kill-buffer buf)))))
+
 ;;; ============================================================================
 ;;; Test 15: Copy/Rename Between Local and Remote
 ;;; ============================================================================
