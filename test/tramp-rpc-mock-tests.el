@@ -2056,6 +2056,42 @@ discard it for being unreadable."
                    ("B" . "direnv")
                    ("GIT_INDEX_FILE" . "/tmp/index")))))
 
+(ert-deftest tramp-rpc-mock-test-tramp-remote-process-environment-to-alist ()
+  "Test conversion of dynamic `tramp-remote-process-environment' entries."
+  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
+  (let ((tramp-remote-process-environment
+         (append '("TERM=dumb" "PYTHONUNBUFFERED=1" "UNSET_ME" "EMPTY=")
+                 (default-toplevel-value 'tramp-remote-process-environment))))
+    (should (equal (tramp-rpc--tramp-remote-process-environment)
+                   '(("TERM" . "dumb")
+                     ("PYTHONUNBUFFERED" . "1")
+                     ("EMPTY" . ""))))))
+
+(ert-deftest tramp-rpc-mock-test-tramp-remote-process-environment-skips-baseline ()
+  "Test TRAMP shell setup defaults are not passed as RPC child env vars."
+  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
+  (let ((tramp-remote-process-environment
+         (default-toplevel-value 'tramp-remote-process-environment)))
+    (should-not (tramp-rpc--tramp-remote-process-environment))))
+
+(ert-deftest tramp-rpc-mock-test-python-tramp-environment-advice ()
+  "Test python.el TRAMP environment advice avoids shell refresh for RPC."
+  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
+  (let ((called-original nil)
+        (body-env nil)
+        (vec (make-tramp-file-name :method "rpc" :host "host" :user "user"
+                                   :localname "/work/"))
+        (tramp-remote-process-environment '("EXISTING=yes")))
+    (tramp-rpc-handle-python-shell--tramp-with-environment
+     (lambda (&rest _args) (setq called-original t))
+     vec
+     '("TERM=dumb" "PYTHONUNBUFFERED=1")
+     (lambda ()
+       (setq body-env tramp-remote-process-environment)))
+    (should-not called-original)
+    (should (equal body-env
+                   '("TERM=dumb" "PYTHONUNBUFFERED=1" "EXISTING=yes")))))
+
 (ert-deftest tramp-rpc-mock-test-process-file-passes-path-and-unresolved-command ()
   "Test `process-file' searches commands with `tramp-remote-path' PATH."
   (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
@@ -2082,6 +2118,32 @@ discard it for being unreadable."
       (should (equal (alist-get 'args captured-params) ["pattern"]))
       (should (equal (assoc "PATH" (alist-get 'env captured-params))
                      '("PATH" . "/home/user/.cargo/bin:/usr/bin:/bin"))))))
+
+(ert-deftest tramp-rpc-mock-test-process-file-passes-tramp-remote-environment ()
+  "Test `process-file' forwards dynamic TRAMP remote process env vars."
+  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
+  (let ((default-directory "/rpc:user@host:/work/")
+        (captured-env nil)
+        (tramp-remote-process-environment '("TERM=dumb" "PYTHONUNBUFFERED=1")))
+    (cl-letf (((symbol-function 'tramp-rpc--cached-remote-path)
+               (lambda (_vec) '("/usr/bin")))
+              ((symbol-function 'tramp-rpc--get-direnv-environment)
+               (lambda (&rest _) nil))
+              ((symbol-function 'tramp-rpc--caller-environment)
+               (lambda () nil))
+              ((symbol-function 'tramp-rpc-magit--process-cache-lookup)
+               (lambda (&rest _) nil))
+              ((symbol-function 'tramp-rpc--decode-output)
+               (lambda (output _encoding) output))
+              ((symbol-function 'tramp-rpc--call)
+               (lambda (_vec method params)
+                 (should (equal method "process.run"))
+                 (setq captured-env (alist-get 'env params))
+                 '((exit_code . 0) (stdout . "") (stderr . "")))))
+      (should (= (tramp-rpc-handle-process-file "python3" nil nil nil "-c" "pass") 0))
+      (should (equal (assoc "TERM" captured-env) '("TERM" . "dumb")))
+      (should (equal (assoc "PYTHONUNBUFFERED" captured-env)
+                     '("PYTHONUNBUFFERED" . "1"))))))
 
 ;;; ============================================================================
 ;;; Direnv Cache Path Normalization Tests (No server or SSH required)
