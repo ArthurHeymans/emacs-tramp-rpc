@@ -6,6 +6,7 @@ use serde::Deserialize;
 use std::collections::HashMap;
 use std::os::unix::fs::{FileTypeExt, MetadataExt};
 use std::path::Path;
+use std::process::Command;
 use std::sync::Mutex;
 use tokio::fs;
 
@@ -136,6 +137,27 @@ fn sysconf_bufsize(name: libc::c_int, fallback: usize) -> usize {
 /// Used for both getpwuid_r and getgrgid_r retry loops.
 const MAX_NSS_BUFSIZE: usize = 1024 * 1024;
 
+fn getent_name(database: &str, id: u32) -> Option<String> {
+    let output = Command::new("getent")
+        .arg(database)
+        .arg(id.to_string())
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let line = std::str::from_utf8(&output.stdout)
+        .ok()?
+        .lines()
+        .next()?;
+    let name = line.split(':').next()?;
+    if name.is_empty() {
+        None
+    } else {
+        Some(name.to_string())
+    }
+}
+
 /// Get user name from uid using thread-safe getpwuid_r.
 ///
 /// Uses `sysconf(_SC_GETPW_R_SIZE_MAX)` for the initial buffer size and
@@ -180,7 +202,7 @@ pub fn get_user_name(uid: u32) -> Option<String> {
         }
 
         if ret != 0 || result_ptr.is_null() {
-            return None;
+            break getent_name("passwd", uid);
         }
 
         let cname = unsafe { std::ffi::CStr::from_ptr(pwd.pw_name) };
@@ -242,7 +264,7 @@ pub fn get_group_name(gid: u32) -> Option<String> {
         }
 
         if ret != 0 || result_ptr.is_null() {
-            return None;
+            break getent_name("group", gid);
         }
 
         let cname = unsafe { std::ffi::CStr::from_ptr(grp.gr_name) };
