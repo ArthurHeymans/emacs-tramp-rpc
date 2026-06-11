@@ -254,6 +254,9 @@ impl FilteredWatcher {
             .standard_filters(true)
             .ignore(false)
             .hidden(false)
+            // Match notify's recursive watcher behavior: recursive watches
+            // follow symlinked directories and install watches below them.
+            .follow_links(true)
             .build();
 
         let mut dirs = HashSet::new();
@@ -841,6 +844,25 @@ mod tests {
         assert!(!dirs.contains(&root.join("gitignored")));
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn test_recursive_scan_follows_symlinked_directories() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let real = root.join("real");
+        let link = root.join("link");
+        fs::create_dir_all(real.join("nested")).unwrap();
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+
+        let dirs = FilteredWatcher::collect_recursive_dirs(&root);
+
+        assert!(dirs.contains(&root));
+        assert!(dirs.contains(&real));
+        assert!(dirs.contains(&real.join("nested")));
+        assert!(dirs.contains(&link));
+        assert!(dirs.contains(&link.join("nested")));
+    }
+
     #[test]
     fn test_refresh_adds_new_directory_under_recursive_root() {
         let temp = tempfile::tempdir().unwrap();
@@ -999,6 +1021,41 @@ mod tests {
             assert_eq!(watcher.path_watch_counts.get(&new_dir), Some(&1));
         }
         manager.unwatch(&root).unwrap();
+    }
+
+    #[cfg(all(target_os = "linux", unix))]
+    #[test]
+    fn test_recursive_watch_follows_symlinked_directories_for_real_events() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let real = root.join("real");
+        let link = root.join("link");
+        let linked_nested = link.join("nested");
+        let linked_file = linked_nested.join("file");
+        fs::create_dir_all(real.join("nested")).unwrap();
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+
+        let (tx, rx) = std_mpsc::channel();
+        let mut watcher = FilteredWatcher::new(move |event: notify::Result<Event>| {
+            if let Ok(event) = event {
+                let _ = tx.send(event);
+            }
+        })
+        .unwrap();
+
+        watcher.watch(&root, RecursiveMode::Recursive).unwrap();
+        std::thread::sleep(Duration::from_millis(100));
+        drain_events(&rx);
+
+        fs::write(&linked_file, "changed").unwrap();
+        recv_event_matching(&rx, Duration::from_secs(2), |event| {
+            event
+                .paths
+                .iter()
+                .any(|path| path.starts_with(&linked_nested))
+        });
+
+        watcher.unwatch(&root).unwrap();
     }
 
     #[cfg(target_os = "linux")]
