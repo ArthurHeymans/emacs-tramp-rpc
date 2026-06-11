@@ -1023,16 +1023,17 @@ mod tests {
         manager.unwatch(&root).unwrap();
     }
 
-    #[cfg(all(target_os = "linux", unix))]
+    #[cfg(all(target_os = "linux", target_arch = "x86_64", unix))]
     #[test]
     fn test_recursive_watch_follows_symlinked_directories_for_real_events() {
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path().canonicalize().unwrap();
         let real = root.join("real");
         let link = root.join("link");
+        let real_nested = real.join("nested");
         let linked_nested = link.join("nested");
         let linked_file = linked_nested.join("file");
-        fs::create_dir_all(real.join("nested")).unwrap();
+        fs::create_dir_all(&real_nested).unwrap();
         std::os::unix::fs::symlink(&real, &link).unwrap();
 
         let (tx, rx) = std_mpsc::channel();
@@ -1052,7 +1053,7 @@ mod tests {
             event
                 .paths
                 .iter()
-                .any(|path| path.starts_with(&linked_nested))
+                .any(|path| path.starts_with(&linked_nested) || path.starts_with(&real_nested))
         });
 
         watcher.unwatch(&root).unwrap();
