@@ -67,6 +67,7 @@
 ;; Variables from vc-dir.el / tramp.el (used in integration handlers)
 (defvar vc-dir-process-buffer)
 (defvar tramp-remote-process-environment)
+(defvar tramp-file-name-for-operation-external)
 
 ;; ============================================================================
 ;; Process I/O handler
@@ -339,7 +340,7 @@ state."
 ;; ============================================================================
 
 (defun tramp-rpc-handle-python-shell--tramp-with-environment
-    (orig-fun vec extraenv bodyfun)
+    (_vec extraenv bodyfun)
   "Run Python shell BODYFUN without tramp-sh environment refresh for RPC.
 
 `python-shell--tramp-with-environment' assumes that every TRAMP connection
@@ -349,13 +350,36 @@ server, not a shell, so sending shell snippets to it can block commands such as
 `run-python'.  For rpc connections, keep the requested environment in a
 dynamic `tramp-remote-process-environment' binding and let tramp-rpc's process
 handlers pass it directly to the server."
+  (let ((tramp-remote-process-environment
+         (append extraenv tramp-remote-process-environment)))
+    (funcall bodyfun)))
+
+(defun tramp-rpc-handle-python-shell--tramp-with-environment-compat
+    (orig-fun vec extraenv bodyfun)
+  "Compatibility advice for older Tramp versions.
+
+Tramp 2.8.2 adds `tramp-file-name' as ARG-TYPE for
+`tramp-add-external-operation', which lets
+`python-shell--tramp-with-environment' be registered as a regular Tramp
+external operation.  Until tramp-rpc can require Tramp 2.8.2, keep this
+fallback so released Tramp versions do not fail when python.el is loaded."
   (if (tramp-rpc-file-name-p vec)
-      (let ((tramp-remote-process-environment
-             (append extraenv
-                     (and (boundp 'tramp-remote-process-environment)
-                          tramp-remote-process-environment))))
-        (funcall bodyfun))
+      (tramp-rpc-handle-python-shell--tramp-with-environment
+       vec extraenv bodyfun)
     (funcall orig-fun vec extraenv bodyfun)))
+
+(defun tramp-rpc--python-tramp-file-name-external-operation-p ()
+  "Return non-nil if Tramp supports `tramp-file-name' external ARG-TYPE."
+  (let ((tramp-file-name-for-operation-external
+         (cons '(tramp-rpc--external-operation-probe . tramp-file-name)
+               tramp-file-name-for-operation-external))
+        (debug-ignored-errors (cons 'remote-file-error debug-ignored-errors)))
+    (condition-case nil
+        (stringp
+         (tramp-file-name-for-operation
+          'tramp-rpc--external-operation-probe
+          (make-tramp-file-name :method "rpc" :host "host" :localname "/")))
+      (remote-file-error nil))))
 
 ;; ============================================================================
 ;; Eglot integration
@@ -485,15 +509,30 @@ exited (remote side finished), delete it so the refresh can proceed."
     (tramp-add-external-operation
      'vc-exec-after
      #'tramp-rpc-handle-vc-exec-after 'tramp-rpc 'default-directory))
-  ;; If eglot/magit-process is already loaded while `tramp-rpc' is being
-  ;; required, defer registration until `tramp-rpc' is provided; otherwise
-  ;; `tramp-add-external-operation' calls `(require 'tramp-rpc)' recursively.
+  ;; If python/eglot/magit-process is already loaded while `tramp-rpc'
+  ;; is being required, defer registration until `tramp-rpc' is
+  ;; provided; otherwise `tramp-add-external-operation' calls
+  ;; `(require 'tramp-rpc)' recursively.
   (with-eval-after-load 'python
-    (unless (advice-member-p
-             #'tramp-rpc-handle-python-shell--tramp-with-environment
-             'python-shell--tramp-with-environment)
-      (advice-add 'python-shell--tramp-with-environment :around
-                  #'tramp-rpc-handle-python-shell--tramp-with-environment)))
+    (with-eval-after-load 'tramp-rpc
+      (if (tramp-rpc--python-tramp-file-name-external-operation-p)
+          (condition-case err
+              (tramp-add-external-operation
+               'python-shell--tramp-with-environment
+               #'tramp-rpc-handle-python-shell--tramp-with-environment
+               'tramp-rpc 'tramp-file-name)
+            (remote-file-error
+             (signal (car err) (cdr err))))
+        ;; Compatibility fallback for Tramp < 2.8.2.  Remove this advice
+        ;; path once tramp-rpc can require a Tramp release supporting
+        ;; `tramp-file-name' ARG-TYPE for external operations.
+        (unless (advice-member-p
+                 #'tramp-rpc-handle-python-shell--tramp-with-environment-compat
+                 'python-shell--tramp-with-environment)
+          (advice-add
+           'python-shell--tramp-with-environment
+           :around
+           #'tramp-rpc-handle-python-shell--tramp-with-environment-compat)))))
   (with-eval-after-load 'eglot
     (with-eval-after-load 'tramp-rpc
       (tramp-add-external-operation
@@ -522,9 +561,12 @@ exited (remote side finished), delete it so the refresh can proceed."
   (tramp-remove-external-operation 'process-tty-name 'tramp-rpc)
   (tramp-remove-external-operation 'vc-call-backend 'tramp-rpc)
   (tramp-remove-external-operation 'vc-exec-after 'tramp-rpc)
+  (tramp-remove-external-operation
+   'python-shell--tramp-with-environment 'tramp-rpc)
   (when (fboundp 'python-shell--tramp-with-environment)
-    (advice-remove 'python-shell--tramp-with-environment
-                   #'tramp-rpc-handle-python-shell--tramp-with-environment))
+    (advice-remove
+     'python-shell--tramp-with-environment
+     #'tramp-rpc-handle-python-shell--tramp-with-environment-compat))
   (tramp-remove-external-operation 'eglot--cmd 'tramp-rpc)
   (tramp-remove-external-operation 'magit-start-process 'tramp-rpc)
   (tramp-remove-external-operation 'vc-dir-refresh 'tramp-rpc))
