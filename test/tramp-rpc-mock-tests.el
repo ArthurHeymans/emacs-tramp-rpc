@@ -2213,21 +2213,18 @@ discard it for being unreadable."
          (default-toplevel-value 'tramp-remote-process-environment)))
     (should-not (tramp-rpc--tramp-remote-process-environment))))
 
-(ert-deftest tramp-rpc-mock-test-python-tramp-environment-advice ()
-  "Test python.el TRAMP environment advice avoids shell refresh for RPC."
+(ert-deftest tramp-rpc-mock-test-python-tramp-environment-handler ()
+  "Test python.el TRAMP environment handler avoids shell refresh for RPC."
   (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
-  (let ((called-original nil)
-        (body-env nil)
+  (let ((body-env nil)
         (vec (make-tramp-file-name :method "rpc" :host "host" :user "user"
                                    :localname "/work/"))
         (tramp-remote-process-environment '("EXISTING=yes")))
     (tramp-rpc-handle-python-shell--tramp-with-environment
-     (lambda (&rest _args) (setq called-original t))
      vec
      '("TERM=dumb" "PYTHONUNBUFFERED=1")
      (lambda ()
        (setq body-env tramp-remote-process-environment)))
-    (should-not called-original)
     (should (equal body-env
                    '("TERM=dumb" "PYTHONUNBUFFERED=1" "EXISTING=yes")))))
 
