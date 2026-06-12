@@ -852,13 +852,23 @@ Used by `tramp-rpc--action-controlmaster-established'.")
 (defun tramp-rpc--action-controlmaster-established (proc _vec)
   "Succeed when the ControlMaster socket file appears, fail on process death.
 The target socket path is read from the dynamic variable
-`tramp-rpc--controlmaster-socket-path'."
+`tramp-rpc--controlmaster-socket-path'.
+
+When SSH detects a controlling terminal (Emacs gave it a PTY via
+`process-connection-type'), it may fork to background, causing the
+foreground process to exit.  The socket file is created by the
+backgrounded process just before/after the fork.  We check one more
+time after process death to catch this common race."
   (cond
    ((file-exists-p tramp-rpc--controlmaster-socket-path)
     (throw 'tramp-action 'ok))
    ((not (process-live-p proc))
     (while (tramp-accept-process-output proc))
-    (throw 'tramp-action 'process-died))))
+    ;; SSH may have backgrounded itself (forked to detach from our PTY).
+    ;; The background process creates the socket; give it a final chance.
+    (if (file-exists-p tramp-rpc--controlmaster-socket-path)
+        (throw 'tramp-action 'ok)
+      (throw 'tramp-action 'process-died)))))
 
 (defconst tramp-rpc--controlmaster-actions
   '((tramp-password-prompt-regexp tramp-action-password)
