@@ -1210,6 +1210,22 @@ This matches the upstream `tramp-test28-process-file' test."
       (should (>= (nth 1 info) 0)))))
 
 ;;; ============================================================================
+;;; Test 13b: Coding argument handling (unit test, no remote host needed)
+;;; ============================================================================
+
+(ert-deftest tramp-rpc-test13b-coding-args ()
+  "Test `tramp-rpc--coding-args' handles symbol and cons pair coding."
+  ;; Symbol case: same value used for both decoding and encoding
+  (should (equal '(utf-8-unix utf-8-unix)
+                 (tramp-rpc--coding-args 'utf-8-unix)))
+  ;; Cons pair case: (DECODING . ENCODING)
+  (should (equal '(undecided-unix utf-8-unix)
+                 (tramp-rpc--coding-args '(undecided-unix . utf-8-unix))))
+  ;; Nil case (not normally called, but be safe)
+  (should (equal '(nil nil)
+                 (tramp-rpc--coding-args nil))))
+
+;;; ============================================================================
 ;;; Test 14: Async Processes
 ;;; ============================================================================
 

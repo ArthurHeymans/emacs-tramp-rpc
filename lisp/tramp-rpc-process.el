@@ -407,6 +407,18 @@ update is still running."
                                          (delete-process proc))))))))))
 
 ;; ============================================================================
+;; Coding helper
+;; ============================================================================
+
+(defun tramp-rpc--coding-args (coding)
+  "Return list of arguments for `set-process-coding-system' from CODING.
+CODING can be a symbol (used for both decoding and encoding) or a cons
+cell (DECODING . ENCODING)."
+  (if (consp coding)
+      (list (car coding) (cdr coding))
+    (list coding coding)))
+
+;; ============================================================================
 ;; make-process handler
 ;; ============================================================================
 
@@ -494,7 +506,8 @@ Resolves program path and loads direnv environment from working directory."
 
           ;; Configure the local relay process
           (when coding
-            (set-process-coding-system local-process coding coding))
+            (apply #'set-process-coding-system local-process
+                   (tramp-rpc--coding-args coding)))
           (set-process-query-on-exit-flag local-process (not noquery))
 
           (process-put local-process :tramp-rpc-vec v)
@@ -654,7 +667,8 @@ DIRENV-ENV is an optional alist of environment variables from direnv."
 
     ;; Configure the process
     (when coding
-      (set-process-coding-system process coding coding))
+      (apply #'set-process-coding-system process
+             (tramp-rpc--coding-args coding)))
     (set-process-query-on-exit-flag process (not noquery))
 
     ;; Set up filter
@@ -725,7 +739,8 @@ DIRENV-ENV is an optional alist of environment variables for the process."
     (set-process-sentinel local-process #'tramp-rpc--pty-sentinel)
     (set-process-query-on-exit-flag local-process (not noquery))
     (when coding
-      (set-process-coding-system local-process coding coding))
+      (apply #'set-process-coding-system local-process
+             (tramp-rpc--coding-args coding)))
 
     ;; Store process info
     (process-put local-process :tramp-rpc-pty t)
