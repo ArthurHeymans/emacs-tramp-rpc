@@ -1021,9 +1021,20 @@ Returns non-nil on success."
       (ignore-errors (delete-file socket-path)))
     (with-current-buffer buffer
       (erase-buffer))
-    ;; Start SSH with PTY for interactive password prompt
-    (let ((process-connection-type t))  ; Use PTY for password prompts
-      (setq process (apply #'start-process process-name buffer ssh-args)))
+    ;; Start SSH with pipe connection (not PTY).  PTYs cause SSH to
+    ;; allocate a remote pseudo-terminal which can interfere with
+    ;; ControlMaster socket creation on ProxyJump/multi-hop connections.
+    ;; `tramp-process-actions' reads process output from the buffer and
+    ;; handles password prompts via regexp matching, so a PTY is not needed.
+    (setq process
+          (make-process
+           :name process-name
+           :buffer buffer
+           :command ssh-args
+           :connection-type 'pipe
+           :noquery t
+           :stderr (get-buffer-create
+                    (format " *tramp-rpc-auth-stderr %s*" host))))
     (set-process-query-on-exit-flag process nil)
     (set-process-sentinel process #'ignore)
     ;; Set up process properties for tramp-process-actions / tramp-read-passwd.
