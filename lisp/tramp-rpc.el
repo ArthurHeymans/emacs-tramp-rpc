@@ -3486,8 +3486,17 @@ round-trips for the common non-VISIT case."
 
 (defun tramp-rpc--system-info (vec)
   "Return cached system.info for VEC, fetching it at most once per connection."
-  (with-tramp-connection-property vec tramp-rpc--system-info-property
-    (tramp-rpc--cache-system-info vec (tramp-rpc--call vec "system.info" nil))))
+  (or (tramp-get-connection-property vec tramp-rpc--system-info-property nil)
+      (progn
+        ;; Establishing a new connection already performs and caches a
+        ;; `system.info' call as its readiness ping.  Re-check the property after
+        ;; connection setup so a cold caller does not immediately send a second
+        ;; identical RPC.
+        (tramp-rpc--ensure-connection vec)
+        (or (tramp-get-connection-property
+             vec tramp-rpc--system-info-property nil)
+            (tramp-rpc--cache-system-info
+             vec (tramp-rpc--call vec "system.info" nil))))))
 
 (defun tramp-rpc-handle-get-home-directory (vec &optional user)
   "Return home directory for USER on remote host VEC using RPC.

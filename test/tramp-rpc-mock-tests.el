@@ -853,6 +853,29 @@ This matches the behavior expected by `tramp-test28-process-file'."
       (should (equal (tramp-get-connection-property vec "gid-string" nil) "5678"))
       (should (equal (tramp-get-connection-property vec "~mock" nil) "/home/mock")))))
 
+(ert-deftest tramp-rpc-mock-test-system-info-cold-connection-reuses-startup-cache ()
+  "A cold system.info lookup reuses the cache seeded by connection setup."
+  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
+  (let ((vec (tramp-dissect-file-name "/rpc:mock@mockhost:/tmp"))
+        (ensure-count 0))
+    (tramp-flush-connection-properties vec)
+    (cl-letf (((symbol-function 'tramp-rpc--ensure-connection)
+               (lambda (connection-vec)
+                 (cl-incf ensure-count)
+                 (tramp-rpc--cache-system-info
+                  connection-vec '((uid . 1234)
+                                   (gid . 5678)
+                                   (home . "/home/mock")
+                                   (user . "mock")
+                                   (os . "linux")
+                                   (shell . "/bin/zsh")))
+                 '(:process mock)))
+              ((symbol-function 'tramp-rpc--call)
+               (lambda (&rest _)
+                 (ert-fail "cold system.info lookup should reuse startup cache"))))
+      (should (= (tramp-rpc-handle-get-remote-uid vec 'integer) 1234))
+      (should (= ensure-count 1)))))
+
 (ert-deftest tramp-rpc-mock-test-file-directory-p-caches-nil ()
   "`file-directory-p' caches negative RPC stat results."
   (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
