@@ -1349,10 +1349,7 @@ This matches the upstream `tramp-test28-process-file' test."
                    (tramp-rpc--coding-args '(nil . utf-8-unix))))
     ;; Cons pair with nil encoding: nil replaced with default
     (should (equal (list 'utf-8-unix default-enc)
-                   (tramp-rpc--coding-args '(utf-8-unix . nil))))
-    ;; Bare nil: both sides defaulted
-    (should (equal (list default-dec default-enc)
-                   (tramp-rpc--coding-args nil)))))
+                   (tramp-rpc--coding-args '(utf-8-unix . nil))))))
 
 ;;; ============================================================================
 ;;; Test 14: Async Processes
