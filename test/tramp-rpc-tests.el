@@ -1336,15 +1336,23 @@ This matches the upstream `tramp-test28-process-file' test."
 
 (ert-deftest tramp-rpc-test13b-coding-args ()
   "Test `tramp-rpc--coding-args' handles symbol and cons pair coding."
-  ;; Symbol case: same value used for both decoding and encoding
-  (should (equal '(utf-8-unix utf-8-unix)
-                 (tramp-rpc--coding-args 'utf-8-unix)))
-  ;; Cons pair case: (DECODING . ENCODING)
-  (should (equal '(undecided-unix utf-8-unix)
-                 (tramp-rpc--coding-args '(undecided-unix . utf-8-unix))))
-  ;; Nil case (not normally called, but be safe)
-  (should (equal '(nil nil)
-                 (tramp-rpc--coding-args nil))))
+  (let ((default-dec (car default-process-coding-system))
+        (default-enc (cdr default-process-coding-system)))
+    ;; Symbol case: same value used for both decoding and encoding
+    (should (equal '(utf-8-unix utf-8-unix)
+                   (tramp-rpc--coding-args 'utf-8-unix)))
+    ;; Cons pair case: (DECODING . ENCODING)
+    (should (equal '(undecided-unix utf-8-unix)
+                   (tramp-rpc--coding-args '(undecided-unix . utf-8-unix))))
+    ;; Cons pair with nil decoding: nil replaced with default
+    (should (equal (list default-dec 'utf-8-unix)
+                   (tramp-rpc--coding-args '(nil . utf-8-unix))))
+    ;; Cons pair with nil encoding: nil replaced with default
+    (should (equal (list 'utf-8-unix default-enc)
+                   (tramp-rpc--coding-args '(utf-8-unix . nil))))
+    ;; Bare nil: both sides defaulted
+    (should (equal (list default-dec default-enc)
+                   (tramp-rpc--coding-args nil)))))
 
 ;;; ============================================================================
 ;;; Test 14: Async Processes

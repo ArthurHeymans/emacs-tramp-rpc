@@ -412,11 +412,18 @@ update is still running."
 
 (defun tramp-rpc--coding-args (coding)
   "Return list of arguments for `set-process-coding-system' from CODING.
-CODING can be a symbol (used for both decoding and encoding) or a cons
-cell (DECODING . ENCODING)."
+CODING can be a symbol (used for both decoding and encoding), a cons
+cell (DECODING . ENCODING), or nil.  When DECODING or ENCODING is nil
+inside a cons, it is replaced with the corresponding default from
+`default-process-coding-system', matching how native `make-process'
+handles nil :coding elements."
   (if (consp coding)
-      (list (car coding) (cdr coding))
-    (list coding coding)))
+      (list (or (car coding) (car default-process-coding-system))
+            (or (cdr coding) (cdr default-process-coding-system)))
+    (if coding
+        (list coding coding)
+      (list (car default-process-coding-system)
+            (cdr default-process-coding-system)))))
 
 ;; ============================================================================
 ;; make-process handler
