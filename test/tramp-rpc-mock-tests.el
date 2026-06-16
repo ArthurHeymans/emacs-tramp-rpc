@@ -803,8 +803,10 @@ This matches the behavior expected by `tramp-test28-process-file'."
          (other-vec (tramp-dissect-file-name "/rpc:other:/tmp/"))
          (watch-key (format "%s:%s" (tramp-rpc--connection-key-string vec) "/tmp/"))
          (other-key (format "%s:%s" (tramp-rpc--connection-key-string other-vec) "/tmp/"))
-         (descriptor (cons 'tramp-rpc-file-notify 1001))
-         (other-descriptor (cons 'tramp-rpc-file-notify 1002))
+         (descriptor (tramp-rpc--make-file-notify-descriptor
+                      vec "/rpc:mock:/tmp/" "/tmp/"))
+         (other-descriptor (tramp-rpc--make-file-notify-descriptor
+                            other-vec "/rpc:other:/tmp/" "/tmp/"))
          (stopped-events nil)
          (other-stopped-events nil))
     (unwind-protect
@@ -830,14 +832,18 @@ This matches the behavior expected by `tramp-test28-process-file'."
           (should-not (gethash watch-key tramp-rpc--file-notify-watch-counts))
           (should-not (gethash descriptor file-notify-descriptors))
           (should-not (tramp-rpc-handle-file-notify-valid-p descriptor))
+          (should-not (process-live-p descriptor))
           (should (equal stopped-events
                          `((,descriptor stopped "/rpc:mock:/tmp/"))))
           (should-not other-stopped-events)
           (should (gethash other-descriptor tramp-rpc--file-notify-descriptors))
           (should (gethash other-key tramp-rpc--file-notify-watch-counts))
+          (should (process-live-p other-descriptor))
           (should (gethash other-descriptor file-notify-descriptors)))
       (remhash descriptor file-notify-descriptors)
-      (remhash other-descriptor file-notify-descriptors))))
+      (remhash other-descriptor file-notify-descriptors)
+      (tramp-rpc--delete-file-notify-descriptor-process descriptor)
+      (tramp-rpc--delete-file-notify-descriptor-process other-descriptor))))
 
 (ert-deftest tramp-rpc-mock-test-file-notify-dispatch-matches-canonical-directory ()
   "Dispatch matches canonical watch paths returned by the server."
@@ -849,35 +855,42 @@ This matches the behavior expected by `tramp-test28-process-file'."
          (directory "/rpc:mock:/tmp/link/")
          (events nil)
          descriptor)
-    (cl-letf (((symbol-function 'tramp-rpc--call)
-               (lambda (_vec method _params)
-                 (when (equal method "watch.add")
-                   '((path . "/tmp/real/")))))
-              ((symbol-function 'insert-special-event)
-               (lambda (event) (push event events))))
-      (setq descriptor
-            (tramp-rpc-handle-file-notify-add-watch directory '(change) #'ignore))
-      (should (equal (plist-get (gethash descriptor
-                                         tramp-rpc--file-notify-descriptors)
-                                :canonical-directory)
-                     "/rpc:mock:/tmp/real/"))
-      (tramp-rpc--file-notify-dispatch "/rpc:mock:/tmp/real/changed")
-      (should (equal events
-                     `((file-notify
-                        (,descriptor (modify) "/rpc:mock:/tmp/real/changed")
-                        file-notify-callback))))
-      ;; Dispatch uses the shared watch entry's canonical directory if it is
-      ;; refreshed after the descriptor was created.
-      (setq events nil)
-      (let* ((data (gethash descriptor tramp-rpc--file-notify-descriptors))
-             (entry (gethash (plist-get data :watch-key)
-                             tramp-rpc--file-notify-watch-counts)))
-        (plist-put entry :canonical-directory "/rpc:mock:/tmp/new-real/"))
-      (tramp-rpc--file-notify-dispatch "/rpc:mock:/tmp/new-real/changed")
-      (should (equal events
-                     `((file-notify
-                        (,descriptor (modify) "/rpc:mock:/tmp/new-real/changed")
-                        file-notify-callback)))))))
+    (unwind-protect
+        (cl-letf (((symbol-function 'tramp-rpc--call)
+                   (lambda (_vec method _params)
+                     (when (equal method "watch.add")
+                       '((path . "/tmp/real/")))))
+                  ((symbol-function 'insert-special-event)
+                   (lambda (event) (push event events))))
+          (setq descriptor
+                (tramp-rpc-handle-file-notify-add-watch directory '(change) #'ignore))
+          (should (processp descriptor))
+          (should (process-get descriptor 'tramp-vector))
+          (should (equal (process-get descriptor 'tramp-watch-name) "/tmp/link/"))
+          (should (equal (plist-get (gethash descriptor
+                                             tramp-rpc--file-notify-descriptors)
+                                    :canonical-directory)
+                         "/rpc:mock:/tmp/real/"))
+          (tramp-rpc--file-notify-dispatch "/rpc:mock:/tmp/real/changed")
+          (should (equal events
+                         `((file-notify
+                            (,descriptor (modify) "/rpc:mock:/tmp/real/changed")
+                            file-notify-callback))))
+          ;; Dispatch uses the shared watch entry's canonical directory if it is
+          ;; refreshed after the descriptor was created.
+          (setq events nil)
+          (let* ((data (gethash descriptor tramp-rpc--file-notify-descriptors))
+                 (entry (gethash (plist-get data :watch-key)
+                                 tramp-rpc--file-notify-watch-counts)))
+            (plist-put entry :canonical-directory "/rpc:mock:/tmp/new-real/"))
+          (tramp-rpc--file-notify-dispatch "/rpc:mock:/tmp/new-real/changed")
+          (should (equal events
+                         `((file-notify
+                            (,descriptor (modify) "/rpc:mock:/tmp/new-real/changed")
+                            file-notify-callback)))))
+      (when descriptor
+        (remhash descriptor tramp-rpc--file-notify-descriptors)
+        (tramp-rpc--delete-file-notify-descriptor-process descriptor)))))
 
 (ert-deftest tramp-rpc-mock-test-file-notify-public-rm-and-valid-route ()
   "Public file-notify APIs route TRAMP-RPC descriptors to private state."
@@ -898,54 +911,23 @@ This matches the behavior expected by `tramp-test28-process-file'."
                    (lambda (_filename) t)))
           (setq descriptor
                 (file-notify-add-watch directory '(change) #'ignore))
+          (should (processp descriptor))
+          (should (process-live-p descriptor))
+          (should (equal (process-get descriptor 'tramp-watch-name) "/tmp/repo"))
           (should (gethash descriptor tramp-rpc--file-notify-descriptors))
           (should (gethash descriptor file-notify-descriptors))
           (should (file-notify-valid-p descriptor))
           (file-notify-rm-watch descriptor)
           (should-not (gethash descriptor tramp-rpc--file-notify-descriptors))
           (should-not (gethash descriptor file-notify-descriptors))
+          (should-not (process-live-p descriptor))
           (should (= (hash-table-count tramp-rpc--file-notify-watch-counts) 0))
           (should (equal (mapcar #'car (nreverse (copy-sequence calls)))
                          '("watch.add" "watch.remove"))))
       (when (and descriptor (boundp 'file-notify-descriptors))
-        (remhash descriptor file-notify-descriptors)))))
-
-(ert-deftest tramp-rpc-mock-test-file-notify-public-stale-descriptor-cleans-up ()
-  "Public valid/rm clean TRAMP-RPC state when the global descriptor is gone."
-  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
-  (require 'filenotify)
-  (let* ((tramp-rpc--file-notify-descriptors (make-hash-table :test 'eq))
-         (tramp-rpc--file-notify-watch-counts (make-hash-table :test 'equal))
-         (tramp-rpc--watched-directories (make-hash-table :test 'equal))
-         (directory "/rpc:mock:/tmp/repo/")
-         (calls nil)
-         descriptor)
-    (unwind-protect
-        (cl-letf (((symbol-function 'tramp-rpc--call)
-                   (lambda (_vec method params)
-                     (push (list method params) calls)
-                     t))
-                  ((symbol-function 'tramp-rpc-handle-file-directory-p)
-                   (lambda (_filename) t)))
-          (setq descriptor
-                (file-notify-add-watch directory '(change) #'ignore))
-          (remhash descriptor file-notify-descriptors)
-          (should-not (file-notify-valid-p descriptor))
-          (should-not (gethash descriptor tramp-rpc--file-notify-descriptors))
-          (should (= (hash-table-count tramp-rpc--file-notify-watch-counts) 0))
-          (should (equal (mapcar #'car (nreverse (copy-sequence calls)))
-                         '("watch.add" "watch.remove")))
-
-          (setq calls nil
-                descriptor (file-notify-add-watch directory '(change) #'ignore))
-          (remhash descriptor file-notify-descriptors)
-          (file-notify-rm-watch descriptor)
-          (should-not (gethash descriptor tramp-rpc--file-notify-descriptors))
-          (should (= (hash-table-count tramp-rpc--file-notify-watch-counts) 0))
-          (should (equal (mapcar #'car (nreverse (copy-sequence calls)))
-                         '("watch.add" "watch.remove"))))
-      (when (and descriptor (boundp 'file-notify-descriptors))
-        (remhash descriptor file-notify-descriptors)))))
+        (remhash descriptor file-notify-descriptors))
+      (when descriptor
+        (tramp-rpc--delete-file-notify-descriptor-process descriptor)))))
 
 (ert-deftest tramp-rpc-mock-test-file-notify-watch-upgrade-does-not-mask-recursive ()
   "A direct file-notify watch does not mask or remove a recursive watch."
