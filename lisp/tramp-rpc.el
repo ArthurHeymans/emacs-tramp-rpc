@@ -4195,6 +4195,11 @@ Removes advice and cleans up async processes."
   (tramp-remove-external-operation 'move-file-to-trash 'tramp-rpc)
   ;; Remove all advice (from tramp-rpc-advice module)
   ;; Not needed. This is called in `tramp-rpc-advice-unload-function'.
+  ;; Remove file notification advice installed by tramp-rpc core.
+  (advice-remove 'file-notify-valid-p
+                 #'tramp-rpc--file-notify-valid-p-advice)
+  (advice-remove 'file-notify-rm-watch
+                 #'tramp-rpc--file-notify-rm-watch-advice)
   ;; Remove multi-hop hook and cleanup hooks.
   (remove-hook 'tramp-multi-hop-p-hook #'tramp-rpc-multi-hop-p)
   (remove-hook 'tramp-cleanup-connection-hook #'tramp-rpc-cleanup-connection)
