@@ -217,13 +217,33 @@ TRAMP-RPC exposes these method categories:
 | ancestors.scan        | {path, markers}                 | {found: [{marker, directory}]} |
 
 **** Filesystem Watch Operations
-| Method       | Parameters     | Returns                   |
-|--------------+----------------+---------------------------|
-| watch.add    | path           | boolean                   |
-| watch.remove | path           | boolean                   |
-| watch.list   | (none)         | [string]                  |
+| Method       | Parameters                       | Returns                                      |
+|--------------+----------------------------------+----------------------------------------------|
+| watch.add    | ~{path: bin/string, recursive?}~ | ~{path: bin, recursive: bool}~               |
+| watch.remove | ~{path: bin/string}~             | ~true~                                       |
+| watch.list   | ~(none)~                         | ~[{path: bin, recursive: bool}]~             |
 
-The server also pushes ~fs.changed~ notifications (no id) when watched directories change.
+The server also pushes ~fs.events~ notifications (no id) when watched directories change:
+
+#+begin_src elisp
+((version . "2.0")
+ (method . "fs.events")
+ (params . ((events . [((action . "created") (path . PATH-BIN))
+                       ((action . "changed") (path . PATH-BIN))
+                       ((action . "attribute-changed") (path . PATH-BIN))
+                       ((action . "deleted") (path . PATH-BIN))
+                       ((action . "renamed")
+                        (path . OLD-PATH-BIN) (path1 . NEW-PATH-BIN))
+                       ((action . "renamed-from")
+                        (path . OLD-PATH-BIN) (cookie . COOKIE))
+                       ((action . "renamed-to")
+                        (path . NEW-PATH-BIN) (cookie . COOKIE))
+                       ((action . "rescan"))]))))
+#+end_src
+
+~watch.add~ defaults ~recursive~ to true when the field is omitted.  ~PATH-BIN~
+values are MessagePack ~bin~ payloads containing remote OS path bytes.  A
+~rescan~ event means the client should discard cached state for the connection.
 
 * Performance Analysis
 

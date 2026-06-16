@@ -6,7 +6,7 @@
 
 use crate::protocol::{Notification, RpcError};
 use crate::{msgpack_map, WriterHandle};
-use notify::event::{ModifyKind, RemoveKind};
+use notify::event::{DataChange, MetadataKind, ModifyKind, RemoveKind, RenameMode};
 use notify::{Config, Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 use rmpv::Value;
 use std::collections::{HashMap, HashSet};
@@ -116,6 +116,10 @@ impl FilteredWatcher {
         }
 
         Ok(())
+    }
+
+    fn recursive_roots(&self) -> Vec<PathBuf> {
+        self.recursive_roots.keys().cloned().collect()
     }
 
     fn recursive_roots_for_paths(&self, paths: &[PathBuf]) -> Vec<PathBuf> {
@@ -273,6 +277,75 @@ impl FilteredWatcher {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct WatchEvent {
+    action: &'static str,
+    path: Option<PathBuf>,
+    path1: Option<PathBuf>,
+    cookie: Option<usize>,
+}
+
+impl WatchEvent {
+    fn path(action: &'static str, path: PathBuf) -> Self {
+        Self {
+            action,
+            path: Some(path),
+            path1: None,
+            cookie: None,
+        }
+    }
+
+    fn rename(path: PathBuf, path1: PathBuf) -> Self {
+        Self {
+            action: "renamed",
+            path: Some(path),
+            path1: Some(path1),
+            cookie: None,
+        }
+    }
+
+    fn tracked(action: &'static str, path: PathBuf, cookie: Option<usize>) -> Self {
+        Self {
+            action,
+            path: Some(path),
+            path1: None,
+            cookie,
+        }
+    }
+
+    fn rescan() -> Self {
+        Self {
+            action: "rescan",
+            path: None,
+            path1: None,
+            cookie: None,
+        }
+    }
+
+    fn to_value(&self) -> Value {
+        let mut fields = vec![(
+            Value::String("action".into()),
+            Value::String(self.action.into()),
+        )];
+
+        if let Some(path) = &self.path {
+            fields.push((Value::String("path".into()), path_to_value(path)));
+        }
+        if let Some(path1) = &self.path1 {
+            fields.push((Value::String("path1".into()), path_to_value(path1)));
+        }
+        if let Some(cookie) = self.cookie {
+            fields.push((Value::String("cookie".into()), Value::from(cookie as u64)));
+        }
+
+        Value::Map(fields)
+    }
+}
+
+fn path_to_value(path: &Path) -> Value {
+    Value::String(path.to_string_lossy().into_owned().into())
+}
+
 /// Manages filesystem watchers and sends change notifications to the client.
 pub struct WatchManager {
     /// The underlying OS watcher (inotify/kqueue).
@@ -291,21 +364,21 @@ impl WatchManager {
     /// Create a new WatchManager and spawn the debounce background task.
     ///
     /// The debounce task receives raw inotify events, batches them over a
-    /// short window, and writes `fs.changed` notifications to the client
+    /// short window, and writes `fs.events` notifications to the client
     /// via the shared stdout writer.
     pub fn new(writer: WriterHandle) -> Result<Arc<Self>, notify::Error> {
         let (tx, rx) = mpsc::unbounded_channel();
 
         let watcher = FilteredWatcher::new(move |event: notify::Result<Event>| {
             if let Ok(event) = event {
-                // Only forward events that indicate filesystem mutations
-                match event.kind {
-                    EventKind::Create(_) | EventKind::Modify(_) | EventKind::Remove(_) => {
-                        // Topology events cannot be dropped, and blocking here can
-                        // deadlock notify's watch/unwatch event loop.
-                        let _ = tx.send(event);
-                    }
-                    _ => {} // Ignore Access, Other events
+                if matches!(
+                    event.kind,
+                    EventKind::Create(_) | EventKind::Modify(_) | EventKind::Remove(_)
+                ) || event.need_rescan()
+                {
+                    // Topology events cannot be dropped, and blocking here can
+                    // deadlock notify's watch/unwatch event loop.
+                    let _ = tx.send(event);
                 }
             }
         })?;
@@ -408,15 +481,20 @@ impl WatchManager {
     fn recursive_roots_for_event(&self, event: &Event) -> HashSet<PathBuf> {
         let refresh_paths = directory_tree_refresh_paths(event);
         let ignore_paths = ignore_rule_paths(event);
-        if refresh_paths.is_empty() && ignore_paths.is_empty() {
+        let need_rescan = event.need_rescan();
+        if !need_rescan && refresh_paths.is_empty() && ignore_paths.is_empty() {
             return HashSet::new();
         }
 
         let watcher = lock_or_recover(&self.watcher);
-        let mut roots_to_refresh: HashSet<_> = watcher
-            .recursive_roots_for_paths(&refresh_paths)
-            .into_iter()
-            .collect();
+        let mut roots_to_refresh: HashSet<_> = if need_rescan {
+            watcher.recursive_roots().into_iter().collect()
+        } else {
+            watcher
+                .recursive_roots_for_paths(&refresh_paths)
+                .into_iter()
+                .collect()
+        };
 
         for path in ignore_paths {
             roots_to_refresh.extend(watcher.recursive_roots_for_ignore_rule(&path));
@@ -557,14 +635,93 @@ fn ignore_rule_scope(path: &Path) -> Option<PathBuf> {
     None
 }
 
+fn event_to_watch_events(event: &Event) -> Vec<WatchEvent> {
+    let mut events = Vec::new();
+
+    if event.need_rescan() {
+        events.push(WatchEvent::rescan());
+    }
+
+    match event.kind {
+        EventKind::Create(_) => {
+            events.extend(paths_as_events("created", &event.paths));
+        }
+        EventKind::Modify(ModifyKind::Data(
+            DataChange::Any | DataChange::Size | DataChange::Content | DataChange::Other,
+        ))
+        | EventKind::Modify(ModifyKind::Any | ModifyKind::Other) => {
+            events.extend(paths_as_events("changed", &event.paths));
+        }
+        EventKind::Modify(ModifyKind::Metadata(
+            MetadataKind::Any
+            | MetadataKind::AccessTime
+            | MetadataKind::WriteTime
+            | MetadataKind::Permissions
+            | MetadataKind::Ownership
+            | MetadataKind::Extended
+            | MetadataKind::Other,
+        )) => {
+            events.extend(paths_as_events("attribute-changed", &event.paths));
+        }
+        EventKind::Modify(ModifyKind::Name(RenameMode::Both)) => {
+            if event.paths.len() >= 2 {
+                if let (Some(from), Some(to)) = (event.paths.first(), event.paths.last()) {
+                    events.push(WatchEvent::rename(from.clone(), to.clone()));
+                }
+            } else {
+                events.extend(paths_as_events("renamed", &event.paths));
+            }
+        }
+        EventKind::Modify(ModifyKind::Name(RenameMode::From)) => {
+            let cookie = event.tracker();
+            events.extend(
+                event
+                    .paths
+                    .iter()
+                    .cloned()
+                    .map(|path| WatchEvent::tracked("renamed-from", path, cookie)),
+            );
+        }
+        EventKind::Modify(ModifyKind::Name(RenameMode::To)) => {
+            let cookie = event.tracker();
+            events.extend(
+                event
+                    .paths
+                    .iter()
+                    .cloned()
+                    .map(|path| WatchEvent::tracked("renamed-to", path, cookie)),
+            );
+        }
+        EventKind::Modify(ModifyKind::Name(RenameMode::Any | RenameMode::Other)) => {
+            events.extend(paths_as_events("renamed", &event.paths));
+        }
+        EventKind::Remove(_) => {
+            events.extend(paths_as_events("deleted", &event.paths));
+        }
+        EventKind::Any | EventKind::Access(_) | EventKind::Other => {}
+    }
+
+    events
+}
+
+fn paths_as_events<'paths>(
+    action: &'static str,
+    paths: &'paths [PathBuf],
+) -> impl Iterator<Item = WatchEvent> + 'paths {
+    paths
+        .iter()
+        .cloned()
+        .map(move |path| WatchEvent::path(action, path))
+}
+
 /// Background task: receives raw inotify events, debounces them, and sends
-/// batched `fs.changed` notifications to the Emacs client.
+/// batched `fs.events` notifications to the Emacs client.
 ///
 /// Algorithm (fixed-window debounce):
 /// 1. Wait for the first event (blocks until something happens)
 /// 2. Start a 200ms timer
 /// 3. Collect all events that arrive during the timer window
-/// 4. When the timer fires, send one notification with all unique paths
+/// 4. When the timer fires, send one notification with all collected events
 /// 5. Go back to step 1
 async fn debounce_loop(
     mut rx: mpsc::UnboundedReceiver<Event>,
@@ -578,13 +735,13 @@ async fn debounce_loop(
             None => break, // Channel closed, watcher dropped
         };
 
-        let mut pending_paths: HashSet<PathBuf> = HashSet::new();
+        let mut pending_events: Vec<WatchEvent> = Vec::new();
         let mut roots_to_refresh: HashSet<PathBuf> = HashSet::new();
         let mut suspect_paths: HashSet<PathBuf> = HashSet::new();
         collect_event(
             event,
             &manager,
-            &mut pending_paths,
+            &mut pending_events,
             &mut roots_to_refresh,
             &mut suspect_paths,
         );
@@ -602,7 +759,7 @@ async fn debounce_loop(
                             collect_event(
                                 e,
                                 &manager,
-                                &mut pending_paths,
+                                &mut pending_events,
                                 &mut roots_to_refresh,
                                 &mut suspect_paths,
                             );
@@ -618,8 +775,9 @@ async fn debounce_loop(
             manager.rearm_suspect_paths(suspect_paths);
         }
 
-        // Phase 3: Send notification with all collected paths
-        if !pending_paths.is_empty() && send_notification(&writer, &pending_paths).await.is_err() {
+        // Phase 3: Send notification with all collected events
+        if !pending_events.is_empty() && send_notification(&writer, &pending_events).await.is_err()
+        {
             // Stdout is broken (Emacs disconnected), stop the loop.
             // Cannot use eprintln! as SSH merges stderr with stdout.
             break;
@@ -630,7 +788,7 @@ async fn debounce_loop(
 fn collect_event(
     event: Event,
     manager: &Weak<WatchManager>,
-    pending_paths: &mut HashSet<PathBuf>,
+    pending_events: &mut Vec<WatchEvent>,
     roots_to_refresh: &mut HashSet<PathBuf>,
     suspect_paths: &mut HashSet<PathBuf>,
 ) {
@@ -639,27 +797,28 @@ fn collect_event(
     }
 
     suspect_paths.extend(inode_replacing_paths(&event));
-    pending_paths.extend(event.paths);
+    pending_events.extend(event_to_watch_events(&event));
 }
 
-/// Serialize and send an `fs.changed` notification over the stdout writer.
+fn fs_events_notification(events: &[WatchEvent]) -> Notification {
+    let events_value: Vec<Value> = events.iter().map(WatchEvent::to_value).collect();
+
+    Notification::new(
+        "fs.events",
+        Value::Map(vec![(
+            Value::String("events".into()),
+            Value::Array(events_value),
+        )]),
+    )
+}
+
+/// Serialize and send an `fs.events` notification over the stdout writer.
 /// Returns an error if serialization or writing fails.
 async fn send_notification(
     writer: &WriterHandle,
-    paths: &HashSet<PathBuf>,
+    events: &[WatchEvent],
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let paths_value: Vec<Value> = paths
-        .iter()
-        .map(|p| Value::String(p.to_string_lossy().into_owned().into()))
-        .collect();
-
-    let notification = Notification::new(
-        "fs.changed",
-        Value::Map(vec![(
-            Value::String("paths".into()),
-            Value::Array(paths_value),
-        )]),
-    );
+    let notification = fs_events_notification(events);
 
     let bytes = rmp_serde::to_vec_named(&notification)?;
     let mut w = writer.lock().await;
@@ -751,7 +910,7 @@ pub fn handle_list(_params: Value) -> HandlerResult {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use notify::event::{CreateKind, RenameMode};
+    use notify::event::{CreateKind, Flag};
     use std::fs;
     #[cfg(target_os = "linux")]
     use std::sync::mpsc as std_mpsc;
@@ -765,9 +924,165 @@ mod tests {
         }
     }
 
+    fn map_value<'a>(value: &'a Value, key: &str) -> Option<&'a Value> {
+        match value {
+            Value::Map(fields) => fields.iter().find_map(|(k, v)| match k {
+                Value::String(s) if s.as_str() == Some(key) => Some(v),
+                _ => None,
+            }),
+            _ => None,
+        }
+    }
+
+    #[test]
+    fn test_watch_event_mapping_basic_actions() {
+        let path = PathBuf::from("/tmp/file");
+
+        assert_eq!(
+            event_to_watch_events(
+                &Event::new(EventKind::Create(CreateKind::File)).add_path(path.clone())
+            ),
+            vec![WatchEvent::path("created", path.clone())]
+        );
+        assert_eq!(
+            event_to_watch_events(
+                &Event::new(EventKind::Modify(ModifyKind::Data(DataChange::Content)))
+                    .add_path(path.clone())
+            ),
+            vec![WatchEvent::path("changed", path.clone())]
+        );
+        assert_eq!(
+            event_to_watch_events(
+                &Event::new(EventKind::Modify(ModifyKind::Metadata(
+                    MetadataKind::Permissions,
+                )))
+                .add_path(path.clone())
+            ),
+            vec![WatchEvent::path("attribute-changed", path.clone())]
+        );
+        assert_eq!(
+            event_to_watch_events(
+                &Event::new(EventKind::Remove(RemoveKind::File)).add_path(path.clone())
+            ),
+            vec![WatchEvent::path("deleted", path)]
+        );
+    }
+
+    #[test]
+    fn test_watch_event_mapping_rename_actions() {
+        let old = PathBuf::from("/tmp/old");
+        let new = PathBuf::from("/tmp/new");
+
+        assert_eq!(
+            event_to_watch_events(
+                &Event::new(EventKind::Modify(ModifyKind::Name(RenameMode::Both)))
+                    .add_path(old.clone())
+                    .add_path(new.clone())
+            ),
+            vec![WatchEvent::rename(old.clone(), new)]
+        );
+        assert_eq!(
+            event_to_watch_events(
+                &Event::new(EventKind::Modify(ModifyKind::Name(RenameMode::From)))
+                    .add_path(old.clone())
+                    .set_tracker(42)
+            ),
+            vec![WatchEvent::tracked("renamed-from", old.clone(), Some(42))]
+        );
+        assert_eq!(
+            event_to_watch_events(
+                &Event::new(EventKind::Modify(ModifyKind::Name(RenameMode::To)))
+                    .add_path(old.clone())
+                    .set_tracker(42)
+            ),
+            vec![WatchEvent::tracked("renamed-to", old, Some(42))]
+        );
+    }
+
+    #[test]
+    fn test_watch_event_serializes_paths_as_strings() {
+        let event = WatchEvent::rename(PathBuf::from("/tmp/old"), PathBuf::from("/tmp/new"));
+        let value = event.to_value();
+
+        assert_eq!(
+            map_value(&value, "action"),
+            Some(&Value::String("renamed".into()))
+        );
+        assert_eq!(
+            map_value(&value, "path"),
+            Some(&Value::String("/tmp/old".into()))
+        );
+        assert_eq!(
+            map_value(&value, "path1"),
+            Some(&Value::String("/tmp/new".into()))
+        );
+    }
+
+    #[test]
+    fn test_watch_event_mapping_includes_rescan() {
+        let events = event_to_watch_events(&Event::new(EventKind::Any).set_flag(Flag::Rescan));
+
+        assert_eq!(events, vec![WatchEvent::rescan()]);
+    }
+
+    #[test]
+    fn test_fs_events_notification_envelope() {
+        let notification = fs_events_notification(&[
+            WatchEvent::path("created", PathBuf::from("/tmp/new")),
+            WatchEvent::rescan(),
+        ]);
+
+        assert_eq!(notification.version, "2.0");
+        assert_eq!(notification.method, "fs.events");
+        let events = match map_value(&notification.params, "events") {
+            Some(Value::Array(events)) => events,
+            other => panic!("expected events array, got {other:?}"),
+        };
+        assert_eq!(events.len(), 2);
+        assert_eq!(
+            map_value(&events[0], "action"),
+            Some(&Value::String("created".into()))
+        );
+        assert_eq!(
+            map_value(&events[0], "path"),
+            Some(&Value::String("/tmp/new".into()))
+        );
+        assert_eq!(
+            map_value(&events[1], "action"),
+            Some(&Value::String("rescan".into()))
+        );
+    }
+
     fn refresh_for_event(manager: &WatchManager, event: &Event) {
         let roots = manager.recursive_roots_for_event(event);
         manager.refresh_recursive_roots(roots);
+    }
+
+    #[test]
+    fn test_rescan_refreshes_all_recursive_roots() {
+        let temp = tempfile::tempdir().unwrap();
+        let root1 = temp.path().join("root1");
+        let root2 = temp.path().join("root2");
+        fs::create_dir_all(&root1).unwrap();
+        fs::create_dir_all(&root2).unwrap();
+        let root1 = root1.canonicalize().unwrap();
+        let root2 = root2.canonicalize().unwrap();
+        let manager = test_manager();
+
+        manager.watch(&root1, true).unwrap();
+        manager.watch(&root2, true).unwrap();
+        fs::create_dir(root1.join("new1")).unwrap();
+        fs::create_dir(root2.join("new2")).unwrap();
+
+        refresh_for_event(&manager, &Event::new(EventKind::Any).set_flag(Flag::Rescan));
+
+        {
+            let watcher = lock_or_recover(&manager.watcher);
+            assert!(watcher.recursive_roots[&root1].contains(&root1.join("new1")));
+            assert!(watcher.recursive_roots[&root2].contains(&root2.join("new2")));
+        }
+        manager.unwatch(&root1).unwrap();
+        manager.unwatch(&root2).unwrap();
     }
 
     #[cfg(target_os = "linux")]

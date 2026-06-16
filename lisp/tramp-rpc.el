@@ -3,7 +3,7 @@
 ;; Copyright (C) 2026 Arthur Heymans <arthur@aheymans.xyz>
 
 ;; Author: Arthur Heymans <arthur@aheymans.xyz>
-;; Version: 0.10.0
+;; Version: 0.11.0
 ;; Keywords: comm, processes, files
 ;; Package-Requires: ((emacs "30.1") (msgpack "0") (tramp "2.8.1.4"))
 
@@ -3708,6 +3708,43 @@ Keys are the same connection/path keys as `tramp-rpc--watched-directories'.")
       (when (buffer-live-p buffer)
         (kill-buffer buffer)))))
 
+(defun tramp-rpc--canonical-directory-equal-p (a b)
+  "Return non-nil if canonical directory names A and B are equal."
+  (and (stringp a)
+       (stringp b)
+       (string= (directory-file-name a) (directory-file-name b))))
+
+(defun tramp-rpc--watch-entry-canonical-directory (entry)
+  "Return canonical directory recorded in watch ENTRY."
+  (or (plist-get entry :canonical-directory)
+      (plist-get entry :directory)))
+
+(defun tramp-rpc--canonical-watch-active-p (canonical-directory)
+  "Return non-nil if CANONICAL-DIRECTORY still has a client-side owner.
+Both explicit watch entries and file-notify watch entries count as owners."
+  (let (active)
+    (when (and (stringp canonical-directory)
+               (hash-table-p tramp-rpc--watched-directories))
+      (maphash
+       (lambda (_key entry)
+         (when (tramp-rpc--canonical-directory-equal-p
+                canonical-directory
+                (tramp-rpc--watch-entry-canonical-directory entry))
+           (setq active t)))
+       tramp-rpc--watched-directories))
+    (when (and (not active)
+               (stringp canonical-directory)
+               (hash-table-p tramp-rpc--file-notify-watch-counts))
+      (maphash
+       (lambda (_key entry)
+         (when (and (plist-get entry :count)
+                    (tramp-rpc--canonical-directory-equal-p
+                     canonical-directory
+                     (tramp-rpc--watch-entry-canonical-directory entry)))
+           (setq active t)))
+       tramp-rpc--file-notify-watch-counts))
+    active))
+
 (defun tramp-rpc--cleanup-file-notify-for-connection (&optional vec)
   "Remove TRAMP-RPC file notification state for VEC.
 When VEC is nil, remove all TRAMP-RPC file notification state.  This also
@@ -3748,62 +3785,155 @@ descriptors after connection cleanup."
        (length watch-keys-to-remove)
        (if vec (format " for %s" prefix) "")))))
 
-(defun tramp-rpc--file-notify-direct-child-p (directory file)
-  "Return non-nil if FILE is an immediate child of DIRECTORY."
+(defun tramp-rpc--file-notify-relative-name (directory file)
+  "Return FILE's relative name under DIRECTORY, or nil.
+Only DIRECTORY itself and immediate children match.  DIRECTORY itself returns
+the empty string."
   (let* ((dir (file-name-as-directory (directory-file-name directory)))
          (file (directory-file-name file)))
-    (and (string-prefix-p dir file)
-         (let ((rest (substring file (length dir))))
-           (and (not (string-empty-p rest))
-                (not (string-match-p "/" rest)))))))
+    (cond
+     ((string= (directory-file-name dir) file) "")
+     ((string-prefix-p dir file)
+      (let ((rest (substring file (length dir))))
+        (and (not (string-empty-p rest))
+             (not (string-match-p "/" rest))
+             rest))))))
 
-(defun tramp-rpc--file-notify-dispatch (file-name)
-  "Dispatch a `file-notify' event for changed TRAMP FILE-NAME."
-  (when (and (hash-table-p tramp-rpc--file-notify-descriptors)
-             (> (hash-table-count tramp-rpc--file-notify-descriptors) 0))
-    ;; `file-notify-callback' and the special-event handler live in
-    ;; filenotify.el.  It is normally loaded before file notifications are
-    ;; registered, but require it defensively before constructing events.
-    (require 'filenotify)
-    (let ((descriptors nil))
+(defun tramp-rpc--file-notify-direct-child-p (directory file)
+  "Return non-nil if FILE is DIRECTORY or its immediate child."
+  (and (tramp-rpc--file-notify-relative-name directory file) t))
+
+(defun tramp-rpc--file-notify-action-enabled-p (action flags)
+  "Return non-nil when ACTION is enabled by file notification FLAGS."
+  (or (member action '("stopped"))
+      (and (memq 'change flags)
+           (member action '("created" "changed" "deleted"
+                            "renamed" "renamed-from" "renamed-to")))
+      (and (memq 'attribute-change flags)
+           (string= action "attribute-changed"))))
+
+(defun tramp-rpc--file-notify-callback-action (action)
+  "Map protocol ACTION to an action accepted by `file-notify-callback'."
+  (pcase action
+    ("created" 'created)
+    ("changed" 'changed)
+    ("attribute-changed" 'attribute-changed)
+    ("deleted" 'deleted)
+    ("renamed" 'moved)
+    ("renamed-from" 'moved-from)
+    ("renamed-to" 'moved-to)
+    ("stopped" 'unmounted)
+    (_ nil)))
+
+(defun tramp-rpc--file-notify-alias-paths (file-name)
+  "Return original watch spellings equivalent to canonical FILE-NAME."
+  (let (aliases)
+    (when (hash-table-p tramp-rpc--file-notify-descriptors)
       (maphash
-       (lambda (descriptor data)
+       (lambda (_descriptor data)
          (let* ((watch-key (plist-get data :watch-key))
                 (watch-entry (and watch-key
                                   (gethash watch-key
                                            tramp-rpc--file-notify-watch-counts)))
-                ;; Prefer the shared watch entry, because explicit unwatch can
-                ;; restore a file-notify-owned direct watch and learn a newer
-                ;; canonical path after descriptors were created.
                 (canonical-directory
                  (or (plist-get watch-entry :canonical-directory)
-                     (plist-get data :canonical-directory))))
-           (when (or (tramp-rpc--file-notify-direct-child-p
-                      (plist-get data :directory) file-name)
-                     ;; The server registers canonical watch paths and can
-                     ;; report events using that canonical spelling.  Keep the
-                     ;; original directory for Emacs' public descriptor table,
-                     ;; but also match against the canonical directory returned
-                     ;; by `watch.add' when it differs (for example, symlinked
-                     ;; watched directories).
-                     (and canonical-directory
-                          (tramp-rpc--file-notify-direct-child-p
-                           canonical-directory file-name)))
-             (push descriptor descriptors))))
+                     (plist-get data :canonical-directory)))
+                (directory (plist-get data :directory))
+                (relative (and canonical-directory directory
+                               (tramp-rpc--file-notify-relative-name
+                                canonical-directory file-name))))
+           (when relative
+             (let ((alias (if (string-empty-p relative)
+                              (directory-file-name directory)
+                            (expand-file-name relative directory))))
+               (unless (string= alias file-name)
+                 (cl-pushnew alias aliases :test #'string=))))))
+       tramp-rpc--file-notify-descriptors))
+    aliases))
+
+(defun tramp-rpc--file-notify-canonical-directory (data)
+  "Return the canonical directory associated with descriptor DATA."
+  (let* ((watch-key (plist-get data :watch-key))
+         (watch-entry (and watch-key
+                           (gethash watch-key
+                                    tramp-rpc--file-notify-watch-counts))))
+    ;; Prefer the shared watch entry, because explicit unwatch can restore a
+    ;; file-notify-owned direct watch and learn a newer canonical path after
+    ;; descriptors were created.
+    (or (plist-get watch-entry :canonical-directory)
+        (plist-get data :canonical-directory))))
+
+(defun tramp-rpc--file-notify-original-spelling (data file-name)
+  "Return FILE-NAME rewritten to descriptor DATA's original watch spelling."
+  (let* ((canonical-directory
+          (tramp-rpc--file-notify-canonical-directory data))
+         (directory (plist-get data :directory))
+         (relative (and canonical-directory directory
+                        (tramp-rpc--file-notify-relative-name
+                         canonical-directory file-name))))
+    (if relative
+        (if (string-empty-p relative)
+            (directory-file-name directory)
+          (expand-file-name relative directory))
+      file-name)))
+
+(defun tramp-rpc--file-notify-path-matches-p (data file-name)
+  "Return non-nil if descriptor DATA covers FILE-NAME."
+  (let ((canonical-directory
+         (tramp-rpc--file-notify-canonical-directory data)))
+    (or (tramp-rpc--file-notify-direct-child-p
+         (plist-get data :directory) file-name)
+        ;; The server registers canonical watch paths and can report events
+        ;; using that canonical spelling.  Keep the original directory for
+        ;; Emacs' public descriptor table, but also match against the
+        ;; canonical directory returned by `watch.add' when it differs (for
+        ;; example, symlinked watched directories).
+        (and canonical-directory
+             (tramp-rpc--file-notify-direct-child-p
+              canonical-directory file-name)))))
+
+(defun tramp-rpc--file-notify-dispatch (action file-name &optional file-name1 cookie)
+  "Dispatch a `file-notify' ACTION for TRAMP FILE-NAME.
+FILE-NAME1 is the destination for `renamed' events.  COOKIE pairs
+`renamed-from' and `renamed-to' events when the server provides one."
+  (when (and (hash-table-p tramp-rpc--file-notify-descriptors)
+             (> (hash-table-count tramp-rpc--file-notify-descriptors) 0)
+             (tramp-rpc--file-notify-callback-action action))
+    ;; `file-notify-callback' and the special-event handler live in
+    ;; filenotify.el.  It is normally loaded before file notifications are
+    ;; registered, but require it defensively before constructing events.
+    (require 'filenotify)
+    (let ((descriptors nil)
+          (callback-action (tramp-rpc--file-notify-callback-action action)))
+      (maphash
+       (lambda (descriptor data)
+         (when (and (tramp-rpc--file-notify-action-enabled-p
+                     action (plist-get data :flags))
+                    (or (tramp-rpc--file-notify-path-matches-p data file-name)
+                        (and file-name1
+                             (tramp-rpc--file-notify-path-matches-p
+                              data file-name1))))
+             (push (cons descriptor data) descriptors)))
        tramp-rpc--file-notify-descriptors)
-      (dolist (descriptor descriptors)
-        ;; `file-notify-callback' accepts inotify action names and maps
-        ;; `modify' to the public `changed' action.  The server currently
-        ;; reports only paths, not event kinds, so this is the best available
-        ;; approximation until the protocol carries create/delete/rename/etc.
-        (let ((event `(file-notify
-                       (,descriptor (modify) ,file-name)
-                       file-notify-callback)))
+      (dolist (descriptor-data descriptors)
+        (let* ((descriptor (car descriptor-data))
+               (data (cdr descriptor-data))
+               (display-file-name
+                (tramp-rpc--file-notify-original-spelling data file-name))
+               (display-file-name1
+                (and file-name1
+                     (tramp-rpc--file-notify-original-spelling data file-name1)))
+               (event-data (append (list descriptor (list callback-action)
+                                         display-file-name)
+                                   (cond
+                                    (display-file-name1 (list display-file-name1))
+                                    (cookie (list cookie)))))
+               (event `(file-notify ,event-data file-notify-callback)))
           (if (fboundp 'insert-special-event)
               (insert-special-event event)
             (funcall (lookup-key special-event-map [file-notify]) event)))))))
 
-(defun tramp-rpc-handle-file-notify-add-watch (directory _flags _callback)
+(defun tramp-rpc-handle-file-notify-add-watch (directory flags _callback)
   "Like `file-notify-add-watch' for TRAMP-RPC files.
 DIRECTORY is the remote directory passed by `file-notify-add-watch'."
   ;; `file-notify-add-watch' validates FLAGS and CALLBACK before invoking file
@@ -3853,6 +3983,7 @@ DIRECTORY is the remote directory passed by `file-notify-add-watch'."
                  (list :directory directory
                        :canonical-directory (plist-get watch-entry
                                                        :canonical-directory)
+                       :flags flags
                        :localname localname
                        :watch-key watch-key)
                  tramp-rpc--file-notify-descriptors))
@@ -3863,6 +3994,8 @@ DIRECTORY is the remote directory passed by `file-notify-add-watch'."
   (when-let* ((data (gethash descriptor tramp-rpc--file-notify-descriptors)))
     (let* ((watch-key (plist-get data :watch-key))
            (entry (gethash watch-key tramp-rpc--file-notify-watch-counts))
+           (canonical-directory
+            (tramp-rpc--watch-entry-canonical-directory entry))
            (count (and entry (plist-get entry :count))))
       (cond
        ((and count (> count 1))
@@ -3871,9 +4004,10 @@ DIRECTORY is the remote directory passed by `file-notify-add-watch'."
         (remhash watch-key tramp-rpc--file-notify-watch-counts)
         (when (and (plist-get entry :owned)
                    ;; If a Magit/cache watch has been installed for the same
-                   ;; key while this file notification was live, do not remove
-                   ;; the server watch from underneath it.
-                   (not (gethash watch-key tramp-rpc--watched-directories)))
+                   ;; key or canonical path while this file notification was
+                   ;; live, do not remove the server watch from underneath it.
+                   (not (tramp-rpc--canonical-watch-active-p
+                         canonical-directory)))
           ;; Removing a file notification should not make
           ;; `file-notify-rm-watch' fail if the remote connection has already
           ;; gone away.
