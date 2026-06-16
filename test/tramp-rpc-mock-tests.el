@@ -764,10 +764,10 @@ This matches the behavior expected by `tramp-test28-process-file'."
        (fboundp 'tramp-file-name-with-sudo)))
 
 (ert-deftest tramp-rpc-mock-test-file-notify-suppression-still-dispatches ()
-  "fs.changed suppression skips cache work but still dispatches file notifications."
+  "fs.events suppression skips cache work but still dispatches file notifications."
   (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
   (let* ((vec (tramp-dissect-file-name "/rpc:mock:/tmp/"))
-         (proc (make-process :name "tramp-rpc-fs-changed-test"
+         (proc (make-process :name "tramp-rpc-fs-events-test"
                              :buffer nil
                              :command '("cat")
                              :connection-type 'pipe
@@ -784,14 +784,203 @@ This matches the behavior expected by `tramp-test28-process-file'."
                     ((symbol-function 'tramp-rpc--invalidate-cache-for-path)
                      (lambda (path) (push path invalidations)))
                     ((symbol-function 'tramp-rpc--file-notify-dispatch)
-                     (lambda (path) (push path dispatches))))
+                     (lambda (action path &optional path1 cookie)
+                       (push (list action path path1 cookie) dispatches))))
             (tramp-rpc--handle-notification
-             proc "fs.changed" '((paths . ("/tmp/changed"))))
+             proc "fs.events"
+             '((events . (((action . "changed")
+                            (path . "/tmp/changed"))))))
             (should (= status-clears 0))
             (should-not invalidations)
-            (should (equal dispatches '("/rpc:mock:/tmp/changed")))))
+            (should (equal dispatches
+                           '(("changed" "/rpc:mock:/tmp/changed" nil nil))))))
       (when (process-live-p proc)
         (delete-process proc)))))
+
+(ert-deftest tramp-rpc-mock-test-file-notify-unsuppressed-events-invalidate-caches ()
+  "Unsuppressed fs.events clear status/cache state and dispatch notifications."
+  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
+  (let* ((vec (tramp-dissect-file-name "/rpc:mock:/tmp/"))
+         (proc (make-process :name "tramp-rpc-fs-events-unsuppressed-test"
+                             :buffer nil
+                             :command '("cat")
+                             :connection-type 'pipe
+                             :noquery t))
+         (status-clears 0)
+         (invalidations nil)
+         (connection-clears nil)
+         (dispatches nil)
+         (tramp-rpc--suppress-fs-notifications nil))
+    (unwind-protect
+        (progn
+          (process-put proc :tramp-rpc-vec vec)
+          (cl-letf (((symbol-function 'tramp-rpc-magit--clear-status-cache)
+                     (lambda () (cl-incf status-clears)))
+                    ((symbol-function 'tramp-rpc--invalidate-cache-for-path)
+                     (lambda (path) (push path invalidations)))
+                    ((symbol-function 'tramp-rpc--clear-file-caches-for-connection)
+                     (lambda (clear-vec) (push clear-vec connection-clears)))
+                    ((symbol-function 'tramp-rpc--file-notify-dispatch)
+                     (lambda (action path &optional path1 cookie)
+                       (push (list action path path1 cookie) dispatches))))
+            (tramp-rpc--handle-notification
+             proc "fs.events"
+             '((events . (((action . "changed")
+                            (path . "/tmp/changed"))
+                           ((action . "renamed")
+                            (path . "/tmp/old")
+                            (path1 . "/tmp/new"))
+                           ((action . "rescan"))))))
+            (should (= status-clears 1))
+            (should (member "/rpc:mock:/tmp/changed" invalidations))
+            (should (member "/rpc:mock:/tmp/old" invalidations))
+            (should (member "/rpc:mock:/tmp/new" invalidations))
+            (should (equal connection-clears (list vec)))
+            (should (equal (nreverse dispatches)
+                           '(("changed" "/rpc:mock:/tmp/changed" nil nil)
+                             ("renamed" "/rpc:mock:/tmp/old" "/rpc:mock:/tmp/new" nil))))))
+      (when (process-live-p proc)
+        (delete-process proc)))))
+
+(ert-deftest tramp-rpc-mock-test-file-notify-canonical-event-invalidates-original-watch-spelling ()
+  "Canonical fs.events paths also invalidate equivalent original watch paths."
+  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
+  (let* ((tramp-rpc--file-notify-descriptors (make-hash-table :test 'eq))
+         (tramp-rpc--file-notify-watch-counts (make-hash-table :test 'equal))
+         (vec (tramp-dissect-file-name "/rpc:mock:/tmp/"))
+         (proc (make-process :name "tramp-rpc-fs-events-canonical-test"
+                             :buffer nil
+                             :command '("cat")
+                             :connection-type 'pipe
+                             :noquery t))
+         (watch-key (format "%s:%s" (tramp-rpc--connection-key-string vec) "/tmp/link/"))
+         (descriptor (tramp-rpc--make-file-notify-descriptor
+                      vec "/rpc:mock:/tmp/link/" "/tmp/link/"))
+         (invalidations nil))
+    (unwind-protect
+        (progn
+          (process-put proc :tramp-rpc-vec vec)
+          (puthash descriptor
+                   (list :watch-key watch-key
+                         :directory "/rpc:mock:/tmp/link/"
+                         :canonical-directory "/rpc:mock:/tmp/real/"
+                         :flags '(change))
+                   tramp-rpc--file-notify-descriptors)
+          (puthash watch-key
+                   '(:count 1 :owned t
+                     :directory "/rpc:mock:/tmp/link/"
+                     :canonical-directory "/rpc:mock:/tmp/real/")
+                   tramp-rpc--file-notify-watch-counts)
+          (cl-letf (((symbol-function 'tramp-rpc-magit--clear-status-cache) #'ignore)
+                    ((symbol-function 'tramp-rpc--invalidate-cache-for-path)
+                     (lambda (path) (push path invalidations)))
+                    ((symbol-function 'tramp-rpc--file-notify-dispatch) #'ignore))
+            (tramp-rpc--handle-notification
+             proc "fs.events"
+             '((events . (((action . "changed")
+                            (path . "/tmp/real/changed"))))))
+            (should (member "/rpc:mock:/tmp/real/changed" invalidations))
+            (should (member "/rpc:mock:/tmp/link/changed" invalidations))))
+      (when (process-live-p proc)
+        (delete-process proc))
+      (tramp-rpc--delete-file-notify-descriptor-process descriptor))))
+
+(ert-deftest tramp-rpc-mock-test-file-notify-watch-directory-canonical-event-invalidates-original-spelling ()
+  "Explicit watch canonical fs.events paths invalidate original watched paths."
+  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
+  (let* ((tramp-rpc--watched-directories (make-hash-table :test 'equal))
+         (vec (tramp-dissect-file-name "/rpc:mock:/tmp/"))
+         (proc (make-process :name "tramp-rpc-watch-canonical-test"
+                             :buffer nil
+                             :command '("cat")
+                             :connection-type 'pipe
+                             :noquery t))
+         (directory "/rpc:mock:/tmp/link/")
+         (watch-key (format "%s:%s" (tramp-rpc--connection-key-string vec)
+                            "/tmp/link/"))
+         (invalidations nil))
+    (unwind-protect
+        (progn
+          (process-put proc :tramp-rpc-vec vec)
+          (cl-letf (((symbol-function 'tramp-rpc--call)
+                     (lambda (_vec method _params)
+                       (when (equal method "watch.add")
+                         '((path . "/tmp/real/")))))
+                    ((symbol-function 'tramp-rpc-magit--clear-status-cache) #'ignore)
+                    ((symbol-function 'tramp-rpc--invalidate-cache-for-path)
+                     (lambda (path) (push path invalidations)))
+                    ((symbol-function 'tramp-rpc--file-notify-dispatch) #'ignore))
+            (tramp-rpc-watch-directory directory t)
+            (should (equal (plist-get (gethash watch-key tramp-rpc--watched-directories)
+                                      :canonical-directory)
+                           "/rpc:mock:/tmp/real/"))
+            (tramp-rpc--handle-notification
+             proc "fs.events"
+             '((events . (((action . "changed")
+                            (path . "/tmp/real/sub/file"))))))
+            (should (member "/rpc:mock:/tmp/real/sub/file" invalidations))
+            (should (member "/rpc:mock:/tmp/link/sub/file" invalidations))))
+      (when (process-live-p proc)
+        (delete-process proc)))))
+
+(ert-deftest tramp-rpc-mock-test-watch-directory-canonical-aliases-share-server-watch ()
+  "Explicit watches with the same canonical path do not remove each other."
+  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
+  (let* ((tramp-rpc--watched-directories (make-hash-table :test 'equal))
+         (tramp-rpc--file-notify-watch-counts (make-hash-table :test 'equal))
+         (link-directory "/rpc:mock:/tmp/link/")
+         (real-directory "/rpc:mock:/tmp/real/")
+         (calls nil))
+    (cl-letf (((symbol-function 'tramp-rpc--call)
+               (lambda (_vec method params)
+                 (push (list method params) calls)
+                 (when (equal method "watch.add")
+                   '((path . "/tmp/real/"))))))
+      (tramp-rpc-watch-directory link-directory t)
+      (tramp-rpc-watch-directory real-directory t)
+      (setq calls nil)
+      (tramp-rpc-unwatch-directory link-directory)
+      (should (equal (mapcar #'car (nreverse (copy-sequence calls))) nil))
+      (should (tramp-rpc--directory-watched-p "/tmp/real/" (tramp-dissect-file-name real-directory)))
+      (tramp-rpc-unwatch-directory real-directory)
+      (should (equal (mapcar #'car (nreverse (copy-sequence calls)))
+                     '("watch.remove"))))))
+
+(ert-deftest tramp-rpc-mock-test-file-notify-canonical-aliases-share-server-watch ()
+  "File notification watches with the same canonical path are refcounted."
+  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
+  (require 'filenotify)
+  (let* ((tramp-rpc--file-notify-descriptors (make-hash-table :test 'eq))
+         (tramp-rpc--file-notify-watch-counts (make-hash-table :test 'equal))
+         (tramp-rpc--watched-directories (make-hash-table :test 'equal))
+         (link-directory "/rpc:mock:/tmp/link/")
+         (real-directory "/rpc:mock:/tmp/real/")
+         (calls nil)
+         link-descriptor
+         real-descriptor)
+    (unwind-protect
+        (cl-letf (((symbol-function 'tramp-rpc--call)
+                   (lambda (_vec method params)
+                     (push (list method params) calls)
+                     (when (equal method "watch.add")
+                       '((path . "/tmp/real/")))))
+                  ((symbol-function 'tramp-rpc-handle-file-directory-p)
+                   (lambda (_filename) t)))
+          (setq link-descriptor
+                (file-notify-add-watch link-directory '(change) #'ignore))
+          (setq real-descriptor
+                (file-notify-add-watch real-directory '(change) #'ignore))
+          (setq calls nil)
+          (file-notify-rm-watch link-descriptor)
+          (should (equal (mapcar #'car (nreverse (copy-sequence calls))) nil))
+          (should (file-notify-valid-p real-descriptor))
+          (file-notify-rm-watch real-descriptor)
+          (should (equal (mapcar #'car (nreverse (copy-sequence calls)))
+                         '("watch.remove"))))
+      (when (and link-descriptor (boundp 'file-notify-descriptors))
+        (remhash link-descriptor file-notify-descriptors))
+      (when (and real-descriptor (boundp 'file-notify-descriptors))
+        (remhash real-descriptor file-notify-descriptors)))))
 
 (ert-deftest tramp-rpc-mock-test-file-notify-cleanup-for-connection ()
   "Per-connection cleanup removes TRAMP-RPC and global file-notify descriptors."
@@ -871,10 +1060,19 @@ This matches the behavior expected by `tramp-test28-process-file'."
                                              tramp-rpc--file-notify-descriptors)
                                     :canonical-directory)
                          "/rpc:mock:/tmp/real/"))
-          (tramp-rpc--file-notify-dispatch "/rpc:mock:/tmp/real/changed")
+          (tramp-rpc--file-notify-dispatch "changed" "/rpc:mock:/tmp/real/changed")
           (should (equal events
                          `((file-notify
-                            (,descriptor (modify) "/rpc:mock:/tmp/real/changed")
+                            (,descriptor (changed) "/rpc:mock:/tmp/link/changed")
+                            file-notify-callback))))
+          (setq events nil)
+          (tramp-rpc--file-notify-dispatch
+           "renamed" "/rpc:mock:/tmp/real/old" "/rpc:mock:/tmp/real/new")
+          (should (equal events
+                         `((file-notify
+                            (,descriptor (moved)
+                             "/rpc:mock:/tmp/link/old"
+                             "/rpc:mock:/tmp/link/new")
                             file-notify-callback))))
           ;; Dispatch uses the shared watch entry's canonical directory if it is
           ;; refreshed after the descriptor was created.
@@ -883,14 +1081,95 @@ This matches the behavior expected by `tramp-test28-process-file'."
                  (entry (gethash (plist-get data :watch-key)
                                  tramp-rpc--file-notify-watch-counts)))
             (plist-put entry :canonical-directory "/rpc:mock:/tmp/new-real/"))
-          (tramp-rpc--file-notify-dispatch "/rpc:mock:/tmp/new-real/changed")
+          (tramp-rpc--file-notify-dispatch "changed" "/rpc:mock:/tmp/new-real/changed")
           (should (equal events
                          `((file-notify
-                            (,descriptor (modify) "/rpc:mock:/tmp/new-real/changed")
+                            (,descriptor (changed) "/rpc:mock:/tmp/link/changed")
                             file-notify-callback)))))
       (when descriptor
         (remhash descriptor tramp-rpc--file-notify-descriptors)
         (tramp-rpc--delete-file-notify-descriptor-process descriptor)))))
+
+(ert-deftest tramp-rpc-mock-test-file-notify-dispatches-structured-actions ()
+  "Structured server watch events dispatch the corresponding file-notify actions."
+  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
+  (require 'filenotify)
+  (let* ((tramp-rpc--file-notify-descriptors (make-hash-table :test 'eq))
+         (tramp-rpc--file-notify-watch-counts (make-hash-table :test 'equal))
+         (tramp-rpc--watched-directories (make-hash-table :test 'equal))
+         (directory "/rpc:mock:/tmp/repo/")
+         (events nil)
+         descriptor)
+    (unwind-protect
+        (cl-letf (((symbol-function 'tramp-rpc--call)
+                   (lambda (_vec method _params)
+                     (when (equal method "watch.add")
+                       '((path . "/tmp/repo/")))))
+                  ((symbol-function 'insert-special-event)
+                   (lambda (event) (push event events))))
+          (setq descriptor
+                (tramp-rpc-handle-file-notify-add-watch
+                 directory '(change attribute-change) #'ignore))
+          (should (processp descriptor))
+          (tramp-rpc--file-notify-dispatch "created" "/rpc:mock:/tmp/repo/new")
+          (tramp-rpc--file-notify-dispatch "attribute-changed" "/rpc:mock:/tmp/repo/new")
+          (tramp-rpc--file-notify-dispatch
+           "renamed" "/rpc:mock:/tmp/repo/old" "/rpc:mock:/tmp/repo/new")
+          (tramp-rpc--file-notify-dispatch "deleted" "/rpc:mock:/tmp/repo/new")
+          (should (equal (nreverse events)
+                         `((file-notify
+                            (,descriptor (created) "/rpc:mock:/tmp/repo/new")
+                            file-notify-callback)
+                           (file-notify
+                            (,descriptor (attribute-changed) "/rpc:mock:/tmp/repo/new")
+                            file-notify-callback)
+                           (file-notify
+                            (,descriptor (moved) "/rpc:mock:/tmp/repo/old" "/rpc:mock:/tmp/repo/new")
+                            file-notify-callback)
+                           (file-notify
+                            (,descriptor (deleted) "/rpc:mock:/tmp/repo/new")
+                            file-notify-callback)))))
+      (when descriptor
+        (remhash descriptor tramp-rpc--file-notify-descriptors)
+        (tramp-rpc--delete-file-notify-descriptor-process descriptor)))))
+
+(ert-deftest tramp-rpc-mock-test-file-notify-dispatch-honors-flags ()
+  "TRAMP-RPC file notifications honor change vs attribute-change flags."
+  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
+  (require 'filenotify)
+  (let* ((tramp-rpc--file-notify-descriptors (make-hash-table :test 'eq))
+         (tramp-rpc--file-notify-watch-counts (make-hash-table :test 'equal))
+         (tramp-rpc--watched-directories (make-hash-table :test 'equal))
+         (directory "/rpc:mock:/tmp/repo/")
+         (events nil)
+         change-descriptor
+         attribute-descriptor)
+    (unwind-protect
+        (cl-letf (((symbol-function 'tramp-rpc--call)
+                   (lambda (_vec method _params)
+                     (when (equal method "watch.add")
+                       '((path . "/tmp/repo/")))))
+                  ((symbol-function 'insert-special-event)
+                   (lambda (event) (push event events))))
+          (setq change-descriptor
+                (tramp-rpc-handle-file-notify-add-watch directory '(change) #'ignore))
+          (setq attribute-descriptor
+                (tramp-rpc-handle-file-notify-add-watch directory '(attribute-change) #'ignore))
+          (should (processp change-descriptor))
+          (should (processp attribute-descriptor))
+          (tramp-rpc--file-notify-dispatch "changed" "/rpc:mock:/tmp/repo/file")
+          (tramp-rpc--file-notify-dispatch "attribute-changed" "/rpc:mock:/tmp/repo/file")
+          (should (equal (nreverse events)
+                         `((file-notify
+                            (,change-descriptor (changed) "/rpc:mock:/tmp/repo/file")
+                            file-notify-callback)
+                           (file-notify
+                            (,attribute-descriptor (attribute-changed) "/rpc:mock:/tmp/repo/file")
+                            file-notify-callback)))))
+      (dolist (descriptor (list change-descriptor attribute-descriptor))
+        (when descriptor
+          (remhash descriptor tramp-rpc--file-notify-descriptors)
+          (tramp-rpc--delete-file-notify-descriptor-process descriptor))))))
 
 (ert-deftest tramp-rpc-mock-test-file-notify-public-rm-and-valid-route ()
   "Public file-notify APIs route TRAMP-RPC descriptors to private state."
@@ -992,7 +1271,7 @@ This matches the behavior expected by `tramp-test28-process-file'."
       (should (plist-get (gethash watch-key tramp-rpc--file-notify-watch-counts)
                          :owned))
       (should (equal (mapcar #'car (nreverse (copy-sequence calls)))
-                     '("watch.add" "watch.remove" "watch.add"))))))
+                     '("watch.add" "watch.add"))))))
 
 (ert-deftest tramp-rpc-mock-test-file-notify-watch-upgrade-failure-keeps-direct ()
   "A failed recursive upgrade does not remove a direct file-notify watch."

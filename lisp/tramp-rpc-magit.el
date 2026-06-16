@@ -18,7 +18,7 @@
 ;; This file provides caching infrastructure, filesystem watching, and
 ;; magit/projectile integration for tramp-rpc.  It includes:
 ;; - TTL-based file-exists and file-truename caches
-;; - Cache invalidation via server push notifications (fs.changed)
+;; - Cache invalidation via server push notifications (fs.events)
 ;; - Watch management (add/remove/list watched directories)
 ;; - Notification dispatch for filesystem change events
 ;; - Parallel git command prefetch for fast magit-status
@@ -40,8 +40,12 @@
 (declare-function tramp-rpc--call "tramp-rpc")
 (declare-function tramp-rpc--connection-key "tramp-rpc")
 (declare-function tramp-rpc--decode-output "tramp-rpc")
+(declare-function tramp-rpc--decode-string "tramp-rpc")
 (declare-function tramp-rpc-file-name-p "tramp-rpc")
+(declare-function tramp-rpc--canonical-watch-active-p "tramp-rpc")
+(declare-function tramp-rpc--file-notify-alias-paths "tramp-rpc")
 (declare-function tramp-rpc--file-notify-dispatch "tramp-rpc")
+(declare-function tramp-rpc--watch-entry-canonical-directory "tramp-rpc")
 
 ;; Silence byte-compiler warnings for external functions
 (declare-function projectile-dir-files-alien "projectile")
@@ -157,7 +161,7 @@ Keys are \"conn-key:path\" strings, values are plists with watch metadata.")
 (defvar tramp-rpc--file-notify-watch-counts)
 
 (defvar tramp-rpc--suppress-fs-notifications nil
-  "When non-nil, suppress handling of fs.changed notifications.
+  "When non-nil, suppress cache handling of fs.events notifications.
 Used during operations that will invalidate caches themselves.")
 
 (defun tramp-rpc--connection-key-string (vec)
@@ -180,32 +184,90 @@ Used during operations that will invalidate caches themselves.")
 PROCESS is the connection, METHOD is the notification method,
 PARAMS is the notification parameters."
   (cond
-   ((string= method "fs.changed")
-    (tramp-rpc--handle-fs-changed process params))
+   ((string= method "fs.events")
+    (tramp-rpc--handle-fs-events process params))
    (t
     (tramp-rpc--debug "Unknown notification: %s" method))))
 
-(defun tramp-rpc--handle-fs-changed (process params)
-  "Handle an fs.changed notification from PROCESS with PARAMS.
-Invalidates caches for the changed paths."
-  (let ((paths (alist-get 'paths params)))
-    (when paths
-      (tramp-rpc--debug "fs.changed: %d paths changed" (length paths))
-      (unless tramp-rpc--suppress-fs-notifications
-        ;; Also clear the magit process-file cache since git state may have changed.
-        (tramp-rpc-magit--clear-status-cache))
-      (dolist (path paths)
-        (when (stringp path)
-          ;; Build the full tramp path for cache invalidation and file
-          ;; notification dispatch.  File notifications are deliberately not
-          ;; suppressed by `tramp-rpc--suppress-fs-notifications': that variable
-          ;; only suppresses cache/status work during operations that invalidate
-          ;; caches themselves.
-          (when-let* ((vec (process-get process :tramp-rpc-vec)))
-            (let ((full-path (tramp-make-tramp-file-name vec path)))
-              (unless tramp-rpc--suppress-fs-notifications
-                (tramp-rpc--invalidate-cache-for-path full-path))
-              (tramp-rpc--file-notify-dispatch full-path))))))))
+(defun tramp-rpc--fs-event-path (vec event key)
+  "Return EVENT's KEY path as a TRAMP file name on VEC, or nil."
+  (when-let* ((path (tramp-rpc--decode-string (alist-get key event)))
+              ((stringp path)))
+    (tramp-make-tramp-file-name vec path)))
+
+(defun tramp-rpc--watch-canonical-directory (vec result)
+  "Return canonical TRAMP directory from watch.add RESULT on VEC."
+  (when-let* ((canonical-localname (and (listp result)
+                                        (tramp-rpc--decode-string
+                                         (alist-get 'path result))))
+              ((stringp canonical-localname)))
+    (tramp-make-tramp-file-name vec canonical-localname)))
+
+(defun tramp-rpc--path-under-directory-relative (directory file-name)
+  "Return FILE-NAME relative to DIRECTORY, or nil.
+DIRECTORY itself returns the empty string.  Descendants can contain slashes."
+  (let* ((dir (file-name-as-directory (directory-file-name directory)))
+         (file (directory-file-name file-name)))
+    (cond
+     ((string= (directory-file-name dir) file) "")
+     ((string-prefix-p dir file)
+      (substring file (length dir))))))
+
+(defun tramp-rpc--watched-directory-alias-paths (path)
+  "Return explicit watch spellings equivalent to canonical PATH."
+  (let (aliases)
+    (when (hash-table-p tramp-rpc--watched-directories)
+      (maphash
+       (lambda (_key entry)
+         (let* ((canonical-directory (plist-get entry :canonical-directory))
+                (directory (plist-get entry :directory))
+                (relative (and canonical-directory directory
+                               (tramp-rpc--path-under-directory-relative
+                                canonical-directory path))))
+           (when relative
+             (let ((alias (if (string-empty-p relative)
+                              (directory-file-name directory)
+                            (expand-file-name relative directory))))
+               (unless (string= alias path)
+                 (cl-pushnew alias aliases :test #'string=))))))
+       tramp-rpc--watched-directories))
+    aliases))
+
+(defun tramp-rpc--invalidate-event-path (path)
+  "Invalidate caches for PATH and equivalent original watch spellings."
+  (dolist (candidate (append (list path)
+                             (tramp-rpc--watched-directory-alias-paths path)
+                             (tramp-rpc--file-notify-alias-paths path)))
+    (tramp-rpc--invalidate-cache-for-path candidate)))
+
+(defun tramp-rpc--handle-fs-events (process params)
+  "Handle an fs.events notification from PROCESS with PARAMS."
+  (let ((events (alist-get 'events params)))
+    (when events
+      (tramp-rpc--debug "fs.events: %d events" (length events))
+      (when-let* ((vec (process-get process :tramp-rpc-vec)))
+        (unless tramp-rpc--suppress-fs-notifications
+          ;; Also clear the magit process-file cache since git state may have changed.
+          (tramp-rpc-magit--clear-status-cache))
+        (dolist (event events)
+          (let* ((action (alist-get 'action event))
+                 (path (tramp-rpc--fs-event-path vec event 'path))
+                 (path1 (tramp-rpc--fs-event-path vec event 'path1))
+                 (cookie (alist-get 'cookie event)))
+            (when (stringp action)
+              (if (string= action "rescan")
+                  (unless tramp-rpc--suppress-fs-notifications
+                    (tramp-rpc--clear-file-caches-for-connection vec))
+                (when path
+                  ;; File notifications are deliberately not suppressed by
+                  ;; `tramp-rpc--suppress-fs-notifications': that variable only
+                  ;; suppresses cache/status work during operations that
+                  ;; invalidate caches themselves.
+                  (unless tramp-rpc--suppress-fs-notifications
+                    (tramp-rpc--invalidate-event-path path)
+                    (when path1
+                      (tramp-rpc--invalidate-event-path path1)))
+                  (tramp-rpc--file-notify-dispatch action path path1 cookie))))))))))
 
 (defun tramp-rpc-watch-directory (directory &optional recursive)
   "Start watching DIRECTORY for filesystem changes.
@@ -226,19 +288,29 @@ When RECURSIVE is non-nil, watch subdirectories too."
           ;; atomic non-recursive-to-recursive upgrade path.  Do not remove the
           ;; existing watch first; if the recursive add fails, the server rolls
           ;; back and our file-notify ownership state remains unchanged.
-          (progn
-            (tramp-rpc--call v "watch.add"
-                             `((path . ,localname) (recursive . t)))
+          (let* ((result (tramp-rpc--call
+                          v "watch.add"
+                          `((path . ,localname) (recursive . t))))
+                 (canonical-directory
+                  (tramp-rpc--watch-canonical-directory v result)))
             (plist-put file-notify-entry :owned nil)
-            (puthash watch-key '(:recursive t)
+            (puthash watch-key
+                     (list :recursive t
+                           :directory directory
+                           :canonical-directory canonical-directory)
                      tramp-rpc--watched-directories))
-        (tramp-rpc--call v "watch.add"
-                         `((path . ,localname)
-                           (recursive . ,(if recursive t :msgpack-false))))
-        (puthash watch-key
-                 (list :recursive (or recursive
-                                      (tramp-rpc--watch-entry-recursive-p entry)))
-                 tramp-rpc--watched-directories)))
+        (let* ((result (tramp-rpc--call
+                        v "watch.add"
+                        `((path . ,localname)
+                          (recursive . ,(if recursive t :msgpack-false)))))
+               (canonical-directory
+                (tramp-rpc--watch-canonical-directory v result)))
+          (puthash watch-key
+                   (list :recursive (or recursive
+                                        (tramp-rpc--watch-entry-recursive-p entry))
+                         :directory directory
+                         :canonical-directory canonical-directory)
+                   tramp-rpc--watched-directories))))
     (tramp-rpc--debug "Watching: %s (recursive=%s)" localname recursive)))
 
 (defun tramp-rpc-unwatch-directory (directory)
@@ -247,10 +319,12 @@ When RECURSIVE is non-nil, watch subdirectories too."
   (with-parsed-tramp-file-name directory nil
     (let* ((watch-key (format "%s:%s" (tramp-rpc--connection-key-string v)
                               localname))
+           (entry (gethash watch-key tramp-rpc--watched-directories))
+           (canonical-directory
+            (tramp-rpc--watch-entry-canonical-directory entry))
            (file-notify-entry (and (boundp 'tramp-rpc--file-notify-watch-counts)
                                    (gethash watch-key
                                             tramp-rpc--file-notify-watch-counts))))
-      (tramp-rpc--call v "watch.remove" `((path . ,localname)))
       (remhash watch-key tramp-rpc--watched-directories)
       ;; If file-notify was relying on the watch we just removed, restore its
       ;; direct non-recursive watch.  This applies to both recursive and
@@ -261,12 +335,17 @@ When RECURSIVE is non-nil, watch subdirectories too."
         (let ((result (tramp-rpc--call v "watch.add"
                                        `((path . ,localname)
                                          (recursive . :msgpack-false)))))
-          (when-let* ((canonical-localname (and (listp result)
-                                                (alist-get 'path result)))
-                      ((stringp canonical-localname)))
-            (plist-put file-notify-entry :canonical-directory
-                       (tramp-make-tramp-file-name v canonical-localname))))
-        (plist-put file-notify-entry :owned t)))
+          (when-let* ((restored-canonical-directory
+                       (tramp-rpc--watch-canonical-directory v result)))
+            (setq canonical-directory restored-canonical-directory)
+            (plist-put file-notify-entry :canonical-directory canonical-directory)))
+        (plist-put file-notify-entry :owned t))
+      (unless (tramp-rpc--canonical-watch-active-p canonical-directory)
+        (tramp-rpc--call
+         v "watch.remove"
+         `((path . ,(if (stringp canonical-directory)
+                        (tramp-file-local-name canonical-directory)
+                      localname))))))
     (tramp-rpc--debug "Unwatched: %s" localname)))
 
 (defun tramp-rpc--cleanup-watches-for-connection (vec)
@@ -521,9 +600,9 @@ commands.run_parallel RPC call, then stores the results directly
 as the process-file cache.  Also fetches ancestor markers."
   (when (and (file-remote-p directory)
              (tramp-rpc-file-name-p directory))
-    ;; Suppress fs.changed notifications during prefetch.
-    ;; The git commands we run on the server touch .git/index etc.,
-    ;; triggering inotify events that would clear the cache we're building.
+    ;; Suppress fs.events cache handling during prefetch.  The git commands
+    ;; we run on the server touch .git/index etc., triggering inotify events
+    ;; that would clear the cache we're building.
     (let ((tramp-rpc--suppress-fs-notifications t))
       ;; Remember the directory we prefetched for
       (setq tramp-rpc-magit--prefetch-directory (expand-file-name directory))
@@ -677,7 +756,7 @@ Only uses the cache if FILENAME is under the prefetched directory."
 
 (defun tramp-rpc-handle-magit-status-setup-buffer (&optional directory)
   "Handler for `magit-status-setup-buffer' to prefetch data.
-Suppresses fs.changed notifications during refresh to prevent
+Suppresses fs.events cache handling during refresh to prevent
 inotify events (from git commands touching .git/index etc.) from
 clearing caches mid-refresh."
   (let ((directory (or directory default-directory))
@@ -687,13 +766,13 @@ clearing caches mid-refresh."
         (tramp-run-real-handler 'magit-status-setup-buffer (list directory))
       ;; Clear process-file cache - ancestors/prefetch-dir stay for other packages
       (tramp-rpc-magit--clear-status-cache)
-      ;; Flush file caches since we suppressed fs.changed during the refresh
+      ;; Flush file caches since we suppressed fs.events during the refresh
       (clrhash tramp-rpc--file-exists-cache)
       (clrhash tramp-rpc--file-truename-cache))))
 
 (defun tramp-rpc-handle-magit-status-refresh-buffer ()
   "Handler for `magit-status-refresh-buffer' to prefetch data.
-Suppresses fs.changed notifications during refresh to prevent
+Suppresses fs.events cache handling during refresh to prevent
 inotify events from clearing caches mid-refresh."
   (when (null (tramp-rpc-magit--get-process-cache))
     (tramp-rpc-magit--prefetch default-directory))
@@ -702,7 +781,7 @@ inotify events from clearing caches mid-refresh."
         (tramp-run-real-handler 'magit-status-refresh-buffer nil)
       ;; Clear process-file cache - ancestors/prefetch-dir stay for other packages
       (tramp-rpc-magit--clear-status-cache)
-      ;; Flush file caches since we suppressed fs.changed during the refresh
+      ;; Flush file caches since we suppressed fs.events during the refresh
       (clrhash tramp-rpc--file-exists-cache)
       (clrhash tramp-rpc--file-truename-cache))))
 
