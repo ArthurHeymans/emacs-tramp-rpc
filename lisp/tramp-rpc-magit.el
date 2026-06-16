@@ -247,17 +247,16 @@ When RECURSIVE is non-nil, watch subdirectories too."
   (with-parsed-tramp-file-name directory nil
     (let* ((watch-key (format "%s:%s" (tramp-rpc--connection-key-string v)
                               localname))
-           (entry (gethash watch-key tramp-rpc--watched-directories))
-           (was-recursive (tramp-rpc--watch-entry-recursive-p entry))
            (file-notify-entry (and (boundp 'tramp-rpc--file-notify-watch-counts)
                                    (gethash watch-key
                                             tramp-rpc--file-notify-watch-counts))))
       (tramp-rpc--call v "watch.remove" `((path . ,localname)))
       (remhash watch-key tramp-rpc--watched-directories)
-      ;; If file-notify was relying on the recursive watch we just removed,
-      ;; restore its direct non-recursive watch.
-      (when (and was-recursive
-                 file-notify-entry
+      ;; If file-notify was relying on the watch we just removed, restore its
+      ;; direct non-recursive watch.  This applies to both recursive and
+      ;; non-recursive explicit watches; otherwise a still-valid file-notify
+      ;; descriptor could be left without any server watch underneath it.
+      (when (and file-notify-entry
                  (not (plist-get file-notify-entry :owned)))
         (tramp-rpc--call v "watch.add"
                          `((path . ,localname)

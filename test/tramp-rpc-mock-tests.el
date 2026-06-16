@@ -929,6 +929,36 @@ This matches the behavior expected by `tramp-test28-process-file'."
       (should (tramp-rpc--watch-entry-recursive-p
                (gethash watch-key tramp-rpc--watched-directories))))))
 
+(ert-deftest tramp-rpc-mock-test-file-notify-unwatch-restores-direct-watch ()
+  "Explicit unwatch restores a direct watch needed by file-notify."
+  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
+  (let* ((tramp-rpc--file-notify-descriptors (make-hash-table :test 'eq))
+         (tramp-rpc--file-notify-watch-counts (make-hash-table :test 'equal))
+         (tramp-rpc--watched-directories (make-hash-table :test 'equal))
+         (directory "/rpc:mock:/tmp/repo/")
+         (vec (tramp-dissect-file-name directory))
+         (watch-key (format "%s:%s" (tramp-rpc--connection-key-string vec) "/tmp/repo/"))
+         (calls nil)
+         descriptor)
+    (cl-letf (((symbol-function 'tramp-rpc--call)
+               (lambda (_vec method params)
+                 (push (list method params) calls)
+                 t))
+              ((symbol-function 'file-truename)
+               (lambda (filename) filename)))
+      (tramp-rpc-watch-directory directory nil)
+      (setq descriptor
+            (tramp-rpc-handle-file-notify-add-watch directory '(change) #'ignore))
+      (should (gethash descriptor tramp-rpc--file-notify-descriptors))
+      (should-not (plist-get (gethash watch-key tramp-rpc--file-notify-watch-counts)
+                             :owned))
+      (tramp-rpc-unwatch-directory directory)
+      (should-not (gethash watch-key tramp-rpc--watched-directories))
+      (should (plist-get (gethash watch-key tramp-rpc--file-notify-watch-counts)
+                         :owned))
+      (should (equal (mapcar #'car (nreverse (copy-sequence calls)))
+                     '("watch.add" "watch.remove" "watch.add"))))))
+
 (ert-deftest tramp-rpc-mock-test-file-notify-watch-upgrade-failure-keeps-direct ()
   "A failed recursive upgrade does not remove a direct file-notify watch."
   (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
