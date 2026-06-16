@@ -234,6 +234,7 @@ Returns nil if no proxy hops remain."
 (declare-function tramp-rpc--cache-get "tramp-rpc-magit")
 (declare-function tramp-rpc--cache-put "tramp-rpc-magit")
 (declare-function tramp-rpc--invalidate-cache-for-path "tramp-rpc-magit")
+(declare-function tramp-rpc--connection-key-string "tramp-rpc-magit")
 (declare-function tramp-rpc--directory-watched-p "tramp-rpc-magit")
 (declare-function tramp-rpc--handle-notification "tramp-rpc-magit")
 (declare-function tramp-rpc-watch-directory "tramp-rpc-magit")
@@ -1281,8 +1282,9 @@ accidentally routing file operations through tramp-sh."
   ;; First, clean up any async and PTY processes for this connection
   (tramp-rpc--cleanup-async-processes vec)
   (tramp-rpc--cleanup-pty-processes vec)
-  ;; Clean up watched directory entries for this connection
+  ;; Clean up watched directory entries for this connection.
   (tramp-rpc--cleanup-watches-for-connection vec)
+  (tramp-rpc--cleanup-file-notify-for-connection vec)
   (let ((conn (tramp-rpc--get-connection vec)))
     (when conn
       (let ((process (plist-get conn :process)))
@@ -3647,36 +3649,188 @@ would otherwise flood the echo area with \"Cannot expand tilde\"."
      (let ((tramp-tolerate-tilde t))
        (tramp-handle-expand-file-name name dir)))))
 
-(defun tramp-rpc-handle-file-notify-add-watch (file-name _flags _callback)
-  "Like `file-notify-add-watch' for TRAMP-RPC files."
-  ;; FLAGS and CALLBACK are handled by `file-notify-add-watch'.  The server
-  ;; currently watches directories and reports changed paths without event
-  ;; kinds, so start a directory watch and return a distinct descriptor.
-  (let* ((dir-name (if (file-directory-p file-name)
-                       file-name
-                     (file-name-directory file-name)))
-         (default-directory dir-name)
-         (vec (tramp-dissect-file-name dir-name))
-         (name (format "%s file-notify" (tramp-get-connection-name vec)))
-         proc)
-    (tramp-rpc-watch-directory dir-name)
-    ;; Use a dummy process object as the watch descriptor.  This matches the
-    ;; generic TRAMP file-notify descriptor shape and gives each watch a unique
-    ;; object for removal.
-    (setq proc (make-process
-                :name name
-                :buffer (generate-new-buffer name 'inhibit)
-                :command '("sleep" "inf")
-                :connection-type 'pipe
-                :noquery t))
-    (process-put proc 'tramp-vector vec)
-    proc))
+(defvar tramp-rpc--file-notify-descriptors (make-hash-table :test 'eq)
+  "TRAMP-RPC file notification descriptors.")
 
-(defun tramp-rpc-handle-file-notify-rm-watch (proc)
-  "Like `file-notify-rm-watch' for TRAMP-RPC watch PROC."
-  (tramp-rpc-unwatch-directory
-   (tramp-make-tramp-file-name (process-get proc 'tramp-vector)))
-  (tramp-handle-file-notify-rm-watch proc))
+(defvar tramp-rpc--file-notify-watch-counts (make-hash-table :test 'equal)
+  "Reference counts for directories watched via file notifications.
+Keys are the same connection/path keys as `tramp-rpc--watched-directories'.")
+
+(defvar tramp-rpc--file-notify-next-descriptor 0
+  "Counter used to create distinct TRAMP-RPC file notification descriptors.")
+
+(defun tramp-rpc--cleanup-file-notify-for-connection (&optional vec)
+  "Remove TRAMP-RPC file notification state for VEC.
+When VEC is nil, remove all TRAMP-RPC file notification state.  This also
+removes matching descriptors from Emacs' global `file-notify-descriptors'
+table when it is loaded, so `file-notify-valid-p' cannot retain stale
+descriptors after connection cleanup."
+  (let* ((prefix (and vec (concat (tramp-rpc--connection-key-string vec) ":")))
+         (descriptors-to-remove nil)
+         (watch-keys-to-remove nil))
+    (maphash
+     (lambda (descriptor data)
+       (let ((watch-key (plist-get data :watch-key)))
+         (when (or (null prefix)
+                   (and watch-key (string-prefix-p prefix watch-key)))
+           (push descriptor descriptors-to-remove))))
+     tramp-rpc--file-notify-descriptors)
+    (maphash
+     (lambda (watch-key _data)
+       (when (or (null prefix) (string-prefix-p prefix watch-key))
+         (push watch-key watch-keys-to-remove)))
+     tramp-rpc--file-notify-watch-counts)
+    (dolist (descriptor descriptors-to-remove)
+      (remhash descriptor tramp-rpc--file-notify-descriptors)
+      (when (boundp 'file-notify-descriptors)
+        (remhash descriptor file-notify-descriptors)))
+    (dolist (watch-key watch-keys-to-remove)
+      (remhash watch-key tramp-rpc--file-notify-watch-counts))
+    (when (or descriptors-to-remove watch-keys-to-remove)
+      (tramp-rpc--debug
+       "Cleaned up %d file-notify descriptors and %d file-notify watches%s"
+       (length descriptors-to-remove)
+       (length watch-keys-to-remove)
+       (if vec (format " for %s" prefix) "")))))
+
+(defun tramp-rpc--file-notify-direct-child-p (directory file)
+  "Return non-nil if FILE is an immediate child of DIRECTORY."
+  (let* ((dir (file-name-as-directory (directory-file-name directory)))
+         (file (directory-file-name file)))
+    (and (string-prefix-p dir file)
+         (let ((rest (substring file (length dir))))
+           (and (not (string-empty-p rest))
+                (not (string-match-p "/" rest)))))))
+
+(defun tramp-rpc--file-notify-dispatch (file-name)
+  "Dispatch a `file-notify' event for changed TRAMP FILE-NAME."
+  (when (and (hash-table-p tramp-rpc--file-notify-descriptors)
+             (> (hash-table-count tramp-rpc--file-notify-descriptors) 0))
+    ;; `file-notify-callback' and the special-event handler live in
+    ;; filenotify.el.  It is normally loaded before file notifications are
+    ;; registered, but require it defensively before constructing events.
+    (require 'filenotify)
+    (let ((descriptors nil))
+      (maphash
+       (lambda (descriptor data)
+         (when (tramp-rpc--file-notify-direct-child-p
+                (plist-get data :directory) file-name)
+           (push descriptor descriptors)))
+       tramp-rpc--file-notify-descriptors)
+      (dolist (descriptor descriptors)
+        ;; `file-notify-callback' accepts inotify action names and maps
+        ;; `modify' to the public `changed' action.  The server currently
+        ;; reports only paths, not event kinds, so this is the best available
+        ;; approximation until the protocol carries create/delete/rename/etc.
+        (let ((event `(file-notify
+                       (,descriptor (modify) ,file-name)
+                       file-notify-callback)))
+          (if (fboundp 'insert-special-event)
+              (insert-special-event event)
+            (funcall (lookup-key special-event-map [file-notify]) event)))))))
+
+(defun tramp-rpc-handle-file-notify-add-watch (directory _flags _callback)
+  "Like `file-notify-add-watch' for TRAMP-RPC files.
+DIRECTORY is the remote directory passed by `file-notify-add-watch'."
+  ;; `file-notify-add-watch' validates FLAGS and CALLBACK before invoking file
+  ;; name handlers, and stores the callback in `file-notify-descriptors' after
+  ;; this handler returns.  We only need to create a distinct descriptor and
+  ;; ensure the corresponding remote directory is watched.
+  (require 'filenotify)
+  (with-parsed-tramp-file-name directory nil
+    (let* ((watch-key (format "%s:%s" (tramp-rpc--connection-key-string v)
+                              localname))
+           (entry (gethash watch-key tramp-rpc--file-notify-watch-counts))
+           (preexisting (gethash watch-key tramp-rpc--watched-directories))
+           (descriptor (cons 'tramp-rpc-file-notify
+                             (cl-incf tramp-rpc--file-notify-next-descriptor))))
+      (if entry
+          (plist-put entry :count (1+ (plist-get entry :count)))
+        ;; Keep file-notify's non-recursive watches out of
+        ;; `tramp-rpc--watched-directories'.  That table is also used by Magit
+        ;; and cache invalidation, where a truthy entry means a recursive
+        ;; worktree/cache watch may already exist.
+        (unless preexisting
+          (tramp-rpc--call v "watch.add"
+                           `((path . ,localname)
+                             (recursive . :msgpack-false))))
+        (puthash watch-key
+                 (list :count 1 :owned (not preexisting) :directory directory)
+                 tramp-rpc--file-notify-watch-counts))
+      (puthash descriptor
+               (list :directory directory
+                     :localname localname
+                     :watch-key watch-key)
+               tramp-rpc--file-notify-descriptors)
+      descriptor)))
+
+(defun tramp-rpc-handle-file-notify-rm-watch (descriptor)
+  "Like `file-notify-rm-watch' for TRAMP-RPC watch DESCRIPTOR."
+  (when-let* ((data (gethash descriptor tramp-rpc--file-notify-descriptors)))
+    (let* ((watch-key (plist-get data :watch-key))
+           (entry (gethash watch-key tramp-rpc--file-notify-watch-counts))
+           (count (and entry (plist-get entry :count))))
+      (cond
+       ((and count (> count 1))
+        (plist-put entry :count (1- count)))
+       (entry
+        (remhash watch-key tramp-rpc--file-notify-watch-counts)
+        (when (and (plist-get entry :owned)
+                   ;; If a Magit/cache watch has been installed for the same
+                   ;; key while this file notification was live, do not remove
+                   ;; the server watch from underneath it.
+                   (not (gethash watch-key tramp-rpc--watched-directories)))
+          ;; Removing a file notification should not make
+          ;; `file-notify-rm-watch' fail if the remote connection has already
+          ;; gone away.
+          (condition-case err
+              (tramp-rpc-unwatch-directory (plist-get entry :directory))
+            (error
+             (tramp-rpc--debug "failed to remove file-notify watch %s: %s"
+                               (plist-get entry :directory)
+                               (error-message-string err))))))))
+    (remhash descriptor tramp-rpc--file-notify-descriptors)))
+
+(defun tramp-rpc-handle-file-notify-valid-p (descriptor)
+  "Like `file-notify-valid-p' for TRAMP-RPC watch DESCRIPTOR."
+  (and (gethash descriptor tramp-rpc--file-notify-descriptors) t))
+
+(declare-function file-notify--rm-descriptor "filenotify")
+
+(defun tramp-rpc--file-notify-valid-p-advice (orig-fun descriptor)
+  "Route public `file-notify-valid-p' for TRAMP-RPC DESCRIPTOR."
+  (if (gethash descriptor tramp-rpc--file-notify-descriptors)
+      (progn
+        (require 'filenotify)
+        (if (and (boundp 'file-notify-descriptors)
+                 (gethash descriptor file-notify-descriptors))
+            t
+          ;; The public descriptor table no longer knows this descriptor, so
+          ;; public `file-notify-rm-watch' will not route through the file name
+          ;; handler.  Clean up our private state here to avoid stale watches.
+          (tramp-rpc-handle-file-notify-rm-watch descriptor)
+          nil))
+    (funcall orig-fun descriptor)))
+
+(defun tramp-rpc--file-notify-rm-watch-advice (orig-fun descriptor)
+  "Route public `file-notify-rm-watch' for TRAMP-RPC DESCRIPTOR."
+  (if (gethash descriptor tramp-rpc--file-notify-descriptors)
+      (progn
+        (require 'filenotify)
+        (tramp-rpc-handle-file-notify-rm-watch descriptor)
+        (when (and (boundp 'file-notify-descriptors)
+                   (gethash descriptor file-notify-descriptors))
+          (file-notify--rm-descriptor descriptor)))
+    (funcall orig-fun descriptor)))
+
+(unless (advice-member-p #'tramp-rpc--file-notify-valid-p-advice
+                         'file-notify-valid-p)
+  (advice-add 'file-notify-valid-p :around
+              #'tramp-rpc--file-notify-valid-p-advice))
+(unless (advice-member-p #'tramp-rpc--file-notify-rm-watch-advice
+                         'file-notify-rm-watch)
+  (advice-add 'file-notify-rm-watch :around
+              #'tramp-rpc--file-notify-rm-watch-advice))
 
 ;; ============================================================================
 ;; Process and advice modules (extracted)
@@ -3833,11 +3987,11 @@ Also controls process exit detection latency."
     (temporary-file-directory . tramp-handle-temporary-file-directory)
 
     ;; =========================================================================
-    ;; Generic TRAMP handlers for file notifications
+    ;; RPC-backed file notifications
     ;; =========================================================================
     (file-notify-add-watch . tramp-rpc-handle-file-notify-add-watch)
     (file-notify-rm-watch . tramp-rpc-handle-file-notify-rm-watch)
-    (file-notify-valid-p . tramp-handle-file-notify-valid-p)
+    (file-notify-valid-p . tramp-rpc-handle-file-notify-valid-p)
 
     ;; =========================================================================
     ;; Intentionally ignored (not applicable or handled elsewhere)
@@ -3948,6 +4102,7 @@ cleanup of all connections has run."
     (tramp-rpc--cleanup-pty-processes)
     ;; Clean up all filesystem watches.
     (clrhash tramp-rpc--watched-directories)
+    (tramp-rpc--cleanup-file-notify-for-connection)
     ;; Kill any remaining RPC server processes and clear connections hash.
     (maphash (lambda (_key conn)
                (let ((process (plist-get conn :process)))
