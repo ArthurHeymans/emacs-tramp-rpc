@@ -253,12 +253,24 @@ async fn batch_execute(params: Value) -> HandlerResult {
             // Convert Response to a result object
             match (response.result, response.error) {
                 (Some(result), None) => msgpack_map! { "result" => result },
-                (None, Some(error)) => msgpack_map! {
-                    "error" => msgpack_map! {
-                        "code" => error.code,
-                        "message" => error.message
+                (None, Some(error)) => {
+                    let mut error_fields = vec![
+                        (
+                            Value::String("code".into()),
+                            Value::Integer(error.code.into()),
+                        ),
+                        (
+                            Value::String("message".into()),
+                            Value::String(error.message.into()),
+                        ),
+                    ];
+                    if let Some(data) = error.data {
+                        error_fields.push((Value::String("data".into()), data));
                     }
-                },
+                    msgpack_map! {
+                        "error" => Value::Map(error_fields)
+                    }
+                }
                 _ => msgpack_map! { "result" => Value::Nil },
             }
         })
@@ -348,5 +360,54 @@ async fn dispatch_inner(request: Request) -> Response {
     match result {
         Ok(value) => Response::success(id, value),
         Err(error) => Response::error(Some(id), error),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::msgpack_map;
+    use std::os::unix::ffi::OsStrExt;
+
+    #[tokio::test]
+    async fn batch_errors_preserve_data() {
+        let tmp = tempfile::tempdir().expect("create tempdir");
+        let file = tmp.path().join("file");
+        tokio::fs::write(&file, b"payload").await.unwrap();
+        let not_a_dir = file.join("child");
+
+        let result = batch_execute(msgpack_map! {
+            "requests" => Value::Array(vec![msgpack_map! {
+                "method" => "file.stat",
+                "params" => msgpack_map! {
+                    "path" => Value::Binary(not_a_dir.as_os_str().as_bytes().to_vec()),
+                },
+            }]),
+        })
+        .await
+        .expect("batch should return per-request errors");
+
+        let results = result
+            .as_map()
+            .and_then(|m| m.iter().find(|(k, _)| k.as_str() == Some("results")))
+            .and_then(|(_, v)| v.as_array())
+            .expect("results array");
+        let error = results[0]
+            .as_map()
+            .and_then(|m| m.iter().find(|(k, _)| k.as_str() == Some("error")))
+            .and_then(|(_, v)| v.as_map())
+            .expect("error map");
+        let data = error
+            .iter()
+            .find(|(k, _)| k.as_str() == Some("data"))
+            .and_then(|(_, v)| v.as_map())
+            .expect("error data");
+        let errno = data
+            .iter()
+            .find(|(k, _)| k.as_str() == Some("os_errno"))
+            .and_then(|(_, v)| v.as_i64())
+            .expect("os_errno");
+
+        assert_eq!(errno, i64::from(libc::ENOTDIR));
     }
 }

@@ -157,15 +157,17 @@
   (skip-unless tramp-rpc-mock-test--msgpack-available)
   (let* ((response-plist '(:id 1
                            :result ((results . (((result . t))
-                                                ((error (code . -32001)
-                                                        (message . "Error"))))))))
+                                                ((error (code . -32003)
+                                                        (message . "Error")
+                                                        (data (os_errno . 20)))))))))
          (decoded (tramp-rpc-protocol-decode-batch-response response-plist)))
     (should (listp decoded))
     (should (= (length decoded) 2))
     ;; First result is success
     (should (eq (car decoded) t))
-    ;; Second is error
-    (should (plist-get (cadr decoded) :error))))
+    ;; Second is error, including structured errno data.
+    (should (plist-get (cadr decoded) :error))
+    (should (= 20 (alist-get 'os_errno (plist-get (cadr decoded) :data))))))
 
 (ert-deftest tramp-rpc-mock-test-protocol-length-framing ()
   "Test length-prefixed framing functions."

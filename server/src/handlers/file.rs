@@ -268,6 +268,16 @@ pub fn map_io_error(err: std::io::Error, path: &str) -> RpcError {
     match err.kind() {
         ErrorKind::NotFound => RpcError::file_not_found(path),
         ErrorKind::PermissionDenied => RpcError::permission_denied(path),
+        ErrorKind::AlreadyExists => {
+            let mut rpc_error = RpcError::io_error(err);
+            if rpc_error.data.is_none() {
+                rpc_error.data = Some(Value::Map(vec![(
+                    Value::String("os_errno".into()),
+                    Value::Integer(libc::EEXIST.into()),
+                )]));
+            }
+            rpc_error
+        }
         _ => RpcError::io_error(err),
     }
 }

@@ -816,6 +816,304 @@ signal `file-already-exists'.  With trailing slash (via
                                (buffer-string))))))
         (ignore-errors (delete-directory dest-dir t))))))
 
+(ert-deftest tramp-rpc-test06-copy-directory-roundtrips ()
+  "Same-remote `copy-directory' uses a constant number of RPC round-trips."
+  (skip-unless (tramp-rpc-test-enabled))
+
+  (let* ((src (tramp-rpc-test--make-temp-name))
+         (nested (expand-file-name "nested" src))
+         (dest (tramp-rpc-test--make-temp-name)))
+    (unwind-protect
+        (progn
+          (make-directory nested t)
+          (write-region "top" nil (expand-file-name "top.txt" src))
+          (write-region "child" nil (expand-file-name "child.txt" nested))
+          ;; `copy-directory' itself calls `file-in-directory-p' before the
+          ;; file-name handler dispatches, so the end-to-end count includes
+          ;; that generic TRAMP safety check plus the backend's batch stat and
+          ;; single recursive `file.copy' RPC.  The important property is that
+          ;; this stays constant regardless of tree size.
+          (tramp-rpc-test--with-call-count 7
+            (copy-directory src dest))
+          (should (file-exists-p (expand-file-name "top.txt" dest)))
+          (should (file-exists-p (expand-file-name "nested/child.txt" dest)))
+          (should (equal "child"
+                         (with-temp-buffer
+                           (insert-file-contents
+                            (expand-file-name "nested/child.txt" dest))
+                           (buffer-string)))))
+      (ignore-errors (delete-directory src t))
+      (ignore-errors (delete-directory dest t)))))
+
+(ert-deftest tramp-rpc-test06-copy-directory-to-existing-dir-roundtrips ()
+  "Same-remote `copy-directory' into an existing directory is constant time."
+  (skip-unless (tramp-rpc-test-enabled))
+
+  (let* ((src (tramp-rpc-test--make-temp-name))
+         (dest-parent (tramp-rpc-test--make-temp-name))
+         (expected-dest (expand-file-name (file-name-nondirectory src) dest-parent)))
+    (unwind-protect
+        (progn
+          (make-directory src)
+          (write-region "payload" nil (expand-file-name "payload.txt" src))
+          (make-directory dest-parent)
+          (tramp-rpc-test--with-call-count 7
+            (copy-directory src (file-name-as-directory dest-parent)))
+          (should (file-exists-p (expand-file-name "payload.txt" expected-dest)))
+          (should (equal "payload"
+                         (with-temp-buffer
+                           (insert-file-contents
+                            (expand-file-name "payload.txt" expected-dest))
+                           (buffer-string)))))
+      (ignore-errors (delete-directory src t))
+      (ignore-errors (delete-directory dest-parent t)))))
+
+(ert-deftest tramp-rpc-test06-copy-directory-merges-existing-target-dir ()
+  "Same-remote `copy-directory' merges into an existing DIRECTORY basename."
+  (skip-unless (tramp-rpc-test-enabled))
+
+  (let* ((src (tramp-rpc-test--make-temp-name))
+         (dest-parent (tramp-rpc-test--make-temp-name))
+         (expected-dest (expand-file-name (file-name-nondirectory src) dest-parent)))
+    (unwind-protect
+        (progn
+          (make-directory src)
+          (write-region "new" nil (expand-file-name "payload.txt" src))
+          (make-directory expected-dest t)
+          (write-region "old" nil (expand-file-name "payload.txt" expected-dest))
+          (tramp-rpc-test--with-call-count 7
+            (copy-directory src (file-name-as-directory dest-parent)))
+          (should-not (file-exists-p (expand-file-name
+                                      (file-name-nondirectory src)
+                                      expected-dest)))
+          (should (equal "new"
+                         (with-temp-buffer
+                           (insert-file-contents
+                            (expand-file-name "payload.txt" expected-dest))
+                           (buffer-string)))))
+      (ignore-errors (delete-directory src t))
+      (ignore-errors (delete-directory dest-parent t)))))
+
+(ert-deftest tramp-rpc-test06-copy-directory-rejects-existing-child-dir ()
+  "With nil PARENTS, existing nested directories match Emacs semantics."
+  (skip-unless (tramp-rpc-test-enabled))
+
+  (let* ((src (tramp-rpc-test--make-temp-name))
+         (dest-parent (tramp-rpc-test--make-temp-name))
+         (expected-dest (expand-file-name (file-name-nondirectory src) dest-parent))
+         (existing-child (expand-file-name "child" expected-dest)))
+    (unwind-protect
+        (progn
+          (make-directory (expand-file-name "child" src) t)
+          (write-region "new" nil (expand-file-name "child/new.txt" src))
+          (make-directory existing-child t)
+          (write-region "old" nil (expand-file-name "old.txt" existing-child))
+          (should-error
+           (copy-directory src (file-name-as-directory dest-parent))
+           :type 'file-already-exists)
+          (should (equal "old"
+                         (with-temp-buffer
+                           (insert-file-contents
+                            (expand-file-name "old.txt" existing-child))
+                           (buffer-string))))
+          (should-not (file-exists-p (expand-file-name "new.txt" existing-child))))
+      (ignore-errors (delete-directory src t))
+      (ignore-errors (delete-directory dest-parent t)))))
+
+(ert-deftest tramp-rpc-test06-copy-directory-parents-merges-existing-child-dir ()
+  "With non-nil PARENTS, existing nested directories are accepted."
+  (skip-unless (tramp-rpc-test-enabled))
+
+  (let* ((src (tramp-rpc-test--make-temp-name))
+         (dest-parent (tramp-rpc-test--make-temp-name))
+         (expected-dest (expand-file-name (file-name-nondirectory src) dest-parent))
+         (existing-child (expand-file-name "child" expected-dest)))
+    (unwind-protect
+        (progn
+          (make-directory (expand-file-name "child" src) t)
+          (write-region "new" nil (expand-file-name "child/new.txt" src))
+          (make-directory existing-child t)
+          (write-region "old" nil (expand-file-name "old.txt" existing-child))
+          (copy-directory src (file-name-as-directory dest-parent) nil t)
+          (should (file-exists-p (expand-file-name "old.txt" existing-child)))
+          (should (equal "new"
+                         (with-temp-buffer
+                           (insert-file-contents
+                            (expand-file-name "new.txt" existing-child))
+                           (buffer-string)))))
+      (ignore-errors (delete-directory src t))
+      (ignore-errors (delete-directory dest-parent t)))))
+
+(ert-deftest tramp-rpc-test06-copy-directory-parents-allows-existing-dir-newname ()
+  "A non-directory-name NEWNAME may be an existing directory when PARENTS is t."
+  (skip-unless (tramp-rpc-test-enabled))
+
+  (let* ((src (tramp-rpc-test--make-temp-name))
+         (dest (tramp-rpc-test--make-temp-name)))
+    (unwind-protect
+        (progn
+          (make-directory src)
+          (write-region "payload" nil (expand-file-name "payload.txt" src))
+          (make-directory dest)
+          (copy-directory src dest nil t)
+          (should (equal "payload"
+                         (with-temp-buffer
+                           (insert-file-contents
+                            (expand-file-name "payload.txt" dest))
+                           (buffer-string)))))
+      (ignore-errors (delete-directory src t))
+      (ignore-errors (delete-directory dest t)))))
+
+(ert-deftest tramp-rpc-test06-copy-directory-preserves-nonwritable-modes ()
+  "Mode preservation happens after child entries are copied."
+  (skip-unless (tramp-rpc-test-enabled))
+
+  (let* ((src (tramp-rpc-test--make-temp-name))
+         (child (expand-file-name "child" src))
+         (dest (tramp-rpc-test--make-temp-name))
+         (copied-child (expand-file-name "child" dest)))
+    (unwind-protect
+        (progn
+          (make-directory child t)
+          (write-region "payload" nil (expand-file-name "payload.txt" child))
+          (set-file-modes child #o555)
+          (set-file-modes src #o555)
+          (copy-directory src dest)
+          (should (equal "payload"
+                         (with-temp-buffer
+                           (insert-file-contents
+                            (expand-file-name "payload.txt" copied-child))
+                           (buffer-string))))
+          (should (= (logand (file-modes dest) #o777) #o555))
+          (should (= (logand (file-modes copied-child) #o777) #o555)))
+      (ignore-errors (set-file-modes child #o755))
+      (ignore-errors (set-file-modes src #o755))
+      (ignore-errors (set-file-modes copied-child #o755))
+      (ignore-errors (set-file-modes dest #o755))
+      (ignore-errors (delete-directory src t))
+      (ignore-errors (delete-directory dest t)))))
+
+(ert-deftest tramp-rpc-test06-copy-directory-merges-through-symlinked-target-dir ()
+  "Existing DIRECTORY basename may be a symlink to a directory."
+  (skip-unless (tramp-rpc-test-enabled))
+
+  (let* ((src (tramp-rpc-test--make-temp-name))
+         (dest-parent (tramp-rpc-test--make-temp-name))
+         (real-target (tramp-rpc-test--make-temp-name))
+         (expected-link (expand-file-name (file-name-nondirectory src) dest-parent)))
+    (unwind-protect
+        (progn
+          (make-directory src)
+          (write-region "payload" nil (expand-file-name "payload.txt" src))
+          (make-directory dest-parent)
+          (make-directory real-target)
+          (condition-case nil
+              (make-symbolic-link real-target expected-link)
+            (file-error (ert-skip "Symlinks not supported")))
+          (tramp-rpc-test--with-call-count 7
+            (copy-directory src (file-name-as-directory dest-parent)))
+          (should (file-symlink-p expected-link))
+          (should (equal "payload"
+                         (with-temp-buffer
+                           (insert-file-contents
+                            (expand-file-name "payload.txt" real-target))
+                           (buffer-string)))))
+      (ignore-errors (delete-file expected-link))
+      (ignore-errors (delete-directory src t))
+      (ignore-errors (delete-directory dest-parent t))
+      (ignore-errors (delete-directory real-target t)))))
+
+(ert-deftest tramp-rpc-test06-copy-directory-follows-symlinked-newname-parent ()
+  "A symlink to a directory may be the NEWNAME parent."
+  (skip-unless (tramp-rpc-test-enabled))
+
+  (let* ((src (tramp-rpc-test--make-temp-name))
+         (link-parent (tramp-rpc-test--make-temp-name))
+         (real-parent (tramp-rpc-test--make-temp-name))
+         (expected-dest (expand-file-name (file-name-nondirectory src) real-parent)))
+    (unwind-protect
+        (progn
+          (make-directory src)
+          (write-region "payload" nil (expand-file-name "payload.txt" src))
+          (make-directory real-parent)
+          (condition-case nil
+              (make-symbolic-link real-parent link-parent)
+            (file-error (ert-skip "Symlinks not supported")))
+          (copy-directory src (file-name-as-directory link-parent))
+          (should (equal "payload"
+                         (with-temp-buffer
+                           (insert-file-contents
+                            (expand-file-name "payload.txt" expected-dest))
+                           (buffer-string)))))
+      (ignore-errors (delete-file link-parent))
+      (ignore-errors (delete-directory src t))
+      (ignore-errors (delete-directory real-parent t)))))
+
+(ert-deftest tramp-rpc-test06-copy-directory-follows-symlinked-newname-parent-file ()
+  "A symlink to a directory may be the parent of a non-directory-name NEWNAME."
+  (skip-unless (tramp-rpc-test-enabled))
+
+  (let* ((src (tramp-rpc-test--make-temp-name))
+         (link-parent (tramp-rpc-test--make-temp-name))
+         (real-parent (tramp-rpc-test--make-temp-name))
+         (expected-dest (expand-file-name "copied" real-parent)))
+    (unwind-protect
+        (progn
+          (make-directory src)
+          (write-region "payload" nil (expand-file-name "payload.txt" src))
+          (make-directory real-parent)
+          (condition-case nil
+              (make-symbolic-link real-parent link-parent)
+            (file-error (ert-skip "Symlinks not supported")))
+          (copy-directory src (expand-file-name "copied" link-parent))
+          (should (equal "payload"
+                         (with-temp-buffer
+                           (insert-file-contents
+                            (expand-file-name "payload.txt" expected-dest))
+                           (buffer-string)))))
+      (ignore-errors (delete-file link-parent))
+      (ignore-errors (delete-directory src t))
+      (ignore-errors (delete-directory real-parent t)))))
+
+(ert-deftest tramp-rpc-test06-copy-directory-create-symlink-overwrites-file ()
+  "`copy-directory-create-symlink' follows Emacs overwrite behavior."
+  (skip-unless (tramp-rpc-test-enabled))
+
+  (let* ((target (tramp-rpc-test--make-temp-name))
+         (src-link (tramp-rpc-test--make-temp-name))
+         (dest (tramp-rpc-test--make-temp-name))
+         (copy-directory-create-symlink t))
+    (unwind-protect
+        (progn
+          (make-directory target)
+          (condition-case nil
+              (make-symbolic-link target src-link)
+            (file-error (ert-skip "Symlinks not supported")))
+          (write-region "old" nil dest)
+          (copy-directory src-link dest)
+          (should (equal (file-symlink-p dest) (file-local-name target))))
+      (ignore-errors (delete-file src-link))
+      (ignore-errors (delete-file dest))
+      (ignore-errors (delete-directory target t)))))
+
+(ert-deftest tramp-rpc-test06-copy-directory-create-symlink-dangling-source ()
+  "`copy-directory-create-symlink' must not follow SOURCE's target."
+  (skip-unless (tramp-rpc-test-enabled))
+
+  (let* ((src-link (tramp-rpc-test--make-temp-name))
+         (dest (tramp-rpc-test--make-temp-name))
+         (target "missing-target")
+         (copy-directory-create-symlink t))
+    (unwind-protect
+        (progn
+          (condition-case nil
+              (make-symbolic-link target src-link)
+            (file-error (ert-skip "Symlinks not supported")))
+          (copy-directory src-link dest)
+          (should (equal (file-symlink-p dest) target)))
+      (ignore-errors (delete-file src-link))
+      (ignore-errors (delete-file dest)))))
+
 (ert-deftest tramp-rpc-test06-rename-file ()
   "Test `rename-file' for TRAMP RPC files."
   (skip-unless (tramp-rpc-test-enabled))
