@@ -236,6 +236,8 @@ Returns nil if no proxy hops remain."
 (declare-function tramp-rpc--invalidate-cache-for-path "tramp-rpc-magit")
 (declare-function tramp-rpc--directory-watched-p "tramp-rpc-magit")
 (declare-function tramp-rpc--handle-notification "tramp-rpc-magit")
+(declare-function tramp-rpc-watch-directory "tramp-rpc-magit")
+(declare-function tramp-rpc-unwatch-directory "tramp-rpc-magit")
 (declare-function tramp-rpc-clear-file-exists-cache "tramp-rpc-magit")
 (declare-function tramp-rpc-clear-file-truename-cache "tramp-rpc-magit")
 (declare-function tramp-rpc--cleanup-watches-for-connection "tramp-rpc-magit")
@@ -3645,6 +3647,37 @@ would otherwise flood the echo area with \"Cannot expand tilde\"."
      (let ((tramp-tolerate-tilde t))
        (tramp-handle-expand-file-name name dir)))))
 
+(defun tramp-rpc-handle-file-notify-add-watch (file-name _flags _callback)
+  "Like `file-notify-add-watch' for TRAMP-RPC files."
+  ;; FLAGS and CALLBACK are handled by `file-notify-add-watch'.  The server
+  ;; currently watches directories and reports changed paths without event
+  ;; kinds, so start a directory watch and return a distinct descriptor.
+  (let* ((dir-name (if (file-directory-p file-name)
+                       file-name
+                     (file-name-directory file-name)))
+         (default-directory dir-name)
+         (vec (tramp-dissect-file-name dir-name))
+         (name (format "%s file-notify" (tramp-get-connection-name vec)))
+         proc)
+    (tramp-rpc-watch-directory dir-name)
+    ;; Use a dummy process object as the watch descriptor.  This matches the
+    ;; generic TRAMP file-notify descriptor shape and gives each watch a unique
+    ;; object for removal.
+    (setq proc (make-process
+                :name name
+                :buffer (generate-new-buffer name 'inhibit)
+                :command '("sleep" "inf")
+                :connection-type 'pipe
+                :noquery t))
+    (process-put proc 'tramp-vector vec)
+    proc))
+
+(defun tramp-rpc-handle-file-notify-rm-watch (proc)
+  "Like `file-notify-rm-watch' for TRAMP-RPC watch PROC."
+  (tramp-rpc-unwatch-directory
+   (tramp-make-tramp-file-name (process-get proc 'tramp-vector)))
+  (tramp-handle-file-notify-rm-watch proc))
+
 ;; ============================================================================
 ;; Process and advice modules (extracted)
 ;; ============================================================================
@@ -3802,8 +3835,8 @@ Also controls process exit detection latency."
     ;; =========================================================================
     ;; Generic TRAMP handlers for file notifications
     ;; =========================================================================
-    (file-notify-add-watch . tramp-handle-file-notify-add-watch)
-    (file-notify-rm-watch . tramp-handle-file-notify-rm-watch)
+    (file-notify-add-watch . tramp-rpc-handle-file-notify-add-watch)
+    (file-notify-rm-watch . tramp-rpc-handle-file-notify-rm-watch)
     (file-notify-valid-p . tramp-handle-file-notify-valid-p)
 
     ;; =========================================================================
