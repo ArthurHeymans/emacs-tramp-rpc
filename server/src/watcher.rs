@@ -324,10 +324,11 @@ impl WatchManager {
     /// Start watching a path for filesystem changes.
     ///
     /// If `recursive` is true, all subdirectories are also watched.
-    /// Returns an error if the path doesn't exist or watch limits are exceeded.
+    /// Returns the canonical watched path, or an error if the path doesn't
+    /// exist or watch limits are exceeded.
     ///
     /// Repeated watches are idempotent; non-recursive watches can be upgraded.
-    pub fn watch(&self, path: &Path, recursive: bool) -> Result<(), notify::Error> {
+    pub fn watch(&self, path: &Path, recursive: bool) -> Result<PathBuf, notify::Error> {
         let mode = if recursive {
             RecursiveMode::Recursive
         } else {
@@ -342,8 +343,8 @@ impl WatchManager {
         let mut paths = lock_or_recover(&self.watched_paths);
 
         match paths.get(&canonical).copied() {
-            Some(existing) if existing == mode => return Ok(()),
-            Some(RecursiveMode::Recursive) => return Ok(()),
+            Some(existing) if existing == mode => return Ok(canonical),
+            Some(RecursiveMode::Recursive) => return Ok(canonical),
             Some(RecursiveMode::NonRecursive) => {
                 watcher.unwatch(&canonical)?;
                 if let Err(err) = watcher.watch(&canonical, RecursiveMode::Recursive) {
@@ -355,15 +356,15 @@ impl WatchManager {
                     }
                     return Err(err);
                 }
-                paths.insert(canonical, RecursiveMode::Recursive);
+                paths.insert(canonical.clone(), RecursiveMode::Recursive);
             }
             None => {
                 watcher.watch(&canonical, mode)?;
-                paths.insert(canonical, mode);
+                paths.insert(canonical.clone(), mode);
             }
         }
 
-        Ok(())
+        Ok(canonical)
     }
 
     /// Stop watching a path.
@@ -695,12 +696,12 @@ pub fn handle_add(params: Value) -> HandlerResult {
 
     let manager = get().ok_or_else(|| RpcError::internal_error("File watcher not available"))?;
 
-    manager
+    let canonical = manager
         .watch(Path::new(&expanded), params.recursive)
         .map_err(|e| RpcError::internal_error(format!("Failed to watch: {}", e)))?;
 
     Ok(msgpack_map! {
-        "path" => expanded.clone(),
+        "path" => canonical.to_string_lossy().into_owned(),
         "recursive" => Value::Boolean(params.recursive)
     })
 }
@@ -1306,6 +1307,23 @@ mod tests {
         });
 
         manager.unwatch(&root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_watch_returns_canonical_path_for_symlink() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let real = root.join("real");
+        let link = root.join("link");
+        fs::create_dir_all(&real).unwrap();
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+
+        let manager = test_manager();
+        let watched = manager.watch(&link, false).unwrap();
+
+        assert_eq!(watched, real.canonicalize().unwrap());
+        assert_eq!(manager.list(), vec![(real.canonicalize().unwrap(), false)]);
     }
 
     #[test]

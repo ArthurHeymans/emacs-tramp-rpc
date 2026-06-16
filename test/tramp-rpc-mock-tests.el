@@ -826,6 +826,46 @@ This matches the behavior expected by `tramp-test28-process-file'."
       (remhash descriptor file-notify-descriptors)
       (remhash other-descriptor file-notify-descriptors))))
 
+(ert-deftest tramp-rpc-mock-test-file-notify-dispatch-matches-canonical-directory ()
+  "Dispatch matches canonical watch paths returned by the server."
+  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
+  (require 'filenotify)
+  (let* ((tramp-rpc--file-notify-descriptors (make-hash-table :test 'eq))
+         (tramp-rpc--file-notify-watch-counts (make-hash-table :test 'equal))
+         (tramp-rpc--watched-directories (make-hash-table :test 'equal))
+         (directory "/rpc:mock:/tmp/link/")
+         (events nil)
+         descriptor)
+    (cl-letf (((symbol-function 'tramp-rpc--call)
+               (lambda (_vec method _params)
+                 (when (equal method "watch.add")
+                   '((path . "/tmp/real/")))))
+              ((symbol-function 'insert-special-event)
+               (lambda (event) (push event events))))
+      (setq descriptor
+            (tramp-rpc-handle-file-notify-add-watch directory '(change) #'ignore))
+      (should (equal (plist-get (gethash descriptor
+                                         tramp-rpc--file-notify-descriptors)
+                                :canonical-directory)
+                     "/rpc:mock:/tmp/real/"))
+      (tramp-rpc--file-notify-dispatch "/rpc:mock:/tmp/real/changed")
+      (should (equal events
+                     `((file-notify
+                        (,descriptor (modify) "/rpc:mock:/tmp/real/changed")
+                        file-notify-callback))))
+      ;; Dispatch uses the shared watch entry's canonical directory if it is
+      ;; refreshed after the descriptor was created.
+      (setq events nil)
+      (let* ((data (gethash descriptor tramp-rpc--file-notify-descriptors))
+             (entry (gethash (plist-get data :watch-key)
+                             tramp-rpc--file-notify-watch-counts)))
+        (plist-put entry :canonical-directory "/rpc:mock:/tmp/new-real/"))
+      (tramp-rpc--file-notify-dispatch "/rpc:mock:/tmp/new-real/changed")
+      (should (equal events
+                     `((file-notify
+                        (,descriptor (modify) "/rpc:mock:/tmp/new-real/changed")
+                        file-notify-callback)))))))
+
 (ert-deftest tramp-rpc-mock-test-file-notify-public-rm-and-valid-route ()
   "Public file-notify APIs route TRAMP-RPC descriptors to private state."
   (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
