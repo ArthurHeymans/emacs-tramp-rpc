@@ -258,9 +258,14 @@ When RECURSIVE is non-nil, watch subdirectories too."
       ;; descriptor could be left without any server watch underneath it.
       (when (and file-notify-entry
                  (not (plist-get file-notify-entry :owned)))
-        (tramp-rpc--call v "watch.add"
-                         `((path . ,localname)
-                           (recursive . :msgpack-false)))
+        (let ((result (tramp-rpc--call v "watch.add"
+                                       `((path . ,localname)
+                                         (recursive . :msgpack-false)))))
+          (when-let* ((canonical-localname (and (listp result)
+                                                (alist-get 'path result)))
+                      ((stringp canonical-localname)))
+            (plist-put file-notify-entry :canonical-directory
+                       (tramp-make-tramp-file-name v canonical-localname))))
         (plist-put file-notify-entry :owned t)))
     (tramp-rpc--debug "Unwatched: %s" localname)))
 

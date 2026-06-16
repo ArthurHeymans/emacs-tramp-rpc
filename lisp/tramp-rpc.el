@@ -3713,9 +3713,28 @@ descriptors after connection cleanup."
     (let ((descriptors nil))
       (maphash
        (lambda (descriptor data)
-         (when (tramp-rpc--file-notify-direct-child-p
-                (plist-get data :directory) file-name)
-           (push descriptor descriptors)))
+         (let* ((watch-key (plist-get data :watch-key))
+                (watch-entry (and watch-key
+                                  (gethash watch-key
+                                           tramp-rpc--file-notify-watch-counts)))
+                ;; Prefer the shared watch entry, because explicit unwatch can
+                ;; restore a file-notify-owned direct watch and learn a newer
+                ;; canonical path after descriptors were created.
+                (canonical-directory
+                 (or (plist-get watch-entry :canonical-directory)
+                     (plist-get data :canonical-directory))))
+           (when (or (tramp-rpc--file-notify-direct-child-p
+                      (plist-get data :directory) file-name)
+                     ;; The server registers canonical watch paths and can
+                     ;; report events using that canonical spelling.  Keep the
+                     ;; original directory for Emacs' public descriptor table,
+                     ;; but also match against the canonical directory returned
+                     ;; by `watch.add' when it differs (for example, symlinked
+                     ;; watched directories).
+                     (and canonical-directory
+                          (tramp-rpc--file-notify-direct-child-p
+                           canonical-directory file-name)))
+             (push descriptor descriptors))))
        tramp-rpc--file-notify-descriptors)
       (dolist (descriptor descriptors)
         ;; `file-notify-callback' accepts inotify action names and maps
@@ -3750,18 +3769,38 @@ DIRECTORY is the remote directory passed by `file-notify-add-watch'."
         ;; `tramp-rpc--watched-directories'.  That table is also used by Magit
         ;; and cache invalidation, where a truthy entry means a recursive
         ;; worktree/cache watch may already exist.
-        (unless preexisting
-          (tramp-rpc--call v "watch.add"
-                           `((path . ,localname)
-                             (recursive . :msgpack-false))))
-        (puthash watch-key
-                 (list :count 1 :owned (not preexisting) :directory directory)
-                 tramp-rpc--file-notify-watch-counts))
-      (puthash descriptor
-               (list :directory directory
-                     :localname localname
-                     :watch-key watch-key)
-               tramp-rpc--file-notify-descriptors)
+        (let* ((result (unless preexisting
+                         (tramp-rpc--call v "watch.add"
+                                          `((path . ,localname)
+                                            (recursive . :msgpack-false)))))
+               (canonical-localname (and (listp result)
+                                         (alist-get 'path result)))
+               (canonical-directory (cond
+                                     ((stringp canonical-localname)
+                                      (tramp-make-tramp-file-name
+                                       v canonical-localname))
+                                     ;; If the server watch preexisted, there
+                                     ;; is no `watch.add' response to learn its
+                                     ;; canonical spelling from.  Use TRAMP's
+                                     ;; truename path as a best-effort match key
+                                     ;; for symlinked watched directories.
+                                     (preexisting
+                                      (ignore-errors
+                                        (file-truename directory))))))
+          (puthash watch-key
+                   (list :count 1
+                         :owned (not preexisting)
+                         :directory directory
+                         :canonical-directory canonical-directory)
+                   tramp-rpc--file-notify-watch-counts)))
+      (let ((watch-entry (gethash watch-key tramp-rpc--file-notify-watch-counts)))
+        (puthash descriptor
+                 (list :directory directory
+                       :canonical-directory (plist-get watch-entry
+                                                       :canonical-directory)
+                       :localname localname
+                       :watch-key watch-key)
+                 tramp-rpc--file-notify-descriptors))
       descriptor)))
 
 (defun tramp-rpc-handle-file-notify-rm-watch (descriptor)
