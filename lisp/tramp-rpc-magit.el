@@ -45,6 +45,7 @@
 ;; Silence byte-compiler warnings for external functions
 (declare-function projectile-dir-files-alien "projectile")
 (declare-function projectile-time-seconds "projectile")
+(declare-function file-notify--watch-absolute-filename "filenotify")
 
 ;; ============================================================================
 ;; Cache infrastructure
@@ -194,7 +195,24 @@ Invalidates caches for the changed paths."
           ;; Get the vec from the process
           (when-let* ((vec (process-get process :tramp-rpc-vec)))
             (let ((full-path (tramp-make-tramp-file-name vec path)))
-              (tramp-rpc--invalidate-cache-for-path full-path))))))))
+              (tramp-rpc--invalidate-cache-for-path full-path)
+              ;; Deliver file-notify events to registered descriptors whose
+              ;; watched path matches this changed path.  The server currently
+              ;; reports changed paths but not event kinds, so treat them as
+              ;; modifications for this first integration.
+              (when (boundp 'file-notify-descriptors)
+                (maphash
+                 (lambda (key value)
+                   (let ((afn (file-notify--watch-absolute-filename value)))
+                     (when (string-prefix-p afn full-path)
+                       (let ((event `(file-notify
+                                      (,key (modify) ,afn)
+                                      file-notify-callback)))
+                         (if (fboundp 'insert-special-event)
+                             (insert-special-event event)
+                           (funcall (lookup-key special-event-map [file-notify])
+                                    event))))))
+                 file-notify-descriptors)))))))))
 
 (defun tramp-rpc-watch-directory (directory &optional recursive)
   "Start watching DIRECTORY for filesystem changes.
@@ -203,7 +221,7 @@ When RECURSIVE is non-nil, watch subdirectories too."
   (with-parsed-tramp-file-name directory nil
     (tramp-rpc--call v "watch.add"
                      `((path . ,localname)
-                       (recursive . ,(if recursive t :json-false))))
+                       (recursive . ,(if recursive t :msgpack-false))))
     (let ((conn-key (tramp-rpc--connection-key-string v)))
       (puthash (format "%s:%s" conn-key localname) t
                tramp-rpc--watched-directories))
