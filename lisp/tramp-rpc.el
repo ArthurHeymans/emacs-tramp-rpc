@@ -3656,10 +3656,47 @@ would otherwise flood the echo area with \"Cannot expand tilde\"."
   "Reference counts for directories watched via file notifications.
 Keys are the same connection/path keys as `tramp-rpc--watched-directories'.")
 
-(defvar tramp-rpc--file-notify-next-descriptor 0
-  "Counter used to create distinct TRAMP-RPC file notification descriptors.")
-
 (declare-function file-notify--rm-descriptor "filenotify")
+(declare-function file-notify-rm-watch "filenotify")
+
+(defun tramp-rpc--file-notify-process-sentinel (descriptor event)
+  "Clean up file notification DESCRIPTOR after EVENT closes it."
+  (unless (process-live-p descriptor)
+    (tramp-rpc--debug "file-notify descriptor closed: %S %s" descriptor event)
+    ;; `file-notify-rm-watch' calls the file-name handler, which deletes the
+    ;; descriptor process.  Avoid re-entering it for that intentional close.
+    (unless (process-get descriptor 'tramp-rpc-file-notify-removing)
+      (file-notify-rm-watch descriptor))))
+
+(defun tramp-rpc--make-file-notify-descriptor (vec directory localname)
+  "Create a TRAMP-style process descriptor for a file notification watch."
+  (let* ((name (format "%s file-notify" (tramp-get-connection-name vec)))
+         (buffer (generate-new-buffer (format " *%s*" name)))
+         (descriptor (make-pipe-process
+                      :name name
+                      :buffer buffer
+                      :noquery t
+                      :sentinel #'tramp-rpc--file-notify-process-sentinel)))
+    (with-current-buffer buffer
+      (setq default-directory directory))
+    ;; These two properties are the ones TRAMP's generic file-notify routing and
+    ;; validity helpers expect on watch descriptors.
+    (process-put descriptor 'tramp-vector vec)
+    (process-put descriptor 'tramp-watch-name localname)
+    ;; RPC-private metadata lives in `tramp-rpc--file-notify-descriptors', but
+    ;; mark the process as ours for debugging and defensive cleanup.
+    (process-put descriptor 'tramp-rpc-file-notify t)
+    descriptor))
+
+(defun tramp-rpc--delete-file-notify-descriptor-process (descriptor)
+  "Delete DESCRIPTOR's synthetic process and hidden process buffer."
+  (when (processp descriptor)
+    (process-put descriptor 'tramp-rpc-file-notify-removing t)
+    (let ((buffer (process-buffer descriptor)))
+      (when (process-live-p descriptor)
+        (delete-process descriptor))
+      (when (buffer-live-p buffer)
+        (kill-buffer buffer)))))
 
 (defun tramp-rpc--cleanup-file-notify-for-connection (&optional vec)
   "Remove TRAMP-RPC file notification state for VEC.
@@ -3687,6 +3724,7 @@ descriptors after connection cleanup."
       ;; callbacks observing `file-notify-valid-p' during cleanup see the
       ;; descriptor as no longer valid.
       (remhash descriptor tramp-rpc--file-notify-descriptors)
+      (tramp-rpc--delete-file-notify-descriptor-process descriptor)
       (when (and (boundp 'file-notify-descriptors)
                  (gethash descriptor file-notify-descriptors))
         (require 'filenotify)
@@ -3768,8 +3806,8 @@ DIRECTORY is the remote directory passed by `file-notify-add-watch'."
                               localname))
            (entry (gethash watch-key tramp-rpc--file-notify-watch-counts))
            (preexisting (gethash watch-key tramp-rpc--watched-directories))
-           (descriptor (cons 'tramp-rpc-file-notify
-                             (cl-incf tramp-rpc--file-notify-next-descriptor))))
+           (descriptor (tramp-rpc--make-file-notify-descriptor
+                        v directory localname)))
       (if entry
           (plist-put entry :count (1+ (plist-get entry :count)))
         ;; Keep file-notify's non-recursive watches out of
@@ -3835,46 +3873,15 @@ DIRECTORY is the remote directory passed by `file-notify-add-watch'."
              (tramp-rpc--debug "failed to remove file-notify watch %s: %s"
                                (plist-get entry :directory)
                                (error-message-string err))))))))
-    (remhash descriptor tramp-rpc--file-notify-descriptors)))
+    (remhash descriptor tramp-rpc--file-notify-descriptors)
+    (tramp-rpc--delete-file-notify-descriptor-process descriptor)))
 
 (defun tramp-rpc-handle-file-notify-valid-p (descriptor)
   "Like `file-notify-valid-p' for TRAMP-RPC watch DESCRIPTOR."
-  (and (gethash descriptor tramp-rpc--file-notify-descriptors) t))
-
-(defun tramp-rpc--file-notify-valid-p-advice (orig-fun descriptor)
-  "Route public `file-notify-valid-p' for TRAMP-RPC DESCRIPTOR."
-  (if (gethash descriptor tramp-rpc--file-notify-descriptors)
-      (progn
-        (require 'filenotify)
-        (if (and (boundp 'file-notify-descriptors)
-                 (gethash descriptor file-notify-descriptors))
-            t
-          ;; The public descriptor table no longer knows this descriptor, so
-          ;; public `file-notify-rm-watch' will not route through the file name
-          ;; handler.  Clean up our private state here to avoid stale watches.
-          (tramp-rpc-handle-file-notify-rm-watch descriptor)
-          nil))
-    (funcall orig-fun descriptor)))
-
-(defun tramp-rpc--file-notify-rm-watch-advice (orig-fun descriptor)
-  "Route public `file-notify-rm-watch' for TRAMP-RPC DESCRIPTOR."
-  (if (gethash descriptor tramp-rpc--file-notify-descriptors)
-      (progn
-        (require 'filenotify)
-        (tramp-rpc-handle-file-notify-rm-watch descriptor)
-        (when (and (boundp 'file-notify-descriptors)
-                   (gethash descriptor file-notify-descriptors))
-          (file-notify--rm-descriptor descriptor)))
-    (funcall orig-fun descriptor)))
-
-(unless (advice-member-p #'tramp-rpc--file-notify-valid-p-advice
-                         'file-notify-valid-p)
-  (advice-add 'file-notify-valid-p :around
-              #'tramp-rpc--file-notify-valid-p-advice))
-(unless (advice-member-p #'tramp-rpc--file-notify-rm-watch-advice
-                         'file-notify-rm-watch)
-  (advice-add 'file-notify-rm-watch :around
-              #'tramp-rpc--file-notify-rm-watch-advice))
+  (and (processp descriptor)
+       (process-live-p descriptor)
+       (gethash descriptor tramp-rpc--file-notify-descriptors)
+       t))
 
 ;; ============================================================================
 ;; Process and advice modules (extracted)
@@ -4193,13 +4200,8 @@ Removes advice and cleans up async processes."
   (tramp-remove-external-operation 'dir-locals--all-files 'tramp-rpc)
   (tramp-remove-external-operation 'dir-locals-find-file 'tramp-rpc)
   (tramp-remove-external-operation 'move-file-to-trash 'tramp-rpc)
-  ;; Remove all advice (from tramp-rpc-advice module)
+  ;; Remove all advice (from tramp-rpc-advice module).
   ;; Not needed. This is called in `tramp-rpc-advice-unload-function'.
-  ;; Remove file notification advice installed by tramp-rpc core.
-  (advice-remove 'file-notify-valid-p
-                 #'tramp-rpc--file-notify-valid-p-advice)
-  (advice-remove 'file-notify-rm-watch
-                 #'tramp-rpc--file-notify-rm-watch-advice)
   ;; Remove multi-hop hook and cleanup hooks.
   (remove-hook 'tramp-multi-hop-p-hook #'tramp-rpc-multi-hop-p)
   (remove-hook 'tramp-cleanup-connection-hook #'tramp-rpc-cleanup-connection)
