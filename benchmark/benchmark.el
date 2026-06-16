@@ -317,7 +317,7 @@ Simulates what magit does: multiple different git commands in one batch."
            ("file.stat" . ((path . ,localname)))
            ("file.readable" . ((path . ,localname)))
            ("file.writable" . ((path . ,localname)))
-           ("dir.list" . ((path . ,localname) (include_attrs . :msgpack-false)))))))))
+           ("dir.list" . ((path . ,localname) (include_attrs . ,messagepack-false)))))))))
 
 (defun tramp-rpc-benchmark--sequential-mixed-ops (method)
   "Benchmark sequential mixed operations for METHOD.
@@ -562,7 +562,7 @@ METHODS accepts nil/:all for both methods or a list with \"sshx\", \"ssh\", and/
 
 Batch mode example:
   emacs -Q --batch -l benchmark/benchmark.el \\
-    --eval '(add-to-list (quote load-path) \"/path/to/msgpack\")' \\
+    --eval '(add-to-list (quote load-path) \"/path/to/emacs-messagepack\")' \\
     --eval '(add-to-list (quote load-path) (expand-file-name \"lisp\" default-directory))' \\
     --eval '(require (quote tramp-rpc))' \\
     --eval '(setq tramp-rpc-benchmark-host \"server\" tramp-rpc-benchmark-iterations 5)' \\

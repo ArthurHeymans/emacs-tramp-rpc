@@ -61,23 +61,27 @@
                                (expand-file-name "test/tramp-rpc-tests.el"))))
   "Project root directory.")
 
-;; Load tramp-rpc from the project
-(let ((lisp-dir (expand-file-name "lisp" tramp-rpc-test--project-root)))
-  (add-to-list 'load-path lisp-dir))
+;; Load tramp-rpc and a sibling messagepack checkout from the project.
+(let ((lisp-dir (expand-file-name "lisp" tramp-rpc-test--project-root))
+      (messagepack-dir (expand-file-name "../emacs-messagepack"
+                                         tramp-rpc-test--project-root)))
+  (add-to-list 'load-path lisp-dir)
+  (when (file-directory-p messagepack-dir)
+    (add-to-list 'load-path messagepack-dir)))
 
 ;; Ensure tests exercise updated source, not stale bytecode.
 (setq load-prefer-newer t)
 
-;; Install msgpack from MELPA if not available (required by tramp-rpc-protocol)
-(unless (require 'msgpack nil t)
+;; Install messagepack if not available (required by tramp-rpc-protocol)
+(unless (require 'messagepack nil t)
   (require 'package)
   (add-to-list 'package-archives
                '("melpa" . "https://melpa.org/packages/") t)
   (package-initialize)
   (unless package-archive-contents
     (package-refresh-contents))
-  (package-install 'msgpack)
-  (require 'msgpack))
+  (package-vc-install '(messagepack :url "https://github.com/ArthurHeymans/emacs-messagepack") "91deebe5")
+  (require 'messagepack))
 
 (require 'tramp-rpc)
 

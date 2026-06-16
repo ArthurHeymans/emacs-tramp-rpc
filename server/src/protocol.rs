@@ -247,9 +247,9 @@ pub struct FileAttributes {
     pub inode: u64,
     /// Device number
     pub dev: u64,
-    /// Symlink target (if symlink)
+    /// Symlink target as raw bytes (if symlink)
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub link_target: Option<String>,
+    pub link_target: Option<Vec<u8>>,
 }
 
 impl FileAttributes {
@@ -308,7 +308,7 @@ impl FileAttributes {
         if let Some(ref link_target) = self.link_target {
             pairs.push((
                 Value::String("link_target".into()),
-                Value::String(link_target.clone().into()),
+                Value::Binary(link_target.clone()),
             ));
         }
 

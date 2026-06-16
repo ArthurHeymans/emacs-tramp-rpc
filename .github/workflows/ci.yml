@@ -136,7 +136,7 @@ jobs:
               --eval "(package-refresh-contents)" \
               --eval "(setq package-install-upgrade-built-in t)" \
               --eval "(package-install 'tramp)" \
-              --eval "(package-install 'msgpack)" && break
+              --eval "(package-vc-install '(messagepack :url \"https://github.com/ArthurHeymans/emacs-messagepack\") \"91deebe5\")" && break
             echo "Attempt $attempt failed, retrying in 10s..."
             sleep 10
           done
@@ -181,7 +181,7 @@ jobs:
               --eval "(package-refresh-contents)" \
               --eval "(setq package-install-upgrade-built-in t)" \
               --eval "(package-install 'tramp)" \
-              --eval "(package-install 'msgpack)" && break
+              --eval "(package-vc-install '(messagepack :url \"https://github.com/ArthurHeymans/emacs-messagepack\") \"91deebe5\")" && break
             echo "Attempt $attempt failed, retrying in 10s..."
             sleep 10
           done
@@ -213,7 +213,7 @@ jobs:
               --eval "(package-refresh-contents)" \
               --eval "(setq package-install-upgrade-built-in t)" \
               --eval "(package-install 'tramp)" \
-              --eval "(package-install 'msgpack)" && break
+              --eval "(package-vc-install '(messagepack :url \"https://github.com/ArthurHeymans/emacs-messagepack\") \"91deebe5\")" && break
             echo "Attempt $attempt failed, retrying in 10s..."
             sleep 10
           done
@@ -257,7 +257,7 @@ jobs:
               --eval "(package-refresh-contents)" \
               --eval "(setq package-install-upgrade-built-in t)" \
               --eval "(package-install 'tramp)" \
-              --eval "(package-install 'msgpack)" && break
+              --eval "(package-vc-install '(messagepack :url \"https://github.com/ArthurHeymans/emacs-messagepack\") \"91deebe5\")" && break
             echo "Attempt $attempt failed, retrying in 10s..."
             sleep 10
           done
@@ -307,7 +307,7 @@ jobs:
               --eval "(package-refresh-contents)" \
               --eval "(setq package-install-upgrade-built-in t)" \
               --eval "(package-install 'tramp)" \
-              --eval "(package-install 'msgpack)" && break
+              --eval "(package-vc-install '(messagepack :url \"https://github.com/ArthurHeymans/emacs-messagepack\") \"91deebe5\")" && break
             echo "Attempt $attempt failed, retrying in 10s..."
             sleep 10
           done
@@ -382,7 +382,7 @@ jobs:
               --eval "(package-refresh-contents)" \
               --eval "(setq package-install-upgrade-built-in t)" \
               --eval "(package-install 'tramp)" \
-              --eval "(package-install 'msgpack)" && break
+              --eval "(package-vc-install '(messagepack :url \"https://github.com/ArthurHeymans/emacs-messagepack\") \"91deebe5\")" && break
             echo "Attempt $attempt failed, retrying in 10s..."
             sleep 10
           done
@@ -471,7 +471,7 @@ jobs:
               --eval "(add-to-list 'package-archives '(\"melpa\" . \"https://melpa.org/packages/\") t)" \
               --eval "(package-initialize)" \
               --eval "(package-refresh-contents)" \
-              --eval "(package-install 'msgpack)" && break
+              --eval "(package-vc-install '(messagepack :url \"https://github.com/ArthurHeymans/emacs-messagepack\") \"91deebe5\")" && break
             echo "Attempt $attempt failed, retrying in 10s..."
             sleep 10
           done

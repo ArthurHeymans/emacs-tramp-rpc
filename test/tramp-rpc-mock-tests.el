@@ -35,30 +35,51 @@
 (let ((lisp-dir (expand-file-name "lisp" tramp-rpc-mock-test--project-root)))
   (add-to-list 'load-path lisp-dir))
 
-;; Install msgpack from MELPA if not available
-(defvar tramp-rpc-mock-test--msgpack-available
-  (or (require 'msgpack nil t)
-      ;; Try to install from MELPA
+;; Prefer a sibling checkout during local development.
+(let ((messagepack-dir (expand-file-name "../emacs-messagepack"
+                                         tramp-rpc-mock-test--project-root)))
+  (when (file-directory-p messagepack-dir)
+    (add-to-list 'load-path messagepack-dir)))
+
+;; Install messagepack if not available
+(defvar tramp-rpc-mock-test--messagepack-available
+  (or (require 'messagepack nil t)
+      ;; Try to install from the upstream Git repository
       (condition-case err
           (progn
             (require 'package)
-            (unless (assoc 'msgpack package-alist)
-              ;; Add MELPA if not present
+            (unless (assoc 'messagepack package-alist)
+              ;; Add MELPA for Tramp and package metadata
               (add-to-list 'package-archives
                            '("melpa" . "https://melpa.org/packages/") t)
               (package-initialize)
               (unless package-archive-contents
                 (package-refresh-contents))
-              (package-install 'msgpack))
-            (require 'msgpack)
+              (package-vc-install '(messagepack :url "https://github.com/ArthurHeymans/emacs-messagepack") "91deebe5"))
+            (require 'messagepack)
             t)
         (error
-         (message "Could not install msgpack: %s" err)
+         (message "Could not install messagepack: %s" err)
          nil)))
-  "Non-nil if msgpack.el is available.")
+  "Non-nil if messagepack.el is available.")
 
-(when tramp-rpc-mock-test--msgpack-available
+(when tramp-rpc-mock-test--messagepack-available
   (require 'tramp-rpc-protocol))
+
+(defun tramp-rpc-mock-test--messagepack-decode (payload)
+  "Decode MessagePack PAYLOAD using tramp-rpc's protocol container policy."
+  (messagepack-decode payload
+                      :map-type 'alist
+                      :key-type 'symbol
+                      :array-type 'list))
+
+(defun tramp-rpc-mock-test--bytes (data)
+  "Return raw bytes from decoded MessagePack DATA."
+  (cond
+   ((messagepack-bin-p data) (messagepack-bin-bytes data))
+   ((stringp data) data)
+   ((null data) nil)
+   (t (signal 'wrong-type-argument (list 'messagepack-bytes-p data)))))
 
 ;;; ============================================================================
 ;;; Protocol Tests (No server required)
@@ -66,7 +87,7 @@
 
 (ert-deftest tramp-rpc-mock-test-protocol-encode-request ()
   "Test MessagePack-RPC request encoding."
-  (skip-unless tramp-rpc-mock-test--msgpack-available)
+  (skip-unless tramp-rpc-mock-test--messagepack-available)
   (let* ((result (tramp-rpc-protocol-encode-request-with-id "file.stat" '((path . "/test"))))
          (id (car result))
          (bytes (cdr result)))
@@ -75,12 +96,12 @@
     (should (not (multibyte-string-p bytes)))
     (should (>= (length bytes) 4))
     ;; Read length prefix
-    (let* ((len (msgpack-bytes-to-unsigned (substring bytes 0 4)))
+    (let* ((len (messagepack-bytes-to-unsigned (substring bytes 0 4)))
            (payload (substring bytes 4))
            ;; Decode the MessagePack payload
-           (msgpack-map-type 'alist)
-           (msgpack-key-type 'symbol)
-           (parsed (msgpack-read-from-string payload)))
+           (messagepack-map-type 'alist)
+           (messagepack-key-type 'symbol)
+           (parsed (tramp-rpc-mock-test--messagepack-decode payload)))
       ;; Length should match payload
       (should (= len (length payload)))
       ;; Check structure
@@ -96,9 +117,9 @@
 
 (ert-deftest tramp-rpc-mock-test-protocol-decode-success ()
   "Test MessagePack-RPC success response decoding."
-  (skip-unless tramp-rpc-mock-test--msgpack-available)
+  (skip-unless tramp-rpc-mock-test--messagepack-available)
   (let* ((response-data '((version . "2.0") (id . 1) (result . ((exists . t)))))
-         (response-bytes (msgpack-encode response-data)))
+         (response-bytes (messagepack-encode response-data)))
     (with-temp-buffer
       (set-buffer-multibyte nil)
       (insert response-bytes)
@@ -110,11 +131,11 @@
 
 (ert-deftest tramp-rpc-mock-test-protocol-decode-error ()
   "Test MessagePack-RPC error response decoding."
-  (skip-unless tramp-rpc-mock-test--msgpack-available)
+  (skip-unless tramp-rpc-mock-test--messagepack-available)
   (let* ((response-data '((version . "2.0")
                           (id . 1)
                           (error . ((code . -32001) (message . "File not found")))))
-         (response-bytes (msgpack-encode response-data)))
+         (response-bytes (messagepack-encode response-data)))
     (with-temp-buffer
       (set-buffer-multibyte nil)
       (insert response-bytes)
@@ -125,7 +146,7 @@
 
 (ert-deftest tramp-rpc-mock-test-protocol-batch-encode ()
   "Test MessagePack-RPC batch request encoding."
-  (skip-unless tramp-rpc-mock-test--msgpack-available)
+  (skip-unless tramp-rpc-mock-test--messagepack-available)
   (let* ((requests '(("file.stat" . ((path . "/a")))
                      ("file.stat" . ((path . "/b")))))
          (result (tramp-rpc-protocol-encode-batch-request-with-id requests))
@@ -133,10 +154,10 @@
          (bytes (cdr result)))
     ;; Skip length prefix and decode
     (let* ((payload (substring bytes 4))
-           (msgpack-map-type 'alist)
-           (msgpack-key-type 'symbol)
-           (msgpack-array-type 'list)
-           (parsed (msgpack-read-from-string payload)))
+           (messagepack-map-type 'alist)
+           (messagepack-key-type 'symbol)
+           (messagepack-array-type 'list)
+           (parsed (tramp-rpc-mock-test--messagepack-decode payload)))
       ;; Should be a single request with batch method
       (should (assoc 'method parsed))
       (should (equal (cdr (assoc 'method parsed)) "batch"))
@@ -148,7 +169,7 @@
 
 (ert-deftest tramp-rpc-mock-test-protocol-batch-decode ()
   "Test MessagePack-RPC batch response decoding."
-  (skip-unless tramp-rpc-mock-test--msgpack-available)
+  (skip-unless tramp-rpc-mock-test--messagepack-available)
   (let* ((response-plist '(:id 1
                            :result ((results . (((result . t))
                                                 ((error (code . -32001)
@@ -163,9 +184,9 @@
 
 (ert-deftest tramp-rpc-mock-test-protocol-length-framing ()
   "Test length-prefixed framing functions."
-  (skip-unless tramp-rpc-mock-test--msgpack-available)
+  (skip-unless tramp-rpc-mock-test--messagepack-available)
   (let* ((test-data '((foo . "bar")))
-         (payload (msgpack-encode test-data))
+         (payload (messagepack-encode test-data))
          (framed (tramp-rpc-protocol--length-prefix payload)))
     ;; Length should be encoded in first 4 bytes
     (should (= (length framed) (+ 4 (length payload))))
@@ -176,7 +197,7 @@
       (should (= (tramp-rpc-protocol-read-length (current-buffer)) (length payload))))
     ;; Try reading a complete message
     (let* ((response '((version . "2.0") (id . 42) (result . t)))
-           (response-payload (msgpack-encode response))
+           (response-payload (messagepack-encode response))
            (response-framed (tramp-rpc-protocol--length-prefix response-payload)))
       (with-temp-buffer
         (set-buffer-multibyte nil)
@@ -188,9 +209,9 @@
 
 (ert-deftest tramp-rpc-mock-test-protocol-incomplete-message ()
   "Test handling of incomplete messages."
-  (skip-unless tramp-rpc-mock-test--msgpack-available)
+  (skip-unless tramp-rpc-mock-test--messagepack-available)
   (let* ((response '((version . "2.0") (id . 1) (result . t)))
-         (payload (msgpack-encode response))
+         (payload (messagepack-encode response))
          (framed (tramp-rpc-protocol--length-prefix payload)))
     ;; Truncate the message - too short for length header
     (with-temp-buffer
@@ -211,7 +232,7 @@
 
 (ert-deftest tramp-rpc-mock-test-protocol-id-uniqueness ()
   "Test that request IDs are unique."
-  (skip-unless tramp-rpc-mock-test--msgpack-available)
+  (skip-unless tramp-rpc-mock-test--messagepack-available)
   (let ((ids (make-hash-table :test 'equal)))
     (dotimes (_ 100)
       (let* ((result (tramp-rpc-protocol-encode-request-with-id "test" nil))
@@ -381,7 +402,7 @@ Returns the result or signals an error."
 (ert-deftest tramp-rpc-mock-test-server-system-info ()
   "Test system.info RPC call."
   :tags '(:server)
-  (skip-unless tramp-rpc-mock-test--msgpack-available)
+  (skip-unless tramp-rpc-mock-test--messagepack-available)
   (skip-unless (tramp-rpc-mock-test--find-server))
   (unwind-protect
       (progn
@@ -404,7 +425,7 @@ Returns the result or signals an error."
 (ert-deftest tramp-rpc-mock-test-server-file-operations ()
   "Test basic file operations via RPC."
   :tags '(:server)
-  (skip-unless tramp-rpc-mock-test--msgpack-available)
+  (skip-unless tramp-rpc-mock-test--messagepack-available)
   (skip-unless (tramp-rpc-mock-test--find-server))
   (unwind-protect
       (progn
@@ -418,8 +439,8 @@ Returns the result or signals an error."
           ;; Write a file - content is now raw binary, not base64
           (tramp-rpc-mock-test--rpc-call
            "file.write" `((path . ,(encode-coding-string test-file 'utf-8))
-                          (content . "hello world")
-                          (append . :msgpack-false)))
+                          (content . ,(messagepack-bin-make (encode-coding-string "hello world" 'utf-8-unix)))
+                          (append . ,messagepack-false)))
 
           ;; File should exist now (stat returns attributes)
           (let ((result (tramp-rpc-mock-test--rpc-call
@@ -431,7 +452,7 @@ Returns the result or signals an error."
                          "file.read" `((path . ,(encode-coding-string test-file 'utf-8))))))
             (should result)
             (let ((content (alist-get 'content result)))
-              (should (equal content "hello world"))))
+              (should (equal (tramp-rpc-mock-test--bytes content) "hello world"))))
 
           ;; Get file stats
           (let ((result (tramp-rpc-mock-test--rpc-call
@@ -451,7 +472,7 @@ Returns the result or signals an error."
 (ert-deftest tramp-rpc-mock-test-server-directory-operations ()
   "Test directory operations via RPC."
   :tags '(:server)
-  (skip-unless tramp-rpc-mock-test--msgpack-available)
+  (skip-unless tramp-rpc-mock-test--messagepack-available)
   (skip-unless (tramp-rpc-mock-test--find-server))
   (unwind-protect
       (progn
@@ -460,7 +481,7 @@ Returns the result or signals an error."
           ;; Create directory
           (tramp-rpc-mock-test--rpc-call
            "dir.create" `((path . ,(encode-coding-string test-dir 'utf-8))
-                          (parents . :msgpack-false)))
+                          (parents . ,messagepack-false)))
 
           ;; Check it exists
           (let ((result (tramp-rpc-mock-test--rpc-call
@@ -471,20 +492,24 @@ Returns the result or signals an error."
           ;; Create files in directory - content is raw binary
           (tramp-rpc-mock-test--rpc-call
            "file.write" `((path . ,(encode-coding-string (expand-file-name "file1.txt" test-dir) 'utf-8))
-                          (content . "a")
-                          (append . :msgpack-false)))
+                          (content . ,(messagepack-bin-make (encode-coding-string "a" 'utf-8-unix)))
+                          (append . ,messagepack-false)))
           (tramp-rpc-mock-test--rpc-call
            "file.write" `((path . ,(encode-coding-string (expand-file-name "file2.txt" test-dir) 'utf-8))
-                          (content . "b")
-                          (append . :msgpack-false)))
+                          (content . ,(messagepack-bin-make (encode-coding-string "b" 'utf-8-unix)))
+                          (append . ,messagepack-false)))
 
           ;; List directory
           (let ((result (tramp-rpc-mock-test--rpc-call
                          "dir.list" `((path . ,(encode-coding-string test-dir 'utf-8))
-                                      (include_attrs . :msgpack-false)
+                                      (include_attrs . ,messagepack-false)
                                       (include_hidden . t)))))
             (should result)
-            (let ((names (mapcar (lambda (e) (alist-get 'name e)) result)))
+            (let ((names (mapcar (lambda (e)
+                              (decode-coding-string
+                               (tramp-rpc-mock-test--bytes (alist-get 'name e))
+                               'utf-8-unix))
+                            result)))
               (should (member "file1.txt" names))
               (should (member "file2.txt" names))))
 
@@ -502,7 +527,7 @@ Returns the result or signals an error."
 (ert-deftest tramp-rpc-mock-test-server-highlevel-locate-dominating-file ()
   "Test high-level locate-dominating-file RPC helper."
   :tags '(:server)
-  (skip-unless tramp-rpc-mock-test--msgpack-available)
+  (skip-unless tramp-rpc-mock-test--messagepack-available)
   (skip-unless (tramp-rpc-mock-test--find-server))
   (unwind-protect
       (progn
@@ -525,7 +550,7 @@ Returns the result or signals an error."
 (ert-deftest tramp-rpc-mock-test-server-highlevel-locate-dominating-file-preserves-symlink-path ()
   "Test locate-dominating-file keeps lexical symlink path."
   :tags '(:server)
-  (skip-unless tramp-rpc-mock-test--msgpack-available)
+  (skip-unless tramp-rpc-mock-test--messagepack-available)
   (skip-unless (tramp-rpc-mock-test--find-server))
   (skip-unless (not (memq system-type '(windows-nt ms-dos))))
   (unwind-protect
@@ -553,7 +578,7 @@ Returns the result or signals an error."
 (ert-deftest tramp-rpc-mock-test-server-highlevel-locate-dominating-file-depth-limit ()
   "Ensure dominating-file helper errors after 100 ancestor levels."
   :tags '(:server)
-  (skip-unless tramp-rpc-mock-test--msgpack-available)
+  (skip-unless tramp-rpc-mock-test--messagepack-available)
   (skip-unless (tramp-rpc-mock-test--find-server))
   (unwind-protect
       (progn
@@ -579,7 +604,7 @@ Returns the result or signals an error."
 (ert-deftest tramp-rpc-mock-test-server-highlevel-test-files-in-dir ()
   "Test high-level dir-locals file listing RPC helper."
   :tags '(:server)
-  (skip-unless tramp-rpc-mock-test--msgpack-available)
+  (skip-unless tramp-rpc-mock-test--messagepack-available)
   (skip-unless (tramp-rpc-mock-test--find-server))
   (unwind-protect
       (progn
@@ -600,7 +625,7 @@ Returns the result or signals an error."
 (ert-deftest tramp-rpc-mock-test-server-highlevel-dir-locals-cache-update ()
   "Test high-level dir-locals cache update RPC helper."
   :tags '(:server)
-  (skip-unless tramp-rpc-mock-test--msgpack-available)
+  (skip-unless tramp-rpc-mock-test--messagepack-available)
   (skip-unless (tramp-rpc-mock-test--find-server))
   (unwind-protect
       (progn
@@ -625,7 +650,7 @@ Returns the result or signals an error."
 (ert-deftest tramp-rpc-mock-test-server-highlevel-dir-locals-cache-update-preserves-symlink-path ()
   "Ensure dir-locals cache update keeps lexical symlink paths."
   :tags '(:server)
-  (skip-unless tramp-rpc-mock-test--msgpack-available)
+  (skip-unless tramp-rpc-mock-test--messagepack-available)
   (skip-unless (tramp-rpc-mock-test--find-server))
   (skip-unless (not (memq system-type '(windows-nt ms-dos))))
   (unwind-protect
@@ -657,7 +682,7 @@ Returns the result or signals an error."
 (ert-deftest tramp-rpc-mock-test-server-highlevel-dir-locals-cache-update-depth-limit ()
   "Ensure dir-locals cache helper errors after 100 ancestor levels."
   :tags '(:server)
-  (skip-unless tramp-rpc-mock-test--msgpack-available)
+  (skip-unless tramp-rpc-mock-test--messagepack-available)
   (skip-unless (tramp-rpc-mock-test--find-server))
   (unwind-protect
       (progn
@@ -683,7 +708,7 @@ Returns the result or signals an error."
 (ert-deftest tramp-rpc-mock-test-server-process-run ()
   "Test process.run RPC call."
   :tags '(:server :process)
-  (skip-unless tramp-rpc-mock-test--msgpack-available)
+  (skip-unless tramp-rpc-mock-test--messagepack-available)
   (skip-unless (tramp-rpc-mock-test--find-server))
   (unwind-protect
       (progn
@@ -696,7 +721,7 @@ Returns the result or signals an error."
           (should result)
           (should (= (alist-get 'exit_code result) 0))
           ;; stdout is now raw binary
-          (let ((stdout (alist-get 'stdout result)))
+          (let ((stdout (tramp-rpc-mock-test--bytes (alist-get 'stdout result))))
             (should (string-match-p "hello world" stdout)))))
     (tramp-rpc-mock-test--stop-server)))
 
@@ -704,7 +729,7 @@ Returns the result or signals an error."
   "Test process.run returns 128+signal for signal-killed processes.
 This matches the behavior expected by `tramp-test28-process-file'."
   :tags '(:server :process)
-  (skip-unless tramp-rpc-mock-test--msgpack-available)
+  (skip-unless tramp-rpc-mock-test--messagepack-available)
   (skip-unless (tramp-rpc-mock-test--find-server))
   (unwind-protect
       (progn
@@ -786,7 +811,9 @@ This matches the behavior expected by `tramp-test28-process-file'."
                     ((symbol-function 'tramp-rpc--file-notify-dispatch)
                      (lambda (path) (push path dispatches))))
             (tramp-rpc--handle-notification
-             proc "fs.changed" '((paths . ("/tmp/changed"))))
+             proc "fs.changed"
+             `((paths . (,(messagepack-bin-make
+                           (encode-coding-string "/tmp/changed" 'utf-8-unix))))))
             (should (= status-clears 0))
             (should-not invalidations)
             (should (equal dispatches '("/rpc:mock:/tmp/changed")))))
@@ -852,7 +879,8 @@ This matches the behavior expected by `tramp-test28-process-file'."
     (cl-letf (((symbol-function 'tramp-rpc--call)
                (lambda (_vec method _params)
                  (when (equal method "watch.add")
-                   '((path . "/tmp/real/")))))
+                   `((path . ,(messagepack-bin-make
+                               (encode-coding-string "/tmp/real/" 'utf-8-unix)))))))
               ((symbol-function 'insert-special-event)
                (lambda (event) (push event events))))
       (setq descriptor
@@ -1427,7 +1455,8 @@ This matches the behavior expected by `tramp-test28-process-file'."
                    (lambda (_vec method _params)
                      (push method calls)
                      (pcase method
-                       ("file.read" '((content . "payload")))
+                       ("file.read" `((content . ,(messagepack-bin-make
+                                                    (encode-coding-string "payload" 'utf-8-unix)))))
                        ("file.delete" t)
                        (_ (error "Unexpected RPC method: %s" method)))))
                   ((symbol-function 'tramp-rpc--invalidate-cache-for-path) #'ignore)
@@ -1449,10 +1478,13 @@ This matches the behavior expected by `tramp-test28-process-file'."
   (let* ((trash-root (make-temp-file "tramp-rpc-trash" t))
          (trash-directory trash-root)
          (stat '((type . "symlink")
-                 (link_target . "../target")
                  (mode . 41471)
                  (mtime . 1700000000)))
          calls)
+    (push (cons 'link_target
+                (messagepack-bin-make
+                 (encode-coding-string "../target" 'utf-8-unix)))
+          stat)
     (unwind-protect
         (cl-letf (((symbol-function 'tramp-rpc--call-file-stat)
                    (lambda (&rest _args) stat))
@@ -1483,8 +1515,9 @@ This matches the behavior expected by `tramp-test28-process-file'."
          (file-stat `((type . "file")
                       (mode . ,(logior #o100000 #o644))
                       (mtime . 1700000000)))
-         (link-stat '((type . "symlink")
-                      (link_target . "a.txt")
+         (link-stat `((type . "symlink")
+                      (link_target . ,(messagepack-bin-make
+                                       (encode-coding-string "a.txt" 'utf-8-unix)))
                       (mode . 41471)
                       (mtime . 1700000000)))
          calls)
@@ -1588,7 +1621,8 @@ This matches the behavior expected by `tramp-test28-process-file'."
                   ((symbol-function 'tramp-rpc--call)
                    (lambda (_vec method _params)
                      (pcase method
-                       ("file.read" '((content . "payload")))
+                       ("file.read" `((content . ,(messagepack-bin-make
+                                                    (encode-coding-string "payload" 'utf-8-unix)))))
                        ("file.delete" (setq remote-delete-called t))
                        (_ (error "Unexpected RPC method: %s" method)))))
                   ((symbol-function 'tramp-rpc--write-local-trash-file)
@@ -1621,7 +1655,8 @@ This matches the behavior expected by `tramp-test28-process-file'."
                   ((symbol-function 'tramp-rpc--call)
                    (lambda (_vec method _params)
                      (pcase method
-                       ("file.read" '((content . "payload")))
+                       ("file.read" `((content . ,(messagepack-bin-make
+                                                    (encode-coding-string "payload" 'utf-8-unix)))))
                        ("file.delete" (signal 'file-error '("remote delete failed")))
                        (_ (error "Unexpected RPC method: %s" method)))))
                   ((symbol-function 'tramp-rpc--fallback-move-file-to-trash)

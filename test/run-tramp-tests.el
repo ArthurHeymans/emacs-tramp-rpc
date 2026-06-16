@@ -33,17 +33,25 @@
 
 ;;; Code:
 
-;; Install msgpack from MELPA if not available
-(unless (require 'msgpack nil t)
+(let* ((project-root (expand-file-name
+                      ".."
+                      (file-name-directory (or load-file-name buffer-file-name
+                                               (expand-file-name "test/run-tramp-tests.el")))))
+       (messagepack-dir (expand-file-name "../emacs-messagepack" project-root)))
+  (when (file-directory-p messagepack-dir)
+    (add-to-list 'load-path messagepack-dir)))
+
+;; Install messagepack if not available
+(unless (require 'messagepack nil t)
   (require 'package)
   (add-to-list 'package-archives
                '("melpa" . "https://melpa.org/packages/") t)
   (package-initialize)
   (unless package-archive-contents
     (package-refresh-contents))
-  (unless (package-installed-p 'msgpack)
-    (package-install 'msgpack))
-  (require 'msgpack))
+  (unless (package-installed-p 'messagepack)
+    (package-vc-install '(messagepack :url "https://github.com/ArthurHeymans/emacs-messagepack") "91deebe5"))
+  (require 'messagepack))
 
 ;; Add tramp-rpc to load-path
 (let ((lisp-dir (expand-file-name

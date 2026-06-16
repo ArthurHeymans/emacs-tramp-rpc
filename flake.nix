@@ -46,8 +46,8 @@
                   ],
                   lib,
                   melpaBuild,
+                  trivialBuild,
                   tramp,
-                  msgpack,
                 }:
                 let
                   versionPrefix = ";; Version: ";
@@ -57,6 +57,17 @@
                       (lib.splitString "\n" (builtins.readFile "${self}/lisp/tramp-rpc.el"))
                   );
                   serverFor = arch: arch.callPackage ./default.nix { };
+                  messagepack = trivialBuild {
+                    pname = "messagepack";
+                    version = "0.1.0";
+                    src = super.fetchFromGitHub {
+                      owner = "ArthurHeymans";
+                      repo = "emacs-messagepack";
+                      rev = "91deebe5";
+                      sha256 = "15gsiv1jyb46jy8nj9wkksik6kqw2cgd1ln3zcjrqwgvpchc9q61";
+                    };
+                    packageRequires = [ ];
+                  };
                 in
                 melpaBuild rec {
                   pname = "tramp-rpc";
@@ -70,7 +81,7 @@
 
                   packageRequires = [
                     tramp
-                    msgpack
+                    messagepack
                   ];
                 }
               ) { };

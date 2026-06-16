@@ -4,7 +4,7 @@
 
 ;; Author: Arthur Heymans <arthur@aheymans.xyz>
 ;; Keywords: comm, processes
-;; Package-Requires: ((emacs "30.1") (msgpack "0"))
+;; Package-Requires: ((emacs "30.1") (messagepack "0.1.0"))
 
 ;; This file is part of tramp-rpc.
 
@@ -32,7 +32,7 @@
 ;;; Code:
 
 (require 'tramp)
-(require 'msgpack)
+(require 'messagepack)
 
 ;; Functions from tramp.el
 (declare-function tramp-add-external-operation "tramp")
@@ -100,7 +100,7 @@
                               string)))
             (tramp-rpc--call-async vec "process.write_pty"
                                    `((pid . ,pid)
-                                     (data . ,(msgpack-bin-make data-bytes)))
+                                     (data . ,(messagepack-bin-make data-bytes)))
                                    #'ignore))  ; Ignore the response
           nil))
        ;; Regular async RPC process (pipe-based)
@@ -146,7 +146,7 @@
                               string)))
             (tramp-rpc--call-async vec "process.write_pty"
                                    `((pid . ,pid)
-                                     (data . ,(msgpack-bin-make data-bytes)))
+                                     (data . ,(messagepack-bin-make data-bytes)))
                                    #'ignore))
           nil))
        ;; Regular async RPC process (pipe-based)
@@ -192,10 +192,10 @@
             (condition-case err
                 (if (process-get proc :tramp-rpc-pty)
                     ;; PTY processes: send Ctrl-D (EOF character) via the PTY
-                    (let ((eof-char (string ?\C-d))) ; ASCII 4 = Ctrl-D
+                    (let ((eof-char (unibyte-string ?\C-d))) ; ASCII 4 = Ctrl-D
                       (tramp-rpc--call-async vec "process.write_pty"
                                              `((pid . ,pid)
-                                               (data . ,(msgpack-bin-make eof-char)))
+                                               (data . ,(messagepack-bin-make eof-char)))
                                              #'ignore))
                   ;; Pipe processes: close the stdin pipe
                   (tramp-rpc--close-remote-stdin vec pid))

@@ -95,7 +95,9 @@ pub async fn read(params: Value) -> HandlerResult {
     } else {
         Ok(msgpack_map! {
             "content" => Value::Binary(content),
-            "size" => size
+            "size" => size,
+            "compressed" => false,
+            "compression" => Value::Nil
         })
     }
 }

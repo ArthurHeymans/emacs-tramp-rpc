@@ -4,7 +4,7 @@
 
 ;; Author: Arthur Heymans <arthur@aheymans.xyz>
 ;; Keywords: comm, processes, vc
-;; Package-Requires: ((emacs "30.1") (msgpack "0"))
+;; Package-Requires: ((emacs "30.1") (messagepack "0.1.0"))
 
 ;; This file is part of tramp-rpc.
 
@@ -30,6 +30,7 @@
 
 (require 'cl-lib)
 (require 'tramp)
+(require 'messagepack)
 
 ;; Functions from tramp.el
 (declare-function tramp-add-external-operation "tramp")
@@ -39,7 +40,9 @@
 (declare-function tramp-rpc--debug "tramp-rpc")
 (declare-function tramp-rpc--call "tramp-rpc")
 (declare-function tramp-rpc--connection-key "tramp-rpc")
+(declare-function tramp-rpc--decode-string "tramp-rpc")
 (declare-function tramp-rpc--decode-output "tramp-rpc")
+(declare-function tramp-rpc--encode-path "tramp-rpc")
 (declare-function tramp-rpc-file-name-p "tramp-rpc")
 (declare-function tramp-rpc--file-notify-dispatch "tramp-rpc")
 
@@ -195,17 +198,18 @@ Invalidates caches for the changed paths."
         ;; Also clear the magit process-file cache since git state may have changed.
         (tramp-rpc-magit--clear-status-cache))
       (dolist (path paths)
-        (when (stringp path)
-          ;; Build the full tramp path for cache invalidation and file
-          ;; notification dispatch.  File notifications are deliberately not
-          ;; suppressed by `tramp-rpc--suppress-fs-notifications': that variable
-          ;; only suppresses cache/status work during operations that invalidate
-          ;; caches themselves.
-          (when-let* ((vec (process-get process :tramp-rpc-vec)))
-            (let ((full-path (tramp-make-tramp-file-name vec path)))
-              (unless tramp-rpc--suppress-fs-notifications
-                (tramp-rpc--invalidate-cache-for-path full-path))
-              (tramp-rpc--file-notify-dispatch full-path))))))))
+        (let ((path (tramp-rpc--decode-string path)))
+          (when (stringp path)
+            ;; Build the full tramp path for cache invalidation and file
+            ;; notification dispatch.  File notifications are deliberately not
+            ;; suppressed by `tramp-rpc--suppress-fs-notifications': that variable
+            ;; only suppresses cache/status work during operations that invalidate
+            ;; caches themselves.
+            (when-let* ((vec (process-get process :tramp-rpc-vec)))
+              (let ((full-path (tramp-make-tramp-file-name vec path)))
+                (unless tramp-rpc--suppress-fs-notifications
+                  (tramp-rpc--invalidate-cache-for-path full-path))
+                (tramp-rpc--file-notify-dispatch full-path)))))))))
 
 (defun tramp-rpc-watch-directory (directory &optional recursive)
   "Start watching DIRECTORY for filesystem changes.
@@ -228,13 +232,14 @@ When RECURSIVE is non-nil, watch subdirectories too."
           ;; back and our file-notify ownership state remains unchanged.
           (progn
             (tramp-rpc--call v "watch.add"
-                             `((path . ,localname) (recursive . t)))
+                             (append (tramp-rpc--encode-path localname)
+                                     '((recursive . t))))
             (plist-put file-notify-entry :owned nil)
             (puthash watch-key '(:recursive t)
                      tramp-rpc--watched-directories))
         (tramp-rpc--call v "watch.add"
-                         `((path . ,localname)
-                           (recursive . ,(if recursive t :msgpack-false))))
+                         (append (tramp-rpc--encode-path localname)
+                                 `((recursive . ,(if recursive t messagepack-false)))))
         (puthash watch-key
                  (list :recursive (or recursive
                                       (tramp-rpc--watch-entry-recursive-p entry)))
@@ -250,7 +255,7 @@ When RECURSIVE is non-nil, watch subdirectories too."
            (file-notify-entry (and (boundp 'tramp-rpc--file-notify-watch-counts)
                                    (gethash watch-key
                                             tramp-rpc--file-notify-watch-counts))))
-      (tramp-rpc--call v "watch.remove" `((path . ,localname)))
+      (tramp-rpc--call v "watch.remove" (tramp-rpc--encode-path localname))
       (remhash watch-key tramp-rpc--watched-directories)
       ;; If file-notify was relying on the watch we just removed, restore its
       ;; direct non-recursive watch.  This applies to both recursive and
@@ -259,10 +264,11 @@ When RECURSIVE is non-nil, watch subdirectories too."
       (when (and file-notify-entry
                  (not (plist-get file-notify-entry :owned)))
         (let ((result (tramp-rpc--call v "watch.add"
-                                       `((path . ,localname)
-                                         (recursive . :msgpack-false)))))
+                                       (append (tramp-rpc--encode-path localname)
+                                               `((recursive . ,messagepack-false))))))
           (when-let* ((canonical-localname (and (listp result)
-                                                (alist-get 'path result)))
+                                                (tramp-rpc--decode-string
+                                                 (alist-get 'path result))))
                       ((stringp canonical-localname)))
             (plist-put file-notify-entry :canonical-directory
                        (tramp-make-tramp-file-name v canonical-localname))))
