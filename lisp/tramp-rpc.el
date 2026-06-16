@@ -3659,6 +3659,8 @@ Keys are the same connection/path keys as `tramp-rpc--watched-directories'.")
 (defvar tramp-rpc--file-notify-next-descriptor 0
   "Counter used to create distinct TRAMP-RPC file notification descriptors.")
 
+(declare-function file-notify--rm-descriptor "filenotify")
+
 (defun tramp-rpc--cleanup-file-notify-for-connection (&optional vec)
   "Remove TRAMP-RPC file notification state for VEC.
 When VEC is nil, remove all TRAMP-RPC file notification state.  This also
@@ -3681,9 +3683,14 @@ descriptors after connection cleanup."
          (push watch-key watch-keys-to-remove)))
      tramp-rpc--file-notify-watch-counts)
     (dolist (descriptor descriptors-to-remove)
+      ;; Remove private state before sending the public `stopped' event, so
+      ;; callbacks observing `file-notify-valid-p' during cleanup see the
+      ;; descriptor as no longer valid.
       (remhash descriptor tramp-rpc--file-notify-descriptors)
-      (when (boundp 'file-notify-descriptors)
-        (remhash descriptor file-notify-descriptors)))
+      (when (and (boundp 'file-notify-descriptors)
+                 (gethash descriptor file-notify-descriptors))
+        (require 'filenotify)
+        (file-notify--rm-descriptor descriptor)))
     (dolist (watch-key watch-keys-to-remove)
       (remhash watch-key tramp-rpc--file-notify-watch-counts))
     (when (or descriptors-to-remove watch-keys-to-remove)
@@ -3833,8 +3840,6 @@ DIRECTORY is the remote directory passed by `file-notify-add-watch'."
 (defun tramp-rpc-handle-file-notify-valid-p (descriptor)
   "Like `file-notify-valid-p' for TRAMP-RPC watch DESCRIPTOR."
   (and (gethash descriptor tramp-rpc--file-notify-descriptors) t))
-
-(declare-function file-notify--rm-descriptor "filenotify")
 
 (defun tramp-rpc--file-notify-valid-p-advice (orig-fun descriptor)
   "Route public `file-notify-valid-p' for TRAMP-RPC DESCRIPTOR."
