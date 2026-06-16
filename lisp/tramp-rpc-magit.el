@@ -4,7 +4,7 @@
 
 ;; Author: Arthur Heymans <arthur@aheymans.xyz>
 ;; Keywords: comm, processes, vc
-;; Package-Requires: ((emacs "30.1") (msgpack "0"))
+;; Package-Requires: ((emacs "30.1") (messagepack "0.1.0"))
 
 ;; This file is part of tramp-rpc.
 
@@ -30,6 +30,7 @@
 
 (require 'cl-lib)
 (require 'tramp)
+(require 'messagepack)
 
 ;; Functions from tramp.el
 (declare-function tramp-add-external-operation "tramp")
@@ -234,7 +235,7 @@ When RECURSIVE is non-nil, watch subdirectories too."
                      tramp-rpc--watched-directories))
         (tramp-rpc--call v "watch.add"
                          `((path . ,localname)
-                           (recursive . ,(if recursive t :msgpack-false))))
+                           (recursive . ,(if recursive t messagepack-false))))
         (puthash watch-key
                  (list :recursive (or recursive
                                       (tramp-rpc--watch-entry-recursive-p entry)))
@@ -260,7 +261,7 @@ When RECURSIVE is non-nil, watch subdirectories too."
                  (not (plist-get file-notify-entry :owned)))
         (let ((result (tramp-rpc--call v "watch.add"
                                        `((path . ,localname)
-                                         (recursive . :msgpack-false)))))
+                                         (recursive . ,messagepack-false)))))
           (when-let* ((canonical-localname (and (listp result)
                                                 (alist-get 'path result)))
                       ((stringp canonical-localname)))

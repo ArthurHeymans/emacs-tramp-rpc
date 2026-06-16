@@ -5,7 +5,7 @@
 ;; Author: Arthur Heymans <arthur@aheymans.xyz>
 ;; Version: 0.10.0
 ;; Keywords: comm, processes, files
-;; Package-Requires: ((emacs "30.1") (msgpack "0") (tramp "2.8.1.4"))
+;; Package-Requires: ((emacs "30.1") (messagepack "0.1.0") (tramp "2.8.1.4"))
 
 ;; This file is part of tramp-rpc.
 
@@ -390,14 +390,29 @@ telemetry even when later tests unload TRAMP and remove debug buffers."
               (write-region line nil log-file 'append 'silent))
           (error nil))))))
 
+(defun tramp-rpc--binary-bytes (data)
+  "Return raw bytes represented by MessagePack DATA.
+MessagePack `bin' values decode to `messagepack-bin' objects.  Keep this
+conversion explicit so RPC fields that carry bytes do not get confused with
+MessagePack `str' fields, which `messagepack.el' already decodes as text."
+  (cond
+   ((messagepack-bin-p data) (messagepack-bin-bytes data))
+   ((stringp data)
+    (if (multibyte-string-p data)
+        (encode-coding-string data 'utf-8-unix)
+      data))
+   ((null data) nil)
+   (t (signal 'wrong-type-argument (list 'messagepack-bytes-p data)))))
+
 (defun tramp-rpc--extract-file-read-content (rpc-result)
   "Extract and optionally decompress content from FILE.READ RPC-RESULT.
 Signals `remote-file-error' on compressed payload decode failures."
-  (let ((content (if (stringp rpc-result)
-                     rpc-result
-                   (alist-get 'content rpc-result))))
-    (if (and (not (stringp rpc-result))
-             (alist-get 'compressed rpc-result))
+  (let ((content (tramp-rpc--binary-bytes
+                  (if (or (stringp rpc-result) (messagepack-bin-p rpc-result))
+                      rpc-result
+                    (alist-get 'content rpc-result)))))
+    (if (and (not (or (stringp rpc-result) (messagepack-bin-p rpc-result)))
+             (eq (alist-get 'compressed rpc-result) t))
         (let ((compression (or (alist-get 'compression rpc-result) "zlib")))
           (cond
            ((and (string= compression "zlib")
@@ -1334,7 +1349,7 @@ socket, then kills the auth process and buffer."
 (defun tramp-rpc--connection-filter (process output)
   "Filter for RPC connection PROCESS receiving OUTPUT.
 Handles async responses by dispatching to registered callbacks.
-Uses length-prefixed binary framing: <4-byte BE length><msgpack payload>."
+Uses length-prefixed binary framing: <4-byte BE length><MessagePack payload>."
   (let ((buffer (process-buffer process))
 	response)
     (when (buffer-live-p buffer)
@@ -1738,30 +1753,30 @@ This is more efficient when the server has async support."
 ;; ============================================================================
 
 (defun tramp-rpc--decode-string (data)
-  "Decode DATA from raw bytes to multibyte UTF-8 string.
-With MessagePack, strings come as raw bytes (unibyte string).
-We decode them as UTF-8 to get proper multibyte strings.
-Returns nil if DATA is nil, empty string if DATA is empty."
+  "Decode MessagePack DATA as text.
+MessagePack `str' values already arrive as Emacs strings.  MessagePack `bin'
+values are decoded as UTF-8 bytes for protocol fields such as filenames that
+intentionally carry raw OS bytes."
   (cond
    ((null data) nil)
-   ((and (stringp data) (> (length data) 0))
-    (decode-coding-string data 'utf-8-unix))
+   ((messagepack-bin-p data)
+    (decode-coding-string (messagepack-bin-bytes data) 'utf-8-unix))
+   ((stringp data) data)
    (t data)))
 
 (defun tramp-rpc--decode-output (data _encoding)
-  "Decode DATA from raw bytes to multibyte UTF-8 string.
-With MessagePack, data comes as raw bytes (unibyte string).
-We decode it as UTF-8 to get a proper multibyte string.
+  "Decode binary process DATA to a multibyte UTF-8 string.
 ENCODING is ignored (kept for API compatibility)."
-  (or (tramp-rpc--decode-string data) ""))
+  (if data
+      (decode-coding-string (tramp-rpc--binary-bytes data) 'utf-8-unix)
+    ""))
 
 (defun tramp-rpc--decode-filename (entry)
-  "Get filename from directory ENTRY.
-With MessagePack, filenames come as raw bytes - decode to UTF-8."
+  "Get filename from directory ENTRY."
   (tramp-rpc--decode-string (alist-get 'name entry)))
 
 (defun tramp-rpc--path-to-bytes (path)
-  "Convert PATH to a unibyte string for MessagePack transmission.
+  "Convert PATH to a unibyte string for MessagePack bin transmission.
 Handles both multibyte UTF-8 strings and unibyte byte strings.
 Strips Emacs file-name quoting (the /: prefix) before sending to
 the server, since the remote side does not understand it."
@@ -1770,12 +1785,21 @@ the server, since the remote side does not understand it."
         (encode-coding-string unquoted 'utf-8-unix)
       unquoted)))
 
+(defun tramp-rpc--path-to-string (path)
+  "Return unquoted PATH as a text string for RPC fields typed as strings."
+  (let ((unquoted (file-name-unquote path)))
+    (if (multibyte-string-p unquoted)
+        unquoted
+      (decode-coding-string unquoted 'utf-8-unix))))
+
+(defun tramp-rpc--path-to-bin (path)
+  "Return PATH as an explicit MessagePack bin value."
+  (messagepack-bin-make (tramp-rpc--path-to-bytes path)))
+
 (defun tramp-rpc--encode-path (path)
-  "Encode PATH for transmission to the server.
-With MessagePack, paths are sent directly as strings/binary.
-Strips any Emacs file-name quoting (\"/:\") before encoding.
-Returns an alist with path."
-  `((path . ,(tramp-rpc--path-to-bytes path))))
+  "Encode PATH for transmission to path-or-bytes server parameters.
+Returns an alist with PATH as an explicit MessagePack bin value."
+  `((path . ,(tramp-rpc--path-to-bin path))))
 
 ;; ============================================================================
 ;; File name handler operations
@@ -1845,11 +1869,10 @@ path unchanged (after resolving any symlinks in parent directories)."
     (condition-case nil
         (let* ((result (tramp-rpc--call v "file.truename"
                                         (tramp-rpc--encode-path localname)))
-               ;; With MessagePack, path comes as raw bytes - decode to UTF-8
                (path (tramp-rpc--decode-string
-                      (if (stringp result)
-                          result
-                        (alist-get 'path result)))))
+                      (if (and (listp result) (not (messagepack-bin-p result)))
+                          (alist-get 'path result)
+                        result))))
           (or path localname))
       ;; If file doesn't exist or has a symlink loop, fall back to
       ;; symlink-chasing approach (same as tramp-handle-file-truename).
@@ -2046,7 +2069,7 @@ Return readable dir-locals files in DIRECTORY in increasing priority order."
            (names (tramp-rpc--dir-locals-candidate-files base-el-only))
            (result (tramp-rpc--call
                     v "highlevel.test_files_in_dir"
-                    `((directory . ,(tramp-rpc--path-to-bytes localdir))
+                    `((directory . ,(tramp-rpc--path-to-string localdir))
                       (names . ,(vconcat names))))))
       (mapcar (lambda (path)
                 (tramp-make-tramp-file-name
@@ -2073,7 +2096,7 @@ to the built-in implementation."
              (names (ensure-list name))
              (result (tramp-rpc--call
                       v "highlevel.locate_dominating_file_multi"
-                      `((file . ,(tramp-rpc--path-to-bytes localname))
+                      `((file . ,(tramp-rpc--path-to-string localname))
                         (names . ,(vconcat names))))))
         (when-let* ((marker (car result))
                     (marker-path (tramp-rpc--decode-string marker)))
@@ -2110,7 +2133,7 @@ to the built-in implementation."
               collect (file-name-unquote (file-local-name cache-dir))))))
       (tramp-rpc--call
        v "highlevel.dir_locals_find_file_cache_update"
-       `((file . ,(tramp-rpc--path-to-bytes localname))
+       `((file . ,(tramp-rpc--path-to-string localname))
          (names . ,(vconcat names))
          (cache_dirs . ,(vconcat cache-dirs)))))))
 
@@ -2191,7 +2214,7 @@ so a single RPC can both validate and list the directory."
               (mapcar #'tramp-rpc--decode-filename
                       (tramp-rpc--call v "dir.list"
                                        (append (tramp-rpc--encode-path localname)
-                                               '((include_attrs . :msgpack-false)
+                                               `((include_attrs . ,messagepack-false)
                                                  (include_hidden . t))))))))
     (when match
       (setq result (cl-remove-if-not
@@ -2251,7 +2274,7 @@ so a single RPC can both validate and list the directory."
 	(let ((entries
 	       (append (tramp-rpc--call v "dir.list"
 				       (append (tramp-rpc--encode-path localname)
-					       '((include_attrs . :msgpack-false)
+					       `((include_attrs . ,messagepack-false)
                                                  (include_hidden . t))))
 		       nil)))
           ;; Build list of names with trailing / for directories
@@ -2307,12 +2330,12 @@ network round-trip."
       (let ((created
              (tramp-rpc--call v "dir.create"
                               (append (tramp-rpc--encode-path localname)
-                                      `((parents . ,(if parents t :msgpack-false))
+                                      `((parents . ,(if parents t messagepack-false))
                                         (mode . ,(default-file-modes)))))))
         (tramp-rpc--invalidate-mkdir-caches v dir localname parents)
         ;; Match `make-directory' return convention: nil when a directory was
         ;; created, t when PARENTS was non-nil and the directory already existed.
-        (and parents (not created))))))
+        (and parents (eq created messagepack-false))))))
 
 (defun tramp-rpc-handle-delete-directory (directory &optional recursive trash)
   "Like `delete-directory' for TRAMP-RPC files."
@@ -2322,7 +2345,7 @@ network round-trip."
   (tramp-skeleton-delete-directory directory recursive trash
     (tramp-rpc--call v "dir.remove"
                      (append (tramp-rpc--encode-path localname)
-                             `((recursive . ,(if recursive t :msgpack-false))))))
+                             `((recursive . ,(if recursive t messagepack-false))))))
   (tramp-rpc--invalidate-cache-for-path directory))
 
 ;; ============================================================================
@@ -2352,10 +2375,10 @@ network round-trip."
                          ((integerp append)
                           ;; Offset write: read file, truncate at offset, append new
                           (let* ((existing (condition-case nil
-                                              (let ((r (tramp-rpc--call
-                                                        v "file.read"
-                                                        (tramp-rpc--encode-path localname))))
-                                                (alist-get 'content r))
+                                              (tramp-rpc--extract-file-read-content
+                                               (tramp-rpc--call
+                                                v "file.read"
+                                                (tramp-rpc--encode-path localname)))
                                             (file-missing nil)))
                                  (prefix (if existing
                                              (substring existing 0 (min append (length existing)))
@@ -2367,8 +2390,8 @@ network round-trip."
                          (append t)
                          (t nil)))
            (params (append (tramp-rpc--encode-path localname)
-                           `((content . ,(msgpack-bin-make content-bytes))
-                             (append . ,(if real-append t :msgpack-false))))))
+                           `((content . ,(messagepack-bin-make content-bytes))
+                             (append . ,(if real-append t messagepack-false))))))
 
       (let ((tramp-rpc--suppress-fs-notifications t))
         (tramp-rpc--call v "file.write" params))
@@ -2425,14 +2448,14 @@ network round-trip."
            newname ok-if-already-exists))
          (t
           (tramp-rpc--call v1 "file.copy"
-                           `((src . ,(tramp-rpc--path-to-bytes
+                           `((src . ,(tramp-rpc--path-to-bin
                                       (file-name-unquote v1-localname)))
-                             (dest . ,(tramp-rpc--path-to-bytes
+                             (dest . ,(tramp-rpc--path-to-bin
                                        (file-name-unquote v2-localname)))
                              (preserve . ,(if (or keep-time preserve-permissions)
-                                              t :msgpack-false))
+                                              t messagepack-false))
                              (overwrite . ,(if ok-if-already-exists
-                                               t :msgpack-false))))))
+                                               t messagepack-false))))))
         (tramp-flush-file-properties v1 v1-localname)
         (tramp-flush-file-properties v2 v2-localname)
         (tramp-flush-directory-properties v2 v2-localname)
@@ -2484,12 +2507,12 @@ network round-trip."
       (with-parsed-tramp-file-name filename v1
         (with-parsed-tramp-file-name newname v2
           (tramp-rpc--call v1 "file.copy"
-                           `((src . ,(tramp-rpc--path-to-bytes
+                           `((src . ,(tramp-rpc--path-to-bin
                                       (file-name-unquote v1-localname)))
-                             (dest . ,(tramp-rpc--path-to-bytes
+                             (dest . ,(tramp-rpc--path-to-bin
                                        (file-name-unquote v2-localname)))
-                             (preserve . ,(if (or keep-time preserve-permissions) t :msgpack-false))
-                             (overwrite . ,(if ok-if-already-exists t :msgpack-false)))))))
+                             (preserve . ,(if (or keep-time preserve-permissions) t messagepack-false))
+                             (overwrite . ,(if ok-if-already-exists t messagepack-false)))))))
      ;; Remote source, local dest - read via RPC, write locally
      ((and source-remote (not dest-remote))
       ;; Use file-local-copy to get a temp local copy, then rename
@@ -2585,12 +2608,12 @@ network round-trip."
              (expand-file-name (file-name-nondirectory filename) newname)
              ok-if-already-exists)))
         (tramp-rpc--call v1 "file.rename"
-                         `((src . ,(tramp-rpc--path-to-bytes
+                         `((src . ,(tramp-rpc--path-to-bin
                                     (file-name-unquote v1-localname)))
-                           (dest . ,(tramp-rpc--path-to-bytes
+                           (dest . ,(tramp-rpc--path-to-bin
                                      (file-name-unquote v2-localname)))
                            (overwrite . ,(if ok-if-already-exists
-                                             t :msgpack-false))))
+                                             t messagepack-false))))
         (tramp-flush-file-properties v1 v1-localname)
         (tramp-rpc--invalidate-cache-for-path filename)
         (tramp-flush-file-properties v2 v2-localname)
@@ -2630,11 +2653,11 @@ network round-trip."
       (with-parsed-tramp-file-name filename v1
         (with-parsed-tramp-file-name newname v2
           (tramp-rpc--call v1 "file.rename"
-                           `((src . ,(tramp-rpc--path-to-bytes
+                           `((src . ,(tramp-rpc--path-to-bin
                                       (file-name-unquote v1-localname)))
-                             (dest . ,(tramp-rpc--path-to-bytes
+                             (dest . ,(tramp-rpc--path-to-bin
                                        (file-name-unquote v2-localname)))
-                             (overwrite . ,(if ok-if-already-exists t :msgpack-false)))))))
+                             (overwrite . ,(if ok-if-already-exists t messagepack-false)))))))
      ;; Different hosts, copy then delete
      (t
       (copy-file filename newname ok-if-already-exists t t t)
@@ -2873,7 +2896,7 @@ implementation, which will use the normal TRAMP-RPC file handlers underneath."
                                   p)))
                             link-path-params)))
       (tramp-rpc--call v "file.make_symlink"
-                       (append `((target . ,(tramp-rpc--path-to-bytes target-path))) params)))
+                       (append `((target . ,(tramp-rpc--path-to-bin target-path))) params)))
     (tramp-rpc--invalidate-cache-for-path linkname)))
 
 (defun tramp-rpc-handle-add-name-to-file (filename newname &optional ok-if-already-exists)
@@ -2903,9 +2926,9 @@ Creates a hard link from NEWNAME to FILENAME."
           (delete-file newname)))
       (tramp-flush-file-properties v2 v2-localname)
       (tramp-rpc--call v1 "file.make_hardlink"
-                       `((src . ,(tramp-rpc--path-to-bytes
+                       `((src . ,(tramp-rpc--path-to-bin
                                   (file-name-unquote v1-localname)))
-                         (dest . ,(tramp-rpc--path-to-bytes
+                         (dest . ,(tramp-rpc--path-to-bin
                                    (file-name-unquote v2-localname))))))))
 
 (defun tramp-rpc-handle-set-file-uid-gid (filename &optional uid gid)
@@ -2996,7 +3019,7 @@ Returns t on success, nil on failure."
                                       `((cmd . "setfacl")
                                         (args . ["--set-file=-" ,localname])
                                         (cwd . "/")
-                                        (stdin . ,(msgpack-bin-make acl-bytes))))))
+                                        (stdin . ,(messagepack-bin-make acl-bytes))))))
         (zerop (alist-get 'exit_code result))))))
 
 ;; ============================================================================
@@ -3221,7 +3244,7 @@ refresh), git commands are served from the prefetch cache when possible."
                                               (cwd . ,localname)
                                               (env . ,env)
                                               ,@(when stdin-content
-                                                  `((stdin . ,stdin-content)))))
+                                                  `((stdin . ,(messagepack-bin-make stdin-content))))))
                          ;; When the binary doesn't exist or can't be
                          ;; spawned, return exit code 127 (command not
                          ;; found) instead of signaling an error.
@@ -3779,7 +3802,7 @@ DIRECTORY is the remote directory passed by `file-notify-add-watch'."
         (let* ((result (unless preexisting
                          (tramp-rpc--call v "watch.add"
                                           `((path . ,localname)
-                                            (recursive . :msgpack-false)))))
+                                            (recursive . ,messagepack-false)))))
                (canonical-localname (and (listp result)
                                          (alist-get 'path result)))
                (canonical-directory (cond

@@ -4,7 +4,7 @@
 
 ;; Author: Arthur Heymans <arthur@aheymans.xyz>
 ;; Keywords: comm, processes
-;; Package-Requires: ((emacs "30.1") (msgpack "0"))
+;; Package-Requires: ((emacs "30.1") (messagepack "0.1.0"))
 
 ;; This file is part of tramp-rpc.
 
@@ -18,12 +18,12 @@
 ;; This file provides the MessagePack-RPC protocol implementation for
 ;; communicating with the tramp-rpc-server binary.
 ;;
-;; Protocol framing: <4-byte big-endian length><msgpack payload>
+;; Protocol framing: <4-byte big-endian length><MessagePack payload>
 
 ;;; Code:
 
 (require 'cl-lib)
-(require 'msgpack)
+(require 'messagepack)
 
 (defvar tramp-rpc-protocol--request-id 0
   "Counter for generating unique request IDs.")
@@ -35,7 +35,7 @@
 (defun tramp-rpc-protocol--length-prefix (payload)
   "Add 4-byte big-endian length prefix to PAYLOAD (unibyte string)."
   (let ((len (length payload)))
-    (concat (msgpack-unsigned-to-bytes len 4) payload)))
+    (concat (messagepack-unsigned-to-bytes len 4) payload)))
 
 (defun tramp-rpc-protocol-encode-request-with-id (method params)
   "Encode a MessagePack-RPC request for METHOD with PARAMS.
@@ -45,7 +45,7 @@ Returns a cons cell (ID . BYTES) for pipelining support."
                     (id . ,id)
                     (method . ,method)
                     (params . ,params)))
-         (payload (msgpack-encode request)))
+         (payload (messagepack-encode request)))
     (cons id (tramp-rpc-protocol--length-prefix payload))))
 
 (defun tramp-rpc-protocol-decode-response (buffer start)
@@ -53,13 +53,12 @@ Returns a cons cell (ID . BYTES) for pipelining support."
 Returns a plist with :id, :result, and :error keys for responses.
 For server-initiated notifications (no :id, has :method), returns a plist
 with :notification t, :method, and :params keys."
-  (let* ((msgpack-map-type 'alist)
-         (msgpack-key-type 'symbol)
-         (msgpack-array-type 'list)
-         (response
+  (let* ((response
 	  (with-current-buffer buffer
 	    (goto-char start)
-	    (msgpack-read)))
+	    (messagepack-read :map-type 'alist
+                              :key-type 'symbol
+                              :array-type 'list)))
          (id (alist-get 'id response))
          (method (alist-get 'method response)))
     ;; Notifications have method but no id (JSON-RPC 2.0 spec)
@@ -115,7 +114,7 @@ Returns the integer errno, or nil if not an IO error with errno."
 Returns the length as an integer, or nil if the BUFFER is too short."
   (with-current-buffer buffer
     (when (>= (point-max) (+ (mark-marker) 4))
-      (msgpack-bytes-to-unsigned
+      (messagepack-bytes-to-unsigned
        (buffer-substring (mark-marker) (+ (mark-marker) 4))))))
 
 (defun tramp-rpc-protocol-try-read-message (buffer)

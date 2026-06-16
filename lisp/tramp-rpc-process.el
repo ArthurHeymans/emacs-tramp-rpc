@@ -4,7 +4,7 @@
 
 ;; Author: Arthur Heymans <arthur@aheymans.xyz>
 ;; Keywords: comm, processes
-;; Package-Requires: ((emacs "30.1") (msgpack "0"))
+;; Package-Requires: ((emacs "30.1") (messagepack "0.1.0"))
 
 ;; This file is part of tramp-rpc.
 
@@ -108,7 +108,7 @@ Returns plist with :stdout, :stderr, :exited, :exit-code."
           :stderr (when-let* ((s (alist-get 'stderr result)))
                     (tramp-rpc--decode-output
                      s (alist-get 'stderr_encoding result)))
-          :exited (alist-get 'exited result)
+          :exited (eq (alist-get 'exited result) t)
           :exit-code (alist-get 'exit_code result))))
 
 (defun tramp-rpc--write-remote-process (vec pid data)
@@ -146,7 +146,7 @@ for LSP servers, where didChange notifications are sent while typing."
                             data)))
           (tramp-rpc--call-async vec "process.write"
                                  `((pid . ,pid)
-                                   (data . ,(msgpack-bin-make data-bytes)))
+                                   (data . ,(messagepack-bin-make data-bytes)))
                                (lambda (response)
                                  (when (plist-get response :error)
                                    (tramp-rpc--debug "WRITE-ERROR pid=%s: %s"
@@ -303,7 +303,7 @@ RESPONSE is the decoded RPC response plist."
                (stderr (when-let* ((s (alist-get 'stderr result)))
                          (tramp-rpc--decode-output
                           s (alist-get 'stderr_encoding result))))
-               (exited (alist-get 'exited result))
+               (exited (eq (alist-get 'exited result) t))
                (exit-code (alist-get 'exit_code result)))
 
           (tramp-rpc--debug "ASYNC-READ response: stdout=%s stderr=%s exited=%s"
@@ -830,7 +830,7 @@ RESPONSE is the decoded RPC response plist."
                (output (when-let* ((o (alist-get 'output result)))
                          (tramp-rpc--decode-output
                           o (alist-get 'output_encoding result))))
-               (exited (alist-get 'exited result))
+               (exited (eq (alist-get 'exited result) t))
                 (exit-code (alist-get 'exit_code result)))
 
           ;; Deliver output via filter

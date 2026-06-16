@@ -142,8 +142,8 @@ TRAMP-RPC uses MessagePack-RPC over stdin/stdout with length-prefixed binary fra
 
 #+begin_src
 Emacs → SSH → tramp-rpc-server stdin
-Request: <length-prefix><msgpack: {version:"2.0",id:1,method:"file.exists",params:{path:"/path"}}>
-Response: <length-prefix><msgpack: {version:"2.0",id:1,result:true}>
+Request: <length-prefix><MessagePack: {version:"2.0",id:1,method:"file.exists",params:{path:"/path"}}>
+Response: <length-prefix><MessagePack: {version:"2.0",id:1,result:true}>
 #+end_src
 
 Advantages:

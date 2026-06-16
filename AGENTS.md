@@ -19,7 +19,7 @@ This can include:
 - remote OS
 - default tramp method
 - tramp source code directory
-- msgpack package path
+- messagepack package path
 - any other relevant instructions or information
 
 # Testing updates
@@ -37,7 +37,7 @@ Always test changes to the code.
 running all tests that start with `tramp-rpc-test` in tramp-rpc-tests.el
 ```sh
   emacs -Q --batch -l test/tramp-rpc-tests.el \
-    --eval '(add-to-list (quote load-path) "/path/to/msgpack")' \
+    --eval '(add-to-list (quote load-path) "/path/to/emacs-messagepack")' \
     --eval '(setq tramp-rpc-test-source "/path/to/tramp/source")' \
     --eval '(setq tramp-rpc-test-host "remote-host")' \
     --eval '(ert-run-tests-batch-and-exit "^tramp-rpc-test")'
@@ -48,7 +48,7 @@ running all tests that start with `tramp-rpc-test` in tramp-rpc-tests.el
 running "file-exists" and "file-read" benchmarks with rpc
 ```sh
   emacs -Q --batch -l benchmark/benchmark.el \
-    --eval '(add-to-list (quote load-path) "/path/to/msgpack")' \
+    --eval '(add-to-list (quote load-path) "/path/to/emacs-messagepack")' \
     --eval '(add-to-list (quote load-path) (expand-file-name "lisp" default-directory))' \
     --eval '(require (quote tramp-rpc))' \
     --eval '(setq tramp-rpc-benchmark-host "remote-host")' \
@@ -67,6 +67,7 @@ rm -f lisp/*.elc && emacs -Q --batch \
   --eval "(add-to-list 'package-archives '(\"melpa\" . \"https://melpa.org/packages/\") t)" \
   --eval "(package-initialize)" \
   --eval "(setq byte-compile-error-on-warn t)" \
+  --eval "(push \"$(pwd)/../emacs-messagepack\" load-path)" \
   --eval "(push \"$(pwd)/lisp\" load-path)" \
   -f batch-byte-compile lisp/*.el
 ```

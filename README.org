@@ -37,7 +37,7 @@ TRAMP-RPC replaces this with a lightweight Rust server that runs on the remote h
 
 - Emacs 30.1 or later
 - Tramp 2.8.1.4 or later (install from GNU ELPA if your Emacs bundles an older version)
-- =msgpack.el= package (installed automatically from MELPA)
+- =messagepack.el= package
 - SSH access to remote hosts
 - Remote host running Linux or macOS (x86_64 or aarch64)
 
@@ -77,13 +77,13 @@ TRAMP-RPC replaces this with a lightweight Rust server that runs on the remote h
 
 1. In =packages.el=:
    #+begin_src emacs-lisp
-   (package! msgpack)
+   (package! messagepack :recipe (:host github :repo "ArthurHeymans/emacs-messagepack"))
    (package! tramp-rpc :recipe (:host github :repo "ArthurHeymans/emacs-tramp-rpc" :files ("lisp/*.el")))
    #+end_src
 
 2. In =config.el=:
    #+begin_src emacs-lisp
-   (use-package! msgpack)
+   (use-package! messagepack)
    (use-package! tramp-rpc)
    #+end_src
 

@@ -13,15 +13,16 @@ echo "Running tramp-rpc autoload tests..."
 echo "Project root: $PROJECT_ROOT"
 echo
 
-# Install msgpack if needed, then run tests
+# Install messagepack if needed, then run tests
 emacs -Q --batch \
     -L "$PROJECT_ROOT/lisp" \
+    -L "$PROJECT_ROOT/../emacs-messagepack" \
     --eval "(require 'package)" \
     --eval "(add-to-list 'package-archives '(\"melpa\" . \"https://melpa.org/packages/\") t)" \
     --eval "(package-initialize)" \
-    --eval "(unless (require 'msgpack nil t)
+    --eval "(unless (require 'messagepack nil t)
               (package-refresh-contents)
-              (package-install 'msgpack))" \
+              (package-vc-install '(messagepack :url \"https://github.com/ArthurHeymans/emacs-messagepack\") \"91deebe5\"))" \
     -l "$SCRIPT_DIR/tramp-rpc-autoload-tests.el" \
     -f ert-run-tests-batch-and-exit
 

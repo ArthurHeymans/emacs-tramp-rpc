@@ -53,6 +53,11 @@
   (expand-file-name "tramp-rpc-autoloads.el" tramp-rpc-autoload-test--lisp-dir)
   "Path to generated autoloads file.")
 
+(let ((messagepack-dir (expand-file-name "../emacs-messagepack"
+                                         tramp-rpc-autoload-test--project-root)))
+  (when (file-directory-p messagepack-dir)
+    (add-to-list 'load-path messagepack-dir)))
+
 ;;; ============================================================================
 ;;; Test Helpers
 ;;; ============================================================================
@@ -188,8 +193,8 @@ This allows testing autoload behavior in a clean state."
 
 (ert-deftest tramp-rpc-autoload-test-predicate-result ()
   "Test that predicate returns correct results."
-  ;; This test requires msgpack to be available
-  (skip-unless (require 'msgpack nil t))
+  ;; This test requires messagepack to be available
+  (skip-unless (require 'messagepack nil t))
   (tramp-rpc-autoload-test--clean-environment)
   (tramp-rpc-autoload-test--generate-autoloads)
   (add-to-list 'load-path tramp-rpc-autoload-test--lisp-dir)
