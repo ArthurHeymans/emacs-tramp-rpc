@@ -97,7 +97,7 @@ fn get_file_attributes_at(
             };
             if len >= 0 {
                 buf.truncate(len as usize);
-                Some(String::from_utf8_lossy(&buf).to_string())
+                Some(buf)
             } else {
                 None
             }

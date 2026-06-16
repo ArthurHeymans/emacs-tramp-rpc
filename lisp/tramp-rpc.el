@@ -407,12 +407,8 @@ MessagePack `str' fields, which `messagepack.el' already decodes as text."
 (defun tramp-rpc--extract-file-read-content (rpc-result)
   "Extract and optionally decompress content from FILE.READ RPC-RESULT.
 Signals `remote-file-error' on compressed payload decode failures."
-  (let ((content (tramp-rpc--binary-bytes
-                  (if (or (stringp rpc-result) (messagepack-bin-p rpc-result))
-                      rpc-result
-                    (alist-get 'content rpc-result)))))
-    (if (and (not (or (stringp rpc-result) (messagepack-bin-p rpc-result)))
-             (eq (alist-get 'compressed rpc-result) t))
+  (let ((content (tramp-rpc--binary-bytes (alist-get 'content rpc-result))))
+    (if (eq (alist-get 'compressed rpc-result) t)
         (let ((compression (or (alist-get 'compression rpc-result) "zlib")))
           (cond
            ((and (string= compression "zlib")
@@ -3801,10 +3797,12 @@ DIRECTORY is the remote directory passed by `file-notify-add-watch'."
         ;; worktree/cache watch may already exist.
         (let* ((result (unless preexisting
                          (tramp-rpc--call v "watch.add"
-                                          `((path . ,localname)
-                                            (recursive . ,messagepack-false)))))
+                                          (append
+                                           (tramp-rpc--encode-path localname)
+                                           `((recursive . ,messagepack-false))))))
                (canonical-localname (and (listp result)
-                                         (alist-get 'path result)))
+                                         (tramp-rpc--decode-string
+                                          (alist-get 'path result))))
                (canonical-directory (cond
                                      ((stringp canonical-localname)
                                       (tramp-make-tramp-file-name

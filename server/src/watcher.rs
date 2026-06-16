@@ -10,13 +10,15 @@ use notify::event::{ModifyKind, RemoveKind};
 use notify::{Config, Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 use rmpv::Value;
 use std::collections::{HashMap, HashSet};
+use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
 use tokio::io::AsyncWriteExt;
 use tokio::sync::mpsc;
 use tokio::time::{self, Duration};
 
-use crate::protocol::from_value;
+use crate::handlers::file::bytes_to_path;
+use crate::protocol::{from_value, path_or_bytes};
 
 /// Duration to debounce filesystem events before sending a notification.
 /// During bulk operations (e.g. git checkout), many events fire in rapid
@@ -650,7 +652,7 @@ async fn send_notification(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let paths_value: Vec<Value> = paths
         .iter()
-        .map(|p| Value::String(p.to_string_lossy().into_owned().into()))
+        .map(|p| Value::Binary(p.as_os_str().as_bytes().to_vec()))
         .collect();
 
     let notification = Notification::new(
@@ -682,7 +684,8 @@ use crate::handlers::HandlerResult;
 pub fn handle_add(params: Value) -> HandlerResult {
     #[derive(serde::Deserialize)]
     struct Params {
-        path: String,
+        #[serde(with = "path_or_bytes")]
+        path: Vec<u8>,
         #[serde(default = "default_recursive")]
         recursive: bool,
     }
@@ -692,16 +695,16 @@ pub fn handle_add(params: Value) -> HandlerResult {
 
     let params: Params = from_value(params).map_err(|e| RpcError::invalid_params(e.to_string()))?;
 
-    let expanded = crate::handlers::expand_tilde(&params.path);
+    let path = bytes_to_path(&params.path);
 
     let manager = get().ok_or_else(|| RpcError::internal_error("File watcher not available"))?;
 
     let canonical = manager
-        .watch(Path::new(&expanded), params.recursive)
+        .watch(&path, params.recursive)
         .map_err(|e| RpcError::internal_error(format!("Failed to watch: {}", e)))?;
 
     Ok(msgpack_map! {
-        "path" => canonical.to_string_lossy().into_owned(),
+        "path" => Value::Binary(canonical.as_os_str().as_bytes().to_vec()),
         "recursive" => Value::Boolean(params.recursive)
     })
 }
@@ -712,17 +715,18 @@ pub fn handle_add(params: Value) -> HandlerResult {
 pub fn handle_remove(params: Value) -> HandlerResult {
     #[derive(serde::Deserialize)]
     struct Params {
-        path: String,
+        #[serde(with = "path_or_bytes")]
+        path: Vec<u8>,
     }
 
     let params: Params = from_value(params).map_err(|e| RpcError::invalid_params(e.to_string()))?;
 
-    let expanded = crate::handlers::expand_tilde(&params.path);
+    let path = bytes_to_path(&params.path);
 
     let manager = get().ok_or_else(|| RpcError::internal_error("File watcher not available"))?;
 
     manager
-        .unwatch(Path::new(&expanded))
+        .unwatch(&path)
         .map_err(|e| RpcError::internal_error(format!("Failed to unwatch: {}", e)))?;
 
     Ok(Value::Boolean(true))
@@ -739,7 +743,7 @@ pub fn handle_list(_params: Value) -> HandlerResult {
         .into_iter()
         .map(|(path, recursive)| {
             msgpack_map! {
-                "path" => path.to_string_lossy().into_owned(),
+                "path" => Value::Binary(path.as_os_str().as_bytes().to_vec()),
                 "recursive" => Value::Boolean(recursive)
             }
         })

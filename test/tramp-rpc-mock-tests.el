@@ -811,7 +811,9 @@ This matches the behavior expected by `tramp-test28-process-file'."
                     ((symbol-function 'tramp-rpc--file-notify-dispatch)
                      (lambda (path) (push path dispatches))))
             (tramp-rpc--handle-notification
-             proc "fs.changed" '((paths . ("/tmp/changed"))))
+             proc "fs.changed"
+             `((paths . (,(messagepack-bin-make
+                           (encode-coding-string "/tmp/changed" 'utf-8-unix))))))
             (should (= status-clears 0))
             (should-not invalidations)
             (should (equal dispatches '("/rpc:mock:/tmp/changed")))))
@@ -877,7 +879,8 @@ This matches the behavior expected by `tramp-test28-process-file'."
     (cl-letf (((symbol-function 'tramp-rpc--call)
                (lambda (_vec method _params)
                  (when (equal method "watch.add")
-                   '((path . "/tmp/real/")))))
+                   `((path . ,(messagepack-bin-make
+                               (encode-coding-string "/tmp/real/" 'utf-8-unix)))))))
               ((symbol-function 'insert-special-event)
                (lambda (event) (push event events))))
       (setq descriptor
@@ -1452,7 +1455,8 @@ This matches the behavior expected by `tramp-test28-process-file'."
                    (lambda (_vec method _params)
                      (push method calls)
                      (pcase method
-                       ("file.read" '((content . "payload")))
+                       ("file.read" `((content . ,(messagepack-bin-make
+                                                    (encode-coding-string "payload" 'utf-8-unix)))))
                        ("file.delete" t)
                        (_ (error "Unexpected RPC method: %s" method)))))
                   ((symbol-function 'tramp-rpc--invalidate-cache-for-path) #'ignore)
@@ -1474,10 +1478,13 @@ This matches the behavior expected by `tramp-test28-process-file'."
   (let* ((trash-root (make-temp-file "tramp-rpc-trash" t))
          (trash-directory trash-root)
          (stat '((type . "symlink")
-                 (link_target . "../target")
                  (mode . 41471)
                  (mtime . 1700000000)))
          calls)
+    (push (cons 'link_target
+                (messagepack-bin-make
+                 (encode-coding-string "../target" 'utf-8-unix)))
+          stat)
     (unwind-protect
         (cl-letf (((symbol-function 'tramp-rpc--call-file-stat)
                    (lambda (&rest _args) stat))
@@ -1508,8 +1515,9 @@ This matches the behavior expected by `tramp-test28-process-file'."
          (file-stat `((type . "file")
                       (mode . ,(logior #o100000 #o644))
                       (mtime . 1700000000)))
-         (link-stat '((type . "symlink")
-                      (link_target . "a.txt")
+         (link-stat `((type . "symlink")
+                      (link_target . ,(messagepack-bin-make
+                                       (encode-coding-string "a.txt" 'utf-8-unix)))
                       (mode . 41471)
                       (mtime . 1700000000)))
          calls)
@@ -1613,7 +1621,8 @@ This matches the behavior expected by `tramp-test28-process-file'."
                   ((symbol-function 'tramp-rpc--call)
                    (lambda (_vec method _params)
                      (pcase method
-                       ("file.read" '((content . "payload")))
+                       ("file.read" `((content . ,(messagepack-bin-make
+                                                    (encode-coding-string "payload" 'utf-8-unix)))))
                        ("file.delete" (setq remote-delete-called t))
                        (_ (error "Unexpected RPC method: %s" method)))))
                   ((symbol-function 'tramp-rpc--write-local-trash-file)
@@ -1646,7 +1655,8 @@ This matches the behavior expected by `tramp-test28-process-file'."
                   ((symbol-function 'tramp-rpc--call)
                    (lambda (_vec method _params)
                      (pcase method
-                       ("file.read" '((content . "payload")))
+                       ("file.read" `((content . ,(messagepack-bin-make
+                                                    (encode-coding-string "payload" 'utf-8-unix)))))
                        ("file.delete" (signal 'file-error '("remote delete failed")))
                        (_ (error "Unexpected RPC method: %s" method)))))
                   ((symbol-function 'tramp-rpc--fallback-move-file-to-trash)
