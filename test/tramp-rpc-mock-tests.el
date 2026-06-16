@@ -804,7 +804,9 @@ This matches the behavior expected by `tramp-test28-process-file'."
          (watch-key (format "%s:%s" (tramp-rpc--connection-key-string vec) "/tmp/"))
          (other-key (format "%s:%s" (tramp-rpc--connection-key-string other-vec) "/tmp/"))
          (descriptor (cons 'tramp-rpc-file-notify 1001))
-         (other-descriptor (cons 'tramp-rpc-file-notify 1002)))
+         (other-descriptor (cons 'tramp-rpc-file-notify 1002))
+         (stopped-events nil)
+         (other-stopped-events nil))
     (unwind-protect
         (progn
           (puthash descriptor (list :watch-key watch-key :directory "/rpc:mock:/tmp/")
@@ -813,13 +815,24 @@ This matches the behavior expected by `tramp-test28-process-file'."
                    tramp-rpc--file-notify-descriptors)
           (puthash watch-key '(:count 1 :owned t) tramp-rpc--file-notify-watch-counts)
           (puthash other-key '(:count 1 :owned t) tramp-rpc--file-notify-watch-counts)
-          (puthash descriptor 'dummy file-notify-descriptors)
-          (puthash other-descriptor 'dummy file-notify-descriptors)
+          (puthash descriptor
+                   (file-notify--watch-make
+                    "/rpc:mock:/tmp/" nil
+                    (lambda (event) (push event stopped-events)))
+                   file-notify-descriptors)
+          (puthash other-descriptor
+                   (file-notify--watch-make
+                    "/rpc:other:/tmp/" nil
+                    (lambda (event) (push event other-stopped-events)))
+                   file-notify-descriptors)
           (tramp-rpc--cleanup-file-notify-for-connection vec)
           (should-not (gethash descriptor tramp-rpc--file-notify-descriptors))
           (should-not (gethash watch-key tramp-rpc--file-notify-watch-counts))
           (should-not (gethash descriptor file-notify-descriptors))
           (should-not (tramp-rpc-handle-file-notify-valid-p descriptor))
+          (should (equal stopped-events
+                         `((,descriptor stopped "/rpc:mock:/tmp/"))))
+          (should-not other-stopped-events)
           (should (gethash other-descriptor tramp-rpc--file-notify-descriptors))
           (should (gethash other-key tramp-rpc--file-notify-watch-counts))
           (should (gethash other-descriptor file-notify-descriptors)))
