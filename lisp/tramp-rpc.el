@@ -1761,31 +1761,7 @@ Returns the result or signals an error."
                   (os-errno (tramp-rpc-protocol-error-errno response)))
               (tramp-rpc--debug "ERROR id=%s code=%s msg=%s errno=%s"
                                expected-id code msg os-errno)
-              (cond
-               ((= code tramp-rpc-protocol-error-file-not-found)
-                (signal 'file-missing (list "RPC" "No such file" msg)))
-               ((= code tramp-rpc-protocol-error-permission-denied)
-                (signal 'permission-denied (list "RPC" "Permission denied" msg)))
-               ;; Map OS errno values to appropriate Emacs error symbols.
-               ;; The server includes the raw errno in the error data field.
-               ((eql os-errno 2) ;; ENOENT
-                (signal 'file-missing (list "RPC" "No such file" msg)))
-               ((eql os-errno 17) ;; EEXIST
-                (signal 'file-already-exists (list "RPC" msg)))
-               ((eql os-errno 39) ;; ENOTEMPTY
-                (signal 'file-error (list "RPC" "Directory not empty" msg)))
-               ((eql os-errno 20) ;; ENOTDIR
-                (signal 'file-error (list "RPC" "Not a directory" msg)))
-               ((eql os-errno 21) ;; EISDIR
-                (signal 'file-error (list "RPC" "Is a directory" msg)))
-               ((eql os-errno 40) ;; ELOOP
-                (signal 'file-error (list "RPC" "Too many levels of symbolic links" msg)))
-               ;; All other IO errors also signal file-error so callers
-               ;; can catch them uniformly with condition-case.
-               ((= code tramp-rpc-protocol-error-io)
-                (signal 'remote-file-error (list "RPC" msg)))
-               (t
-                (signal 'remote-file-error (list "RPC error" msg)))))
+              (tramp-rpc--signal-rpc-error "RPC" msg code os-errno))
           (plist-get response :result))))))
 
 (defun tramp-rpc--call-batch (vec requests)
@@ -2655,6 +2631,73 @@ network round-trip."
   "Return file type string from STAT, or nil."
   (and stat (alist-get 'type stat)))
 
+(defun tramp-rpc--batch-error-p (value)
+  "Return non-nil when VALUE is an error object from `tramp-rpc--call-batch'."
+  (and (consp value) (plist-get value :error)))
+
+(defun tramp-rpc--batch-error-errno (error)
+  "Return OS errno from batched RPC ERROR, or nil."
+  (when-let* ((data (plist-get error :data)))
+    (alist-get 'os_errno data)))
+
+(defun tramp-rpc--error-args (operation detail message filename)
+  "Build signal args for OPERATION, DETAIL, MESSAGE, and optional FILENAME."
+  (cond
+   ((and filename detail) (list operation detail filename message))
+   (filename (list operation filename message))
+   (detail (list operation detail message))
+   (t (list operation message))))
+
+(defun tramp-rpc--signal-rpc-error (operation message code os-errno &optional filename)
+  "Signal RPC error CODE/OS-ERRNO for OPERATION and optional FILENAME."
+  (cond
+   ((= code tramp-rpc-protocol-error-file-not-found)
+    (signal 'file-missing
+            (tramp-rpc--error-args operation "No such file" message filename)))
+   ((= code tramp-rpc-protocol-error-permission-denied)
+    (signal 'permission-denied
+            (tramp-rpc--error-args operation "Permission denied" message filename)))
+   ((eql os-errno 2) ; ENOENT
+    (signal 'file-missing
+            (tramp-rpc--error-args operation "No such file" message filename)))
+   ((eql os-errno 17) ; EEXIST
+    (signal 'file-already-exists
+            (tramp-rpc--error-args operation nil message filename)))
+   ((eql os-errno 39) ; ENOTEMPTY
+    (signal 'file-error
+            (tramp-rpc--error-args operation "Directory not empty" message filename)))
+   ((eql os-errno 20) ; ENOTDIR
+    (signal 'file-error
+            (tramp-rpc--error-args operation "Not a directory" message filename)))
+   ((eql os-errno 21) ; EISDIR
+    (signal 'file-error
+            (tramp-rpc--error-args operation "Is a directory" message filename)))
+   ((eql os-errno 40) ; ELOOP
+    (signal 'file-error
+            (tramp-rpc--error-args
+             operation "Too many levels of symbolic links" message filename)))
+   ((= code tramp-rpc-protocol-error-io)
+    (signal 'remote-file-error
+            (tramp-rpc--error-args operation nil message filename)))
+   (t
+    (signal 'remote-file-error
+            (tramp-rpc--error-args operation nil message filename)))))
+
+(defun tramp-rpc--signal-batch-error (operation filename error)
+  "Signal ERROR returned by a batched RPC for OPERATION on FILENAME."
+  (tramp-rpc--signal-rpc-error
+   operation
+   (or (plist-get error :message) "RPC batch subrequest failed")
+   (plist-get error :error)
+   (tramp-rpc--batch-error-errno error)
+   filename))
+
+(defun tramp-rpc--batch-result-or-signal (operation filename result)
+  "Return batched RESULT, or signal its embedded error for FILENAME."
+  (if (tramp-rpc--batch-error-p result)
+      (tramp-rpc--signal-batch-error operation filename result)
+    result))
+
 (cl-defun tramp-rpc--copy-file-same-remote
     (filename newname ok-if-already-exists keep-time preserve-permissions)
   "Copy FILENAME to NEWNAME on one TRAMP-RPC remote with fewer round-trips."
@@ -2666,8 +2709,10 @@ network round-trip."
                                                 '((lstat . t))))
                        ("file.stat" . ,(append (tramp-rpc--encode-path v2-localname)
                                                 '((lstat . t)))))))
-             (source-stat (nth 0 stats))
-             (dest-stat (nth 1 stats))
+             (source-stat (tramp-rpc--batch-result-or-signal
+                           "file.stat" filename (nth 0 stats)))
+             (dest-stat (tramp-rpc--batch-result-or-signal
+                         "file.stat" newname (nth 1 stats)))
              (source-type (tramp-rpc--stat-type source-stat))
              (dest-type (tramp-rpc--stat-type dest-stat)))
         (unless source-stat
@@ -2706,6 +2751,128 @@ network round-trip."
         (tramp-flush-file-properties v2 v2-localname)
         (tramp-flush-directory-properties v2 v2-localname)
         (tramp-rpc--invalidate-cache-for-path newname)))))
+
+(cl-defun tramp-rpc-handle-copy-directory
+    (dirname newname &optional keep-date parents copy-contents)
+  "Like `copy-directory' for TRAMP-RPC files.
+
+For same-remote whole-directory copies, use the server-side recursive
+`file.copy' operation.  That keeps the number of RPC round-trips constant
+instead of walking the tree from Emacs and issuing one RPC per entry.  Fall
+back to the generic TRAMP handler for cross-remote copies, `copy-contents',
+and keep-date copies whose directory timestamp semantics must match Emacs
+exactly."
+  (setq dirname (expand-file-name dirname)
+        newname (expand-file-name newname))
+  (if (and (not copy-contents)
+           (not keep-date)
+           (tramp-tramp-file-p dirname)
+           (tramp-tramp-file-p newname)
+           (tramp-equal-remote dirname newname))
+      (with-parsed-tramp-file-name dirname v1
+        (with-parsed-tramp-file-name newname v2
+          (let* ((src-localname (file-name-unquote v1-localname))
+                 (dest-localname (file-name-unquote v2-localname))
+                 ;; Match `copy-directory': a directory-name NEWNAME means
+                 ;; copy into NEWNAME under DIRECTORY's basename; otherwise
+                 ;; NEWNAME is the exact destination directory.
+                 (actual-dest-localname
+                  (if (directory-name-p newname)
+                      (expand-file-name
+                       (file-name-nondirectory (directory-file-name src-localname))
+                       dest-localname)
+                    dest-localname))
+                 (actual-dest
+                  (tramp-make-tramp-file-name
+                   v2 (file-name-quote actual-dest-localname)))
+                 (parent-localname
+                  (file-name-directory (directory-file-name actual-dest-localname)))
+                 (parent
+                  (tramp-make-tramp-file-name v2 (file-name-quote parent-localname)))
+                 (stats (tramp-rpc--call-batch
+                         v1
+                         `(("file.stat" . ,(append (tramp-rpc--encode-path src-localname)
+                                                    '((lstat . t))))
+                           ("file.stat" . ,(tramp-rpc--encode-path src-localname))
+                           ("file.stat" . ,(append (tramp-rpc--encode-path actual-dest-localname)
+                                                    '((lstat . t))))
+                           ("file.stat" . ,(tramp-rpc--encode-path actual-dest-localname))
+                           ("file.stat" . ,(tramp-rpc--encode-path parent-localname)))))
+                 (source-lstat (tramp-rpc--batch-result-or-signal
+                                "file.stat" dirname (nth 0 stats)))
+                 ;; Keep following-stat results raw until after the
+                 ;; `copy-directory-create-symlink' branch.  Emacs copies a
+                 ;; source symlink as a symlink without following it, so a
+                 ;; dangling or looping symlink target must not make the fast
+                 ;; path fail before `make-symbolic-link' runs.
+                 (source-stat-result (nth 1 stats))
+                 (actual-dest-lstat-result (nth 2 stats))
+                 (actual-dest-stat-result (nth 3 stats))
+                 (parent-stat-result (nth 4 stats))
+                 (source-lstat-type (tramp-rpc--stat-type source-lstat)))
+            (if (and copy-directory-create-symlink
+                     (equal source-lstat-type "symlink"))
+                (make-symbolic-link
+                 (tramp-rpc--decode-string (alist-get 'link_target source-lstat))
+                 (tramp-make-tramp-file-name
+                  v2 (file-name-quote actual-dest-localname))
+                 t)
+              (let* ((source-stat (tramp-rpc--batch-result-or-signal
+                                    "file.stat" dirname source-stat-result))
+                     (actual-dest-lstat
+                      (tramp-rpc--batch-result-or-signal
+                       "file.stat" actual-dest actual-dest-lstat-result))
+                     (actual-dest-stat
+                      (tramp-rpc--batch-result-or-signal
+                       "file.stat" actual-dest actual-dest-stat-result))
+                     (parent-stat (tramp-rpc--batch-result-or-signal
+                                   "file.stat" parent parent-stat-result))
+                     (source-type (tramp-rpc--stat-type source-stat))
+                     (actual-dest-type (tramp-rpc--stat-type actual-dest-stat))
+                     (parent-type (tramp-rpc--stat-type parent-stat)))
+                (unless source-stat
+                  (signal 'file-missing (list "Opening input file" "No such file" dirname)))
+                (unless (equal source-type "directory")
+                  (signal 'file-error (list "Not a directory" dirname)))
+                ;; `copy-directory' allows an already existing destination
+                ;; directory when NEWNAME is a directory name, and also when
+                ;; PARENTS is non-nil (because `make-directory' with PARENTS
+                ;; accepts existing directories).  In all other cases, existing
+                ;; destination entries are errors.  Directory checks follow
+                ;; symlinks, so a symlink to a directory is accepted like TRAMP's
+                ;; generic handler accepts it.
+                (when (and actual-dest-lstat
+                           (not (equal actual-dest-type "directory")))
+                  (signal 'file-already-exists
+                          (list actual-dest)))
+                (when (and actual-dest-stat
+                           (not (directory-name-p newname))
+                           (not parents))
+                  (signal 'file-already-exists (list actual-dest)))
+                (when (and (not actual-dest-stat)
+                           (not parents))
+                  (unless parent-stat
+                    (signal 'file-missing
+                            (list "Creating directory" "No such file or directory"
+                                  actual-dest)))
+                  (unless (equal parent-type "directory")
+                    (signal 'file-error (list "Not a directory" parent))))
+                (tramp-rpc--call v1 "file.copy"
+                                 `((src . ,(tramp-rpc--path-to-bytes src-localname))
+                                   (dest . ,(tramp-rpc--path-to-bytes actual-dest-localname))
+                                   (preserve_permissions . t)
+                                   (preserve_times . :msgpack-false)
+                                   (overwrite . t)
+                                   (exact_dest . t)
+                                   (merge_existing_directories . ,(if parents
+                                                                      t :msgpack-false))))))
+            (tramp-flush-file-properties v1 v1-localname)
+            (tramp-flush-file-properties v2 actual-dest-localname)
+            (tramp-flush-directory-properties v2 parent-localname)
+            (tramp-rpc--invalidate-cache-for-path dirname)
+            (tramp-rpc--invalidate-cache-for-path
+             (tramp-make-tramp-file-name v2 (file-name-quote actual-dest-localname))))))
+    (tramp-handle-copy-directory dirname newname keep-date parents copy-contents)))
 
 (cl-defun tramp-rpc-handle-copy-file
     (filename newname &optional ok-if-already-exists keep-time
@@ -2747,18 +2914,6 @@ network round-trip."
       (make-symbolic-link
        (file-symlink-p filename) newname ok-if-already-exists))
 
-     ;; Both on same remote host using RPC - use server-side copy
-     ((and source-remote dest-remote
-           (tramp-equal-remote filename newname))
-      (with-parsed-tramp-file-name filename v1
-        (with-parsed-tramp-file-name newname v2
-          (tramp-rpc--call v1 "file.copy"
-                           `((src . ,(tramp-rpc--path-to-bin
-                                      (file-name-unquote v1-localname)))
-                             (dest . ,(tramp-rpc--path-to-bin
-                                       (file-name-unquote v2-localname)))
-                             (preserve . ,(if (or keep-time preserve-permissions) t :msgpack-false))
-                             (overwrite . ,(if ok-if-already-exists t :msgpack-false)))))))
      ;; Remote source, local dest - read via RPC, write locally
      ((and source-remote (not dest-remote))
       ;; Use file-local-copy to get a temp local copy, then rename
@@ -2932,15 +3087,6 @@ as a no-op, so ignore the server's ENOENT mapping as well."
        (tramp-rpc--debug "delete-file ignored missing %s: %s"
                          filename (error-message-string err)))))
   (tramp-rpc--invalidate-cache-for-path filename))
-
-(defun tramp-rpc--batch-error-p (value)
-  "Return non-nil when VALUE is an error object from `tramp-rpc--call-batch'."
-  (and (consp value) (plist-get value :error)))
-
-(defun tramp-rpc--signal-batch-error (operation filename error)
-  "Signal ERROR returned by a batched RPC for OPERATION on FILENAME."
-  (let ((message (or (plist-get error :message) "RPC batch subrequest failed")))
-    (signal 'remote-file-error (list operation filename message))))
 
 (defconst tramp-rpc--trash-read-batch-size 16
   "Maximum regular files to read in one optimized trash batch.")
@@ -4450,7 +4596,7 @@ Also controls process exit detection latency."
     (make-directory . tramp-rpc-handle-make-directory)
     (delete-directory . tramp-rpc-handle-delete-directory)
     (insert-directory . tramp-handle-insert-directory)
-    (copy-directory . tramp-handle-copy-directory)
+    (copy-directory . tramp-rpc-handle-copy-directory)
 
     ;; =========================================================================
     ;; RPC-based file I/O operations

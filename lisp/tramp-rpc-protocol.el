@@ -173,7 +173,8 @@ Returns a list where each element is either:
     (mapcar (lambda (result-obj)
               (if-let* ((error-obj (alist-get 'error result-obj)))
                   (list :error (alist-get 'code error-obj)
-                        :message (alist-get 'message error-obj))
+                        :message (alist-get 'message error-obj)
+                        :data (alist-get 'data error-obj))
                 (alist-get 'result result-obj)))
             results-array)))
 
