@@ -428,10 +428,12 @@ async fn apply_copied_metadata(
             use std::os::unix::fs::MetadataExt;
 
             let atime = src_meta.atime();
+            let atime_nsec = src_meta.atime_nsec();
             let mtime = src_meta.mtime();
+            let mtime_nsec = src_meta.mtime_nsec();
             let dest = dest.to_path_buf();
             tokio::task::spawn_blocking(move || {
-                set_file_times_sync_path_io(&dest, atime, mtime, false)
+                set_file_times_sync_path_io(&dest, atime, atime_nsec, mtime, mtime_nsec, false)
             })
             .await
             .map_err(std::io::Error::other)??;
@@ -558,10 +560,12 @@ pub async fn set_times(params: Value) -> HandlerResult {
     let nofollow = params.nofollow;
 
     // Use spawn_blocking for the libc syscall
-    tokio::task::spawn_blocking(move || set_file_times_sync_path_io(&path, atime, mtime, nofollow))
-        .await
-        .map_err(|e| RpcError::internal_error(e.to_string()))?
-        .map_err(|e| map_io_error(e, &path_str))?;
+    tokio::task::spawn_blocking(move || {
+        set_file_times_sync_path_io(&path, atime, 0, mtime, 0, nofollow)
+    })
+    .await
+    .map_err(|e| RpcError::internal_error(e.to_string()))?
+    .map_err(|e| map_io_error(e, &path_str))?;
 
     Ok(Value::Boolean(true))
 }
@@ -680,7 +684,9 @@ pub async fn chown(params: Value) -> HandlerResult {
 fn set_file_times_sync_path_io(
     path: &Path,
     atime: i64,
+    atime_nsec: i64,
     mtime: i64,
+    mtime_nsec: i64,
     nofollow: bool,
 ) -> std::io::Result<()> {
     use std::os::unix::ffi::OsStrExt;
@@ -692,11 +698,11 @@ fn set_file_times_sync_path_io(
     let times = [
         libc::timespec {
             tv_sec: atime as _,
-            tv_nsec: 0,
+            tv_nsec: atime_nsec as _,
         },
         libc::timespec {
             tv_sec: mtime as _,
-            tv_nsec: 0,
+            tv_nsec: mtime_nsec as _,
         },
     ];
 
@@ -725,6 +731,7 @@ mod tests {
     use super::*;
     use rmpv::Value;
     use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::fs::MetadataExt;
 
     fn path_value(path: &Path) -> Value {
         Value::Binary(path.as_os_str().as_bytes().to_vec())
@@ -835,6 +842,51 @@ mod tests {
             !dest.join("src").exists(),
             "exact_dest must not append basename"
         );
+    }
+
+    #[tokio::test]
+    async fn copy_directory_preserves_file_and_directory_times() {
+        let tmp = tempfile::tempdir().expect("create tempdir");
+        let src = tmp.path().join("src");
+        let child = src.join("child");
+        let file = child.join("file.txt");
+        let dest = tmp.path().join("dest");
+
+        fs::create_dir_all(&child).await.unwrap();
+        fs::write(&file, b"payload").await.unwrap();
+
+        let src_time = 1_600_000_001;
+        let child_time = 1_600_000_002;
+        let file_time = 1_600_000_003;
+        let src_nsec = 101_000_001;
+        let child_nsec = 102_000_002;
+        let file_nsec = 103_000_003;
+        set_file_times_sync_path_io(&file, file_time, file_nsec, file_time, file_nsec, false)
+            .unwrap();
+        set_file_times_sync_path_io(
+            &child, child_time, child_nsec, child_time, child_nsec, false,
+        )
+        .unwrap();
+        set_file_times_sync_path_io(&src, src_time, src_nsec, src_time, src_nsec, false).unwrap();
+
+        copy(msgpack_map! {
+            "src" => path_value(&src),
+            "dest" => path_value(&dest),
+            "exact_dest" => true,
+            "preserve_times" => true,
+        })
+        .await
+        .expect("copy should preserve times");
+
+        let dest_meta = fs::metadata(&dest).await.unwrap();
+        assert_eq!(dest_meta.mtime(), src_time);
+        assert_eq!(dest_meta.mtime_nsec(), src_nsec);
+        let child_meta = fs::metadata(dest.join("child")).await.unwrap();
+        assert_eq!(child_meta.mtime(), child_time);
+        assert_eq!(child_meta.mtime_nsec(), child_nsec);
+        let file_meta = fs::metadata(dest.join("child/file.txt")).await.unwrap();
+        assert_eq!(file_meta.mtime(), file_time);
+        assert_eq!(file_meta.mtime_nsec(), file_nsec);
     }
 
     #[tokio::test]
