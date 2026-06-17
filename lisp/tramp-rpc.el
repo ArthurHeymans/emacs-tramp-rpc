@@ -2756,17 +2756,14 @@ network round-trip."
     (dirname newname &optional keep-date parents copy-contents)
   "Like `copy-directory' for TRAMP-RPC files.
 
-For same-remote whole-directory copies, use the server-side recursive
-`file.copy' operation.  That keeps the number of RPC round-trips constant
-instead of walking the tree from Emacs and issuing one RPC per entry.  Fall
-back to the generic TRAMP handler for cross-remote copies, `copy-contents',
-and keep-date copies whose directory timestamp semantics must match Emacs
-exactly."
+For same-remote directory copies, use the server-side recursive `file.copy'
+operation.  That keeps the number of RPC round-trips constant instead of
+walking the tree from Emacs and issuing one RPC per entry.  Lisp computes the
+Emacs/TRAMP destination and policy details; the server only receives primitive
+copy options.  Fall back to the generic TRAMP handler for cross-remote copies."
   (setq dirname (expand-file-name dirname)
         newname (expand-file-name newname))
-  (if (and (not copy-contents)
-           (not keep-date)
-           (tramp-tramp-file-p dirname)
+  (if (and (tramp-tramp-file-p dirname)
            (tramp-tramp-file-p newname)
            (tramp-equal-remote dirname newname))
       (with-parsed-tramp-file-name dirname v1
@@ -2774,9 +2771,21 @@ exactly."
           (let* ((src-localname (file-name-unquote v1-localname))
                  (dest-localname (file-name-unquote v2-localname))
                  ;; Match `copy-directory': a directory-name NEWNAME means
-                 ;; copy into NEWNAME under DIRECTORY's basename; otherwise
-                 ;; NEWNAME is the exact destination directory.
+                 ;; copy into NEWNAME under DIRECTORY's basename, unless
+                 ;; COPY-CONTENTS requests copying DIRECTORY's entries directly
+                 ;; into NEWNAME.  Otherwise NEWNAME is the exact destination
+                 ;; directory.
                  (actual-dest-localname
+                  (if (and (directory-name-p newname)
+                           (not copy-contents))
+                      (expand-file-name
+                       (file-name-nondirectory (directory-file-name src-localname))
+                       dest-localname)
+                    dest-localname))
+                 ;; The source-symlink special case in `copy-directory' ignores
+                 ;; COPY-CONTENTS: a directory-name NEWNAME still receives a
+                 ;; symlink named after DIRECTORY.
+                 (symlink-dest-localname
                   (if (directory-name-p newname)
                       (expand-file-name
                        (file-name-nondirectory (directory-file-name src-localname))
@@ -2785,6 +2794,9 @@ exactly."
                  (actual-dest
                   (tramp-make-tramp-file-name
                    v2 (file-name-quote actual-dest-localname)))
+                 (symlink-dest
+                  (tramp-make-tramp-file-name
+                   v2 (file-name-quote symlink-dest-localname)))
                  (parent-localname
                   (file-name-directory (directory-file-name actual-dest-localname)))
                  (parent
@@ -2814,8 +2826,7 @@ exactly."
                      (equal source-lstat-type "symlink"))
                 (make-symbolic-link
                  (tramp-rpc--decode-string (alist-get 'link_target source-lstat))
-                 (tramp-make-tramp-file-name
-                  v2 (file-name-quote actual-dest-localname))
+                 symlink-dest
                  t)
               (let* ((source-stat (tramp-rpc--batch-result-or-signal
                                     "file.stat" dirname source-stat-result))
@@ -2861,17 +2872,31 @@ exactly."
                                  `((src . ,(tramp-rpc--path-to-bytes src-localname))
                                    (dest . ,(tramp-rpc--path-to-bytes actual-dest-localname))
                                    (preserve_permissions . t)
-                                   (preserve_times . :msgpack-false)
+                                   (preserve_times . ,(if keep-date t :msgpack-false))
                                    (overwrite . t)
                                    (exact_dest . t)
                                    (merge_existing_directories . ,(if parents
                                                                       t :msgpack-false))))))
             (tramp-flush-file-properties v1 v1-localname)
-            (tramp-flush-file-properties v2 actual-dest-localname)
-            (tramp-flush-directory-properties v2 parent-localname)
-            (tramp-rpc--invalidate-cache-for-path dirname)
-            (tramp-rpc--invalidate-cache-for-path
-             (tramp-make-tramp-file-name v2 (file-name-quote actual-dest-localname))))))
+            (let* ((copied-localname
+                    (if (and copy-directory-create-symlink
+                             (equal source-lstat-type "symlink"))
+                        symlink-dest-localname
+                      actual-dest-localname))
+                   (copied-parent-localname
+                    (file-name-directory (directory-file-name copied-localname))))
+              (tramp-flush-file-properties v2 copied-localname)
+              ;; Flush both the copied directory and its parent.  For
+              ;; COPY-CONTENTS, COPIED-LOCALNAME is the destination whose
+              ;; listing has changed; for whole-directory copies the parent
+              ;; listing has changed, and flushing the copied directory is
+              ;; harmless and clears any stale attributes created during
+              ;; preflight.
+              (tramp-flush-directory-properties v2 copied-localname)
+              (tramp-flush-directory-properties v2 copied-parent-localname)
+              (tramp-rpc--invalidate-cache-for-path dirname)
+              (tramp-rpc--invalidate-cache-for-path
+               (tramp-make-tramp-file-name v2 (file-name-quote copied-localname)))))))
     (tramp-handle-copy-directory dirname newname keep-date parents copy-contents)))
 
 (cl-defun tramp-rpc-handle-copy-file
