@@ -418,10 +418,30 @@ ENCODING).  When DECODING or ENCODING is nil inside a cons, it is
 replaced with the corresponding default from
 `default-process-coding-system', matching how native `make-process'
 handles nil :coding elements."
-  (if (consp coding)
-      (list (or (car coding) (car default-process-coding-system))
-            (or (cdr coding) (cdr default-process-coding-system)))
-    (list coding coding)))
+  (let ((coding (tramp-rpc--normalize-coding coding)))
+    (if (consp coding)
+        (list (car coding) (cdr coding))
+      (list coding coding))))
+
+(defun tramp-rpc--normalize-coding (coding)
+  "Normalize a `make-process' :coding value for internal use.
+
+CODING may be nil, a coding-system symbol, or a cons cell
+(DECODING . ENCODING).  Nil sides in a cons are replaced with the
+corresponding side of `default-process-coding-system', like native
+`make-process'.  When the resolved decoding and encoding coding systems
+are identical, return the single symbol form.  This preserves native
+semantics while avoiding fragile paths which assume a same-sided coding
+pair is a symbol."
+  (cond
+   ((null coding) nil)
+   ((consp coding)
+    (let ((decoding (or (car coding) (car default-process-coding-system)))
+          (encoding (or (cdr coding) (cdr default-process-coding-system))))
+      (if (eq decoding encoding)
+          decoding
+        (cons decoding encoding))))
+   (t coding)))
 
 ;; ============================================================================
 ;; make-process handler
@@ -441,7 +461,7 @@ Resolves program path and loads direnv environment from working directory."
          ;; Extract the actual buffer from the list.
          (buffer (if (consp buffer-arg) (car buffer-arg) buffer-arg))
          (command (plist-get args :command))
-         (coding (plist-get args :coding))
+         (coding (tramp-rpc--normalize-coding (plist-get args :coding)))
          (noquery (plist-get args :noquery))
          (filter (plist-get args :filter))
          (sentinel (plist-get args :sentinel))
@@ -736,8 +756,9 @@ DIRENV-ENV is an optional alist of environment variables for the process."
          (local-process (make-pipe-process
                          :name (or name "tramp-rpc-pty")
                          :buffer actual-buffer
-                          :coding (or coding 'utf-8-unix)
-                          :noquery t)))
+                         :coding (or (tramp-rpc--normalize-coding coding)
+                                     'utf-8-unix)
+                         :noquery t)))
 
     ;; Configure the local relay process
     (set-process-filter local-process (or filter #'tramp-rpc--pty-default-filter))
