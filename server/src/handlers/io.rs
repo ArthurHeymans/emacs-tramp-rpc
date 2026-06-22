@@ -177,21 +177,38 @@ pub async fn copy(params: Value) -> HandlerResult {
         src: Vec<u8>,
         #[serde(with = "path_or_bytes")]
         dest: Vec<u8>,
-        /// Preserve file attributes
+        /// Preserve file attributes (backward-compatible alias for both
+        /// permissions and timestamps).
         #[serde(default)]
         preserve: bool,
+        /// Preserve permission bits without forcing timestamp preservation.
+        #[serde(default)]
+        preserve_permissions: bool,
+        /// Preserve access and modification times.
+        #[serde(default)]
+        preserve_times: bool,
         /// Overwrite existing destination entries where possible.
         #[serde(default)]
         overwrite: bool,
+        /// Treat `dest` as the exact destination path, even when it names an
+        /// existing directory.  The default keeps the historical `file.copy`
+        /// behavior of copying into an existing destination directory.
+        #[serde(default)]
+        exact_dest: bool,
     }
 
     let params: Params = from_value(params).map_err(|e| RpcError::invalid_params(e.to_string()))?;
+    let options = CopyOptions {
+        preserve_permissions: params.preserve || params.preserve_permissions,
+        preserve_times: params.preserve || params.preserve_times,
+        overwrite: params.overwrite,
+    };
 
     let src_path = bytes_to_path(&params.src);
     let mut dest_path = bytes_to_path(&params.dest);
 
     // If destination is a directory, append the source filename
-    if dest_path.is_dir() {
+    if !params.exact_dest && dest_path.is_dir() {
         if let Some(filename) = src_path.file_name() {
             dest_path.push(filename);
         }
@@ -205,29 +222,21 @@ pub async fn copy(params: Value) -> HandlerResult {
 
     let bytes_copied = if src_metadata.is_dir() {
         // Recursive directory copy
-        copy_dir_recursive(&src_path, &dest_path, params.preserve, params.overwrite)
+        copy_dir_recursive(&src_path, &dest_path, options)
             .await
             .map_err(|e| map_io_error(e, &src_str))?
     } else {
         // Copy regular file (or symlink target)
+        prepare_regular_destination(&dest_path, options.overwrite)
+            .await
+            .map_err(|e| map_io_error(e, &src_str))?;
         let n = fs::copy(&src_path, &dest_path)
             .await
             .map_err(|e| map_io_error(e, &src_str))?;
 
-        // Preserve attributes if requested
-        if params.preserve {
-            let _ = fs::set_permissions(&dest_path, src_metadata.permissions()).await;
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::MetadataExt;
-                let atime = src_metadata.atime();
-                let mtime = src_metadata.mtime();
-                let dest = dest_path.to_string_lossy().into_owned();
-                let _ =
-                    tokio::task::spawn_blocking(move || set_file_times_sync(&dest, atime, mtime))
-                        .await;
-            }
-        }
+        apply_copied_metadata(&src_metadata, &dest_path, options)
+            .await
+            .map_err(|e| map_io_error(e, &src_str))?;
         n
     };
 
@@ -236,21 +245,16 @@ pub async fn copy(params: Value) -> HandlerResult {
     })
 }
 
-/// Recursively copy a directory and its contents.
-async fn copy_dir_recursive(
-    src: &Path,
-    dest: &Path,
-    preserve: bool,
+#[derive(Clone, Copy)]
+struct CopyOptions {
+    preserve_permissions: bool,
+    preserve_times: bool,
     overwrite: bool,
-) -> std::io::Result<u64> {
-    // Create destination directory
-    fs::create_dir_all(dest).await?;
+}
 
-    if preserve {
-        // Copy permissions from source dir
-        let src_meta = fs::metadata(src).await?;
-        let _ = fs::set_permissions(dest, src_meta.permissions()).await;
-    }
+/// Recursively copy a directory and its contents.
+async fn copy_dir_recursive(src: &Path, dest: &Path, options: CopyOptions) -> std::io::Result<u64> {
+    ensure_directory_destination(dest).await?;
 
     let mut total: u64 = 0;
     let mut entries = fs::read_dir(src).await?;
@@ -261,47 +265,105 @@ async fn copy_dir_recursive(
         let file_type = entry.file_type().await?;
 
         if file_type.is_dir() {
-            total += Box::pin(copy_dir_recursive(
-                &entry_path,
-                &dest_child,
-                preserve,
-                overwrite,
-            ))
-            .await?;
+            total += Box::pin(copy_dir_recursive(&entry_path, &dest_child, options)).await?;
         } else if file_type.is_symlink() {
             // Preserve symlinks as symlinks
             let link_target = fs::read_link(&entry_path).await?;
-            if overwrite && fs::symlink_metadata(&dest_child).await.is_ok() {
-                remove_path_for_overwrite(&dest_child).await?;
-            }
+            prepare_symlink_destination(&dest_child, options.overwrite).await?;
             tokio::fs::symlink(&link_target, &dest_child).await?;
         } else {
-            if overwrite && fs::symlink_metadata(&dest_child).await.is_ok() {
-                remove_path_for_overwrite(&dest_child).await?;
-            }
+            prepare_regular_destination(&dest_child, options.overwrite).await?;
             let n = fs::copy(&entry_path, &dest_child).await?;
             total += n;
 
-            if preserve {
-                if let Ok(meta) = fs::metadata(&entry_path).await {
-                    let _ = fs::set_permissions(&dest_child, meta.permissions()).await;
-                    #[cfg(unix)]
-                    {
-                        use std::os::unix::fs::MetadataExt;
-                        let atime = meta.atime();
-                        let mtime = meta.mtime();
-                        let dest_str = dest_child.to_string_lossy().into_owned();
-                        let _ = tokio::task::spawn_blocking(move || {
-                            set_file_times_sync(&dest_str, atime, mtime)
-                        })
-                        .await;
-                    }
-                }
-            }
+            let meta = fs::metadata(&entry_path).await?;
+            apply_copied_metadata(&meta, &dest_child, options).await?;
         }
     }
 
+    let src_meta = fs::metadata(src).await?;
+    apply_copied_metadata(&src_meta, dest, options).await?;
+
     Ok(total)
+}
+
+async fn ensure_directory_destination(path: &Path) -> std::io::Result<()> {
+    match fs::symlink_metadata(path).await {
+        Ok(_) => {
+            if fs::metadata(path)
+                .await
+                .map(|meta| meta.is_dir())
+                .unwrap_or(false)
+            {
+                Ok(())
+            } else {
+                Err(already_exists(path))
+            }
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => fs::create_dir_all(path).await,
+        Err(e) => Err(e),
+    }
+}
+
+async fn prepare_regular_destination(path: &Path, overwrite: bool) -> std::io::Result<()> {
+    if overwrite {
+        return Ok(());
+    }
+
+    match fs::symlink_metadata(path).await {
+        Ok(_) => Err(already_exists(path)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(e),
+    }
+}
+
+async fn prepare_symlink_destination(path: &Path, overwrite: bool) -> std::io::Result<()> {
+    match fs::symlink_metadata(path).await {
+        Ok(meta) => {
+            if !overwrite {
+                return Err(already_exists(path));
+            }
+            if meta.is_dir() && !meta.file_type().is_symlink() {
+                return Err(already_exists(path));
+            }
+            remove_path_for_overwrite(path).await
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(e),
+    }
+}
+
+fn already_exists(path: &Path) -> std::io::Error {
+    std::io::Error::new(
+        std::io::ErrorKind::AlreadyExists,
+        format!("Destination already exists: {}", path.display()),
+    )
+}
+
+async fn apply_copied_metadata(
+    src_meta: &std::fs::Metadata,
+    dest: &Path,
+    options: CopyOptions,
+) -> std::io::Result<()> {
+    if options.preserve_permissions {
+        fs::set_permissions(dest, src_meta.permissions()).await?;
+    }
+
+    if options.preserve_times {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+
+            let atime = src_meta.atime();
+            let mtime = src_meta.mtime();
+            let dest = dest.to_path_buf();
+            tokio::task::spawn_blocking(move || set_file_times_sync_path_io(&dest, atime, mtime))
+                .await
+                .map_err(std::io::Error::other)??;
+        }
+    }
+
+    Ok(())
 }
 
 async fn remove_path_for_overwrite(path: &Path) -> std::io::Result<()> {
@@ -412,13 +474,15 @@ pub async fn set_times(params: Value) -> HandlerResult {
     let params: Params = from_value(params).map_err(|e| RpcError::invalid_params(e.to_string()))?;
 
     let path = bytes_to_path(&params.path);
+    let path_str = path.to_string_lossy().into_owned();
     let atime = params.atime.unwrap_or(params.mtime);
     let mtime = params.mtime;
 
     // Use spawn_blocking for the libc syscall
-    tokio::task::spawn_blocking(move || set_file_times_sync_path(&path, atime, mtime))
+    tokio::task::spawn_blocking(move || set_file_times_sync_path_io(&path, atime, mtime))
         .await
-        .map_err(|e| RpcError::internal_error(e.to_string()))??;
+        .map_err(|e| RpcError::internal_error(e.to_string()))?
+        .map_err(|e| map_io_error(e, &path_str))?;
 
     Ok(Value::Boolean(true))
 }
@@ -534,37 +598,7 @@ pub async fn chown(params: Value) -> HandlerResult {
 // ============================================================================
 
 #[cfg(unix)]
-fn set_file_times_sync(path: &str, atime: i64, mtime: i64) -> Result<(), RpcError> {
-    use std::ffi::CString;
-
-    let path_cstr = CString::new(path).map_err(|_| RpcError::invalid_params("Invalid path"))?;
-
-    let times = [
-        libc::timespec {
-            tv_sec: atime as _,
-            tv_nsec: 0,
-        },
-        libc::timespec {
-            tv_sec: mtime as _,
-            tv_nsec: 0,
-        },
-    ];
-
-    let result = unsafe { libc::utimensat(libc::AT_FDCWD, path_cstr.as_ptr(), times.as_ptr(), 0) };
-
-    if result != 0 {
-        return Err(RpcError::io_error(std::io::Error::last_os_error()));
-    }
-
-    Ok(())
-}
-
-#[cfg(unix)]
-fn set_file_times_sync_path(
-    path: &std::path::Path,
-    atime: i64,
-    mtime: i64,
-) -> Result<(), RpcError> {
+fn set_file_times_sync_path_io(path: &Path, atime: i64, mtime: i64) -> std::io::Result<()> {
     use std::os::unix::ffi::OsStrExt;
 
     let path_bytes = path.as_os_str().as_bytes();
@@ -592,7 +626,7 @@ fn set_file_times_sync_path(
     };
 
     if result != 0 {
-        return Err(RpcError::io_error(std::io::Error::last_os_error()));
+        return Err(std::io::Error::last_os_error());
     }
 
     Ok(())
@@ -685,5 +719,110 @@ mod tests {
         .expect_err("copy should fail without overwrite");
 
         assert!(err.message.contains("File exists") || err.message.contains("exists"));
+    }
+
+    #[tokio::test]
+    async fn copy_directory_exact_dest_merges_existing_directory() {
+        let tmp = tempfile::tempdir().expect("create tempdir");
+        let src = tmp.path().join("src");
+        let dest = tmp.path().join("dest").join("src");
+
+        fs::create_dir_all(&src).await.unwrap();
+        fs::write(src.join("file.txt"), b"new").await.unwrap();
+
+        fs::create_dir_all(&dest).await.unwrap();
+        fs::write(dest.join("file.txt"), b"old").await.unwrap();
+
+        copy(msgpack_map! {
+            "src" => path_value(&src),
+            "dest" => path_value(&dest),
+            "overwrite" => true,
+            "exact_dest" => true,
+        })
+        .await
+        .expect("copy should merge into exact destination");
+
+        assert_eq!(fs::read(dest.join("file.txt")).await.unwrap(), b"new");
+        assert!(
+            !dest.join("src").exists(),
+            "exact_dest must not append basename"
+        );
+    }
+
+    #[tokio::test]
+    async fn copy_regular_file_without_overwrite_rejects_existing_file() {
+        let tmp = tempfile::tempdir().expect("create tempdir");
+        let src = tmp.path().join("src.txt");
+        let dest = tmp.path().join("dest.txt");
+
+        fs::write(&src, b"new").await.unwrap();
+        fs::write(&dest, b"old").await.unwrap();
+
+        let err = copy(msgpack_map! {
+            "src" => path_value(&src),
+            "dest" => path_value(&dest),
+        })
+        .await
+        .expect_err("copy should fail without overwrite");
+
+        assert!(err.message.contains("exists"));
+        assert_eq!(fs::read(&dest).await.unwrap(), b"old");
+    }
+
+    #[tokio::test]
+    async fn copy_directory_sets_permissions_after_children() {
+        let tmp = tempfile::tempdir().expect("create tempdir");
+        let src = tmp.path().join("src");
+        let dest = tmp.path().join("dest");
+
+        fs::create_dir_all(src.join("child")).await.unwrap();
+        fs::write(src.join("child/file.txt"), b"payload")
+            .await
+            .unwrap();
+
+        let readonly = std::fs::Permissions::from_mode(0o555);
+        fs::set_permissions(src.join("child"), readonly.clone())
+            .await
+            .unwrap();
+        fs::set_permissions(&src, readonly).await.unwrap();
+
+        copy(msgpack_map! {
+            "src" => path_value(&src),
+            "dest" => path_value(&dest),
+            "preserve_permissions" => true,
+        })
+        .await
+        .expect("copy should not chmod destination before copying children");
+
+        let copied = dest;
+        assert_eq!(
+            fs::read(copied.join("child/file.txt")).await.unwrap(),
+            b"payload"
+        );
+        assert_eq!(
+            fs::metadata(&copied).await.unwrap().permissions().mode() & 0o777,
+            0o555
+        );
+        assert_eq!(
+            fs::metadata(copied.join("child"))
+                .await
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o555
+        );
+
+        let writable = std::fs::Permissions::from_mode(0o755);
+        fs::set_permissions(&src, writable.clone()).await.unwrap();
+        fs::set_permissions(src.join("child"), writable.clone())
+            .await
+            .unwrap();
+        fs::set_permissions(&copied, writable.clone())
+            .await
+            .unwrap();
+        fs::set_permissions(copied.join("child"), writable)
+            .await
+            .unwrap();
     }
 }

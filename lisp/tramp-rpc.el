@@ -2448,6 +2448,104 @@ network round-trip."
         (tramp-flush-directory-properties v2 v2-localname)
         (tramp-rpc--invalidate-cache-for-path newname)))))
 
+(cl-defun tramp-rpc-handle-copy-directory
+    (dirname newname &optional keep-date parents copy-contents)
+  "Like `copy-directory' for TRAMP-RPC files.
+
+For same-remote whole-directory copies, use the server-side recursive
+`file.copy' operation.  That keeps the number of RPC round-trips constant
+instead of walking the tree from Emacs and issuing one RPC per entry.  Fall
+back to the generic TRAMP handler for cross-remote copies, `copy-contents',
+and keep-date copies whose directory timestamp semantics must match Emacs
+exactly."
+  (setq dirname (expand-file-name dirname)
+        newname (expand-file-name newname))
+  (if (and (not copy-contents)
+           (not keep-date)
+           (tramp-tramp-file-p dirname)
+           (tramp-tramp-file-p newname)
+           (tramp-equal-remote dirname newname))
+      (with-parsed-tramp-file-name dirname v1
+        (with-parsed-tramp-file-name newname v2
+          (let* ((src-localname (file-name-unquote v1-localname))
+                 (dest-localname (file-name-unquote v2-localname))
+                 (actual-dest-localname
+                  (if (directory-name-p newname)
+                      (expand-file-name
+                       (file-name-nondirectory (directory-file-name src-localname))
+                       dest-localname)
+                    dest-localname))
+                 (parent-localname
+                  (file-name-directory (directory-file-name actual-dest-localname)))
+                 (stats (tramp-rpc--call-batch
+                         v1
+                         `(("file.stat" . ,(append (tramp-rpc--encode-path src-localname)
+                                                    '((lstat . t))))
+                           ("file.stat" . ,(tramp-rpc--encode-path src-localname))
+                           ("file.stat" . ,(append (tramp-rpc--encode-path dest-localname)
+                                                    '((lstat . t))))
+                           ("file.stat" . ,(append (tramp-rpc--encode-path actual-dest-localname)
+                                                    '((lstat . t))))
+                           ("file.stat" . ,(tramp-rpc--encode-path actual-dest-localname))
+                           ("file.stat" . ,(append (tramp-rpc--encode-path parent-localname)
+                                                    '((lstat . t)))))))
+                 (source-lstat (nth 0 stats))
+                 (source-stat (nth 1 stats))
+                 (dest-stat (nth 2 stats))
+                 (actual-dest-lstat (nth 3 stats))
+                 (actual-dest-stat (nth 4 stats))
+                 (parent-stat (nth 5 stats))
+                 (source-lstat-type (tramp-rpc--stat-type source-lstat))
+                 (source-type (tramp-rpc--stat-type source-stat))
+                 (dest-type (tramp-rpc--stat-type dest-stat))
+                 (actual-dest-type (tramp-rpc--stat-type actual-dest-stat))
+                 (parent-type (tramp-rpc--stat-type parent-stat)))
+            (unless source-stat
+              (signal 'file-missing (list "Opening input file" "No such file" dirname)))
+            (unless (or (equal source-type "directory")
+                        (and copy-directory-create-symlink
+                             (equal source-lstat-type "symlink")))
+              (signal 'file-error (list "Not a directory" dirname)))
+            (if (and copy-directory-create-symlink
+                     (equal source-lstat-type "symlink"))
+                (make-symbolic-link
+                 (tramp-rpc--decode-string (alist-get 'link_target source-lstat))
+                 (tramp-make-tramp-file-name
+                  v2 (file-name-quote actual-dest-localname))
+                 t)
+              (when (and dest-stat
+                         (or (not (equal dest-type "directory"))
+                             (not (directory-name-p newname))))
+                (signal 'file-already-exists (list newname)))
+              (when (and (directory-name-p newname)
+                         actual-dest-lstat
+                         (not (equal actual-dest-type "directory")))
+                (signal 'file-already-exists
+                        (list (tramp-make-tramp-file-name
+                               v2 (file-name-quote actual-dest-localname)))))
+              (unless parents
+                (unless parent-stat
+                  (signal 'file-missing
+                          (list "Creating directory" "No such file or directory"
+                                (tramp-make-tramp-file-name
+                                 v2 (file-name-quote actual-dest-localname)))))
+                (unless (equal parent-type "directory")
+                  (signal 'file-error (list "Not a directory" parent-localname))))
+              (tramp-rpc--call v1 "file.copy"
+                               `((src . ,(tramp-rpc--path-to-bytes src-localname))
+                                 (dest . ,(tramp-rpc--path-to-bytes actual-dest-localname))
+                                 (preserve_permissions . t)
+                                 (preserve_times . :msgpack-false)
+                                 (overwrite . t)
+                                 (exact_dest . t))))
+            (tramp-flush-file-properties v1 v1-localname)
+            (tramp-flush-file-properties v2 actual-dest-localname)
+            (tramp-flush-directory-properties v2 parent-localname)
+            (tramp-rpc--invalidate-cache-for-path dirname)
+            (tramp-rpc--invalidate-cache-for-path
+             (tramp-make-tramp-file-name v2 (file-name-quote actual-dest-localname))))))
+    (tramp-handle-copy-directory dirname newname keep-date parents copy-contents)))
+
 (cl-defun tramp-rpc-handle-copy-file
     (filename newname &optional ok-if-already-exists keep-time
               preserve-uid-gid preserve-permissions)
@@ -2488,18 +2586,6 @@ network round-trip."
       (make-symbolic-link
        (file-symlink-p filename) newname ok-if-already-exists))
 
-     ;; Both on same remote host using RPC - use server-side copy
-     ((and source-remote dest-remote
-           (tramp-equal-remote filename newname))
-      (with-parsed-tramp-file-name filename v1
-        (with-parsed-tramp-file-name newname v2
-          (tramp-rpc--call v1 "file.copy"
-                           `((src . ,(tramp-rpc--path-to-bytes
-                                      (file-name-unquote v1-localname)))
-                             (dest . ,(tramp-rpc--path-to-bytes
-                                       (file-name-unquote v2-localname)))
-                             (preserve . ,(if (or keep-time preserve-permissions) t :msgpack-false))
-                             (overwrite . ,(if ok-if-already-exists t :msgpack-false)))))))
      ;; Remote source, local dest - read via RPC, write locally
      ((and source-remote (not dest-remote))
       ;; Use file-local-copy to get a temp local copy, then rename
@@ -3962,7 +4048,7 @@ Also controls process exit detection latency."
     (make-directory . tramp-rpc-handle-make-directory)
     (delete-directory . tramp-rpc-handle-delete-directory)
     (insert-directory . tramp-handle-insert-directory)
-    (copy-directory . tramp-handle-copy-directory)
+    (copy-directory . tramp-rpc-handle-copy-directory)
 
     ;; =========================================================================
     ;; RPC-based file I/O operations

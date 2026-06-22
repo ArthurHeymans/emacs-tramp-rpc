@@ -28,12 +28,16 @@ fn extract_stat_fields(stat_buf: &libc::stat) -> (i64, i64, i64, u32) {
     #[cfg(not(target_os = "macos"))]
     let mode = stat_buf.st_mode;
 
-    (
-        stat_buf.st_atime.into(),
-        stat_buf.st_mtime.into(),
-        stat_buf.st_ctime.into(),
-        mode,
-    )
+    #[cfg(target_pointer_width = "64")]
+    let (atime, mtime, ctime) = (stat_buf.st_atime, stat_buf.st_mtime, stat_buf.st_ctime);
+    #[cfg(not(target_pointer_width = "64"))]
+    let (atime, mtime, ctime) = (
+        i64::from(stat_buf.st_atime),
+        i64::from(stat_buf.st_mtime),
+        i64::from(stat_buf.st_ctime),
+    );
+
+    (atime, mtime, ctime, mode)
 }
 
 /// Get FileAttributes using fstatat relative to directory fd
