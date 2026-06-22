@@ -24,7 +24,8 @@ This can include:
 
 # Testing updates
 
-NEVER use emacsclient. That will interfer with the users configuration
+NEVER use emacsclient, unless the user specifically request this to reload the configuration.
+That will interfer with the users configuration
 
 Always use `emacs -Q --batch --eval <lisp commands>`
 
