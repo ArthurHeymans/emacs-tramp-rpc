@@ -168,7 +168,8 @@ Returns a list where each element is either:
 
 (add-hook 'tramp-rpc-unload-hook
 	  (lambda ()
-	    (unload-feature 'tramp-rpc-protocol 'force)))
+	    (when (featurep 'tramp-rpc-protocol)
+	      (unload-feature 'tramp-rpc-protocol 'force))))
 
 (provide 'tramp-rpc-protocol)
 ;;; tramp-rpc-protocol.el ends here
