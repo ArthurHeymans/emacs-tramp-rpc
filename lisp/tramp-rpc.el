@@ -47,6 +47,16 @@
 
 ;;; Code:
 
+(eval-and-compile
+  ;; When loading this file by absolute path during development, make sure the
+  ;; sibling modules required below are loaded from the same checkout rather
+  ;; than from an installed package earlier in `load-path'.
+  (when-let* ((dir (file-name-directory (or load-file-name
+                                            (and (boundp 'byte-compile-current-file)
+                                                 byte-compile-current-file)
+                                            buffer-file-name))))
+    (add-to-list 'load-path dir)))
+
 ;; Autoload support - these forms are extracted to tramp-rpc-autoloads.el
 ;; and run at package-initialize time, before the full file is loaded.
 
@@ -4192,6 +4202,9 @@ cleanup of all connections has run."
 ;; Unload support
 ;; ============================================================================
 
+(defvar tramp-rpc-unload-hook nil
+  "Hook run by `tramp-rpc-unload-function' to unload helper modules.")
+
 (defun tramp-rpc-unload-function ()
   "Unload function for tramp-rpc.
 Removes advice and cleans up async processes."
@@ -4200,16 +4213,17 @@ Removes advice and cleans up async processes."
   (tramp-remove-external-operation 'dir-locals--all-files 'tramp-rpc)
   (tramp-remove-external-operation 'dir-locals-find-file 'tramp-rpc)
   (tramp-remove-external-operation 'move-file-to-trash 'tramp-rpc)
-  ;; Remove all advice (from tramp-rpc-advice module).
-  ;; Not needed. This is called in `tramp-rpc-advice-unload-function'.
+  ;; Unload helper modules.  `tramp-rpc.el' requires these modules, so
+  ;; unloading only the top-level feature and loading it again would otherwise
+  ;; leave stale definitions in place (notably `tramp-rpc-process.el').  Helper
+  ;; unload functions also perform their own cleanup before removing symbols.
+  ;; Helper hook entries are idempotent because unloading one helper can unload
+  ;; another as a dependency before its hook entry is reached.
+  (run-hooks 'tramp-rpc-unload-hook)
   ;; Remove multi-hop hook and cleanup hooks.
   (remove-hook 'tramp-multi-hop-p-hook #'tramp-rpc-multi-hop-p)
   (remove-hook 'tramp-cleanup-connection-hook #'tramp-rpc-cleanup-connection)
   (remove-hook 'tramp-cleanup-all-connections-hook #'tramp-rpc-cleanup-all-connections)
-  ;; Clean up all async processes (from tramp-rpc-process module)
-  (tramp-rpc--cleanup-async-processes)
-  ;; Clean up PTY processes (from tramp-rpc-process module)
-  (tramp-rpc--cleanup-pty-processes)
   ;; Remove method registrations.
   (setq tramp-methods (delete (assoc tramp-rpc-method tramp-methods) tramp-methods))
   (setq tramp-foreign-file-name-handler-alist

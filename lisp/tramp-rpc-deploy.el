@@ -1246,7 +1246,8 @@ This helps troubleshoot deployment issues."
 
 (add-hook 'tramp-rpc-unload-hook
 	  (lambda ()
-	    (unload-feature 'tramp-rpc-deploy 'force)))
+	    (when (featurep 'tramp-rpc-deploy)
+	      (unload-feature 'tramp-rpc-deploy 'force))))
 
 (provide 'tramp-rpc-deploy)
 ;;; tramp-rpc-deploy.el ends here

@@ -828,7 +828,8 @@ Removes handlers."
 
 (add-hook 'tramp-rpc-unload-hook
 	  (lambda ()
-	    (unload-feature 'tramp-rpc-magit 'force)))
+	    (when (featurep 'tramp-rpc-magit)
+	      (unload-feature 'tramp-rpc-magit 'force))))
 
 (provide 'tramp-rpc-magit)
 ;;; tramp-rpc-magit.el ends here

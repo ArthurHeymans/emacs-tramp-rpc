@@ -1129,7 +1129,8 @@ Removes handlers and cleans up async processes."
 
 (add-hook 'tramp-rpc-unload-hook
 	  (lambda ()
-	    (unload-feature 'tramp-rpc-process 'force)))
+	    (when (featurep 'tramp-rpc-process)
+	      (unload-feature 'tramp-rpc-process 'force))))
 
 (provide 'tramp-rpc-process)
 ;;; tramp-rpc-process.el ends here
