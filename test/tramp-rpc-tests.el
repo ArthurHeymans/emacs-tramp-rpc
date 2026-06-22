@@ -1335,9 +1335,18 @@ This matches the upstream `tramp-test28-process-file' test."
 ;;; ============================================================================
 
 (ert-deftest tramp-rpc-test13b-coding-args ()
-  "Test `tramp-rpc--coding-args' handles symbol and cons pair coding."
+  "Test coding helpers handle symbol and cons pair coding."
   (let ((default-dec (car default-process-coding-system))
         (default-enc (cdr default-process-coding-system)))
+    ;; Same-sided cons pair is valid `make-process' input, but can be
+    ;; represented as a symbol internally.
+    (should (eq 'utf-8-unix
+                (tramp-rpc--normalize-coding
+                 '(utf-8-unix . utf-8-unix))))
+    ;; Different sides must remain a cons pair.
+    (should (equal '(undecided-unix . utf-8-unix)
+                   (tramp-rpc--normalize-coding
+                    '(undecided-unix . utf-8-unix))))
     ;; Symbol case: same value used for both decoding and encoding
     (should (equal '(utf-8-unix utf-8-unix)
                    (tramp-rpc--coding-args 'utf-8-unix)))
@@ -1350,6 +1359,41 @@ This matches the upstream `tramp-test28-process-file' test."
     ;; Cons pair with nil encoding: nil replaced with default
     (should (equal (list 'utf-8-unix default-enc)
                    (tramp-rpc--coding-args '(utf-8-unix . nil))))))
+
+(ert-deftest tramp-rpc-test13c-make-process-coding-pair ()
+  "Test `make-process' handler accepts same-sided cons pair :coding values."
+  (let ((default-directory "/rpc:mock:/tmp/")
+        (default-process-coding-system '(utf-8-unix . utf-8-unix))
+        proc)
+    (cl-letf (((symbol-function 'tramp-rpc--start-remote-process)
+               (lambda (&rest _args) 12345))
+              ((symbol-function 'tramp-rpc--start-async-read)
+               (lambda (&rest _args) nil))
+              ((symbol-function 'tramp-rpc--kill-remote-process)
+               (lambda (&rest _args) nil))
+              ((symbol-function 'tramp-rpc--remote-path-environment)
+               (lambda (&rest _args) nil))
+              ((symbol-function 'tramp-rpc--tramp-remote-process-environment)
+               (lambda (&rest _args) nil))
+              ((symbol-function 'tramp-rpc--get-direnv-environment)
+               (lambda (&rest _args) nil))
+              ((symbol-function 'tramp-rpc--caller-environment)
+               (lambda (&rest _args) nil)))
+      (unwind-protect
+          (progn
+            (setq proc (tramp-rpc-handle-make-process
+                        :name "tramp-rpc-coding-pair-test"
+                        :buffer nil
+                        :command '("jj" "workspace" "root")
+                        :connection-type 'pipe
+                        :coding default-process-coding-system
+                        :noquery t
+                        :sentinel #'ignore))
+            (should (processp proc))
+            (should (equal (process-coding-system proc)
+                           '(utf-8-unix . utf-8-unix))))
+        (when (processp proc)
+          (ignore-errors (delete-process proc)))))))
 
 ;;; ============================================================================
 ;;; Test 14: Async Processes
