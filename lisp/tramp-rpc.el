@@ -2665,10 +2665,14 @@ network round-trip."
 
 (defun tramp-rpc-handle-delete-file (filename &optional trash)
   "Like `delete-file' for TRAMP-RPC files.
-Calls `file.delete' directly; the server's unlink error is sufficient for the
-missing-file check, so no separate preflight stat is needed."
+Calls `file.delete' directly.  Current Emacs `delete-file' treats missing files
+as a no-op, so ignore the server's ENOENT mapping as well."
   (tramp-skeleton-delete-file filename trash
-    (tramp-rpc--call v "file.delete" (tramp-rpc--encode-path localname)))
+    (condition-case err
+        (tramp-rpc--call v "file.delete" (tramp-rpc--encode-path localname))
+      (file-missing
+       (tramp-rpc--debug "delete-file ignored missing %s: %s"
+                         filename (error-message-string err)))))
   (tramp-rpc--invalidate-cache-for-path filename))
 
 (defun tramp-rpc--batch-error-p (value)
