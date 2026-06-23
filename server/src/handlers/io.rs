@@ -407,6 +407,9 @@ pub async fn set_times(params: Value) -> HandlerResult {
         /// Access time (seconds since epoch, defaults to mtime)
         #[serde(default)]
         atime: Option<i64>,
+        /// If true, update a symlink itself instead of following it.
+        #[serde(default)]
+        nofollow: bool,
     }
 
     let params: Params = from_value(params).map_err(|e| RpcError::invalid_params(e.to_string()))?;
@@ -414,9 +417,10 @@ pub async fn set_times(params: Value) -> HandlerResult {
     let path = bytes_to_path(&params.path);
     let atime = params.atime.unwrap_or(params.mtime);
     let mtime = params.mtime;
+    let nofollow = params.nofollow;
 
     // Use spawn_blocking for the libc syscall
-    tokio::task::spawn_blocking(move || set_file_times_sync_path(&path, atime, mtime))
+    tokio::task::spawn_blocking(move || set_file_times_sync_path(&path, atime, mtime, nofollow))
         .await
         .map_err(|e| RpcError::internal_error(e.to_string()))??;
 
@@ -564,6 +568,7 @@ fn set_file_times_sync_path(
     path: &std::path::Path,
     atime: i64,
     mtime: i64,
+    nofollow: bool,
 ) -> Result<(), RpcError> {
     use std::os::unix::ffi::OsStrExt;
 
@@ -587,7 +592,11 @@ fn set_file_times_sync_path(
             libc::AT_FDCWD,
             path_cstr.as_ptr() as *const libc::c_char,
             times.as_ptr(),
-            0,
+            if nofollow {
+                libc::AT_SYMLINK_NOFOLLOW
+            } else {
+                0
+            },
         )
     };
 

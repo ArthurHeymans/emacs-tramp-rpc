@@ -193,7 +193,9 @@ PARAMS is the notification parameters."
   "Return EVENT's KEY path as a TRAMP file name on VEC, or nil."
   (when-let* ((path (tramp-rpc--decode-string (alist-get key event)))
               ((stringp path)))
-    (tramp-make-tramp-file-name vec path)))
+    (if (tramp-tramp-file-p path)
+        path
+      (tramp-make-tramp-file-name vec path))))
 
 (defun tramp-rpc--watch-canonical-directory (vec result)
   "Return canonical TRAMP directory from watch.add RESULT on VEC."
@@ -201,7 +203,9 @@ PARAMS is the notification parameters."
                                         (tramp-rpc--decode-string
                                          (alist-get 'path result))))
               ((stringp canonical-localname)))
-    (tramp-make-tramp-file-name vec canonical-localname)))
+    (if (tramp-tramp-file-p canonical-localname)
+        canonical-localname
+      (tramp-make-tramp-file-name vec canonical-localname))))
 
 (defun tramp-rpc--path-under-directory-relative (directory file-name)
   "Return FILE-NAME relative to DIRECTORY, or nil.
@@ -249,25 +253,45 @@ DIRECTORY itself returns the empty string.  Descendants can contain slashes."
         (unless tramp-rpc--suppress-fs-notifications
           ;; Also clear the magit process-file cache since git state may have changed.
           (tramp-rpc-magit--clear-status-cache))
-        (dolist (event events)
-          (let* ((action (alist-get 'action event))
-                 (path (tramp-rpc--fs-event-path vec event 'path))
-                 (path1 (tramp-rpc--fs-event-path vec event 'path1))
-                 (cookie (alist-get 'cookie event)))
-            (when (stringp action)
-              (if (string= action "rescan")
-                  (unless tramp-rpc--suppress-fs-notifications
-                    (tramp-rpc--clear-file-caches-for-connection vec))
-                (when path
-                  ;; File notifications are deliberately not suppressed by
-                  ;; `tramp-rpc--suppress-fs-notifications': that variable only
-                  ;; suppresses cache/status work during operations that
-                  ;; invalidate caches themselves.
-                  (unless tramp-rpc--suppress-fs-notifications
-                    (tramp-rpc--invalidate-event-path path)
-                    (when path1
-                      (tramp-rpc--invalidate-event-path path1)))
-                  (tramp-rpc--file-notify-dispatch action path path1 cookie))))))))))
+        (let (renamed-pairs)
+          ;; Linux/inotify can report the same rename as both a combined pair
+          ;; and as cookie-tracked from/to events in one debounce batch.  Emacs'
+          ;; filenotify tests expect one public `renamed' action, so suppress
+          ;; the from/to half when an equivalent combined event is present.
+          (dolist (event events)
+            (let ((action (alist-get 'action event)))
+              (when (string= action "renamed")
+                (when-let* ((path (tramp-rpc--fs-event-path vec event 'path))
+                            (path1 (tramp-rpc--fs-event-path vec event 'path1)))
+                  (push (cons path path1) renamed-pairs)))))
+          (dolist (event events)
+            (let* ((action (alist-get 'action event))
+                   (path (tramp-rpc--fs-event-path vec event 'path))
+                   (path1 (tramp-rpc--fs-event-path vec event 'path1))
+                   (cookie (alist-get 'cookie event))
+                   (duplicate-tracked-rename
+                    (and (member action '("renamed-from" "renamed-to"))
+                         path
+                         (cl-some
+                          (lambda (pair)
+                            (string= path (if (string= action "renamed-from")
+                                              (car pair)
+                                            (cdr pair))))
+                          renamed-pairs))))
+              (when (and (stringp action) (not duplicate-tracked-rename))
+                (if (string= action "rescan")
+                    (unless tramp-rpc--suppress-fs-notifications
+                      (tramp-rpc--clear-file-caches-for-connection vec))
+                  (when path
+                    ;; File notifications are deliberately not suppressed by
+                    ;; `tramp-rpc--suppress-fs-notifications': that variable only
+                    ;; suppresses cache/status work during operations that
+                    ;; invalidate caches themselves.
+                    (unless tramp-rpc--suppress-fs-notifications
+                      (tramp-rpc--invalidate-event-path path)
+                      (when path1
+                        (tramp-rpc--invalidate-event-path path1)))
+                    (tramp-rpc--file-notify-dispatch action path path1 cookie)))))))))))
 
 (defun tramp-rpc-watch-directory (directory &optional recursive)
   "Start watching DIRECTORY for filesystem changes.
