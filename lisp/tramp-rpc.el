@@ -3683,23 +3683,22 @@ Keys are the same connection/path keys as `tramp-rpc--watched-directories'.")
     (unless (process-get descriptor 'tramp-rpc-file-notify-removing)
       (file-notify-rm-watch descriptor))))
 
-(defun tramp-rpc--make-file-notify-descriptor (vec directory localname)
+(defun tramp-rpc--make-file-notify-descriptor (vec _directory localname)
   "Create a TRAMP-style process descriptor for a file notification watch."
   (let* (;; Emacs' remote file notification tests use the process name to
          ;; identify the remote backend and inject synthetic backend events.
          ;; TRAMP-RPC's server uses the notify crate; on GNU/Linux its behavior
          ;; is closest to TRAMP's inotifywait backend.
          (name "inotifywait")
-         (buffer (generate-new-buffer
-                  (format " *%s file-notify %s*"
-                          (tramp-get-connection-name vec) name)))
+         ;; This synthetic process is only a watch descriptor; it never
+         ;; receives output.  Do not attach a buffer: `global-auto-revert-mode'
+         ;; iterates over `buffer-list' while removing file notification
+         ;; watches, and deleting descriptor buffers during that iteration can
+         ;; make Emacs select a just-deleted buffer.
          (descriptor (make-pipe-process
                       :name name
-                      :buffer buffer
                       :noquery t
                       :sentinel #'tramp-rpc--file-notify-process-sentinel)))
-    (with-current-buffer buffer
-      (setq default-directory directory))
     ;; These two properties are the ones TRAMP's generic file-notify routing and
     ;; validity helpers expect on watch descriptors.
     (process-put descriptor 'tramp-vector vec)
@@ -3710,14 +3709,11 @@ Keys are the same connection/path keys as `tramp-rpc--watched-directories'.")
     descriptor))
 
 (defun tramp-rpc--delete-file-notify-descriptor-process (descriptor)
-  "Delete DESCRIPTOR's synthetic process and hidden process buffer."
+  "Delete DESCRIPTOR's synthetic process."
   (when (processp descriptor)
     (process-put descriptor 'tramp-rpc-file-notify-removing t)
-    (let ((buffer (process-buffer descriptor)))
-      (when (process-live-p descriptor)
-        (delete-process descriptor))
-      (when (buffer-live-p buffer)
-        (kill-buffer buffer)))))
+    (when (process-live-p descriptor)
+      (delete-process descriptor))))
 
 (defun tramp-rpc--canonical-directory-equal-p (a b)
   "Return non-nil if canonical directory names A and B are equal."
