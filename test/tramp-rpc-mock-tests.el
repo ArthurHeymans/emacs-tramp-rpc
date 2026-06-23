@@ -1700,6 +1700,20 @@ This matches the behavior expected by `tramp-test28-process-file'."
       (should (equal moved "/rpc:mock:/tmp/file"))
       (should-not rpc-called))))
 
+(ert-deftest tramp-rpc-mock-test-delete-file-missing-is-noop ()
+  "Missing files are ignored like current Emacs `delete-file'."
+  :tags '(:delete)
+  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
+  (let (invalidated)
+    (cl-letf (((symbol-function 'tramp-rpc--call)
+               (lambda (_vec method _params)
+                 (should (equal method "file.delete"))
+                 (signal 'file-missing '("RPC" "No such file" "/tmp/missing"))))
+              ((symbol-function 'tramp-rpc--invalidate-cache-for-path)
+               (lambda (filename) (setq invalidated filename))))
+      (tramp-rpc-handle-delete-file "/rpc:mock:/tmp/missing" nil)
+      (should (equal invalidated "/rpc:mock:/tmp/missing")))))
+
 (ert-deftest tramp-rpc-mock-test-move-file-to-trash-regular-file-local-trash ()
   "Test optimized `move-file-to-trash' copies a remote file to local trash."
   :tags '(:delete)
