@@ -1977,13 +1977,14 @@ errors instead of probing first."
                      (append (tramp-rpc--encode-path localname)
                              `((mode . ,mode))))))
 
-(defun tramp-rpc-handle-set-file-times (filename &optional timestamp _flag)
+(defun tramp-rpc-handle-set-file-times (filename &optional timestamp flag)
   "Like `set-file-times' for TRAMP-RPC files."
   (tramp-rpc--with-set-file-attributes-rpc filename
     (let ((mtime (floor (float-time (or timestamp (current-time))))))
       (tramp-rpc--call v "file.set_times"
                        (append (tramp-rpc--encode-path localname)
-                               `((mtime . ,mtime)))))))
+                               `((mtime . ,mtime)
+                                 (nofollow . ,(if flag t :msgpack-false))))))))
 
 
 ;; ============================================================================
@@ -3680,8 +3681,14 @@ Keys are the same connection/path keys as `tramp-rpc--watched-directories'.")
 
 (defun tramp-rpc--make-file-notify-descriptor (vec directory localname)
   "Create a TRAMP-style process descriptor for a file notification watch."
-  (let* ((name (format "%s file-notify" (tramp-get-connection-name vec)))
-         (buffer (generate-new-buffer (format " *%s*" name)))
+  (let* (;; Emacs' remote file notification tests use the process name to
+         ;; identify the remote backend and inject synthetic backend events.
+         ;; TRAMP-RPC's server uses the notify crate; on GNU/Linux its behavior
+         ;; is closest to TRAMP's inotifywait backend.
+         (name "inotifywait")
+         (buffer (generate-new-buffer
+                  (format " *%s file-notify %s*"
+                          (tramp-get-connection-name vec) name)))
          (descriptor (make-pipe-process
                       :name name
                       :buffer buffer
@@ -3877,6 +3884,25 @@ the empty string."
           (expand-file-name relative directory))
       file-name)))
 
+(defun tramp-rpc--file-notify-callback-name (data file-name)
+  "Return FILE-NAME in the form expected by `file-notify-callback'.
+`file-notify-callback' expands backend file names relative to the
+watch directory stored in `file-notify-descriptors'.  Passing an
+already expanded TRAMP name can therefore produce doubled remote
+prefixes on some TRAMP versions.  Prefer the name relative to the
+original watched directory, falling back to the original spelling when
+we cannot derive one."
+  (let* ((display-file-name
+          (tramp-rpc--file-notify-original-spelling data file-name))
+         (directory (plist-get data :directory))
+         (relative (and directory
+                        (tramp-rpc--file-notify-relative-name
+                         directory display-file-name))))
+    (cond
+     ((null relative) display-file-name)
+     ((string-empty-p relative) ".")
+     (t relative))))
+
 (defun tramp-rpc--file-notify-path-matches-p (data file-name)
   "Return non-nil if descriptor DATA covers FILE-NAME."
   (let ((canonical-directory
@@ -3919,10 +3945,10 @@ FILE-NAME1 is the destination for `renamed' events.  COOKIE pairs
         (let* ((descriptor (car descriptor-data))
                (data (cdr descriptor-data))
                (display-file-name
-                (tramp-rpc--file-notify-original-spelling data file-name))
+                (tramp-rpc--file-notify-callback-name data file-name))
                (display-file-name1
                 (and file-name1
-                     (tramp-rpc--file-notify-original-spelling data file-name1)))
+                     (tramp-rpc--file-notify-callback-name data file-name1)))
                (event-data (append (list descriptor (list callback-action)
                                          display-file-name)
                                    (cond
@@ -3961,6 +3987,9 @@ DIRECTORY is the remote directory passed by `file-notify-add-watch'."
                (canonical-localname (and (listp result)
                                          (alist-get 'path result)))
                (canonical-directory (cond
+                                     ((and (stringp canonical-localname)
+                                           (tramp-tramp-file-p canonical-localname))
+                                      canonical-localname)
                                      ((stringp canonical-localname)
                                       (tramp-make-tramp-file-name
                                        v canonical-localname))

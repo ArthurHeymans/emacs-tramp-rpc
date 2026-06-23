@@ -1063,16 +1063,14 @@ This matches the behavior expected by `tramp-test28-process-file'."
           (tramp-rpc--file-notify-dispatch "changed" "/rpc:mock:/tmp/real/changed")
           (should (equal events
                          `((file-notify
-                            (,descriptor (changed) "/rpc:mock:/tmp/link/changed")
+                            (,descriptor (changed) "changed")
                             file-notify-callback))))
           (setq events nil)
           (tramp-rpc--file-notify-dispatch
            "renamed" "/rpc:mock:/tmp/real/old" "/rpc:mock:/tmp/real/new")
           (should (equal events
                          `((file-notify
-                            (,descriptor (moved)
-                             "/rpc:mock:/tmp/link/old"
-                             "/rpc:mock:/tmp/link/new")
+                            (,descriptor (moved) "old" "new")
                             file-notify-callback))))
           ;; Dispatch uses the shared watch entry's canonical directory if it is
           ;; refreshed after the descriptor was created.
@@ -1084,9 +1082,43 @@ This matches the behavior expected by `tramp-test28-process-file'."
           (tramp-rpc--file-notify-dispatch "changed" "/rpc:mock:/tmp/new-real/changed")
           (should (equal events
                          `((file-notify
-                            (,descriptor (changed) "/rpc:mock:/tmp/link/changed")
+                            (,descriptor (changed) "changed")
                             file-notify-callback)))))
       (when descriptor
+        (remhash descriptor tramp-rpc--file-notify-descriptors)
+        (tramp-rpc--delete-file-notify-descriptor-process descriptor)))))
+
+(ert-deftest tramp-rpc-mock-test-file-notify-callback-expands-relative-event-name ()
+  "Dispatched relative backend names become absolute TRAMP callback names."
+  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
+  (require 'filenotify)
+  (let* ((tramp-rpc--file-notify-descriptors (make-hash-table :test 'eq))
+         (tramp-rpc--file-notify-watch-counts (make-hash-table :test 'equal))
+         (tramp-rpc--watched-directories (make-hash-table :test 'equal))
+         (directory "/rpc:mock:/tmp/link/")
+         (events nil)
+         descriptor)
+    (unwind-protect
+        (cl-letf (((symbol-function 'tramp-rpc--call)
+                   (lambda (_vec method _params)
+                     (when (equal method "watch.add")
+                       '((path . "/tmp/real/")))))
+                  ((symbol-function 'insert-special-event)
+                   (lambda (event)
+                     (funcall (lookup-key special-event-map [file-notify]) event))))
+          (setq descriptor
+                (tramp-rpc-handle-file-notify-add-watch directory '(change) #'ignore))
+          (puthash descriptor
+                   (file-notify--watch-make
+                    (file-name-unquote (directory-file-name directory))
+                    nil
+                    (lambda (event) (push event events)))
+                   file-notify-descriptors)
+          (tramp-rpc--file-notify-dispatch "changed" "/rpc:mock:/tmp/real/changed")
+          (should (equal events
+                         `((,descriptor changed "/rpc:mock:/tmp/link/changed")))))
+      (when descriptor
+        (remhash descriptor file-notify-descriptors)
         (remhash descriptor tramp-rpc--file-notify-descriptors)
         (tramp-rpc--delete-file-notify-descriptor-process descriptor)))))
 
@@ -1118,16 +1150,16 @@ This matches the behavior expected by `tramp-test28-process-file'."
           (tramp-rpc--file-notify-dispatch "deleted" "/rpc:mock:/tmp/repo/new")
           (should (equal (nreverse events)
                          `((file-notify
-                            (,descriptor (created) "/rpc:mock:/tmp/repo/new")
+                            (,descriptor (created) "new")
                             file-notify-callback)
                            (file-notify
-                            (,descriptor (attribute-changed) "/rpc:mock:/tmp/repo/new")
+                            (,descriptor (attribute-changed) "new")
                             file-notify-callback)
                            (file-notify
-                            (,descriptor (moved) "/rpc:mock:/tmp/repo/old" "/rpc:mock:/tmp/repo/new")
+                            (,descriptor (moved) "old" "new")
                             file-notify-callback)
                            (file-notify
-                            (,descriptor (deleted) "/rpc:mock:/tmp/repo/new")
+                            (,descriptor (deleted) "new")
                             file-notify-callback)))))
       (when descriptor
         (remhash descriptor tramp-rpc--file-notify-descriptors)
@@ -1161,10 +1193,10 @@ This matches the behavior expected by `tramp-test28-process-file'."
           (tramp-rpc--file-notify-dispatch "attribute-changed" "/rpc:mock:/tmp/repo/file")
           (should (equal (nreverse events)
                          `((file-notify
-                            (,change-descriptor (changed) "/rpc:mock:/tmp/repo/file")
+                            (,change-descriptor (changed) "file")
                             file-notify-callback)
                            (file-notify
-                            (,attribute-descriptor (attribute-changed) "/rpc:mock:/tmp/repo/file")
+                            (,attribute-descriptor (attribute-changed) "file")
                             file-notify-callback)))))
       (dolist (descriptor (list change-descriptor attribute-descriptor))
         (when descriptor
