@@ -1618,7 +1618,8 @@ This matches the behavior expected by `tramp-test28-process-file'."
   (let ((vec (make-tramp-file-name :method "rpc" :host "target"
                                    :user "user" :localname "/path")))
     (should (equal (tramp-rpc--connection-key vec)
-                   '("target" "user" "22" nil)))))
+                   '(:method "rpc" :host "target" :user "user"
+                     :port "22" :route nil)))))
 
 (ert-deftest tramp-rpc-mock-test-connection-key-with-hop ()
   "Test connection key includes hop for differentiation."
@@ -1631,13 +1632,14 @@ This matches the behavior expected by `tramp-test28-process-file'."
          (key2 (tramp-rpc--connection-key vec2)))
     ;; Keys should differ because one has a hop and the other doesn't
     (should-not (equal key1 key2))
-    ;; Both should have the same host/user/port
-    (should (equal (nth 0 key1) (nth 0 key2)))
-    (should (equal (nth 1 key1) (nth 1 key2)))
-    (should (equal (nth 2 key1) (nth 2 key2)))
-    ;; Hop should differ
-    (should (nth 3 key1))
-    (should-not (nth 3 key2))))
+    ;; Both should have the same target method/host/user/port.
+    (should (equal (plist-get key1 :method) (plist-get key2 :method)))
+    (should (equal (plist-get key1 :host) (plist-get key2 :host)))
+    (should (equal (plist-get key1 :user) (plist-get key2 :user)))
+    (should (equal (plist-get key1 :port) (plist-get key2 :port)))
+    ;; Route should differ.
+    (should (plist-get key1 :route))
+    (should-not (plist-get key2 :route))))
 
 (ert-deftest tramp-rpc-mock-test-connection-key-different-hops ()
   "Test that different hop routes produce different connection keys."
@@ -1648,6 +1650,23 @@ This matches the behavior expected by `tramp-test28-process-file'."
          (key1 (tramp-rpc--connection-key vec1))
          (key2 (tramp-rpc--connection-key vec2)))
     (should-not (equal key1 key2))))
+
+(ert-deftest tramp-rpc-mock-test-connection-key-hidden-sudo-route ()
+  "Hidden native sudo routes should not collide with direct root rpc."
+  :tags '(:multi-hop :sudo)
+  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
+  (skip-unless (tramp-rpc-mock-test--sudo-helper-available-p))
+  (let* ((tramp-default-proxies-alist nil)
+         (tramp-file-name-with-method "sudo")
+         (hidden (tramp-dissect-file-name
+                  (tramp-file-name-with-sudo "/rpc:alice@server:/root")))
+         (explicit (tramp-dissect-file-name
+                    "/rpc:alice@server|sudo:root@server:/root"))
+         (direct-root (tramp-dissect-file-name "/rpc:root@server:/root")))
+    (should (equal (tramp-rpc--connection-key hidden)
+                   (tramp-rpc--connection-key explicit)))
+    (should-not (equal (tramp-rpc--connection-key hidden)
+                       (tramp-rpc--connection-key direct-root)))))
 
 (ert-deftest tramp-rpc-mock-test-controlmaster-socket-different-hops ()
   "Test that different hop routes produce different ControlMaster socket paths."
@@ -2213,26 +2232,31 @@ This matches the behavior expected by `tramp-test28-process-file'."
 ;; method is now multi-hop capable (inherits ssh connection params).
 (ert-deftest tramp-rpc-mock-test-zz-file-name-with-sudo-native ()
   "Test that tramp-file-name-with-sudo natively produces rpc+sudo path."
-  :tags '(:multi-hop)
+  :tags '(:multi-hop :sudo)
   (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
   (skip-unless (tramp-rpc-mock-test--sudo-helper-available-p))
-  (let* ((tramp-file-name-with-method "sudo")
+  (let* ((tramp-default-proxies-alist nil)
+         (tramp-file-name-with-method "sudo")
          (filename (tramp-file-name-with-sudo "/rpc:user@target:/etc/hosts"))
          (vec (tramp-dissect-file-name filename)))
     (should (tramp-tramp-file-p filename))
     (should (equal (tramp-file-name-localname vec) "/etc/hosts"))
     (should (string= (tramp-file-name-method vec) "sudo"))
     (should (string= (tramp-file-name-host vec) "target"))
-    ;; The hop should preserve the rpc method
-    (when (tramp-file-name-hop vec)
-      (should (string-match-p "rpc:" (tramp-file-name-hop vec)))))
-  ;; Also verify non-rpc paths still work
-  (let* ((tramp-file-name-with-method "sudo")
+    ;; Upstream TRAMP hides this ad-hoc hop in `tramp-default-proxies-alist'
+    ;; when `tramp-show-ad-hoc-proxies' is nil; tramp-rpc must still claim it.
+    (should-not (tramp-file-name-hop vec))
+    (should (tramp-rpc--sudo-file-name-p filename))
+    (should (equal (tramp-rpc--detect-sudo-elevation vec) "user")))
+  ;; Also verify non-rpc paths still work and are not claimed by tramp-rpc.
+  (let* ((tramp-default-proxies-alist nil)
+         (tramp-file-name-with-method "sudo")
          (filename (tramp-file-name-with-sudo "/ssh:user@target:/etc/hosts"))
          (vec (tramp-dissect-file-name filename)))
     (should (tramp-tramp-file-p filename))
     (should (string= (tramp-file-name-method vec) "sudo"))
-    (should (string= (tramp-file-name-host vec) "target"))))
+    (should (string= (tramp-file-name-host vec) "target"))
+    (should-not (tramp-rpc--sudo-file-name-p filename))))
 
 (ert-deftest tramp-rpc-mock-test-rpc-method-advertises-host-arg ()
   "Test that the rpc method declares %%h in tramp-login-args.
@@ -2253,8 +2277,15 @@ The rpc method inherits all ssh connection parameters, so
   :tags '(:multi-hop)
   (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
   ;; Manually install the proxy entry that tramp-add-hops would create
-  ;; when processing /rpc:server|sudo:root@server:/path.
-  (let* ((tramp-default-proxies-alist
+  ;; when processing /rpc:server|sudo:root@server:/path.  Disable the
+  ;; tramp-rpc sudo foreign predicate for this low-level TRAMP check; otherwise
+  ;; the hidden rpc+sudo path is intentionally claimed by tramp-rpc before
+  ;; tramp-sh computes its multi-hop chain.
+  (let* ((tramp-foreign-file-name-handler-alist
+          (cl-remove-if
+           (lambda (entry) (eq (car entry) 'tramp-rpc--sudo-file-name-p))
+           tramp-foreign-file-name-handler-alist))
+         (tramp-default-proxies-alist
           (list (list "^server$" "^root$"
                       (propertize "/rpc:server:" 'tramp-ad-hoc t))))
          (sudo-vec (make-tramp-file-name :method "sudo" :user "root"
@@ -2322,7 +2353,28 @@ as a hop in multi-hop chains."
   ;; ssh+sudo should not match (no rpc in hop)
   (should-not (tramp-rpc--sudo-file-name-p
                (tramp-dissect-file-name
-                "/ssh:user@server|sudo:root@server:/root"))))
+                "/ssh:user@server|sudo:root@server:/root")))
+  ;; rpc as a real proxy to a different host should not match either.
+  (should-not (tramp-rpc--sudo-file-name-p
+               (tramp-dissect-file-name
+                "/rpc:user@gateway|sudo:root@server:/root"))))
+
+(ert-deftest tramp-rpc-mock-test-doas-previous-hop-not-sudo-via-rpc ()
+  "Non-sudo previous-hop methods must not be treated as sudo-via-RPC."
+  :tags '(:multi-hop :sudo)
+  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
+  (let ((vec (make-tramp-file-name :method "doas" :user "root"
+                                   :host "server" :localname "/root"
+                                   :hop "rpc:alice@server|")))
+    (should (tramp-rpc--privilege-elevation-vec-p
+             (make-tramp-file-name :method "sudo" :user "root"
+                                   :host "server" :localname "/root"
+                                   :hop "rpc:alice@server|")))
+    (should (tramp-get-method-parameter vec 'tramp-password-previous-hop))
+    (should-not (tramp-rpc--privilege-elevation-vec-p vec))
+    (should-not (tramp-rpc--sudo-file-name-p vec))
+    (should-not (tramp-rpc--detect-sudo-elevation vec))
+    (should-not (tramp-rpc-multi-hop-p vec))))
 
 (ert-deftest tramp-rpc-mock-test-proxy-hop-string-sudo ()
   "Test that same-host sudo hops are excluded from proxy hop string."
@@ -2355,6 +2407,331 @@ as a hop in multi-hop chains."
       (should pj)
       (should (string-match-p "gw" pj))
       (should-not (string-match-p "server" pj)))))
+
+(ert-deftest tramp-rpc-mock-test-sudo-rpc-hop-must-be-final-hop ()
+  "Only the final hop before sudo is the sudo-via-RPC SSH detail hop."
+  :tags '(:multi-hop :sudo)
+  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
+  (let ((vec (tramp-dissect-file-name
+              "/rpc:alice@server|ssh:gateway|sudo:root@server:/root")))
+    (should-not (tramp-rpc--detect-sudo-elevation vec))
+    (should (equal (tramp-rpc--proxy-hop-string vec)
+                   "rpc:alice@server|ssh:gateway|"))
+    (should (equal (tramp-rpc--hops-to-proxyjump vec)
+                   "alice@server,gateway"))))
+
+(ert-deftest tramp-rpc-mock-test-hidden-sudo-proxies-from-native-tramp ()
+  "TRAMP hidden ad-hoc proxies should still identify rpc+sudo paths."
+  :tags '(:multi-hop :sudo)
+  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
+  (skip-unless (tramp-rpc-mock-test--sudo-helper-available-p))
+  (let* ((tramp-default-proxies-alist nil)
+         (tramp-file-name-with-method "sudo")
+         (filename (tramp-file-name-with-sudo
+                    "/rpc:gw|rpc:alice@server:/root"))
+         (vec (tramp-dissect-file-name filename)))
+    (should-not (tramp-file-name-hop vec))
+    (should (tramp-rpc--sudo-file-name-p filename))
+    (should (equal (tramp-rpc--detect-sudo-elevation vec) "alice"))
+    (should (equal (substring-no-properties (tramp-rpc--proxy-hop-string vec))
+                   "rpc:gw|"))
+    (should (equal (substring-no-properties (tramp-rpc--hops-to-proxyjump vec))
+                   "gw"))))
+
+(ert-deftest tramp-rpc-mock-test-hidden-sudo-handler-no-recursion ()
+  "Hidden native rpc+sudo should be claimed without unregistering predicate."
+  :tags '(:multi-hop :sudo)
+  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
+  (skip-unless (tramp-rpc-mock-test--sudo-helper-available-p))
+  (let* ((tramp-default-proxies-alist nil)
+         (tramp-file-name-with-method "sudo")
+         (filename (tramp-file-name-with-sudo "/rpc:alice@server:/root")))
+    (should (eq (tramp-find-foreign-file-name-handler
+                 (tramp-dissect-file-name filename))
+                'tramp-rpc-file-name-handler))
+    (should (assq 'tramp-rpc--sudo-file-name-p
+                  tramp-foreign-file-name-handler-alist))))
+
+(ert-deftest tramp-rpc-mock-test-hidden-different-host-sudo-not-claimed ()
+  "Hidden rpc proxy to another host is not sudo-via-rpc for the target."
+  :tags '(:multi-hop :sudo)
+  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
+  (let* ((tramp-default-proxies-alist
+          (list (list "^server$" "^root$"
+                      (propertize "/rpc:alice@gateway:"
+                                  'tramp-ad-hoc t))))
+         (filename "/sudo:root@server:/root")
+         (vec (tramp-dissect-file-name filename)))
+    (should-not (tramp-rpc--sudo-file-name-p vec))
+    (should-not (eq (tramp-find-foreign-file-name-handler vec)
+                    'tramp-rpc-file-name-handler))))
+
+(ert-deftest tramp-rpc-mock-test-different-host-sudo-probing-is-quiet ()
+  "Non-matching rpc sudo probes should not emit TRAMP host-mismatch messages."
+  :tags '(:multi-hop :sudo)
+  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
+  (let ((messages nil))
+    (cl-letf (((symbol-function 'message)
+               (lambda (format-string &rest args)
+                 (when format-string
+                   (push (apply #'format-message format-string args)
+                         messages)))))
+      ;; Explicit rpc proxy to a different host.
+      (should-not (tramp-rpc--sudo-file-name-p
+                   (tramp-dissect-file-name
+                    "/rpc:alice@gateway|sudo:root@server:/root")))
+      ;; Hidden native ad-hoc proxy to a different host.
+      (let* ((tramp-default-proxies-alist
+              (list (list "^server$" "^root$"
+                          (propertize "/rpc:alice@gateway:"
+                                      'tramp-ad-hoc t))))
+             (vec (tramp-dissect-file-name "/sudo:root@server:/root")))
+        (should-not (tramp-rpc--sudo-file-name-p vec))))
+    (should-not
+     (cl-some (lambda (msg)
+                (string-match-p "Host name .* does not match" msg))
+              messages))))
+
+(ert-deftest tramp-rpc-mock-test-eshell-sudo-uses-native-em-tramp ()
+  "Eshell sudo should keep using em-tramp's TRAMP sudo rewrite."
+  :tags '(:sudo :eshell)
+  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
+  (require 'em-tramp)
+  (let* ((default-directory "/rpc:alice@server:/tmp/")
+         (form (catch 'eshell-replace-command
+                 (eshell/sudo "id")))
+         (binding (caadr form)))
+    (should (eq (car-safe form) 'let))
+    (should (eq (car binding) 'default-directory))
+    (should (string-match-p "/rpc:alice@server|sudo:root@server:/tmp/"
+                            (cadr binding)))))
+
+(ert-deftest tramp-rpc-mock-test-exec-path-sudo-uses-native-sudo-rpc-server ()
+  "Eshell command lookup in /rpc|sudo should use the sudo RPC backend."
+  :tags '(:sudo :eshell)
+  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
+  (let ((default-directory "/rpc:alice@server|sudo:root@server:/tmp/")
+        captured)
+    (cl-letf (((symbol-function 'tramp-rpc--cached-remote-path)
+               (lambda (vec)
+                 (setq captured vec)
+                 '("/bin"))))
+      (should (equal (tramp-rpc-handle-exec-path) '("/bin" "/tmp/")))
+      (should (string= (tramp-file-name-method captured) "sudo"))
+      (should (string= (tramp-file-name-user captured) "root")))))
+
+(ert-deftest tramp-rpc-mock-test-process-file-sudo-uses-native-sudo-rpc-server ()
+  "process-file in /rpc|sudo should run inside the sudo RPC connection."
+  :tags '(:sudo)
+  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
+  (let ((default-directory "/rpc:alice@server|sudo:root@server:/root/")
+        captured)
+    (cl-letf (((symbol-function 'tramp-rpc--remote-path-environment)
+               (lambda (_vec) nil))
+              ((symbol-function 'tramp-rpc--tramp-remote-process-environment)
+               (lambda () nil))
+              ((symbol-function 'tramp-rpc--get-direnv-environment)
+               (lambda (&rest _) nil))
+              ((symbol-function 'tramp-rpc--caller-environment)
+               (lambda () nil))
+              ((symbol-function 'tramp-rpc--directory-watched-p)
+               (lambda (&rest _) t))
+              ((symbol-function 'tramp-rpc--call)
+               (lambda (vec _method params)
+                 (setq captured (list vec params))
+                 '((exit_code . 0) (stdout . "") (stderr . "")))))
+      (should (= (tramp-rpc-handle-process-file "id" nil nil nil "-u") 0))
+      (let ((vec (car captured))
+            (params (cadr captured)))
+        (should (string= (tramp-file-name-method vec) "sudo"))
+        (should (string= (tramp-file-name-user vec) "root"))
+        (should (equal (alist-get 'cmd params) "id"))
+        (should (equal (alist-get 'cwd params) "/root/"))
+        (should (equal (append (alist-get 'args params) nil) '("-u")))))))
+
+(ert-deftest tramp-rpc-mock-test-make-process-sudo-uses-native-sudo-rpc-server ()
+  "make-process in /rpc|sudo should use the elevated RPC connection."
+  :tags '(:sudo)
+  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
+  (let ((default-directory "/rpc:alice@server|sudo:root@server:/root/")
+        captured proc)
+    (cl-letf (((symbol-function 'tramp-rpc--sudo-password-required-p)
+               (lambda (_vec) nil))
+              ((symbol-function 'tramp-rpc--remote-path-environment)
+               (lambda (_vec) nil))
+              ((symbol-function 'tramp-rpc--tramp-remote-process-environment)
+               (lambda () nil))
+              ((symbol-function 'tramp-rpc--get-direnv-environment)
+               (lambda (&rest _) nil))
+              ((symbol-function 'tramp-rpc--caller-environment)
+               (lambda () nil))
+              ((symbol-function 'tramp-rpc--start-remote-process)
+               (lambda (vec program args cwd _env)
+                 (setq captured (list vec program args cwd))
+                 4242))
+              ((symbol-function 'tramp-rpc--write-remote-process)
+               (lambda (&rest _) nil))
+              ((symbol-function 'tramp-rpc--start-async-read)
+               (lambda (&rest _) nil)))
+      (unwind-protect
+          (progn
+            (setq proc (tramp-rpc-handle-make-process
+                        :name "tramp-rpc-sudo-process-test"
+                        :buffer nil
+                        :command '("id" "-u")
+                        :connection-type nil
+                        :noquery t))
+            (should (processp proc))
+            (let ((vec (nth 0 captured)))
+              (should (string= (tramp-file-name-method vec) "sudo"))
+              (should (string= (tramp-file-name-user vec) "root")))
+            (should (equal (nth 1 captured) "id"))
+            (should (equal (nth 3 captured) "/root/"))
+            (should (equal (nth 2 captured) '("-u"))))
+        (when (processp proc)
+          (delete-process proc))))))
+
+(ert-deftest tramp-rpc-mock-test-cleanup-connection-hidden-sudo-via-rpc ()
+  "Cleanup should remove RPC state for hidden native rpc+sudo paths."
+  :tags '(:sudo)
+  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
+  (skip-unless (tramp-rpc-mock-test--sudo-helper-available-p))
+  (let* ((tramp-default-proxies-alist nil)
+         (tramp-file-name-with-method "sudo")
+         (vec (tramp-dissect-file-name
+               (tramp-file-name-with-sudo "/rpc:alice@server:/root")))
+         (buffer (generate-new-buffer " *tramp-rpc-cleanup-sudo-test*"))
+         (proc (make-process :name "tramp-rpc-cleanup-sudo-test"
+                             :buffer buffer
+                             :command '("cat")
+                             :connection-type 'pipe
+                             :noquery t))
+         (key (tramp-rpc--connection-key vec)))
+    (unwind-protect
+        (progn
+          (puthash key (list :process proc :buffer buffer)
+                   tramp-rpc--connections)
+          (puthash buffer 'pending tramp-rpc--pending-responses)
+          (cl-letf (((symbol-function 'tramp-rpc--cleanup-async-processes)
+                     (lambda (&rest _) nil))
+                    ((symbol-function 'tramp-rpc--cleanup-pty-processes)
+                     (lambda (&rest _) nil))
+                    ((symbol-function 'tramp-rpc--cleanup-watches-for-connection)
+                     (lambda (&rest _) nil))
+                    ((symbol-function 'tramp-rpc--cleanup-file-notify-for-connection)
+                     (lambda (&rest _) nil))
+                    ((symbol-function 'tramp-rpc--clear-direnv-cache)
+                     (lambda (&rest _) nil))
+                    ((symbol-function 'tramp-rpc--clear-file-caches-for-connection)
+                     (lambda (&rest _) nil))
+                    ((symbol-function 'tramp-rpc--cleanup-controlmaster)
+                     (lambda (&rest _) nil))
+                    ((symbol-function 'tramp-flush-directory-properties)
+                     (lambda (&rest _) nil))
+                    ((symbol-function 'tramp-flush-connection-properties)
+                     (lambda (&rest _) nil)))
+            (tramp-rpc-cleanup-connection vec))
+          (should-not (gethash key tramp-rpc--connections))
+          (should-not (gethash buffer tramp-rpc--pending-responses)))
+      (remhash key tramp-rpc--connections)
+      (remhash buffer tramp-rpc--pending-responses)
+      (when (process-live-p proc)
+        (delete-process proc))
+      (when (buffer-live-p buffer)
+        (kill-buffer buffer)))))
+
+(ert-deftest tramp-rpc-mock-test-start-server-sudo-password-uses-stdin ()
+  "When sudo needs a password, start the elevated RPC server with sudo -S."
+  :tags '(:sudo)
+  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
+  (let ((vec (tramp-dissect-file-name
+              "/rpc:alice@server|sudo:root@server:/root/"))
+        (orig-make-process (symbol-function 'make-process))
+        command sent proc)
+    (cl-letf (((symbol-function 'make-process)
+               (lambda (&rest plist)
+                 (setq command (plist-get plist :command))
+                 (setq proc (funcall orig-make-process
+                                      :name "tramp-rpc-mock-cat"
+                                      :buffer nil
+                                      :command '("cat")
+                                      :connection-type 'pipe
+                                      :noquery t))))
+              ((symbol-function 'process-send-string)
+               (lambda (_process string)
+                 (setq sent string)))
+              ((symbol-function 'tramp-rpc--call)
+               (lambda (_vec method _params)
+                 (should (equal method "system.info"))
+                 '((uid . 0) (gid . 0) (home . "/root") (shell . "/bin/sh"))))
+              ((symbol-function 'tramp-set-connection-local-variables)
+               (lambda (&rest _) nil)))
+      (unwind-protect
+          (progn
+            (should (tramp-rpc--start-server-process
+                     vec "/tmp/tramp-rpc-server" "secret"))
+            (should (member "sudo" command))
+            (should (member "-k" command))
+            (should (member "-S" command))
+            (should-not (member "-n" command))
+            (should (member "-p" command))
+            (should (member "Password:" command))
+            (should (member "-H" command))
+            (should-not (member "" command))
+            (should (equal sent "secret\n")))
+        (when (processp proc)
+          (delete-process proc))
+        (tramp-rpc--remove-connection vec)))))
+
+(ert-deftest tramp-rpc-mock-test-start-server-sudo-noninteractive-uses-n-H ()
+  "When sudo has a cached ticket, start the elevated RPC server with sudo -n -H."
+  :tags '(:sudo)
+  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
+  (let ((vec (tramp-dissect-file-name
+              "/rpc:alice@server|sudo:root@server:/root/"))
+        (orig-make-process (symbol-function 'make-process))
+        command sent proc)
+    (cl-letf (((symbol-function 'make-process)
+               (lambda (&rest plist)
+                 (setq command (plist-get plist :command))
+                 (setq proc (funcall orig-make-process
+                                      :name "tramp-rpc-mock-cat"
+                                      :buffer nil
+                                      :command '("cat")
+                                      :connection-type 'pipe
+                                      :noquery t))))
+              ((symbol-function 'process-send-string)
+               (lambda (_process string)
+                 (setq sent string)))
+              ((symbol-function 'tramp-rpc--call)
+               (lambda (_vec method _params)
+                 (should (equal method "system.info"))
+                 '((uid . 0) (gid . 0) (home . "/root") (shell . "/bin/sh"))))
+              ((symbol-function 'tramp-set-connection-local-variables)
+               (lambda (&rest _) nil)))
+      (unwind-protect
+          (progn
+            (should (tramp-rpc--start-server-process
+                     vec "/tmp/tramp-rpc-server" nil))
+            (should (member "sudo" command))
+            (should (member "-n" command))
+            (should (member "-H" command))
+            (should-not (member "-S" command))
+            (should-not (member "-p" command))
+            (should-not (member "Password:" command))
+            (should-not sent))
+        (when (processp proc)
+          (delete-process proc))
+        (tramp-rpc--remove-connection vec)))))
+
+(ert-deftest tramp-rpc-mock-test-password-string-unwraps-auth-source-entry ()
+  "Normalize auth-source plist secrets before sending them to sudo -S."
+  :tags '(:sudo)
+  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
+  (should (equal (tramp-rpc--password-string
+                  '(:host "x220-nixos" :user "arthur" :port "sudo"
+                    :secret (lambda () "secret")))
+                 "secret")))
 
 (ert-deftest tramp-rpc-mock-test-controlmaster-socket-shared ()
   "Test that sudo and normal connections share the ControlMaster socket."
@@ -2866,6 +3243,105 @@ discard it for being unreadable."
       (should (equal (assoc "TERM" captured-env) '("TERM" . "dumb")))
       (should (equal (assoc "PYTHONUNBUFFERED" captured-env)
                      '("PYTHONUNBUFFERED" . "1"))))))
+
+(ert-deftest tramp-rpc-mock-test-make-process-connection-type-nil-is-pipe ()
+  "An explicit `:connection-type nil' must not fall back to global PTY mode."
+  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
+  (let ((default-directory "/rpc:user@host:/work/")
+        (process-connection-type t)
+        (started nil)
+        (password-probed nil)
+        (pty-called nil)
+        proc)
+    (cl-letf (((symbol-function 'tramp-rpc--sudo-password-required-p)
+               (lambda (_vec)
+                 (setq password-probed t)
+                 nil))
+              ((symbol-function 'tramp-rpc--sudo-read-password)
+               (lambda (&rest _)
+                 (error "Password should not be read when sudo -n succeeds")))
+              ((symbol-function 'tramp-rpc--remote-path-environment)
+               (lambda (_vec) nil))
+              ((symbol-function 'tramp-rpc--tramp-remote-process-environment)
+               (lambda () nil))
+              ((symbol-function 'tramp-rpc--get-direnv-environment)
+               (lambda (&rest _) nil))
+              ((symbol-function 'tramp-rpc--caller-environment)
+               (lambda () nil))
+              ((symbol-function 'tramp-rpc--start-remote-process)
+               (lambda (_vec program args _cwd _env)
+                 (setq started (list program args))
+                 4242))
+              ((symbol-function 'tramp-rpc--write-remote-process)
+               (lambda (&rest _) nil))
+              ((symbol-function 'tramp-rpc--start-async-read)
+               (lambda (&rest _) nil))
+              ((symbol-function 'tramp-rpc--make-pty-process)
+               (lambda (&rest _)
+                 (setq pty-called t)
+                 'pty-process)))
+      (unwind-protect
+          (progn
+            (setq proc (tramp-rpc-handle-make-process
+                        :name "tramp-rpc-connection-type-nil-test"
+                        :buffer nil
+                        :command '("sudo" "id")
+                        :connection-type nil
+                        :noquery t))
+            (should (processp proc))
+            (should-not pty-called)
+            (should password-probed)
+            (should (equal (car started) "sudo"))
+            (should (equal (cadr started) '("-n" "id"))))
+        (when (processp proc)
+          (delete-process proc))))))
+
+(ert-deftest tramp-rpc-mock-test-make-process-sudo-pipe-uses-stdin-password ()
+  "Pipe-mode literal sudo should authenticate in the same stdin context."
+  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
+  (let ((default-directory "/rpc:user@host:/work/")
+        (started nil)
+        (written nil)
+        proc)
+    (cl-letf (((symbol-function 'tramp-rpc--sudo-password-required-p)
+               (lambda (_vec) t))
+              ((symbol-function 'tramp-rpc--sudo-read-password)
+               (lambda (_vec user)
+                 (should (equal user "user"))
+                 "secret"))
+              ((symbol-function 'tramp-rpc--remote-path-environment)
+               (lambda (_vec) nil))
+              ((symbol-function 'tramp-rpc--tramp-remote-process-environment)
+               (lambda () nil))
+              ((symbol-function 'tramp-rpc--get-direnv-environment)
+               (lambda (&rest _) nil))
+              ((symbol-function 'tramp-rpc--caller-environment)
+               (lambda () nil))
+              ((symbol-function 'tramp-rpc--start-remote-process)
+               (lambda (_vec program args _cwd _env)
+                 (setq started (list program args))
+                 4242))
+              ((symbol-function 'tramp-rpc--write-remote-process)
+               (lambda (_vec pid data)
+                 (setq written (list pid data))))
+              ((symbol-function 'tramp-rpc--start-async-read)
+               (lambda (&rest _) nil)))
+      (unwind-protect
+          (progn
+            (setq proc (tramp-rpc-handle-make-process
+                        :name "tramp-rpc-sudo-stdin-test"
+                        :buffer nil
+                        :command '("sudo" "id")
+                        :connection-type nil
+                        :noquery t))
+            (should (processp proc))
+            (should (equal (car started) "sudo"))
+            (should (equal (cadr started)
+                           '("-k" "-S" "-p" "" "id")))
+            (should-not (member "-n" (cadr started)))
+            (should (equal written '(4242 "secret\n"))))
+        (when (processp proc)
+          (delete-process proc))))))
 
 ;;; ============================================================================
 ;;; Direnv Cache Path Normalization Tests (No server or SSH required)

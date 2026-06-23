@@ -29,6 +29,11 @@
 (declare-function tramp-send-command-and-check "tramp-sh")
 (declare-function tramp-send-command-and-read "tramp-sh")
 
+;; Functions from tramp-rpc.el.  `tramp-rpc-deploy' is loaded by
+;; tramp-rpc.el after these helpers have been defined.
+(declare-function tramp-rpc--proxy-hop-string "tramp-rpc")
+(declare-function tramp-rpc--sudo-rpc-hop-vec "tramp-rpc")
+
 ;;; ============================================================================
 ;;; Customization
 ;;; ============================================================================
@@ -275,19 +280,32 @@ Methods like \"scp\" and \"rsync\" use out-of-band transfer for `copy-file',
 while \"ssh\" and \"sshx\" use inline encoding (base64 through the shell).
 Any \"rpc:\" hops in the hop chain are normalized to \"ssh:\" so that
 standard TRAMP can traverse them."
-  (let ((method (tramp-file-name-method vec)))
-    (if (member method '("ssh" "sshx" "scp" "scpx" "rsync"))
+  (let ((method (tramp-file-name-method vec))
+        (sudo-hop (and (fboundp 'tramp-rpc--sudo-rpc-hop-vec)
+                       (tramp-rpc--sudo-rpc-hop-vec vec))))
+    (if (and (not sudo-hop)
+             (member method '("ssh" "sshx" "scp" "scpx" "rsync")))
         vec  ; Already a TRAMP method that supports shell commands and file transfer
-      ;; Convert to bootstrap method - create a new tramp-file-name struct
+      ;; Convert to bootstrap method - create a new tramp-file-name struct.
+      ;; For /rpc:user@host|sudo:root@host: paths, deployment must still happen
+      ;; over the SSH user from the rpc hop.  The root RPC server is started via
+      ;; sudo later; using root here makes TRAMP try an unrelated scpx root
+      ;; login and fails before sudo authentication can help.
       (make-tramp-file-name
        :method tramp-rpc-deploy-bootstrap-method
-       :user (tramp-file-name-user vec)
+       :user (or (and sudo-hop
+                      (or (tramp-file-name-user sudo-hop) (user-login-name)))
+                 (tramp-file-name-user vec))
        :domain (tramp-file-name-domain vec)
        :host (tramp-file-name-host vec)
-       :port (tramp-file-name-port vec)
+       :port (if sudo-hop
+                 (tramp-file-name-port sudo-hop)
+               (tramp-file-name-port vec))
        :localname (tramp-file-name-localname vec)
        :hop (tramp-rpc-deploy--normalize-hops
-             (tramp-file-name-hop vec))))))
+             (if sudo-hop
+                 (tramp-rpc--proxy-hop-string vec)
+               (tramp-file-name-hop vec)))))))
 
 (defun tramp-rpc-deploy--detect-remote-arch (vec)
   "Detect the architecture of remote host specified by VEC.
