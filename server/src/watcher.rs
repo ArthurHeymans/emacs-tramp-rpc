@@ -342,8 +342,252 @@ impl WatchEvent {
     }
 }
 
+enum WatchInput {
+    Notify(Event),
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    Direct(Vec<WatchEvent>),
+}
+
 fn path_to_value(path: &Path) -> Value {
     Value::String(path.to_string_lossy().into_owned().into())
+}
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+struct NofollowSymlinkWatcher {
+    fd: libc::c_int,
+    watches: HashMap<PathBuf, SymlinkWatchEntry>,
+    wd_to_path: Arc<Mutex<HashMap<libc::c_int, PathBuf>>>,
+    ignored_wds: Arc<Mutex<HashSet<libc::c_int>>>,
+    running: Arc<std::sync::atomic::AtomicBool>,
+    reader: Option<std::thread::JoinHandle<()>>,
+}
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+#[derive(Debug, Clone, Copy)]
+struct SymlinkWatchEntry {
+    wd: libc::c_int,
+    count: usize,
+}
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+impl NofollowSymlinkWatcher {
+    fn new(tx: mpsc::UnboundedSender<WatchInput>) -> Result<Self, notify::Error> {
+        let fd = unsafe { libc::inotify_init1(libc::IN_NONBLOCK | libc::IN_CLOEXEC) };
+        if fd < 0 {
+            return Err(notify::Error::io(std::io::Error::last_os_error()));
+        }
+
+        let wd_to_path = Arc::new(Mutex::new(HashMap::new()));
+        let ignored_wds = Arc::new(Mutex::new(HashSet::new()));
+        let running = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let reader = Some(spawn_nofollow_reader(
+            fd,
+            Arc::clone(&wd_to_path),
+            Arc::clone(&ignored_wds),
+            Arc::clone(&running),
+            tx,
+        ));
+
+        Ok(Self {
+            fd,
+            watches: HashMap::new(),
+            wd_to_path,
+            ignored_wds,
+            running,
+            reader,
+        })
+    }
+
+    fn contains(&mut self, path: &Path) -> bool {
+        self.purge_ignored();
+        self.watches.contains_key(path)
+    }
+
+    fn watch(&mut self, path: &Path) -> Result<PathBuf, notify::Error> {
+        self.purge_ignored();
+        let path = path.to_path_buf();
+        if let Some(entry) = self.watches.get_mut(&path) {
+            entry.count += 1;
+            return Ok(path);
+        }
+
+        let metadata = std::fs::symlink_metadata(&path)
+            .map_err(|err| notify::Error::io(err).add_path(path.clone()))?;
+        if !metadata.file_type().is_symlink() {
+            return Err(notify::Error::generic(&format!(
+                "nofollow watch path is not a symlink: {}",
+                path.display()
+            )));
+        }
+
+        let c_path = path_to_cstring(&path)?;
+        // Only request symlink metadata changes.  Emacs' symlink tests expect
+        // no target events and no event when the symlink is deleted as part of
+        // cleanup, but do expect `set-file-times' with nofollow to report an
+        // attribute change.
+        let mask = libc::IN_ATTRIB | libc::IN_DONT_FOLLOW;
+        let wd = unsafe { libc::inotify_add_watch(self.fd, c_path.as_ptr(), mask) };
+        if wd < 0 {
+            return Err(notify::Error::io(std::io::Error::last_os_error()).add_path(path));
+        }
+
+        self.watches
+            .insert(path.clone(), SymlinkWatchEntry { wd, count: 1 });
+        lock_or_recover(&self.wd_to_path).insert(wd, path.clone());
+        Ok(path)
+    }
+
+    fn unwatch(&mut self, path: &Path) -> Result<(), notify::Error> {
+        self.purge_ignored();
+        let Some(entry) = self.watches.get_mut(path) else {
+            return Err(notify::Error::watch_not_found().add_path(path.to_path_buf()));
+        };
+
+        if entry.count > 1 {
+            entry.count -= 1;
+            return Ok(());
+        }
+
+        let wd = entry.wd;
+        if unsafe { libc::inotify_rm_watch(self.fd, wd) } < 0 {
+            return Err(
+                notify::Error::io(std::io::Error::last_os_error()).add_path(path.to_path_buf())
+            );
+        }
+
+        self.watches.remove(path);
+        lock_or_recover(&self.wd_to_path).remove(&wd);
+        Ok(())
+    }
+
+    fn purge_ignored(&mut self) {
+        let ignored: Vec<_> = lock_or_recover(&self.ignored_wds).drain().collect();
+        if ignored.is_empty() {
+            return;
+        }
+
+        let mut wd_to_path = lock_or_recover(&self.wd_to_path);
+        for wd in ignored {
+            if let Some(path) = self
+                .watches
+                .iter()
+                .find_map(|(path, entry)| (entry.wd == wd).then(|| path.clone()))
+            {
+                self.watches.remove(&path);
+            }
+            wd_to_path.remove(&wd);
+        }
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+impl Drop for NofollowSymlinkWatcher {
+    fn drop(&mut self) {
+        self.running
+            .store(false, std::sync::atomic::Ordering::Relaxed);
+        if let Some(reader) = self.reader.take() {
+            let _ = reader.join();
+        }
+        unsafe {
+            libc::close(self.fd);
+        }
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn path_to_cstring(path: &Path) -> Result<std::ffi::CString, notify::Error> {
+    use std::os::unix::ffi::OsStrExt;
+
+    std::ffi::CString::new(path.as_os_str().as_bytes())
+        .map_err(|_| notify::Error::generic(&format!("path contains NUL: {}", path.display())))
+}
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn spawn_nofollow_reader(
+    fd: libc::c_int,
+    wd_to_path: Arc<Mutex<HashMap<libc::c_int, PathBuf>>>,
+    ignored_wds: Arc<Mutex<HashSet<libc::c_int>>>,
+    running: Arc<std::sync::atomic::AtomicBool>,
+    tx: mpsc::UnboundedSender<WatchInput>,
+) -> std::thread::JoinHandle<()> {
+    std::thread::spawn(move || {
+        let mut buf = vec![0_u8; 4096];
+        while running.load(std::sync::atomic::Ordering::Relaxed) {
+            let len = unsafe { libc::read(fd, buf.as_mut_ptr().cast(), buf.len()) };
+            if len > 0 {
+                emit_nofollow_events(&buf[..len as usize], &wd_to_path, &ignored_wds, &tx);
+                continue;
+            }
+
+            if len < 0 {
+                let err = std::io::Error::last_os_error();
+                match err.raw_os_error() {
+                    Some(libc::EAGAIN) | Some(libc::EINTR) => {}
+                    _ => break,
+                }
+            }
+            std::thread::sleep(std::time::Duration::from_millis(25));
+        }
+    })
+}
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn emit_nofollow_events(
+    bytes: &[u8],
+    wd_to_path: &Mutex<HashMap<libc::c_int, PathBuf>>,
+    ignored_wds: &Mutex<HashSet<libc::c_int>>,
+    tx: &mpsc::UnboundedSender<WatchInput>,
+) {
+    let event_size = std::mem::size_of::<libc::inotify_event>();
+    let mut offset = 0;
+    while offset + event_size <= bytes.len() {
+        let event = unsafe {
+            std::ptr::read_unaligned(bytes.as_ptr().add(offset).cast::<libc::inotify_event>())
+        };
+        offset += event_size + event.len as usize;
+
+        let mut paths = lock_or_recover(wd_to_path);
+        let path = paths.get(&event.wd).cloned();
+        if event.mask & libc::IN_IGNORED != 0 {
+            paths.remove(&event.wd);
+            lock_or_recover(ignored_wds).insert(event.wd);
+        }
+        drop(paths);
+
+        if event.mask & libc::IN_ATTRIB != 0 {
+            if let Some(path) = path {
+                let _ = tx.send(WatchInput::Direct(vec![WatchEvent::path(
+                    "attribute-changed",
+                    path,
+                )]));
+            }
+        }
+    }
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "android")))]
+struct NofollowSymlinkWatcher;
+
+#[cfg(not(any(target_os = "linux", target_os = "android")))]
+impl NofollowSymlinkWatcher {
+    fn new(_tx: mpsc::UnboundedSender<WatchInput>) -> Result<Self, notify::Error> {
+        Ok(Self)
+    }
+
+    fn contains(&mut self, _path: &Path) -> bool {
+        false
+    }
+
+    fn watch(&mut self, path: &Path) -> Result<PathBuf, notify::Error> {
+        Err(notify::Error::generic(&format!(
+            "nofollow symlink watches are not supported on this platform: {}",
+            path.display()
+        )))
+    }
+
+    fn unwatch(&mut self, path: &Path) -> Result<(), notify::Error> {
+        Err(notify::Error::watch_not_found().add_path(path.to_path_buf()))
+    }
 }
 
 /// Manages filesystem watchers and sends change notifications to the client.
@@ -358,6 +602,9 @@ pub struct WatchManager {
     /// that unwatch() doesn't need to re-canonicalize (which would fail if
     /// the directory has been deleted).
     watched_paths: Mutex<HashMap<PathBuf, RecursiveMode>>,
+
+    /// Nofollow symlink watches for file-notify descriptors.
+    symlink_watcher: Mutex<Option<NofollowSymlinkWatcher>>,
 }
 
 impl WatchManager {
@@ -368,6 +615,7 @@ impl WatchManager {
     /// via the shared stdout writer.
     pub fn new(writer: WriterHandle) -> Result<Arc<Self>, notify::Error> {
         let (tx, rx) = mpsc::unbounded_channel();
+        let notify_tx = tx.clone();
 
         let watcher = FilteredWatcher::new(move |event: notify::Result<Event>| {
             if let Ok(event) = event {
@@ -378,7 +626,7 @@ impl WatchManager {
                 {
                     // Topology events cannot be dropped, and blocking here can
                     // deadlock notify's watch/unwatch event loop.
-                    let _ = tx.send(event);
+                    let _ = notify_tx.send(WatchInput::Notify(event));
                 }
             }
         })?;
@@ -386,6 +634,7 @@ impl WatchManager {
         let manager = Arc::new(Self {
             watcher: Mutex::new(watcher),
             watched_paths: Mutex::new(HashMap::new()),
+            symlink_watcher: Mutex::new(NofollowSymlinkWatcher::new(tx).ok()),
         });
 
         // Spawn the debounce background task
@@ -402,6 +651,26 @@ impl WatchManager {
     ///
     /// Repeated watches are idempotent; non-recursive watches can be upgraded.
     pub fn watch(&self, path: &Path, recursive: bool) -> Result<PathBuf, notify::Error> {
+        self.watch_with_options(path, recursive, false)
+    }
+
+    /// Start watching a path, optionally without following a symlink path.
+    pub fn watch_with_options(
+        &self,
+        path: &Path,
+        recursive: bool,
+        nofollow: bool,
+    ) -> Result<PathBuf, notify::Error> {
+        if nofollow {
+            let mut watcher = lock_or_recover(&self.symlink_watcher);
+            let Some(watcher) = watcher.as_mut() else {
+                return Err(notify::Error::generic(
+                    "nofollow symlink watches are not available",
+                ));
+            };
+            return watcher.watch(path);
+        }
+
         let mode = if recursive {
             RecursiveMode::Recursive
         } else {
@@ -447,6 +716,15 @@ impl WatchManager {
     ///
     /// Lock ordering: watcher -> watched_paths (same as watch()).
     pub fn unwatch(&self, path: &Path) -> Result<(), notify::Error> {
+        {
+            let mut symlink_watcher = lock_or_recover(&self.symlink_watcher);
+            if let Some(watcher) = symlink_watcher.as_mut() {
+                if watcher.contains(path) {
+                    return watcher.unwatch(path);
+                }
+            }
+        }
+
         // Try to canonicalize, but fall back to the raw path
         let canonical = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
 
@@ -724,7 +1002,7 @@ fn paths_as_events<'paths>(
 /// 4. When the timer fires, send one notification with all collected events
 /// 5. Go back to step 1
 async fn debounce_loop(
-    mut rx: mpsc::UnboundedReceiver<Event>,
+    mut rx: mpsc::UnboundedReceiver<WatchInput>,
     writer: WriterHandle,
     manager: Weak<WatchManager>,
 ) {
@@ -738,7 +1016,7 @@ async fn debounce_loop(
         let mut pending_events: Vec<WatchEvent> = Vec::new();
         let mut roots_to_refresh: HashSet<PathBuf> = HashSet::new();
         let mut suspect_paths: HashSet<PathBuf> = HashSet::new();
-        collect_event(
+        collect_input(
             event,
             &manager,
             &mut pending_events,
@@ -756,7 +1034,7 @@ async fn debounce_loop(
                 event = rx.recv() => {
                     match event {
                         Some(e) => {
-                            collect_event(
+                            collect_input(
                                 e,
                                 &manager,
                                 &mut pending_events,
@@ -785,19 +1063,25 @@ async fn debounce_loop(
     }
 }
 
-fn collect_event(
-    event: Event,
+fn collect_input(
+    input: WatchInput,
     manager: &Weak<WatchManager>,
     pending_events: &mut Vec<WatchEvent>,
     roots_to_refresh: &mut HashSet<PathBuf>,
     suspect_paths: &mut HashSet<PathBuf>,
 ) {
-    if let Some(manager) = manager.upgrade() {
-        roots_to_refresh.extend(manager.recursive_roots_for_event(&event));
-    }
+    match input {
+        WatchInput::Notify(event) => {
+            if let Some(manager) = manager.upgrade() {
+                roots_to_refresh.extend(manager.recursive_roots_for_event(&event));
+            }
 
-    suspect_paths.extend(inode_replacing_paths(&event));
-    pending_events.extend(event_to_watch_events(&event));
+            suspect_paths.extend(inode_replacing_paths(&event));
+            pending_events.extend(event_to_watch_events(&event));
+        }
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        WatchInput::Direct(events) => pending_events.extend(events),
+    }
 }
 
 fn fs_events_notification(events: &[WatchEvent]) -> Notification {
@@ -837,13 +1121,16 @@ use crate::handlers::HandlerResult;
 
 /// Handle `watch.add` - start watching a directory for changes.
 ///
-/// Params: { "path": "/path/to/dir", "recursive": true|false }
+/// Params: { "path": "/path/to/dir", "recursive": true|false,
+/// "nofollow": true|false }
 pub fn handle_add(params: Value) -> HandlerResult {
     #[derive(serde::Deserialize)]
     struct Params {
         path: String,
         #[serde(default = "default_recursive")]
         recursive: bool,
+        #[serde(default)]
+        nofollow: bool,
     }
     fn default_recursive() -> bool {
         true
@@ -855,13 +1142,17 @@ pub fn handle_add(params: Value) -> HandlerResult {
 
     let manager = get().ok_or_else(|| RpcError::internal_error("File watcher not available"))?;
 
-    let canonical = manager
-        .watch(Path::new(&expanded), params.recursive)
-        .map_err(|e| RpcError::internal_error(format!("Failed to watch: {}", e)))?;
+    let canonical = if params.nofollow {
+        manager.watch_with_options(Path::new(&expanded), params.recursive, true)
+    } else {
+        manager.watch(Path::new(&expanded), params.recursive)
+    }
+    .map_err(|e| RpcError::internal_error(format!("Failed to watch: {}", e)))?;
 
     Ok(msgpack_map! {
         "path" => canonical.to_string_lossy().into_owned(),
-        "recursive" => Value::Boolean(params.recursive)
+        "recursive" => Value::Boolean(params.recursive),
+        "nofollow" => Value::Boolean(params.nofollow)
     })
 }
 
@@ -918,9 +1209,11 @@ mod tests {
     use std::time::{Duration, Instant};
 
     fn test_manager() -> WatchManager {
+        let (tx, _rx) = mpsc::unbounded_channel();
         WatchManager {
             watcher: Mutex::new(FilteredWatcher::new(|_: notify::Result<Event>| {}).unwrap()),
             watched_paths: Mutex::new(HashMap::new()),
+            symlink_watcher: Mutex::new(NofollowSymlinkWatcher::new(tx).ok()),
         }
     }
 
@@ -965,6 +1258,76 @@ mod tests {
                 &Event::new(EventKind::Remove(RemoveKind::File)).add_path(path.clone())
             ),
             vec![WatchEvent::path("deleted", path)]
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn test_nofollow_symlink_watch_reports_link_attribute_change() {
+        let temp = tempfile::tempdir().unwrap();
+        let target = temp.path().join("target");
+        let link = temp.path().join("link");
+        fs::write(&target, "target").unwrap();
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let mut watcher = NofollowSymlinkWatcher::new(tx).unwrap();
+        assert_eq!(watcher.watch(&link).unwrap(), link);
+
+        fs::write(&target, "changed").unwrap();
+        std::thread::sleep(Duration::from_millis(200));
+        assert!(
+            rx.try_recv().is_err(),
+            "target changes must not be reported"
+        );
+
+        set_symlink_mtime(&link, 1);
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let mut found = false;
+        while Instant::now() < deadline {
+            match rx.try_recv() {
+                Ok(WatchInput::Direct(events)) => {
+                    found |= events.iter().any(|event| {
+                        event.action == "attribute-changed" && event.path.as_ref() == Some(&link)
+                    });
+                    if found {
+                        break;
+                    }
+                }
+                Ok(WatchInput::Notify(_)) => {}
+                Err(_) => std::thread::sleep(Duration::from_millis(25)),
+            }
+        }
+
+        assert!(found, "symlink metadata changes should be reported");
+    }
+
+    #[cfg(target_os = "linux")]
+    fn set_symlink_mtime(path: &Path, seconds: libc::time_t) {
+        let c_path = path_to_cstring(path).unwrap();
+        let times = [
+            libc::timespec {
+                tv_sec: seconds,
+                tv_nsec: 0,
+            },
+            libc::timespec {
+                tv_sec: seconds,
+                tv_nsec: 0,
+            },
+        ];
+        let ret = unsafe {
+            libc::utimensat(
+                libc::AT_FDCWD,
+                c_path.as_ptr(),
+                times.as_ptr(),
+                libc::AT_SYMLINK_NOFOLLOW,
+            )
+        };
+        assert_eq!(
+            ret,
+            0,
+            "utimensat failed: {}",
+            std::io::Error::last_os_error()
         );
     }
 
@@ -1523,6 +1886,7 @@ mod tests {
                 .unwrap(),
             ),
             watched_paths: Mutex::new(HashMap::new()),
+            symlink_watcher: Mutex::new(None),
         };
         manager.watch(&root, true).unwrap();
 
@@ -1589,6 +1953,7 @@ mod tests {
                 .unwrap(),
             ),
             watched_paths: Mutex::new(HashMap::new()),
+            symlink_watcher: Mutex::new(None),
         };
         manager.watch(&root, true).unwrap();
 

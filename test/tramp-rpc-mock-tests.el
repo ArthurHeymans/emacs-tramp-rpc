@@ -393,6 +393,9 @@ Returns the result or signals an error."
           (should (assoc 'uid result))
           (should (assoc 'gid result))
           (should (assoc 'home result))
+          (should (member (alist-get 'watcher result)
+                          '("inotify" "fsevent" "kqueue" "poll"
+                            "windows" "null" "unknown")))
           ;; shell field should be present and be a string
           (should (assoc 'shell result))
           (let ((shell (alist-get 'shell result)))
@@ -762,6 +765,111 @@ This matches the behavior expected by `tramp-test28-process-file'."
   "Return non-nil when the sudo path helpers needed by this test are available."
   (and (require 'tramp-cmds nil t)
        (fboundp 'tramp-file-name-with-sudo)))
+
+(ert-deftest tramp-rpc-mock-test-file-notify-descriptor-monitor-name ()
+  "File notification descriptors expose library and monitor names for tests."
+  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
+  (let* ((vec (tramp-dissect-file-name "/rpc:mock:/tmp/"))
+         descriptor)
+    (unwind-protect
+        (cl-letf (((symbol-function 'tramp-rpc--system-info)
+                   (lambda (_vec) '((os . "linux") (watcher . "inotify")))))
+          (setq descriptor
+                (tramp-rpc--make-file-notify-descriptor
+                 vec "/rpc:mock:/tmp/" "/tmp/"))
+          (should (string-equal (process-name descriptor) "tramp-rpc"))
+          (should (eq (tramp-get-connection-property
+                       descriptor "file-monitor" nil)
+                      'TrampRPCinotify)))
+      (when descriptor
+        (tramp-rpc--delete-file-notify-descriptor-process descriptor)))))
+
+(ert-deftest tramp-rpc-mock-test-file-notify-symlink-requests-nofollow-watch ()
+  "File notification watches on symlinks request nofollow server watches."
+  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
+  (require 'filenotify)
+  (let* ((tramp-rpc--file-notify-descriptors (make-hash-table :test 'eq))
+         (tramp-rpc--file-notify-watch-counts (make-hash-table :test 'equal))
+         (tramp-rpc--watched-directories (make-hash-table :test 'equal))
+         (directory "/rpc:mock:/tmp/link")
+         (vec (tramp-dissect-file-name directory))
+         (watch-key (format "%s:%s" (tramp-rpc--connection-key-string vec)
+                            "/tmp/link"))
+         calls
+         descriptor)
+    (unwind-protect
+        (cl-letf (((symbol-function 'file-symlink-p)
+                   (lambda (_filename) "/tmp/real"))
+                  ((symbol-function 'tramp-rpc--system-info)
+                   (lambda (_vec) '((os . "linux") (watcher . "inotify"))))
+                  ((symbol-function 'tramp-rpc--call)
+                   (lambda (_vec method params)
+                     (push (list method params) calls)
+                     '((path . "/tmp/link"))))
+                  ((symbol-function 'tramp-rpc-unwatch-directory)
+                   (lambda (directory)
+                     (push (list "watch.remove" directory) calls))))
+          (setq descriptor
+                (tramp-rpc-handle-file-notify-add-watch
+                 directory '(change attribute-change) #'ignore))
+          (let ((entry (gethash watch-key tramp-rpc--file-notify-watch-counts)))
+            (should entry)
+            (should-not (plist-get entry :synthetic))
+            (should (plist-get entry :owned))
+            (should (string= (plist-get entry :canonical-directory)
+                             "/rpc:mock:/tmp/link")))
+          (let ((watch-add (car (last calls))))
+            (should (equal (car watch-add) "watch.add"))
+            (should (eq (alist-get 'nofollow (cadr watch-add)) t))
+            (should (eq (alist-get 'recursive (cadr watch-add))
+                        :msgpack-false)))
+          (tramp-rpc-handle-file-notify-rm-watch descriptor)
+          (setq descriptor nil)
+          (should (equal (caar calls) "watch.remove")))
+      (when descriptor
+        (remhash descriptor tramp-rpc--file-notify-descriptors)
+        (tramp-rpc--delete-file-notify-descriptor-process descriptor)))))
+
+(ert-deftest tramp-rpc-mock-test-file-notify-symlink-falls-back-to-synthetic ()
+  "Symlink file notification watches stay synthetic without server support."
+  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
+  (require 'filenotify)
+  (let* ((tramp-rpc--file-notify-descriptors (make-hash-table :test 'eq))
+         (tramp-rpc--file-notify-watch-counts (make-hash-table :test 'equal))
+         (tramp-rpc--watched-directories (make-hash-table :test 'equal))
+         (directory "/rpc:mock:/tmp/link")
+         (vec (tramp-dissect-file-name directory))
+         (watch-key (format "%s:%s" (tramp-rpc--connection-key-string vec)
+                            "/tmp/link"))
+         calls
+         descriptor)
+    (unwind-protect
+        (cl-letf (((symbol-function 'file-symlink-p)
+                   (lambda (_filename) "/tmp/real"))
+                  ((symbol-function 'tramp-rpc--system-info)
+                   (lambda (_vec) '((os . "linux") (watcher . "inotify"))))
+                  ((symbol-function 'tramp-rpc--call)
+                   (lambda (_vec method _params)
+                     (push method calls)
+                     (signal 'remote-file-error '("nofollow unsupported"))))
+                  ((symbol-function 'tramp-rpc-unwatch-directory)
+                   (lambda (_directory)
+                     (push "watch.remove" calls))))
+          (setq descriptor
+                (tramp-rpc-handle-file-notify-add-watch
+                 directory '(change attribute-change) #'ignore))
+          (let ((entry (gethash watch-key tramp-rpc--file-notify-watch-counts)))
+            (should entry)
+            (should (plist-get entry :synthetic))
+            (should-not (plist-get entry :owned))
+            (should-not (plist-get entry :canonical-directory)))
+          (should (equal calls '("watch.add")))
+          (tramp-rpc-handle-file-notify-rm-watch descriptor)
+          (setq descriptor nil)
+          (should (equal calls '("watch.add"))))
+      (when descriptor
+        (remhash descriptor tramp-rpc--file-notify-descriptors)
+        (tramp-rpc--delete-file-notify-descriptor-process descriptor)))))
 
 (ert-deftest tramp-rpc-mock-test-file-notify-suppression-still-dispatches ()
   "fs.events suppression skips cache work but still dispatches file notifications."
