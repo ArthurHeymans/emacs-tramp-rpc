@@ -1356,27 +1356,28 @@ Uses length-prefixed binary framing: <4-byte BE length><msgpack payload>."
                           (length output) (buffer-size))
         ;; Process complete messages
         (goto-char (point-min))
-        (while (setq response (tramp-rpc-protocol-try-read-message buffer))
-          ;; Replace buffer contents with remaining data
-          (delete-region (point-min) (mark-marker))
-          (goto-char (point-min))
-          ;; Check for server-initiated notification (no id, has method)
-          (if (plist-get response :notification)
-              (tramp-rpc--handle-notification
-               process
-               (plist-get response :method)
-               (plist-get response :params))
-            ;; Handle normal response
-            (let* ((id (plist-get response :id))
-                   (callback (gethash id tramp-rpc--async-callbacks)))
-              (if callback
-                  (progn
-                    (tramp-rpc--debug "FILTER dispatching async id=%s" id)
-                    (remhash id tramp-rpc--async-callbacks)
-                    (funcall callback response))
-                ;; Not an async response - store for sync code
-                (tramp-rpc--debug "FILTER storing sync response id=%s" id)
-                (puthash id response (tramp-rpc--get-pending-responses buffer))))))))))
+        (let ((tramp-rpc-protocol--message-target process))
+          (while (setq response (tramp-rpc-protocol-try-read-message buffer))
+            ;; Replace buffer contents with remaining data
+            (delete-region (point-min) (mark-marker))
+            (goto-char (point-min))
+            ;; Check for server-initiated notification (no id, has method)
+            (if (plist-get response :notification)
+                (tramp-rpc--handle-notification
+                 process
+                 (plist-get response :method)
+                 (plist-get response :params))
+              ;; Handle normal response
+              (let* ((id (plist-get response :id))
+                     (callback (gethash id tramp-rpc--async-callbacks)))
+                (if callback
+                    (progn
+                      (tramp-rpc--debug "FILTER dispatching async id=%s" id)
+                      (remhash id tramp-rpc--async-callbacks)
+                      (funcall callback response))
+                  ;; Not an async response - store for sync code
+                  (tramp-rpc--debug "FILTER storing sync response id=%s" id)
+                  (puthash id response (tramp-rpc--get-pending-responses buffer)))))))))))
 
 (defun tramp-rpc--call-async (vec method params callback)
   "Call METHOD with PARAMS asynchronously on the RPC server for VEC.
@@ -1384,7 +1385,9 @@ CALLBACK is called with the response plist when it arrives.
 Returns the request ID."
   (let* ((conn (tramp-rpc--ensure-connection vec))
          (process (plist-get conn :process))
-         (id-and-request (tramp-rpc-protocol-encode-request-with-id method params))
+         (id-and-request (let ((tramp-rpc-protocol--message-target process))
+                           (tramp-rpc-protocol-encode-request-with-id
+                            method params)))
          (id (car id-and-request))
          (request (cdr id-and-request)))
     (tramp-rpc--debug "SEND-ASYNC id=%s method=%s" id method)
@@ -1451,7 +1454,9 @@ Returns the result or signals an error."
   (let* ((conn (tramp-rpc--ensure-connection vec))
          (process (plist-get conn :process))
          (buffer (plist-get conn :buffer))
-         (id-and-request (tramp-rpc-protocol-encode-request-with-id method params))
+         (id-and-request (let ((tramp-rpc-protocol--message-target process))
+                           (tramp-rpc-protocol-encode-request-with-id
+                            method params)))
          (expected-id (car id-and-request))
          (request (cdr id-and-request)))
 
@@ -1577,7 +1582,9 @@ Returns:
   (let* ((conn (tramp-rpc--ensure-connection vec))
          (process (plist-get conn :process))
          (buffer (plist-get conn :buffer))
-         (id-and-request (tramp-rpc-protocol-encode-batch-request-with-id requests))
+         (id-and-request (let ((tramp-rpc-protocol--message-target process))
+                           (tramp-rpc-protocol-encode-batch-request-with-id
+                            requests)))
          (expected-id (car id-and-request))
          (request (cdr id-and-request)))
 
@@ -1656,8 +1663,9 @@ Returns a list of request IDs in the same order."
          (process (plist-get conn :process))
          ids)
     (dolist (req requests)
-      (let* ((id-and-bytes (tramp-rpc-protocol-encode-request-with-id
-                            (car req) (cdr req)))
+      (let* ((id-and-bytes (let ((tramp-rpc-protocol--message-target process))
+                             (tramp-rpc-protocol-encode-request-with-id
+                              (car req) (cdr req))))
              (id (car id-and-bytes))
              (bytes (cdr id-and-bytes)))
         (tramp-rpc--debug "SEND-PIPE id=%s method=%s" id (car req))
@@ -1980,11 +1988,20 @@ errors instead of probing first."
 (defun tramp-rpc-handle-set-file-times (filename &optional timestamp flag)
   "Like `set-file-times' for TRAMP-RPC files."
   (tramp-rpc--with-set-file-attributes-rpc filename
-    (let ((mtime (floor (float-time (or timestamp (current-time))))))
-      (tramp-rpc--call v "file.set_times"
-                       (append (tramp-rpc--encode-path localname)
-                               `((mtime . ,mtime)
-                                 (nofollow . ,(if flag t :msgpack-false))))))))
+    (let* ((mtime (floor (float-time (or timestamp (current-time)))))
+           (tramp-name (tramp-make-tramp-file-name v localname))
+           (result
+            (tramp-rpc--call v "file.set_times"
+                             (append (tramp-rpc--encode-path localname)
+                                     `((mtime . ,mtime)
+                                       (nofollow . ,(if flag t :msgpack-false)))))))
+      ;; Synthetic symlink watches intentionally do not install a server watch,
+      ;; because the notify backend follows symlink watch paths.  Attribute
+      ;; changes made through this handler are the one symlink event we can
+      ;; report precisely without watching the target.
+      (when (and flag (tramp-rpc--file-notify-synthetic-watch-p tramp-name))
+        (tramp-rpc--file-notify-dispatch "attribute-changed" tramp-name))
+      result)))
 
 
 ;; ============================================================================
@@ -3671,8 +3688,31 @@ would otherwise flood the echo area with \"Cannot expand tilde\"."
   "Reference counts for directories watched via file notifications.
 Keys are the same connection/path keys as `tramp-rpc--watched-directories'.")
 
+(defvar tramp-rpc-protocol--message-target)
+
 (declare-function file-notify--rm-descriptor "filenotify")
 (declare-function file-notify-rm-watch "filenotify")
+
+(defun tramp-rpc--file-notify-monitor (vec)
+  "Return the file notification monitor symbol for VEC."
+  (let* ((info (ignore-errors (tramp-rpc--system-info vec)))
+         (watcher (and (listp info)
+                       (tramp-rpc--decode-string (alist-get 'watcher info))))
+         (os (and (listp info)
+                  (tramp-rpc--decode-string (alist-get 'os info)))))
+    (pcase watcher
+      ("inotify" 'TrampRPCinotify)
+      ("kqueue" 'TrampRPCkqueue)
+      ("fsevent" 'TrampRPCfsevent)
+      ("poll" 'TrampRPCpoll)
+      ((pred null)
+       (pcase os
+         ("linux" 'TrampRPCinotify)
+         ((or "freebsd" "openbsd" "netbsd" "dragonfly" "ios")
+          'TrampRPCkqueue)
+         ("macos" 'TrampRPCfsevent)
+         (_ 'TrampRPC)))
+      (_ 'TrampRPC))))
 
 (defun tramp-rpc--file-notify-process-sentinel (descriptor event)
   "Clean up file notification DESCRIPTOR after EVENT closes it."
@@ -3686,10 +3726,9 @@ Keys are the same connection/path keys as `tramp-rpc--watched-directories'.")
 (defun tramp-rpc--make-file-notify-descriptor (vec _directory localname)
   "Create a TRAMP-style process descriptor for a file notification watch."
   (let* (;; Emacs' remote file notification tests use the process name to
-         ;; identify the remote backend and inject synthetic backend events.
-         ;; TRAMP-RPC's server uses the notify crate; on GNU/Linux its behavior
-         ;; is closest to TRAMP's inotifywait backend.
-         (name "inotifywait")
+         ;; identify the remote library.  The concrete backend is exposed via
+         ;; the "file-monitor" connection property below.
+         (name "tramp-rpc")
          ;; This synthetic process is only a watch descriptor; it never
          ;; receives output.  Do not attach a buffer: `global-auto-revert-mode'
          ;; iterates over `buffer-list' while removing file notification
@@ -3703,6 +3742,10 @@ Keys are the same connection/path keys as `tramp-rpc--watched-directories'.")
     ;; validity helpers expect on watch descriptors.
     (process-put descriptor 'tramp-vector vec)
     (process-put descriptor 'tramp-watch-name localname)
+    ;; Match gio/smb-notify: tests can use the library name for broad behavior
+    ;; and this property for backend-specific expectations.
+    (tramp-set-connection-property
+     descriptor "file-monitor" (tramp-rpc--file-notify-monitor vec))
     ;; RPC-private metadata lives in `tramp-rpc--file-notify-descriptors', but
     ;; mark the process as ours for debugging and defensive cleanup.
     (process-put descriptor 'tramp-rpc-file-notify t)
@@ -3918,6 +3961,22 @@ we cannot derive one."
              (tramp-rpc--file-notify-direct-child-p
               canonical-directory file-name)))))
 
+(defun tramp-rpc--file-notify-synthetic-watch-p (file-name)
+  "Return non-nil if FILE-NAME is covered by a synthetic symlink watch."
+  (let (matched)
+    (when (hash-table-p tramp-rpc--file-notify-descriptors)
+      (maphash
+       (lambda (_descriptor data)
+         (let* ((watch-key (plist-get data :watch-key))
+                (entry (and watch-key
+                            (gethash watch-key
+                                     tramp-rpc--file-notify-watch-counts))))
+           (when (and (plist-get entry :synthetic)
+                      (tramp-rpc--file-notify-path-matches-p data file-name))
+             (setq matched t))))
+       tramp-rpc--file-notify-descriptors))
+    matched))
+
 (defun tramp-rpc--file-notify-dispatch (action file-name &optional file-name1 cookie)
   "Dispatch a `file-notify' ACTION for TRAMP FILE-NAME.
 FILE-NAME1 is the destination for `renamed' events.  COOKIE pairs
@@ -3972,6 +4031,10 @@ DIRECTORY is the remote directory passed by `file-notify-add-watch'."
                               localname))
            (entry (gethash watch-key tramp-rpc--file-notify-watch-counts))
            (preexisting (gethash watch-key tramp-rpc--watched-directories))
+           ;; file-notify does not follow symlinks.  Ask the server for a
+           ;; nofollow symlink watch when needed, falling back to a synthetic
+           ;; client-side descriptor on platforms without nofollow support.
+           (symlink-watch (ignore-errors (file-symlink-p directory)))
            (descriptor (tramp-rpc--make-file-notify-descriptor
                         v directory localname)))
       (if entry
@@ -3980,10 +4043,30 @@ DIRECTORY is the remote directory passed by `file-notify-add-watch'."
         ;; `tramp-rpc--watched-directories'.  That table is also used by Magit
         ;; and cache invalidation, where a truthy entry means a recursive
         ;; worktree/cache watch may already exist.
-        (let* ((result (unless preexisting
+        (let* ((synthetic nil)
+               (result (cond
+                        (symlink-watch
+                         (if preexisting
+                             (progn
+                               (setq synthetic symlink-watch)
+                               nil)
+                           (condition-case err
+                               (tramp-rpc--call
+                                v "watch.add"
+                                `((path . ,localname)
+                                  (recursive . :msgpack-false)
+                                  (nofollow . t)))
+                             (error
+                              (setq synthetic symlink-watch)
+                              (tramp-rpc--debug
+                               "nofollow file-notify watch unsupported for %s: %s"
+                               directory (error-message-string err))
+                              nil))))
+                        (preexisting nil)
+                        (t
                          (tramp-rpc--call v "watch.add"
                                           `((path . ,localname)
-                                            (recursive . :msgpack-false)))))
+                                            (recursive . :msgpack-false))))))
                (canonical-localname (and (listp result)
                                          (alist-get 'path result)))
                (canonical-directory (cond
@@ -4003,7 +4086,8 @@ DIRECTORY is the remote directory passed by `file-notify-add-watch'."
                                         (file-truename directory))))))
           (puthash watch-key
                    (list :count 1
-                         :owned (not preexisting)
+                         :owned (and (not preexisting) (not synthetic))
+                         :synthetic synthetic
                          :directory directory
                          :canonical-directory canonical-directory)
                    tramp-rpc--file-notify-watch-counts)))

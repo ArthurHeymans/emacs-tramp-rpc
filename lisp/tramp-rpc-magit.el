@@ -34,6 +34,7 @@
 ;; Functions from tramp.el
 (declare-function tramp-add-external-operation "tramp")
 (declare-function tramp-remove-external-operation "tramp")
+(declare-function tramp-message "tramp-message")
 
 ;; Functions from tramp-rpc.el
 (declare-function tramp-rpc--debug "tramp-rpc")
@@ -249,6 +250,7 @@ DIRECTORY itself returns the empty string.  Descendants can contain slashes."
   (let ((events (alist-get 'events params)))
     (when events
       (tramp-rpc--debug "fs.events: %d events" (length events))
+      (tramp-message process 6 "%s" events)
       (when-let* ((vec (process-get process :tramp-rpc-vec)))
         (unless tramp-rpc--suppress-fs-notifications
           ;; Also clear the magit process-file cache since git state may have changed.

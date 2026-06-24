@@ -25,8 +25,19 @@
 (require 'cl-lib)
 (require 'msgpack)
 
+(declare-function tramp-message "tramp-message")
+
 (defvar tramp-rpc-protocol--request-id 0
   "Counter for generating unique request IDs.")
+
+(defvar tramp-rpc-protocol--message-target nil
+  "TRAMP vector or process used for level-6 protocol debug messages.")
+
+(defun tramp-rpc-protocol--message (object)
+  "Log OBJECT as a level-6 Tramp debug message when possible."
+  (when (and tramp-rpc-protocol--message-target
+             (fboundp 'tramp-message))
+    (tramp-message tramp-rpc-protocol--message-target 6 "%s" object)))
 
 (defun tramp-rpc-protocol--next-id ()
   "Generate the next request ID."
@@ -46,6 +57,7 @@ Returns a cons cell (ID . BYTES) for pipelining support."
                     (method . ,method)
                     (params . ,params)))
          (payload (msgpack-encode request)))
+    (tramp-rpc-protocol--message request)
     (cons id (tramp-rpc-protocol--length-prefix payload))))
 
 (defun tramp-rpc-protocol-decode-response (buffer start)
@@ -61,21 +73,24 @@ with :notification t, :method, and :params keys."
 	    (goto-char start)
 	    (msgpack-read)))
          (id (alist-get 'id response))
-         (method (alist-get 'method response)))
-    ;; Notifications have method but no id (JSON-RPC 2.0 spec)
-    (if (and method (not id))
-        (list :notification t
-              :method method
-              :params (alist-get 'params response))
-      ;; Normal response
-      (let ((result (alist-get 'result response))
-            (error-obj (alist-get 'error response)))
-        (list :id id
-              :result result
-              :error (when error-obj
-                       (list :code (alist-get 'code error-obj)
-                             :message (alist-get 'message error-obj)
-                             :data (alist-get 'data error-obj))))))))
+         (method (alist-get 'method response))
+         (result
+          ;; Notifications have method but no id (JSON-RPC 2.0 spec)
+          (if (and method (not id))
+              (list :notification t
+                    :method method
+                    :params (alist-get 'params response))
+            ;; Normal response
+            (let ((result (alist-get 'result response))
+                  (error-obj (alist-get 'error response)))
+              (list :id id
+                    :result result
+                    :error (when error-obj
+                             (list :code (alist-get 'code error-obj)
+                                   :message (alist-get 'message error-obj)
+                                   :data (alist-get 'data error-obj))))))))
+    (tramp-rpc-protocol--message result)
+    result))
 
 (defun tramp-rpc-protocol-error-p (response)
   "Return non-nil if RESPONSE contains an error."

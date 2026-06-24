@@ -35,6 +35,7 @@ fn system_info() -> HandlerResult {
         "version" => env!("CARGO_PKG_VERSION"),
         "os" => std::env::consts::OS,
         "arch" => std::env::consts::ARCH,
+        "watcher" => watcher_kind(),
         "hostname" => hostname(),
         "uid" => unsafe { libc::getuid() },
         "gid" => unsafe { libc::getgid() },
@@ -42,6 +43,20 @@ fn system_info() -> HandlerResult {
         "user" => env::var("USER").ok().into_value(),
         "shell" => login_shell().into_value()
     })
+}
+
+fn watcher_kind() -> &'static str {
+    use notify::{RecommendedWatcher, Watcher, WatcherKind};
+
+    match RecommendedWatcher::kind() {
+        WatcherKind::Inotify => "inotify",
+        WatcherKind::Fsevent => "fsevent",
+        WatcherKind::Kqueue => "kqueue",
+        WatcherKind::PollWatcher => "poll",
+        WatcherKind::ReadDirectoryChangesWatcher => "windows",
+        WatcherKind::NullWatcher => "null",
+        _ => "unknown",
+    }
 }
 
 /// Look up the current user's login shell from the passwd database.
