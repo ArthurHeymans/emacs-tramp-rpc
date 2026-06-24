@@ -111,11 +111,16 @@ jobs:
         run: cargo fmt --all --check
 
   elisp:
-    name: Emacs Lisp
+    name: Emacs Lisp (${{ matrix.emacs_label }})
     runs-on: ubuntu-latest
     strategy:
+      fail-fast: false
       matrix:
-        emacs_version: ["30.1"]
+        include:
+          - emacs_version: "30.1"
+            emacs_label: "30.1"
+          - emacs_version: "release-snapshot"
+            emacs_label: "31 release snapshot"
 
     steps:
       - name: Checkout
@@ -158,9 +163,17 @@ jobs:
             --eval "(with-current-buffer (find-file-noselect \"lisp/tramp-rpc.el\") (package-buffer-info))"
 
   test-autoload:
-    name: Autoload Tests
+    name: Autoload Tests (${{ matrix.emacs_label }})
     runs-on: ubuntu-latest
     needs: elisp
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - emacs_version: "30.1"
+            emacs_label: "30.1"
+          - emacs_version: "release-snapshot"
+            emacs_label: "31 release snapshot"
 
     steps:
       - name: Checkout
@@ -169,7 +182,7 @@ jobs:
       - name: Set up Emacs
         uses: purcell/setup-emacs@master
         with:
-          version: "30.1"
+          version: ${{ matrix.emacs_version }}
 
       - name: Install dependencies
         run: |
@@ -190,9 +203,17 @@ jobs:
         run: ./test/run-autoload-tests.sh
 
   test-protocol:
-    name: Protocol Tests
+    name: Protocol Tests (${{ matrix.emacs_label }})
     runs-on: ubuntu-latest
     needs: elisp
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - emacs_version: "30.1"
+            emacs_label: "30.1"
+          - emacs_version: "release-snapshot"
+            emacs_label: "31 release snapshot"
 
     steps:
       - name: Checkout
@@ -201,7 +222,7 @@ jobs:
       - name: Set up Emacs
         uses: purcell/setup-emacs@master
         with:
-          version: "30.1"
+          version: ${{ matrix.emacs_version }}
 
       - name: Install dependencies
         run: |
@@ -229,9 +250,17 @@ jobs:
             --eval "(ert-run-tests-batch-and-exit \"^tramp-rpc-mock-test-protocol\")"
 
   test-multi-hop:
-    name: Multi-Hop Tests
+    name: Multi-Hop Tests (${{ matrix.emacs_label }})
     runs-on: ubuntu-latest
     needs: elisp
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - emacs_version: "30.1"
+            emacs_label: "30.1"
+          - emacs_version: "release-snapshot"
+            emacs_label: "31 release snapshot"
 
     steps:
       - name: Checkout
@@ -240,7 +269,7 @@ jobs:
       - name: Set up Emacs
         uses: purcell/setup-emacs@master
         with:
-          version: "30.1"
+          version: ${{ matrix.emacs_version }}
 
       - name: Clone upstream tramp
         run: |
@@ -275,9 +304,17 @@ jobs:
             --eval "(ert-run-tests-batch-and-exit '(tag :multi-hop))"
 
   test-server:
-    name: Server Integration Tests
+    name: Server Integration Tests (${{ matrix.emacs_label }})
     runs-on: ubuntu-latest
     needs: [rust-linux, elisp]
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - emacs_version: "30.1"
+            emacs_label: "30.1"
+          - emacs_version: "release-snapshot"
+            emacs_label: "31 release snapshot"
 
     steps:
       - name: Checkout
@@ -286,7 +323,7 @@ jobs:
       - name: Set up Emacs
         uses: purcell/setup-emacs@master
         with:
-          version: "30.1"
+          version: ${{ matrix.emacs_version }}
 
       - name: Download server binary
         uses: actions/download-artifact@v8
@@ -323,9 +360,17 @@ jobs:
             --eval "(ert-run-tests-batch-and-exit '(tag :server))"
 
   test-full-suite:
-    name: Full Test Suite (with SSH)
+    name: Full Test Suite (with SSH) (${{ matrix.emacs_label }})
     runs-on: ubuntu-latest
     needs: [rust-linux, elisp]
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - emacs_version: "30.1"
+            emacs_label: "30.1"
+          - emacs_version: "release-snapshot"
+            emacs_label: "31 release snapshot"
 
     steps:
       - name: Checkout
@@ -334,7 +379,7 @@ jobs:
       - name: Set up Emacs
         uses: purcell/setup-emacs@master
         with:
-          version: "30.1"
+          version: ${{ matrix.emacs_version }}
 
       - name: Download server binary
         uses: actions/download-artifact@v8
@@ -401,9 +446,17 @@ jobs:
             --eval "(ert-run-tests-batch-and-exit \"^tramp-rpc-test\")"
 
   test-upstream-tramp:
-    name: Upstream Tramp Tests
+    name: Upstream Tramp Tests (${{ matrix.emacs_label }})
     runs-on: ubuntu-latest
     needs: [rust-linux, elisp]
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - emacs_version: "30.1"
+            emacs_label: "30.1"
+          - emacs_version: "release-snapshot"
+            emacs_label: "31 release snapshot"
 
     steps:
       - name: Checkout
@@ -412,7 +465,7 @@ jobs:
       - name: Set up Emacs
         uses: purcell/setup-emacs@master
         with:
-          version: "30.1"
+          version: ${{ matrix.emacs_version }}
 
       - name: Clone upstream tramp
         run: |
