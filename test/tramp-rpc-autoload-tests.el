@@ -108,6 +108,8 @@ This allows testing autoload behavior in a clean state."
           (when (fboundp sym) (fmakunbound sym)))
         '(tramp-rpc-method
           tramp-rpc-file-name-p
+          tramp-rpc--sudo-file-name-p
+          tramp-rpc--sudo-file-name-p-in-progress
           tramp-rpc-file-name-handler)))
 
 ;;; ============================================================================
@@ -201,6 +203,62 @@ This allows testing autoload behavior in a clean state."
   (should-not (tramp-rpc-file-name-p "/ssh:user@host:/path"))
   (should-not (tramp-rpc-file-name-p "/sudo:root@localhost:/path"))
   (should-not (tramp-rpc-file-name-p "/path/to/local/file")))
+
+(ert-deftest tramp-rpc-autoload-test-sudo-predicate-explicit-different-host ()
+  "Autoloaded sudo predicate must not claim rpc proxy to another host."
+  (tramp-rpc-autoload-test--clean-environment)
+  (tramp-rpc-autoload-test--generate-autoloads)
+  (add-to-list 'load-path tramp-rpc-autoload-test--lisp-dir)
+  (load tramp-rpc-autoload-test--autoloads-file nil t)
+  (require 'tramp)
+  (let ((vec (tramp-dissect-file-name
+              "/rpc:alice@gateway|sudo:root@server:/root")))
+    (should-not (tramp-rpc--sudo-file-name-p vec))))
+
+(ert-deftest tramp-rpc-autoload-test-sudo-predicate-ignores-doas ()
+  "Autoloaded sudo predicate must not claim non-sudo previous-hop methods."
+  (tramp-rpc-autoload-test--clean-environment)
+  (tramp-rpc-autoload-test--generate-autoloads)
+  (add-to-list 'load-path tramp-rpc-autoload-test--lisp-dir)
+  (load tramp-rpc-autoload-test--autoloads-file nil t)
+  (require 'tramp)
+  (let ((vec (make-tramp-file-name :method "doas" :user "root"
+                                   :host "server" :localname "/root"
+                                   :hop "rpc:alice@server|")))
+    (should (tramp-get-method-parameter vec 'tramp-password-previous-hop))
+    (should-not (tramp-rpc--sudo-file-name-p vec))
+    (should-not (featurep 'tramp-rpc))))
+
+(ert-deftest tramp-rpc-autoload-test-sudo-predicate-hidden-native ()
+  "Autoloaded sudo predicate claims hidden native rpc+sudo without recursion."
+  (tramp-rpc-autoload-test--clean-environment)
+  (tramp-rpc-autoload-test--generate-autoloads)
+  (add-to-list 'load-path tramp-rpc-autoload-test--lisp-dir)
+  (load tramp-rpc-autoload-test--autoloads-file nil t)
+  (require 'tramp)
+  (require 'tramp-cmds)
+  (should (fboundp 'tramp-rpc--sudo-file-name-p))
+  (should-not (autoloadp (symbol-function 'tramp-rpc--sudo-file-name-p)))
+  (should-not (featurep 'tramp-rpc))
+  (let* ((tramp-default-proxies-alist
+          (list (list "^server$" "^root$"
+                      (propertize "/rpc:alice@server:"
+                                  'tramp-ad-hoc t))))
+         ;; This is the hidden ad-hoc proxy shape TRAMP records for native
+         ;; `tramp-file-name-with-sudo' when `tramp-show-ad-hoc-proxies' is nil.
+         ;; Avoid calling that helper here: expanding the original /rpc: file
+         ;; would intentionally autoload the full handler before this test's
+         ;; first-use sudo predicate assertion.
+         (vec (tramp-dissect-file-name "/sudo:root@server:/root")))
+    ;; First use must be TRAMP's handler lookup.  The inline predicate should
+    ;; claim the hidden native sudo path without loading full tramp-rpc.el.
+    (should (eq (tramp-find-foreign-file-name-handler vec)
+                'tramp-rpc-file-name-handler))
+    (should-not (featurep 'tramp-rpc))
+    (should (tramp-rpc--sudo-file-name-p vec))
+    (should-not (featurep 'tramp-rpc))
+    (should (assq 'tramp-rpc--sudo-file-name-p
+                  tramp-foreign-file-name-handler-alist))))
 
 (ert-deftest tramp-rpc-autoload-test-autoloads-content ()
   "Test that autoloads file contains expected content."

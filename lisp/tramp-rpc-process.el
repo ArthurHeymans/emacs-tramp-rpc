@@ -33,6 +33,8 @@
 ;; Functions from tramp.el
 (declare-function tramp-add-external-operation "tramp")
 (declare-function tramp-remove-external-operation "tramp")
+(declare-function tramp-rpc--sudo-password-required-p "tramp-rpc")
+(declare-function tramp-rpc--sudo-read-password "tramp-rpc")
 
 ;; Silence byte-compiler warnings for variables defined in vterm
 (defvar vterm-copy-mode)
@@ -55,6 +57,7 @@
 (declare-function tramp-rpc--remote-path-environment "tramp-rpc")
 (declare-function tramp-rpc--tramp-remote-process-environment "tramp-rpc")
 (declare-function tramp-rpc--caller-environment "tramp-rpc")
+(declare-function tramp-rpc--ssh-detail-user "tramp-rpc")
 (declare-function tramp-rpc-file-name-p "tramp-rpc")
 
 ;; Variables from tramp-rpc.el
@@ -450,7 +453,7 @@ pair is a symbol."
 (defun tramp-rpc-handle-make-process (&rest args)
   "Create an async process on the remote host.
 ARGS are keyword arguments as per `make-process'.
-Supports PTY allocation when :connection-type is \\='pty or t,
+Supports PTY allocation when :connection-type is \='pty or t,
 or when `process-connection-type' is t.
 For pipe mode, uses async polling for long-running processes.
 Resolves program path and loads direnv environment from working directory."
@@ -460,22 +463,33 @@ Resolves program path and loads direnv environment from working directory."
          ;; as the buffer argument for async commands with stderr.
          ;; Extract the actual buffer from the list.
          (buffer (if (consp buffer-arg) (car buffer-arg) buffer-arg))
-         (command (plist-get args :command))
+         (raw-command (plist-get args :command))
+         (sudo-command (and (car raw-command)
+                            (string= (file-name-nondirectory (car raw-command))
+                                     "sudo")))
+         ;; Check both :connection-type arg and process-connection-type variable.
+         ;; `:connection-type nil' explicitly requests a pipe, so use
+         ;; `plist-member' instead of `or' to preserve that nil value.
+         (connection-type (if (plist-member args :connection-type)
+                              (plist-get args :connection-type)
+                            (when (boundp 'process-connection-type)
+                              process-connection-type)))
+         ;; Determine if PTY is requested.  Only non-PTY literal sudo commands
+         ;; are wrapped for non-interactive stdin authentication; PTY sudo
+         ;; commands stay untouched so sudo can interact with the terminal
+         ;; normally.  For /rpc|sudo paths we follow
+         ;; TRAMP's sudo design and run inside the elevated RPC connection.
+         (use-pty (memq connection-type '(pty t)))
+         (pipe-sudo (and sudo-command (not use-pty)))
+         (command raw-command)
+         (sudo-password nil)
          (coding (tramp-rpc--normalize-coding (plist-get args :coding)))
          (noquery (plist-get args :noquery))
          (filter (plist-get args :filter))
          (sentinel (plist-get args :sentinel))
          (stderr (plist-get args :stderr))
          ;; file-handler is accepted but not used (we ARE the file handler)
-         (_file-handler (plist-get args :file-handler))
-         ;; Check both :connection-type arg and process-connection-type variable
-         (connection-type (or (plist-get args :connection-type)
-                              (when (boundp 'process-connection-type)
-                                process-connection-type)))
-         (program (car command))
-         (program-args (cdr command))
-         ;; Determine if PTY is requested
-         (use-pty (memq connection-type '(pty t))))
+         (_file-handler (plist-get args :file-handler)))
 
     ;; Ensure we're in a remote directory
     (unless (tramp-tramp-file-p default-directory)
@@ -486,6 +500,23 @@ Resolves program path and loads direnv environment from working directory."
     (with-parsed-tramp-file-name default-directory nil
       ;; Unquote localname in case of file-name-quoted paths (e.g. /: prefix).
       (setq localname (file-name-unquote localname))
+      ;; For non-PTY literal sudo commands, validate sudo in the same RPC pipe
+      ;; execution context that will run the command.  If a password is needed,
+      ;; use sudo's stdin wrapper; a separate PTY preauth can miss tty-scoped
+      ;; sudo timestamps and leave the pipe-mode command unauthenticated.
+      (when pipe-sudo
+        (let ((ssh-user (or (tramp-rpc--ssh-detail-user v) (user-login-name))))
+          (if (tramp-rpc--sudo-password-required-p v)
+              (setq sudo-password (tramp-rpc--sudo-read-password v ssh-user)
+                    ;; This RPC path invokes sudo directly, so unlike the SSH
+                    ;; server-start path the empty prompt argument is preserved.
+                    ;; Suppress prompt text so it does not pollute the async
+                    ;; process' stdout/stderr.
+                    command (append (list (car raw-command)
+                                          "-k" "-S" "-p" "")
+                                    (cdr raw-command)))
+            (setq command (append (list (car raw-command) "-n")
+                                  (cdr raw-command))))))
       ;; Get the remote process environment: PATH from `tramp-remote-path'
       ;; (or deprecated `tramp-rpc-remote-path'), direnv for this directory,
       ;; INSIDE_EMACS, and caller-set env vars (e.g. GIT_INDEX_FILE from magit).
@@ -496,15 +527,19 @@ Resolves program path and loads direnv environment from working directory."
                            (tramp-rpc--get-direnv-environment v localname)
                            (tramp-rpc--caller-environment)))))
         (if use-pty
-            ;; PTY mode - start async process with PTY
-            (tramp-rpc--make-pty-process v name buffer command coding noquery
-                                          filter sentinel localname process-env)
+            ;; PTY mode - start async process with PTY.  Do not add -n or
+            ;; pre-authenticate here; sudo owns the terminal prompt.
+            (tramp-rpc--make-pty-process
+             v name buffer command coding noquery
+             filter sentinel localname process-env)
           ;; Pipe mode - use a local cat process as relay for proper I/O events
           ;; This is needed because accept-process-output waits for actual I/O,
           ;; not just filter calls
           ;; Leave relative PROGRAM names unresolved so the server's process
           ;; launcher searches the PATH we pass in PROCESS-ENV.
-          (let* ((remote-pid (tramp-rpc--start-remote-process
+          (let* ((program (car command))
+                 (program-args (cdr command))
+                 (remote-pid (tramp-rpc--start-remote-process
                               v program program-args localname process-env))
                  ;; Use a local cat process as relay - we write output to its stdin
                  ;; and it echoes to stdout, triggering proper I/O events
@@ -528,6 +563,12 @@ Resolves program path and loads direnv environment from working directory."
                                   "cat")))
                       (set-process-query-on-exit-flag proc nil)
                       proc))))
+
+          ;; Feed sudo's stdin password before exposing the relay to callers;
+          ;; subsequent writes use the same queue and stay ordered after it.
+          (when sudo-password
+            (tramp-rpc--write-remote-process
+             v remote-pid (concat sudo-password "\n")))
 
           ;; Configure the local relay process
           (when coding
