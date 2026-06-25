@@ -237,6 +237,7 @@ Returns nil if no proxy hops remain."
 ;; (vterm variables are declared in tramp-rpc-process.el)
 
 ;; Forward declarations for cache/watch functions (tramp-rpc-magit.el)
+(defvar tramp-rpc--cache-ttl)
 (defvar tramp-rpc--file-exists-cache)
 (defvar tramp-rpc--file-truename-cache)
 (defvar tramp-rpc--suppress-fs-notifications)
@@ -254,6 +255,7 @@ Returns nil if no proxy hops remain."
 (declare-function tramp-rpc--cleanup-watches-for-connection "tramp-rpc-magit")
 (declare-function tramp-rpc--clear-file-caches-for-connection "tramp-rpc-magit")
 (declare-function tramp-rpc-magit--process-cache-lookup "tramp-rpc-magit")
+(declare-function tramp-rpc-magit--process-cache-store "tramp-rpc-magit")
 (declare-function tramp-rpc-magit--file-exists-p "tramp-rpc-magit")
 (declare-function tramp-rpc-magit--clear-cache "tramp-rpc-magit")
 (defvar tramp-rpc-magit--debug)
@@ -1847,6 +1849,57 @@ ELOOP errors to nil (the file effectively doesn't exist for stat)."
            nil
          (signal (car err) (cdr err)))))))
 
+(defun tramp-rpc--file-exists-cache-lookup (filename)
+  "Return cached `file-exists-p' value for FILENAME, or `not-cached'.
+Unlike `tramp-rpc--cache-get', this preserves cached nil values."
+  (let* ((expanded (expand-file-name filename))
+         (entry (gethash expanded tramp-rpc--file-exists-cache)))
+    (if (not entry)
+        'not-cached
+      (let ((timestamp (car entry))
+            (value (cdr entry)))
+        (if (< (- (float-time) timestamp) tramp-rpc--cache-ttl)
+            value
+          (remhash expanded tramp-rpc--file-exists-cache)
+          'not-cached)))))
+
+(defun tramp-rpc-handle-file-exists-p (filename)
+  "Like `file-exists-p' for TRAMP-RPC files.
+Uses TRAMP-RPC caches and Magit ancestor scan data before falling back to a
+single `file.stat' RPC.  This avoids latency-amplified marker scans from
+Projectile, project.el, and editorconfig during Magit section expansion."
+  (or
+   ;; Preserve TRAMP's empty localname/root fast path semantics.
+   (tramp-string-empty-or-nil-p (tramp-file-local-name filename))
+   (string-equal (tramp-file-local-name filename) "/")
+   (pcase (tramp-rpc-magit--file-exists-p filename)
+     ('not-cached
+      (pcase (tramp-rpc--file-exists-cache-lookup filename)
+        ('not-cached
+         (with-parsed-tramp-file-name (expand-file-name filename) nil
+           (let* ((stat (tramp-rpc--call-file-stat v localname))
+                  (exists (if stat t nil)))
+             (tramp-rpc--cache-put tramp-rpc--file-exists-cache
+                                   (expand-file-name filename)
+                                   exists)
+             exists)))
+        (cached cached)))
+     (cached cached))))
+
+(defun tramp-rpc-handle-file-readable-p (filename)
+  "Like `file-readable-p' for TRAMP-RPC files.
+For cached-missing marker files, avoid delegating to TRAMP's generic handler,
+which would otherwise perform another remote stat."
+  (pcase (tramp-rpc-magit--file-exists-p filename)
+    ('nil nil)
+    (_ (tramp-handle-file-readable-p filename))))
+
+(defun tramp-rpc-handle-file-regular-p (filename)
+  "Like `file-regular-p' for TRAMP-RPC files, with cached missing fast path."
+  (pcase (tramp-rpc-magit--file-exists-p filename)
+    ('nil nil)
+    (_ (tramp-handle-file-regular-p filename))))
+
 
 (defun tramp-rpc-handle-file-truename (filename)
   "Like `file-truename' for TRAMP-RPC files.
@@ -3267,6 +3320,13 @@ refresh), git commands are served from the prefetch cache when possible."
                              (alist-get 'stderr result)
                              (alist-get 'stderr_encoding result))))
 
+                ;; Memoize uncached Magit git calls made during lazy remote
+                ;; status expansion, so repeated section washing queries don't
+                ;; pay another round-trip.
+                (when (null infile)
+                  (tramp-rpc-magit--process-cache-store
+                   program args exit-code stdout))
+
                 ;; Handle destination
                 (tramp-rpc--route-process-file-output destination stdout stderr)
 
@@ -4179,12 +4239,12 @@ Also controls process exit detection latency."
   '(;; =========================================================================
     ;; RPC-based file attribute operations
     ;; =========================================================================
-    (file-exists-p . tramp-handle-file-exists-p)
-    (file-readable-p . tramp-handle-file-readable-p)
+    (file-exists-p . tramp-rpc-handle-file-exists-p)
+    (file-readable-p . tramp-rpc-handle-file-readable-p)
     (file-writable-p . tramp-handle-file-writable-p)
     (file-executable-p . tramp-rpc-handle-file-executable-p)
     (file-directory-p . tramp-rpc-handle-file-directory-p)
-    (file-regular-p . tramp-handle-file-regular-p)
+    (file-regular-p . tramp-rpc-handle-file-regular-p)
     (file-symlink-p . tramp-handle-file-symlink-p)
     (file-truename . tramp-rpc-handle-file-truename)
     (file-attributes . tramp-rpc-handle-file-attributes)
