@@ -48,9 +48,15 @@
 (declare-function tramp-rpc--file-notify-dispatch "tramp-rpc")
 (declare-function tramp-rpc--watch-entry-canonical-directory "tramp-rpc")
 
+;; Functions from magit-section.el.
+(declare-function magit-section-show "magit-section")
+
 ;; Silence byte-compiler warnings for external functions
 (declare-function projectile-dir-files-alien "projectile")
 (declare-function projectile-time-seconds "projectile")
+
+;; Variables from magit-diff.el.
+(defvar magit-diff-adjust-tab-width)
 
 ;; ============================================================================
 ;; Cache infrastructure
@@ -420,13 +426,50 @@ magit-status on remote repositories."
   :group 'tramp-rpc)
 
 (defvar tramp-rpc-magit--process-caches (make-hash-table :test 'equal)
-  "Hash table mapping (conn-key . directory) to process-file cache hash tables.
-Each value is a hash table mapping git arg keys to (exit-code . stdout-string).
-Keyed per-connection and per-directory to support multiple remotes and repos.")
+  "Hash table mapping (conn-key . directory) to process-file cache entries.
+Each value stores a timestamp and a hash table mapping git arg keys to
+(exit-code . stdout-string).  Keyed per connection and per directory to
+support multiple remotes and repos.")
+
+(defcustom tramp-rpc-magit-process-cache-ttl 120
+  "Seconds to keep prefetched Magit git command output.
+
+Magit creates some expensive status sections lazily.  For example,
+pressing TAB on the Unstaged changes or Untracked files section
+can run git after the initial status refresh has completed.  Keeping the
+prefetched command output briefly lets those lazy expansions reuse the
+same batched status snapshot instead of making another remote round-trip.
+
+Filesystem watch notifications and the next status refresh still clear or
+replace this cache; this TTL is only a backstop for unwatched changes."
+  :type 'number
+  :group 'tramp-rpc)
+
+(defcustom tramp-rpc-magit-disable-remote-diff-tab-width-detection t
+  "Whether remote Magit status expansion should skip per-file tab-width probing.
+
+Magit can inspect each changed file while washing diffs to derive its
+buffer-local `tab-width'.  On TRAMP-RPC remotes that may open many files
+and trigger many serial `file.stat', `file.truename', and process RPCs
+when pressing TAB in `magit-status'.  When this option is non-nil,
+TRAMP-RPC binds `magit-diff-adjust-tab-width' to nil while refreshing or
+expanding remote Magit status sections, avoiding those round-trips and
+using the current `tab-width' instead."
+  :type 'boolean
+  :group 'tramp-rpc)
 
 (defvar tramp-rpc-magit--ancestors-cache nil
   "Cached ancestor scan data from server-side RPC.
 This is populated by `tramp-rpc-magit--prefetch' for file existence checks.")
+
+(defconst tramp-rpc-magit--ancestor-marker-names
+  '(".git" ".svn" ".hg" ".bzr" "_darcs"
+    ".fslckout" "_FOSSIL_" ".pijul" ".sl" ".jj"
+    ".projectile" ".project" ".dir-locals.el" ".editorconfig")
+  "Marker names checked by project, VC, Projectile, and editorconfig code.")
+
+(defvar tramp-rpc-magit--ancestor-scan-caches (make-hash-table :test 'equal)
+  "Cached ancestor scans keyed by remote search directory.")
 
 (defvar tramp-rpc-magit--prefetch-directory nil
   "The directory that was prefetched.
@@ -434,6 +477,13 @@ Used to answer file-exists-p queries for the directory itself.")
 
 (defvar tramp-rpc-magit--debug nil
   "When non-nil, log cache hits/misses for debugging.")
+
+(defvar tramp-rpc-magit--allow-process-cache nil
+  "Non-nil when prefetched git output may satisfy `process-file'.
+
+This is dynamically bound while Magit is refreshing or lazily expanding a
+status section.  Outside those windows, exact git command matches should
+run normally instead of using a possibly stale status snapshot.")
 
 (defun tramp-rpc-magit--get-cache-key (vec directory)
   "Build a cache key for VEC and DIRECTORY.
@@ -446,13 +496,45 @@ Returns a cons cell (connection-key . directory) for hash table lookups."
 Returns the cache hash table, or nil if none."
   (when (file-remote-p default-directory)
     (with-parsed-tramp-file-name default-directory nil
-      (let ((key (tramp-rpc-magit--get-cache-key v default-directory)))
-        (gethash key tramp-rpc-magit--process-caches)))))
+      (cl-labels ((valid-cache
+                   (key)
+                   (let* ((entry (gethash key tramp-rpc-magit--process-caches))
+                          ;; Older sessions may still contain the pre-TTL
+                          ;; representation.
+                          (cache (if (hash-table-p entry)
+                                     entry
+                                   (plist-get entry :cache)))
+                          (time (and (not (hash-table-p entry))
+                                     (plist-get entry :time))))
+                     (cond
+                      ((not cache) nil)
+                      ((and time
+                            tramp-rpc-magit-process-cache-ttl
+                            (> (- (float-time) time)
+                               tramp-rpc-magit-process-cache-ttl))
+                       (remhash key tramp-rpc-magit--process-caches)
+                       nil)
+                      (t cache)))))
+        (or (valid-cache (tramp-rpc-magit--get-cache-key v default-directory))
+            ;; Magit sometimes temporarily sets `default-directory' to a file's
+            ;; subdirectory while washing a status diff.  Reuse the repository
+            ;; root prefetch cache for those subdirectories; otherwise exact
+            ;; prefetched git commands miss solely because the cwd changed.
+            (when (and tramp-rpc-magit--prefetch-directory
+                       (equal (file-remote-p default-directory)
+                              (file-remote-p tramp-rpc-magit--prefetch-directory))
+                       (string-prefix-p
+                        (file-name-as-directory
+                         (tramp-file-local-name tramp-rpc-magit--prefetch-directory))
+                        (tramp-file-local-name (expand-file-name default-directory))))
+              (valid-cache (tramp-rpc-magit--get-cache-key
+                            v tramp-rpc-magit--prefetch-directory))))))))
 
 (defun tramp-rpc-magit--set-process-cache (vec directory cache)
   "Set the process-file CACHE for VEC and DIRECTORY."
   (let ((key (tramp-rpc-magit--get-cache-key vec directory)))
-    (puthash key cache tramp-rpc-magit--process-caches)))
+    (puthash key (list :time (float-time) :cache cache)
+             tramp-rpc-magit--process-caches)))
 
 (defun tramp-rpc-magit--process-cache-key (&rest args)
   "Build a cache key from git ARGS.
@@ -510,6 +592,7 @@ State file checks use \"state_file:PATH\" keys."
       ;; HEAD info
       (add-git "rev-parse" "HEAD")
       (add-git "rev-parse" "--short" "HEAD")
+      (add-git "rev-parse" "--short=9" "HEAD")
       (add-git "symbolic-ref" "--short" "HEAD")
       (add-git "log" "-1" "--format=%s" "HEAD")
       (add-git "rev-parse" "--verify" "HEAD")
@@ -529,6 +612,16 @@ State file checks use \"state_file:PATH\" keys."
 
       ;; Untracked files
       (add-git "ls-files" "--others" "--exclude-standard" "--directory" "--no-empty-directory")
+      (add-git "status" "-z" "--porcelain" "--untracked-files=all" "--")
+
+      ;; File-list sections are inserted lazily when expanding collapsed
+      ;; Magit status sections.  Prefetch their common commands so TAB can be
+      ;; served from the same batched snapshot.
+      (add-git "ls-files" "-z" "--full-name")
+      (add-git "ls-files" "-z" "--full-name" "--cached")
+      (add-git "ls-files" "-z" "--full-name" "--others" "--ignored" "--exclude-standard")
+      (add-git "ls-files" "-z" "--full-name" "-t")
+      (add-git "ls-files" "-z" "--full-name" "-v")
 
       ;; Tags
       (add-git "describe" "--tags" "--exact-match" "HEAD")
@@ -547,6 +640,14 @@ State file checks use \"state_file:PATH\" keys."
       (add-git "config" "--bool" "--default" "false" "core.bare")
       (add-git "config" "--list" "-z")
       (add-git "config" "--local" "-z" "--get-all" "--include" "status.showUntrackedFiles")
+      (add-git "config" "-z" "--get-all" "--include" "core.abbrev")
+      (add-git "config" "-z" "--get-all" "--include" "forge.remote")
+      (add-git "config" "--get" "remote.upstream.url")
+      (add-git "config" "--get" "remote.origin.url")
+
+      ;; Revision/name formatting used while washing expanded file sections.
+      (add-git "for-each-ref" "--format=%(symref)\f%(refname)" "refs/")
+      (add-git "for-each-ref" "--format=%(symref)\f%(refname:short)" "refs/")
 
       ;; Porcelain status
       (add-git "status" "-z" "--porcelain" "--untracked-files=normal" "--")
@@ -564,6 +665,7 @@ State file checks use \"state_file:PATH\" keys."
 
       ;; Parent commits
       (add-git "rev-parse" "--short" "HEAD~")
+      (add-git "rev-parse" "--short=9" "HEAD~")
       (add-git "rev-parse" "--verify" "HEAD~10")
 
       ;; Recent log with decorations
@@ -574,6 +676,102 @@ State file checks use \"state_file:PATH\" keys."
       (add-git "log" "--no-walk" "--format=%h %s" "HEAD^{commit}" "--"))
 
     (vconcat (nreverse cmds))))
+
+(defun tramp-rpc-magit--git-command-entry (directory args)
+  "Return a commands.run_parallel entry for git ARGS in DIRECTORY."
+  `((key . ,(apply #'tramp-rpc-magit--process-cache-key args))
+    (cmd . "git")
+    (args . ,(vconcat args))
+    (cwd . ,directory)))
+
+(defun tramp-rpc-magit--store-command-results (vec directory results)
+  "Merge commands.run_parallel RESULTS into the process cache for DIRECTORY."
+  (when results
+    (let* ((key (tramp-rpc-magit--get-cache-key vec directory))
+           (cache (or (tramp-rpc-magit--get-process-cache)
+                      (make-hash-table :test 'equal)))
+           (remote-prefix (file-remote-p directory)))
+      (dolist (entry results)
+        (let* ((cmd-key (if (symbolp (car entry))
+                            (symbol-name (car entry))
+                          (car entry)))
+               (data (cdr entry))
+               (exit-code (alist-get 'exit_code data)))
+          (if (string-prefix-p "state_file:" cmd-key)
+              (let* ((remote-path (substring cmd-key (length "state_file:")))
+                     (tramp-path (concat remote-prefix remote-path)))
+                (tramp-rpc--cache-put tramp-rpc--file-exists-cache
+                                      tramp-path
+                                      (= exit-code 0)))
+            (let* ((stdout-raw (alist-get 'stdout data))
+                   (stdout (tramp-rpc--decode-output stdout-raw nil)))
+              (puthash cmd-key (cons exit-code stdout) cache)))))
+      (puthash key (list :time (float-time) :cache cache)
+               tramp-rpc-magit--process-caches)
+      cache)))
+
+(defun tramp-rpc-magit--prefetch-file-section (section)
+  "Prefetch the git commands needed to expand Magit file SECTION.
+This is intentionally much smaller than the full status prefetch and is used
+when the status cache has expired but TAB is expanding a single file section."
+  (when-let* ((file (tramp-rpc-magit--section-slot section 'value))
+              ((stringp file))
+              (directory (or tramp-rpc-magit--prefetch-directory
+                             default-directory))
+              ((file-remote-p directory))
+              ((tramp-rpc-file-name-p directory)))
+    (with-parsed-tramp-file-name directory nil
+      (let* ((root-local (file-name-as-directory localname))
+             (rel-file (if (file-name-absolute-p file)
+                           (file-relative-name file root-local)
+                         file))
+             (abs-file (expand-file-name rel-file root-local))
+             (cache (tramp-rpc-magit--get-process-cache))
+             (diff-key (tramp-rpc-magit--process-cache-key
+                        "diff" "--quiet" "--cached" "--submodule=short"
+                        "--" rel-file)))
+        (unless (and cache (gethash diff-key cache))
+          ;; First ensure we know the full HEAD object name; several Magit
+          ;; helpers subsequently ask about that exact object, not the symbol
+          ;; HEAD, so the cache key must contain the resolved object name.
+          (unless (and cache (gethash (tramp-rpc-magit--process-cache-key
+                                       "rev-parse" "HEAD")
+                                      cache))
+            (tramp-rpc-magit--store-command-results
+             v directory
+             (tramp-rpc--call
+              v "commands.run_parallel"
+              `((commands . ,(vector
+                              (tramp-rpc-magit--git-command-entry
+                               root-local '("rev-parse" "HEAD"))))))))
+          (setq cache (tramp-rpc-magit--get-process-cache))
+          (let* ((head-entry (and cache
+                                  (gethash (tramp-rpc-magit--process-cache-key
+                                            "rev-parse" "HEAD")
+                                           cache)))
+                 (head (and head-entry (= 0 (car head-entry))
+                            (string-trim (cdr head-entry))))
+                 (commands nil))
+            (cl-labels ((add (&rest args)
+                          (push (tramp-rpc-magit--git-command-entry
+                                 root-local args)
+                                commands)))
+              (add "diff" "--quiet" "--cached" "--submodule=short"
+                   "--" rel-file)
+              (add "ls-files" "-c" "-z" "--" rel-file)
+              (add "config" "-z" "--get-all" "--include" "core.abbrev")
+              (add "for-each-ref" "--format=%(symref)\f%(refname)" "refs/")
+              (add "for-each-ref" "--format=%(symref)\f%(refname:short)" "refs/")
+              (when head
+                (add "rev-parse" "--short=9" head)
+                (add "cat-file" "-t" head)
+                (add "rev-parse" "--verify" (concat head "^{commit}"))
+                (add "ls-tree" "--full-tree" head "--" abs-file)
+                (add "cat-file" "-p" (format "%s:%s" head rel-file))))
+            (tramp-rpc-magit--store-command-results
+             v directory
+             (tramp-rpc--call v "commands.run_parallel"
+                              `((commands . ,(vconcat (nreverse commands))))))))))))
 
 (defun tramp-rpc-magit--strip-git-prefix-args (args)
   "Strip magit's prefix flags from git ARGS to get the core command.
@@ -618,6 +816,20 @@ Only matches git commands.  Strips magit's prefix flags
             ;; Fix #M5: Log cache misses for git commands when cache is populated
             (tramp-rpc--debug "process-file MISS (prefetch): git %s" key)))
         result))))
+
+(defun tramp-rpc-magit--process-cache-store (program args exit-code stdout)
+  "Store a just-run git PROGRAM ARGS result in the active Magit cache.
+EXIT-CODE and STDOUT are the values returned by `process-file'.
+
+This memoizes repeated lazy expansion queries which were not known at
+prefetch time, such as file-specific `diff --quiet' and object-specific
+`cat-file' calls."
+  (when-let* ((cache (tramp-rpc-magit--get-process-cache)))
+    (when (or (string-suffix-p "/git" program)
+              (string= "git" program))
+      (let* ((core-args (tramp-rpc-magit--strip-git-prefix-args args))
+             (key (apply #'tramp-rpc-magit--process-cache-key core-args)))
+        (puthash key (cons exit-code stdout) cache)))))
 
 (defun tramp-rpc-magit--prefetch (directory)
   "Prefetch magit status and ancestor data for DIRECTORY.
@@ -676,10 +888,8 @@ as the process-file cache.  Also fetches ancestor markers."
                 (tramp-rpc--auto-watch-git-worktree v toplevel)))))
         ;; Fetch ancestor markers for project/VC detection
         (setq tramp-rpc-magit--ancestors-cache
-              (tramp-rpc-ancestors-scan directory
-                                        '(".git" ".svn" ".hg" ".bzr" "_darcs"
-                                          ".projectile" ".project" ".dir-locals.el"
-                                          ".editorconfig")))
+              (tramp-rpc-ancestors-scan
+               directory tramp-rpc-magit--ancestor-marker-names))
         (when tramp-rpc-magit--debug
           (let ((cache (tramp-rpc-magit--get-process-cache)))
             (tramp-rpc--debug "tramp-rpc-magit: prefetched %d commands + ancestors for %s"
@@ -734,33 +944,92 @@ the server scans the entire tree in one operation."
                             (decode-coding-string val 'utf-8)))))
                 result)))))
 
+(defun tramp-rpc-magit--ancestor-scan-cache-key (directory)
+  "Return cache key for ancestor scan rooted at DIRECTORY."
+  (cons (file-remote-p directory) (tramp-file-local-name directory)))
+
+(defun tramp-rpc-magit--ancestor-scan-for-directory (directory)
+  "Return cached ancestor marker scan for DIRECTORY, fetching it if needed."
+  (let* ((directory (file-name-as-directory (expand-file-name directory)))
+         (key (tramp-rpc-magit--ancestor-scan-cache-key directory)))
+    (or (gethash key tramp-rpc-magit--ancestor-scan-caches)
+        (puthash key
+                 (tramp-rpc-ancestors-scan
+                  directory tramp-rpc-magit--ancestor-marker-names)
+                 tramp-rpc-magit--ancestor-scan-caches))))
+
+(defun tramp-rpc-magit--ancestor-cache-covers-p (scan-directory candidate-dir)
+  "Return non-nil if SCAN-DIRECTORY's ancestor scan covers CANDIDATE-DIR."
+  (let ((scan (file-name-as-directory (directory-file-name scan-directory)))
+        (candidate (file-name-as-directory (directory-file-name candidate-dir))))
+    (string-prefix-p candidate scan)))
+
+(defun tramp-rpc-magit--file-exists-in-ancestor-scan (filename scan)
+  "Return FILENAME existence using ancestor SCAN, or `not-cached'."
+  (let* ((expanded (expand-file-name filename))
+         (basename (file-name-nondirectory expanded))
+         (entry (assoc basename scan)))
+    (if entry
+        (if (cdr entry)
+            (let ((found-dir (directory-file-name (cdr entry)))
+                  (candidate-dir (directory-file-name
+                                  (file-name-directory
+                                   (tramp-file-local-name expanded)))))
+              (if (string= found-dir candidate-dir) t nil))
+          nil)
+      'not-cached)))
+
 (defun tramp-rpc-magit--file-exists-p (filename)
   "Check if FILENAME exists using cached ancestor data.
-Returns t, nil, or \\='not-cached if not in cache.
-Only uses the cache if FILENAME is under the prefetched directory."
-  (if (and tramp-rpc-magit--ancestors-cache
-           tramp-rpc-magit--prefetch-directory)
-      ;; First check if this file is under the prefetched directory
-      (let* ((expanded (expand-file-name filename))
-             (prefetch-local (tramp-file-local-name tramp-rpc-magit--prefetch-directory))
-             (file-local (tramp-file-local-name expanded)))
-        (if (string-prefix-p prefetch-local file-local)
-            ;; File is under the prefetched directory - cache applies
-            (let ((basename (file-name-nondirectory filename)))
-              ;; Check if this is one of the markers we scanned for
-              (if-let* ((entry (assoc basename tramp-rpc-magit--ancestors-cache)))
-                  (if (cdr entry)
-                      ;; Marker was found - check if at right location
-                      (let ((found-dir (cdr entry))
-                            (file-dir (file-name-directory file-local)))
-                        (if (string-prefix-p found-dir file-dir)
-                            t
-                          nil))
-                    nil)
-                'not-cached))
-          ;; File is outside the prefetched directory - cache doesn't apply
-          'not-cached))
-    'not-cached))
+Returns t, nil, or \\='not-cached if not in cache."
+  (let* ((expanded (expand-file-name filename))
+         (basename (file-name-nondirectory expanded))
+         (file-dir (file-name-as-directory
+                    (directory-file-name
+                     (or (file-name-directory (tramp-file-local-name expanded))
+                         (tramp-file-local-name expanded)))))
+         (answer 'not-cached))
+    (when (member basename tramp-rpc-magit--ancestor-marker-names)
+      ;; Reuse any dynamic scan whose root is below this candidate directory;
+      ;; ancestor scans cover all parents of their search root.
+      (maphash
+       (lambda (key scan)
+         (when (and (eq answer 'not-cached)
+                    (equal (car key) (file-remote-p expanded))
+                    (tramp-rpc-magit--ancestor-cache-covers-p
+                     (cdr key) file-dir))
+           (setq answer
+                 (tramp-rpc-magit--file-exists-in-ancestor-scan
+                  expanded scan))))
+       tramp-rpc-magit--ancestor-scan-caches)
+      (when (and (eq answer 'not-cached)
+                 tramp-rpc-magit--ancestors-cache
+                 tramp-rpc-magit--prefetch-directory
+                 (tramp-rpc-magit--ancestor-cache-covers-p
+                  (tramp-file-local-name tramp-rpc-magit--prefetch-directory)
+                  file-dir))
+        (setq answer
+              (tramp-rpc-magit--file-exists-in-ancestor-scan
+               expanded tramp-rpc-magit--ancestors-cache)))
+      ;; If this is a marker under the prefetched repository, one high-level
+      ;; ancestor scan from the queried directory replaces dozens of serial
+      ;; file.stat calls as project.el/Projectile walk upward.  Preserve nil as
+      ;; a real cached answer, not as "try the next fallback".
+      (when (and (eq answer 'not-cached)
+                 tramp-rpc-magit--prefetch-directory
+                 (equal (file-remote-p expanded)
+                        (file-remote-p tramp-rpc-magit--prefetch-directory))
+                 (string-prefix-p
+                  (file-name-as-directory
+                   (directory-file-name
+                    (tramp-file-local-name tramp-rpc-magit--prefetch-directory)))
+                  (tramp-file-local-name expanded)))
+        (setq answer
+              (tramp-rpc-magit--file-exists-in-ancestor-scan
+               expanded
+               (tramp-rpc-magit--ancestor-scan-for-directory
+                (file-name-directory expanded))))))
+    answer))
 
 ;; ============================================================================
 ;; Cache clearing
@@ -773,8 +1042,49 @@ Only uses the cache if FILENAME is under the prefetched directory."
 (defun tramp-rpc-magit--clear-cache ()
   "Clear all magit-related caches."
   (clrhash tramp-rpc-magit--process-caches)
+  (clrhash tramp-rpc-magit--ancestor-scan-caches)
   (setq tramp-rpc-magit--ancestors-cache nil)
   (setq tramp-rpc-magit--prefetch-directory nil))
+
+;; ============================================================================
+;; Lazy Magit section expansion
+;; ============================================================================
+
+(defconst tramp-rpc-magit--lazy-status-section-types
+  '(unstaged staged untracked tracked ignored skip-worktree assume-unchanged file)
+  "Magit status section types whose bodies may run git lazily on expansion.")
+
+(defun tramp-rpc-magit--section-slot (section slot)
+  "Return SECTION's SLOT value, or nil if unavailable."
+  (ignore-errors (eieio-oref section slot)))
+
+(defun tramp-rpc-magit--maybe-prefetch-for-section (section)
+  "Ensure batched data exists before expanding lazy Magit SECTION."
+  (when (and tramp-rpc-magit-optimize
+             (derived-mode-p 'magit-status-mode)
+             (file-remote-p default-directory)
+             (tramp-rpc-file-name-p default-directory)
+             (tramp-rpc-magit--section-slot section 'hidden)
+             (memq (tramp-rpc-magit--section-slot section 'type)
+                   tramp-rpc-magit--lazy-status-section-types))
+    (if (eq (tramp-rpc-magit--section-slot section 'type) 'file)
+        (tramp-rpc-magit--prefetch-file-section section)
+      (when (null (tramp-rpc-magit--get-process-cache))
+        (tramp-rpc-magit--prefetch default-directory)))))
+
+(defun tramp-rpc-magit--section-show-advice (orig section)
+  "Advice around `magit-section-show' for lazy remote status sections."
+  (let ((tramp-rpc-magit--allow-process-cache t))
+    (tramp-rpc-magit--maybe-prefetch-for-section section)
+    (let ((magit-diff-adjust-tab-width
+           (if (and tramp-rpc-magit-disable-remote-diff-tab-width-detection
+                    (derived-mode-p 'magit-status-mode)
+                    (file-remote-p default-directory)
+                    (tramp-rpc-file-name-p default-directory))
+               nil
+             (and (boundp 'magit-diff-adjust-tab-width)
+                  magit-diff-adjust-tab-width))))
+      (funcall orig section))))
 
 ;; ============================================================================
 ;; Magit handlers
@@ -786,12 +1096,20 @@ Suppresses fs.events cache handling during refresh to prevent
 inotify events (from git commands touching .git/index etc.) from
 clearing caches mid-refresh."
   (let ((directory (or directory default-directory))
-	(tramp-rpc--suppress-fs-notifications t))
+	(tramp-rpc--suppress-fs-notifications t)
+        (tramp-rpc-magit--allow-process-cache t)
+        (magit-diff-adjust-tab-width
+         (if (and tramp-rpc-magit-disable-remote-diff-tab-width-detection
+                  (file-remote-p (or directory default-directory))
+                  (tramp-rpc-file-name-p (or directory default-directory)))
+             nil
+           (and (boundp 'magit-diff-adjust-tab-width)
+                magit-diff-adjust-tab-width))))
     (tramp-rpc-magit--prefetch directory)
     (unwind-protect
         (tramp-run-real-handler 'magit-status-setup-buffer (list directory))
-      ;; Clear process-file cache - ancestors/prefetch-dir stay for other packages
-      (tramp-rpc-magit--clear-status-cache)
+      ;; Keep process-file cache briefly: Magit inserts some expensive status
+      ;; bodies lazily, so pressing TAB should reuse the batched snapshot.
       ;; Flush file caches since we suppressed fs.events during the refresh
       (clrhash tramp-rpc--file-exists-cache)
       (clrhash tramp-rpc--file-truename-cache))))
@@ -802,11 +1120,19 @@ Suppresses fs.events cache handling during refresh to prevent
 inotify events from clearing caches mid-refresh."
   (when (null (tramp-rpc-magit--get-process-cache))
     (tramp-rpc-magit--prefetch default-directory))
-  (let ((tramp-rpc--suppress-fs-notifications t))
+  (let ((tramp-rpc--suppress-fs-notifications t)
+        (tramp-rpc-magit--allow-process-cache t)
+        (magit-diff-adjust-tab-width
+         (if (and tramp-rpc-magit-disable-remote-diff-tab-width-detection
+                  (file-remote-p default-directory)
+                  (tramp-rpc-file-name-p default-directory))
+             nil
+           (and (boundp 'magit-diff-adjust-tab-width)
+                magit-diff-adjust-tab-width))))
     (unwind-protect
         (tramp-run-real-handler 'magit-status-refresh-buffer nil)
-      ;; Clear process-file cache - ancestors/prefetch-dir stay for other packages
-      (tramp-rpc-magit--clear-status-cache)
+      ;; Keep process-file cache briefly: Magit inserts some expensive status
+      ;; bodies lazily, so pressing TAB should reuse the batched snapshot.
       ;; Flush file caches since we suppressed fs.events during the refresh
       (clrhash tramp-rpc--file-exists-cache)
       (clrhash tramp-rpc--file-truename-cache))))
@@ -817,6 +1143,13 @@ inotify events from clearing caches mid-refresh."
 This uses parallel command prefetching to dramatically speed up
 magit-status on remote repositories."
   (interactive)
+  ;; Make repeated enable calls idempotent.
+  (advice-remove 'magit-section-show #'tramp-rpc-magit--section-show-advice)
+  (when (fboundp 'magit-section-show)
+    (advice-add 'magit-section-show :around #'tramp-rpc-magit--section-show-advice))
+  (with-eval-after-load 'magit-section
+    (advice-remove 'magit-section-show #'tramp-rpc-magit--section-show-advice)
+    (advice-add 'magit-section-show :around #'tramp-rpc-magit--section-show-advice))
   (tramp-add-external-operation
    'magit-status-setup-buffer
    #'tramp-rpc-handle-magit-status-setup-buffer 'tramp-rpc)
@@ -829,6 +1162,7 @@ magit-status on remote repositories."
 (defun tramp-rpc-magit-disable ()
   "Disable tramp-rpc magit optimizations."
   (interactive)
+  (advice-remove 'magit-section-show #'tramp-rpc-magit--section-show-advice)
   (tramp-remove-external-operation 'magit-status-setup-buffer 'tramp-rpc)
   (tramp-remove-external-operation 'magit-status-refresh-buffer 'tramp-rpc)
   (tramp-rpc-magit--clear-cache)
