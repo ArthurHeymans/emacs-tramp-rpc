@@ -546,6 +546,52 @@ jobs:
             -l test/run-tramp-tests.el \
             --eval "(tramp-rpc-test-run-tests-batch-and-exit '(and (not (tag :unstable)) (not tramp-test45-asynchronous-requests)))"
 
+      - name: Clone Emacs 31 tests
+        if: matrix.emacs_version == 'release-snapshot'
+        run: |
+          EMACS31_TESTS_COMMIT=e486f2d975a360062a23878ea9a1ab4c08081e30
+          git init -q ~/src/emacs-31
+          git -C ~/src/emacs-31 remote add origin https://github.com/emacs-mirror/emacs.git
+          git -C ~/src/emacs-31 fetch --depth 1 origin "$EMACS31_TESTS_COMMIT"
+          git -C ~/src/emacs-31 checkout --detach FETCH_HEAD
+          echo "Emacs 31 tests commit: $(git -C ~/src/emacs-31 rev-parse HEAD)"
+
+      - name: Run Emacs 31 autorevert remote tests
+        if: matrix.emacs_version == 'release-snapshot'
+        env:
+          EMACS_TEST_VERBOSE: "1"
+          REMOTE_FILE_NOTIFY_LIBRARY: tramp-rpc
+        run: |
+          export REMOTE_TEMPORARY_FILE_DIRECTORY="/rpc:${USER}@localhost:~/tmp/"
+          emacs -Q --batch \
+            -L lisp \
+            --eval "(require 'package)" \
+            --eval "(add-to-list 'package-archives '(\"melpa\" . \"https://melpa.org/packages/\") t)" \
+            --eval "(package-initialize)" \
+            -l tramp-rpc \
+            --eval "(setq tramp-rpc-deploy-git-build-policy 'release)" \
+            -l ert \
+            -l "$HOME/src/emacs-31/test/lisp/autorevert-tests.el" \
+            --eval "(ert-run-tests-batch-and-exit '(and (not (tag :unstable)) \"remote\"))"
+
+      - name: Run Emacs 31 filenotify remote tests
+        if: matrix.emacs_version == 'release-snapshot'
+        env:
+          EMACS_TEST_VERBOSE: "1"
+          REMOTE_FILE_NOTIFY_LIBRARY: tramp-rpc
+        run: |
+          export REMOTE_TEMPORARY_FILE_DIRECTORY="/rpc:${USER}@localhost:~/tmp/"
+          emacs -Q --batch \
+            -L lisp \
+            --eval "(require 'package)" \
+            --eval "(add-to-list 'package-archives '(\"melpa\" . \"https://melpa.org/packages/\") t)" \
+            --eval "(package-initialize)" \
+            -l tramp-rpc \
+            --eval "(setq tramp-rpc-deploy-git-build-policy 'release)" \
+            -l ert \
+            -l "$HOME/src/emacs-31/test/lisp/filenotify-tests.el" \
+            --eval "(ert-run-tests-batch-and-exit '(and (not (tag :unstable)) \"remote\"))"
+
   summary:
     name: Test Summary
     runs-on: ubuntu-latest
@@ -577,7 +623,7 @@ jobs:
           echo "Multi-Hop Tests: ${{ needs.test-multi-hop.result }}"
           echo "Server Tests: ${{ needs.test-server.result }}"
           echo "Full Test Suite: ${{ needs.test-full-suite.result }}"
-          echo "Upstream Tramp Tests: ${{ needs.test-upstream-tramp.result }}"
+          echo "Upstream Tramp and Emacs Remote Tests: ${{ needs.test-upstream-tramp.result }}"
 
           if [[ "${{ needs.rust-linux.result }}" != "success" ]] || \
              [[ "${{ needs.rust-macos.result }}" != "success" ]] || \
