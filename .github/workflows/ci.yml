@@ -162,6 +162,9 @@ jobs:
             --eval "(require 'package)" \
             --eval "(with-current-buffer (find-file-noselect \"lisp/tramp-rpc.el\") (package-buffer-info))"
 
+      - name: Check NonGNU ELPA package layout
+        run: ./test/nongnu-elpa-check.sh
+
   test-autoload:
     name: Autoload Tests (${{ matrix.emacs_label }})
     runs-on: ubuntu-latest

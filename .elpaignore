@@ -1,0 +1,12 @@
+# Files not shipped in ELPA package archives.
+AGENTS.md
+.github
+.gitignore
+default.nix
+flake.lock
+flake.nix
+benchmark
+doc
+scripts
+target
+test

@@ -5,6 +5,7 @@
 ;; Author: Arthur Heymans <arthur@aheymans.xyz>
 ;; Version: 0.11.0
 ;; Keywords: comm, processes, files
+;; URL: https://github.com/ArthurHeymans/emacs-tramp-rpc
 ;; Package-Requires: ((emacs "30.1") (msgpack "0") (tramp "2.8.1.4"))
 
 ;; This file is part of tramp-rpc.
@@ -13,6 +14,14 @@
 ;; it under the terms of the GNU General Public License as published by
 ;; the Free Software Foundation, either version 3 of the License, or
 ;; (at your option) any later version.
+
+;; tramp-rpc is distributed in the hope that it will be useful,
+;; but WITHOUT ANY WARRANTY; without even the implied warranty of
+;; MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+;; GNU General Public License for more details.
+
+;; You should have received a copy of the GNU General Public License
+;; along with tramp-rpc.  If not, see <https://www.gnu.org/licenses/>.
 
 ;;; Commentary:
 

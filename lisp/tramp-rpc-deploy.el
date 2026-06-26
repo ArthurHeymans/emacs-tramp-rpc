@@ -8,6 +8,19 @@
 
 ;; This file is part of tramp-rpc.
 
+;; tramp-rpc is free software: you can redistribute it and/or modify
+;; it under the terms of the GNU General Public License as published by
+;; the Free Software Foundation, either version 3 of the License, or
+;; (at your option) any later version.
+
+;; tramp-rpc is distributed in the hope that it will be useful,
+;; but WITHOUT ANY WARRANTY; without even the implied warranty of
+;; MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+;; GNU General Public License for more details.
+
+;; You should have received a copy of the GNU General Public License
+;; along with tramp-rpc.  If not, see <https://www.gnu.org/licenses/>.
+
 ;;; Commentary:
 
 ;; This file handles deployment of the tramp-rpc-server binary to
@@ -34,25 +47,36 @@
 ;;; ============================================================================
 
 (defun tramp-rpc-deploy--load-source-file-name ()
-  "Return the Elisp source file corresponding to `load-file-name'.
-When packages are byte-compiled, `load-file-name' points at the .elc in the
-build directory.  Package managers such as straight.el keep an adjacent .el
-symlink to the real checkout, so prefer that source file and follow symlinks
-before deriving the project root."
-  (when load-file-name
-    (let* ((base (file-name-sans-extension load-file-name))
+  "Return the Elisp source file corresponding to this library.
+When packages are byte-compiled, the library path often points at the .elc in
+an install directory.  Package managers such as straight.el keep an adjacent
+.el symlink to the real checkout, so prefer that source file and follow
+symlinks before deriving the project root."
+  (when-let* ((loaded-file (or load-file-name
+                              buffer-file-name
+                              (locate-library "tramp-rpc-deploy"))))
+    (let* ((base (file-name-sans-extension loaded-file))
            (source (concat base ".el"))
-           (file (if (file-exists-p source) source load-file-name)))
+           (file (if (file-exists-p source) source loaded-file)))
       (file-truename file))))
 
 (defun tramp-rpc-deploy--default-source-directory ()
-  "Return the default tramp-rpc source directory.
-This is usually the parent of the lisp directory.  Following source-file
+  "Return the default source directory, or nil if sources are absent.
+Git checkouts keep Lisp files in lisp/, so the project root is the
+parent directory.  ELPA packages may flatten lisp/ into the package root,
+so also check the Lisp file directory itself.  Following source-file
 symlinks is important for straight.el/Doom builds: the loaded .elc lives in
 straight/build..., while the adjacent .el symlink points back to
 straight/repos..., which contains Cargo.toml and the Rust server sources."
-  (when-let* ((file (tramp-rpc-deploy--load-source-file-name)))
-    (expand-file-name ".." (file-name-directory file))))
+  (when-let* ((file (tramp-rpc-deploy--load-source-file-name))
+              (lisp-dir (file-name-directory file))
+              (parent-dir (expand-file-name ".." lisp-dir)))
+    (cond
+     ((file-exists-p (expand-file-name "Cargo.toml" lisp-dir))
+      (file-name-as-directory lisp-dir))
+     ((file-exists-p (expand-file-name "Cargo.toml" parent-dir))
+      (file-name-as-directory parent-dir))
+     (t nil))))
 
 (defgroup tramp-rpc-deploy nil
   "Deployment settings for TRAMP-RPC."
@@ -84,10 +108,10 @@ Binaries are stored as CACHE-DIR/VERSION/ARCH/tramp-rpc-server."
   :type 'directory
   :group 'tramp-rpc-deploy)
 
-(defcustom tramp-rpc-deploy-source-directory
-  (tramp-rpc-deploy--default-source-directory)
+(defcustom tramp-rpc-deploy-source-directory nil
   "Directory containing the tramp-rpc source code.
-Used for building from source.  Set to nil to disable source builds."
+Used for building from source.  When nil, infer the source directory from the
+loaded package or checkout when needed."
   :type '(choice directory (const nil))
   :group 'tramp-rpc-deploy)
 
@@ -154,8 +178,22 @@ the remote shell's PATH to locate it."
 
 (defcustom tramp-rpc-deploy-prefer-build nil
   "If non-nil, prefer building from source over downloading.
-By default, downloading is attempted first as it's faster."
+When `tramp-rpc-deploy-allow-download' is nil, downloads are skipped.
+When it is `ask', tramp-rpc asks before downloading."
   :type 'boolean
+  :group 'tramp-rpc-deploy)
+
+(defcustom tramp-rpc-deploy-allow-download 'ask
+  "Whether to allow downloading pre-built server binaries.
+When t, downloads are allowed.  When nil, tramp-rpc will only use
+bundled binaries, existing local cache entries, source-tree build
+outputs, or builds from local source.
+
+When `ask' (the default), tramp-rpc asks before downloading.  In
+noninteractive sessions, `ask' behaves like nil."
+  :type '(choice (const :tag "Ask before downloading" ask)
+                 (const :tag "Allow downloads" t)
+                 (const :tag "Disable downloads" nil))
   :group 'tramp-rpc-deploy)
 
 (defcustom tramp-rpc-deploy-git-build-policy 'auto
@@ -163,9 +201,10 @@ By default, downloading is attempted first as it's faster."
 This only applies when `tramp-rpc-deploy-source-directory' points at a
 git checkout that contains the Rust server sources.
 
-`auto' means use release binaries for release/package installs, but build
-from source for git checkouts.  This keeps latest-git users from using a
-stale release binary whose version number has not been bumped yet.
+`auto' means use release binaries for release/package installs when
+downloads are allowed, but build from source for git checkouts.  This
+keeps latest-git users from using a stale release binary whose version
+number has not been bumped yet.
 
 `release' always uses the release-oriented versioned binary id and obtain
 order, preserving the historical behavior.
@@ -337,9 +376,10 @@ Linux targets use musl for fully static binaries."
     (_ (signal 'remote-file-error (list "Unknown architecture" arch)))))
 
 (defun tramp-rpc-deploy--source-root ()
-  "Return the configured source root as a directory name, or nil."
-  (when tramp-rpc-deploy-source-directory
-    (file-name-as-directory (expand-file-name tramp-rpc-deploy-source-directory))))
+  "Return the configured or inferred source root as a directory name, or nil."
+  (when-let* ((source-directory (or tramp-rpc-deploy-source-directory
+                                   (tramp-rpc-deploy--default-source-directory))))
+    (file-name-as-directory (expand-file-name source-directory))))
 
 (defun tramp-rpc-deploy--source-has-server-p ()
   "Return non-nil if the configured source directory has Rust server sources."
@@ -644,66 +684,97 @@ Cross-compilation requires additional setup, so we only build natively."
 (defun tramp-rpc-deploy--build-binary (arch)
   "Build the binary for ARCH from source.
 Returns the path to the binary on success, nil on failure."
-  (unless tramp-rpc-deploy-source-directory
-    (signal 'remote-file-error (list "Source directory not configured")))
-  (unless (tramp-rpc-deploy--cargo-available-p)
-    (signal 'remote-file-error (list "Rust toolchain (cargo) not found")))
-  (unless (tramp-rpc-deploy--can-build-for-arch-p arch)
-    (signal
-     'remote-file-error
-     (list "Cannot cross-compile for" arch "on"
-	   (tramp-rpc-deploy--detect-local-arch))))
+  (let ((source-root (tramp-rpc-deploy--source-root)))
+    (unless source-root
+      (signal 'remote-file-error (list "Source directory not configured")))
+    (unless (tramp-rpc-deploy--cargo-available-p)
+      (signal 'remote-file-error (list "Rust toolchain (cargo) not found")))
+    (unless (tramp-rpc-deploy--can-build-for-arch-p arch)
+      (signal
+       'remote-file-error
+       (list "Cannot cross-compile for" arch "on"
+	     (tramp-rpc-deploy--detect-local-arch))))
 
-  (let* ((default-directory tramp-rpc-deploy-source-directory)
-         (target (tramp-rpc-deploy--arch-to-rust-target arch))
-         (cache-path (tramp-rpc-deploy--local-cache-path arch))
-         (cache-dir (file-name-directory cache-path))
-         (build-output (expand-file-name
-                        (format "target/%s/release/%s"
-                                target tramp-rpc-deploy-binary-name)
-                        tramp-rpc-deploy-source-directory))
-         (build-buffer (get-buffer-create "*tramp-rpc-build*")))
+    (let* ((default-directory source-root)
+           (target (tramp-rpc-deploy--arch-to-rust-target arch))
+           (cache-path (tramp-rpc-deploy--local-cache-path arch))
+           (cache-dir (file-name-directory cache-path))
+           (build-output (expand-file-name
+                          (format "target/%s/release/%s"
+                                  target tramp-rpc-deploy-binary-name)
+                          source-root))
+           (build-buffer (get-buffer-create "*tramp-rpc-build*")))
 
-    (message "Building tramp-rpc-server for %s (this may take a minute)..." arch)
+      (message "Building tramp-rpc-server for %s (this may take a minute)..." arch)
 
-    (with-current-buffer build-buffer
-      (erase-buffer))
+      (with-current-buffer build-buffer
+        (erase-buffer))
 
-    (let ((exit-code
-           (call-process "cargo" nil build-buffer nil
-                         "build" "--release"
-                         "--target" target
-                         "--manifest-path"
-                         (expand-file-name "Cargo.toml" tramp-rpc-deploy-source-directory))))
-      (if (zerop exit-code)
-          (progn
-            ;; Copy to cache
-            (make-directory cache-dir t)
-            (copy-file build-output cache-path t)
-            (set-file-modes cache-path #o755)
-            (message "Built tramp-rpc-server for %s" arch)
-            cache-path)
-        (with-current-buffer build-buffer
-          (signal
-	   'remote-file-error
-	   (list (format "Build failed (exit %d):\n%s" exit-code (buffer-string)))))))))
+      (let ((exit-code
+             (call-process "cargo" nil build-buffer nil
+                           "build" "--release"
+                           "--target" target
+                           "--manifest-path"
+                           (expand-file-name "Cargo.toml" source-root))))
+        (if (zerop exit-code)
+            (progn
+              ;; Copy to cache
+              (make-directory cache-dir t)
+              (copy-file build-output cache-path t)
+              (set-file-modes cache-path #o755)
+              (message "Built tramp-rpc-server for %s" arch)
+              cache-path)
+          (with-current-buffer build-buffer
+            (signal
+	     'remote-file-error
+	     (list (format "Build failed (exit %d):\n%s" exit-code (buffer-string))))))))))
 
 ;;; ============================================================================
 ;;; Main logic: ensure local binary exists
 ;;; ============================================================================
 
+(defun tramp-rpc-deploy--download-enabled-p ()
+  "Return non-nil if release downloads may be attempted.
+This does not prompt the user; `ask' is enabled only for interactive sessions."
+  (or (eq tramp-rpc-deploy-allow-download t)
+      (and (eq tramp-rpc-deploy-allow-download 'ask)
+           (not noninteractive))))
+
+(defun tramp-rpc-deploy--download-allowed-p ()
+  "Return non-nil if release binary downloads are allowed.
+When `tramp-rpc-deploy-allow-download' is `ask', prompt the user once and
+store the answer for the current session."
+  (cond
+   ((eq tramp-rpc-deploy-allow-download t)
+    t)
+   ((and (eq tramp-rpc-deploy-allow-download 'ask)
+         (not noninteractive))
+    (setq tramp-rpc-deploy-allow-download
+          (y-or-n-p
+           (format "Download tramp-rpc-server release binaries from %s? "
+                   tramp-rpc-deploy-github-repo))))
+   (t nil)))
+
 (defun tramp-rpc-deploy--obtain-methods ()
   "Return the methods to use for obtaining a missing local binary."
-  (cond
-   ;; Git checkouts should not silently fall back to release artifacts: the
-   ;; release binary may be stale when the lisp/server protocol changed without
-   ;; a version bump.
-   ((tramp-rpc-deploy--use-source-binary-id-p)
-    '(build))
-   (tramp-rpc-deploy-prefer-build
-    '(build download))
-   (t
-    '(download build))))
+  (let ((methods
+         (cond
+          ;; Git checkouts should not silently fall back to release artifacts:
+          ;; the release binary may be stale when the lisp/server protocol
+          ;; changed without a version bump.
+          ((tramp-rpc-deploy--use-source-binary-id-p)
+           '(build))
+          ;; ELPA packages include the Rust sources.  With the default `ask'
+          ;; policy, try a local source build before asking about downloads.
+          ((or tramp-rpc-deploy-prefer-build
+               (and (tramp-rpc-deploy--source-has-server-p)
+                    (eq tramp-rpc-deploy-allow-download 'ask)))
+           '(build download))
+          (t
+           '(download build)))))
+    (if (tramp-rpc-deploy--download-enabled-p)
+        methods
+      (cl-remove 'download methods))))
 
 (defun tramp-rpc-deploy--ensure-local-binary (arch)
   "Ensure a local binary exists for ARCH.
@@ -756,7 +827,10 @@ Returns the path to the local binary."
                 (setq result
                       (pcase method
                         ('download
-                         (tramp-rpc-deploy--download-binary arch))
+                         (if (tramp-rpc-deploy--download-allowed-p)
+                             (tramp-rpc-deploy--download-binary arch)
+                           (signal 'remote-file-error
+                                   (list "Download declined"))))
                         ('build
                          (tramp-rpc-deploy--build-binary arch))))
               (error
@@ -785,26 +859,30 @@ Returns the path to the local binary."
          "To resolve this, you can:\n\n"
          (if (string= arch local-arch)
              (concat
-              "1. Install Rust and build from source:\n"
-              "   curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh\n"
-              "   Then restart Emacs and try again.\n\n")
+              "1. Install Rust/cargo with your system package manager,\n"
+              "   then restart Emacs and try again.\n\n")
            (format
             "1. Build on a %s machine and copy to:\n   %s\n\n"
             arch
             (tramp-rpc-deploy--local-cache-path arch)))
          "2. To force release artifacts instead, customize:\n"
-         "   (setq tramp-rpc-deploy-git-build-policy 'release)\n\n"
+         "   (setq tramp-rpc-deploy-git-build-policy 'release\n"
+         "         tramp-rpc-deploy-allow-download t)\n\n"
          (format "Binary should be placed at:\n   %s"
                  (tramp-rpc-deploy--local-cache-path arch)))
       (concat
        "To resolve this, you can:\n\n"
-       (format "1. Download manually from:\n   %s\n\n"
-               (tramp-rpc-deploy--download-url arch))
+       (if (eq tramp-rpc-deploy-allow-download t)
+           (format "1. Download manually from:\n   %s\n\n"
+                   (tramp-rpc-deploy--download-url arch))
+         (concat "1. Install tramp-rpc-server with your system package "
+                 "manager,\n   or build it outside Emacs and copy it to the path below.\n"
+                 "   Automatic release downloads are not enabled.  To opt in,\n"
+                 "   customize `tramp-rpc-deploy-allow-download'.\n\n"))
        (if (string= arch local-arch)
            (concat
-            "2. Install Rust and build from source:\n"
-            "   curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh\n"
-            "   Then restart Emacs and try again.\n\n")
+            "2. Install Rust/cargo with your system package manager,\n"
+            "   then restart Emacs and try again.\n\n")
          (format
           "2. Build on a %s machine and copy to:\n   %s\n\n"
           arch
@@ -1085,6 +1163,7 @@ binary lookup, and remote installation target."
                         (or tramp-rpc-deploy-remote-binary-path
                             (format "%s (PATH lookup)" tramp-rpc-deploy-binary-name)))))
       (insert (format "Auto deploy: %s\n" (if tramp-rpc-deploy-auto-deploy "yes" "no")))
+      (insert (format "Allow downloads: %s\n" tramp-rpc-deploy-allow-download))
       (insert (format "Bootstrap method: %s%s\n"
                       tramp-rpc-deploy-bootstrap-method
                       (if (member tramp-rpc-deploy-bootstrap-method '("scp" "scpx" "rsync"))

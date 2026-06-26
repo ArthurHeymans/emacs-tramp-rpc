@@ -1,3 +1,6 @@
+// Copyright (C) 2026 Arthur Heymans <arthur@aheymans.xyz>
+// SPDX-License-Identifier: GPL-3.0-or-later
+
 //! Request handlers for TRAMP-RPC operations
 
 pub mod commands;
