@@ -480,11 +480,17 @@ proxy hops remain."
 (defvar tramp-rpc--cache-ttl)
 (defvar tramp-rpc--file-exists-cache)
 (defvar tramp-rpc--file-truename-cache)
+(defvar tramp-rpc--file-stat-cache)
 (defvar tramp-rpc--suppress-fs-notifications)
 (defvar tramp-rpc--watched-directories)
+(defvar tramp-rpc-magit--allow-process-cache)
 (declare-function tramp-rpc--cache-get "tramp-rpc-magit")
 (declare-function tramp-rpc--cache-put "tramp-rpc-magit")
+(declare-function tramp-rpc--cache-lookup "tramp-rpc-magit")
+(declare-function tramp-rpc--file-stat-cache-key "tramp-rpc-magit")
+(declare-function tramp-rpc--cache-file-stat-result "tramp-rpc-magit")
 (declare-function tramp-rpc--invalidate-cache-for-path "tramp-rpc-magit")
+(declare-function tramp-rpc--invalidate-cache-for-subtree "tramp-rpc-magit")
 (declare-function tramp-rpc--connection-key-string "tramp-rpc-magit")
 (declare-function tramp-rpc--directory-watched-p "tramp-rpc-magit")
 (declare-function tramp-rpc--handle-notification "tramp-rpc-magit")
@@ -492,11 +498,17 @@ proxy hops remain."
 (declare-function tramp-rpc-unwatch-directory "tramp-rpc-magit")
 (declare-function tramp-rpc-clear-file-exists-cache "tramp-rpc-magit")
 (declare-function tramp-rpc-clear-file-truename-cache "tramp-rpc-magit")
+(declare-function tramp-rpc-clear-file-stat-cache "tramp-rpc-magit")
+(declare-function tramp-rpc--clear-file-metadata-caches "tramp-rpc-magit")
 (declare-function tramp-rpc--cleanup-watches-for-connection "tramp-rpc-magit")
 (declare-function tramp-rpc--clear-file-caches-for-connection "tramp-rpc-magit")
 (declare-function tramp-rpc-magit--process-cache-lookup "tramp-rpc-magit")
 (declare-function tramp-rpc-magit--process-cache-store "tramp-rpc-magit")
 (declare-function tramp-rpc-magit--file-exists-p "tramp-rpc-magit")
+(declare-function tramp-rpc-magit--clear-status-cache "tramp-rpc-magit")
+(declare-function tramp-rpc-magit--prefetch "tramp-rpc-magit")
+(declare-function tramp-rpc-magit--strip-git-prefix-args "tramp-rpc-magit")
+(declare-function tramp-rpc-magit--git-cache-safe-environment-p "tramp-rpc-magit")
 (declare-function tramp-rpc-magit--clear-cache "tramp-rpc-magit")
 (defvar tramp-rpc-magit--debug)
 (defvar tramp-rpc-magit--process-caches)
@@ -2052,19 +2064,30 @@ For symlinks, follows through to the target (like
 If LSTAT is non-nil, don't follow symlinks.
 Uses `tramp-rpc--call' internally but converts file-missing and
 ELOOP errors to nil (the file effectively doesn't exist for stat)."
-  (let ((params (append (tramp-rpc--encode-path localname)
-                        (when lstat '((lstat . t))))))
-    (condition-case err
-        (tramp-rpc--call vec "file.stat" params)
-      (file-missing nil)
-      (file-error
-       ;; Return nil for ELOOP (symlink loop) and ENOTDIR (path component
-       ;; is not a directory, e.g. "file.py/.editorconfig") - the file
-       ;; can't be resolved, so it effectively doesn't exist for stat purposes.
-       (if (or (string-match-p "Too many levels of symbolic links" (cadr err))
-               (string-match-p "Not a directory" (cadr err)))
-           nil
-         (signal (car err) (cdr err)))))))
+  (let* ((cache-key (tramp-rpc--file-stat-cache-key vec localname lstat))
+         (cached (tramp-rpc--cache-lookup tramp-rpc--file-stat-cache cache-key)))
+    (if (not (eq cached 'not-cached))
+        cached
+      (let ((params (append (tramp-rpc--encode-path localname)
+                            (when lstat '((lstat . t))))))
+        (condition-case err
+            (let ((stat (tramp-rpc--call vec "file.stat" params)))
+              (tramp-rpc--cache-file-stat-result vec localname stat lstat)
+              stat)
+          (file-missing
+           (tramp-rpc--cache-file-stat-result vec localname nil lstat)
+           nil)
+          (file-error
+           ;; Return nil for ELOOP (symlink loop) and ENOTDIR (path component
+           ;; is not a directory, e.g. "file.py/.editorconfig") - the file
+           ;; can't be resolved, so it effectively doesn't exist for stat purposes.
+           (let ((message (error-message-string err)))
+             (if (or (string-match-p "Too many levels of symbolic links" message)
+                     (string-match-p "Not a directory" message))
+                 (progn
+                   (tramp-rpc--cache-file-stat-result vec localname nil lstat)
+                   nil)
+               (signal (car err) (cdr err))))))))))
 
 (defun tramp-rpc--file-exists-cache-lookup (filename)
   "Return cached `file-exists-p' value for FILENAME, or `not-cached'.
@@ -2086,22 +2109,32 @@ Uses TRAMP-RPC caches and Magit ancestor scan data before falling back to a
 single `file.stat' RPC.  This avoids latency-amplified marker scans from
 Projectile, project.el, and editorconfig during Magit section expansion."
   (or
-   ;; Preserve TRAMP's empty localname/root fast path semantics.
+   ;; Preserve TRAMP's completion/root and non-essential fast paths, but avoid
+   ;; `tramp-skeleton-file-exists-p' here: its generic symlink preflight adds a
+   ;; second stat for ordinary missing files.  Server `file.stat' follows
+   ;; symlinks and maps dangling/cyclic links to nil, so one RPC is enough.
    (tramp-string-empty-or-nil-p (tramp-file-local-name filename))
    (string-equal (tramp-file-local-name filename) "/")
-   (pcase (tramp-rpc-magit--file-exists-p filename)
-     ('not-cached
-      (pcase (tramp-rpc--file-exists-cache-lookup filename)
-        ('not-cached
-         (with-parsed-tramp-file-name (expand-file-name filename) nil
-           (let* ((stat (tramp-rpc--call-file-stat v localname))
-                  (exists (if stat t nil)))
-             (tramp-rpc--cache-put tramp-rpc--file-exists-cache
-                                   (expand-file-name filename)
-                                   exists)
-             exists)))
-        (cached cached)))
-     (cached cached))))
+   (when (tramp-connectable-p filename)
+     (with-parsed-tramp-file-name (expand-file-name filename) nil
+       (with-tramp-file-property v localname "file-exists-p"
+         (cond
+          ((and-let* (((tramp-file-property-p v localname "file-attributes"))
+                      (fa (tramp-get-file-property v localname "file-attributes"))
+                      ((not (stringp (car fa)))))))
+          (t
+           (pcase (tramp-rpc-magit--file-exists-p filename)
+             ('not-cached
+              (pcase (tramp-rpc--file-exists-cache-lookup filename)
+                ('not-cached
+                 (let* ((stat (tramp-rpc--call-file-stat v localname))
+                        (exists (if stat t nil)))
+                   (tramp-rpc--cache-put tramp-rpc--file-exists-cache
+                                         (expand-file-name filename)
+                                         exists)
+                   exists))
+                (cached cached)))
+             (cached cached)))))))))
 
 (defun tramp-rpc-handle-file-readable-p (filename)
   "Like `file-readable-p' for TRAMP-RPC files.
@@ -2117,50 +2150,84 @@ which would otherwise perform another remote stat."
     ('nil nil)
     (_ (tramp-handle-file-regular-p filename))))
 
+(defun tramp-rpc-handle-file-symlink-p (filename)
+  "Like `file-symlink-p' for TRAMP-RPC files."
+  (with-parsed-tramp-file-name (expand-file-name filename) nil
+    (when-let* ((stat (tramp-rpc--call-file-stat v localname t))
+                ((equal (alist-get 'type stat) "symlink")))
+      (tramp-rpc--decode-string (alist-get 'link_target stat)))))
+
+(defun tramp-rpc-handle-access-file (filename string)
+  "Like `access-file' for TRAMP-RPC files."
+  (condition-case err
+      (tramp-handle-access-file filename string)
+    (file-error
+     (let* ((target (file-symlink-p filename))
+            (target-file
+             (and target
+                  (if (file-name-absolute-p target)
+                      (with-parsed-tramp-file-name filename nil
+                        (tramp-make-tramp-file-name v target))
+                    (expand-file-name target (file-name-directory filename))))))
+       (if (and target
+                (not (file-exists-p filename))
+                ;; Preserve symlink-cycle errors; only dangling links are missing.
+                (not (file-symlink-p target-file)))
+           (signal 'file-missing (cdr err))
+         (signal (car err) (cdr err)))))))
+
 
 (defun tramp-rpc-handle-file-truename (filename)
   "Like `file-truename' for TRAMP-RPC files.
 Resolves symlinks in the path.  For non-existing files, returns the
 path unchanged (after resolving any symlinks in parent directories)."
-  ;; Use tramp-skeleton-file-truename which handles:
-  ;; - Caching via with-tramp-file-property
-  ;; - Proper filename expansion and unquoting
-  ;; - Preserving trailing "/" and requoting
-  ;; The BODY must return a localname, which the skeleton wraps with
-  ;; tramp-make-tramp-file-name.
-  (tramp-skeleton-file-truename filename
-    ;; Try RPC first for existing files (fast path)
-    (condition-case nil
-        (let* ((result (tramp-rpc--call v "file.truename"
-                                        (tramp-rpc--encode-path localname)))
-               (path (tramp-rpc--decode-string
-                      (if (and (listp result) (not (msgpack-bin-p result)))
-                          (alist-get 'path result)
-                        result))))
-          (or path localname))
-      ;; If file doesn't exist or has a symlink loop, fall back to
-      ;; symlink-chasing approach (same as tramp-handle-file-truename).
-      ;; ELOOP (symlink loop) maps to file-error, not file-missing.
-      (file-error
-       (let ((result (directory-file-name localname))
-             (numchase 0)
-             (numchase-limit 20)
-             symlink-target)
-         (while (and (setq symlink-target
-                           (file-symlink-p (tramp-make-tramp-file-name v result)))
-                     (< numchase numchase-limit))
-           (setq numchase (1+ numchase)
-                 result
-                 (if (tramp-tramp-file-p symlink-target)
-                     (file-name-quote symlink-target 'top)
-                   (tramp-drop-volume-letter
-                    (expand-file-name
-                     symlink-target (file-name-directory result)))))
-           (when (>= numchase numchase-limit)
-             (tramp-error
-              v 'file-error
-              "Maximum number (%d) of symlinks exceeded" numchase-limit)))
-         (directory-file-name result))))))
+  (let* ((expanded (expand-file-name filename))
+         (cached (tramp-rpc--cache-get tramp-rpc--file-truename-cache
+                                      expanded)))
+    (or cached
+        (let ((truename
+               ;; Use tramp-skeleton-file-truename which handles:
+               ;; - Caching via with-tramp-file-property
+               ;; - Proper filename expansion and unquoting
+               ;; - Preserving trailing "/" and requoting
+               ;; The BODY must return a localname, which the skeleton wraps with
+               ;; tramp-make-tramp-file-name.
+               (tramp-skeleton-file-truename filename
+                 ;; Try RPC first for existing files (fast path)
+                 (condition-case nil
+                     (let* ((result (tramp-rpc--call v "file.truename"
+                                                     (tramp-rpc--encode-path localname)))
+                            (path (tramp-rpc--decode-string
+                                   (if (and (listp result) (not (msgpack-bin-p result)))
+                                       (alist-get 'path result)
+                                     result))))
+                       (or path localname))
+                   ;; If file doesn't exist or has a symlink loop, fall back to
+                   ;; symlink-chasing approach (same as tramp-handle-file-truename).
+                   ;; ELOOP (symlink loop) maps to file-error, not file-missing.
+                   (file-error
+                    (let ((result (directory-file-name localname))
+                          (numchase 0)
+                          (numchase-limit 20)
+                          symlink-target)
+                      (while (and (setq symlink-target
+                                        (file-symlink-p (tramp-make-tramp-file-name v result)))
+                                  (< numchase numchase-limit))
+                        (setq numchase (1+ numchase)
+                              result
+                              (if (tramp-tramp-file-p symlink-target)
+                                  (file-name-quote symlink-target 'top)
+                                (tramp-drop-volume-letter
+                                 (expand-file-name
+                                  symlink-target (file-name-directory result)))))
+                        (when (>= numchase numchase-limit)
+                          (tramp-error
+                           v 'file-error
+                           "Maximum number (%d) of symlinks exceeded" numchase-limit)))
+                      (directory-file-name result)))))))
+          (tramp-rpc--cache-put tramp-rpc--file-truename-cache expanded truename)
+          truename))))
+
 
 (defun tramp-rpc-handle-file-attributes (filename &optional id-format)
   "Like `file-attributes' for TRAMP-RPC files."
@@ -2168,10 +2235,14 @@ path unchanged (after resolving any symlinks in parent directories)."
     (with-tramp-file-property
         v localname (format "file-attributes-%s" id-format)
       (let ((result (tramp-rpc--call-file-stat v localname t)))  ; lstat=t
-        ;; Populate file-exists cache as side effect
-        (let ((expanded (expand-file-name filename)))
-          (tramp-rpc--cache-put tramp-rpc--file-exists-cache
-                                expanded (if result t nil)))
+        ;; Populate file-exists cache as side effect when lstat is definitive
+        ;; for follow semantics.  For symlinks, lstat success does not tell us
+        ;; whether the target exists (dangling symlink), so leave file-exists-p
+        ;; uncached.
+        (unless (and result (equal (alist-get 'type result) "symlink"))
+          (let ((expanded (expand-file-name filename)))
+            (tramp-rpc--cache-put tramp-rpc--file-exists-cache
+                                  expanded (if result t nil))))
         ;; `file-attributes' uses lstat, while `file-directory-p' follows
         ;; symlinks.  Only populate the directory predicate cache when the
         ;; lstat answer is definitive for the follow case too.
@@ -2241,11 +2312,19 @@ errors instead of probing first."
          ;; that depend on modes/timestamps must be recomputed.
          '("file-directory-p" "file-exists-p" "file-symlink-p" "file-truename")
        (tramp-flush-file-properties v localname))
-     (condition-case err
-         (progn ,@body)
-       (error (if tramp-inhibit-errors-if-setting-file-attributes-fail
-                  (display-warning 'tramp (error-message-string err))
-                (signal (car err) (cdr err)))))))
+    (condition-case err
+        (let ((result (progn ,@body)))
+          ;; Attribute mutations change mode/time/owner data used by
+          ;; `file-attributes' and predicates such as `file-executable-p'.  TRAMP
+          ;; properties were flushed above; also drop TRAMP-RPC's parallel
+          ;; metadata caches so a prior `file.stat' result cannot survive chmod
+          ;; or touch until TTL expiry.
+          (tramp-rpc--invalidate-cache-for-path
+           (tramp-make-tramp-file-name v localname))
+          result)
+      (error (if tramp-inhibit-errors-if-setting-file-attributes-fail
+                 (display-warning 'tramp (error-message-string err))
+               (signal (car err) (cdr err)))))))
 
 (defun tramp-rpc-handle-set-file-modes (filename mode &optional _flag)
   "Like `set-file-modes' for TRAMP-RPC files."
@@ -2620,7 +2699,9 @@ network round-trip."
     (tramp-rpc--call v "dir.remove"
                      (append (tramp-rpc--encode-path localname)
                              `((recursive . ,(if recursive t :msgpack-false))))))
-  (tramp-rpc--invalidate-cache-for-path directory))
+  (if recursive
+      (tramp-rpc--invalidate-cache-for-subtree directory)
+    (tramp-rpc--invalidate-cache-for-path directory)))
 
 ;; ============================================================================
 ;; File I/O operations
@@ -3094,10 +3175,14 @@ copy options.  Fall back to the generic TRAMP handler for cross-remote copies."
                            (overwrite . ,(if ok-if-already-exists
                                              t :msgpack-false))))
         (tramp-flush-file-properties v1 v1-localname)
-        (tramp-rpc--invalidate-cache-for-path filename)
+        (if (equal source-type "directory")
+            (tramp-rpc--invalidate-cache-for-subtree filename)
+          (tramp-rpc--invalidate-cache-for-path filename))
         (tramp-flush-file-properties v2 v2-localname)
         (tramp-flush-directory-properties v2 v2-localname)
-        (tramp-rpc--invalidate-cache-for-path newname)))))
+        (if (equal source-type "directory")
+            (tramp-rpc--invalidate-cache-for-subtree newname)
+          (tramp-rpc--invalidate-cache-for-path newname))))))
 
 (cl-defun tramp-rpc-handle-rename-file (filename newname &optional ok-if-already-exists)
   "Like `rename-file' for TRAMP-RPC files."
@@ -3110,49 +3195,56 @@ copy options.  Fall back to the generic TRAMP handler for cross-remote copies."
     (cl-return-from tramp-rpc-handle-rename-file
       (tramp-rpc--rename-file-same-remote
        filename newname ok-if-already-exists)))
-  ;; Check ok-if-already-exists BEFORE any directory rewriting.
-  (when (file-exists-p newname)
-    (unless ok-if-already-exists
-      (signal 'file-already-exists (list newname)))
-    ;; Even with ok-if-already-exists, can't rename a file onto a directory.
+  (let ((source-directory-p (file-directory-p filename)))
+    ;; Check ok-if-already-exists BEFORE any directory rewriting.
+    (when (file-exists-p newname)
+      (unless ok-if-already-exists
+        (signal 'file-already-exists (list newname)))
+      ;; Even with ok-if-already-exists, can't rename a file onto a directory.
+      (when (and (file-directory-p newname)
+                 (not (directory-name-p newname))
+                 (not (file-directory-p filename)))
+        (signal 'file-error (list "File is a directory" newname))))
+    ;; If newname is a directory (with trailing slash), rename INTO it.
     (when (and (file-directory-p newname)
-               (not (directory-name-p newname))
-               (not (file-directory-p filename)))
-      (signal 'file-error (list "File is a directory" newname))))
-  ;; If newname is a directory (with trailing slash), rename INTO it.
-  (when (and (file-directory-p newname)
-             (directory-name-p newname))
-    (setq newname (expand-file-name (file-name-nondirectory filename) newname)))
-  (let ((source-remote (tramp-tramp-file-p filename))
-        (dest-remote (tramp-tramp-file-p newname)))
-    (cond
-     ;; Both on same remote host using RPC
-     ((and source-remote dest-remote
-           (tramp-equal-remote filename newname))
-      (with-parsed-tramp-file-name filename v1
+               (directory-name-p newname))
+      (setq newname (expand-file-name (file-name-nondirectory filename) newname)))
+    (let ((source-remote (tramp-tramp-file-p filename))
+          (dest-remote (tramp-tramp-file-p newname)))
+      (cond
+       ;; Both on same remote host using RPC.
+       ((and source-remote dest-remote
+             (tramp-equal-remote filename newname))
+        (with-parsed-tramp-file-name filename v1
+          (with-parsed-tramp-file-name newname v2
+            (tramp-rpc--call v1 "file.rename"
+                             `((src . ,(tramp-rpc--path-to-bin
+                                        (file-name-unquote v1-localname)))
+                               (dest . ,(tramp-rpc--path-to-bin
+                                         (file-name-unquote v2-localname)))
+                               (overwrite . ,(if ok-if-already-exists
+                                                 t :msgpack-false)))))))
+       ;; Different hosts, copy then delete.
+       (t
+        (copy-file filename newname ok-if-already-exists t t t)
+        (if (file-directory-p filename)
+            (delete-directory filename 'recursive)
+          (delete-file filename))))
+      ;; Flush tramp file property cache for source and destination.
+      (when source-remote
+        (with-parsed-tramp-file-name filename v1
+          (tramp-flush-file-properties v1 v1-localname))
+        (if source-directory-p
+            (tramp-rpc--invalidate-cache-for-subtree filename)
+          (tramp-rpc--invalidate-cache-for-path filename)))
+      (when dest-remote
         (with-parsed-tramp-file-name newname v2
-          (tramp-rpc--call v1 "file.rename"
-                           `((src . ,(tramp-rpc--path-to-bin
-                                      (file-name-unquote v1-localname)))
-                             (dest . ,(tramp-rpc--path-to-bin
-                                       (file-name-unquote v2-localname)))
-                             (overwrite . ,(if ok-if-already-exists t :msgpack-false)))))))
-     ;; Different hosts, copy then delete
-     (t
-      (copy-file filename newname ok-if-already-exists t t t)
-      (if (file-directory-p filename)
-          (delete-directory filename 'recursive)
-        (delete-file filename))))
-    ;; Flush tramp file property cache for source and destination
-    (when source-remote
-      (with-parsed-tramp-file-name filename v1
-        (tramp-flush-file-properties v1 v1-localname))
-      (tramp-rpc--invalidate-cache-for-path filename))
-    (when dest-remote
-      (with-parsed-tramp-file-name newname v2
-        (tramp-flush-file-properties v2 v2-localname)
-        (tramp-flush-directory-properties v2 v2-localname))
-      (tramp-rpc--invalidate-cache-for-path newname))))
+          (tramp-flush-file-properties v2 v2-localname)
+          (tramp-flush-directory-properties v2 v2-localname))
+        (if source-directory-p
+            (tramp-rpc--invalidate-cache-for-subtree newname)
+          (tramp-rpc--invalidate-cache-for-path newname))))))
+
 
 (defun tramp-rpc-handle-delete-file (filename &optional trash)
   "Like `delete-file' for TRAMP-RPC files.
@@ -3356,21 +3448,27 @@ implementation, which will use the normal TRAMP-RPC file handlers underneath."
             (tramp-rpc--fallback-move-file-to-trash filename))))
     (tramp-rpc--fallback-move-file-to-trash filename)))
 
-(defun tramp-rpc-handle-make-symbolic-link (target linkname &optional ok-if-already-exists)
+(defun tramp-rpc-handle-make-symbolic-link
+    (target linkname &optional ok-if-already-exists)
   "Like `make-symbolic-link' for TRAMP-RPC files."
-  (tramp-skeleton-make-symbolic-link target linkname ok-if-already-exists
-    (let* ((target-path (file-name-unquote target))
-           (link-path-params (tramp-rpc--encode-path localname))
-           ;; Rename 'path' to 'link_path' in the encoded params
-           (params (mapcar (lambda (p)
-                              (if (eq (car p) 'path)
-                                  (cons 'link_path (cdr p))
-                                (if (eq (car p) 'path_encoding)
-                                    (cons 'link_path_encoding (cdr p))
-                                  p)))
-                            link-path-params)))
-      (tramp-rpc--call v "file.make_symlink"
-                       (append `((target . ,(tramp-rpc--path-to-bin target-path))) params)))
+  (prog1
+      (tramp-skeleton-make-symbolic-link target linkname ok-if-already-exists
+        (let* ((target-path (file-name-unquote target))
+               (link-path-params (tramp-rpc--encode-path localname))
+               ;; Rename 'path' to 'link_path' in the encoded params.
+               (params (mapcar (lambda (p)
+                                  (cond
+                                   ((eq (car p) 'path)
+                                    (cons 'link_path (cdr p)))
+                                   ((eq (car p) 'path_encoding)
+                                    (cons 'link_path_encoding (cdr p)))
+                                   (t p)))
+                                link-path-params)))
+          (tramp-rpc--call
+           v "file.make_symlink"
+           (append `((target . ,(tramp-rpc--path-to-bin target-path)))
+                   params))))
+
     (tramp-rpc--invalidate-cache-for-path linkname)))
 
 (defun tramp-rpc-handle-add-name-to-file (filename newname &optional ok-if-already-exists)
@@ -3398,12 +3496,16 @@ Creates a hard link from NEWNAME to FILENAME."
                                    v2-localname)))))
             (tramp-error v2 'file-already-exists newname)
           (delete-file newname)))
+      (tramp-flush-file-properties v1 v1-localname)
       (tramp-flush-file-properties v2 v2-localname)
       (tramp-rpc--call v1 "file.make_hardlink"
                        `((src . ,(tramp-rpc--path-to-bin
                                   (file-name-unquote v1-localname)))
                          (dest . ,(tramp-rpc--path-to-bin
-                                   (file-name-unquote v2-localname))))))))
+                                  (file-name-unquote v2-localname)))))
+      (tramp-rpc--invalidate-cache-for-path filename)
+      (tramp-rpc--invalidate-cache-for-path newname))))
+
 
 (defun tramp-rpc-handle-set-file-uid-gid (filename &optional uid gid)
   "Like `tramp-set-file-uid-gid' for TRAMP-RPC files.
@@ -3738,6 +3840,21 @@ refresh), git commands are served from the prefetch cache when possible."
                 (when (null infile)
                   (tramp-rpc-magit--process-cache-store
                    program args exit-code stdout))
+
+                ;; Preserve Magit's ordering for status refresh: let the real
+                ;; `update-index --refresh' run, then build the read snapshot
+                ;; that subsequent status/diff/log commands may reuse.
+                (when (and (null infile)
+                           (bound-and-true-p tramp-rpc-magit--allow-process-cache)
+                           (or (string-suffix-p "/git" program)
+                               (string= "git" program))
+                           (= exit-code 0)
+                           (tramp-rpc-magit--git-cache-safe-environment-p))
+                  (let ((core-args (tramp-rpc-magit--strip-git-prefix-args args)))
+                    (when (and (equal (car core-args) "update-index")
+                               (member "--refresh" core-args))
+                      (tramp-rpc-magit--clear-status-cache)
+                      (tramp-rpc-magit--prefetch default-directory))))
 
                 ;; Handle destination
                 (tramp-rpc--route-process-file-output destination stdout stderr)
@@ -4657,7 +4774,7 @@ Also controls process exit detection latency."
     (file-executable-p . tramp-rpc-handle-file-executable-p)
     (file-directory-p . tramp-rpc-handle-file-directory-p)
     (file-regular-p . tramp-rpc-handle-file-regular-p)
-    (file-symlink-p . tramp-handle-file-symlink-p)
+    (file-symlink-p . tramp-rpc-handle-file-symlink-p)
     (file-truename . tramp-rpc-handle-file-truename)
     (file-attributes . tramp-rpc-handle-file-attributes)
     (file-modes . tramp-handle-file-modes)
@@ -4737,7 +4854,7 @@ Also controls process exit detection latency."
     (file-group-gid . tramp-handle-file-group-gid)
     (file-user-uid . tramp-handle-file-user-uid)
     (memory-info . tramp-handle-memory-info)
-    (access-file . tramp-handle-access-file)
+    (access-file . tramp-rpc-handle-access-file)
     (directory-file-name . tramp-handle-directory-file-name)
     (dired-uncache . tramp-handle-dired-uncache)
     (file-accessible-directory-p . tramp-handle-file-accessible-directory-p)
@@ -4912,8 +5029,7 @@ cleanup of all connections has run."
   (clrhash tramp-rpc--async-callbacks)
   (clrhash tramp-rpc--executable-cache)
   (tramp-rpc--clear-direnv-cache)
-  (tramp-rpc-clear-file-exists-cache)
-  (tramp-rpc-clear-file-truename-cache)
+  (tramp-rpc--clear-file-metadata-caches)
   ;; Note: recentf cleanup is handled by `tramp-recentf-cleanup-all'
   ;; from tramp-integration.el, registered on the same
   ;; `tramp-cleanup-all-connections-hook'.

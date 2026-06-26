@@ -774,6 +774,36 @@ This matches the behavior expected by `tramp-test28-process-file'."
      nil))
   "Non-nil if tramp-rpc.el loaded successfully.")
 
+(defvar tramp-rpc-mock-test--tramp-rpc-magit-loaded
+  (or tramp-rpc-mock-test--tramp-rpc-loaded
+      (condition-case err
+          (progn
+            (require 'tramp)
+            (require 'tramp-rpc-magit)
+            t)
+        (error
+         (message "Could not load tramp-rpc-magit: %s" err)
+         nil)))
+  "Non-nil if tramp-rpc-magit.el loaded successfully.")
+
+(ert-deftest tramp-rpc-mock-test-ancestor-scan-parent-falls-through ()
+  "Closest-only ancestor scan must not cache false negatives above the hit."
+  (skip-unless tramp-rpc-mock-test--tramp-rpc-magit-loaded)
+  (let ((scan '((".editorconfig" . "/repo/sub"))))
+    (should (eq (tramp-rpc-magit--file-exists-in-ancestor-scan
+                 "/ssh:mock:/repo/sub/.editorconfig" scan)
+                t))
+    ;; The closest hit proves that deeper descendants before /repo/sub do not
+    ;; contain this marker.
+    (should-not (tramp-rpc-magit--file-exists-in-ancestor-scan
+                 "/ssh:mock:/repo/sub/nested/.editorconfig" scan))
+    ;; It does not prove anything about ancestors above /repo/sub.  A parent
+    ;; lookup must fall back to a real stat so a parent marker is not hidden by
+    ;; the child marker cached from the closest-only scan.
+    (should (eq (tramp-rpc-magit--file-exists-in-ancestor-scan
+                 "/ssh:mock:/repo/.editorconfig" scan)
+                'not-cached))))
+
 (defun tramp-rpc-mock-test--sudo-helper-available-p ()
   "Return non-nil when the sudo path helpers needed by this test are available."
   (and (require 'tramp-cmds nil t)
@@ -1616,6 +1646,221 @@ This matches the behavior expected by `tramp-test28-process-file'."
                  t)))
       (set-file-modes "/rpc:mockhost:/tmp/file" #o644)
       (should (equal (nreverse calls) '("file.set_modes"))))))
+
+(ert-deftest tramp-rpc-mock-test-set-file-modes-invalidates-metadata-caches ()
+  "`set-file-modes' clears cached metadata that depends on file mode bits."
+  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
+  (let* ((filename "/rpc:mockhost:/tmp/file")
+         (vec (tramp-dissect-file-name filename))
+         (localname "/tmp/file")
+         (expanded (expand-file-name filename))
+         (stat-key (tramp-rpc--file-stat-cache-key vec localname nil))
+         (lstat-key (tramp-rpc--file-stat-cache-key vec localname t))
+         (calls nil))
+    (unwind-protect
+        (progn
+          (tramp-rpc--cache-put tramp-rpc--file-exists-cache expanded t)
+          (tramp-rpc--cache-put tramp-rpc--file-truename-cache expanded expanded)
+          (tramp-rpc--cache-put tramp-rpc--file-stat-cache stat-key '((mode . 420)))
+          (tramp-rpc--cache-put tramp-rpc--file-stat-cache lstat-key '((mode . 420)))
+          (cl-letf (((symbol-function 'tramp-rpc--call)
+                     (lambda (_vec method _params)
+                       (push method calls)
+                       t)))
+            (set-file-modes filename #o755))
+          (should (equal (nreverse calls) '("file.set_modes")))
+          (should-not (gethash expanded tramp-rpc--file-exists-cache))
+          (should-not (gethash expanded tramp-rpc--file-truename-cache))
+          (should-not (gethash stat-key tramp-rpc--file-stat-cache))
+          (should-not (gethash lstat-key tramp-rpc--file-stat-cache)))
+      (tramp-rpc--invalidate-cache-for-path filename))))
+
+(ert-deftest tramp-rpc-mock-test-make-symlink-invalidates-negative-lstat-cache ()
+  "`make-symbolic-link' clears stale negative lstat metadata for LINKNAME."
+  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
+  (let* ((filename "/rpc:mockhost:/tmp/link")
+         (vec (tramp-dissect-file-name filename))
+         (localname "/tmp/link")
+         (expanded (expand-file-name filename))
+         (lstat-key (tramp-rpc--file-stat-cache-key vec localname t))
+         (linked nil)
+         calls)
+    (unwind-protect
+        (progn
+          ;; Simulate an earlier `file-symlink-p' or `file-attributes' miss.
+          (tramp-rpc--cache-put tramp-rpc--file-exists-cache expanded nil)
+          (tramp-rpc--cache-put tramp-rpc--file-stat-cache lstat-key nil)
+          (cl-letf (((symbol-function 'tramp-rpc--call)
+                     (lambda (_vec method params)
+                       (push method calls)
+                       (pcase method
+                         ("file.make_symlink"
+                          (setq linked t)
+                          t)
+                         ("file.stat"
+                          (if linked
+                              (if (alist-get 'lstat params)
+                                  `((type . "symlink")
+                                    (link_target . ,(encode-coding-string
+                                                     "target" 'utf-8-unix)))
+                                '((type . "file")))
+                            (signal 'file-missing
+                                    (list "RPC" "No such file"
+                                          (alist-get 'path params)))))
+                         (_ (error "Unexpected RPC method: %s" method))))))
+            (tramp-rpc-handle-make-symbolic-link "target" filename)
+            (should linked)
+            (should-not (gethash expanded tramp-rpc--file-exists-cache))
+            (should-not (gethash lstat-key tramp-rpc--file-stat-cache))
+            ;; `file-exists-p' follows the symlink.  Its followed "file" stat
+            ;; must not be cached as lstat, or `file-symlink-p' will return nil.
+            (should (tramp-rpc-handle-file-exists-p filename))
+            (should (equal (tramp-rpc-handle-file-symlink-p filename)
+                           "target"))
+            (should (member "file.make_symlink" calls))
+            (should (member "file.stat" calls))))
+      (tramp-rpc--invalidate-cache-for-path filename))))
+
+(ert-deftest tramp-rpc-mock-test-follow-stat-does-not-seed-lstat-cache ()
+  "A followed stat for a symlink must not pollute the lstat cache."
+  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
+  (let* ((filename "/rpc:mockhost:/tmp/link")
+         (vec (tramp-dissect-file-name filename))
+         (follow-key (tramp-rpc--file-stat-cache-key vec "/tmp/link" nil))
+         (lstat-key (tramp-rpc--file-stat-cache-key vec "/tmp/link" t)))
+    (unwind-protect
+        (progn
+          (tramp-rpc--cache-file-stat-result
+           vec "/tmp/link" '((type . "file") (mode . 33188)) nil)
+          (should (gethash follow-key tramp-rpc--file-stat-cache))
+          (should-not (gethash lstat-key tramp-rpc--file-stat-cache))
+          (tramp-rpc--cache-file-stat-result
+           vec "/tmp/link" '((type . "file") (mode . 33188)) t)
+          (should (gethash follow-key tramp-rpc--file-stat-cache))
+          (should (gethash lstat-key tramp-rpc--file-stat-cache)))
+      (tramp-rpc--invalidate-cache-for-path filename))))
+
+(ert-deftest tramp-rpc-mock-test-file-stat-file-error-message-matched ()
+  "`file.stat' treats ELOOP/ENOTDIR file-error messages as missing."
+  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
+  (let* ((filename "/rpc:mockhost:/tmp/file/.editorconfig")
+         (vec (tramp-dissect-file-name filename))
+         (key (tramp-rpc--file-stat-cache-key vec "/tmp/file/.editorconfig" nil)))
+    (unwind-protect
+        (cl-letf (((symbol-function 'tramp-rpc--call)
+                   (lambda (_vec _method _params)
+                     (signal 'file-error
+                             '("RPC" "Not a directory" "/tmp/file/.editorconfig")))))
+          (should-not (tramp-rpc--call-file-stat
+                       vec "/tmp/file/.editorconfig"))
+          (should (gethash key tramp-rpc--file-stat-cache)))
+      (tramp-rpc--invalidate-cache-for-path filename))))
+
+(ert-deftest tramp-rpc-mock-test-access-file-dangling-symlink-is-missing ()
+  "`access-file' reports non-cyclic dangling symlinks as `file-missing'."
+  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
+  (cl-letf (((symbol-function 'tramp-handle-access-file)
+             (lambda (_filename _string)
+               (signal 'file-error '("Apparent cycle"))))
+            ((symbol-function 'file-symlink-p)
+             (lambda (_filename) "does-not-exist"))
+            ((symbol-function 'file-exists-p) #'ignore))
+    (should-error
+     (tramp-rpc-handle-access-file "/rpc:mockhost:/tmp/link" "error")
+     :type 'file-missing)))
+
+(ert-deftest tramp-rpc-mock-test-access-file-cyclic-symlink-stays-file-error ()
+  "`access-file' keeps self-referential symlinks as `file-error'."
+  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
+  (cl-letf (((symbol-function 'tramp-handle-access-file)
+             (lambda (_filename _string)
+               (signal 'file-error '("Apparent cycle"))))
+            ((symbol-function 'file-symlink-p)
+             (lambda (_filename) "link"))
+            ((symbol-function 'file-exists-p) #'ignore))
+    (condition-case err
+        (progn
+          (tramp-rpc-handle-access-file "/rpc:mockhost:/tmp/link" "error")
+          (ert-fail "Expected file-error"))
+      (error
+       (should (eq (car err) 'file-error))))))
+
+(ert-deftest tramp-rpc-mock-test-subtree-invalidation-clears-descendant-caches ()
+  "Subtree invalidation clears stale metadata for cached descendants."
+  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
+  (let* ((root "/rpc:mockhost:/tmp/dest")
+         (child "/rpc:mockhost:/tmp/dest/source")
+         (nested "/rpc:mockhost:/tmp/dest/source/file")
+         (sibling "/rpc:mockhost:/tmp/dest-sibling/source")
+         (vec (tramp-dissect-file-name child))
+         (root-key (expand-file-name root))
+         (child-key (expand-file-name child))
+         (nested-key (expand-file-name nested))
+         (sibling-key (expand-file-name sibling))
+         (child-stat-key (tramp-rpc--file-stat-cache-key vec "/tmp/dest/source" nil))
+         (nested-stat-key (tramp-rpc--file-stat-cache-key
+                           vec "/tmp/dest/source/file" nil))
+         (sibling-stat-key (tramp-rpc--file-stat-cache-key
+                            vec "/tmp/dest-sibling/source" nil)))
+    (unwind-protect
+        (progn
+          (dolist (key (list root-key child-key nested-key sibling-key))
+            (tramp-rpc--cache-put tramp-rpc--file-exists-cache key t)
+            (tramp-rpc--cache-put tramp-rpc--file-truename-cache key key))
+          (tramp-rpc--cache-put tramp-rpc--file-stat-cache
+                                child-stat-key '((type . "directory")))
+          (tramp-rpc--cache-put tramp-rpc--file-stat-cache
+                                nested-stat-key '((type . "file")))
+          (tramp-rpc--cache-put tramp-rpc--file-stat-cache
+                                sibling-stat-key '((type . "directory")))
+          (tramp-rpc--invalidate-cache-for-subtree root)
+          (dolist (key (list root-key child-key nested-key))
+            (should-not (gethash key tramp-rpc--file-exists-cache))
+            (should-not (gethash key tramp-rpc--file-truename-cache)))
+          (should-not (gethash child-stat-key tramp-rpc--file-stat-cache))
+          (should-not (gethash nested-stat-key tramp-rpc--file-stat-cache))
+          ;; Prefix matching must not evict similarly named siblings.
+          (should (gethash sibling-key tramp-rpc--file-exists-cache))
+          (should (gethash sibling-key tramp-rpc--file-truename-cache))
+          (should (gethash sibling-stat-key tramp-rpc--file-stat-cache)))
+      (dolist (filename (list root child nested sibling))
+        (tramp-rpc--invalidate-cache-for-path filename)))))
+
+(ert-deftest tramp-rpc-mock-test-hardlink-invalidates-source-and-dest ()
+  "`add-name-to-file' clears source and destination metadata caches."
+  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
+  (let* ((source "/rpc:mockhost:/tmp/source")
+         (dest "/rpc:mockhost:/tmp/dest")
+         (vec (tramp-dissect-file-name source))
+         (source-key (expand-file-name source))
+         (dest-key (expand-file-name dest))
+         (source-stat-key (tramp-rpc--file-stat-cache-key vec "/tmp/source" nil))
+         (dest-stat-key (tramp-rpc--file-stat-cache-key vec "/tmp/dest" nil))
+         calls)
+    (unwind-protect
+        (progn
+          (dolist (key (list source-key dest-key))
+            (tramp-rpc--cache-put tramp-rpc--file-exists-cache key t)
+            (tramp-rpc--cache-put tramp-rpc--file-truename-cache key key))
+          ;; Destination must look absent to the existence preflight.
+          (tramp-rpc--cache-put tramp-rpc--file-exists-cache dest-key nil)
+          (tramp-rpc--cache-put tramp-rpc--file-stat-cache
+                                source-stat-key '((type . "file") (nlink . 1)))
+          (tramp-rpc--cache-put tramp-rpc--file-stat-cache dest-stat-key nil)
+          (cl-letf (((symbol-function 'tramp-rpc--call)
+                     (lambda (_vec method _params)
+                       (push method calls)
+                       (should (equal method "file.make_hardlink"))
+                       t)))
+            (tramp-rpc-handle-add-name-to-file source dest)
+            (should (equal calls '("file.make_hardlink")))
+            (dolist (key (list source-key dest-key))
+              (should-not (gethash key tramp-rpc--file-exists-cache))
+              (should-not (gethash key tramp-rpc--file-truename-cache)))
+            (should-not (gethash source-stat-key tramp-rpc--file-stat-cache))
+            (should-not (gethash dest-stat-key tramp-rpc--file-stat-cache))))
+      (dolist (filename (list source dest))
+        (tramp-rpc--invalidate-cache-for-path filename)))))
 
 (ert-deftest tramp-rpc-mock-test-set-file-modes-no-preflight-missing ()
   "`set-file-modes' surfaces server-side missing-file errors directly."
