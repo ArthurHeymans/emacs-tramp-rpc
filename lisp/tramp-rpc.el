@@ -240,10 +240,15 @@ Returns nil if no proxy hops remain."
 (defvar tramp-rpc--cache-ttl)
 (defvar tramp-rpc--file-exists-cache)
 (defvar tramp-rpc--file-truename-cache)
+(defvar tramp-rpc--file-stat-cache)
 (defvar tramp-rpc--suppress-fs-notifications)
 (defvar tramp-rpc--watched-directories)
+(defvar tramp-rpc-magit--allow-process-cache)
 (declare-function tramp-rpc--cache-get "tramp-rpc-magit")
 (declare-function tramp-rpc--cache-put "tramp-rpc-magit")
+(declare-function tramp-rpc--cache-lookup "tramp-rpc-magit")
+(declare-function tramp-rpc--file-stat-cache-key "tramp-rpc-magit")
+(declare-function tramp-rpc--cache-file-stat-result "tramp-rpc-magit")
 (declare-function tramp-rpc--invalidate-cache-for-path "tramp-rpc-magit")
 (declare-function tramp-rpc--connection-key-string "tramp-rpc-magit")
 (declare-function tramp-rpc--directory-watched-p "tramp-rpc-magit")
@@ -252,11 +257,17 @@ Returns nil if no proxy hops remain."
 (declare-function tramp-rpc-unwatch-directory "tramp-rpc-magit")
 (declare-function tramp-rpc-clear-file-exists-cache "tramp-rpc-magit")
 (declare-function tramp-rpc-clear-file-truename-cache "tramp-rpc-magit")
+(declare-function tramp-rpc-clear-file-stat-cache "tramp-rpc-magit")
+(declare-function tramp-rpc--clear-file-metadata-caches "tramp-rpc-magit")
 (declare-function tramp-rpc--cleanup-watches-for-connection "tramp-rpc-magit")
 (declare-function tramp-rpc--clear-file-caches-for-connection "tramp-rpc-magit")
 (declare-function tramp-rpc-magit--process-cache-lookup "tramp-rpc-magit")
 (declare-function tramp-rpc-magit--process-cache-store "tramp-rpc-magit")
 (declare-function tramp-rpc-magit--file-exists-p "tramp-rpc-magit")
+(declare-function tramp-rpc-magit--clear-status-cache "tramp-rpc-magit")
+(declare-function tramp-rpc-magit--prefetch "tramp-rpc-magit")
+(declare-function tramp-rpc-magit--strip-git-prefix-args "tramp-rpc-magit")
+(declare-function tramp-rpc-magit--git-cache-safe-environment-p "tramp-rpc-magit")
 (declare-function tramp-rpc-magit--clear-cache "tramp-rpc-magit")
 (defvar tramp-rpc-magit--debug)
 (defvar tramp-rpc-magit--process-caches)
@@ -1835,19 +1846,29 @@ For symlinks, follows through to the target (like
 If LSTAT is non-nil, don't follow symlinks.
 Uses `tramp-rpc--call' internally but converts file-missing and
 ELOOP errors to nil (the file effectively doesn't exist for stat)."
-  (let ((params (append (tramp-rpc--encode-path localname)
-                        (when lstat '((lstat . t))))))
-    (condition-case err
-        (tramp-rpc--call vec "file.stat" params)
-      (file-missing nil)
-      (file-error
-       ;; Return nil for ELOOP (symlink loop) and ENOTDIR (path component
-       ;; is not a directory, e.g. "file.py/.editorconfig") - the file
-       ;; can't be resolved, so it effectively doesn't exist for stat purposes.
-       (if (or (string-match-p "Too many levels of symbolic links" (cadr err))
-               (string-match-p "Not a directory" (cadr err)))
-           nil
-         (signal (car err) (cdr err)))))))
+  (let* ((cache-key (tramp-rpc--file-stat-cache-key vec localname lstat))
+         (cached (tramp-rpc--cache-lookup tramp-rpc--file-stat-cache cache-key)))
+    (if (not (eq cached 'not-cached))
+        cached
+      (let ((params (append (tramp-rpc--encode-path localname)
+                            (when lstat '((lstat . t))))))
+        (condition-case err
+            (let ((stat (tramp-rpc--call vec "file.stat" params)))
+              (tramp-rpc--cache-file-stat-result vec localname stat lstat)
+              stat)
+          (file-missing
+           (tramp-rpc--cache-file-stat-result vec localname nil lstat)
+           nil)
+          (file-error
+           ;; Return nil for ELOOP (symlink loop) and ENOTDIR (path component
+           ;; is not a directory, e.g. "file.py/.editorconfig") - the file
+           ;; can't be resolved, so it effectively doesn't exist for stat purposes.
+           (if (or (string-match-p "Too many levels of symbolic links" (cadr err))
+                   (string-match-p "Not a directory" (cadr err)))
+               (progn
+                 (tramp-rpc--cache-file-stat-result vec localname nil lstat)
+                 nil)
+             (signal (car err) (cdr err)))))))))
 
 (defun tramp-rpc--file-exists-cache-lookup (filename)
   "Return cached `file-exists-p' value for FILENAME, or `not-cached'.
@@ -1905,46 +1926,53 @@ which would otherwise perform another remote stat."
   "Like `file-truename' for TRAMP-RPC files.
 Resolves symlinks in the path.  For non-existing files, returns the
 path unchanged (after resolving any symlinks in parent directories)."
-  ;; Use tramp-skeleton-file-truename which handles:
-  ;; - Caching via with-tramp-file-property
-  ;; - Proper filename expansion and unquoting
-  ;; - Preserving trailing "/" and requoting
-  ;; The BODY must return a localname, which the skeleton wraps with
-  ;; tramp-make-tramp-file-name.
-  (tramp-skeleton-file-truename filename
-    ;; Try RPC first for existing files (fast path)
-    (condition-case nil
-        (let* ((result (tramp-rpc--call v "file.truename"
-                                        (tramp-rpc--encode-path localname)))
-               ;; With MessagePack, path comes as raw bytes - decode to UTF-8
-               (path (tramp-rpc--decode-string
-                      (if (stringp result)
-                          result
-                        (alist-get 'path result)))))
-          (or path localname))
-      ;; If file doesn't exist or has a symlink loop, fall back to
-      ;; symlink-chasing approach (same as tramp-handle-file-truename).
-      ;; ELOOP (symlink loop) maps to file-error, not file-missing.
-      (file-error
-       (let ((result (directory-file-name localname))
-             (numchase 0)
-             (numchase-limit 20)
-             symlink-target)
-         (while (and (setq symlink-target
-                           (file-symlink-p (tramp-make-tramp-file-name v result)))
-                     (< numchase numchase-limit))
-           (setq numchase (1+ numchase)
-                 result
-                 (if (tramp-tramp-file-p symlink-target)
-                     (file-name-quote symlink-target 'top)
-                   (tramp-drop-volume-letter
-                    (expand-file-name
-                     symlink-target (file-name-directory result)))))
-           (when (>= numchase numchase-limit)
-             (tramp-error
-              v 'file-error
-              "Maximum number (%d) of symlinks exceeded" numchase-limit)))
-         (directory-file-name result))))))
+  (let* ((expanded (expand-file-name filename))
+         (cached (tramp-rpc--cache-get tramp-rpc--file-truename-cache
+                                      expanded)))
+    (or cached
+        (let ((truename
+               ;; Use tramp-skeleton-file-truename which handles:
+               ;; - Caching via with-tramp-file-property
+               ;; - Proper filename expansion and unquoting
+               ;; - Preserving trailing "/" and requoting
+               ;; The BODY must return a localname, which the skeleton wraps with
+               ;; tramp-make-tramp-file-name.
+               (tramp-skeleton-file-truename filename
+                 ;; Try RPC first for existing files (fast path)
+                 (condition-case nil
+                     (let* ((result (tramp-rpc--call v "file.truename"
+                                                     (tramp-rpc--encode-path localname)))
+                            ;; With MessagePack, path comes as raw bytes - decode to UTF-8
+                            (path (tramp-rpc--decode-string
+                                   (if (stringp result)
+                                       result
+                                     (alist-get 'path result)))))
+                       (or path localname))
+                   ;; If file doesn't exist or has a symlink loop, fall back to
+                   ;; symlink-chasing approach (same as tramp-handle-file-truename).
+                   ;; ELOOP (symlink loop) maps to file-error, not file-missing.
+                   (file-error
+                    (let ((result (directory-file-name localname))
+                          (numchase 0)
+                          (numchase-limit 20)
+                          symlink-target)
+                      (while (and (setq symlink-target
+                                        (file-symlink-p (tramp-make-tramp-file-name v result)))
+                                  (< numchase numchase-limit))
+                        (setq numchase (1+ numchase)
+                              result
+                              (if (tramp-tramp-file-p symlink-target)
+                                  (file-name-quote symlink-target 'top)
+                                (tramp-drop-volume-letter
+                                 (expand-file-name
+                                  symlink-target (file-name-directory result)))))
+                        (when (>= numchase numchase-limit)
+                          (tramp-error
+                           v 'file-error
+                           "Maximum number (%d) of symlinks exceeded" numchase-limit)))
+                      (directory-file-name result)))))))
+          (tramp-rpc--cache-put tramp-rpc--file-truename-cache expanded truename)
+          truename))))
 
 (defun tramp-rpc-handle-file-attributes (filename &optional id-format)
   "Like `file-attributes' for TRAMP-RPC files."
@@ -1952,10 +1980,14 @@ path unchanged (after resolving any symlinks in parent directories)."
     (with-tramp-file-property
         v localname (format "file-attributes-%s" id-format)
       (let ((result (tramp-rpc--call-file-stat v localname t)))  ; lstat=t
-        ;; Populate file-exists cache as side effect
-        (let ((expanded (expand-file-name filename)))
-          (tramp-rpc--cache-put tramp-rpc--file-exists-cache
-                                expanded (if result t nil)))
+        ;; Populate file-exists cache as side effect when lstat is definitive
+        ;; for follow semantics.  For symlinks, lstat success does not tell us
+        ;; whether the target exists (dangling symlink), so leave file-exists-p
+        ;; uncached.
+        (unless (and result (equal (alist-get 'type result) "symlink"))
+          (let ((expanded (expand-file-name filename)))
+            (tramp-rpc--cache-put tramp-rpc--file-exists-cache
+                                  expanded (if result t nil))))
         ;; `file-attributes' uses lstat, while `file-directory-p' follows
         ;; symlinks.  Only populate the directory predicate cache when the
         ;; lstat answer is definitive for the follow case too.
@@ -3327,6 +3359,21 @@ refresh), git commands are served from the prefetch cache when possible."
                   (tramp-rpc-magit--process-cache-store
                    program args exit-code stdout))
 
+                ;; Preserve Magit's ordering for status refresh: let the real
+                ;; `update-index --refresh' run, then build the read snapshot
+                ;; that subsequent status/diff/log commands may reuse.
+                (when (and (null infile)
+                           (bound-and-true-p tramp-rpc-magit--allow-process-cache)
+                           (or (string-suffix-p "/git" program)
+                               (string= "git" program))
+                           (= exit-code 0)
+                           (tramp-rpc-magit--git-cache-safe-environment-p))
+                  (let ((core-args (tramp-rpc-magit--strip-git-prefix-args args)))
+                    (when (and (equal (car core-args) "update-index")
+                               (member "--refresh" core-args))
+                      (tramp-rpc-magit--clear-status-cache)
+                      (tramp-rpc-magit--prefetch default-directory))))
+
                 ;; Handle destination
                 (tramp-rpc--route-process-file-output destination stdout stderr)
 
@@ -4494,8 +4541,7 @@ cleanup of all connections has run."
   (clrhash tramp-rpc--async-callbacks)
   (clrhash tramp-rpc--executable-cache)
   (tramp-rpc--clear-direnv-cache)
-  (tramp-rpc-clear-file-exists-cache)
-  (tramp-rpc-clear-file-truename-cache)
+  (tramp-rpc--clear-file-metadata-caches)
   ;; Note: recentf cleanup is handled by `tramp-recentf-cleanup-all'
   ;; from tramp-integration.el, registered on the same
   ;; `tramp-cleanup-all-connections-hook'.
