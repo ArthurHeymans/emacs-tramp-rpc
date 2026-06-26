@@ -51,6 +51,9 @@
 (declare-function tramp-rpc--file-notify-dispatch "tramp-rpc")
 (declare-function tramp-rpc--watch-entry-canonical-directory "tramp-rpc")
 
+;; Functions from tramp-cache.el.
+(declare-function tramp-flush-file-properties "tramp-cache")
+
 ;; Functions from magit-section.el.
 (declare-function magit-section-show "magit-section")
 
@@ -155,6 +158,11 @@ because both variants return the same attributes."
                 (remhash candidate tramp-rpc--file-truename-cache)
                 (remhash (cons candidate nil) tramp-rpc--file-stat-cache)
                 (remhash (cons candidate t) tramp-rpc--file-stat-cache))
+              (flush-tramp-properties (candidate)
+                (when (tramp-tramp-file-p candidate)
+                  (ignore-errors
+                    (with-parsed-tramp-file-name candidate nil
+                      (tramp-flush-file-properties v localname)))))
               (spellings (path)
                 (delete-dups
                  (list path
@@ -163,12 +171,14 @@ because both variants return the same attributes."
                         (directory-file-name path))))))
     (let ((expanded (expand-file-name filename)))
       (dolist (candidate (spellings expanded))
-        (drop candidate))
+        (drop candidate)
+        (flush-tramp-properties candidate))
       ;; Also invalidate parent directory.
       (let ((dir (file-name-directory expanded)))
         (when dir
           (dolist (candidate (spellings dir))
-            (drop candidate)))))))
+            (drop candidate)
+            (flush-tramp-properties candidate)))))))
 
 (defun tramp-rpc-clear-file-exists-cache ()
   "Clear the file-exists-p cache."
@@ -1475,12 +1485,14 @@ clearing caches mid-refresh."
             (and (boundp 'magit-diff-adjust-tab-width)
                  magit-diff-adjust-tab-width))))
     (tramp-rpc-magit--clear-status-cache)
-    (unwind-protect
+    ;; Drop stale metadata before refresh.  Fresh metadata prefetched during the
+    ;; refresh must survive so lazy Magit section expansion can reuse it.
+    (tramp-rpc--clear-file-metadata-caches)
+    (condition-case err
         (tramp-run-real-handler 'magit-status-setup-buffer (list directory))
-      ;; Keep process-file cache briefly: Magit inserts some expensive status
-      ;; bodies lazily, so pressing TAB should reuse the batched snapshot.
-      ;; Flush file caches since we suppressed fs.events during the refresh.
-      (tramp-rpc--clear-file-metadata-caches))))
+      (error
+       (tramp-rpc--clear-file-metadata-caches)
+       (signal (car err) (cdr err))))))
 
 (defun tramp-rpc-handle-magit-status-refresh-buffer ()
   "Handler for `magit-status-refresh-buffer' to prefetch data.
@@ -1497,12 +1509,14 @@ inotify events from clearing caches mid-refresh."
              nil
            (and (boundp 'magit-diff-adjust-tab-width)
                 magit-diff-adjust-tab-width))))
-    (unwind-protect
+    ;; Drop stale metadata before refresh.  Fresh metadata prefetched during the
+    ;; refresh must survive so lazy Magit section expansion can reuse it.
+    (tramp-rpc--clear-file-metadata-caches)
+    (condition-case err
         (tramp-run-real-handler 'magit-status-refresh-buffer nil)
-      ;; Keep process-file cache briefly: Magit inserts some expensive status
-      ;; bodies lazily, so pressing TAB should reuse the batched snapshot.
-      ;; Flush file caches since we suppressed fs.events during the refresh.
-      (tramp-rpc--clear-file-metadata-caches))))
+      (error
+       (tramp-rpc--clear-file-metadata-caches)
+       (signal (car err) (cdr err))))))
 
 ;;;###autoload
 (defun tramp-rpc-magit-enable ()
