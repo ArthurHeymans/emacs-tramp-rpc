@@ -37,6 +37,21 @@
 ;;; Code:
 
 (require 'ert)
+(require 'cl-lib)
+
+(declare-function tramp-rpc-file-name-p "tramp-rpc")
+(declare-function tramp-rpc--sudo-file-name-p "tramp-rpc")
+(declare-function make-tramp-file-name "tramp")
+(declare-function tramp-dissect-file-name "tramp")
+(declare-function tramp-find-foreign-file-name-handler "tramp")
+(declare-function tramp-get-method-parameter "tramp")
+(declare-function loaddefs-generate "autoload")
+(declare-function update-file-autoloads "autoload")
+(defvar generated-autoload-file)
+(defvar tramp-rpc-method)
+(defvar tramp-foreign-file-name-handler-alist)
+(defvar tramp-default-proxies-alist)
+(defvar tramp-methods)
 
 ;; Get project root
 (defvar tramp-rpc-autoload-test--project-root
