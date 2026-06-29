@@ -58,6 +58,7 @@
 (declare-function tramp-rpc--tramp-remote-process-environment "tramp-rpc")
 (declare-function tramp-rpc--caller-environment "tramp-rpc")
 (declare-function tramp-rpc--ssh-detail-user "tramp-rpc")
+(declare-function tramp-rpc--sudo-rpc-hop-vec "tramp-rpc")
 (declare-function tramp-rpc-file-name-p "tramp-rpc")
 
 ;; Variables from tramp-rpc.el
@@ -394,24 +395,33 @@ so dynamic rebinding, such as TRAMP's `shell-command-sentinel' test
 rebinding, is still honored.  Without cleanup, `get-buffer-process'
 keeps returning the dead cat relay, which makes `vc-dir-busy' think an
 update is still running."
-  (when (process-live-p process)
-    (let ((sentinel (process-sentinel process)))
-      (unless (process-get process :tramp-rpc-cleanup-sentinel-installed)
-        (process-put process :tramp-rpc-cleanup-sentinel-installed t)
-        (set-process-sentinel
-         process
-         (lambda (proc event)
-           (when sentinel
-             (funcall sentinel proc event))
-           (when (memq (process-status proc) '(exit signal))
-             ;; Defer deletion so the full sentinel chain completes first.
-             (run-at-time 0 nil
-                          (lambda ()
-                            (when (and (processp proc)
-                                       (not (process-live-p proc)))
-                              (remhash proc tramp-rpc--async-processes)
-                              (ignore-errors
-                                (delete-process proc))))))))))))
+  (cl-labels ((cleanup
+               (proc)
+               (run-at-time
+                0 nil
+                (lambda ()
+                  (when (processp proc)
+                    (remhash proc tramp-rpc--async-processes)
+                    (unless (process-live-p proc)
+                      (ignore-errors
+                        (delete-process proc))))))))
+    (cond
+     ((process-live-p process)
+      (let ((sentinel (process-sentinel process)))
+        (unless (process-get process :tramp-rpc-cleanup-sentinel-installed)
+          (process-put process :tramp-rpc-cleanup-sentinel-installed t)
+          (set-process-sentinel
+           process
+           (lambda (proc event)
+             (when sentinel
+               (funcall sentinel proc event))
+             (when (memq (process-status proc) '(exit signal))
+               ;; Defer deletion so the full sentinel chain completes first.
+               (cleanup proc)))))))
+     ((processp process)
+      ;; The relay can finish before the deferred installer runs.  Its original
+      ;; sentinel has already fired in that case, so just remove stale tracking.
+      (cleanup process)))))
 
 ;; ============================================================================
 ;; Coding helper
@@ -648,7 +658,11 @@ DIRENV-ENV is an optional alist of environment variables from direnv.
 When `tramp-rpc-use-direct-ssh-pty' is non-nil (the default), this uses
 a direct SSH connection for the PTY, providing much lower latency for
 interactive terminal use.  Otherwise, uses the RPC-based PTY implementation."
-  (if tramp-rpc-use-direct-ssh-pty
+  (if (and tramp-rpc-use-direct-ssh-pty
+           ;; Sudo-via-RPC paths must not use the final sudo vec for direct SSH,
+           ;; because that would attempt to SSH as root instead of using the rpc
+           ;; hop's identity and elevated RPC server.
+           (not (tramp-rpc--sudo-rpc-hop-vec vec)))
       ;; Use direct SSH for low-latency PTY
       (tramp-rpc--make-direct-ssh-pty-process
        vec name buffer command coding noquery filter sentinel localname direnv-env)

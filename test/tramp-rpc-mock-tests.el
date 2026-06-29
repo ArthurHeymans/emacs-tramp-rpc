@@ -3343,6 +3343,57 @@ discard it for being unreadable."
         (when (processp proc)
           (delete-process proc))))))
 
+(ert-deftest tramp-rpc-mock-test-process-cleanup-handles-already-exited-relay ()
+  "Deferred cleanup must remove relays that exit before installation."
+  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
+  (let* ((buffer (generate-new-buffer " *tramp-rpc-cleanup-exited-test*"))
+         (proc (let ((process-connection-type nil))
+                 (start-process "tramp-rpc-cleanup-exited-test" buffer "cat"))))
+    (unwind-protect
+        (progn
+          (puthash proc '(:pid 4242) tramp-rpc--async-processes)
+          (process-send-eof proc)
+          (while (process-live-p proc)
+            (accept-process-output proc 0.01 nil t))
+          (should (gethash proc tramp-rpc--async-processes))
+          (tramp-rpc--install-process-cleanup proc)
+          (accept-process-output nil 0.05)
+          (should-not (gethash proc tramp-rpc--async-processes))
+          (should-not (get-buffer-process buffer)))
+      (when (processp proc)
+        (ignore-errors (delete-process proc)))
+      (when (buffer-live-p buffer)
+        (kill-buffer buffer)))))
+
+(ert-deftest tramp-rpc-mock-test-sudo-via-rpc-pty-uses-rpc-backend ()
+  "PTYs for sudo-via-RPC must not use direct SSH as the sudo target user."
+  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
+  (let ((vec (tramp-dissect-file-name "/rpc:alice@server|sudo:root@server:/root/"))
+        (tramp-rpc-use-direct-ssh-pty t)
+        (rpc-called nil))
+    (cl-letf (((symbol-function 'tramp-rpc--make-direct-ssh-pty-process)
+               (lambda (&rest _)
+                 (error "sudo-via-RPC PTY must not use direct SSH")))
+              ((symbol-function 'tramp-rpc--make-rpc-pty-process)
+               (lambda (got-vec name buffer command coding noquery
+                         filter sentinel localname &optional direnv-env)
+                 (setq rpc-called t)
+                 (should (eq got-vec vec))
+                 (should (equal name "sudo-pty"))
+                 (should-not buffer)
+                 (should (equal command '("id")))
+                 (should-not coding)
+                 (should noquery)
+                 (should-not filter)
+                 (should-not sentinel)
+                 (should (equal localname "/root/"))
+                 (should-not direnv-env)
+                 'rpc-pty)))
+      (should (eq (tramp-rpc--make-pty-process
+                   vec "sudo-pty" nil '("id") nil t nil nil "/root/" nil)
+                  'rpc-pty))
+      (should rpc-called))))
+
 ;;; ============================================================================
 ;;; Direnv Cache Path Normalization Tests (No server or SSH required)
 ;;; ============================================================================
