@@ -464,6 +464,18 @@ pair is a symbol."
 ;; make-process handler
 ;; ============================================================================
 
+(defun tramp-rpc--make-process-skeleton-args (args)
+  "Return ARGS adjusted for `tramp-skeleton-make-process'.
+TRAMP's skeleton uses `or' when resolving `:connection-type', which would
+turn an explicit nil into the dynamic `process-connection-type'.  Native
+`make-process' treats explicit nil as a pipe, so pass `pipe' to the skeleton
+for that one case."
+  (let ((args (copy-sequence args)))
+    (when (and (plist-member args :connection-type)
+               (null (plist-get args :connection-type)))
+      (setq args (plist-put args :connection-type 'pipe)))
+    args))
+
 (defun tramp-rpc-handle-make-process (&rest args)
   "Create an async process on the remote host.
 ARGS are keyword arguments as per `make-process'.
@@ -471,168 +483,142 @@ Supports PTY allocation when :connection-type is \='pty or t,
 or when `process-connection-type' is t.
 For pipe mode, uses async polling for long-running processes.
 Resolves program path and loads direnv environment from working directory."
-  (let* ((name (plist-get args :name))
-         (buffer-arg (plist-get args :buffer))
-         ;; tramp-handle-shell-command passes (output-buffer error-file)
-         ;; as the buffer argument for async commands with stderr.
-         ;; Extract the actual buffer from the list.
-         (buffer (if (consp buffer-arg) (car buffer-arg) buffer-arg))
-         (raw-command (plist-get args :command))
-         (sudo-command (and (car raw-command)
-                            (string= (file-name-nondirectory (car raw-command))
-                                     "sudo")))
-         ;; Check both :connection-type arg and process-connection-type variable.
-         ;; `:connection-type nil' explicitly requests a pipe, so use
-         ;; `plist-member' instead of `or' to preserve that nil value.
-         (connection-type (if (plist-member args :connection-type)
-                              (plist-get args :connection-type)
-                            (when (boundp 'process-connection-type)
-                              process-connection-type)))
-         ;; Determine if PTY is requested.  Only non-PTY literal sudo commands
-         ;; are wrapped for non-interactive stdin authentication; PTY sudo
-         ;; commands stay untouched so sudo can interact with the terminal
-         ;; normally.  For /rpc|sudo paths we follow
-         ;; TRAMP's sudo design and run inside the elevated RPC connection.
-         (use-pty (memq connection-type '(pty t)))
-         (pipe-sudo (and sudo-command (not use-pty)))
-         (command raw-command)
-         (sudo-password nil)
-         (coding (tramp-rpc--normalize-coding (plist-get args :coding)))
-         (noquery (plist-get args :noquery))
-         (filter (plist-get args :filter))
-         (sentinel (plist-get args :sentinel))
-         (stderr (plist-get args :stderr))
-         ;; file-handler is accepted but not used (we ARE the file handler)
-         (_file-handler (plist-get args :file-handler)))
-
-    ;; Ensure we're in a remote directory
-    (unless (tramp-tramp-file-p default-directory)
-      (signal
-       'remote-file-error
-       (list "tramp-rpc-handle-make-process called without remote default-directory")))
-
-    (with-parsed-tramp-file-name default-directory nil
+  (let ((args (tramp-rpc--make-process-skeleton-args args)))
+    ;; Reuse TRAMP's make-process skeleton for type checks, unique process names,
+    ;; buffer setup, stderr validation, and TRAMP file-name parsing.  The body
+    ;; below is only the RPC-specific process creation path.
+    (tramp-skeleton-make-process args nil t
       ;; Unquote localname in case of file-name-quoted paths (e.g. /: prefix).
       (setq localname (file-name-unquote localname))
-      ;; For non-PTY literal sudo commands, validate sudo in the same RPC pipe
-      ;; execution context that will run the command.  If a password is needed,
-      ;; use sudo's stdin wrapper; a separate PTY preauth can miss tty-scoped
-      ;; sudo timestamps and leave the pipe-mode command unauthenticated.
-      (when pipe-sudo
-        (let ((ssh-user (or (tramp-rpc--ssh-detail-user v) (user-login-name))))
-          (if (tramp-rpc--sudo-password-required-p v)
-              (setq sudo-password (tramp-rpc--sudo-read-password v ssh-user)
-                    ;; This RPC path invokes sudo directly, so unlike the SSH
-                    ;; server-start path the empty prompt argument is preserved.
-                    ;; Suppress prompt text so it does not pollute the async
-                    ;; process' stdout/stderr.
-                    command (append (list (car raw-command)
-                                          "-k" "-S" "-p" "")
-                                    (cdr raw-command)))
-            (setq command (append (list (car raw-command) "-n")
-                                  (cdr raw-command))))))
-      ;; Get the remote process environment: PATH from `tramp-remote-path'
-      ;; (or deprecated `tramp-rpc-remote-path'), direnv for this directory,
-      ;; INSIDE_EMACS, and caller-set env vars (e.g. GIT_INDEX_FILE from magit).
-      (let ((process-env (tramp-rpc--ensure-inside-emacs-env
-                          (tramp-rpc--merge-environments
-                           (tramp-rpc--remote-path-environment v)
-                           (tramp-rpc--tramp-remote-process-environment)
-                           (tramp-rpc--get-direnv-environment v localname)
-                           (tramp-rpc--caller-environment)))))
-        (if use-pty
-            ;; PTY mode - start async process with PTY.  Do not add -n or
-            ;; pre-authenticate here; sudo owns the terminal prompt.
-            (tramp-rpc--make-pty-process
-             v name buffer command coding noquery
-             filter sentinel localname process-env)
-          ;; Pipe mode - use a local cat process as relay for proper I/O events
-          ;; This is needed because accept-process-output waits for actual I/O,
-          ;; not just filter calls
-          ;; Leave relative PROGRAM names unresolved so the server's process
-          ;; launcher searches the PATH we pass in PROCESS-ENV.
-          (let* ((program (car command))
-                 (program-args (cdr command))
-                 (remote-pid (tramp-rpc--start-remote-process
-                              v program program-args localname process-env))
-                 ;; Use a local cat process as relay - we write output to its stdin
-                 ;; and it echoes to stdout, triggering proper I/O events
-                 (local-process (let ((process-connection-type nil)) ; Use pipes, not PTY
-                                  (start-process (or name "tramp-rpc-async")
-                                                 buffer
-                                                 "cat")))
-                 (stderr-buffer (cond
-                                 ((bufferp stderr) stderr)
-                                 ((stringp stderr) (get-buffer-create stderr))
-                                 (t nil)))
-                 ;; Create a stderr cat relay so that
-                 ;; (get-buffer-process stderr-buffer) returns a process,
-                 ;; matching the contract of native `make-process' with :stderr.
-                 (stderr-process
-                  (when stderr-buffer
-                    (let* ((process-connection-type nil)
-                           (proc (start-process
-                                  (format "%s-stderr" (or name "tramp-rpc-async"))
-                                  stderr-buffer
-                                  "cat")))
-                      (set-process-query-on-exit-flag proc nil)
-                      proc))))
+      (let* ((sudo-command (and (car command)
+                                (string= (file-name-nondirectory (car command))
+                                         "sudo")))
+             ;; The skeleton normalizes t to `pty'.  `pipe' and nil are both
+             ;; non-PTY from the RPC process launcher's perspective.
+             (use-pty (eq connection-type 'pty))
+             (pipe-sudo (and sudo-command (not use-pty)))
+             (sudo-password nil)
+             (coding (tramp-rpc--normalize-coding coding)))
+        ;; For non-PTY literal sudo commands, validate sudo in the same RPC pipe
+        ;; execution context that will run the command.  If a password is needed,
+        ;; use sudo's stdin wrapper; a separate PTY preauth can miss tty-scoped
+        ;; sudo timestamps and leave the pipe-mode command unauthenticated.
+        (when pipe-sudo
+          (let ((ssh-user (or (tramp-rpc--ssh-detail-user v) (user-login-name))))
+            (if (tramp-rpc--sudo-password-required-p v)
+                (setq sudo-password (tramp-rpc--sudo-read-password v ssh-user)
+                      ;; This RPC path invokes sudo directly, so unlike the SSH
+                      ;; server-start path the empty prompt argument is preserved.
+                      ;; Suppress prompt text so it does not pollute the async
+                      ;; process' stdout/stderr.
+                      command (append (list (car command) "-k" "-S" "-p" "")
+                                      (cdr command)))
+              (setq command (append (list (car command) "-n")
+                                    (cdr command))))))
+        ;; Get the remote process environment: PATH from `tramp-remote-path'
+        ;; (or deprecated `tramp-rpc-remote-path'), direnv for this directory,
+        ;; INSIDE_EMACS, and caller-set env vars (e.g. GIT_INDEX_FILE from magit).
+        (let ((process-env (tramp-rpc--ensure-inside-emacs-env
+                            (tramp-rpc--merge-environments
+                             (tramp-rpc--remote-path-environment v)
+                             (tramp-rpc--tramp-remote-process-environment)
+                             (tramp-rpc--get-direnv-environment v localname)
+                             (tramp-rpc--caller-environment)))))
+          (if use-pty
+              ;; PTY mode - start async process with PTY.  Do not add -n or
+              ;; pre-authenticate here; sudo owns the terminal prompt.
+              (tramp-rpc--make-pty-process
+               v name buffer command coding noquery
+               filter sentinel localname process-env)
+            ;; Pipe mode - use a local cat process as relay for proper I/O events.
+            ;; This is needed because accept-process-output waits for actual I/O,
+            ;; not just filter calls.  Leave relative PROGRAM names unresolved so
+            ;; the server's process launcher searches the PATH we pass in
+            ;; PROCESS-ENV.
+            (let* ((program (car command))
+                   (program-args (cdr command))
+                   (remote-pid (tramp-rpc--start-remote-process
+                                v program program-args localname process-env))
+                   ;; Use a local cat process as relay: we write output to its
+                   ;; stdin and it echoes to stdout, triggering proper I/O events.
+                   (local-process (let ((process-connection-type nil))
+                                    (start-process (or name "tramp-rpc-async")
+                                                   buffer
+                                                   "cat")))
+                   (stderr-buffer (cond
+                                   ((bufferp stderr) stderr)
+                                   ((stringp stderr) (get-buffer-create stderr))
+                                   (t nil)))
+                   ;; Create a stderr cat relay so that
+                   ;; (get-buffer-process stderr-buffer) returns a process,
+                   ;; matching the contract of native `make-process' with :stderr.
+                   (stderr-process
+                    (when stderr-buffer
+                      (let* ((process-connection-type nil)
+                             (proc (start-process
+                                    (format "%s-stderr" (or name "tramp-rpc-async"))
+                                    stderr-buffer
+                                    "cat")))
+                        (set-process-query-on-exit-flag proc nil)
+                        proc))))
 
-          ;; Feed sudo's stdin password before exposing the relay to callers;
-          ;; subsequent writes use the same queue and stay ordered after it.
-          (when sudo-password
-            (tramp-rpc--write-remote-process
-             v remote-pid (concat sudo-password "\n")))
+              ;; Feed sudo's stdin password before exposing the relay to callers;
+              ;; subsequent writes use the same queue and stay ordered after it.
+              (when sudo-password
+                (tramp-rpc--write-remote-process
+                 v remote-pid (concat sudo-password "\n")))
 
-          ;; Configure the local relay process
-          (when coding
-            (apply #'set-process-coding-system local-process
-                   (tramp-rpc--coding-args coding)))
-          (set-process-query-on-exit-flag local-process (not noquery))
+              ;; Configure the local relay process.
+              (when coding
+                (apply #'set-process-coding-system local-process
+                       (tramp-rpc--coding-args coding)))
+              (set-process-query-on-exit-flag local-process (not noquery))
 
-          (process-put local-process :tramp-rpc-vec v)
-          (process-put local-process :tramp-rpc-pid remote-pid)
-          (process-put local-process 'tramp-vector v)
-          (process-put local-process 'remote-command command)
+              (process-put local-process :tramp-rpc-vec v)
+              (process-put local-process :tramp-rpc-pid remote-pid)
+              (process-put local-process 'tramp-vector v)
+              (process-put local-process 'remote-command orig-command)
 
-          (when filter
-            (set-process-filter local-process filter))
-          (when sentinel
-            ;; Wrap sentinel to handle our cleanup
-            (set-process-sentinel local-process
-                                  (lambda (proc event)
-                                    (tramp-rpc--pipe-process-sentinel proc event sentinel))))
+              (when filter
+                (set-process-filter local-process filter))
+              (when sentinel
+                ;; Wrap sentinel to handle our cleanup.
+                (set-process-sentinel
+                 local-process
+                 (lambda (proc event)
+                   (tramp-rpc--pipe-process-sentinel proc event sentinel))))
 
-          ;; Store process info
-          (puthash local-process
-                   (list :vec v
-                         :pid remote-pid
-                         :stderr-buffer stderr-buffer
-                         :stderr-process stderr-process)
-                   tramp-rpc--async-processes)
+              ;; Store process info.
+              (puthash local-process
+                       (list :vec v
+                             :pid remote-pid
+                             :stderr-buffer stderr-buffer
+                             :stderr-process stderr-process)
+                       tramp-rpc--async-processes)
 
-          (tramp-rpc--debug "MAKE-PROCESS created local=%s remote-pid=%s program=%s"
-                           local-process remote-pid program)
+              (tramp-rpc--debug
+               "MAKE-PROCESS created local=%s remote-pid=%s program=%s"
+               local-process remote-pid program)
 
-          ;; Start async read loop
-          (tramp-rpc--start-async-read local-process)
+              ;; Start async read loop.
+              (tramp-rpc--start-async-read local-process)
 
-          ;; Schedule deferred sentinel cleanup.  Callers like `vc-do-command'
-          ;; replace the sentinel with `set-process-sentinel' AFTER
-          ;; `start-file-process' returns, so we must add our cleanup wrapper
-          ;; after that.  `run-at-time 0' ensures it runs once the current
-          ;; code path (including the caller's sentinel setup) completes.
-          ;; The wrapper calls `delete-process' after the sentinel chain
-          ;; finishes, which removes the process from `Vprocess_alist'.
-          ;; Without this, `get-buffer-process' returns stale exited cat
-          ;; relays, causing e.g. `vc-dir-busy' to report a false positive.
-          (let ((proc local-process))
-            (run-at-time 0 nil
-                         (lambda ()
-                           (when (processp proc)
-                             (tramp-rpc--install-process-cleanup proc)))))
+              ;; Schedule deferred sentinel cleanup.  Callers like `vc-do-command'
+              ;; replace the sentinel with `set-process-sentinel' AFTER
+              ;; `start-file-process' returns, so we must add our cleanup wrapper
+              ;; after that.  `run-at-time 0' ensures it runs once the current
+              ;; code path (including the caller's sentinel setup) completes.
+              ;; The wrapper calls `delete-process' after the sentinel chain
+              ;; finishes, which removes the process from `Vprocess_alist'.
+              ;; Without this, `get-buffer-process' returns stale exited cat
+              ;; relays, causing e.g. `vc-dir-busy' to report a false positive.
+              (let ((proc local-process))
+                (run-at-time 0 nil
+                             (lambda ()
+                               (when (processp proc)
+                                 (tramp-rpc--install-process-cleanup proc)))))
 
-          local-process))))))
+              local-process)))))))
 
 (defun tramp-rpc-handle-start-file-process (name buffer program &rest args)
   "Start async process on remote host.
