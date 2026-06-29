@@ -388,26 +388,30 @@ before the cat relay drains its pipe causes a stale FD that makes
 
 (defun tramp-rpc--install-process-cleanup (process)
   "Add sentinel cleanup to PROCESS so it is deleted after exit.
-Uses `add-function' to append after whatever sentinel the caller has
-already installed (e.g. `vc-do-command' sets #\\='ignore then adds
-via `add-function').  When the sentinel fires for exit/signal, we
-schedule a deferred `delete-process' that removes the process from
-Emacs's `Vprocess_alist'.  Without this, `get-buffer-process' keeps
-returning the dead cat relay, which makes `vc-dir-busy' think an
+Wrap the caller's current sentinel and invoke it at event time before
+scheduling cleanup.  Keep symbol sentinels as symbols when calling them
+so dynamic rebinding, such as TRAMP's `shell-command-sentinel' test
+rebinding, is still honored.  Without cleanup, `get-buffer-process'
+keeps returning the dead cat relay, which makes `vc-dir-busy' think an
 update is still running."
   (when (process-live-p process)
-    (add-function :after (process-sentinel process)
-                  (lambda (proc _event)
-                    (when (memq (process-status proc) '(exit signal))
-                      ;; Defer the deletion so the full sentinel chain
-                      ;; (including vc-exec-after stages) completes first.
-                      (run-at-time 0 nil
-                                   (lambda ()
-                                     (when (and (processp proc)
-                                                (not (process-live-p proc)))
-                                       (remhash proc tramp-rpc--async-processes)
-                                       (ignore-errors
-                                         (delete-process proc))))))))))
+    (let ((sentinel (process-sentinel process)))
+      (unless (process-get process :tramp-rpc-cleanup-sentinel-installed)
+        (process-put process :tramp-rpc-cleanup-sentinel-installed t)
+        (set-process-sentinel
+         process
+         (lambda (proc event)
+           (when sentinel
+             (funcall sentinel proc event))
+           (when (memq (process-status proc) '(exit signal))
+             ;; Defer deletion so the full sentinel chain completes first.
+             (run-at-time 0 nil
+                          (lambda ()
+                            (when (and (processp proc)
+                                       (not (process-live-p proc)))
+                              (remhash proc tramp-rpc--async-processes)
+                              (ignore-errors
+                                (delete-process proc))))))))))))
 
 ;; ============================================================================
 ;; Coding helper
