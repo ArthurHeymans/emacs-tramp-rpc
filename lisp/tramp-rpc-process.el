@@ -469,11 +469,19 @@ pair is a symbol."
 TRAMP's skeleton uses `or' when resolving `:connection-type', which would
 turn an explicit nil into the dynamic `process-connection-type'.  Native
 `make-process' treats explicit nil as a pipe, so pass `pipe' to the skeleton
-for that one case."
+for that one case.
+
+The skeleton also treats string `:stderr' as a remote stderr file.  Preserve
+tramp-rpc's existing compatibility behavior where non-remote strings name
+stderr buffers."
   (let ((args (copy-sequence args)))
     (when (and (plist-member args :connection-type)
                (null (plist-get args :connection-type)))
       (setq args (plist-put args :connection-type 'pipe)))
+    (when-let* ((stderr (plist-get args :stderr)))
+      (when (and (stringp stderr)
+                 (not (tramp-tramp-file-p stderr)))
+        (setq args (plist-put args :stderr (get-buffer-create stderr)))))
     args))
 
 (defun tramp-rpc-handle-make-process (&rest args)
