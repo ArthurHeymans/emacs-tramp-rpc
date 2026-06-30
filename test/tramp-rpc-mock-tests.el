@@ -135,7 +135,6 @@
   (let* ((requests '(("file.stat" . ((path . "/a")))
                      ("file.stat" . ((path . "/b")))))
          (result (tramp-rpc-protocol-encode-batch-request-with-id requests))
-         (id (car result))
          (bytes (cdr result)))
     ;; Skip length prefix and decode
     (let* ((payload (substring bytes 4))
@@ -774,16 +773,32 @@ This matches the behavior expected by `tramp-test28-process-file'."
      nil))
   "Non-nil if tramp-rpc.el loaded successfully.")
 
+(declare-function tramp-rpc-magit--file-exists-in-ancestor-scan
+                  "tramp-rpc-magit" (filename scan))
+(declare-function tramp-rpc-magit--get-cache-key "tramp-rpc-magit" (vec directory))
+(declare-function tramp-rpc-magit--process-cache-key "tramp-rpc-magit" (&rest args))
+(declare-function tramp-rpc-magit--process-cache-lookup "tramp-rpc-magit" (program args))
+(declare-function tramp-rpc-magit--process-cache-store "tramp-rpc-magit" (program args exit-code stdout))
+(declare-function tramp-rpc-handle-magit-status-setup-buffer "tramp-rpc-magit" (&optional directory))
+(declare-function tramp-rpc-handle-file-regular-p "tramp-rpc" (filename))
+(declare-function tramp-rpc--clear-file-caches-for-connection "tramp-rpc-magit" (vec))
+(declare-function tramp-rpc--invalidate-cache-for-subtree "tramp-rpc-magit" (directory))
+(defvar tramp-rpc-magit-disable-remote-diff-tab-width-detection)
+(defvar tramp-rpc-magit--allow-process-cache)
+(defvar tramp-rpc-magit--prefetch-directory)
+(defvar tramp-rpc-magit--process-caches)
+(defvar tramp-rpc-magit--ancestors-cache)
+(defvar tramp-rpc-magit--ancestor-scan-caches)
+
 (defvar tramp-rpc-mock-test--tramp-rpc-magit-loaded
-  (or tramp-rpc-mock-test--tramp-rpc-loaded
-      (condition-case err
-          (progn
-            (require 'tramp)
-            (require 'tramp-rpc-magit)
-            t)
-        (error
-         (message "Could not load tramp-rpc-magit: %s" err)
-         nil)))
+  (condition-case err
+      (progn
+        (require 'tramp)
+        (require 'tramp-rpc-magit)
+        t)
+    (error
+     (message "Could not load tramp-rpc-magit: %s" err)
+     nil))
   "Non-nil if tramp-rpc-magit.el loaded successfully.")
 
 (ert-deftest tramp-rpc-mock-test-ancestor-scan-parent-falls-through ()
@@ -803,6 +818,155 @@ This matches the behavior expected by `tramp-test28-process-file'."
     (should (eq (tramp-rpc-magit--file-exists-in-ancestor-scan
                  "/ssh:mock:/repo/.editorconfig" scan)
                 'not-cached))))
+
+(defmacro tramp-rpc-mock-test--with-git-process-cache (&rest body)
+  "Run BODY with an isolated Magit process cache."
+  (declare (indent 0) (debug t))
+  `(let* ((default-directory "/ssh:mock:/repo/")
+          (vec (tramp-dissect-file-name default-directory))
+          (cache (make-hash-table :test 'equal))
+          (tramp-rpc-magit--process-caches (make-hash-table :test 'equal))
+          (tramp-rpc-magit--prefetch-directory default-directory)
+          (process-environment (default-toplevel-value 'process-environment)))
+     (cl-letf (((symbol-function 'tramp-rpc--connection-key)
+                (lambda (_vec) '("rpc" nil "mock" nil))))
+       (puthash (tramp-rpc-magit--get-cache-key vec default-directory)
+                (list :time (float-time) :cache cache)
+                tramp-rpc-magit--process-caches)
+       ,@body)))
+
+(ert-deftest tramp-rpc-mock-test-git-process-cache-requires-opt-in ()
+  "Prefetched git output is ignored outside Magit's cache window."
+  (skip-unless tramp-rpc-mock-test--tramp-rpc-magit-loaded)
+  (tramp-rpc-mock-test--with-git-process-cache
+    (puthash (tramp-rpc-magit--process-cache-key "status" "--porcelain")
+             '(0 . "cached") cache)
+    (let ((tramp-rpc-magit--allow-process-cache nil))
+      (should-not (tramp-rpc-magit--process-cache-lookup
+                   "git" '("status" "--porcelain"))))))
+
+(ert-deftest tramp-rpc-mock-test-git-process-cache-strips-safe-prefixes ()
+  "Cache lookup ignores Magit's cache-neutral git prefixes."
+  (skip-unless tramp-rpc-mock-test--tramp-rpc-magit-loaded)
+  (tramp-rpc-mock-test--with-git-process-cache
+    (puthash (tramp-rpc-magit--process-cache-key "status" "--porcelain")
+             '(0 . "cached") cache)
+    (let ((tramp-rpc-magit--allow-process-cache t))
+      (should (equal (tramp-rpc-magit--process-cache-lookup
+                      "git" '("--no-pager" "--literal-pathspecs"
+                              "-c" "core.preloadIndex=true"
+                              "status" "--porcelain"))
+                     '(0 . "cached"))))))
+
+(ert-deftest tramp-rpc-mock-test-git-process-cache-rejects-semantic-prefixes ()
+  "Cache lookup misses when git prefixes change repository semantics."
+  (skip-unless tramp-rpc-mock-test--tramp-rpc-magit-loaded)
+  (tramp-rpc-mock-test--with-git-process-cache
+    (puthash (tramp-rpc-magit--process-cache-key "status") '(0 . "cached") cache)
+    (let ((tramp-rpc-magit--allow-process-cache t))
+      (should-not (tramp-rpc-magit--process-cache-lookup
+                   "git" '("-C" "/tmp" "status")))
+      (should-not (tramp-rpc-magit--process-cache-lookup
+                   "git" '("--glob-pathspecs" "status")))
+      (should-not (tramp-rpc-magit--process-cache-lookup
+                   "git" '("-c" "status.relativePaths=false" "status"))))))
+
+(ert-deftest tramp-rpc-mock-test-git-process-cache-rejects-git-env ()
+  "Cache lookup misses when dynamic GIT_* environment differs."
+  (skip-unless tramp-rpc-mock-test--tramp-rpc-magit-loaded)
+  (tramp-rpc-mock-test--with-git-process-cache
+    (puthash (tramp-rpc-magit--process-cache-key "status") '(0 . "cached") cache)
+    (let ((tramp-rpc-magit--allow-process-cache t)
+          (process-environment (cons "GIT_INDEX_FILE=/tmp/other-index"
+                                     process-environment)))
+      (should-not (tramp-rpc-magit--process-cache-lookup "git" '("status"))))))
+
+(ert-deftest tramp-rpc-mock-test-git-process-cache-does-not-store-mutators ()
+  "Mutating git commands are never stored in the process cache."
+  (skip-unless tramp-rpc-mock-test--tramp-rpc-magit-loaded)
+  (tramp-rpc-mock-test--with-git-process-cache
+    (let ((tramp-rpc-magit--allow-process-cache t))
+      (tramp-rpc-magit--process-cache-store
+       "git" '("update-index" "--refresh") 0 "")
+      (should-not (gethash (tramp-rpc-magit--process-cache-key
+                            "update-index" "--refresh")
+                           cache)))))
+
+(ert-deftest tramp-rpc-mock-test-git-process-cache-does-not-reuse-subdir ()
+  "A repo-root process cache is not reused for a different cwd."
+  (skip-unless tramp-rpc-mock-test--tramp-rpc-magit-loaded)
+  (tramp-rpc-mock-test--with-git-process-cache
+    (puthash (tramp-rpc-magit--process-cache-key "status") '(0 . "cached") cache)
+    (let ((default-directory "/ssh:mock:/repo/sub/")
+          (tramp-rpc-magit--allow-process-cache t))
+      (should-not (tramp-rpc-magit--process-cache-lookup "git" '("status"))))))
+
+(ert-deftest tramp-rpc-mock-test-file-regular-p-delegates-except-cached-miss ()
+  "`file-regular-p' only short-circuits cached Magit misses."
+  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
+  (dolist (case '((nil nil nil)
+                  (not-cached delegated t)
+                  (t delegated t)))
+    (let ((cached (nth 0 case))
+          (expected (nth 1 case))
+          (expected-called (nth 2 case))
+          called)
+      (cl-letf (((symbol-function 'tramp-rpc-magit--file-exists-p)
+                 (lambda (_filename) cached))
+                ((symbol-function 'tramp-handle-file-regular-p)
+                 (lambda (_filename)
+                   (setq called t)
+                   'delegated)))
+        (should (eq (tramp-rpc-handle-file-regular-p "/rpc:mock:/tmp/file")
+                    expected))
+        (should (eq (and called t) expected-called))))))
+
+(ert-deftest tramp-rpc-mock-test-connection-cache-clear-clears-ancestor-scans ()
+  "Connection cache clearing also drops ancestor marker scans."
+  (skip-unless tramp-rpc-mock-test--tramp-rpc-magit-loaded)
+  (let ((tramp-rpc-magit--ancestors-cache '((".git" . "/repo")))
+        (tramp-rpc-magit--ancestor-scan-caches (make-hash-table :test 'equal))
+        (vec (tramp-dissect-file-name "/ssh:mock:/repo/")))
+    (puthash '("ssh:mock" . "/repo/") '((".git" . "/repo"))
+             tramp-rpc-magit--ancestor-scan-caches)
+    (cl-letf (((symbol-function 'tramp-flush-directory-properties) #'ignore))
+      (tramp-rpc--clear-file-caches-for-connection vec))
+    (should-not tramp-rpc-magit--ancestors-cache)
+    (should (= 0 (hash-table-count tramp-rpc-magit--ancestor-scan-caches)))))
+
+(ert-deftest tramp-rpc-mock-test-subtree-invalidation-flushes-tramp-properties ()
+  "Subtree invalidation flushes descendant TRAMP file properties."
+  (skip-unless tramp-rpc-mock-test--tramp-rpc-magit-loaded)
+  (let* ((child "/ssh:mock:/repo/child")
+         (tramp-rpc--file-exists-cache (make-hash-table :test 'equal))
+         (tramp-rpc--file-truename-cache (make-hash-table :test 'equal))
+         (tramp-rpc--file-stat-cache (make-hash-table :test 'equal))
+         flushed)
+    (puthash child (cons (float-time) t) tramp-rpc--file-exists-cache)
+    (puthash (cons child nil) (cons (float-time) '((type . "file")))
+             tramp-rpc--file-stat-cache)
+    (cl-letf (((symbol-function 'tramp-flush-file-properties)
+               (lambda (_vec localname) (push (list 'file localname) flushed)))
+              ((symbol-function 'tramp-flush-directory-properties)
+               (lambda (_vec localname) (push (list 'directory localname) flushed))))
+      (tramp-rpc--invalidate-cache-for-subtree "/ssh:mock:/repo/"))
+    (should-not (gethash child tramp-rpc--file-exists-cache))
+    (should-not (gethash (cons child nil) tramp-rpc--file-stat-cache))
+    (should (member '(file "/repo/child") flushed))
+    (should (member '(directory "/repo/child") flushed))))
+
+(ert-deftest tramp-rpc-mock-test-magit-status-setup-clears-requested-directory ()
+  "`magit-status-setup-buffer' clears metadata for its DIRECTORY argument."
+  (skip-unless tramp-rpc-mock-test--tramp-rpc-magit-loaded)
+  (let ((default-directory "/ssh:other:/else/")
+        (tramp-rpc-magit-disable-remote-diff-tab-width-detection nil)
+        cleared)
+    (cl-letf (((symbol-function 'tramp-rpc--clear-file-metadata-caches)
+               (lambda () (push default-directory cleared)))
+              ((symbol-function 'tramp-run-real-handler)
+               (lambda (_operation _args) 'ok)))
+      (tramp-rpc-handle-magit-status-setup-buffer "/ssh:mock:/repo"))
+    (should (equal cleared '("/ssh:mock:/repo/")))))
 
 (defun tramp-rpc-mock-test--sudo-helper-available-p ()
   "Return non-nil when the sudo path helpers needed by this test are available."
@@ -1690,7 +1854,8 @@ This matches the behavior expected by `tramp-test28-process-file'."
           ;; Simulate an earlier `file-symlink-p' or `file-attributes' miss.
           (tramp-rpc--cache-put tramp-rpc--file-exists-cache expanded nil)
           (tramp-rpc--cache-put tramp-rpc--file-stat-cache lstat-key nil)
-          (cl-letf (((symbol-function 'tramp-rpc--call)
+          (cl-letf (((symbol-function 'tramp-connectable-p) (lambda (_filename) t))
+                    ((symbol-function 'tramp-rpc--call)
                      (lambda (_vec method params)
                        (push method calls)
                        (pcase method
@@ -1712,9 +1877,9 @@ This matches the behavior expected by `tramp-test28-process-file'."
             (should linked)
             (should-not (gethash expanded tramp-rpc--file-exists-cache))
             (should-not (gethash lstat-key tramp-rpc--file-stat-cache))
-            ;; `file-exists-p' follows the symlink.  Its followed "file" stat
-            ;; must not be cached as lstat, or `file-symlink-p' will return nil.
-            (should (tramp-rpc-handle-file-exists-p filename))
+            ;; A followed stat must not be cached as lstat, or
+            ;; `file-symlink-p' will return nil.
+            (should (tramp-rpc--call-file-stat vec localname))
             (should (equal (tramp-rpc-handle-file-symlink-p filename)
                            "target"))
             (should (member "file.make_symlink" calls))
@@ -1763,7 +1928,8 @@ This matches the behavior expected by `tramp-test28-process-file'."
              (lambda (_filename _string)
                (signal 'file-error '("Apparent cycle"))))
             ((symbol-function 'file-symlink-p)
-             (lambda (_filename) "does-not-exist"))
+             (lambda (filename)
+               (and (string-suffix-p "/link" filename) "does-not-exist")))
             ((symbol-function 'file-exists-p) #'ignore))
     (should-error
      (tramp-rpc-handle-access-file "/rpc:mockhost:/tmp/link" "error")
@@ -1847,7 +2013,8 @@ This matches the behavior expected by `tramp-test28-process-file'."
           (tramp-rpc--cache-put tramp-rpc--file-stat-cache
                                 source-stat-key '((type . "file") (nlink . 1)))
           (tramp-rpc--cache-put tramp-rpc--file-stat-cache dest-stat-key nil)
-          (cl-letf (((symbol-function 'tramp-rpc--call)
+          (cl-letf (((symbol-function 'file-exists-p) #'ignore)
+                    ((symbol-function 'tramp-rpc--call)
                      (lambda (_vec method _params)
                        (push method calls)
                        (should (equal method "file.make_hardlink"))

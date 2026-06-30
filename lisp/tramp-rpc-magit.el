@@ -53,6 +53,7 @@
 
 ;; Functions from tramp-cache.el.
 (declare-function tramp-flush-file-properties "tramp-cache")
+(declare-function tramp-flush-directory-properties "tramp-cache")
 
 ;; Functions from magit-section.el.
 (declare-function magit-section-show "magit-section")
@@ -153,8 +154,18 @@ must still report symlink type for lstat."
           (remhash (caar entries) cache)
           (setq entries (cdr entries)))))))
 
+(defvar tramp-rpc-magit--ancestors-cache)
+(defvar tramp-rpc-magit--ancestor-scan-caches)
+
+(defun tramp-rpc-magit--clear-ancestor-caches ()
+  "Clear cached ancestor marker scans."
+  (when (boundp 'tramp-rpc-magit--ancestor-scan-caches)
+    (clrhash tramp-rpc-magit--ancestor-scan-caches))
+  (setq tramp-rpc-magit--ancestors-cache nil))
+
 (defun tramp-rpc--invalidate-cache-for-path (filename)
   "Invalidate cache entries for FILENAME."
+  (tramp-rpc-magit--clear-ancestor-caches)
   (cl-labels ((drop (candidate)
                 (remhash candidate tramp-rpc--file-exists-cache)
                 (remhash candidate tramp-rpc--file-truename-cache)
@@ -191,6 +202,7 @@ must still report symlink type for lstat."
 
 (defun tramp-rpc--invalidate-cache-for-subtree (directory)
   "Invalidate cache entries for DIRECTORY and all cached descendants."
+  (tramp-rpc-magit--clear-ancestor-caches)
   (let* ((expanded-dir (file-name-as-directory (expand-file-name directory)))
          (expanded-file (directory-file-name expanded-dir)))
     (tramp-rpc--invalidate-cache-for-path expanded-file)
@@ -240,11 +252,20 @@ must still report symlink type for lstat."
   (interactive)
   (clrhash tramp-rpc--file-stat-cache))
 
+(defun tramp-rpc--clear-current-tramp-file-properties ()
+  "Clear TRAMP file properties for the current remote connection."
+  (when (file-remote-p default-directory)
+    (ignore-errors
+      (with-parsed-tramp-file-name default-directory nil
+        (tramp-flush-directory-properties v "/")))))
+
 (defun tramp-rpc--clear-file-metadata-caches ()
   "Clear cached file metadata."
   (clrhash tramp-rpc--file-exists-cache)
   (clrhash tramp-rpc--file-truename-cache)
-  (clrhash tramp-rpc--file-stat-cache))
+  (clrhash tramp-rpc--file-stat-cache)
+  (tramp-rpc-magit--clear-ancestor-caches)
+  (tramp-rpc--clear-current-tramp-file-properties))
 
 (defun tramp-rpc-clear-all-caches ()
   "Clear all tramp-rpc caches."
@@ -256,6 +277,8 @@ must still report symlink type for lstat."
   "Clear file-exists and file-truename cache entries for connection VEC.
 Entries are keyed by expanded TRAMP filenames; this removes those
 matching the remote prefix of VEC."
+  (tramp-rpc-magit--clear-ancestor-caches)
+  (ignore-errors (tramp-flush-directory-properties vec "/"))
   (let ((prefix (tramp-make-tramp-file-name vec "/")))
     ;; Match the prefix up to the colon-slash that starts the localname.
     ;; e.g. "/rpc:user@host:/" -- any key starting with this belongs to VEC.
@@ -639,22 +662,8 @@ Returns a cons cell (connection-key . directory) for hash table lookups."
 Returns the cache hash table, or nil if none."
   (when (file-remote-p default-directory)
     (with-parsed-tramp-file-name default-directory nil
-      (or (tramp-rpc-magit--valid-process-cache
-           (tramp-rpc-magit--get-cache-key v default-directory))
-          ;; Magit sometimes temporarily sets `default-directory' to a file's
-          ;; subdirectory while washing a status diff.  Reuse the repository
-          ;; root prefetch cache for those subdirectories; otherwise exact
-          ;; prefetched git commands miss solely because the cwd changed.
-          (when (and tramp-rpc-magit--prefetch-directory
-                     (equal (file-remote-p default-directory)
-                            (file-remote-p tramp-rpc-magit--prefetch-directory))
-                     (string-prefix-p
-                      (file-name-as-directory
-                       (tramp-file-local-name tramp-rpc-magit--prefetch-directory))
-                      (tramp-file-local-name (expand-file-name default-directory))))
-            (tramp-rpc-magit--valid-process-cache
-             (tramp-rpc-magit--get-cache-key
-              v tramp-rpc-magit--prefetch-directory)))))))
+      (tramp-rpc-magit--valid-process-cache
+       (tramp-rpc-magit--get-cache-key v default-directory)))))
 
 (defun tramp-rpc-magit--set-process-cache (vec directory cache)
   "Set the process-file CACHE for VEC and DIRECTORY."
@@ -1099,8 +1108,7 @@ upstream names, and commands used to wash already-expanded file sections."
                            (cached "status" "-z" "--porcelain"
                                    "--untracked-files=all" "--" :raw)))
                (files (tramp-rpc-magit--status-files-from-porcelain status))
-               (head (or (cached "rev-parse" "--short=9" "HEAD")
-                         (cached "rev-parse" "HEAD"))))
+               (head (cached "rev-parse" "HEAD")))
           (when head
             (add-git "rev-parse" "--short=9" head)
             (add-git "cat-file" "-t" head)
@@ -1128,8 +1136,7 @@ This is intentionally much smaller than the full status prefetch and is used
 when the status cache has expired but TAB is expanding a single file section."
   (when-let* ((file (tramp-rpc-magit--section-slot section 'value))
               ((stringp file))
-              (directory (or tramp-rpc-magit--prefetch-directory
-                             default-directory))
+              (directory default-directory)
               ((file-remote-p directory))
               ((tramp-rpc-file-name-p directory)))
     (with-parsed-tramp-file-name directory nil
@@ -1475,8 +1482,7 @@ Returns t, nil, or \\='not-cached if not in cache."
 (defun tramp-rpc-magit--clear-cache ()
   "Clear all magit-related caches."
   (clrhash tramp-rpc-magit--process-caches)
-  (clrhash tramp-rpc-magit--ancestor-scan-caches)
-  (setq tramp-rpc-magit--ancestors-cache nil)
+  (tramp-rpc-magit--clear-ancestor-caches)
   (setq tramp-rpc-magit--prefetch-directory nil))
 
 ;; ============================================================================
