@@ -1757,6 +1757,71 @@ This is the root cause of the lsp-mode crash reported with tramp-rpc."
             (should (equal expected actual))))))))
 
 ;;; ============================================================================
+;;; Test 20: PTY login shell command normalization
+;;; ============================================================================
+
+(ert-deftest tramp-rpc-test20-pty-shell-login-args ()
+  "Interactive PTY login shells should be started as login shells."
+  (cl-letf (((symbol-function 'tramp-rpc--get-remote-login-shell)
+             (lambda (_vec) "/opt/bin/my-shell"))
+            ((symbol-function 'tramp-get-method-parameter)
+             (lambda (_vec parameter &optional default)
+               (if (eq parameter 'tramp-remote-shell-login) '("-l") default))))
+    (should (equal (tramp-rpc--maybe-login-shell-command nil '("/opt/bin/my-shell"))
+                   '("/opt/bin/my-shell" "-l")))
+    (should (equal (tramp-rpc--maybe-login-shell-command nil '("/opt/bin/my-shell" "-i"))
+                   '("/opt/bin/my-shell" "-l" "-i")))
+    (should (equal (tramp-rpc--maybe-login-shell-command nil '("/opt/bin/my-shell" "-l" "-i"))
+                   '("/opt/bin/my-shell" "-l" "-i")))
+    (should (equal (tramp-rpc--maybe-login-shell-command nil '("/opt/bin/my-shell" "/tmp/script.sh"))
+                   '("/opt/bin/my-shell" "/tmp/script.sh")))
+    (should (equal (tramp-rpc--maybe-login-shell-command nil '("/opt/bin/my-shell" "-c" "echo ok"))
+                   '("/opt/bin/my-shell" "-c" "echo ok")))
+    (should (equal (tramp-rpc--maybe-login-shell-command nil '("/bin/bash" "-i"))
+                   '("/bin/bash" "-i")))
+    (should (equal (tramp-rpc--maybe-login-shell-command nil '("python3" "-i"))
+                   '("python3" "-i")))))
+
+(ert-deftest tramp-rpc-test20-make-process-pty-normalizes-login-shell ()
+  "`tramp-rpc-handle-make-process' sends normalized login command to PTY path."
+  (let ((default-directory "/rpc:test-host:/tmp/")
+        captured-command)
+    (cl-letf (((symbol-function 'tramp-rpc--get-remote-login-shell)
+               (lambda (_vec) "/bin/bash"))
+              ((symbol-function 'tramp-get-method-parameter)
+               (lambda (_vec parameter &optional default)
+                 (if (eq parameter 'tramp-remote-shell-login) '("-l") default)))
+              ((symbol-function 'tramp-rpc--remote-path-environment)
+               (lambda (_vec) nil))
+              ((symbol-function 'tramp-rpc--tramp-remote-process-environment)
+               (lambda () nil))
+              ((symbol-function 'tramp-rpc--get-direnv-environment)
+               (lambda (&rest _args) nil))
+              ((symbol-function 'tramp-rpc--caller-environment)
+               (lambda () nil))
+              ((symbol-function 'tramp-rpc--ensure-inside-emacs-env)
+               (lambda (env) env))
+              ((symbol-function 'tramp-rpc--make-pty-process)
+               (lambda (_vec _name _buffer command &rest _args)
+                 (setq captured-command command)
+                 'tramp-rpc-test-pty-process)))
+      (should (eq (tramp-rpc-handle-make-process
+                   :name "tramp-rpc-test"
+                   :buffer nil
+                   :command '("/bin/bash" "-i")
+                   :connection-type 'pty)
+                  'tramp-rpc-test-pty-process))
+      (should (equal captured-command '("/bin/bash" "-l" "-i")))
+      (let ((process-connection-type t))
+        (setq captured-command nil)
+        (should (eq (tramp-rpc-handle-make-process
+                     :name "tramp-rpc-test-dynamic"
+                     :buffer nil
+                     :command '("/bin/bash" "-i"))
+                    'tramp-rpc-test-pty-process))
+        (should (equal captured-command '("/bin/bash" "-l" "-i")))))))
+
+;;; ============================================================================
 ;;; Test Runner
 ;;; ============================================================================
 

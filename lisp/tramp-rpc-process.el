@@ -48,6 +48,7 @@
 (declare-function tramp-rpc--call-fast "tramp-rpc")
 (declare-function tramp-rpc--call-async "tramp-rpc")
 (declare-function tramp-rpc--get-direnv-environment "tramp-rpc")
+(declare-function tramp-rpc--get-remote-login-shell "tramp-rpc")
 (declare-function tramp-rpc--decode-output "tramp-rpc")
 (declare-function tramp-rpc--controlmaster-socket-path "tramp-rpc")
 (declare-function tramp-rpc--hops-to-proxyjump "tramp-rpc")
@@ -460,6 +461,28 @@ pair is a symbol."
         (cons decoding encoding))))
    (t coding)))
 
+(defun tramp-rpc--maybe-login-shell-command (vec command)
+  "Add login-shell args to interactive PTY login-shell COMMAND.
+Non-shell commands, `shell -c ...', and script launches are left untouched."
+  (let* ((program (car command))
+         (args (cdr command))
+         (base (and (stringp program) (file-name-nondirectory program)))
+         (login-args (tramp-get-method-parameter
+                      vec 'tramp-remote-shell-login)))
+    (if (and base
+             (or (null args)
+                 (member "-i" args)
+                 (member "--interactive" args))
+             (not (member "-c" args))
+             (not (member "--command" args))
+             (not (member "--login" args))
+             (not (cl-intersection login-args args :test #'string=))
+             (equal base (ignore-errors
+                           (file-name-nondirectory
+                            (tramp-rpc--get-remote-login-shell vec)))))
+        (append (list program) login-args args)
+      command)))
+
 ;; ============================================================================
 ;; make-process handler
 ;; ============================================================================
@@ -523,6 +546,8 @@ Resolves program path and loads direnv environment from working directory."
                                       (cdr command)))
               (setq command (append (list (car command) "-n")
                                     (cdr command))))))
+        (when use-pty
+          (setq command (tramp-rpc--maybe-login-shell-command v command)))
         ;; Get the remote process environment: PATH from `tramp-remote-path'
         ;; (or deprecated `tramp-rpc-remote-path'), direnv for this directory,
         ;; INSIDE_EMACS, and caller-set env vars (e.g. GIT_INDEX_FILE from magit).
