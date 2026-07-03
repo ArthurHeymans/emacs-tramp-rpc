@@ -2920,6 +2920,34 @@ as a hop in multi-hop chains."
         (delete-process proc))
       (kill-buffer buffer))))
 
+(ert-deftest tramp-rpc-mock-test-vc-exec-after-running-process-no-private-vc-sentinel ()
+  "Test run-state handler doesn't call removed `vc--process-sentinel'."
+  :tags '(:vc-handler)
+  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
+  (require 'vc-dispatcher)
+  (let* ((buffer (generate-new-buffer " *tramp-rpc-vc-exec-after-test*"))
+         (proc (make-process :name "tramp-rpc-vc-exec-after-test"
+                             :buffer buffer
+                             :command '("sh" "-c" "sleep 60")
+                             :noquery t))
+         (ran nil))
+    (unwind-protect
+        (with-current-buffer buffer
+          (process-put proc :tramp-rpc-pid 123)
+          (cl-letf (((symbol-function 'vc--process-sentinel)
+                     (lambda (&rest _) (error "vc--process-sentinel called")))
+                    ((symbol-function 'tramp-run-real-handler)
+                     (lambda (&rest _) (error "Unexpected process state"))))
+            (tramp-rpc-handle-vc-exec-after
+             (lambda () (setq ran t)))
+            (cl-letf (((symbol-function 'process-status) (lambda (_process) 'exit))
+                      ((symbol-function 'process-exit-status) (lambda (_process) 0)))
+              (funcall (process-sentinel proc) proc "finished")))
+          (should ran))
+      (when (process-live-p proc)
+        (delete-process proc))
+      (kill-buffer buffer))))
+
 ;;; ============================================================================
 ;;; Dir-locals advice tests (No server or SSH required)
 ;;; ============================================================================

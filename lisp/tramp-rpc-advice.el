@@ -59,7 +59,6 @@
 ;; Functions from vc-dispatcher.el (used by vc-exec-after handler)
 (declare-function vc-exec-after "vc-dispatcher")
 (declare-function vc-set-mode-line-busy-indicator "vc-dispatcher")
-(declare-function vc--process-sentinel "vc-dispatcher")
 
 ;; Functions from python.el (used by python-shell integration)
 (declare-function python-shell--tramp-with-environment "python")
@@ -296,7 +295,15 @@ process-file calls are routed through the TRAMP handler."
     (tramp-run-real-handler
      #'vc-call-backend (append `(,backend ,function-name) args))))
 
-(defun tramp-rpc-handle-vc-exec-after (code &optional success)
+(defun tramp-rpc--vc-exec-after-real (code okstatus proc)
+  "Call the real `vc-exec-after' with the arity this Emacs supports."
+  (tramp-run-real-handler
+   #'vc-exec-after
+   (if (and proc (>= (cdr (func-arity #'vc-exec-after)) 3))
+       (list code okstatus proc)       ; Emacs 31+
+     (list code okstatus))))           ; Emacs 30
+
+(defun tramp-rpc-handle-vc-exec-after (code &optional okstatus proc)
   "Handler for `vc-exec-after' to handle TRAMP-RPC relay processes.
 
 Some native-compiled VC functions can observe the raw local relay process
@@ -306,7 +313,7 @@ non-`exit' state while TRAMP-RPC has already recorded the remote exit.  The
 stock `vc-exec-after' then signals \"Unexpected process state\".  For
 TRAMP-RPC processes, reproduce `vc-exec-after' using the logical process
 state."
-  (let ((proc (get-buffer-process (current-buffer))))
+  (let ((proc (or proc (get-buffer-process (current-buffer)))))
     (if (and (processp proc)
              (process-get proc :tramp-rpc-pid))
         (let ((status (cond
@@ -321,18 +328,23 @@ state."
             ;; run with `inhibit-quit' bound; Emacs 30 warns about blocking
             ;; `accept-process-output' in that context.
             (while (accept-process-output proc 0 nil t))
-            (when (or (not success)
-                      (zerop (process-exit-status success)))
+            (when (cond
+                   ((null okstatus) t)
+                   ((processp okstatus) (zerop (process-exit-status okstatus))) ; Emacs 30
+                   ((integerp okstatus) (<= (process-exit-status proc) okstatus))) ; Emacs 31+
               (if (functionp code) (funcall code) (eval code t))))
            ((eq status 'run)
             (vc-set-mode-line-busy-indicator)
             (letrec ((fun (lambda (p _msg)
                             (remove-function (process-sentinel p) fun)
-                            (vc--process-sentinel p code success))))
+                            (when-let* ((buf (process-buffer p))
+                                        (_ (buffer-live-p buf)))
+                              (with-current-buffer buf
+                                (tramp-rpc-handle-vc-exec-after code okstatus p))))))
               (add-function :after (process-sentinel proc) fun)))
            (t
-            (tramp-run-real-handler #'vc-exec-after (list code success)))))
-      (tramp-run-real-handler #'vc-exec-after (list code success))))
+            (tramp-rpc--vc-exec-after-real code okstatus proc))))
+      (tramp-rpc--vc-exec-after-real code okstatus proc)))
   nil)
 
 ;; ============================================================================
