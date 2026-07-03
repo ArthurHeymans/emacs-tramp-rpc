@@ -83,6 +83,9 @@
                  ;; The actual tramp-login-args value is never used for login
                  ;; because rpc is a foreign (non-tramp-sh) file handler.
                  (tramp-login-args (("%h")))
+                 ;; Match TRAMP's remote-shell convention so PTY login shells
+                 ;; can honor method/connection-local overrides.
+                 (tramp-remote-shell-login ("-l"))
                  ;; Direct async process support: tramp-rpc uses direct SSH
                  ;; PTY connections for async processes, which means stderr
                  ;; is mixed with stdout (normal PTY behavior).  Setting
