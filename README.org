@@ -37,7 +37,7 @@ TRAMP-RPC replaces this with a lightweight Rust server that runs on the remote h
 
 - Emacs 30.1 or later
 - Tramp 2.8.1.4 or later (install from GNU ELPA if your Emacs bundles an older version)
-- =msgpack.el= package (installed automatically from MELPA)
+- =msgpack.el= 0.1.1 or later (installed automatically from MELPA)
 - SSH access to remote hosts
 - Remote host running Linux or macOS (x86_64 or aarch64)
 

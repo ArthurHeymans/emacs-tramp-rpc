@@ -75,7 +75,7 @@ pub async fn get_file_attributes(path: &Path, lstat: bool) -> Result<FileAttribu
         fs::read_link(path)
             .await
             .ok()
-            .map(|p| p.to_string_lossy().into_owned())
+            .map(|p| p.as_os_str().as_bytes().to_vec())
     } else {
         None
     };

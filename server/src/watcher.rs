@@ -16,7 +16,8 @@ use tokio::io::AsyncWriteExt;
 use tokio::sync::mpsc;
 use tokio::time::{self, Duration};
 
-use crate::protocol::from_value;
+use crate::handlers::file::bytes_to_path;
+use crate::protocol::{from_value, path_or_bytes};
 
 /// Duration to debounce filesystem events before sending a notification.
 /// During bulk operations (e.g. git checkout), many events fire in rapid
@@ -349,7 +350,9 @@ enum WatchInput {
 }
 
 fn path_to_value(path: &Path) -> Value {
-    Value::String(path.to_string_lossy().into_owned().into())
+    use std::os::unix::ffi::OsStrExt;
+
+    Value::Binary(path.as_os_str().as_bytes().to_vec())
 }
 
 #[cfg(any(target_os = "linux", target_os = "android"))]
@@ -1126,7 +1129,8 @@ use crate::handlers::HandlerResult;
 pub fn handle_add(params: Value) -> HandlerResult {
     #[derive(serde::Deserialize)]
     struct Params {
-        path: String,
+        #[serde(with = "path_or_bytes")]
+        path: Vec<u8>,
         #[serde(default = "default_recursive")]
         recursive: bool,
         #[serde(default)]
@@ -1138,19 +1142,20 @@ pub fn handle_add(params: Value) -> HandlerResult {
 
     let params: Params = from_value(params).map_err(|e| RpcError::invalid_params(e.to_string()))?;
 
-    let expanded = crate::handlers::expand_tilde(&params.path);
+    // `bytes_to_path` preserves the legacy ~ expansion used by watch paths.
+    let path = bytes_to_path(&params.path);
 
     let manager = get().ok_or_else(|| RpcError::internal_error("File watcher not available"))?;
 
     let canonical = if params.nofollow {
-        manager.watch_with_options(Path::new(&expanded), params.recursive, true)
+        manager.watch_with_options(&path, params.recursive, true)
     } else {
-        manager.watch(Path::new(&expanded), params.recursive)
+        manager.watch(&path, params.recursive)
     }
     .map_err(|e| RpcError::internal_error(format!("Failed to watch: {}", e)))?;
 
     Ok(msgpack_map! {
-        "path" => canonical.to_string_lossy().into_owned(),
+        "path" => path_to_value(&canonical),
         "recursive" => Value::Boolean(params.recursive),
         "nofollow" => Value::Boolean(params.nofollow)
     })
@@ -1162,17 +1167,19 @@ pub fn handle_add(params: Value) -> HandlerResult {
 pub fn handle_remove(params: Value) -> HandlerResult {
     #[derive(serde::Deserialize)]
     struct Params {
-        path: String,
+        #[serde(with = "path_or_bytes")]
+        path: Vec<u8>,
     }
 
     let params: Params = from_value(params).map_err(|e| RpcError::invalid_params(e.to_string()))?;
 
-    let expanded = crate::handlers::expand_tilde(&params.path);
+    // `bytes_to_path` preserves the legacy ~ expansion used by watch paths.
+    let path = bytes_to_path(&params.path);
 
     let manager = get().ok_or_else(|| RpcError::internal_error("File watcher not available"))?;
 
     manager
-        .unwatch(Path::new(&expanded))
+        .unwatch(&path)
         .map_err(|e| RpcError::internal_error(format!("Failed to unwatch: {}", e)))?;
 
     Ok(Value::Boolean(true))
@@ -1189,7 +1196,7 @@ pub fn handle_list(_params: Value) -> HandlerResult {
         .into_iter()
         .map(|(path, recursive)| {
             msgpack_map! {
-                "path" => path.to_string_lossy().into_owned(),
+                "path" => path_to_value(&path),
                 "recursive" => Value::Boolean(recursive)
             }
         })
@@ -1363,7 +1370,7 @@ mod tests {
     }
 
     #[test]
-    fn test_watch_event_serializes_paths_as_strings() {
+    fn test_watch_event_serializes_paths_as_binary() {
         let event = WatchEvent::rename(PathBuf::from("/tmp/old"), PathBuf::from("/tmp/new"));
         let value = event.to_value();
 
@@ -1373,11 +1380,11 @@ mod tests {
         );
         assert_eq!(
             map_value(&value, "path"),
-            Some(&Value::String("/tmp/old".into()))
+            Some(&Value::Binary(b"/tmp/old".to_vec()))
         );
         assert_eq!(
             map_value(&value, "path1"),
-            Some(&Value::String("/tmp/new".into()))
+            Some(&Value::Binary(b"/tmp/new".to_vec()))
         );
     }
 
@@ -1408,7 +1415,7 @@ mod tests {
         );
         assert_eq!(
             map_value(&events[0], "path"),
-            Some(&Value::String("/tmp/new".into()))
+            Some(&Value::Binary(b"/tmp/new".to_vec()))
         );
         assert_eq!(
             map_value(&events[1], "action"),

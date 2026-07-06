@@ -4,7 +4,7 @@
 
 ;; Author: Arthur Heymans <arthur@aheymans.xyz>
 ;; Keywords: comm, processes
-;; Package-Requires: ((emacs "30.1") (msgpack "0"))
+;; Package-Requires: ((emacs "30.1") (msgpack "0.1.1"))
 
 ;; This file is part of tramp-rpc.
 
@@ -65,13 +65,13 @@ Returns a cons cell (ID . BYTES) for pipelining support."
 Returns a plist with :id, :result, and :error keys for responses.
 For server-initiated notifications (no :id, has :method), returns a plist
 with :notification t, :method, and :params keys."
-  (let* ((msgpack-map-type 'alist)
-         (msgpack-key-type 'symbol)
-         (msgpack-array-type 'list)
-         (response
+  (let* ((response
 	  (with-current-buffer buffer
 	    (goto-char start)
-	    (msgpack-read)))
+	    (msgpack-read :map-type 'alist
+                          :key-type 'symbol
+                          :array-type 'list
+                          :bin-type 'msgpack-bin)))
          (id (alist-get 'id response))
          (method (alist-get 'method response))
          (result
