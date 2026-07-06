@@ -22,6 +22,11 @@ use crate::protocol::path_or_bytes;
 /// - On Linux: st_mode is u32; time fields are i32 on 32-bit, i64 on 64-bit
 /// - On macOS: st_mode is u16, time fields are i64
 #[inline]
+fn stat_time_to_i64<T: Into<i64>>(time: T) -> i64 {
+    time.into()
+}
+
+#[inline]
 fn extract_stat_fields(stat_buf: &libc::stat) -> (i64, i64, i64, u32) {
     #[cfg(target_os = "macos")]
     let mode = stat_buf.st_mode as u32;
@@ -29,9 +34,9 @@ fn extract_stat_fields(stat_buf: &libc::stat) -> (i64, i64, i64, u32) {
     let mode = stat_buf.st_mode;
 
     (
-        stat_buf.st_atime.into(),
-        stat_buf.st_mtime.into(),
-        stat_buf.st_ctime.into(),
+        stat_time_to_i64(stat_buf.st_atime),
+        stat_time_to_i64(stat_buf.st_mtime),
+        stat_time_to_i64(stat_buf.st_ctime),
         mode,
     )
 }
@@ -81,7 +86,7 @@ fn get_file_attributes_at(
 
     // Get link target if symlink
     let link_target = if file_type == FileType::Symlink {
-        let full_name = if name == b"." || name == b".." {
+        if name == b"." || name == b".." {
             // For . and .., we need the full path for readlink
             None
         } else {
@@ -97,12 +102,11 @@ fn get_file_attributes_at(
             };
             if len >= 0 {
                 buf.truncate(len as usize);
-                Some(String::from_utf8_lossy(&buf).to_string())
+                Some(buf)
             } else {
                 None
             }
-        };
-        full_name
+        }
     } else {
         None
     };

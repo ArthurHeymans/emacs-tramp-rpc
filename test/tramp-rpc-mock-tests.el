@@ -60,6 +60,12 @@
 (when tramp-rpc-mock-test--msgpack-available
   (require 'tramp-rpc-protocol))
 
+(defun tramp-rpc-mock-test--bytes-string (data)
+  "Return DATA as a plain byte string, unwrapping MessagePack bin."
+  (if (and tramp-rpc-mock-test--msgpack-available (msgpack-bin-p data))
+      (msgpack-bin-string data)
+    data))
+
 ;;; ============================================================================
 ;;; Protocol Tests (No server required)
 ;;; ============================================================================
@@ -434,7 +440,8 @@ Returns the result or signals an error."
                          "file.read" `((path . ,(encode-coding-string test-file 'utf-8))))))
             (should result)
             (let ((content (alist-get 'content result)))
-              (should (equal content "hello world"))))
+              (should (msgpack-bin-p content))
+              (should (equal (msgpack-bin-string content) "hello world"))))
 
           ;; Get file stats
           (let ((result (tramp-rpc-mock-test--rpc-call
@@ -487,7 +494,10 @@ Returns the result or signals an error."
                                       (include_attrs . :msgpack-false)
                                       (include_hidden . t)))))
             (should result)
-            (let ((names (mapcar (lambda (e) (alist-get 'name e)) result)))
+            (let ((names (mapcar (lambda (e)
+                                    (tramp-rpc-mock-test--bytes-string
+                                     (alist-get 'name e)))
+                                  result)))
               (should (member "file1.txt" names))
               (should (member "file2.txt" names))))
 
@@ -700,7 +710,8 @@ Returns the result or signals an error."
           (should (= (alist-get 'exit_code result) 0))
           ;; stdout is now raw binary
           (let ((stdout (alist-get 'stdout result)))
-            (should (string-match-p "hello world" stdout)))))
+            (should (msgpack-bin-p stdout))
+            (should (string-match-p "hello world" (msgpack-bin-string stdout))))))
     (tramp-rpc-mock-test--stop-server)))
 
 (ert-deftest tramp-rpc-mock-test-server-process-signal-exit ()
@@ -1932,7 +1943,8 @@ This matches the behavior expected by `tramp-test28-process-file'."
                        ("dir.list"
                         (should (eq (alist-get 'include_attrs params) t))
                         (should (eq (alist-get 'include_hidden params) t))
-                        (pcase (alist-get 'path params)
+                        (pcase (tramp-rpc-mock-test--bytes-string
+                                (alist-get 'path params))
                           ("/tmp/dir"
                            `(((name . ".") (type . "directory") (attrs . ,dir-stat))
                              ((name . "..") (type . "directory") (attrs . ,dir-stat))
@@ -1949,7 +1961,8 @@ This matches the behavior expected by `tramp-test28-process-file'."
                   ((symbol-function 'tramp-rpc--call-batch)
                    (lambda (_vec requests)
                      (mapcar (lambda (request)
-                               (pcase (alist-get 'path (cdr request))
+                               (pcase (tramp-rpc-mock-test--bytes-string
+                                       (alist-get 'path (cdr request)))
                                  ("/tmp/dir/a.txt" '((content . "root")))
                                  ("/tmp/dir/sub/b.txt" '((content . "child")))
                                  (_ (error "Unexpected batch request: %S" request))))
@@ -2104,7 +2117,8 @@ This matches the behavior expected by `tramp-test28-process-file'."
                      (mapcar (lambda (request)
                                `((content . ,(format "content:%s"
                                               (file-name-nondirectory
-                                               (alist-get 'path (cdr request)))))))
+                                               (tramp-rpc-mock-test--bytes-string
+                                                (alist-get 'path (cdr request))))))))
                              requests)))
                   ((symbol-function 'tramp-rpc--invalidate-cache-for-path) #'ignore)
                   ((symbol-function 'tramp-flush-file-properties) #'ignore)

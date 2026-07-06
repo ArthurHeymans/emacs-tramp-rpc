@@ -5,7 +5,7 @@
 ;; Author: Arthur Heymans <arthur@aheymans.xyz>
 ;; Version: 0.11.0
 ;; Keywords: comm, processes, files
-;; Package-Requires: ((emacs "30.1") (msgpack "0") (tramp "2.8.1.4"))
+;; Package-Requires: ((emacs "30.1") (msgpack "0.1.1") (tramp "2.8.1.4"))
 
 ;; This file is part of tramp-rpc.
 
@@ -640,9 +640,10 @@ telemetry even when later tests unload TRAMP and remove debug buffers."
 (defun tramp-rpc--extract-file-read-content (rpc-result)
   "Extract and optionally decompress content from FILE.READ RPC-RESULT.
 Signals `remote-file-error' on compressed payload decode failures."
-  (let ((content (if (stringp rpc-result)
-                     rpc-result
-                   (alist-get 'content rpc-result))))
+  (let ((content (tramp-rpc--binary-bytes
+                  (if (or (stringp rpc-result) (msgpack-bin-p rpc-result))
+                      rpc-result
+                    (alist-get 'content rpc-result)))))
     (if (and (not (stringp rpc-result))
              (alist-get 'compressed rpc-result))
         (let ((compression (or (alist-get 'compression rpc-result) "zlib")))
@@ -1976,22 +1977,30 @@ This is more efficient when the server has async support."
 ;; ============================================================================
 
 (defun tramp-rpc--decode-string (data)
-  "Decode DATA from raw bytes to multibyte UTF-8 string.
-With MessagePack, strings come as raw bytes (unibyte string).
-We decode them as UTF-8 to get proper multibyte strings.
-Returns nil if DATA is nil, empty string if DATA is empty."
+  "Decode binary DATA to a multibyte UTF-8 string.
+MessagePack `bin' values carry bytes; MessagePack `str' values are already
+text strings.  Returns nil if DATA is nil."
   (cond
    ((null data) nil)
-   ((and (stringp data) (> (length data) 0))
-    (decode-coding-string data 'utf-8-unix))
+   ((msgpack-bin-p data)
+    (decode-coding-string (msgpack-bin-string data) 'utf-8-unix))
+   ((stringp data) data)
+   (t data)))
+
+(defun tramp-rpc--binary-bytes (data)
+  "Return raw bytes from DATA, unwrapping MessagePack bin values."
+  (cond
+   ((msgpack-bin-p data) (msgpack-bin-string data))
+   ((and (stringp data) (multibyte-string-p data))
+    (encode-coding-string data 'utf-8-unix))
    (t data)))
 
 (defun tramp-rpc--decode-output (data _encoding)
-  "Decode DATA from raw bytes to multibyte UTF-8 string.
-With MessagePack, data comes as raw bytes (unibyte string).
-We decode it as UTF-8 to get a proper multibyte string.
+  "Decode binary process DATA to a multibyte UTF-8 string.
 ENCODING is ignored (kept for API compatibility)."
-  (or (tramp-rpc--decode-string data) ""))
+  (if data
+      (decode-coding-string (tramp-rpc--binary-bytes data) 'utf-8-unix)
+    ""))
 
 (defun tramp-rpc--decode-filename (entry)
   "Get filename from directory ENTRY.
@@ -2008,12 +2017,21 @@ the server, since the remote side does not understand it."
         (encode-coding-string unquoted 'utf-8-unix)
       unquoted)))
 
+(defun tramp-rpc--path-to-string (path)
+  "Return unquoted PATH as a text string for RPC fields typed as strings."
+  (let ((unquoted (file-name-unquote path)))
+    (if (multibyte-string-p unquoted)
+        unquoted
+      (decode-coding-string unquoted 'utf-8-unix))))
+
+(defun tramp-rpc--path-to-bin (path)
+  "Return PATH as an explicit MessagePack bin value."
+  (msgpack-bin-make (tramp-rpc--path-to-bytes path)))
+
 (defun tramp-rpc--encode-path (path)
-  "Encode PATH for transmission to the server.
-With MessagePack, paths are sent directly as strings/binary.
-Strips any Emacs file-name quoting (\"/:\") before encoding.
-Returns an alist with path."
-  `((path . ,(tramp-rpc--path-to-bytes path))))
+  "Encode PATH for transmission to path-or-bytes server parameters.
+Returns an alist with PATH as an explicit MessagePack bin value."
+  `((path . ,(tramp-rpc--path-to-bin path))))
 
 ;; ============================================================================
 ;; File name handler operations
@@ -2083,11 +2101,10 @@ path unchanged (after resolving any symlinks in parent directories)."
     (condition-case nil
         (let* ((result (tramp-rpc--call v "file.truename"
                                         (tramp-rpc--encode-path localname)))
-               ;; With MessagePack, path comes as raw bytes - decode to UTF-8
                (path (tramp-rpc--decode-string
-                      (if (stringp result)
-                          result
-                        (alist-get 'path result)))))
+                      (if (and (listp result) (not (msgpack-bin-p result)))
+                          (alist-get 'path result)
+                        result))))
           (or path localname))
       ;; If file doesn't exist or has a symlink loop, fall back to
       ;; symlink-chasing approach (same as tramp-handle-file-truename).
@@ -2294,7 +2311,7 @@ Return readable dir-locals files in DIRECTORY in increasing priority order."
            (names (tramp-rpc--dir-locals-candidate-files base-el-only))
            (result (tramp-rpc--call
                     v "highlevel.test_files_in_dir"
-                    `((directory . ,(tramp-rpc--path-to-bytes localdir))
+                    `((directory . ,(tramp-rpc--path-to-string localdir))
                       (names . ,(vconcat names))))))
       (mapcar (lambda (path)
                 (tramp-make-tramp-file-name
@@ -2321,7 +2338,7 @@ to the built-in implementation."
              (names (ensure-list name))
              (result (tramp-rpc--call
                       v "highlevel.locate_dominating_file_multi"
-                      `((file . ,(tramp-rpc--path-to-bytes localname))
+                      `((file . ,(tramp-rpc--path-to-string localname))
                         (names . ,(vconcat names))))))
         (when-let* ((marker (car result))
                     (marker-path (tramp-rpc--decode-string marker)))
@@ -2358,7 +2375,7 @@ to the built-in implementation."
               collect (file-name-unquote (file-local-name cache-dir))))))
       (tramp-rpc--call
        v "highlevel.dir_locals_find_file_cache_update"
-       `((file . ,(tramp-rpc--path-to-bytes localname))
+       `((file . ,(tramp-rpc--path-to-string localname))
          (names . ,(vconcat names))
          (cache_dirs . ,(vconcat cache-dirs)))))))
 
@@ -2603,7 +2620,8 @@ network round-trip."
                                               (let ((r (tramp-rpc--call
                                                         v "file.read"
                                                         (tramp-rpc--encode-path localname))))
-                                                (alist-get 'content r))
+                                                (tramp-rpc--binary-bytes
+                                                 (alist-get 'content r)))
                                             (file-missing nil)))
                                  (prefix (if existing
                                              (substring existing 0 (min append (length existing)))
@@ -2673,9 +2691,9 @@ network round-trip."
            newname ok-if-already-exists))
          (t
           (tramp-rpc--call v1 "file.copy"
-                           `((src . ,(tramp-rpc--path-to-bytes
+                           `((src . ,(tramp-rpc--path-to-bin
                                       (file-name-unquote v1-localname)))
-                             (dest . ,(tramp-rpc--path-to-bytes
+                             (dest . ,(tramp-rpc--path-to-bin
                                        (file-name-unquote v2-localname)))
                              (preserve . ,(if (or keep-time preserve-permissions)
                                               t :msgpack-false))
@@ -2732,9 +2750,9 @@ network round-trip."
       (with-parsed-tramp-file-name filename v1
         (with-parsed-tramp-file-name newname v2
           (tramp-rpc--call v1 "file.copy"
-                           `((src . ,(tramp-rpc--path-to-bytes
+                           `((src . ,(tramp-rpc--path-to-bin
                                       (file-name-unquote v1-localname)))
-                             (dest . ,(tramp-rpc--path-to-bytes
+                             (dest . ,(tramp-rpc--path-to-bin
                                        (file-name-unquote v2-localname)))
                              (preserve . ,(if (or keep-time preserve-permissions) t :msgpack-false))
                              (overwrite . ,(if ok-if-already-exists t :msgpack-false)))))))
@@ -2833,9 +2851,9 @@ network round-trip."
              (expand-file-name (file-name-nondirectory filename) newname)
              ok-if-already-exists)))
         (tramp-rpc--call v1 "file.rename"
-                         `((src . ,(tramp-rpc--path-to-bytes
+                         `((src . ,(tramp-rpc--path-to-bin
                                     (file-name-unquote v1-localname)))
-                           (dest . ,(tramp-rpc--path-to-bytes
+                           (dest . ,(tramp-rpc--path-to-bin
                                      (file-name-unquote v2-localname)))
                            (overwrite . ,(if ok-if-already-exists
                                              t :msgpack-false))))
@@ -2878,9 +2896,9 @@ network round-trip."
       (with-parsed-tramp-file-name filename v1
         (with-parsed-tramp-file-name newname v2
           (tramp-rpc--call v1 "file.rename"
-                           `((src . ,(tramp-rpc--path-to-bytes
+                           `((src . ,(tramp-rpc--path-to-bin
                                       (file-name-unquote v1-localname)))
-                             (dest . ,(tramp-rpc--path-to-bytes
+                             (dest . ,(tramp-rpc--path-to-bin
                                        (file-name-unquote v2-localname)))
                              (overwrite . ,(if ok-if-already-exists t :msgpack-false)))))))
      ;; Different hosts, copy then delete
@@ -3125,7 +3143,7 @@ implementation, which will use the normal TRAMP-RPC file handlers underneath."
                                   p)))
                             link-path-params)))
       (tramp-rpc--call v "file.make_symlink"
-                       (append `((target . ,(tramp-rpc--path-to-bytes target-path))) params)))
+                       (append `((target . ,(tramp-rpc--path-to-bin target-path))) params)))
     (tramp-rpc--invalidate-cache-for-path linkname)))
 
 (defun tramp-rpc-handle-add-name-to-file (filename newname &optional ok-if-already-exists)
@@ -3155,9 +3173,9 @@ Creates a hard link from NEWNAME to FILENAME."
           (delete-file newname)))
       (tramp-flush-file-properties v2 v2-localname)
       (tramp-rpc--call v1 "file.make_hardlink"
-                       `((src . ,(tramp-rpc--path-to-bytes
+                       `((src . ,(tramp-rpc--path-to-bin
                                   (file-name-unquote v1-localname)))
-                         (dest . ,(tramp-rpc--path-to-bytes
+                         (dest . ,(tramp-rpc--path-to-bin
                                    (file-name-unquote v2-localname))))))))
 
 (defun tramp-rpc-handle-set-file-uid-gid (filename &optional uid gid)
