@@ -1,19 +1,18 @@
 //! Process execution operations
 
 use crate::msgpack_map;
-use crate::protocol::{from_value, ProcessResult, RpcError};
-use nix::fcntl::{fcntl, FcntlArg, OFlag};
-use nix::pty::{openpty, OpenptyResult};
+use crate::protocol::{ProcessResult, RpcError, from_value};
+use nix::fcntl::{FcntlArg, OFlag, fcntl};
+use nix::pty::{OpenptyResult, openpty};
 use nix::sys::signal::Signal;
-use nix::sys::wait::{waitpid, WaitPidFlag, WaitStatus};
-use nix::unistd::{close, dup2, execvp, fork, setsid, tcgetpgrp, ForkResult, Pid};
+use nix::sys::wait::{WaitPidFlag, WaitStatus, waitpid};
+use nix::unistd::{Pid, tcgetpgrp};
 use rmpv::Value;
 use serde::Deserialize;
 use std::collections::HashMap;
-use std::ffi::CString;
 use std::io::ErrorKind;
 use std::os::fd::{AsRawFd, BorrowedFd, RawFd};
-use std::process::Stdio;
+use std::process::{Command as StdCommand, Stdio};
 use std::sync::{Arc, OnceLock};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 use tokio::process::{Child, ChildStderr, ChildStdin, ChildStdout, Command};
@@ -108,9 +107,10 @@ pub async fn run(params: Value) -> HandlerResult {
 
     // Write stdin if provided (no base64 decoding needed!)
     if let Some(stdin_data) = params.stdin
-        && let Some(mut stdin) = child.stdin.take() {
-            let _ = stdin.write_all(&stdin_data).await;
-        }
+        && let Some(mut stdin) = child.stdin.take()
+    {
+        let _ = stdin.write_all(&stdin_data).await;
+    }
 
     // Wait for process to complete (async!)
     let output = child
@@ -464,9 +464,10 @@ pub async fn list(_params: Value) -> HandlerResult {
 // PTY (Pseudo-Terminal) Process Management
 // ============================================================================
 
-use std::os::unix::io::{FromRawFd, OwnedFd};
-use tokio::io::unix::AsyncFd;
+use std::os::unix::io::{FromRawFd, IntoRawFd, OwnedFd};
+use std::os::unix::process::CommandExt;
 use tokio::io::Interest;
+use tokio::io::unix::AsyncFd;
 
 static PTY_PROCESS_MAP: OnceLock<Mutex<HashMap<u32, ManagedPtyProcess>>> = OnceLock::new();
 static PTY_PID_COUNTER: OnceLock<Mutex<u32>> = OnceLock::new();
@@ -495,6 +496,10 @@ fn set_fd_nonblocking(fd: RawFd) -> Result<(), nix::Error> {
     let new_flags = OFlag::from_bits_truncate(flags) | OFlag::O_NONBLOCK;
     fcntl(fd, FcntlArg::F_SETFL(new_flags))?;
     Ok(())
+}
+
+fn dup_cloexec(fd: RawFd) -> Result<RawFd, nix::Error> {
+    fcntl(fd, FcntlArg::F_DUPFD_CLOEXEC(0))
 }
 
 fn set_window_size(fd: RawFd, rows: u16, cols: u16) -> Result<(), std::io::Error> {
@@ -555,64 +560,62 @@ fn do_fork_exec(params: PtyStartParams) -> Result<ForkResult2, RpcError> {
     set_window_size(master.as_raw_fd(), params.rows, params.cols)
         .map_err(|e| RpcError::process_error(format!("Failed to set window size: {}", e)))?;
 
-    let cmd_cstring = CString::new(params.cmd.clone()).map_err(|e| RpcError {
-        code: RpcError::INVALID_PARAMS,
-        message: format!("Invalid command: {}", e),
-        data: None,
-    })?;
+    let mut cmd = StdCommand::new(&params.cmd);
+    cmd.args(&params.args);
 
-    let mut args_cstrings: Vec<CString> = vec![cmd_cstring.clone()];
-    for arg in &params.args {
-        args_cstrings.push(CString::new(arg.clone()).map_err(|e| RpcError {
-            code: RpcError::INVALID_PARAMS,
-            message: format!("Invalid argument: {}", e),
-            data: None,
-        })?);
+    if let Some(cwd) = &params.cwd {
+        cmd.current_dir(super::expand_tilde(cwd));
     }
 
-    match unsafe { fork() } {
-        Ok(ForkResult::Child) => {
-            let _ = close(master.as_raw_fd());
-            let _ = setsid();
-            unsafe {
-                libc::ioctl(slave.as_raw_fd(), libc::TIOCSCTTY as _, 0);
-            }
-            let _ = dup2(slave.as_raw_fd(), 0);
-            let _ = dup2(slave.as_raw_fd(), 1);
-            let _ = dup2(slave.as_raw_fd(), 2);
-            if slave.as_raw_fd() > 2 {
-                let _ = close(slave.as_raw_fd());
-            }
-            if let Some(cwd) = &params.cwd {
-                let _ = std::env::set_current_dir(super::expand_tilde(cwd));
-            }
-            if params.clear_env {
-                for (key, _) in std::env::vars() {
-                    // FIXME: Audit that the environment access only happens in single-threaded code.
-                    unsafe { std::env::remove_var(key) };
-                }
-            }
-            if let Some(env) = &params.env {
-                for (key, value) in env {
-                    // FIXME: Audit that the environment access only happens in single-threaded code.
-                    unsafe { std::env::set_var(key, value) };
-                }
-            }
-            let _ = execvp(&cmd_cstring, &args_cstrings);
-            std::process::exit(127);
-        }
-        Ok(ForkResult::Parent { child }) => {
-            drop(slave);
-            use std::os::fd::IntoRawFd;
-            let master_fd = master.into_raw_fd();
-            Ok(ForkResult2 {
-                master_fd,
-                child_pid: child,
-                tty_name,
-            })
-        }
-        Err(e) => Err(RpcError::process_error(format!("Failed to fork: {}", e))),
+    if params.clear_env {
+        cmd.env_clear();
     }
+
+    if let Some(env) = &params.env {
+        cmd.envs(env);
+    }
+
+    let slave_fd = slave.as_raw_fd();
+    let master_fd = master.as_raw_fd();
+    let stdin_fd = dup_cloexec(slave_fd)
+        .map_err(|e| RpcError::process_error(format!("Failed to duplicate PTY: {}", e)))?;
+    let stdout_fd = dup_cloexec(slave_fd)
+        .map_err(|e| RpcError::process_error(format!("Failed to duplicate PTY: {}", e)))?;
+    let stderr_fd = dup_cloexec(slave_fd)
+        .map_err(|e| RpcError::process_error(format!("Failed to duplicate PTY: {}", e)))?;
+
+    // SAFETY: `dup_cloexec` returned fresh owned file descriptors; `Stdio` takes ownership.
+    cmd.stdin(unsafe { Stdio::from_raw_fd(stdin_fd) });
+    cmd.stdout(unsafe { Stdio::from_raw_fd(stdout_fd) });
+    cmd.stderr(unsafe { Stdio::from_raw_fd(stderr_fd) });
+
+    // SAFETY: the pre-exec hook only calls async-signal-safe libc syscalls.
+    unsafe {
+        cmd.pre_exec(move || {
+            libc::close(master_fd);
+            if libc::setsid() < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            if libc::ioctl(slave_fd, libc::TIOCSCTTY as _, 0) < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            if slave_fd > 2 {
+                libc::close(slave_fd);
+            }
+            Ok(())
+        });
+    }
+
+    let child = cmd
+        .spawn()
+        .map_err(|e| RpcError::process_error(format!("Failed to spawn PTY process: {}", e)))?;
+    drop(slave);
+
+    Ok(ForkResult2 {
+        master_fd: master.into_raw_fd(),
+        child_pid: Pid::from_raw(child.id() as i32),
+        tty_name,
+    })
 }
 
 /// Start a process with a PTY (pseudo-terminal)
@@ -939,7 +942,7 @@ pub async fn write_pty(params: Value) -> HandlerResult {
             return Err(RpcError::process_error(format!(
                 "Failed to write to PTY: {}",
                 e
-            )))
+            )));
         }
         Err(_would_block) => 0,
     };
@@ -1028,4 +1031,73 @@ pub async fn list_pty(_params: Value) -> HandlerResult {
         .collect();
 
     Ok(Value::Array(list))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn map_get<'a>(value: &'a Value, key: &str) -> Option<&'a Value> {
+        value.as_map().and_then(|m| {
+            m.iter()
+                .find(|(k, _)| k.as_str() == Some(key))
+                .map(|(_, v)| v)
+        })
+    }
+
+    #[tokio::test]
+    async fn start_pty_applies_env_without_mutating_process_env() {
+        let parent_value = std::env::var("TRAMP_RPC_PTY_TEST").ok();
+        let start = start_pty(Value::Map(vec![
+            (Value::String("cmd".into()), Value::String("/bin/sh".into())),
+            (
+                Value::String("args".into()),
+                Value::Array(vec![
+                    Value::String("-c".into()),
+                    Value::String("printf %s \"$TRAMP_RPC_PTY_TEST\"; read _".into()),
+                ]),
+            ),
+            (Value::String("clear_env".into()), Value::Boolean(true)),
+            (
+                Value::String("env".into()),
+                Value::Map(vec![(
+                    Value::String("TRAMP_RPC_PTY_TEST".into()),
+                    Value::String("ok".into()),
+                )]),
+            ),
+        ]))
+        .await
+        .expect("start pty");
+
+        let pid = map_get(&start, "pid").and_then(Value::as_u64).expect("pid") as u32;
+        let mut output = Vec::new();
+
+        for _ in 0..5 {
+            let read = read_pty(Value::Map(vec![
+                (Value::String("pid".into()), Value::Integer(pid.into())),
+                (
+                    Value::String("timeout_ms".into()),
+                    Value::Integer(1_000.into()),
+                ),
+            ]))
+            .await
+            .expect("read pty");
+
+            if let Some(Value::Binary(bytes)) = map_get(&read, "output") {
+                output.extend_from_slice(bytes);
+            }
+            if !output.is_empty() {
+                break;
+            }
+        }
+
+        let _ = close_pty(Value::Map(vec![(
+            Value::String("pid".into()),
+            Value::Integer(pid.into()),
+        )]))
+        .await;
+
+        assert_eq!(String::from_utf8_lossy(&output), "ok");
+        assert_eq!(std::env::var("TRAMP_RPC_PTY_TEST").ok(), parent_value);
+    }
 }

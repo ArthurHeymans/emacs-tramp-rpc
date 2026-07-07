@@ -1,6 +1,6 @@
 //! File metadata operations
 
-use crate::protocol::{from_value, FileAttributes, FileType, RpcError};
+use crate::protocol::{FileAttributes, FileType, RpcError, from_value};
 use rmpv::Value;
 use serde::Deserialize;
 use std::collections::HashMap;
@@ -129,11 +129,7 @@ static USER_NAMES: std::sync::LazyLock<Mutex<HashMap<u32, String>>> =
 /// Initial buffer size hint from sysconf, or a reasonable default.
 fn sysconf_bufsize(name: libc::c_int, fallback: usize) -> usize {
     let ret = unsafe { libc::sysconf(name) };
-    if ret > 0 {
-        ret as usize
-    } else {
-        fallback
-    }
+    if ret > 0 { ret as usize } else { fallback }
 }
 
 /// Maximum buffer size we will attempt before giving up (1 MiB).

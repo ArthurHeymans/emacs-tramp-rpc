@@ -5,7 +5,7 @@
 //! - `ancestors.scan`: Scan ancestor directories for marker files
 
 use crate::msgpack_map;
-use crate::protocol::{from_value, IntoValue, RpcError};
+use crate::protocol::{IntoValue, RpcError, from_value};
 use rmpv::Value;
 use serde::Deserialize;
 use std::collections::HashMap;
