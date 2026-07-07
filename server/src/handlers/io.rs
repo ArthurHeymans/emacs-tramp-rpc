@@ -221,11 +221,9 @@ pub async fn copy(params: Value) -> HandlerResult {
             .await
             .map(|meta| meta.is_dir())
             .unwrap_or(false)
-    {
-        if let Some(filename) = src_path.file_name() {
+        && let Some(filename) = src_path.file_name() {
             dest_path.push(filename);
         }
-    }
 
     let src_str = src_path.to_string_lossy().into_owned();
 

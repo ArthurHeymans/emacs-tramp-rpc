@@ -557,14 +557,13 @@ fn emit_nofollow_events(
         }
         drop(paths);
 
-        if event.mask & libc::IN_ATTRIB != 0 {
-            if let Some(path) = path {
+        if event.mask & libc::IN_ATTRIB != 0
+            && let Some(path) = path {
                 let _ = tx.send(WatchInput::Direct(vec![WatchEvent::path(
                     "attribute-changed",
                     path,
                 )]));
             }
-        }
     }
 }
 
@@ -621,17 +620,16 @@ impl WatchManager {
         let notify_tx = tx.clone();
 
         let watcher = FilteredWatcher::new(move |event: notify::Result<Event>| {
-            if let Ok(event) = event {
-                if matches!(
+            if let Ok(event) = event
+                && (matches!(
                     event.kind,
                     EventKind::Create(_) | EventKind::Modify(_) | EventKind::Remove(_)
-                ) || event.need_rescan()
+                ) || event.need_rescan())
                 {
                     // Topology events cannot be dropped, and blocking here can
                     // deadlock notify's watch/unwatch event loop.
                     let _ = notify_tx.send(WatchInput::Notify(event));
                 }
-            }
         })?;
 
         let manager = Arc::new(Self {
@@ -721,11 +719,10 @@ impl WatchManager {
     pub fn unwatch(&self, path: &Path) -> Result<(), notify::Error> {
         {
             let mut symlink_watcher = lock_or_recover(&self.symlink_watcher);
-            if let Some(watcher) = symlink_watcher.as_mut() {
-                if watcher.contains(path) {
+            if let Some(watcher) = symlink_watcher.as_mut()
+                && watcher.contains(path) {
                     return watcher.unwatch(path);
                 }
-            }
         }
 
         // Try to canonicalize, but fall back to the raw path

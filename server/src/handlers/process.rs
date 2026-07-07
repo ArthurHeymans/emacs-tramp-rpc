@@ -107,11 +107,10 @@ pub async fn run(params: Value) -> HandlerResult {
         .map_err(|e| RpcError::process_error(format!("Failed to spawn process: {}", e)))?;
 
     // Write stdin if provided (no base64 decoding needed!)
-    if let Some(stdin_data) = params.stdin {
-        if let Some(mut stdin) = child.stdin.take() {
+    if let Some(stdin_data) = params.stdin
+        && let Some(mut stdin) = child.stdin.take() {
             let _ = stdin.write_all(&stdin_data).await;
         }
-    }
 
     // Wait for process to complete (async!)
     let output = child
