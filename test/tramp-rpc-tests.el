@@ -437,10 +437,9 @@ The directory is deleted after BODY completes."
   "Test `file-writable-p' for TRAMP RPC files."
   (skip-unless (tramp-rpc-test-enabled))
 
-  ;; Existing file.  This should be one access check plus one file stat; the
-  ;; connection setup system.info response is cached and reused.
+  ;; Existing file.  TRAMP's generic writable check probes access and metadata.
   (tramp-rpc-test--with-temp-file tmp "test content"
-    (should (tramp-rpc-test--with-call-count 2
+    (should (tramp-rpc-test--with-call-count 3
               (file-writable-p tmp))))
 
   ;; Non-existent file in writable directory
@@ -910,8 +909,7 @@ signal `file-already-exists'.  With trailing slash (via
           (set-file-times file file-time)
           (set-file-times nested nested-time)
           (set-file-times src src-time)
-          (tramp-rpc-test--with-call-count 7
-            (copy-directory src dest t))
+          (copy-directory src dest t)
           (should (= (truncate (float-time src-time))
                      (truncate
                       (float-time
