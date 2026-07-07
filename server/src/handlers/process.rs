@@ -997,15 +997,16 @@ pub async fn close_pty(params: Value) -> HandlerResult {
 
     let mut processes = get_pty_process_map().lock().await;
 
-    match processes.remove(&params.pid) { Some(managed) => {
-        let _ = nix::sys::signal::kill(managed.child_pid, Signal::SIGKILL);
-        Ok(Value::Boolean(true))
-    } _ => {
-        Err(RpcError::process_error(format!(
+    match processes.remove(&params.pid) {
+        Some(managed) => {
+            let _ = nix::sys::signal::kill(managed.child_pid, Signal::SIGKILL);
+            Ok(Value::Boolean(true))
+        }
+        _ => Err(RpcError::process_error(format!(
             "PTY process not found: {}",
             params.pid
-        )))
-    }}
+        ))),
+    }
 }
 
 /// List all PTY processes
