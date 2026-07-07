@@ -1,9 +1,9 @@
 //! File I/O operations
 
 use crate::msgpack_map;
-use crate::protocol::{from_value, RpcError};
-use flate2::write::ZlibEncoder;
+use crate::protocol::{RpcError, from_value};
 use flate2::Compression;
+use flate2::write::ZlibEncoder;
 use rmpv::Value;
 use serde::Deserialize;
 use std::io::{SeekFrom, Write};
@@ -12,8 +12,8 @@ use std::path::{Path, PathBuf};
 use tokio::fs::{self, File, OpenOptions};
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 
-use super::file::{bytes_to_path, map_io_error};
 use super::HandlerResult;
+use super::file::{bytes_to_path, map_io_error};
 
 use crate::protocol::path_or_bytes;
 
@@ -221,9 +221,10 @@ pub async fn copy(params: Value) -> HandlerResult {
             .await
             .map(|meta| meta.is_dir())
             .unwrap_or(false)
-        && let Some(filename) = src_path.file_name() {
-            dest_path.push(filename);
-        }
+        && let Some(filename) = src_path.file_name()
+    {
+        dest_path.push(filename);
+    }
 
     let src_str = src_path.to_string_lossy().into_owned();
 

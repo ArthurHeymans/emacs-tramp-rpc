@@ -7,7 +7,7 @@ pub mod io;
 pub mod process;
 
 use crate::msgpack_map;
-use crate::protocol::{from_value, Request, RequestId, Response, RpcError};
+use crate::protocol::{Request, RequestId, Response, RpcError, from_value};
 use rmpv::Value;
 
 /// Dispatch a request to the appropriate handler
@@ -206,9 +206,10 @@ pub(crate) fn expand_tilde(path: &str) -> String {
             return format!("{}{}", home, &path[1..]);
         }
     } else if path == "~"
-        && let Ok(home) = std::env::var("HOME") {
-            return home;
-        }
+        && let Ok(home) = std::env::var("HOME")
+    {
+        return home;
+    }
     path.to_string()
 }
 

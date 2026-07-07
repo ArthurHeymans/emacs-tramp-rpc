@@ -5,15 +5,15 @@
 //! - `fstatat` with directory fd for efficient attribute collection
 //! - Synchronous blocking task to avoid per-entry async overhead
 
-use crate::protocol::{from_value, DirEntry, FileAttributes, FileType, RpcError};
+use crate::protocol::{DirEntry, FileAttributes, FileType, RpcError, from_value};
 use rmpv::Value;
 use serde::Deserialize;
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use tokio::fs;
 
-use super::file::{bytes_to_path, map_io_error};
 use super::HandlerResult;
+use super::file::{bytes_to_path, map_io_error};
 
 use crate::protocol::path_or_bytes;
 
