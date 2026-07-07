@@ -31,7 +31,8 @@
 ;; - VC mode integration works (git, etc.)
 ;;
 ;; HOW ASYNC PROCESSES WORK:
-;; Remote processes are started via RPC and polled periodically for output.
+;; Remote processes are started via RPC and stream output via server push
+;; notifications over the same connection.
 ;; A local pipe process serves as a relay to provide Emacs process semantics.
 ;; Process filters, sentinels, and signals all work as expected.
 ;;
@@ -502,7 +503,11 @@ proxy hops remain."
 (declare-function tramp-rpc--invalidate-cache-for-subtree "tramp-rpc-magit")
 (declare-function tramp-rpc--connection-key-string "tramp-rpc-magit")
 (declare-function tramp-rpc--directory-watched-p "tramp-rpc-magit")
-(declare-function tramp-rpc--handle-notification "tramp-rpc-magit")
+(declare-function tramp-rpc--handle-fs-events "tramp-rpc-magit")
+(declare-function tramp-rpc--handle-process-output-notification "tramp-rpc-process")
+(declare-function tramp-rpc--handle-process-exit-notification "tramp-rpc-process")
+(declare-function tramp-rpc--handle-pty-output-notification "tramp-rpc-process")
+(declare-function tramp-rpc--handle-pty-exit-notification "tramp-rpc-process")
 (declare-function tramp-rpc-watch-directory "tramp-rpc-magit")
 (declare-function tramp-rpc-unwatch-directory "tramp-rpc-magit")
 (declare-function tramp-rpc-clear-file-exists-cache "tramp-rpc-magit")
@@ -1934,6 +1939,22 @@ the underlying SSH ControlMaster may be half-open after a network interruption."
 ;; ============================================================================
 ;; RPC communication
 ;; ============================================================================
+
+(defconst tramp-rpc--notification-handlers
+  '(("fs.events" . tramp-rpc--handle-fs-events)
+    ("process.output" . tramp-rpc--handle-process-output-notification)
+    ("process.exit" . tramp-rpc--handle-process-exit-notification)
+    ("process.pty_output" . tramp-rpc--handle-pty-output-notification)
+    ("process.pty_exit" . tramp-rpc--handle-pty-exit-notification))
+  "Map server notification methods to their owning feature handlers.")
+
+(defun tramp-rpc--handle-notification (process method params)
+  "Dispatch a server notification from PROCESS with METHOD and PARAMS."
+  (if-let* ((handler (alist-get method tramp-rpc--notification-handlers
+                                nil nil #'string=))
+            ((fboundp handler)))
+      (funcall handler process params)
+    (tramp-rpc--debug "Unknown notification: %s" method)))
 
 (defun tramp-rpc--connection-filter (process output)
   "Filter for RPC connection PROCESS receiving OUTPUT.
@@ -5293,14 +5314,6 @@ Used by advice functions to bypass interception during output delivery.")
   "Non-nil while sending EOF to a local cat relay process.
 Tells the `process-send-eof' advice to call the original function
 instead of routing to the remote process.")
-
-(defcustom tramp-rpc-async-read-timeout-ms 200
-  "Timeout in milliseconds for async process reads.
-The server will block for this long waiting for data before returning.
-Lower values mean more responsive but higher CPU usage.
-Also controls process exit detection latency."
-  :type 'integer
-  :group 'tramp-rpc)
 
 ;; Process support, advice functions, and magit integration are now in
 ;; separate modules for better organization and maintainability.

@@ -454,6 +454,7 @@ async fn accept_frame<W>(
 #[tokio::main]
 async fn main() -> std::process::ExitCode {
     let stdout: WriterHandle = Arc::new(Mutex::new(BufWriter::new(tokio::io::stdout())));
+    handlers::process::init_notification_writer(Arc::clone(&stdout));
 
     // Initialize the filesystem watcher for cache invalidation notifications.
     // If this fails (e.g. inotify not available), we continue without watching.
@@ -1642,6 +1643,47 @@ mod tests {
         );
 
         let _ = read_task.await;
+        let kill_payload = make_request(
+            "process.kill",
+            Value::Map(vec![
+                (Value::String("pid".into()), Value::Integer(pid.into())),
+                (Value::String("signal".into()), Value::Integer(9.into())),
+            ]),
+        );
+        let _ = process_request(&kill_payload).await;
+    }
+
+    #[tokio::test]
+    async fn test_process_subscribe_and_unsubscribe() {
+        let _test_lock = handlers::process::test_process_map_lock().await;
+        let start_payload = make_request(
+            "process.start",
+            Value::Map(vec![(
+                Value::String("cmd".into()),
+                Value::String("cat".into()),
+            )]),
+        );
+        let start_response = process_request(&start_payload).await;
+        assert!(
+            start_response.error.is_none(),
+            "process.start should not error"
+        );
+        let pid = map_get(start_response.result.as_ref().unwrap(), "pid")
+            .and_then(Value::as_u64)
+            .expect("process.start should return pid") as u32;
+
+        for method in ["process.subscribe", "process.unsubscribe"] {
+            let response = process_request(&make_request(
+                method,
+                Value::Map(vec![(
+                    Value::String("pid".into()),
+                    Value::Integer(pid.into()),
+                )]),
+            ))
+            .await;
+            assert!(response.error.is_none(), "{method} failed: {response:?}");
+        }
+
         let kill_payload = make_request(
             "process.kill",
             Value::Map(vec![

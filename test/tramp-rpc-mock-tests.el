@@ -1094,8 +1094,6 @@ This matches the behavior expected by `tramp-test28-process-file'."
   (error "tramp-rpc mock tests require Tramp >= %s, but %s is loaded; set TRAMP_SOURCE to a supported checkout"
          tramp-rpc-mock-test--minimum-tramp-version tramp-version))
 (require 'tramp-rpc)
-(declare-function tramp-rpc--pty-handle-async-response
-                  "tramp-rpc-process" (local-process response))
 (declare-function tramp-rpc-deploy--download-file
                   "tramp-rpc-deploy" (url dest))
 (defconst tramp-rpc-mock-test--tramp-rpc-loaded t
@@ -1735,31 +1733,10 @@ This matches the behavior expected by `tramp-test28-process-file'."
       (dolist (buf (list buffer replacement-buffer))
         (when (buffer-live-p buf) (kill-buffer buf))))))
 
-(ert-deftest tramp-rpc-mock-test-pty-read-error-is-terminal ()
-  "PTY RPC errors and malformed responses terminate without another poll."
-  (dolist (response '((:error (:code -32004 :message "read failed"))
-                      (:result ((exited . nil)))))
-    (let ((process (make-pipe-process
-                    :name "tramp-rpc-pty-read-error-mock"
-                    :noquery t))
-          exit-code)
-      (unwind-protect
-          (progn
-            (puthash process '(:vec mock :pid 42 :poll-timer nil)
-                     tramp-rpc--pty-processes)
-            (cl-letf (((symbol-function 'tramp-rpc--handle-pty-exit)
-                       (lambda (_process code)
-                         (setq exit-code code))))
-              (tramp-rpc--pty-handle-async-response process response))
-            (should (= exit-code -1))
-            (should-not (plist-get (gethash process tramp-rpc--pty-processes)
-                                   :poll-timer)))
-        (remhash process tramp-rpc--pty-processes)
-        (when (process-live-p process) (delete-process process))))))
-
 (ert-deftest tramp-rpc-mock-test-pty-sigkill-status-reaches-sentinel-and-exit-status ()
   "A terminal SIGKILL result remains abnormal through the local PTY relay."
   (let* ((process (start-process "tramp-rpc-pty-sigkill-status" nil "cat"))
+         (connection (start-process "tramp-rpc-pty-sigkill-connection" nil "cat"))
          (tramp-rpc--pty-processes (make-hash-table :test 'eq))
          events)
     (unwind-protect
@@ -1767,40 +1744,51 @@ This matches the behavior expected by `tramp-test28-process-file'."
           (process-put process :tramp-rpc-pid 42)
           (process-put process :tramp-rpc-user-sentinel
                        (lambda (_process event) (push event events)))
-          (puthash process '(:poll-timer nil) tramp-rpc--pty-processes)
+          (puthash process
+                   (list :pid 42 :rpc-pty t :connection-process connection
+                         :pending-output nil :pending-exit nil
+                         :delivery-timer nil)
+                   tramp-rpc--pty-processes)
           (set-process-sentinel process #'tramp-rpc--pty-sentinel)
-          ;; This is the read response after explicit remote SIGKILL removed
-          ;; the PTY registry.  Its status must not become local exit 0.
-          (tramp-rpc--pty-handle-async-response
-           process '(:result ((output . nil) (exited . t) (exit_code . 137))))
-          (accept-process-output process 0.1)
+          (tramp-rpc--handle-pty-exit-notification
+           connection '((pid . 42) (exit_code . 137)))
+          (with-timeout (5 (error "PTY relay did not exit within timeout"))
+            (while (process-live-p process)
+              (accept-process-output process 0.1)))
           (should (= (tramp-rpc-handle-process-exit-status process) 137))
           (should (equal events '("exited abnormally with code 137\n"))))
       (remhash process tramp-rpc--pty-processes)
-      (when (process-live-p process) (delete-process process)))))
+      (when (process-live-p process) (delete-process process))
+      (when (process-live-p connection) (delete-process connection)))))
 
-(ert-deftest tramp-rpc-mock-test-pty-terminal-read-error-calls-user-sentinel-once ()
-  "A terminal PTY read error invokes the real user sentinel exactly once."
+(ert-deftest tramp-rpc-mock-test-pty-duplicate-exit-calls-user-sentinel-once ()
+  "Duplicate PTY exit notifications invoke the user sentinel exactly once."
   (let* ((process (start-process "tramp-rpc-pty-terminal-error" nil "cat"))
+         (connection (start-process "tramp-rpc-pty-terminal-connection" nil "cat"))
          (tramp-rpc--pty-processes (make-hash-table :test 'eq))
          (calls 0))
     (unwind-protect
         (progn
           (process-put process :tramp-rpc-user-sentinel
                        (lambda (_ _event) (cl-incf calls)))
-          (puthash process '(:poll-timer nil) tramp-rpc--pty-processes)
+          (puthash process
+                   (list :pid 42 :rpc-pty t :connection-process connection
+                         :pending-output nil :pending-exit nil
+                         :delivery-timer nil)
+                   tramp-rpc--pty-processes)
           (set-process-sentinel process #'tramp-rpc--pty-sentinel)
-          (tramp-rpc--pty-handle-async-response
-           process '(:error (:code -32004 :message "read failed")))
-          ;; `delete-process' queues the real sentinel callback.
-          (accept-process-output process 0.1)
+          (tramp-rpc--handle-pty-exit-notification
+           connection '((pid . 42) (exit_code . -1)))
+          (tramp-rpc--handle-pty-exit-notification
+           connection '((pid . 42) (exit_code . -1)))
+          (with-timeout (5 (error "PTY relay did not exit within timeout"))
+            (while (process-live-p process)
+              (accept-process-output process 0.1)))
           (should (= calls 1))
           (should-not (gethash process tramp-rpc--pty-processes))
-          ;; A duplicate terminal response cannot invoke it again.
-          (tramp-rpc--pty-handle-async-response
-           process '(:error (:code -32004 :message "read failed")))
           (should (= calls 1)))
-      (when (process-live-p process) (delete-process process)))))
+      (when (process-live-p process) (delete-process process))
+      (when (process-live-p connection) (delete-process connection)))))
 
 (ert-deftest tramp-rpc-mock-test-transport-death-wakes-sync-call ()
   "A synchronous call reports transport death without waiting for timeout."
@@ -1980,7 +1968,7 @@ This matches the behavior expected by `tramp-test28-process-file'."
       (when (buffer-live-p buffer) (kill-buffer buffer)))))
 
 (ert-deftest tramp-rpc-mock-test-process-timers-cancelled-after-cleanup ()
-  "Cleanup cancels independent delivery and polling timers without rescheduling."
+  "Cleanup cancels deferred delivery without allowing rescheduling."
   (let* ((vec (tramp-dissect-file-name "/rpc:timer-cleanup:/tmp/"))
          (process (start-process "tramp-rpc-timer-cleanup" nil "cat"))
          (tramp-rpc--async-processes (make-hash-table :test 'eq))
@@ -1988,18 +1976,13 @@ This matches the behavior expected by `tramp-test28-process-file'."
          (fired nil))
     (unwind-protect
         (progn
-          (puthash process (list :vec vec :pid 1
-                                 :delivery-timer nil :poll-timer nil)
+          (puthash process (list :vec vec :pid 1 :delivery-timer nil)
                    tramp-rpc--async-processes)
           (tramp-rpc--schedule-process-timer
            tramp-rpc--async-processes process :delivery-timer
            (lambda () (setq fired t)))
-          (tramp-rpc--schedule-process-timer
-           tramp-rpc--async-processes process :poll-timer
-           (lambda () (setq fired t)))
           (let ((info (gethash process tramp-rpc--async-processes)))
-            (should (timerp (plist-get info :delivery-timer)))
-            (should (timerp (plist-get info :poll-timer))))
+            (should (timerp (plist-get info :delivery-timer))))
           (tramp-rpc--cleanup-async-processes vec nil)
           (let ((barrier nil))
             (run-at-time 0 nil (lambda () (setq barrier t)))
@@ -2009,14 +1992,15 @@ This matches the behavior expected by `tramp-test28-process-file'."
           (should-not (gethash process tramp-rpc--async-processes)))
       (when (process-live-p process) (delete-process process)))))
 
-(ert-deftest tramp-rpc-mock-test-async-read-delivers-output-while-polling ()
-  "A non-exit read delivers its chunk exactly once while queuing the next read."
+(ert-deftest tramp-rpc-mock-test-push-notifications-deliver-ordered-output ()
+  "Push notifications deliver each output chunk once and in order."
   (let* ((vec (tramp-dissect-file-name "/rpc:async-output:/tmp/"))
          (buffer (generate-new-buffer " *tramp-rpc-async-output*"))
          (process (let ((process-connection-type nil))
                     (start-process "tramp-rpc-async-output" buffer "cat")))
-         (tramp-rpc--async-processes (make-hash-table :test 'eq))
-         (next-reads 0))
+         (connection (let ((process-connection-type nil))
+                       (start-process "tramp-rpc-push-connection" nil "cat")))
+         (tramp-rpc--async-processes (make-hash-table :test 'eq)))
     (unwind-protect
         (progn
           (set-process-filter
@@ -2026,26 +2010,25 @@ This matches the behavior expected by `tramp-test28-process-file'."
                (goto-char (point-max))
                (insert output))))
           (puthash process (list :vec vec :pid 1
-                                 :delivery-timer nil :poll-timer nil)
+                                 :connection-process connection
+                                 :delivery-timer nil)
                    tramp-rpc--async-processes)
-          (cl-letf (((symbol-function 'tramp-rpc--call-async)
-                     (lambda (&rest _) (cl-incf next-reads))))
-            (tramp-rpc--handle-async-read-response
-             process '(:result ((stdout . "chunk-a") (exited . nil))))
-            ;; A second response before timers run must append, not replace,
-            ;; the first queued delivery.
-            (tramp-rpc--handle-async-read-response
-             process '(:result ((stdout . "chunk-b") (exited . nil))))
-            (let ((deadline (+ (float-time) 1.0)))
-              (while (and (< (float-time) deadline)
-                          (or (= next-reads 0)
-                              (with-current-buffer buffer
-                                (not (equal (buffer-string) "chunk-achunk-b")))))
-                (accept-process-output nil 0.01)))
-            (should (= next-reads 1))
-            (with-current-buffer buffer
-              (should (equal (buffer-string) "chunk-achunk-b")))))
+          (tramp-rpc--handle-process-output-notification
+           connection '((pid . 1) (stdout . "chunk-a")))
+          (tramp-rpc--handle-process-output-notification
+           connection '((pid . 1) (stdout . "chunk-b")))
+          ;; Notification dispatch must not run the user filter reentrantly.
+          (with-current-buffer buffer
+            (should (equal (buffer-string) "")))
+          (let ((deadline (+ (float-time) 1.0)))
+            (while (and (< (float-time) deadline)
+                        (with-current-buffer buffer
+                          (not (equal (buffer-string) "chunk-achunk-b"))))
+              (accept-process-output nil 0.01)))
+          (with-current-buffer buffer
+            (should (equal (buffer-string) "chunk-achunk-b"))))
       (when (process-live-p process) (delete-process process))
+      (when (process-live-p connection) (delete-process connection))
       (when (buffer-live-p buffer) (kill-buffer buffer)))))
 
 (ert-deftest tramp-rpc-mock-test-direct-pty-normal-exit-calls-sentinel-once ()
@@ -4136,7 +4119,13 @@ This matches the behavior expected by `tramp-test28-process-file'."
                  (mtime . 1700000000)))
          calls)
     (unwind-protect
-        (cl-letf (((symbol-function 'tramp-rpc--call-file-stat)
+        (cl-letf (((symbol-function 'tramp-rpc--local-trash-destination)
+                   (lambda (filename)
+                     (expand-file-name
+                      (file-name-nondirectory
+                       (directory-file-name (expand-file-name filename)))
+                      trash-root)))
+                  ((symbol-function 'tramp-rpc--call-file-stat)
                    (lambda (_vec localname &optional lstat)
                      (should (equal localname "/tmp/file"))
                      (should lstat)
@@ -4172,7 +4161,13 @@ This matches the behavior expected by `tramp-test28-process-file'."
                  (mtime . 1700000000)))
          calls)
     (unwind-protect
-        (cl-letf (((symbol-function 'tramp-rpc--call-file-stat)
+        (cl-letf (((symbol-function 'tramp-rpc--local-trash-destination)
+                   (lambda (filename)
+                     (expand-file-name
+                      (file-name-nondirectory
+                       (directory-file-name (expand-file-name filename)))
+                      trash-root)))
+                  ((symbol-function 'tramp-rpc--call-file-stat)
                    (lambda (&rest _args) stat))
                   ((symbol-function 'tramp-rpc--call)
                    (lambda (_vec method _params)
@@ -4207,7 +4202,13 @@ This matches the behavior expected by `tramp-test28-process-file'."
                       (mtime . 1700000000)))
          calls)
     (unwind-protect
-        (cl-letf (((symbol-function 'tramp-rpc--call-file-stat)
+        (cl-letf (((symbol-function 'tramp-rpc--local-trash-destination)
+                   (lambda (filename)
+                     (expand-file-name
+                      (file-name-nondirectory
+                       (directory-file-name (expand-file-name filename)))
+                      trash-root)))
+                  ((symbol-function 'tramp-rpc--call-file-stat)
                    (lambda (&rest _args) dir-stat))
                   ((symbol-function 'tramp-rpc--call)
                    (lambda (_vec method params)
@@ -4303,7 +4304,13 @@ This matches the behavior expected by `tramp-test28-process-file'."
                  (mtime . 1700000000)))
          remote-delete-called fallback-called)
     (unwind-protect
-        (cl-letf (((symbol-function 'tramp-rpc--call-file-stat)
+        (cl-letf (((symbol-function 'tramp-rpc--local-trash-destination)
+                   (lambda (filename)
+                     (expand-file-name
+                      (file-name-nondirectory
+                       (directory-file-name (expand-file-name filename)))
+                      trash-root)))
+                  ((symbol-function 'tramp-rpc--call-file-stat)
                    (lambda (&rest _args) stat))
                   ((symbol-function 'tramp-rpc--call)
                    (lambda (_vec method _params)
@@ -4336,7 +4343,13 @@ This matches the behavior expected by `tramp-test28-process-file'."
                  (mtime . 1700000000)))
          fallback-called)
     (unwind-protect
-        (cl-letf (((symbol-function 'tramp-rpc--call-file-stat)
+        (cl-letf (((symbol-function 'tramp-rpc--local-trash-destination)
+                   (lambda (filename)
+                     (expand-file-name
+                      (file-name-nondirectory
+                       (directory-file-name (expand-file-name filename)))
+                      trash-root)))
+                  ((symbol-function 'tramp-rpc--call-file-stat)
                    (lambda (&rest _args) stat))
                   ((symbol-function 'tramp-rpc--call)
                    (lambda (_vec method _params)
@@ -4368,7 +4381,13 @@ This matches the behavior expected by `tramp-test28-process-file'."
          (names (cl-loop for i below file-count collect (format "file-%02d" i)))
          batch-sizes)
     (unwind-protect
-        (cl-letf (((symbol-function 'tramp-rpc--call-file-stat)
+        (cl-letf (((symbol-function 'tramp-rpc--local-trash-destination)
+                   (lambda (filename)
+                     (expand-file-name
+                      (file-name-nondirectory
+                       (directory-file-name (expand-file-name filename)))
+                      trash-root)))
+                  ((symbol-function 'tramp-rpc--call-file-stat)
                    (lambda (&rest _args) dir-stat))
                   ((symbol-function 'tramp-rpc--call)
                    (lambda (_vec method params)
@@ -4551,7 +4570,8 @@ This matches the behavior expected by `tramp-test28-process-file'."
           (let ((load-file-name build-elc))
             (should (equal (file-name-as-directory
                             (tramp-rpc-deploy--default-source-directory))
-                           (file-name-as-directory repo)))))
+                           ;; Use file-truename to handle macOS /var → /private/var symlinks.
+                           (file-name-as-directory (file-truename repo))))))
       (delete-directory dir t))))
 
 (ert-deftest tramp-rpc-mock-test-deploy-git-install-ask-without-cargo ()
@@ -5368,7 +5388,8 @@ issue #268 (0.13 fails to download prebuilt binary)."
                   (tramp-rpc-deploy--make-remote-staging-directory
                    vec remote-local)))
           (should (file-name-absolute-p directory))
-          (should (equal (file-name-directory directory) parent)))
+          ;; Use file-truename to handle macOS /var → /private/var symlinks.
+          (should (equal (file-name-directory directory) (file-truename parent))))
       (when directory
         (delete-directory directory t))
       (when (buffer-live-p buffer)
@@ -6671,8 +6692,9 @@ discard it for being unreadable."
         (progn
           (puthash proc '(:pid 4242) tramp-rpc--async-processes)
           (process-send-eof proc)
-          (while (process-live-p proc)
-            (accept-process-output proc 0.01 nil t))
+          (with-timeout (5 (error "Relay did not exit within timeout"))
+            (while (process-live-p proc)
+              (accept-process-output proc 0.01 nil t)))
           (should (gethash proc tramp-rpc--async-processes))
           (tramp-rpc--install-process-cleanup proc)
           (accept-process-output nil 0.05)
@@ -6709,8 +6731,9 @@ discard it for being unreadable."
           (process-put proc :tramp-rpc-exit-code 0)
           (process-put proc :tramp-rpc-exited t)
           (process-send-eof proc)
-          (while (process-live-p proc)
-            (accept-process-output proc 0.01 nil t))
+          (with-timeout (5 (error "Relay did not exit within timeout"))
+            (while (process-live-p proc)
+              (accept-process-output proc 0.01 nil t)))
           (accept-process-output nil 0.01)
           (should (equal user-events '("finished\n"))))
       (when (processp proc)
@@ -6784,6 +6807,94 @@ discard it for being unreadable."
       ;; Second access via absolute path - should hit the cache, not fetch again
       (tramp-rpc--get-direnv-environment vec "/home/user/project")
       (should (= fetch-count 1)))))
+
+(ert-deftest tramp-rpc-mock-test-notification-dispatch-process-events ()
+  "Test notification dispatcher routes process push notifications."
+  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
+  (let ((output-called nil)
+        (exit-called nil)
+        (pty-output-called nil)
+        (pty-exit-called nil))
+    (cl-letf (((symbol-function 'tramp-rpc--handle-process-output-notification)
+               (lambda (_process _params) (setq output-called t)))
+              ((symbol-function 'tramp-rpc--handle-process-exit-notification)
+               (lambda (_process _params) (setq exit-called t)))
+              ((symbol-function 'tramp-rpc--handle-pty-output-notification)
+               (lambda (_process _params) (setq pty-output-called t)))
+              ((symbol-function 'tramp-rpc--handle-pty-exit-notification)
+               (lambda (_process _params) (setq pty-exit-called t))))
+      (tramp-rpc--handle-notification nil "process.output" '((pid . 1)))
+      (tramp-rpc--handle-notification
+       nil "process.exit" '((pid . 1) (exit_code . 0)))
+      (tramp-rpc--handle-notification
+       nil "process.pty_output" '((pid . 1) (output . "x")))
+      (tramp-rpc--handle-notification
+       nil "process.pty_exit" '((pid . 1) (exit_code . 0))))
+    (should output-called)
+    (should exit-called)
+    (should pty-output-called)
+    (should pty-exit-called)))
+
+(ert-deftest tramp-rpc-mock-test-async-read-subscribes-instead-of-polling ()
+  "Test async process startup subscribes on its captured connection."
+  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
+  (let* ((proc (start-process "tramp-rpc-mock-subscribe" nil "cat"))
+         (connection-process
+          (start-process "tramp-rpc-mock-subscribe-connection" nil "cat"))
+         (connection (list :process connection-process))
+         (vec (make-tramp-file-name
+               :method "rpc" :host "host" :user "user" :localname "/"))
+         (tramp-rpc--async-processes (make-hash-table :test 'eq))
+         method-called params-called connection-called)
+    (unwind-protect
+        (progn
+          (process-put proc :tramp-rpc-connection connection)
+          (puthash proc
+                   (list :vec vec :pid 42
+                         :connection-process connection-process)
+                   tramp-rpc--async-processes)
+          (cl-letf (((symbol-function 'tramp-rpc--call-async)
+                     (lambda (_vec method params _callback &optional rpc-connection)
+                       (setq method-called method
+                             params-called params
+                             connection-called rpc-connection))))
+            (tramp-rpc--start-async-read proc))
+          (should (equal method-called "process.subscribe"))
+          (should (= (alist-get 'pid params-called) 42))
+          (should (eq connection-called connection)))
+      (dolist (process (list proc connection-process))
+        (when (process-live-p process)
+          (ignore-errors (delete-process process)))))))
+
+(ert-deftest tramp-rpc-mock-test-rpc-pty-subscribes-instead-of-polling ()
+  "Test RPC PTY startup subscribes on its captured connection."
+  (let* ((proc (start-process "tramp-rpc-mock-pty-subscribe" nil "cat"))
+         (connection-process
+          (start-process "tramp-rpc-mock-pty-connection" nil "cat"))
+         (connection (list :process connection-process))
+         (vec (make-tramp-file-name
+               :method "rpc" :host "host" :user "user" :localname "/"))
+         (tramp-rpc--pty-processes (make-hash-table :test 'eq))
+         method-called connection-called)
+    (unwind-protect
+        (progn
+          (process-put proc :tramp-rpc-vec vec)
+          (process-put proc :tramp-rpc-pid 42)
+          (process-put proc :tramp-rpc-connection connection)
+          (puthash proc
+                   (list :vec vec :pid 42 :rpc-pty t
+                         :connection-process connection-process)
+                   tramp-rpc--pty-processes)
+          (cl-letf (((symbol-function 'tramp-rpc--call-async)
+                     (lambda (_vec method _params _callback &optional rpc-connection)
+                       (setq method-called method
+                             connection-called rpc-connection))))
+            (tramp-rpc--pty-start-async-read proc))
+          (should (equal method-called "process.subscribe_pty"))
+          (should (eq connection-called connection)))
+      (dolist (process (list proc connection-process))
+        (when (process-live-p process)
+          (ignore-errors (delete-process process)))))))
 
 ;;; ============================================================================
 ;;; Test Runner

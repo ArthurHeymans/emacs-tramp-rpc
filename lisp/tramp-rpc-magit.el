@@ -380,16 +380,6 @@ Used during operations that will invalidate caches themselves.")
   "Return non-nil if watched-directory ENTRY is recursive."
   (and (consp entry) (plist-get entry :recursive)))
 
-(defun tramp-rpc--handle-notification (process method params)
-  "Handle a server-initiated notification.
-PROCESS is the connection, METHOD is the notification method,
-PARAMS is the notification parameters."
-  (cond
-   ((string= method "fs.events")
-    (tramp-rpc--handle-fs-events process params))
-   (t
-    (tramp-rpc--debug "Unknown notification: %s" method))))
-
 (defun tramp-rpc--fs-event-path (vec event key)
   "Return EVENT's KEY path as a TRAMP file name on VEC, or nil."
   (when-let* ((path (tramp-rpc--decode-string (alist-get key event)))

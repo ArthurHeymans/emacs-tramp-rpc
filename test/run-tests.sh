@@ -4,13 +4,15 @@
 #   ./test/run-tests.sh [OPTIONS]
 #
 # Options:
-#   --mock      Run mock tests only (no SSH required)
-#   --protocol  Run protocol tests only (no server required)
-#   --server    Run server tests (requires built server)
-#   --remote    Run remote tests (requires SSH to TRAMP_RPC_TEST_HOST)
-#   --upstream  Run upstream tests (requires SSH to TRAMP_RPC_TEST_HOST)
-#   --all       Run protocol and server tests (requires SSH to TRAMP_RPC_TEST_HOST)
-#   --help      Show this help
+#   --mock           Run mock tests only (no SSH required)
+#   --protocol       Run protocol tests only (no server required)
+#   --server         Run server tests (requires built server)
+#   --remote         Run remote tests (requires SSH to TRAMP_RPC_TEST_HOST)
+#   --upstream       Run upstream tests (requires SSH to TRAMP_RPC_TEST_HOST)
+#   --stress         Run subscriber model stress tests (requires built server)
+#   --stress-remote  Run subscriber model stress tests over real SSH (requires TRAMP_RPC_TEST_HOST)
+#   --all            Run protocol and server tests (requires SSH to TRAMP_RPC_TEST_HOST)
+#   --help           Show this help
 
 set -e
 
@@ -25,12 +27,15 @@ TRAMP_TEST_SOURCE_ENV="${TRAMP_TEST_SOURCE-}"
 TRAMP_TEST_SOURCE_ENV_SET="${TRAMP_TEST_SOURCE+x}"
 TRAMP_RPC_TEST_HOST_ENV="${TRAMP_RPC_TEST_HOST-}"
 TRAMP_RPC_TEST_HOST_ENV_SET="${TRAMP_RPC_TEST_HOST+x}"
+MSGPACK_SOURCE_ENV="${MSGPACK_SOURCE-}"
+MSGPACK_SOURCE_ENV_SET="${MSGPACK_SOURCE+x}"
 if [[ -f "$PROJECT_DIR/.config.local" ]]; then
     source "$PROJECT_DIR/.config.local"
 fi
 if [[ -n "$TRAMP_SOURCE_ENV_SET" ]]; then TRAMP_SOURCE="$TRAMP_SOURCE_ENV"; fi
 if [[ -n "$TRAMP_TEST_SOURCE_ENV_SET" ]]; then TRAMP_TEST_SOURCE="$TRAMP_TEST_SOURCE_ENV"; fi
 if [[ -n "$TRAMP_RPC_TEST_HOST_ENV_SET" ]]; then TRAMP_RPC_TEST_HOST="$TRAMP_RPC_TEST_HOST_ENV"; fi
+if [[ -n "$MSGPACK_SOURCE_ENV_SET" ]]; then MSGPACK_SOURCE="$MSGPACK_SOURCE_ENV"; fi
 
 expand_home() {
     case "$1" in
@@ -42,14 +47,28 @@ expand_home() {
 
 TRAMP_SOURCE="$(expand_home "${TRAMP_SOURCE:-}")"
 TRAMP_TEST_SOURCE="$(expand_home "${TRAMP_TEST_SOURCE:-}")"
-export TRAMP_SOURCE TRAMP_TEST_SOURCE
+MSGPACK_SOURCE="$(expand_home "${MSGPACK_SOURCE:-}")"
+export TRAMP_SOURCE TRAMP_TEST_SOURCE MSGPACK_SOURCE
 if [[ -n "${TRAMP_RPC_TEST_HOST+x}" ]]; then export TRAMP_RPC_TEST_HOST; fi
 EMACS_LOAD_PATH_ARGS=()
 
 if [[ -n "$TRAMP_SOURCE" && -d "$TRAMP_SOURCE/lisp" ]]; then
     EMACS_LOAD_PATH_ARGS=(-L "$TRAMP_SOURCE/lisp")
+elif [[ -n "$TRAMP_SOURCE" && -f "$TRAMP_SOURCE/tramp.el" ]]; then
+    # Flat checkout — .el files live directly in TRAMP_SOURCE (no lisp/ subdir).
+    EMACS_LOAD_PATH_ARGS=(-L "$TRAMP_SOURCE")
 elif [[ -n "$TRAMP_SOURCE" ]]; then
-    echo "TRAMP_SOURCE does not contain a lisp/ directory: $TRAMP_SOURCE" >&2
+    echo "TRAMP_SOURCE does not contain a lisp/ directory or tramp.el: $TRAMP_SOURCE" >&2
+    exit 1
+fi
+
+# Add msgpack source to load-path so (require 'msgpack nil t) succeeds before
+# package-initialize is called, preventing ELPA packages from shadowing a
+# custom TRAMP checkout.
+if [[ -n "$MSGPACK_SOURCE" && -f "$MSGPACK_SOURCE/msgpack.el" ]]; then
+    EMACS_LOAD_PATH_ARGS+=(-L "$MSGPACK_SOURCE")
+elif [[ -n "$MSGPACK_SOURCE" ]]; then
+    echo "MSGPACK_SOURCE does not contain msgpack.el: $MSGPACK_SOURCE" >&2
     exit 1
 fi
 
@@ -63,17 +82,20 @@ usage() {
     echo "Usage: $0 [OPTIONS]"
     echo ""
     echo "Options:"
-    echo "  --mock      Run mock tests only (no SSH required)"
-    echo "  --protocol  Run protocol tests only (no server required)"
-    echo "  --server    Run server tests (requires built server)"
-    echo "  --remote    Run remote tests (requires SSH to TRAMP_RPC_TEST_HOST)"
-    echo "  --upstream  Run upstream tests (requires SSH to TRAMP_RPC_TEST_HOST)"
-    echo "  --all       Run protocol and server tests (requires SSH to TRAMP_RPC_TEST_HOST)"
+    echo "  --mock           Run mock tests only (no SSH required)"
+    echo "  --protocol       Run protocol tests only (no server required)"
+    echo "  --server         Run server tests (requires built server)"
+    echo "  --remote         Run remote tests (requires SSH to TRAMP_RPC_TEST_HOST)"
+    echo "  --upstream       Run upstream tests (requires SSH to TRAMP_RPC_TEST_HOST)"
+    echo "  --stress         Run subscriber model stress tests (requires built server)"
+    echo "  --stress-remote  Run subscriber model stress tests over real SSH (requires TRAMP_RPC_TEST_HOST)"
+    echo "  --all            Run protocol and server tests (requires SSH to TRAMP_RPC_TEST_HOST)"
     echo "  --help      Show this help"
     echo ""
     echo "Environment variables:"
     echo "  TRAMP_SOURCE          Supported TRAMP source tree (optional; bundled TRAMP otherwise)"
     echo "  TRAMP_TEST_SOURCE     TRAMP source tree for upstream tests (default: TRAMP_SOURCE)"
+    echo "  MSGPACK_SOURCE        msgpack.el source directory (prevents package-initialize shadowing TRAMP)"
     echo "  TRAMP_RPC_TEST_HOST   Remote host for testing (default: localhost)"
     echo "  TRAMP_RPC_TEST_USER   User for remote testing"
     echo "  EMACS                 Emacs executable (default: emacs)"
@@ -164,6 +186,31 @@ run_upstream_tests() {
         "${upstream_load_path_args[@]}"
 }
 
+run_stress_tests() {
+    echo -e "${YELLOW}Running subscriber model stress tests...${NC}"
+    if ! server_available; then
+        echo -e "${RED}No server found. Build with 'cargo build'.${NC}"
+        exit 1
+    fi
+    require_supported_tramp "${EMACS_LOAD_PATH_ARGS[@]}"
+    run_ert_selector "$SCRIPT_DIR/tramp-rpc-stress-tests.el" "\"^tramp-rpc-stress-test-\"" nil \
+        "${EMACS_LOAD_PATH_ARGS[@]}"
+}
+
+run_stress_remote_tests() {
+    echo -e "${YELLOW}Running SSH subscriber stress tests against ${TRAMP_RPC_TEST_HOST:-localhost}...${NC}"
+    # Stress-remote tests load tramp-rpc directly; pass TRAMP_SOURCE as a plain
+    # load-path entry so both flat checkouts (no lisp/ subdir) and lisp/-layout
+    # checkouts work.
+    local extra_load_args=()
+    if [[ -n "$TRAMP_SOURCE" ]]; then
+        extra_load_args=(-L "$TRAMP_SOURCE")
+    fi
+    require_supported_tramp "${extra_load_args[@]}"
+    run_ert_selector "$SCRIPT_DIR/tramp-rpc-stress-remote-tests.el" \
+        "\"^tramp-rpc-stress-remote-test-\"" nil "${extra_load_args[@]}"
+}
+
 run_all_tests() {
     echo -e "${YELLOW}Running all tests...${NC}"
     local failed=0
@@ -211,6 +258,12 @@ case "$1" in
         ;;
     --upstream)
         run_upstream_tests
+        ;;
+    --stress)
+        run_stress_tests
+        ;;
+    --stress-remote)
+        run_stress_remote_tests
         ;;
     --all)
         run_all_tests

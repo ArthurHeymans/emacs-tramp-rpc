@@ -81,9 +81,12 @@
 
 (require 'tramp-rpc)
 
-(declare-function tramp-rpc--handle-async-read-response "tramp-rpc-process")
-(declare-function tramp-rpc--pty-handle-async-response
-                  "tramp-rpc-process" (local-process response))
+(declare-function tramp-rpc--handle-process-exit-notification
+                  "tramp-rpc-process" (connection params))
+(declare-function tramp-rpc--handle-pty-output-notification
+                  "tramp-rpc-process" (connection params))
+(declare-function tramp-rpc--handle-pty-exit-notification
+                  "tramp-rpc-process" (connection params))
 
 ;;; ============================================================================
 ;;; Test Configuration
@@ -2022,9 +2025,50 @@ This matches the upstream `tramp-test28-process-file' test."
       (delete-process stdout)
       (delete-process stderr))))
 
+(ert-deftest tramp-rpc-test13e-separate-stderr-drains-before-exit ()
+  "Separate stderr output finishes before the public process sentinel."
+  (let* ((tramp-rpc--async-processes (make-hash-table :test 'eq))
+         (stdout (start-process "tramp-rpc-exit-stdout" nil "cat"))
+         (stderr (start-process "tramp-rpc-exit-stderr" nil "cat"))
+         (stdout-output "")
+         (stderr-output "")
+         stderr-at-exit)
+    (unwind-protect
+        (progn
+          (set-process-filter
+           stdout (lambda (_process string)
+                    (setq stdout-output (concat stdout-output string))))
+          (set-process-filter
+           stderr (lambda (_process string)
+                    (setq stderr-output (concat stderr-output string))))
+          (puthash stdout
+                   (list :stderr-process stderr :pending-output nil
+                         :pending-exit nil :delivery-timer nil)
+                   tramp-rpc--async-processes)
+          (set-process-sentinel
+           stdout
+           (lambda (process event)
+             (tramp-rpc--pipe-process-sentinel
+              process event
+              (lambda (_process _event)
+                (setq stderr-at-exit stderr-output)))))
+          (tramp-rpc--deliver-process-output
+           stdout "stdout-final\n" "stderr-final\n" t)
+          (tramp-rpc--handle-process-exit stdout 0)
+          (with-timeout (5 (error "Stdout relay did not exit within timeout"))
+            (while (process-live-p stdout)
+              (accept-process-output nil 0.1)))
+          (should (equal stdout-output "stdout-final\n"))
+          (should (equal stderr-output "stderr-final\n"))
+          (should (equal stderr-at-exit "stderr-final\n")))
+      (remhash stdout tramp-rpc--async-processes)
+      (ignore-errors (delete-process stdout))
+      (ignore-errors (delete-process stderr)))))
+
 (ert-deftest tramp-rpc-test13f-pty-coding-byte-boundary ()
   "RPC PTY output remains raw until the local incremental decoder."
   (let* ((process (start-process "tramp-rpc-coding-pty" nil "cat"))
+         (connection (start-process "tramp-rpc-coding-pty-connection" nil "cat"))
          (bytes (encode-coding-string "é" 'binary))
          (output ""))
     (unwind-protect
@@ -2037,25 +2081,28 @@ This matches the upstream `tramp-test28-process-file' test."
                               (lambda (_process string)
                                 (setq output (concat output string))))
           (process-put process :tramp-rpc-pty t)
-          (puthash process '(:poll-timer nil) tramp-rpc--pty-processes)
-          (cl-letf (((symbol-function 'tramp-rpc--pty-start-async-read)
-                     (lambda (&rest _args) nil)))
-            (tramp-rpc--pty-handle-async-response
-             process `(:result ((output . ,(substring bytes 0 1))
-                                (exited . nil))))
-            (tramp-rpc--pty-handle-async-response
-             process `(:result ((output . ,(concat (substring bytes 1) "\n"))
-                                (exited . nil))))
-            (tramp-rpc-test--wait-for
-             (lambda () (equal output "é\n")) "complete PTY coding output"
-             process))
+          (puthash process
+                   (list :pid 1 :rpc-pty t :connection-process connection
+                         :pending-output nil :pending-exit nil
+                         :delivery-timer nil)
+                   tramp-rpc--pty-processes)
+          (tramp-rpc--handle-pty-output-notification
+           connection `((pid . 1) (output . ,(substring bytes 0 1))))
+          (tramp-rpc--handle-pty-output-notification
+           connection `((pid . 1)
+                        (output . ,(concat (substring bytes 1) "\n"))))
+          (tramp-rpc-test--wait-for
+           (lambda () (equal output "é\n")) "complete PTY coding output"
+           process)
           (should (equal output "é\n")))
       (remhash process tramp-rpc--pty-processes)
-      (delete-process process))))
+      (delete-process process)
+      (delete-process connection))))
 
 (ert-deftest tramp-rpc-test13g-pty-final-output-flushes-before-exit ()
   "RPC PTY final output is delivered before its local relay exits."
   (let* ((process (start-process "tramp-rpc-final-pty" nil "cat"))
+         (connection (start-process "tramp-rpc-final-pty-connection" nil "cat"))
          (output "")
          (sentinel-events nil))
     (unwind-protect
@@ -2070,59 +2117,48 @@ This matches the upstream `tramp-test28-process-file' test."
           (process-put process :tramp-rpc-user-sentinel
                        (lambda (_process event)
                          (push event sentinel-events)))
-          (puthash process '(:poll-timer nil) tramp-rpc--pty-processes)
-          (tramp-rpc--pty-handle-async-response
-           process '(:result ((output . "final output\n")
-                              (exited . t)
-                              (exit_code . 0))))
-          (while (process-live-p process)
-            (accept-process-output process 0.1 nil t))
+          (puthash process
+                   (list :pid 1 :rpc-pty t :connection-process connection
+                         :pending-output nil :pending-exit nil
+                         :delivery-timer nil)
+                   tramp-rpc--pty-processes)
+          (tramp-rpc--handle-pty-output-notification
+           connection '((pid . 1) (output . "final output\n")))
+          (tramp-rpc--handle-pty-exit-notification
+           connection '((pid . 1) (exit_code . 0)))
+          (with-timeout (5 (error "PTY relay did not exit within timeout"))
+            (while (process-live-p process)
+              (accept-process-output process 0.1 nil t)))
           (should (equal output "final output\n"))
           (should (equal sentinel-events '("finished\n")))
           (should-not (gethash process tramp-rpc--pty-processes)))
       (remhash process tramp-rpc--pty-processes)
       (when (processp process)
-        (ignore-errors (delete-process process))))))
+        (ignore-errors (delete-process process)))
+      (ignore-errors (delete-process connection)))))
 
-(ert-deftest tramp-rpc-test13d-async-read-rpc-error-exits-process ()
-  "Test async read RPC errors terminate the local process state."
-  (let ((proc (make-pipe-process
-               :name "tramp-rpc-read-error-test"
-               :noquery t))
+(ert-deftest tramp-rpc-test13d-push-exit-notification-exits-process ()
+  "Test a push exit notification terminates the matching local process state."
+  (let ((proc (make-pipe-process :name "tramp-rpc-push-exit-test" :noquery t))
+        (connection
+         (make-pipe-process :name "tramp-rpc-push-connection-test" :noquery t))
         exit-code)
     (unwind-protect
         (progn
-          (puthash proc '(:vec mock :pid 12345)
+          (puthash proc (list :vec 'mock :pid 12345
+                              :connection-process connection)
                    tramp-rpc--async-processes)
           (cl-letf (((symbol-function 'tramp-rpc--handle-process-exit)
                      (lambda (_proc code)
                        (setq exit-code code))))
-            (tramp-rpc--handle-async-read-response
-             proc '(:error (:code -32004 :message "read failed"))))
-          (should (= exit-code -1)))
+            (tramp-rpc--handle-process-exit-notification
+             connection '((pid . 12345) (exit_code . 17)))
+            (should-not exit-code)
+            (tramp-rpc--deliver-pending-process-output proc))
+          (should (= exit-code 17)))
       (remhash proc tramp-rpc--async-processes)
-      (ignore-errors (delete-process proc)))))
-
-(ert-deftest tramp-rpc-test13d-pty-read-rpc-error-exits-process ()
-  "PTY read RPC errors stop polling and use an abnormal sentinel exit."
-  (let ((proc (make-pipe-process
-               :name "tramp-rpc-pty-read-error-test"
-               :noquery t))
-        exit-code)
-    (unwind-protect
-        (progn
-          (puthash proc '(:vec mock :pid 12345 :poll-timer nil)
-                   tramp-rpc--pty-processes)
-          (cl-letf (((symbol-function 'tramp-rpc--handle-pty-exit)
-                     (lambda (_proc code)
-                       (setq exit-code code))))
-            (tramp-rpc--pty-handle-async-response
-             proc '(:error (:code -32004 :message "read failed"))))
-          (should (= exit-code -1))
-          (should-not (plist-get (gethash proc tramp-rpc--pty-processes)
-                                 :poll-timer)))
-      (remhash proc tramp-rpc--pty-processes)
-      (ignore-errors (delete-process proc)))))
+      (ignore-errors (delete-process proc))
+      (ignore-errors (delete-process connection)))))
 
 ;;; ============================================================================
 ;;; Test 14: Async Processes
@@ -2215,6 +2251,33 @@ This matches the upstream `tramp-test28-process-file' test."
               (accept-process-output proc 0.1)))
           (should (= 0 (process-exit-status proc)))
           (should (equal output "firstsecond")))
+      (when (processp proc)
+        (ignore-errors (delete-process proc))))))
+
+(ert-deftest tramp-rpc-test14-rpc-pty-push-output ()
+  "Test RPC PTYs receive output and exit through server notifications."
+  :tags '(:process :expensive-test)
+  (skip-unless (tramp-rpc-test-enabled))
+  (let* ((default-directory (tramp-rpc-test--remote-directory))
+         (tramp-rpc-use-direct-ssh-pty nil)
+         (output "")
+         (proc (make-process
+                :name "tramp-rpc-push-pty"
+                :buffer nil
+                :command '("/bin/sh" "-c" "printf pty-push")
+                :connection-type 'pty
+                :coding 'binary
+                :noquery t
+                :file-handler t
+                :filter (lambda (_process string)
+                          (setq output (concat output string))))))
+    (unwind-protect
+        (progn
+          (with-timeout (15 (error "RPC PTY push timeout"))
+            (while (process-live-p proc)
+              (accept-process-output proc 0.1)))
+          (should (= 0 (process-exit-status proc)))
+          (should (string-match-p "pty-push" output)))
       (when (processp proc)
         (ignore-errors (delete-process proc))))))
 

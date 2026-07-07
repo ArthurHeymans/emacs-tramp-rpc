@@ -1,7 +1,8 @@
 //! Process execution operations
 
+use crate::WriterHandle;
 use crate::msgpack_map;
-use crate::protocol::{ProcessResult, RpcError, from_value};
+use crate::protocol::{Notification, ProcessResult, RpcError, from_value};
 use nix::pty::{OpenptyResult, openpty};
 use nix::sys::signal::Signal;
 use nix::sys::termios::{LocalFlags, OutputFlags, SetArg, tcgetattr, tcsetattr};
@@ -20,10 +21,17 @@ use std::sync::{Arc, Mutex as StdMutex, OnceLock};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 use tokio::process::{Child, ChildStderr, ChildStdin, ChildStdout, Command};
 use tokio::sync::{Mutex, Notify, Semaphore};
+use tokio::task::JoinHandle;
 
 use super::HandlerResult;
 
 const MAX_PROCESS_READ_BYTES: usize = 1024 * 1024;
+// Bound each notification frame so process output cannot monopolize the shared
+// response stream behind one large write.
+const PUSH_READ_MAX_BYTES: usize = 65_536;
+const PUSH_READ_TIMEOUT_MS: u64 = 200;
+const _: () = assert!(PUSH_READ_MAX_BYTES <= 64 * 1024);
+const _: () = assert!(PUSH_READ_MAX_BYTES < crate::MAX_FRAME_SIZE);
 
 /// A child that exits or closes stdin before consuming all input is normal
 /// shell behavior (`head`, `grep -q', a failing filter).  `tramp-sh' runs
@@ -224,6 +232,7 @@ fn process_is_running(pid: i32) -> bool {
 // serialize connection loops with `test_process_map_lock` for the same reason.
 static PROCESS_MAP: OnceLock<Mutex<HashMap<u32, ManagedProcess>>> = OnceLock::new();
 static PID_COUNTER: OnceLock<Mutex<u32>> = OnceLock::new();
+static PROCESS_NOTIFICATION_WRITER: OnceLock<WriterHandle> = OnceLock::new();
 
 #[cfg(test)]
 static PROCESS_TEST_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
@@ -288,6 +297,211 @@ struct ManagedProcess {
     stdout: Arc<Mutex<Option<ChildStdout>>>,
     stderr: Arc<Mutex<Option<ChildStderr>>>,
     cmd: String,
+    push_subscription: Option<PushSubscription>,
+    subscription_requested: bool,
+    terminating: bool,
+}
+
+struct PushSubscription {
+    stop: Arc<AtomicBool>,
+    wake: Arc<Notify>,
+    task: JoinHandle<()>,
+}
+
+async fn stop_push_subscription(subscription: PushSubscription) {
+    subscription.stop.store(true, Ordering::Release);
+    subscription.wake.notify_one();
+    let _ = subscription.task.await;
+}
+
+pub fn init_notification_writer(writer: WriterHandle) {
+    let _ = PROCESS_NOTIFICATION_WRITER.set(writer);
+}
+
+async fn send_process_notification(method: &str, params: Value) -> Result<(), RpcError> {
+    let writer = PROCESS_NOTIFICATION_WRITER
+        .get()
+        .cloned()
+        .ok_or_else(|| RpcError::internal_error("Process notification writer not initialized"))?;
+    let notification = Notification::new(method, params);
+    let bytes = rmp_serde::to_vec_named(&notification)
+        .map_err(|e| RpcError::internal_error(format!("Failed to encode notification: {e}")))?;
+    let mut writer = writer.lock().await;
+    writer
+        .write_all(&(bytes.len() as u32).to_be_bytes())
+        .await
+        .map_err(|e| {
+            RpcError::internal_error(format!("Failed to write notification length: {e}"))
+        })?;
+    writer.write_all(&bytes).await.map_err(|e| {
+        RpcError::internal_error(format!("Failed to write notification payload: {e}"))
+    })?;
+    writer
+        .flush()
+        .await
+        .map_err(|e| RpcError::internal_error(format!("Failed to flush notification: {e}")))
+}
+
+fn response_field<'a>(value: &'a Value, key: &str) -> Option<&'a Value> {
+    value
+        .as_map()?
+        .iter()
+        .find_map(|(candidate, value)| (candidate.as_str() == Some(key)).then_some(value))
+}
+
+fn spawn_push_subscription_task(pid: u32, stop: Arc<AtomicBool>) -> JoinHandle<()> {
+    // NOTE: No wake/Notify is passed here.  The pipe read includes a bounded
+    // PUSH_READ_TIMEOUT_MS timeout, so the task exits within ~200 ms of stop
+    // being set.  Cancelling an in-flight read is not safe because it may
+    // have consumed bytes before waiting for lifecycle ownership.
+    tokio::spawn(async move {
+        while !stop.load(Ordering::Acquire) {
+            // Let an in-flight read finish: it may have consumed bytes before
+            // waiting for lifecycle ownership, so cancellation is not safe.
+            let result = read(msgpack_map! {
+                "pid" => pid,
+                "max_bytes" => PUSH_READ_MAX_BYTES as u64,
+                "timeout_ms" => PUSH_READ_TIMEOUT_MS
+            })
+            .await;
+            let Ok(result) = result else {
+                // A read error (e.g. waitpid failure) means we cannot deliver
+                // further output or a real exit code.  Send a synthetic exit
+                // so the client relay is not left hanging indefinitely.
+                let _ = send_process_notification(
+                    "process.exit",
+                    msgpack_map! { "pid" => pid, "exit_code" => -1i64 },
+                )
+                .await;
+                break;
+            };
+
+            let stdout = response_field(&result, "stdout")
+                .and_then(Value::as_slice)
+                .map_or_else(Vec::new, ToOwned::to_owned);
+            let stderr = response_field(&result, "stderr")
+                .and_then(Value::as_slice)
+                .map_or_else(Vec::new, ToOwned::to_owned);
+            if !stdout.is_empty() || !stderr.is_empty() {
+                let _ = send_process_notification(
+                    "process.output",
+                    msgpack_map! {
+                        "pid" => pid,
+                        "stdout" => if stdout.is_empty() { Value::Nil } else { Value::Binary(stdout) },
+                        "stderr" => if stderr.is_empty() { Value::Nil } else { Value::Binary(stderr) }
+                    },
+                )
+                .await;
+                // Yield after releasing the shared writer lock so other RPC
+                // response tasks can interleave between notification frames.
+                tokio::task::yield_now().await;
+            }
+
+            if response_field(&result, "exited").and_then(Value::as_bool) == Some(true) {
+                let exit_code = response_field(&result, "exit_code")
+                    .and_then(Value::as_i64)
+                    .unwrap_or(-1);
+                let _ = send_process_notification(
+                    "process.exit",
+                    msgpack_map! {
+                        "pid" => pid,
+                        "exit_code" => exit_code
+                    },
+                )
+                .await;
+                break;
+            }
+        }
+    })
+}
+
+fn spawn_pty_push_subscription_task(
+    pid: u32,
+    stop: Arc<AtomicBool>,
+    wake: Arc<Notify>,
+) -> JoinHandle<()> {
+    tokio::spawn(async move {
+        while !stop.load(Ordering::Acquire) {
+            let result = read_pty_now(pid, PUSH_READ_MAX_BYTES).await;
+            let Ok(result) = result else {
+                // A read error means we cannot deliver further PTY output or a
+                // real exit code.  Send a synthetic exit so the client relay is
+                // not left hanging indefinitely.
+                let _ = send_process_notification(
+                    "process.pty_exit",
+                    msgpack_map! { "pid" => pid, "exit_code" => -1i64 },
+                )
+                .await;
+                break;
+            };
+            if result.pending {
+                tokio::select! {
+                    _ = wake.notified() => break,
+                    _ = wait_for_pty_readable(pid) => {}
+                }
+                continue;
+            }
+            if !result.output.is_empty() {
+                let _ = send_process_notification(
+                    "process.pty_output",
+                    msgpack_map! {
+                        "pid" => pid,
+                        "output" => Value::Binary(result.output)
+                    },
+                )
+                .await;
+                // Yield after releasing the shared writer lock so other RPC
+                // response tasks can interleave between PTY notification frames.
+                // Without this yield a fast producer (e.g. `yes` in vterm) can
+                // monopolise the writer and stall every RPC response.
+                tokio::task::yield_now().await;
+            }
+
+            if result.exited {
+                let _ = send_process_notification(
+                    "process.pty_exit",
+                    msgpack_map! {
+                        "pid" => pid,
+                        "exit_code" => result.exit_code.unwrap_or(-1)
+                    },
+                )
+                .await;
+                break;
+            }
+        }
+    })
+}
+
+fn new_pipe_subscription(pid: u32) -> PushSubscription {
+    let stop = Arc::new(AtomicBool::new(false));
+    let wake = Arc::new(Notify::new());
+    let task = spawn_push_subscription_task(pid, Arc::clone(&stop));
+    PushSubscription { stop, wake, task }
+}
+
+fn new_pty_subscription(pid: u32) -> PushSubscription {
+    let stop = Arc::new(AtomicBool::new(false));
+    let wake = Arc::new(Notify::new());
+    let task = spawn_pty_push_subscription_task(pid, Arc::clone(&stop), Arc::clone(&wake));
+    PushSubscription { stop, wake, task }
+}
+
+async fn restore_pipe_after_failed_termination(pid: u32) {
+    if let Some(managed) = get_process_map().lock().await.get_mut(&pid) {
+        managed.terminating = false;
+        if managed.subscription_requested && managed.push_subscription.is_none() {
+            managed.push_subscription = Some(new_pipe_subscription(pid));
+        }
+    }
+}
+
+async fn restore_pty_after_failed_termination(pid: u32) {
+    if let Some(managed) = get_pty_process_map().lock().await.get_mut(&pid) {
+        managed.terminating = false;
+        if managed.subscription_requested && managed.push_subscription.is_none() {
+            managed.push_subscription = Some(new_pty_subscription(pid));
+        }
+    }
 }
 
 // ============================================================================
@@ -512,6 +726,9 @@ pub async fn start(params: Value) -> HandlerResult {
         child,
         child_pid,
         cmd: params.cmd.clone(),
+        push_subscription: None,
+        subscription_requested: false,
+        terminating: false,
     };
 
     get_process_map().lock().await.insert(pid, managed);
@@ -522,6 +739,53 @@ pub async fn start(params: Value) -> HandlerResult {
     Ok(msgpack_map! {
         "pid" => pid
     })
+}
+
+/// Subscribe to server-pushed output and exit notifications.
+pub async fn subscribe(params: Value) -> HandlerResult {
+    #[derive(Deserialize)]
+    struct Params {
+        pid: u32,
+    }
+
+    let params: Params = from_value(params).map_err(|e| RpcError::invalid_params(e.to_string()))?;
+    let mut processes = get_process_map().lock().await;
+    let managed = processes
+        .get_mut(&params.pid)
+        .ok_or_else(|| RpcError::process_error(format!("Process not found: {}", params.pid)))?;
+    if managed.terminating {
+        return Err(RpcError::process_error(format!(
+            "Process is terminating: {}",
+            params.pid
+        )));
+    }
+    if managed.push_subscription.is_none() {
+        managed.push_subscription = Some(new_pipe_subscription(params.pid));
+    }
+    managed.subscription_requested = true;
+    Ok(Value::Boolean(true))
+}
+
+/// Stop server-pushed notifications without terminating the process.
+pub async fn unsubscribe(params: Value) -> HandlerResult {
+    #[derive(Deserialize)]
+    struct Params {
+        pid: u32,
+    }
+
+    let params: Params = from_value(params).map_err(|e| RpcError::invalid_params(e.to_string()))?;
+    let subscription = {
+        let mut processes = get_process_map().lock().await;
+        let managed = processes
+            .get_mut(&params.pid)
+            .ok_or_else(|| RpcError::process_error(format!("Process not found: {}", params.pid)))?;
+        managed.subscription_requested = false;
+        managed.push_subscription.take()
+    };
+    if let Some(subscription) = subscription {
+        stop_push_subscription(subscription).await;
+    }
+    Ok(Value::Boolean(true))
 }
 
 /// Write to an async process's stdin
@@ -1134,13 +1398,54 @@ pub async fn kill(params: Value) -> HandlerResult {
     validate_signal(params.signal)?;
     // Signaling an unknown pid is an error; internal cleanup paths call
     // terminate_pipe_process directly and tolerate vanished entries.
-    if !get_process_map().lock().await.contains_key(&params.pid) {
-        return Err(RpcError::process_error(format!(
-            "Process not found: {}",
-            params.pid
-        )));
+    let (subscription, shared_exit_status) = {
+        let mut processes = get_process_map().lock().await;
+        let managed = processes
+            .get_mut(&params.pid)
+            .ok_or_else(|| RpcError::process_error(format!("Process not found: {}", params.pid)))?;
+        if managed.terminating {
+            return Err(RpcError::process_error(format!(
+                "Process is already terminating: {}",
+                params.pid
+            )));
+        }
+        if params.signal == libc::SIGKILL {
+            managed.terminating = true;
+            (
+                managed.push_subscription.take(),
+                Some(managed.shared_exit_status.clone()),
+            )
+        } else {
+            (None, None)
+        }
+    };
+    let subscribed = subscription.is_some();
+    if let Some(subscription) = subscription {
+        stop_push_subscription(subscription).await;
     }
-    terminate_pipe_process(params.pid, params.signal, false).await?;
+    if let Err(error) = terminate_pipe_process(params.pid, params.signal, false).await {
+        restore_pipe_after_failed_termination(params.pid).await;
+        return Err(error);
+    }
+    if params.signal == libc::SIGKILL && subscribed {
+        // Prefer the real exit status reaped by terminate_pipe_process over the
+        // synthetic 128+signal value.  A process that exited cleanly just before
+        // the kill should report 0, not 137.
+        let exit_code = shared_exit_status
+            .as_ref()
+            .and_then(|arc| *arc.lock().expect("shared pipe exit status lock"))
+            .map(crate::protocol::exit_code_from_status)
+            .map(i64::from)
+            .unwrap_or_else(|| i64::from(128 + params.signal));
+        let _ = send_process_notification(
+            "process.exit",
+            msgpack_map! {
+                "pid" => params.pid,
+                "exit_code" => exit_code
+            },
+        )
+        .await;
+    }
     Ok(Value::Boolean(true))
 }
 
@@ -1295,6 +1600,9 @@ struct ManagedPtyProcess {
     // before explicit SIGKILL removes its registry entry.
     shared_exit_status: Arc<StdMutex<Option<i32>>>,
     output_eof: bool,
+    push_subscription: Option<PushSubscription>,
+    subscription_requested: bool,
+    terminating: bool,
 }
 
 fn checked_fcntl(result: libc::c_int) -> Result<libc::c_int, std::io::Error> {
@@ -1620,6 +1928,9 @@ pub async fn start_pty(params: Value) -> HandlerResult {
         exit_status: None,
         shared_exit_status: Arc::new(StdMutex::new(None)),
         output_eof: false,
+        push_subscription: None,
+        subscription_requested: false,
+        terminating: false,
     };
 
     processes.insert(our_pid, managed);
@@ -1630,6 +1941,53 @@ pub async fn start_pty(params: Value) -> HandlerResult {
         "os_pid" => child_pid.as_raw(),
         "tty_name" => tty_name
     })
+}
+
+/// Subscribe to server-pushed PTY output and exit notifications.
+pub async fn subscribe_pty(params: Value) -> HandlerResult {
+    #[derive(Deserialize)]
+    struct Params {
+        pid: u32,
+    }
+
+    let params: Params = from_value(params).map_err(|e| RpcError::invalid_params(e.to_string()))?;
+    let mut processes = get_pty_process_map().lock().await;
+    let managed = processes
+        .get_mut(&params.pid)
+        .ok_or_else(|| RpcError::process_error(format!("PTY process not found: {}", params.pid)))?;
+    if managed.terminating {
+        return Err(RpcError::process_error(format!(
+            "PTY process is terminating: {}",
+            params.pid
+        )));
+    }
+    if managed.push_subscription.is_none() {
+        managed.push_subscription = Some(new_pty_subscription(params.pid));
+    }
+    managed.subscription_requested = true;
+    Ok(Value::Boolean(true))
+}
+
+/// Stop server-pushed PTY notifications without terminating the process.
+pub async fn unsubscribe_pty(params: Value) -> HandlerResult {
+    #[derive(Deserialize)]
+    struct Params {
+        pid: u32,
+    }
+
+    let params: Params = from_value(params).map_err(|e| RpcError::invalid_params(e.to_string()))?;
+    let subscription = {
+        let mut processes = get_pty_process_map().lock().await;
+        let managed = processes.get_mut(&params.pid).ok_or_else(|| {
+            RpcError::process_error(format!("PTY process not found: {}", params.pid))
+        })?;
+        managed.subscription_requested = false;
+        managed.push_subscription.take()
+    };
+    if let Some(subscription) = subscription {
+        stop_push_subscription(subscription).await;
+    }
+    Ok(Value::Boolean(true))
 }
 
 /// Resize a PTY terminal
@@ -2200,24 +2558,65 @@ pub async fn kill_pty(params: Value) -> HandlerResult {
     validate_signal(params.signal)?;
     // Signaling an unknown pid is an error; close_pty stays idempotent by
     // calling terminate_pty_process directly.
-    if !get_pty_process_map().lock().await.contains_key(&params.pid) {
-        return Err(RpcError::process_error(format!(
-            "PTY process not found: {}",
-            params.pid
-        )));
+    let (subscription, shared_exit_status) = {
+        let mut processes = get_pty_process_map().lock().await;
+        let managed = processes.get_mut(&params.pid).ok_or_else(|| {
+            RpcError::process_error(format!("PTY process not found: {}", params.pid))
+        })?;
+        if managed.terminating {
+            return Err(RpcError::process_error(format!(
+                "PTY process is already terminating: {}",
+                params.pid
+            )));
+        }
+        if params.signal == libc::SIGKILL {
+            managed.terminating = true;
+            (
+                managed.push_subscription.take(),
+                Some(managed.shared_exit_status.clone()),
+            )
+        } else {
+            (None, None)
+        }
+    };
+    let subscribed = subscription.is_some();
+    if let Some(subscription) = subscription {
+        stop_push_subscription(subscription).await;
     }
     // Match local signal-process semantics: forward the requested signal
     // without turning a survivable signal such as SIGINT into SIGKILL.
     // Explicit close and connection cleanup retain escalation authority.
     // Explicit SIGKILL also opts out of output draining.
-    terminate_pty_process(
+    if let Err(error) = terminate_pty_process(
         params.pid,
         params.signal,
         false,
         params.signal == libc::SIGKILL,
         params.signal == libc::SIGKILL,
     )
-    .await?;
+    .await
+    {
+        restore_pty_after_failed_termination(params.pid).await;
+        return Err(error);
+    }
+    if params.signal == libc::SIGKILL && subscribed {
+        // Prefer the real exit status reaped by terminate_pty_process over the
+        // synthetic 128+signal value.  A process that exited cleanly just before
+        // the kill should report 0, not 137.
+        let exit_code = shared_exit_status
+            .as_ref()
+            .and_then(|arc| *arc.lock().expect("shared PTY exit status lock"))
+            .map(i64::from)
+            .unwrap_or_else(|| i64::from(128 + params.signal));
+        let _ = send_process_notification(
+            "process.pty_exit",
+            msgpack_map! {
+                "pid" => params.pid,
+                "exit_code" => exit_code
+            },
+        )
+        .await;
+    }
     Ok(Value::Boolean(true))
 }
 
@@ -2229,8 +2628,30 @@ pub async fn close_pty(params: Value) -> HandlerResult {
     }
 
     let params: Params = from_value(params).map_err(|e| RpcError::invalid_params(e.to_string()))?;
+    let subscription = {
+        let mut processes = get_pty_process_map().lock().await;
+        match processes.get_mut(&params.pid) {
+            Some(managed) if managed.terminating => {
+                return Err(RpcError::process_error(format!(
+                    "PTY process is already terminating: {}",
+                    params.pid
+                )));
+            }
+            Some(managed) => {
+                managed.terminating = true;
+                managed.push_subscription.take()
+            }
+            None => None,
+        }
+    };
+    if let Some(subscription) = subscription {
+        stop_push_subscription(subscription).await;
+    }
     // Explicit close is the opt-out from kill's drain-preserving ownership.
-    terminate_pty_process(params.pid, libc::SIGKILL, true, true, false).await?;
+    if let Err(error) = terminate_pty_process(params.pid, libc::SIGKILL, true, true, false).await {
+        restore_pty_after_failed_termination(params.pid).await;
+        return Err(error);
+    }
     discard_terminated_pty_status(params.pid);
     Ok(Value::Boolean(true))
 }
@@ -2266,6 +2687,25 @@ pub async fn list_pty(_params: Value) -> HandlerResult {
 
 /// Stop and reap managed children after the transport is gone.
 pub async fn cleanup_managed_processes() -> Result<(), RpcError> {
+    // No notification can be delivered after transport EOF.  Stop readers
+    // before process termination so no detached task retains stream/fd state.
+    let mut subscriptions = Vec::new();
+    {
+        let mut processes = get_process_map().lock().await;
+        for managed in processes.values_mut() {
+            managed.terminating = true;
+            subscriptions.extend(managed.push_subscription.take());
+        }
+    }
+    {
+        let mut processes = get_pty_process_map().lock().await;
+        for managed in processes.values_mut() {
+            managed.terminating = true;
+            subscriptions.extend(managed.push_subscription.take());
+        }
+    }
+    futures::future::join_all(subscriptions.into_iter().map(stop_push_subscription)).await;
+
     let pipe_pids: Vec<(u32, u32)> = {
         let processes = get_process_map().lock().await;
         processes
@@ -3216,6 +3656,83 @@ mod tests {
         .await
         .expect_err("kill_pty of unknown pid should fail");
         assert_eq!(error.code, RpcError::PROCESS_ERROR);
+    }
+
+    #[tokio::test]
+    async fn pty_subscription_can_be_stopped_without_closing_process() {
+        let _test_lock = test_process_map_lock().await;
+        let result = start_pty(Value::Map(vec![(
+            Value::String("cmd".into()),
+            Value::String("cat".into()),
+        )]))
+        .await
+        .expect("start PTY");
+        let pid = map_get(&result, "pid")
+            .and_then(Value::as_u64)
+            .expect("PTY pid") as u32;
+        let params = || {
+            Value::Map(vec![(
+                Value::String("pid".into()),
+                Value::Integer(pid.into()),
+            )])
+        };
+
+        subscribe_pty(params()).await.expect("subscribe PTY");
+        assert!(
+            get_pty_process_map()
+                .lock()
+                .await
+                .get(&pid)
+                .is_some_and(|managed| {
+                    managed.subscription_requested && managed.push_subscription.is_some()
+                })
+        );
+        unsubscribe_pty(params()).await.expect("unsubscribe PTY");
+        assert!(
+            get_pty_process_map()
+                .lock()
+                .await
+                .get(&pid)
+                .is_some_and(|managed| {
+                    !managed.subscription_requested && managed.push_subscription.is_none()
+                })
+        );
+        close_pty(params()).await.expect("close PTY");
+    }
+
+    #[tokio::test]
+    async fn connection_cleanup_stops_pipe_and_pty_subscriptions() {
+        let _test_lock = test_process_map_lock().await;
+        let pipe_pid = start_pipe_process("sleep 30").await;
+        let pty = start_pty(Value::Map(vec![
+            (Value::String("cmd".into()), Value::String("sleep".into())),
+            (
+                Value::String("args".into()),
+                Value::Array(vec![Value::String("30".into())]),
+            ),
+        ]))
+        .await
+        .expect("start PTY");
+        let pty_pid = map_get(&pty, "pid")
+            .and_then(Value::as_u64)
+            .expect("PTY pid") as u32;
+        let pid_params = |pid: u32| {
+            Value::Map(vec![(
+                Value::String("pid".into()),
+                Value::Integer(pid.into()),
+            )])
+        };
+
+        subscribe(pid_params(pipe_pid))
+            .await
+            .expect("subscribe pipe");
+        subscribe_pty(pid_params(pty_pid))
+            .await
+            .expect("subscribe PTY");
+        cleanup_managed_processes()
+            .await
+            .expect("cleanup subscribed processes");
+        assert!(test_managed_maps_empty().await);
     }
 
     #[tokio::test]
@@ -4515,6 +5032,395 @@ mod tests {
         .expect_err("oversized PTY read should be rejected");
 
         assert_eq!(error.code, RpcError::INVALID_PARAMS);
+    }
+
+    // =========================================================================
+    // Subscriber model stress tests
+    //
+    // These tests verify that the subscribe/unsubscribe lifecycle is correct
+    // under concurrent and high-load conditions.  Because unit tests do not
+    // initialise PROCESS_NOTIFICATION_WRITER, notification *delivery* is not
+    // checked here; see test/tramp-rpc-stress-tests.el for end-to-end coverage
+    // of the full notification path through a live server binary.
+    // =========================================================================
+
+    fn pid_param(pid: u32) -> Value {
+        Value::Map(vec![(
+            Value::String("pid".into()),
+            Value::Integer(pid.into()),
+        )])
+    }
+
+    async fn subscription_is_active(pid: u32) -> bool {
+        get_process_map()
+            .lock()
+            .await
+            .get(&pid)
+            .map(|m| m.push_subscription.is_some())
+            .unwrap_or(false)
+    }
+
+    async fn subscription_task_finished(pid: u32) -> bool {
+        get_process_map()
+            .lock()
+            .await
+            .get(&pid)
+            .and_then(|m| m.push_subscription.as_ref())
+            .map(|s| s.task.is_finished())
+            .unwrap_or(true) // no subscription means nothing is running
+    }
+
+    // Subscribe to PID and return the subscription's JoinHandle clone via
+    // a polled-flag so we can wait for the task to finish independently.
+    async fn subscribe_pid(pid: u32) {
+        subscribe(pid_param(pid))
+            .await
+            .expect("subscribe should succeed");
+    }
+
+    async fn unsubscribe_pid(pid: u32) {
+        unsubscribe(pid_param(pid))
+            .await
+            .expect("unsubscribe should succeed");
+    }
+
+    /// Subscribe all PIDs in `pids`, returning after all subscribe RPCs
+    /// succeed.
+    async fn subscribe_all(pids: &[u32]) {
+        for &pid in pids {
+            subscribe_pid(pid).await;
+        }
+    }
+
+    /// Collect PIDs from a set of `process.start` results.
+    fn extract_pid(result: &Value) -> u32 {
+        map_get(result, "pid")
+            .and_then(Value::as_u64)
+            .expect("process pid") as u32
+    }
+
+    // -------------------------------------------------------------------------
+    // stress_subscribe_many_concurrent_processes_cleanup
+    //
+    // Start N short-lived processes, subscribe to all of them, let them exit
+    // naturally, then run connection cleanup.  Verifies:
+    //   - No deadlock under concurrent subscription tasks.
+    //   - All map entries are removed after cleanup.
+    // -------------------------------------------------------------------------
+    #[tokio::test]
+    async fn stress_subscribe_many_concurrent_processes_cleanup() {
+        let _test_lock = test_process_map_lock().await;
+        const N: usize = 20;
+
+        // Start processes that write a small amount then exit quickly.
+        let starts = futures::future::join_all((0..N).map(|i| {
+            start(Value::Map(vec![
+                (Value::String("cmd".into()), Value::String("/bin/sh".into())),
+                (
+                    Value::String("args".into()),
+                    Value::Array(vec![
+                        Value::String("-c".into()),
+                        Value::String(format!("printf 'p{i}'; exit 0").into()),
+                    ]),
+                ),
+            ]))
+        }))
+        .await;
+
+        let pids: Vec<u32> = starts
+            .into_iter()
+            .map(|r| extract_pid(&r.expect("start")))
+            .collect();
+
+        // Subscribe to every process – this spawns N subscription tasks.
+        subscribe_all(&pids).await;
+
+        // Wait until all subscription tasks finish on their own (processes exit
+        // quickly, so each task detects exit and breaks within its 200 ms read
+        // window).
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+        for &pid in &pids {
+            loop {
+                if subscription_task_finished(pid).await {
+                    break;
+                }
+                assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "subscription task for pid {pid} did not finish before deadline"
+                );
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        }
+
+        // Connection cleanup must remove all entries with no errors.
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            cleanup_managed_processes(),
+        )
+        .await
+        .expect("cleanup should not hang")
+        .expect("cleanup should succeed");
+
+        assert!(
+            test_managed_maps_empty().await,
+            "process maps should be empty after cleanup"
+        );
+    }
+
+    // -------------------------------------------------------------------------
+    // stress_subscribe_unsubscribe_cycle_no_task_leak
+    //
+    // Repeatedly subscribe and unsubscribe to a long-running process.  Each
+    // unsubscribe must stop the previous task before returning.  Verifies:
+    //   - No orphaned tasks accumulate.
+    //   - No deadlock in the subscribe/unsubscribe lock path.
+    // -------------------------------------------------------------------------
+    #[tokio::test]
+    async fn stress_subscribe_unsubscribe_cycle_no_task_leak() {
+        let _test_lock = test_process_map_lock().await;
+        const CYCLES: usize = 10;
+
+        let pid = start_pipe_process("sleep 30").await;
+
+        for _ in 0..CYCLES {
+            subscribe_pid(pid).await;
+            assert!(
+                subscription_is_active(pid).await,
+                "subscription must be active after subscribe"
+            );
+            unsubscribe_pid(pid).await;
+            // After unsubscribe the subscription slot must be cleared (the
+            // task was awaited and stopped inside unsubscribe).
+            assert!(
+                !subscription_is_active(pid).await,
+                "subscription must be inactive after unsubscribe"
+            );
+        }
+
+        // Verify no task handle leaked – the process should still be alive.
+        assert!(
+            get_process_map().lock().await.contains_key(&pid),
+            "process should still be registered"
+        );
+
+        kill(Value::Map(vec![
+            (Value::String("pid".into()), Value::Integer(pid.into())),
+            (
+                Value::String("signal".into()),
+                Value::Integer((libc::SIGKILL as i64).into()),
+            ),
+        ]))
+        .await
+        .expect("cleanup SIGKILL");
+    }
+
+    // -------------------------------------------------------------------------
+    // stress_concurrent_subscribe_and_write_no_deadlock
+    //
+    // Subscribe to a process while writing to its stdin concurrently.  The
+    // write queue and the subscription task both acquire process-map locks;
+    // this test verifies they do not deadlock each other.
+    // -------------------------------------------------------------------------
+    #[tokio::test]
+    async fn stress_concurrent_subscribe_and_write_no_deadlock() {
+        let _test_lock = test_process_map_lock().await;
+        // cat reads stdin and echoes to stdout.
+        let pid = start_pipe_process("cat").await;
+
+        let payload = Value::Map(vec![
+            (Value::String("pid".into()), Value::Integer(pid.into())),
+            (
+                Value::String("data".into()),
+                Value::Binary(vec![b'x'; 4096]),
+            ),
+        ]);
+
+        // Interleave subscribe and write calls concurrently.
+        let (sub_result, write_result) = tokio::join!(subscribe(pid_param(pid)), write(payload));
+        sub_result.expect("subscribe should not fail");
+        write_result.expect("write should not fail");
+
+        // Close stdin so cat exits and the subscription task can terminate.
+        close_stdin(pid_param(pid)).await.expect("close stdin");
+
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            if subscription_task_finished(pid).await {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "subscription task did not finish after stdin close"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+
+        cleanup_managed_processes()
+            .await
+            .expect("cleanup after concurrent subscribe+write");
+    }
+
+    // -------------------------------------------------------------------------
+    // stress_concurrent_subscribe_and_kill_multiple_processes
+    //
+    // Start N processes, subscribe to all, then SIGKILL them all concurrently.
+    // Verifies that concurrent kill+cleanup does not deadlock or leave leaked
+    // subscription tasks.
+    // -------------------------------------------------------------------------
+    #[tokio::test]
+    async fn stress_concurrent_subscribe_and_kill_multiple_processes() {
+        let _test_lock = test_process_map_lock().await;
+        const N: usize = 10;
+
+        let pids: Vec<u32> = futures::future::join_all(
+            (0..N).map(|_| async { start_pipe_process("sleep 30").await }),
+        )
+        .await;
+
+        subscribe_all(&pids).await;
+
+        // Kill all processes concurrently.
+        let kill_futures: Vec<_> = pids
+            .iter()
+            .map(|&pid| {
+                kill(Value::Map(vec![
+                    (Value::String("pid".into()), Value::Integer(pid.into())),
+                    (
+                        Value::String("signal".into()),
+                        Value::Integer((libc::SIGKILL as i64).into()),
+                    ),
+                ]))
+            })
+            .collect();
+
+        let results = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            futures::future::join_all(kill_futures),
+        )
+        .await
+        .expect("concurrent kills must not hang");
+
+        for (i, result) in results.into_iter().enumerate() {
+            result.unwrap_or_else(|e| panic!("kill pid index {i} failed: {e:?}"));
+        }
+
+        // All entries should be gone (SIGKILL removes from the map).
+        for &pid in &pids {
+            assert!(
+                !get_process_map().lock().await.contains_key(&pid),
+                "pid {pid} should be removed after SIGKILL"
+            );
+        }
+
+        assert!(
+            test_managed_maps_empty().await,
+            "process maps must be empty after concurrent SIGKILL"
+        );
+    }
+
+    // -------------------------------------------------------------------------
+    // stress_subscribe_task_stops_after_natural_process_exit
+    //
+    // Subscribe to a process that exits immediately.  The subscription task
+    // must detect the exit via `process.read` and terminate within the read
+    // timeout window (PUSH_READ_TIMEOUT_MS = 200 ms).  Verifies:
+    //   - Task finishes without an explicit unsubscribe call.
+    //   - Elapsed time is bounded (no infinite loop).
+    // -------------------------------------------------------------------------
+    #[tokio::test]
+    async fn stress_subscribe_task_stops_after_natural_process_exit() {
+        let _test_lock = test_process_map_lock().await;
+        const N: usize = 8;
+
+        for _ in 0..N {
+            let pid = start_pipe_process("exit 0").await;
+            subscribe_pid(pid).await;
+
+            let deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(2_000);
+            loop {
+                if subscription_task_finished(pid).await {
+                    break;
+                }
+                assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "subscription task did not detect process exit within deadline"
+                );
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+
+            // Clean up the process map entry.
+            cleanup_managed_processes()
+                .await
+                .expect("cleanup after natural exit");
+        }
+    }
+
+    // -------------------------------------------------------------------------
+    // stress_idempotent_subscribe_does_not_spawn_extra_tasks
+    //
+    // Calling subscribe multiple times for the same PID must not create
+    // multiple background tasks — the server is supposed to reuse the existing
+    // subscription when one is already active.
+    // -------------------------------------------------------------------------
+    #[tokio::test]
+    async fn stress_idempotent_subscribe_does_not_spawn_extra_tasks() {
+        let _test_lock = test_process_map_lock().await;
+        let pid = start_pipe_process("sleep 30").await;
+
+        // Subscribe three times in a row.
+        for _ in 0..3 {
+            subscribe_pid(pid).await;
+        }
+
+        // There must still be exactly one subscription (not three).
+        // We verify indirectly: unsubscribe once and the slot is clear.
+        unsubscribe_pid(pid).await;
+        assert!(
+            !subscription_is_active(pid).await,
+            "subscription must be gone after a single unsubscribe"
+        );
+
+        kill(Value::Map(vec![
+            (Value::String("pid".into()), Value::Integer(pid.into())),
+            (
+                Value::String("signal".into()),
+                Value::Integer((libc::SIGKILL as i64).into()),
+            ),
+        ]))
+        .await
+        .expect("cleanup SIGKILL");
+    }
+
+    // -------------------------------------------------------------------------
+    // stress_high_throughput_output_via_subscribe
+    //
+    // A process that writes a large volume of data.  The subscription task
+    // must drain all output without hanging.  Output data is not delivered
+    // (no notification writer in unit tests) but the task must still exit
+    // cleanly after the process finishes.
+    // -------------------------------------------------------------------------
+    #[tokio::test]
+    async fn stress_high_throughput_output_via_subscribe() {
+        let _test_lock = test_process_map_lock().await;
+        // Generate ~2 MiB of output to stress the read loop.
+        let pid = start_pipe_process("dd if=/dev/zero bs=4096 count=512 2>/dev/null | cat").await;
+        subscribe_pid(pid).await;
+
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(15);
+        loop {
+            if subscription_task_finished(pid).await {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "subscription task did not finish draining 2 MiB output"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+
+        cleanup_managed_processes()
+            .await
+            .expect("cleanup after high-throughput subscribe");
     }
 
     #[tokio::test]
