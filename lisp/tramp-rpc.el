@@ -2145,10 +2145,11 @@ which would otherwise perform another remote stat."
     (_ (tramp-handle-file-readable-p filename))))
 
 (defun tramp-rpc-handle-file-regular-p (filename)
-  "Like `file-regular-p' for TRAMP-RPC files, with cached missing fast path."
-  (pcase (tramp-rpc-magit--file-exists-p filename)
-    ('nil nil)
-    (_ (tramp-handle-file-regular-p filename))))
+  "Like `file-regular-p' for TRAMP-RPC files."
+  (with-parsed-tramp-file-name (expand-file-name filename) nil
+    (with-tramp-file-property v localname "file-regular-p"
+      (when-let* ((stat (tramp-rpc--call-file-stat v localname)))
+        (equal (alist-get 'type stat) "file")))))
 
 (defun tramp-rpc-handle-file-symlink-p (filename)
   "Like `file-symlink-p' for TRAMP-RPC files."
@@ -2897,7 +2898,9 @@ Emacs/TRAMP destination and policy details; the server only receives primitive
 copy options.  Fall back to the generic TRAMP handler for cross-remote copies."
   (setq dirname (expand-file-name dirname)
         newname (expand-file-name newname))
-  (if (and (tramp-tramp-file-p dirname)
+  (if (and (not keep-date)
+           (not (and parents copy-contents))
+           (tramp-tramp-file-p dirname)
            (tramp-tramp-file-p newname)
            (tramp-equal-remote dirname newname))
       (with-parsed-tramp-file-name dirname v1
@@ -2925,12 +2928,11 @@ copy options.  Fall back to the generic TRAMP handler for cross-remote copies."
                        (file-name-nondirectory (directory-file-name src-localname))
                        dest-localname)
                     dest-localname))
+                 (source-symlink-target
+                  (and copy-directory-create-symlink (file-symlink-p dirname)))
                  (actual-dest
                   (tramp-make-tramp-file-name
                    v2 (file-name-quote actual-dest-localname)))
-                 (symlink-dest
-                  (tramp-make-tramp-file-name
-                   v2 (file-name-quote symlink-dest-localname)))
                  (parent-localname
                   (file-name-directory (directory-file-name actual-dest-localname)))
                  (parent
@@ -2956,12 +2958,24 @@ copy options.  Fall back to the generic TRAMP handler for cross-remote copies."
                  (actual-dest-stat-result (nth 3 stats))
                  (parent-stat-result (nth 4 stats))
                  (source-lstat-type (tramp-rpc--stat-type source-lstat)))
-            (if (and copy-directory-create-symlink
-                     (equal source-lstat-type "symlink"))
-                (make-symbolic-link
-                 (tramp-rpc--decode-string (alist-get 'link_target source-lstat))
-                 symlink-dest
-                 t)
+            (if (or source-symlink-target
+                    (and copy-directory-create-symlink
+                         (equal source-lstat-type "symlink")))
+                (prog1
+                    (tramp-rpc--call
+                     v2 "file.make_symlink"
+                     (append
+                      `((target . ,(tramp-rpc--path-to-bin
+                                    (or source-symlink-target
+                                        (tramp-rpc--decode-string
+                                         (alist-get 'link_target source-lstat))))))
+                      (mapcar (lambda (param)
+                                (pcase (car param)
+                                  ('path (cons 'link_path (cdr param)))
+                                  ('path_encoding (cons 'link_path_encoding (cdr param)))
+                                  (_ param)))
+                              (tramp-rpc--encode-path symlink-dest-localname))))
+                  (tramp-rpc-clear-all-caches))
               (let* ((source-stat (tramp-rpc--batch-result-or-signal
                                     "file.stat" dirname source-stat-result))
                      (actual-dest-lstat
@@ -3002,9 +3016,14 @@ copy options.  Fall back to the generic TRAMP handler for cross-remote copies."
                                   actual-dest)))
                   (unless (equal parent-type "directory")
                     (signal 'file-error (list "Not a directory" parent))))
+                (when (zerop (logand (or (alist-get 'mode source-stat) 0) #o200))
+                  (cl-return-from tramp-rpc-handle-copy-directory
+                    (tramp-handle-copy-directory
+                     dirname newname keep-date parents copy-contents)))
                 (tramp-rpc--call v1 "file.copy"
                                  `((src . ,(tramp-rpc--path-to-bytes src-localname))
                                    (dest . ,(tramp-rpc--path-to-bytes actual-dest-localname))
+                                   (preserve . ,(if keep-date t :msgpack-false))
                                    (preserve_permissions . t)
                                    (preserve_times . ,(if keep-date t :msgpack-false))
                                    (overwrite . t)
@@ -3028,8 +3047,9 @@ copy options.  Fall back to the generic TRAMP handler for cross-remote copies."
               ;; preflight.
               (tramp-flush-directory-properties v2 copied-localname)
               (tramp-flush-directory-properties v2 copied-parent-localname)
+              (tramp-flush-connection-properties v2)
               (tramp-rpc--invalidate-cache-for-path dirname)
-              (tramp-rpc--invalidate-cache-for-path
+              (tramp-rpc--invalidate-cache-for-subtree
                (tramp-make-tramp-file-name v2 (file-name-quote copied-localname)))))))
     (tramp-handle-copy-directory dirname newname keep-date parents copy-contents)))
 
