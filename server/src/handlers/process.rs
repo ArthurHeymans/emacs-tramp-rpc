@@ -589,12 +589,14 @@ fn do_fork_exec(params: PtyStartParams) -> Result<ForkResult2, RpcError> {
             }
             if params.clear_env {
                 for (key, _) in std::env::vars() {
-                    std::env::remove_var(key);
+                    // FIXME: Audit that the environment access only happens in single-threaded code.
+                    unsafe { std::env::remove_var(key) };
                 }
             }
             if let Some(env) = &params.env {
                 for (key, value) in env {
-                    std::env::set_var(key, value);
+                    // FIXME: Audit that the environment access only happens in single-threaded code.
+                    unsafe { std::env::set_var(key, value) };
                 }
             }
             let _ = execvp(&cmd_cstring, &args_cstrings);
@@ -995,15 +997,15 @@ pub async fn close_pty(params: Value) -> HandlerResult {
 
     let mut processes = get_pty_process_map().lock().await;
 
-    if let Some(managed) = processes.remove(&params.pid) {
+    match processes.remove(&params.pid) { Some(managed) => {
         let _ = nix::sys::signal::kill(managed.child_pid, Signal::SIGKILL);
         Ok(Value::Boolean(true))
-    } else {
+    } _ => {
         Err(RpcError::process_error(format!(
             "PTY process not found: {}",
             params.pid
         )))
-    }
+    }}
 }
 
 /// List all PTY processes

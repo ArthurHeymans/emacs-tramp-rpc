@@ -393,7 +393,7 @@ impl ProcessResult {
 /// Create a MessagePack map value from key-value pairs
 #[macro_export]
 macro_rules! msgpack_map {
-    ($($key:expr => $value:expr),* $(,)?) => {{
+    ($($key:expr_2021 => $value:expr_2021),* $(,)?) => {{
         let pairs: Vec<(rmpv::Value, rmpv::Value)> = vec![
             $(
                 (rmpv::Value::String($key.into()), $value.into()),
