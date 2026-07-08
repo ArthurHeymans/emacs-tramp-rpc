@@ -2,7 +2,6 @@
 
 use crate::msgpack_map;
 use crate::protocol::{ProcessResult, RpcError, from_value};
-use nix::fcntl::{FcntlArg, OFlag, fcntl};
 use nix::pty::{OpenptyResult, openpty};
 use nix::sys::signal::Signal;
 use nix::sys::wait::{WaitPidFlag, WaitStatus, waitpid};
@@ -491,15 +490,28 @@ struct ManagedPtyProcess {
     exit_status: Option<i32>,
 }
 
-fn set_fd_nonblocking(fd: RawFd) -> Result<(), nix::Error> {
-    let flags = fcntl(fd, FcntlArg::F_GETFL)?;
-    let new_flags = OFlag::from_bits_truncate(flags) | OFlag::O_NONBLOCK;
-    fcntl(fd, FcntlArg::F_SETFL(new_flags))?;
+fn checked_fcntl(result: libc::c_int) -> Result<libc::c_int, std::io::Error> {
+    if result < 0 {
+        Err(std::io::Error::last_os_error())
+    } else {
+        Ok(result)
+    }
+}
+
+fn set_fd_nonblocking(fd: RawFd) -> Result<(), std::io::Error> {
+    let flags = checked_fcntl(unsafe { libc::fcntl(fd, libc::F_GETFL) })?;
+    checked_fcntl(unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) })?;
     Ok(())
 }
 
-fn dup_cloexec(fd: RawFd) -> Result<RawFd, nix::Error> {
-    fcntl(fd, FcntlArg::F_DUPFD_CLOEXEC(0))
+fn set_fd_cloexec(fd: RawFd) -> Result<(), std::io::Error> {
+    let flags = checked_fcntl(unsafe { libc::fcntl(fd, libc::F_GETFD) })?;
+    checked_fcntl(unsafe { libc::fcntl(fd, libc::F_SETFD, flags | libc::FD_CLOEXEC) })?;
+    Ok(())
+}
+
+fn dup_cloexec(fd: RawFd) -> Result<RawFd, std::io::Error> {
+    checked_fcntl(unsafe { libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, 0) })
 }
 
 fn set_window_size(fd: RawFd, rows: u16, cols: u16) -> Result<(), std::io::Error> {
@@ -537,6 +549,11 @@ struct ForkResult2 {
 fn do_fork_exec(params: PtyStartParams) -> Result<ForkResult2, RpcError> {
     let OpenptyResult { master, slave } = openpty(None, None)
         .map_err(|e| RpcError::process_error(format!("Failed to open PTY: {}", e)))?;
+
+    set_fd_cloexec(master.as_raw_fd())
+        .map_err(|e| RpcError::process_error(format!("Failed to mark PTY CLOEXEC: {}", e)))?;
+    set_fd_cloexec(slave.as_raw_fd())
+        .map_err(|e| RpcError::process_error(format!("Failed to mark PTY CLOEXEC: {}", e)))?;
 
     let tty_name = {
         let mut buf = vec![0u8; 256];
