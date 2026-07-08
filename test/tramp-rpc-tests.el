@@ -2150,7 +2150,11 @@ This is the root cause of the lsp-mode crash reported with tramp-rpc."
     (should (equal (tramp-rpc--maybe-login-shell-command nil '("/opt/bin/my-shell"))
                    '("/opt/bin/my-shell" "-l")))
     (should (equal (tramp-rpc--maybe-login-shell-command nil '("/opt/bin/my-shell" "-i"))
-                   '("/opt/bin/my-shell" "-l" "-i")))
+                   '("/opt/bin/my-shell" "-i" "-l")))
+    ;; Real `M-x shell' bash case: --noediting is a long option, so -l must be
+    ;; appended -- bash rejects `-l --noediting' with "--: invalid option".
+    (should (equal (tramp-rpc--maybe-login-shell-command nil '("/opt/bin/my-shell" "--noediting" "-i"))
+                   '("/opt/bin/my-shell" "--noediting" "-i" "-l")))
     (should (equal (tramp-rpc--maybe-login-shell-command nil '("/opt/bin/my-shell" "-l" "-i"))
                    '("/opt/bin/my-shell" "-l" "-i")))
     (should (equal (tramp-rpc--maybe-login-shell-command nil '("/opt/bin/my-shell" "/tmp/script.sh"))
@@ -2191,7 +2195,7 @@ This is the root cause of the lsp-mode crash reported with tramp-rpc."
                    :command '("/bin/bash" "-i")
                    :connection-type 'pty)
                   'tramp-rpc-test-pty-process))
-      (should (equal captured-command '("/bin/bash" "-l" "-i")))
+      (should (equal captured-command '("/bin/bash" "-i" "-l")))
       (let ((process-connection-type t))
         (setq captured-command nil)
         (should (eq (tramp-rpc-handle-make-process
@@ -2199,7 +2203,7 @@ This is the root cause of the lsp-mode crash reported with tramp-rpc."
                      :buffer nil
                      :command '("/bin/bash" "-i"))
                     'tramp-rpc-test-pty-process))
-        (should (equal captured-command '("/bin/bash" "-l" "-i")))))))
+        (should (equal captured-command '("/bin/bash" "-i" "-l")))))))
 
 ;;; ============================================================================
 ;;; Test Runner

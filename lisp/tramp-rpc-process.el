@@ -463,7 +463,10 @@ pair is a symbol."
 
 (defun tramp-rpc--maybe-login-shell-command (vec command)
   "Add login-shell args to interactive PTY login-shell COMMAND.
-Non-shell commands, `shell -c ...', and script launches are left untouched."
+Non-shell commands, `shell -c ...', and script launches are left untouched.
+Login args are appended after the existing args: `M-x shell' passes bash
+`--noediting -i', and bash rejects the long `--noediting' option once a short
+option like `-l' precedes it (an invalid-option error)."
   (let* ((program (car command))
          (args (cdr command))
          (base (and (stringp program) (file-name-nondirectory program)))
@@ -480,7 +483,8 @@ Non-shell commands, `shell -c ...', and script launches are left untouched."
              (equal base (ignore-errors
                            (file-name-nondirectory
                             (tramp-rpc--get-remote-login-shell vec)))))
-        (append (list program) login-args args)
+        ;; bash refuses `bash -l --noediting -i' but accepts `bash --noediting -i -l'.
+        (append command login-args)
       command)))
 
 ;; ============================================================================
