@@ -3,7 +3,7 @@
 ;; Copyright (C) 2026 Arthur Heymans <arthur@aheymans.xyz>
 
 ;; Author: Arthur Heymans <arthur@aheymans.xyz>
-;; Version: 0.11.0
+;; Version: 0.12.0
 ;; Keywords: comm, processes, files
 ;; Package-Requires: ((emacs "30.1") (msgpack "0.1.1") (tramp "2.8.1.4"))
 

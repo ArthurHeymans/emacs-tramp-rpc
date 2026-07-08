@@ -63,7 +63,7 @@ straight/repos..., which contains Cargo.toml and the Rust server sources."
   "Deployment settings for TRAMP-RPC."
   :group 'tramp)
 
-(defconst tramp-rpc-deploy-version "0.11.0"
+(defconst tramp-rpc-deploy-version "0.12.0"
   "Current version of tramp-rpc-server.")
 
 (defconst tramp-rpc-deploy-binary-name "tramp-rpc-server"
