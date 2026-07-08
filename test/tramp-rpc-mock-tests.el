@@ -781,6 +781,7 @@ This matches the behavior expected by `tramp-test28-process-file'."
 (declare-function tramp-rpc-magit--process-cache-store "tramp-rpc-magit" (program args exit-code stdout))
 (declare-function tramp-rpc-magit--cache-file-truename "tramp-rpc-magit" (vec localname result))
 (declare-function tramp-rpc-handle-magit-status-setup-buffer "tramp-rpc-magit" (&optional directory))
+(declare-function tramp-rpc-handle-dired-compress-file "tramp-rpc" (file))
 (declare-function tramp-rpc-handle-file-regular-p "tramp-rpc" (filename))
 (declare-function tramp-rpc--clear-file-caches-for-connection "tramp-rpc-magit" (vec))
 (declare-function tramp-rpc--invalidate-cache-for-subtree "tramp-rpc-magit" (directory))
@@ -801,6 +802,25 @@ This matches the behavior expected by `tramp-test28-process-file'."
      (message "Could not load tramp-rpc-magit: %s" err)
      nil))
   "Non-nil if tramp-rpc-magit.el loaded successfully.")
+
+(ert-deftest tramp-rpc-mock-test-dired-compress-file-registered ()
+  "`dired-compress-file' is handled for TRAMP-RPC files."
+  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
+  (should (eq (alist-get 'dired-compress-file tramp-rpc-file-name-handler-alist)
+              'tramp-rpc-handle-dired-compress-file)))
+
+(ert-deftest tramp-rpc-mock-test-dired-compress-file-delegates-to-real-handler ()
+  "TRAMP-RPC reuses Emacs' `dired-compress-file' implementation."
+  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
+  (let ((calls nil))
+    (cl-letf (((symbol-function 'tramp-run-real-handler)
+               (lambda (operation args)
+                 (push (list operation args) calls)
+                 "/rpc:mock:/tmp/file.gz")))
+      (should (equal (tramp-rpc-handle-dired-compress-file "/rpc:mock:/tmp/file")
+                     "/rpc:mock:/tmp/file.gz"))
+      (should (equal calls
+                     '((dired-compress-file ("/rpc:mock:/tmp/file"))))))))
 
 (ert-deftest tramp-rpc-mock-test-ancestor-scan-parent-falls-through ()
   "Closest-only ancestor scan must not cache false negatives above the hit."

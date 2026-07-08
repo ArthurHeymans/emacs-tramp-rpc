@@ -235,6 +235,7 @@ This is called from `tramp-multi-hop-p-hook'."
 ;; Silence byte-compiler warnings for functions defined in with-eval-after-load
 (declare-function tramp-add-external-operation "tramp")
 (declare-function tramp-remove-external-operation "tramp")
+(declare-function dired-compress-file "dired-aux")
 (declare-function tramp-rpc--sudo-file-name-p "tramp-rpc")
 (declare-function tramp-rpc-multi-hop-p "tramp-rpc")
 
@@ -3682,6 +3683,14 @@ Returns t on success, nil on failure."
         (zerop (alist-get 'exit_code result))))))
 
 ;; ============================================================================
+;; Dired operations
+;; ============================================================================
+
+(defun tramp-rpc-handle-dired-compress-file (file)
+  "Like `dired-compress-file' for TRAMP-RPC files."
+  (tramp-run-real-handler #'dired-compress-file (list file)))
+
+;; ============================================================================
 ;; Process operations
 ;; ============================================================================
 
@@ -4817,6 +4826,7 @@ Also controls process exit detection latency."
     (file-name-all-completions . tramp-rpc-handle-file-name-all-completions)
     (make-directory . tramp-rpc-handle-make-directory)
     (delete-directory . tramp-rpc-handle-delete-directory)
+    (dired-compress-file . tramp-rpc-handle-dired-compress-file)
     (insert-directory . tramp-handle-insert-directory)
     (copy-directory . tramp-rpc-handle-copy-directory)
 
