@@ -26,7 +26,7 @@ libc = "0.2"
 nix = { version = "0.31", features = ["term", "process", "signal", "fs"] }
 
 # For filesystem watching (inotify on Linux, kqueue on macOS)
-notify = "7.0"
+notify = "8.2"
 
 # For Git-aware recursive watch discovery.
 ignore = "0.4"
