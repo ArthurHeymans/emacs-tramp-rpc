@@ -779,6 +779,7 @@ This matches the behavior expected by `tramp-test28-process-file'."
 (declare-function tramp-rpc-magit--process-cache-key "tramp-rpc-magit" (&rest args))
 (declare-function tramp-rpc-magit--process-cache-lookup "tramp-rpc-magit" (program args))
 (declare-function tramp-rpc-magit--process-cache-store "tramp-rpc-magit" (program args exit-code stdout))
+(declare-function tramp-rpc-magit--cache-file-truename "tramp-rpc-magit" (vec localname result))
 (declare-function tramp-rpc-handle-magit-status-setup-buffer "tramp-rpc-magit" (&optional directory))
 (declare-function tramp-rpc-handle-file-regular-p "tramp-rpc" (filename))
 (declare-function tramp-rpc--clear-file-caches-for-connection "tramp-rpc-magit" (vec))
@@ -960,6 +961,20 @@ This matches the behavior expected by `tramp-test28-process-file'."
                (lambda (_operation _args) 'ok)))
       (tramp-rpc-handle-magit-status-setup-buffer "/ssh:mock:/repo"))
     (should (equal cleared '("/ssh:mock:/repo/")))))
+
+(ert-deftest tramp-rpc-mock-test-magit-cache-file-truename-accepts-bin-result ()
+  "Magit metadata prefetch accepts bin file.truename results."
+  (skip-unless (and tramp-rpc-mock-test--tramp-rpc-magit-loaded
+                   tramp-rpc-mock-test--msgpack-available))
+  (let ((tramp-rpc--file-truename-cache (make-hash-table :test 'equal))
+        (vec (tramp-dissect-file-name "/rpc:mock:/repo/")))
+    (cl-letf (((symbol-function 'tramp-rpc--decode-string)
+               #'tramp-rpc-mock-test--bytes-string))
+      (tramp-rpc-magit--cache-file-truename
+       vec "/repo" (msgpack-bin-make "/home/arthur/src/doom")))
+    (should (equal (tramp-rpc--cache-get
+                    tramp-rpc--file-truename-cache "/rpc:mock:/repo")
+                   "/rpc:mock:/home/arthur/src/doom"))))
 
 (defun tramp-rpc-mock-test--sudo-helper-available-p ()
   "Return non-nil when the sudo path helpers needed by this test are available."
