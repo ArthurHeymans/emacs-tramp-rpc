@@ -1008,9 +1008,9 @@ whitespace."
   "Populate `file-truename' cache for LOCALNAME from RESULT."
   (when result
     (let* ((truename-local (tramp-rpc--decode-string
-                            (if (stringp result)
-                                result
-                              (alist-get 'path result))))
+                            (if (consp result)
+                                (alist-get 'path result)
+                              result)))
            (filename (tramp-rpc-magit--remote-path vec localname))
            (truename (tramp-rpc-magit--remote-path vec truename-local)))
       (tramp-rpc--cache-put tramp-rpc--file-truename-cache filename truename))))
