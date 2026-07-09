@@ -298,51 +298,55 @@ RESPONSE is the decoded RPC response plist."
   (when (and (processp local-process)
              (process-live-p local-process)
              (gethash local-process tramp-rpc--async-processes))
-    (condition-case err
-        (let* ((info (gethash local-process tramp-rpc--async-processes))
-               (stderr-buffer (plist-get info :stderr-buffer))
-               (result (plist-get response :result))
-               (stdout (when-let* ((s (alist-get 'stdout result)))
-                         (tramp-rpc--decode-output
-                          s (alist-get 'stdout_encoding result))))
-               (stderr (when-let* ((s (alist-get 'stderr result)))
-                         (tramp-rpc--decode-output
-                          s (alist-get 'stderr_encoding result))))
-               (exited (alist-get 'exited result))
-               (exit-code (alist-get 'exit_code result)))
+    (if-let* ((rpc-error (plist-get response :error)))
+        (progn
+          (tramp-rpc--debug "ASYNC-READ RPC error: %S" rpc-error)
+          (tramp-rpc--handle-process-exit local-process -1))
+      (condition-case err
+          (let* ((info (gethash local-process tramp-rpc--async-processes))
+                 (stderr-buffer (plist-get info :stderr-buffer))
+                 (result (plist-get response :result))
+                 (stdout (when-let* ((s (alist-get 'stdout result)))
+                           (tramp-rpc--decode-output
+                            s (alist-get 'stdout_encoding result))))
+                 (stderr (when-let* ((s (alist-get 'stderr result)))
+                           (tramp-rpc--decode-output
+                            s (alist-get 'stderr_encoding result))))
+                 (exited (alist-get 'exited result))
+                 (exit-code (alist-get 'exit_code result)))
 
-          (tramp-rpc--debug "ASYNC-READ response: stdout=%s stderr=%s exited=%s"
-                           (if stdout (length stdout) "nil")
-                           (if stderr (length stderr) "nil")
-                           exited)
+            (tramp-rpc--debug "ASYNC-READ response: stdout=%s stderr=%s exited=%s"
+                             (if stdout (length stdout) "nil")
+                             (if stderr (length stderr) "nil")
+                             exited)
 
-          ;; Deliver output.  When the remote process reports EXITED, flush
-          ;; data immediately before sending EOF to the local relay; otherwise
-          ;; the deferred delivery can race with relay shutdown and lose output.
-          (if exited
+            ;; Deliver output.  When the remote process reports EXITED, flush
+            ;; data immediately before sending EOF to the local relay; otherwise
+            ;; the deferred delivery can race with relay shutdown and lose output.
+            (if exited
+                (when (or stdout stderr)
+                  (tramp-rpc--deliver-process-output
+                   local-process stdout stderr stderr-buffer))
+              ;; Keep deferred delivery for the non-exit hot path so
+              ;; accept-process-output observes normal I/O activity.
               (when (or stdout stderr)
-                (tramp-rpc--deliver-process-output
-                 local-process stdout stderr stderr-buffer))
-            ;; Keep deferred delivery for the non-exit hot path so
-            ;; accept-process-output observes normal I/O activity.
-            (when (or stdout stderr)
-              (run-at-time 0 nil #'tramp-rpc--deliver-process-output
-                           local-process stdout stderr stderr-buffer)))
+                (run-at-time 0 nil #'tramp-rpc--deliver-process-output
+                             local-process stdout stderr stderr-buffer)))
 
-          ;; Handle process exit or chain next read
-          (if exited
-              ;; Handle exit immediately so `process-live-p' flips to nil
-              ;; before callers can issue another round of remote operations.
-              ;; Deferring this via `run-at-time 0' leaves a small window where
-              ;; loops that poll `process-live-p' can observe a stale live
-              ;; process and run one extra iteration.
-              (tramp-rpc--handle-process-exit local-process exit-code)
-            ;; Chain another read - use run-at-time to avoid stack overflow
-            (run-at-time 0 nil #'tramp-rpc--start-async-read local-process)))
-      (error
-       (tramp-rpc--debug "ASYNC-READ-ERROR: %S" err)
-       ;; On error, clean up
-       (run-at-time 0 nil #'tramp-rpc--handle-process-exit local-process -1)))))
+            ;; Handle process exit or chain next read
+            (if exited
+                ;; Handle exit immediately so `process-live-p' flips to nil
+                ;; before callers can issue another round of remote operations.
+                ;; Deferring this via `run-at-time 0' leaves a small window where
+                ;; loops that poll `process-live-p' can observe a stale live
+                ;; process and run one extra iteration.
+                (tramp-rpc--handle-process-exit local-process exit-code)
+              ;; Chain another read - use run-at-time to avoid stack overflow
+              (run-at-time 0 nil #'tramp-rpc--start-async-read local-process)))
+        (error
+         (tramp-rpc--debug "ASYNC-READ-ERROR: %S" err)
+         ;; On error, clean up
+         (run-at-time 0 nil #'tramp-rpc--handle-process-exit local-process -1))))))
 
 (defun tramp-rpc--handle-process-exit (local-process exit-code)
   "Handle exit of remote process associated with LOCAL-PROCESS.

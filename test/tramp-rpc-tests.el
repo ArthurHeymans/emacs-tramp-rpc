@@ -1775,6 +1775,25 @@ This matches the upstream `tramp-test28-process-file' test."
         (when (processp proc)
           (ignore-errors (delete-process proc)))))))
 
+(ert-deftest tramp-rpc-test13d-async-read-rpc-error-exits-process ()
+  "Test async read RPC errors terminate the local process state."
+  (let ((proc (make-pipe-process
+               :name "tramp-rpc-read-error-test"
+               :noquery t))
+        exit-code)
+    (unwind-protect
+        (progn
+          (puthash proc '(:vec mock :pid 12345)
+                   tramp-rpc--async-processes)
+          (cl-letf (((symbol-function 'tramp-rpc--handle-process-exit)
+                     (lambda (_proc code)
+                       (setq exit-code code))))
+            (tramp-rpc--handle-async-read-response
+             proc '(:error (:code -32004 :message "read failed"))))
+          (should (= exit-code -1)))
+      (remhash proc tramp-rpc--async-processes)
+      (ignore-errors (delete-process proc)))))
+
 ;;; ============================================================================
 ;;; Test 14: Async Processes
 ;;; ============================================================================
@@ -1808,6 +1827,8 @@ This matches the upstream `tramp-test28-process-file' test."
          (proc (make-process
                 :name "test-make-proc"
                 :command '("cat")
+                :connection-type 'pipe
+                :file-handler t
                 :filter (lambda (_proc str) (setq output (concat output str))))))
     (unwind-protect
         (progn
@@ -1820,6 +1841,52 @@ This matches the upstream `tramp-test28-process-file' test."
               (accept-process-output proc 0.1)))
           (should (string-match-p "test-input" output)))
       (ignore-errors (delete-process proc)))))
+
+(ert-deftest tramp-rpc-test14-make-process-drains-output-after-exit ()
+  "Test `make-process' continues reading after remote child exit."
+  :tags '(:process :expensive-test)
+  (skip-unless (tramp-rpc-test-enabled))
+
+  (let* ((default-directory (tramp-rpc-test--remote-directory))
+         (output "")
+         (delay-first-read t)
+         (orig-call-async (symbol-function 'tramp-rpc--call-async))
+         proc)
+    (unwind-protect
+        (cl-letf (((symbol-function 'tramp-rpc--call-async)
+                   (lambda (vec method params callback)
+                     (if (equal method "process.read")
+                         (let ((params (cons '(max_bytes . 1) params)))
+                           (if delay-first-read
+                               (progn
+                                 (setq delay-first-read nil)
+                                 ;; Let the short-lived child exit before the
+                                 ;; first bounded read.  The old server returned
+                                 ;; exited with the first byte and lost the rest.
+                                 (run-at-time 0.2 nil orig-call-async
+                                              vec method params callback))
+                             (funcall orig-call-async
+                                      vec method params callback)))
+                       (funcall orig-call-async
+                                vec method params callback)))))
+          (setq proc
+                (make-process
+                 :name "tramp-rpc-eof-race"
+                 :buffer nil
+                 :command '("/bin/sh" "-c" "printf firstsecond")
+                 :connection-type 'pipe
+                 :coding 'binary
+                 :noquery t
+                 :file-handler t
+                 :filter (lambda (_proc string)
+                           (setq output (concat output string)))))
+          (with-timeout (15 (error "Process output drain timeout"))
+            (while (process-live-p proc)
+              (accept-process-output proc 0.1)))
+          (should (= 0 (process-exit-status proc)))
+          (should (equal output "firstsecond")))
+      (when (processp proc)
+        (ignore-errors (delete-process proc))))))
 
 (ert-deftest tramp-rpc-test14-python-shell-make-comint ()
   "Test `python-shell-make-comint' on an existing TRAMP RPC connection."
