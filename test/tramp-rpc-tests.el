@@ -81,6 +81,8 @@
 
 (require 'tramp-rpc)
 
+(declare-function tramp-rpc--handle-async-read-response "tramp-rpc-process")
+
 ;;; ============================================================================
 ;;; Test Configuration
 ;;; ============================================================================

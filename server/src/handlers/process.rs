@@ -270,15 +270,8 @@ pub async fn read(params: Value) -> HandlerResult {
     // the Emacs client; holding that lock here makes concurrent
     // `process.write` calls wait behind the read timeout, which turns LSP
     // typing into a synchronous round-trip bottleneck.
-    let (stdout_result, stderr_result) = tokio::join!(
-        try_read_optional_stream(stdout, params.max_bytes, timeout),
-        try_read_optional_stream(stderr, params.max_bytes, timeout)
-    );
-
-    let stdout_result = stdout_result
-        .map_err(|e| RpcError::process_error(format!("Failed to read stdout: {e}")))?;
-    let stderr_result = stderr_result
-        .map_err(|e| RpcError::process_error(format!("Failed to read stderr: {e}")))?;
+    let (stdout_result, stderr_result) =
+        try_read_streams(stdout, stderr, params.max_bytes, timeout).await?;
 
     let stdout_eof = matches!(stdout_result, ReadResult::Eof);
     let stderr_eof = matches!(stderr_result, ReadResult::Eof);
@@ -355,18 +348,77 @@ fn poll_exit_status(managed: &mut ManagedProcess) -> std::io::Result<Option<Exit
     Ok(managed.exit_status)
 }
 
-/// Try to read from an optional async reader with configurable timeout.
+/// Read both output streams until either produces data or the shared timeout expires.
+async fn try_read_streams<ROut, RErr>(
+    stdout: Arc<Mutex<Option<ROut>>>,
+    stderr: Arc<Mutex<Option<RErr>>>,
+    max_bytes: usize,
+    timeout_ms: u64,
+) -> Result<(ReadResult, ReadResult), RpcError>
+where
+    ROut: AsyncRead + Unpin,
+    RErr: AsyncRead + Unpin,
+{
+    let stdout_read = async {
+        try_read_optional_stream(stdout, max_bytes)
+            .await
+            .map_err(|e| RpcError::process_error(format!("Failed to read stdout: {e}")))
+    };
+    let stderr_read = async {
+        try_read_optional_stream(stderr, max_bytes)
+            .await
+            .map_err(|e| RpcError::process_error(format!("Failed to read stderr: {e}")))
+    };
+    let deadline = tokio::time::sleep(std::time::Duration::from_millis(if timeout_ms == 0 {
+        1
+    } else {
+        timeout_ms
+    }));
+
+    tokio::pin!(stdout_read, stderr_read, deadline);
+
+    // AsyncReadExt::read is cancellation-safe: when one stream produces data,
+    // dropping the other branch cannot consume bytes from the idle stream.
+    tokio::select! {
+        stdout_result = &mut stdout_read => {
+            let stdout_result = stdout_result?;
+            if matches!(stdout_result, ReadResult::Data(_)) {
+                return Ok((stdout_result, ReadResult::Pending));
+            }
+
+            let stderr_result = tokio::select! {
+                stderr_result = &mut stderr_read => stderr_result?,
+                _ = &mut deadline => ReadResult::Pending,
+            };
+            Ok((stdout_result, stderr_result))
+        }
+        stderr_result = &mut stderr_read => {
+            let stderr_result = stderr_result?;
+            if matches!(stderr_result, ReadResult::Data(_)) {
+                return Ok((ReadResult::Pending, stderr_result));
+            }
+
+            let stdout_result = tokio::select! {
+                stdout_result = &mut stdout_read => stdout_result?,
+                _ = &mut deadline => ReadResult::Pending,
+            };
+            Ok((stdout_result, stderr_result))
+        }
+        _ = &mut deadline => Ok((ReadResult::Pending, ReadResult::Pending)),
+    }
+}
+
+/// Try to read from an optional async reader.
 async fn try_read_optional_stream<R>(
     stream: Arc<Mutex<Option<R>>>,
     max_bytes: usize,
-    timeout_ms: u64,
 ) -> std::io::Result<ReadResult>
 where
     R: AsyncRead + Unpin,
 {
     let mut stream_guard = stream.lock().await;
     if let Some(reader) = stream_guard.as_mut() {
-        let result = try_read_async_with_timeout(reader, max_bytes, timeout_ms).await?;
+        let result = try_read_async(reader, max_bytes).await?;
         if matches!(result, ReadResult::Eof) {
             *stream_guard = None;
         }
@@ -376,29 +428,21 @@ where
     }
 }
 
-/// Try to read from an async reader with configurable timeout.
-async fn try_read_async_with_timeout<R: AsyncRead + Unpin>(
+/// Try to read from an async reader.
+async fn try_read_async<R: AsyncRead + Unpin>(
     reader: &mut R,
     max_bytes: usize,
-    timeout_ms: u64,
 ) -> std::io::Result<ReadResult> {
     let mut buf = vec![0u8; max_bytes];
-    let timeout = if timeout_ms == 0 { 1 } else { timeout_ms };
 
-    match tokio::time::timeout(
-        std::time::Duration::from_millis(timeout),
-        reader.read(&mut buf),
-    )
-    .await
-    {
-        Ok(Ok(0)) => Ok(ReadResult::Eof),
-        Ok(Ok(n)) => {
+    match reader.read(&mut buf).await {
+        Ok(0) => Ok(ReadResult::Eof),
+        Ok(n) => {
             buf.truncate(n);
             Ok(ReadResult::Data(buf))
         }
-        Ok(Err(e)) if e.kind() == ErrorKind::WouldBlock => Ok(ReadResult::Pending),
-        Ok(Err(e)) => Err(e),
-        Err(_) => Ok(ReadResult::Pending),
+        Err(e) if e.kind() == ErrorKind::WouldBlock => Ok(ReadResult::Pending),
+        Err(e) => Err(e),
     }
 }
 
@@ -1251,11 +1295,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn process_read_keeps_running_with_idle_stderr() {
-        let pid = start_pipe_process("printf stdout; sleep 0.2").await;
+    async fn process_read_returns_stdout_before_idle_stderr_timeout() {
+        let pid = start_pipe_process("printf stdout; sleep 1").await;
         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
 
-        let first = read_pipe_process(pid, 65_536, 25).await;
+        let started = std::time::Instant::now();
+        let first = read_pipe_process(pid, 65_536, 500).await;
+        assert!(
+            started.elapsed() < std::time::Duration::from_millis(250),
+            "stdout was delayed behind the idle stderr timeout"
+        );
         assert_eq!(
             map_get(&first, "stdout"),
             Some(&Value::Binary(b"stdout".to_vec()))
