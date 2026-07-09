@@ -11,7 +11,7 @@ use serde::Deserialize;
 use std::collections::HashMap;
 use std::io::ErrorKind;
 use std::os::fd::{AsRawFd, BorrowedFd, RawFd};
-use std::process::{Command as StdCommand, Stdio};
+use std::process::{Command as StdCommand, ExitStatus, Stdio};
 use std::sync::{Arc, OnceLock};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 use tokio::process::{Child, ChildStderr, ChildStdin, ChildStdout, Command};
@@ -40,6 +40,7 @@ async fn get_next_pid() -> u32 {
 
 struct ManagedProcess {
     child: Child,
+    exit_status: Option<ExitStatus>,
     stdin: Arc<Mutex<Option<ChildStdin>>>,
     stdout: Arc<Mutex<Option<ChildStdout>>>,
     stderr: Arc<Mutex<Option<ChildStderr>>>,
@@ -177,6 +178,7 @@ pub async fn start(params: Value) -> HandlerResult {
     let pid = get_next_pid().await;
 
     let managed = ManagedProcess {
+        exit_status: None,
         stdin: Arc::new(Mutex::new(child.stdin.take())),
         stdout: Arc::new(Mutex::new(child.stdout.take())),
         stderr: Arc::new(Mutex::new(child.stderr.take())),
@@ -247,6 +249,12 @@ pub async fn read(params: Value) -> HandlerResult {
 
     let params: Params = from_value(params).map_err(|e| RpcError::invalid_params(e.to_string()))?;
 
+    if params.max_bytes == 0 {
+        return Err(RpcError::invalid_params(
+            "max_bytes must be greater than zero",
+        ));
+    }
+
     let timeout = params.timeout_ms.unwrap_or(0);
 
     let (stdout, stderr) = {
@@ -262,19 +270,38 @@ pub async fn read(params: Value) -> HandlerResult {
     // the Emacs client; holding that lock here makes concurrent
     // `process.write` calls wait behind the read timeout, which turns LSP
     // typing into a synchronous round-trip bottleneck.
-    let (stdout_data, stderr_data) = tokio::join!(
+    let (stdout_result, stderr_result) = tokio::join!(
         try_read_optional_stream(stdout, params.max_bytes, timeout),
         try_read_optional_stream(stderr, params.max_bytes, timeout)
     );
+
+    let stdout_result = stdout_result
+        .map_err(|e| RpcError::process_error(format!("Failed to read stdout: {e}")))?;
+    let stderr_result = stderr_result
+        .map_err(|e| RpcError::process_error(format!("Failed to read stderr: {e}")))?;
+
+    let stdout_eof = matches!(stdout_result, ReadResult::Eof);
+    let stderr_eof = matches!(stderr_result, ReadResult::Eof);
+    let stdout_data = stdout_result.into_data();
+    let stderr_data = stderr_result.into_data();
 
     // Check if process has exited.  Reacquire the map briefly; do not hold it
     // across any await points above.
     let exit_status = {
         let mut processes = get_process_map().lock().await;
-        processes
+        let managed = processes
             .get_mut(&params.pid)
-            .and_then(|managed| managed.child.try_wait().ok().flatten())
+            .ok_or_else(|| RpcError::process_error(format!("Process not found: {}", params.pid)))?;
+        poll_exit_status(managed)
+            .map_err(|e| RpcError::process_error(format!("Failed to query process status: {e}")))?
     };
+
+    // Child exit and pipe EOF are separate events.  A child can exit after a
+    // read returns data while additional bytes are still buffered in either
+    // pipe.  Only report the terminal state after both streams have returned
+    // EOF so the client continues issuing process.read requests until all
+    // output has been delivered.
+    let exited = exit_status.is_some() && stdout_eof && stderr_eof;
 
     // Return binary data directly (no encoding!)
     let stdout_val = if stdout_data.is_empty() {
@@ -289,12 +316,43 @@ pub async fn read(params: Value) -> HandlerResult {
         Value::Binary(stderr_data)
     };
 
+    let exit_code = if exited {
+        exit_status
+            .map(crate::protocol::exit_code_from_status)
+            .map(|code| Value::Integer(code.into()))
+            .unwrap_or(Value::Nil)
+    } else {
+        Value::Nil
+    };
+
     Ok(msgpack_map! {
         "stdout" => stdout_val,
         "stderr" => stderr_val,
-        "exited" => exit_status.is_some(),
-        "exit_code" => exit_status.map(crate::protocol::exit_code_from_status).map(|c| Value::Integer(c.into())).unwrap_or(Value::Nil)
+        "exited" => exited,
+        "exit_code" => exit_code
     })
+}
+
+enum ReadResult {
+    Data(Vec<u8>),
+    Pending,
+    Eof,
+}
+
+impl ReadResult {
+    fn into_data(self) -> Vec<u8> {
+        match self {
+            Self::Data(data) => data,
+            Self::Pending | Self::Eof => Vec::new(),
+        }
+    }
+}
+
+fn poll_exit_status(managed: &mut ManagedProcess) -> std::io::Result<Option<ExitStatus>> {
+    if managed.exit_status.is_none() {
+        managed.exit_status = managed.child.try_wait()?;
+    }
+    Ok(managed.exit_status)
 }
 
 /// Try to read from an optional async reader with configurable timeout.
@@ -302,15 +360,19 @@ async fn try_read_optional_stream<R>(
     stream: Arc<Mutex<Option<R>>>,
     max_bytes: usize,
     timeout_ms: u64,
-) -> Vec<u8>
+) -> std::io::Result<ReadResult>
 where
     R: AsyncRead + Unpin,
 {
     let mut stream_guard = stream.lock().await;
     if let Some(reader) = stream_guard.as_mut() {
-        try_read_async_with_timeout(reader, max_bytes, timeout_ms).await
+        let result = try_read_async_with_timeout(reader, max_bytes, timeout_ms).await?;
+        if matches!(result, ReadResult::Eof) {
+            *stream_guard = None;
+        }
+        Ok(result)
     } else {
-        vec![]
+        Ok(ReadResult::Eof)
     }
 }
 
@@ -319,7 +381,7 @@ async fn try_read_async_with_timeout<R: AsyncRead + Unpin>(
     reader: &mut R,
     max_bytes: usize,
     timeout_ms: u64,
-) -> Vec<u8> {
+) -> std::io::Result<ReadResult> {
     let mut buf = vec![0u8; max_bytes];
     let timeout = if timeout_ms == 0 { 1 } else { timeout_ms };
 
@@ -329,14 +391,14 @@ async fn try_read_async_with_timeout<R: AsyncRead + Unpin>(
     )
     .await
     {
-        Ok(Ok(0)) => vec![], // EOF
+        Ok(Ok(0)) => Ok(ReadResult::Eof),
         Ok(Ok(n)) => {
             buf.truncate(n);
-            buf
+            Ok(ReadResult::Data(buf))
         }
-        Ok(Err(e)) if e.kind() == ErrorKind::WouldBlock => vec![],
-        Ok(Err(_)) => vec![],
-        Err(_) => vec![], // Timeout - no data available
+        Ok(Err(e)) if e.kind() == ErrorKind::WouldBlock => Ok(ReadResult::Pending),
+        Ok(Err(e)) => Err(e),
+        Err(_) => Ok(ReadResult::Pending),
     }
 }
 
@@ -430,7 +492,8 @@ pub async fn status(params: Value) -> HandlerResult {
         .get_mut(&params.pid)
         .ok_or_else(|| RpcError::process_error(format!("Process not found: {}", params.pid)))?;
 
-    let exit_status = managed.child.try_wait().ok().flatten();
+    let exit_status = poll_exit_status(managed)
+        .map_err(|e| RpcError::process_error(format!("Failed to query process status: {e}")))?;
 
     Ok(msgpack_map! {
         "exited" => exit_status.is_some(),
@@ -445,7 +508,7 @@ pub async fn list(_params: Value) -> HandlerResult {
     let list: Vec<Value> = processes
         .iter_mut()
         .map(|(pid, managed)| {
-            let exited = managed.child.try_wait().ok().flatten();
+            let exited = poll_exit_status(managed).ok().flatten();
             msgpack_map! {
                 "pid" => *pid,
                 "os_pid" => managed.child.id().map(|id| Value::Integer((id as i64).into())).unwrap_or(Value::Nil),
@@ -1060,6 +1123,173 @@ mod tests {
                 .find(|(k, _)| k.as_str() == Some(key))
                 .map(|(_, v)| v)
         })
+    }
+
+    async fn start_pipe_process(script: &str) -> u32 {
+        let result = start(Value::Map(vec![
+            (Value::String("cmd".into()), Value::String("/bin/sh".into())),
+            (
+                Value::String("args".into()),
+                Value::Array(vec![
+                    Value::String("-c".into()),
+                    Value::String(script.into()),
+                ]),
+            ),
+        ]))
+        .await
+        .expect("start pipe process");
+
+        map_get(&result, "pid")
+            .and_then(Value::as_u64)
+            .expect("process pid") as u32
+    }
+
+    async fn read_pipe_process(pid: u32, max_bytes: usize, timeout_ms: u64) -> Value {
+        read(Value::Map(vec![
+            (Value::String("pid".into()), Value::Integer(pid.into())),
+            (
+                Value::String("max_bytes".into()),
+                Value::Integer((max_bytes as u64).into()),
+            ),
+            (
+                Value::String("timeout_ms".into()),
+                Value::Integer(timeout_ms.into()),
+            ),
+        ]))
+        .await
+        .expect("read pipe process")
+    }
+
+    async fn wait_for_child_exit(pid: u32) {
+        for _ in 0..100 {
+            let result = status(Value::Map(vec![(
+                Value::String("pid".into()),
+                Value::Integer(pid.into()),
+            )]))
+            .await
+            .expect("query pipe process status");
+            if map_get(&result, "exited").and_then(Value::as_bool) == Some(true) {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+
+        panic!("process {pid} did not exit");
+    }
+
+    async fn collect_pipe_output(pid: u32, max_bytes: usize) -> (Vec<u8>, Vec<u8>, i64) {
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+
+        for _ in 0..64 {
+            let result = read_pipe_process(pid, max_bytes, 500).await;
+            if let Some(Value::Binary(bytes)) = map_get(&result, "stdout") {
+                stdout.extend_from_slice(bytes);
+            }
+            if let Some(Value::Binary(bytes)) = map_get(&result, "stderr") {
+                stderr.extend_from_slice(bytes);
+            }
+
+            if map_get(&result, "exited").and_then(Value::as_bool) == Some(true) {
+                let exit_code = map_get(&result, "exit_code")
+                    .and_then(Value::as_i64)
+                    .expect("exit code");
+                get_process_map().lock().await.remove(&pid);
+                return (stdout, stderr, exit_code);
+            }
+        }
+
+        panic!("process {pid} did not reach EOF");
+    }
+
+    #[tokio::test]
+    async fn process_read_rejects_zero_max_bytes() {
+        let error = read(Value::Map(vec![
+            (Value::String("pid".into()), Value::Integer(1.into())),
+            (Value::String("max_bytes".into()), Value::Integer(0.into())),
+        ]))
+        .await
+        .expect_err("zero max_bytes should be rejected");
+
+        assert_eq!(error.code, RpcError::INVALID_PARAMS);
+    }
+
+    #[tokio::test]
+    async fn process_read_drains_pipes_after_status_reports_exit() {
+        let pid = start_pipe_process("printf abc; printf XYZ >&2").await;
+        wait_for_child_exit(pid).await;
+
+        let (stdout, stderr, exit_code) = collect_pipe_output(pid, 1).await;
+        assert_eq!(stdout, b"abc");
+        assert_eq!(stderr, b"XYZ");
+        assert_eq!(exit_code, 0);
+    }
+
+    #[tokio::test]
+    async fn process_read_waits_for_eof_after_child_exit() {
+        let pid = start_pipe_process("printf first; sleep 0.1; printf second").await;
+
+        // Ensure the first chunk is buffered before the long-polling read.  The
+        // stderr read then remains pending until the shell exits, reproducing
+        // the race where try_wait succeeds while stdout still contains data.
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+
+        let (stdout, stderr, exit_code) = collect_pipe_output(pid, 65_536).await;
+        assert_eq!(stdout, b"firstsecond");
+        assert!(stderr.is_empty());
+        assert_eq!(exit_code, 0);
+    }
+
+    #[tokio::test]
+    async fn process_read_drains_output_larger_than_max_bytes() {
+        let pid = start_pipe_process("printf 0123456789abcdef").await;
+        let (stdout, stderr, exit_code) = collect_pipe_output(pid, 3).await;
+
+        assert_eq!(stdout, b"0123456789abcdef");
+        assert!(stderr.is_empty());
+        assert_eq!(exit_code, 0);
+    }
+
+    #[tokio::test]
+    async fn process_read_keeps_running_with_idle_stderr() {
+        let pid = start_pipe_process("printf stdout; sleep 0.2").await;
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+
+        let first = read_pipe_process(pid, 65_536, 25).await;
+        assert_eq!(
+            map_get(&first, "stdout"),
+            Some(&Value::Binary(b"stdout".to_vec()))
+        );
+        assert_eq!(map_get(&first, "stderr"), Some(&Value::Nil));
+        assert_eq!(
+            map_get(&first, "exited").and_then(Value::as_bool),
+            Some(false)
+        );
+
+        let (stdout, stderr, exit_code) = collect_pipe_output(pid, 65_536).await;
+        assert!(stdout.is_empty());
+        assert!(stderr.is_empty());
+        assert_eq!(exit_code, 0);
+    }
+
+    #[tokio::test]
+    async fn process_read_delivers_output_written_immediately_before_exit() {
+        let pid = start_pipe_process("sleep 0.05; printf final").await;
+        let (stdout, stderr, exit_code) = collect_pipe_output(pid, 65_536).await;
+
+        assert_eq!(stdout, b"final");
+        assert!(stderr.is_empty());
+        assert_eq!(exit_code, 0);
+    }
+
+    #[tokio::test]
+    async fn process_read_drains_stdout_and_stderr_separately() {
+        let pid = start_pipe_process("printf stdout; printf stderr >&2").await;
+        let (stdout, stderr, exit_code) = collect_pipe_output(pid, 65_536).await;
+
+        assert_eq!(stdout, b"stdout");
+        assert_eq!(stderr, b"stderr");
+        assert_eq!(exit_code, 0);
     }
 
     #[tokio::test]
