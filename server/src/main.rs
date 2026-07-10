@@ -13,19 +13,297 @@ mod handlers;
 mod protocol;
 mod watcher;
 
-use protocol::{Request, Response, RpcError};
+use protocol::{Request, RequestId, Response, RpcError};
+use rmpv::Value;
+use std::collections::VecDeque;
+use std::io::Cursor;
 use std::sync::Arc;
-use tokio::io::{AsyncReadExt, AsyncWriteExt, BufWriter};
-use tokio::sync::Mutex;
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufWriter};
+use tokio::sync::{Mutex, OwnedSemaphorePermit, Semaphore, mpsc};
 use tokio::task::JoinSet;
+
+pub(crate) const MAX_FRAME_SIZE: usize = 100 * 1024 * 1024;
+pub(crate) const MAX_RESPONSE_OUTPUT_BYTES: usize = MAX_FRAME_SIZE - 1024 * 1024;
+const FRAME_CHANNEL_SIZE: usize = 2;
+const GENERAL_TASK_LIMIT: usize = 16;
+const CONTROL_TASK_LIMIT: usize = 4;
+/// How many decoded-but-not-yet-started requests are buffered before the
+/// connection stops reading frames.  Past this point the bounded frame
+/// channel and the OS pipe throttle the client, which is the only
+/// backpressure signal it can actually act on -- a synthetic "too busy"
+/// error would just surface as a spurious `remote-file-error' in the middle
+/// of an ordinary file operation.
+const DEFERRED_REQUEST_LIMIT: usize = 64;
+const ERROR_RESPONSE_CHANNEL_SIZE: usize = 16;
 
 /// Shared handle to the stdout writer, used by both response writing
 /// and the watcher's notification sending.
 pub type WriterHandle = Arc<Mutex<BufWriter<tokio::io::Stdout>>>;
 
+async fn read_frames<R>(
+    mut stdin: R,
+    sender: mpsc::Sender<Vec<u8>>,
+    errors: mpsc::Sender<Response>,
+    max_frame_size: usize,
+) where
+    R: AsyncRead + Unpin,
+{
+    loop {
+        let mut len_buf = [0u8; 4];
+        if stdin.read_exact(&mut len_buf).await.is_err() {
+            break;
+        }
+        let len = u32::from_be_bytes(len_buf) as usize;
+
+        // Answer and drain oversized frames so that a following frame remains
+        // aligned and the client is not left waiting on its own timeout.
+        if len > max_frame_size {
+            if errors
+                .send(Response::error(
+                    None,
+                    RpcError::invalid_request(format!(
+                        "Request frame exceeds {max_frame_size} byte limit"
+                    )),
+                ))
+                .await
+                .is_err()
+            {
+                return;
+            }
+            let mut discard = [0u8; 8192];
+            let mut remaining = len;
+            while remaining > 0 {
+                let amount = remaining.min(discard.len());
+                if stdin.read_exact(&mut discard[..amount]).await.is_err() {
+                    return;
+                }
+                remaining -= amount;
+            }
+            continue;
+        }
+
+        let mut payload = vec![0u8; len];
+        if stdin.read_exact(&mut payload).await.is_err() {
+            break;
+        }
+        if sender.send(payload).await.is_err() {
+            break;
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+enum TaskClass {
+    General,
+    Control,
+}
+
+struct Admissions {
+    general: Arc<Semaphore>,
+    control: Arc<Semaphore>,
+}
+
+impl Admissions {
+    fn try_acquire(&self, class: TaskClass) -> Option<OwnedSemaphorePermit> {
+        let semaphore = match class {
+            TaskClass::General => &self.general,
+            TaskClass::Control => &self.control,
+        };
+        Arc::clone(semaphore).try_acquire_owned().ok()
+    }
+}
+
+impl Default for Admissions {
+    fn default() -> Self {
+        Self {
+            general: Arc::new(Semaphore::new(GENERAL_TASK_LIMIT)),
+            control: Arc::new(Semaphore::new(CONTROL_TASK_LIMIT)),
+        }
+    }
+}
+
+fn task_class(method: &str) -> TaskClass {
+    // These operations only signal/close an already managed process.  Keep
+    // them available while long-running general requests consume their slots.
+    match method {
+        "process.kill" | "process.close_stdin" | "process.kill_pty" | "process.close_pty" => {
+            TaskClass::Control
+        }
+        _ => TaskClass::General,
+    }
+}
+
+async fn write_response<W>(writer: &Arc<Mutex<W>>, response: &Response)
+where
+    W: AsyncWrite + Unpin,
+{
+    let Ok(mut msgpack_bytes) = rmp_serde::to_vec_named(response) else {
+        return;
+    };
+    if msgpack_bytes.len() > MAX_FRAME_SIZE {
+        let oversized = Response::error(
+            response.id.clone(),
+            RpcError::internal_error("Response exceeds maximum frame size"),
+        );
+        let Ok(encoded_error) = rmp_serde::to_vec_named(&oversized) else {
+            return;
+        };
+        msgpack_bytes = encoded_error;
+    }
+    let mut writer = writer.lock().await;
+    let len_bytes = (msgpack_bytes.len() as u32).to_be_bytes();
+    let _ = writer.write_all(&len_bytes).await;
+    let _ = writer.write_all(&msgpack_bytes).await;
+    let _ = writer.flush().await;
+}
+
+fn spawn_request<W>(
+    tasks: &mut JoinSet<()>,
+    request: Request,
+    permit: OwnedSemaphorePermit,
+    writer: &Arc<Mutex<W>>,
+) where
+    W: AsyncWrite + Unpin + Send + 'static,
+{
+    let writer = Arc::clone(writer);
+    tasks.spawn(async move {
+        let _permit = permit;
+        #[cfg(test)]
+        let panic_after_response = request.method == "test.panic";
+        let response = handlers::dispatch(request).await;
+        write_response(&writer, &response).await;
+        #[cfg(test)]
+        if panic_after_response {
+            panic!("test request task panic");
+        }
+    });
+}
+
+async fn run_connection<R, W>(reader: R, writer: Arc<Mutex<W>>)
+where
+    R: AsyncRead + Unpin + Send + 'static,
+    W: AsyncWrite + Unpin + Send + 'static,
+{
+    // Protocol-level failures are answered by a dedicated writer so they can
+    // never be dropped: a missing response leaves the client blocked until
+    // its own timeout with no indication of what went wrong.
+    let (errors, mut error_responses) = mpsc::channel::<Response>(ERROR_RESPONSE_CHANNEL_SIZE);
+    let error_writer = tokio::spawn({
+        let writer = Arc::clone(&writer);
+        async move {
+            while let Some(response) = error_responses.recv().await {
+                write_response(&writer, &response).await;
+            }
+        }
+    });
+
+    let (sender, mut frames) = mpsc::channel(FRAME_CHANNEL_SIZE);
+    let frame_reader = tokio::spawn(read_frames(reader, sender, errors.clone(), MAX_FRAME_SIZE));
+
+    let mut tasks: JoinSet<()> = JoinSet::new();
+    let admissions = Admissions::default();
+    let mut deferred: VecDeque<Request> = VecDeque::new();
+
+    loop {
+        start_admissible(&mut deferred, &mut tasks, &writer, &admissions);
+        // Stop pulling frames while the backlog is full.  The bounded frame
+        // channel then stops draining the pipe, which is the throttle the
+        // client can actually observe.
+        let accepting = deferred.len() < DEFERRED_REQUEST_LIMIT;
+
+        if tasks.is_empty() {
+            if !accepting {
+                break;
+            }
+            let Some(payload) = frames.recv().await else {
+                break;
+            };
+            accept_frame(
+                payload,
+                &mut deferred,
+                &admissions,
+                &mut tasks,
+                &writer,
+                &errors,
+            )
+            .await;
+        } else {
+            tokio::select! {
+                Some(_) = tasks.join_next() => {}
+                payload = frames.recv(), if accepting => match payload {
+                    Some(payload) => {
+                        accept_frame(
+                            payload, &mut deferred, &admissions, &mut tasks, &writer, &errors,
+                        )
+                        .await;
+                    }
+                    // The transport is gone, so stop accepting frames.  The
+                    // shutdown path below still joins in-flight requests.
+                    None => break,
+                },
+            }
+        }
+    }
+
+    while tasks.join_next().await.is_some() {}
+    frame_reader.abort();
+    drop(errors);
+    let _ = error_writer.await;
+}
+
+/// Start every queued request that currently fits in its class.
+///
+/// Requests are kept in arrival order, but a class with free slots is never
+/// blocked by a queued request of a saturated class -- that is what keeps
+/// `process.kill' responsive behind a backlog of long-polling reads.
+fn start_admissible<W>(
+    deferred: &mut VecDeque<Request>,
+    tasks: &mut JoinSet<()>,
+    writer: &Arc<Mutex<W>>,
+    admissions: &Admissions,
+) where
+    W: AsyncWrite + Unpin + Send + 'static,
+{
+    let mut still_deferred = VecDeque::with_capacity(deferred.len());
+    while let Some(request) = deferred.pop_front() {
+        match admissions.try_acquire(task_class(&request.method)) {
+            Some(permit) => spawn_request(tasks, request, permit, writer),
+            None => still_deferred.push_back(request),
+        }
+    }
+    *deferred = still_deferred;
+}
+
+async fn accept_frame<W>(
+    payload: Vec<u8>,
+    deferred: &mut VecDeque<Request>,
+    admissions: &Admissions,
+    tasks: &mut JoinSet<()>,
+    writer: &Arc<Mutex<W>>,
+    errors: &mpsc::Sender<Response>,
+) where
+    W: AsyncWrite + Unpin + Send + 'static,
+{
+    // Decode and validate before spawning.  This lets the frame Vec be freed
+    // before a handler awaits, while retaining the request params it needs.
+    let request = match decode_request(&payload) {
+        Ok(request) => request,
+        Err(response) => {
+            let _ = errors.send(*response).await;
+            return;
+        }
+    };
+    match admissions.try_acquire(task_class(&request.method)) {
+        Some(permit) => spawn_request(tasks, request, permit, writer),
+        // Queue rather than reject.  The caller stops reading frames once the
+        // queue is full, so the client is throttled instead of being handed a
+        // synthetic error for a request it was entitled to make.
+        None => deferred.push_back(request),
+    }
+}
+
 #[tokio::main]
 async fn main() {
-    let mut stdin = tokio::io::stdin();
     let stdout: WriterHandle = Arc::new(Mutex::new(BufWriter::new(tokio::io::stdout())));
 
     // Initialize the filesystem watcher for cache invalidation notifications.
@@ -37,82 +315,62 @@ async fn main() {
         watcher::init(manager);
     }
 
-    let mut tasks: JoinSet<()> = JoinSet::new();
-
-    // Process requests concurrently
-    loop {
-        // Read 4-byte length prefix (big-endian)
-        let mut len_buf = [0u8; 4];
-        if stdin.read_exact(&mut len_buf).await.is_err() {
-            break; // EOF or error
-        }
-        let len = u32::from_be_bytes(len_buf) as usize;
-
-        // Sanity check - reject obviously invalid lengths
-        if len > 100 * 1024 * 1024 {
-            // 100MB max message size - drain the payload to keep framing in sync
-            // (cannot use eprintln! as SSH merges stderr with stdout)
-            let mut discard = vec![0u8; 8192];
-            let mut remaining = len;
-            while remaining > 0 {
-                let to_read = remaining.min(discard.len());
-                if stdin.read_exact(&mut discard[..to_read]).await.is_err() {
-                    break;
-                }
-                remaining -= to_read;
-            }
-            continue;
-        }
-
-        // Read payload
-        let mut payload = vec![0u8; len];
-        if stdin.read_exact(&mut payload).await.is_err() {
-            break; // EOF or error
-        }
-
-        // Clone writer for this task
-        let writer = Arc::clone(&stdout);
-
-        // Spawn a task for each request - allows concurrent processing
-        tasks.spawn(async move {
-            let response = process_request(&payload).await;
-
-            // Serialize response with MessagePack
-            if let Ok(msgpack_bytes) = rmp_serde::to_vec_named(&response) {
-                let mut writer = writer.lock().await;
-                // Write length prefix
-                let len_bytes = (msgpack_bytes.len() as u32).to_be_bytes();
-                let _ = writer.write_all(&len_bytes).await;
-                // Write payload
-                let _ = writer.write_all(&msgpack_bytes).await;
-                let _ = writer.flush().await;
-            }
-        });
-    }
-
-    // Wait for all pending tasks to complete before exiting
-    while tasks.join_next().await.is_some() {}
+    run_connection(tokio::io::stdin(), stdout).await;
 }
 
-async fn process_request(payload: &[u8]) -> Response {
-    // Parse the request from MessagePack
-    let request: Request = match rmp_serde::from_slice(payload) {
-        Ok(r) => r,
+fn decode_request(payload: &[u8]) -> Result<Request, Box<Response>> {
+    // Decode the wire format first, then validate its request shape.  This
+    // keeps malformed MessagePack distinct from a valid but invalid request.
+    let mut cursor = Cursor::new(payload);
+    let value: Value = match rmpv::decode::read_value(&mut cursor) {
+        Ok(value) if cursor.position() == payload.len() as u64 => value,
+        Ok(_) => {
+            return Err(Box::new(Response::error(
+                None,
+                RpcError::parse_error("trailing MessagePack data"),
+            )));
+        }
         Err(e) => {
-            return Response::error(None, RpcError::parse_error(e.to_string()));
+            return Err(Box::new(Response::error(
+                None,
+                RpcError::parse_error(e.to_string()),
+            )));
+        }
+    };
+    let id = request_id_from_value(&value);
+    let request: Request = match protocol::from_value(value) {
+        Ok(request) => request,
+        Err(e) => {
+            return Err(Box::new(Response::error(
+                id,
+                RpcError::invalid_request(e.to_string()),
+            )));
         }
     };
 
-    // Validate RPC version
     if request.version != "2.0" {
-        return Response::error(
+        return Err(Box::new(Response::error(
             Some(request.id),
             RpcError::invalid_request("Invalid RPC version"),
-        );
+        )));
     }
+    Ok(request)
+}
 
-    // Dispatch to handler
-    handlers::dispatch(request).await
+fn request_id_from_value(value: &Value) -> Option<RequestId> {
+    let id = value
+        .as_map()?
+        .iter()
+        .find_map(|(key, value)| (key.as_str() == Some("id")).then_some(value))?;
+    protocol::from_value(id.clone()).ok()
+}
+
+#[cfg(test)]
+async fn process_request(payload: &[u8]) -> Response {
+    match decode_request(payload) {
+        Ok(request) => handlers::dispatch(request).await,
+        Err(response) => *response,
+    }
 }
 
 #[cfg(test)]
@@ -121,9 +379,13 @@ mod tests {
     use rmpv::Value;
 
     fn make_request(method: &str, params: Value) -> Vec<u8> {
+        make_request_with_id(1, method, params)
+    }
+
+    fn make_request_with_id(id: i64, method: &str, params: Value) -> Vec<u8> {
         let request = rmpv::Value::Map(vec![
             (Value::String("version".into()), Value::String("2.0".into())),
-            (Value::String("id".into()), Value::Integer(1.into())),
+            (Value::String("id".into()), Value::Integer(id.into())),
             (Value::String("method".into()), Value::String(method.into())),
             (Value::String("params".into()), params),
         ]);
@@ -149,6 +411,357 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_structurally_invalid_request_is_invalid_request() {
+        let payload = rmp_serde::to_vec_named(&Value::Map(vec![
+            (Value::String("version".into()), Value::String("2.0".into())),
+            (Value::String("id".into()), Value::Integer(1.into())),
+        ]))
+        .unwrap();
+        let response = process_request(&payload).await;
+        assert!(matches!(response.id, Some(RequestId::Number(1))));
+        assert_eq!(response.error.unwrap().code, RpcError::INVALID_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn test_oversized_frame_is_answered_and_drained() {
+        let oversized = frame(b"oversized");
+        let valid = frame(&[0xc0]);
+        let input = [oversized, valid].concat();
+        let (frames_tx, mut frames_rx) = mpsc::channel(1);
+        let (errors_tx, mut errors_rx) = mpsc::channel(1);
+
+        read_frames(&input[..], frames_tx, errors_tx, 4).await;
+
+        let response = errors_rx.recv().await.expect("oversized frame response");
+        assert_eq!(response.error.unwrap().code, RpcError::INVALID_REQUEST);
+        assert_eq!(frames_rx.recv().await, Some(vec![0xc0]));
+    }
+
+    /// Malformed frames must always be answered.  A dropped response leaves
+    /// the client blocked on its own timeout with no diagnosis.
+    #[tokio::test]
+    async fn test_every_malformed_frame_is_answered() {
+        let (mut client, server_reader) = tokio::io::duplex(4096);
+        let (server_writer, mut client_reader) = tokio::io::duplex(4096);
+        let connection = tokio::spawn(run_connection(
+            server_reader,
+            Arc::new(Mutex::new(server_writer)),
+        ));
+
+        let malformed = ERROR_RESPONSE_CHANNEL_SIZE * 3;
+        let writes = tokio::spawn(async move {
+            for _ in 0..malformed {
+                client.write_all(&frame(&[0xc1])).await.unwrap();
+            }
+            client
+        });
+
+        for _ in 0..malformed {
+            let response = read_frame(&mut client_reader).await;
+            let code = map_get(&response, "error").and_then(map_get_code);
+            assert!(
+                matches!(
+                    code,
+                    Some(RpcError::PARSE_ERROR) | Some(RpcError::INVALID_REQUEST)
+                ),
+                "unexpected code {code:?}"
+            );
+        }
+
+        drop(writes.await.unwrap());
+        connection.await.unwrap();
+    }
+
+    fn frame(payload: &[u8]) -> Vec<u8> {
+        let mut frame = (payload.len() as u32).to_be_bytes().to_vec();
+        frame.extend_from_slice(payload);
+        frame
+    }
+
+    async fn read_frame<R: AsyncRead + Unpin>(reader: &mut R) -> Value {
+        let mut len = [0; 4];
+        reader.read_exact(&mut len).await.unwrap();
+        let mut payload = vec![0; u32::from_be_bytes(len) as usize];
+        reader.read_exact(&mut payload).await.unwrap();
+        rmp_serde::from_slice(&payload).unwrap()
+    }
+
+    #[tokio::test]
+    async fn test_connection_handles_fragmented_frame_while_writing_response() {
+        let (mut client, server_reader) = tokio::io::duplex(1024);
+        let (server_writer, mut client_reader) = tokio::io::duplex(1024);
+        let writer = Arc::new(Mutex::new(server_writer));
+        let connection = tokio::spawn(run_connection(server_reader, writer));
+        let first = make_request("missing.first", Value::Map(vec![]));
+        let second = make_request("missing.second", Value::Map(vec![]));
+
+        client.write_all(&frame(&first)).await.unwrap();
+        let second_frame = frame(&second);
+        // Leave the reader in the middle of the next prefix while the first
+        // request runs through JoinSet and the response writer.
+        client.write_all(&second_frame[..1]).await.unwrap();
+        let first_response = read_frame(&mut client_reader).await;
+        assert_eq!(
+            map_get(&first_response, "error").and_then(map_get_code),
+            Some(RpcError::METHOD_NOT_FOUND)
+        );
+
+        client.write_all(&second_frame[1..4]).await.unwrap();
+        client.write_all(&second_frame[4..]).await.unwrap();
+        let second_response = read_frame(&mut client_reader).await;
+        assert_eq!(
+            map_get(&second_response, "error").and_then(map_get_code),
+            Some(RpcError::METHOD_NOT_FOUND)
+        );
+
+        drop(client);
+        connection.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_connection_recovers_admission_after_panicked_tasks() {
+        let (mut client, server_reader) = tokio::io::duplex(4096);
+        let (server_writer, mut client_reader) = tokio::io::duplex(4096);
+        let connection = tokio::spawn(run_connection(
+            server_reader,
+            Arc::new(Mutex::new(server_writer)),
+        ));
+
+        for id in 1..=GENERAL_TASK_LIMIT as i64 {
+            client
+                .write_all(&frame(&make_request_with_id(
+                    id,
+                    "test.panic",
+                    Value::Map(vec![]),
+                )))
+                .await
+                .unwrap();
+        }
+        let mut completed = Vec::with_capacity(GENERAL_TASK_LIMIT);
+        for _ in 0..GENERAL_TASK_LIMIT {
+            let response = read_frame(&mut client_reader).await;
+            completed.push(map_get_id(&response).expect("panicked request response id"));
+            assert_eq!(
+                map_get(&response, "error").and_then(map_get_code),
+                Some(RpcError::METHOD_NOT_FOUND)
+            );
+        }
+        completed.sort_unstable();
+        assert_eq!(
+            completed,
+            (1..=GENERAL_TASK_LIMIT as i64).collect::<Vec<_>>()
+        );
+
+        client
+            .write_all(&frame(&make_request_with_id(
+                999,
+                "missing.after-panic",
+                Value::Map(vec![]),
+            )))
+            .await
+            .unwrap();
+        let response = read_frame(&mut client_reader).await;
+        assert_eq!(map_get_id(&response), Some(999));
+        assert_eq!(
+            map_get(&response, "error").and_then(map_get_code),
+            Some(RpcError::METHOD_NOT_FOUND)
+        );
+
+        drop(client);
+        connection.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_process_run_without_stdin_uses_null() {
+        let params = Value::Map(vec![(
+            Value::String("cmd".into()),
+            Value::String("cat".into()),
+        )]);
+        let response = process_request(&make_request("process.run", params)).await;
+        assert!(response.error.is_none());
+        assert_eq!(
+            map_get(response.result.as_ref().unwrap(), "stdout"),
+            Some(&Value::Binary(vec![]))
+        );
+    }
+
+    #[tokio::test]
+    async fn test_process_run_large_bidirectional_io_does_not_deadlock() {
+        let input = vec![b'x'; 1024 * 1024];
+        let params = Value::Map(vec![
+            (Value::String("cmd".into()), Value::String("cat".into())),
+            (Value::String("stdin".into()), Value::Binary(input.clone())),
+        ]);
+        let response = process_request(&make_request("process.run", params)).await;
+        assert!(response.error.is_none());
+        assert_eq!(
+            map_get(response.result.as_ref().unwrap(), "stdout"),
+            Some(&Value::Binary(input))
+        );
+    }
+
+    /// A child that stops reading stdin early is ordinary shell behavior.
+    /// `tramp-sh' runs `command <infile', where EPIPE never reaches Emacs, so
+    /// `process-file' must still see the output and the real exit status.
+    #[tokio::test]
+    async fn test_process_run_stdin_broken_pipe_preserves_output() {
+        let params = Value::Map(vec![
+            (Value::String("cmd".into()), Value::String("/bin/sh".into())),
+            (
+                Value::String("args".into()),
+                Value::Array(vec![
+                    Value::String("-c".into()),
+                    Value::String("head -c 5".into()),
+                ]),
+            ),
+            (
+                Value::String("stdin".into()),
+                Value::Binary(vec![b'x'; 8 * 1024 * 1024]),
+            ),
+        ]);
+        let response = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            process_request(&make_request("process.run", params)),
+        )
+        .await
+        .expect("broken stdin pipe must not hang");
+        assert!(response.error.is_none(), "error: {:?}", response.error);
+        let result = response.result.unwrap();
+        assert_eq!(
+            map_get(&result, "stdout"),
+            Some(&Value::Binary(b"xxxxx".to_vec()))
+        );
+        assert_eq!(
+            map_get(&result, "exit_code").and_then(Value::as_i64),
+            Some(0)
+        );
+    }
+
+    /// A child that closes stdin but keeps running must not stall the RPC
+    /// either; the write is abandoned and the child's exit status is used.
+    #[tokio::test]
+    async fn test_process_run_stdin_closed_early_still_completes() {
+        let params = Value::Map(vec![
+            (Value::String("cmd".into()), Value::String("/bin/sh".into())),
+            (
+                Value::String("args".into()),
+                Value::Array(vec![
+                    Value::String("-c".into()),
+                    Value::String("exec 0<&-; printf done; exit 3".into()),
+                ]),
+            ),
+            (
+                Value::String("stdin".into()),
+                Value::Binary(vec![b'x'; 1024 * 1024]),
+            ),
+        ]);
+        let response = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            process_request(&make_request("process.run", params)),
+        )
+        .await
+        .expect("closed stdin must not hang");
+        assert!(response.error.is_none(), "error: {:?}", response.error);
+        let result = response.result.unwrap();
+        assert_eq!(
+            map_get(&result, "stdout"),
+            Some(&Value::Binary(b"done".to_vec()))
+        );
+        assert_eq!(
+            map_get(&result, "exit_code").and_then(Value::as_i64),
+            Some(3)
+        );
+    }
+
+    #[tokio::test]
+    async fn test_commands_run_parallel_stdin_broken_pipe_preserves_output() {
+        let command = Value::Map(vec![
+            (Value::String("key".into()), Value::String("head".into())),
+            (Value::String("cmd".into()), Value::String("/bin/sh".into())),
+            (
+                Value::String("args".into()),
+                Value::Array(vec![
+                    Value::String("-c".into()),
+                    Value::String("head -c 5".into()),
+                ]),
+            ),
+            (
+                Value::String("stdin".into()),
+                Value::Binary(vec![b'x'; 8 * 1024 * 1024]),
+            ),
+        ]);
+        let result = handlers::commands::run_parallel(Value::Map(vec![(
+            Value::String("commands".into()),
+            Value::Array(vec![command]),
+        )]))
+        .await
+        .unwrap();
+        let entry = map_get(&result, "head").unwrap();
+        assert_eq!(
+            map_get(entry, "stdout"),
+            Some(&Value::Binary(b"xxxxx".to_vec()))
+        );
+        assert_eq!(map_get(entry, "exit_code").and_then(Value::as_i64), Some(0));
+    }
+
+    #[tokio::test]
+    async fn test_commands_run_parallel_stdin() {
+        let command = Value::Map(vec![
+            (Value::String("key".into()), Value::String("cat".into())),
+            (Value::String("cmd".into()), Value::String("cat".into())),
+            (
+                Value::String("stdin".into()),
+                Value::Binary(b"input".to_vec()),
+            ),
+        ]);
+        let no_stdin = Value::Map(vec![
+            (Value::String("key".into()), Value::String("empty".into())),
+            (Value::String("cmd".into()), Value::String("cat".into())),
+        ]);
+        let result = handlers::commands::run_parallel(Value::Map(vec![(
+            Value::String("commands".into()),
+            Value::Array(vec![command, no_stdin]),
+        )]))
+        .await
+        .unwrap();
+        let output = match map_get(map_get(&result, "cat").unwrap(), "stdout").unwrap() {
+            Value::Binary(output) => output,
+            value => panic!("expected binary stdout, got {value:?}"),
+        };
+        assert_eq!(output, b"input");
+        assert_eq!(
+            map_get(map_get(&result, "empty").unwrap(), "stdout"),
+            Some(&Value::Binary(vec![]))
+        );
+    }
+
+    #[tokio::test]
+    async fn test_commands_run_parallel_signal_exit_code() {
+        let command = Value::Map(vec![
+            (Value::String("key".into()), Value::String("signal".into())),
+            (Value::String("cmd".into()), Value::String("/bin/sh".into())),
+            (
+                Value::String("args".into()),
+                Value::Array(vec![
+                    Value::String("-c".into()),
+                    Value::String("kill -TERM $$".into()),
+                ]),
+            ),
+        ]);
+        let result = handlers::commands::run_parallel(Value::Map(vec![(
+            Value::String("commands".into()),
+            Value::Array(vec![command]),
+        )]))
+        .await
+        .unwrap();
+        let entry = map_get(&result, "signal").unwrap();
+        assert_eq!(
+            map_get(entry, "exit_code").and_then(Value::as_i64),
+            Some(143)
+        );
+    }
+
+    #[tokio::test]
     async fn test_method_not_found() {
         let params = Value::Map(vec![]);
         let payload = make_request("nonexistent.method", params);
@@ -163,6 +776,111 @@ mod tests {
                 .find(|(k, _)| k.as_str() == Some(key))
                 .map(|(_, v)| v)
         })
+    }
+
+    fn map_get_code(value: &Value) -> Option<i32> {
+        map_get(value, "code")
+            .and_then(Value::as_i64)
+            .map(|code| code as i32)
+    }
+
+    fn map_get_id(value: &Value) -> Option<i64> {
+        map_get(value, "id").and_then(Value::as_i64)
+    }
+
+    /// An over-subscribed general pool must queue rather than reject, while a
+    /// control request still overtakes the backlog.  Rejecting would surface
+    /// as a spurious `remote-file-error' for a perfectly valid request.
+    #[tokio::test]
+    async fn test_general_overload_queues_and_control_is_reserved() {
+        let (mut client, server_reader) = tokio::io::duplex(4096);
+        let (server_writer, mut client_reader) = tokio::io::duplex(4096);
+        let connection = tokio::spawn(run_connection(
+            server_reader,
+            Arc::new(Mutex::new(server_writer)),
+        ));
+
+        let start = make_request(
+            "process.start",
+            Value::Map(vec![
+                (Value::String("cmd".into()), Value::String("sleep".into())),
+                (
+                    Value::String("args".into()),
+                    Value::Array(vec![Value::String("30".into())]),
+                ),
+            ]),
+        );
+        client.write_all(&frame(&start)).await.unwrap();
+        let start_response = read_frame(&mut client_reader).await;
+        let pid = map_get(&start_response, "result")
+            .and_then(|result| map_get(result, "pid"))
+            .and_then(Value::as_u64)
+            .expect("process.start pid") as i64;
+
+        let read_params = || {
+            Value::Map(vec![
+                (Value::String("pid".into()), Value::Integer(pid.into())),
+                (
+                    Value::String("timeout_ms".into()),
+                    Value::Integer(30_000.into()),
+                ),
+            ])
+        };
+        for id in 1..=GENERAL_TASK_LIMIT as i64 {
+            client
+                .write_all(&frame(&make_request_with_id(
+                    id,
+                    "process.read",
+                    read_params(),
+                )))
+                .await
+                .unwrap();
+        }
+        client
+            .write_all(&frame(&make_request_with_id(
+                999,
+                "process.read",
+                read_params(),
+            )))
+            .await
+            .unwrap();
+        client
+            .write_all(&frame(&make_request_with_id(
+                1000,
+                "process.kill",
+                Value::Map(vec![
+                    (Value::String("pid".into()), Value::Integer(pid.into())),
+                    (Value::String("signal".into()), Value::Integer(9.into())),
+                ]),
+            )))
+            .await
+            .unwrap();
+
+        // The kill answers first, from its reserved pool, even though the
+        // queued 17th read arrived before it.
+        let first = read_frame(&mut client_reader).await;
+        assert_eq!(map_get_id(&first), Some(1000));
+        assert!(map_get(&first, "error").is_none(), "kill failed: {first:?}");
+
+        // Every read, including the queued one, is eventually answered; none
+        // is rejected with a synthetic overload error.
+        let mut seen = Vec::new();
+        while seen.len() < GENERAL_TASK_LIMIT + 1 {
+            let response = read_frame(&mut client_reader).await;
+            assert_ne!(
+                map_get(&response, "error").and_then(map_get_code),
+                Some(RpcError::INTERNAL_ERROR),
+                "queued request was rejected: {response:?}"
+            );
+            seen.push(map_get_id(&response).expect("response id"));
+        }
+        seen.sort_unstable();
+        let mut expected: Vec<i64> = (1..=GENERAL_TASK_LIMIT as i64).collect();
+        expected.push(999);
+        assert_eq!(seen, expected);
+
+        drop(client);
+        connection.await.unwrap();
     }
 
     #[tokio::test]
