@@ -690,6 +690,9 @@ Signals `remote-file-error' on compressed payload decode failures."
                           (format "Unsupported file.read compression: %s" compression))))))
       content)))
 
+(defconst tramp-rpc--file-read-chunk-size (* 16 1024 1024)
+  "Maximum bytes requested by one `file.read' RPC.")
+
 (defun tramp-rpc--file-read-params (localname &optional force-uncompressed)
   "Build params for `file.read' on LOCALNAME.
 When `tramp-rpc-compress-file-read' is non-nil, request compression unless
@@ -699,6 +702,40 @@ FORCE-UNCOMPRESSED is non-nil."
                (not force-uncompressed))
       (push '(compress . t) params))
     params))
+
+(defun tramp-rpc--read-file-bytes
+    (vec localname &optional beg end force-uncompressed)
+  "Read bytes from LOCALNAME on VEC in bounded RPC chunks.
+BEG and END are byte offsets.  When END is nil, read through end of file.
+FORCE-UNCOMPRESSED is passed to `tramp-rpc--file-read-params'."
+  (let ((offset (or beg 0))
+        (remaining (and end (- end (or beg 0))))
+        done)
+    (when (and remaining (< remaining 0))
+      (signal 'args-out-of-range (list beg end)))
+    (with-temp-buffer
+      (set-buffer-multibyte nil)
+      (while (not done)
+        (let* ((requested (if remaining
+                              (min remaining tramp-rpc--file-read-chunk-size)
+                            tramp-rpc--file-read-chunk-size))
+               (params (tramp-rpc--file-read-params
+                        localname force-uncompressed)))
+          (if (= requested 0)
+              (setq done t)
+            (push `(offset . ,offset) params)
+            (push `(length . ,requested) params)
+            (let* ((result (tramp-rpc--call vec "file.read" params))
+                   (content (tramp-rpc--extract-file-read-content result))
+                   (received (length content)))
+              (insert content)
+              (setq offset (+ offset received))
+              (when remaining
+                (setq remaining (- remaining received)))
+              (when (or (< received requested)
+                        (and remaining (= remaining 0)))
+                (setq done t))))))
+      (buffer-string))))
 
 ;; ============================================================================
 ;; Connection management
@@ -1803,10 +1840,11 @@ Returns the result or signals an error."
         (if (tramp-rpc-protocol-error-p response)
             (let ((code (tramp-rpc-protocol-error-code response))
                   (msg (tramp-rpc-protocol-error-message response))
+                  (data (tramp-rpc-protocol-error-data response))
                   (os-errno (tramp-rpc-protocol-error-errno response)))
               (tramp-rpc--debug "ERROR id=%s code=%s msg=%s errno=%s"
                                expected-id code msg os-errno)
-              (tramp-rpc--signal-rpc-error "RPC" msg code os-errno))
+              (tramp-rpc--signal-rpc-error "RPC" msg code os-errno nil data))
           (plist-get response :result))))))
 
 (defun tramp-rpc--call-batch (vec requests)
@@ -1969,7 +2007,14 @@ TIMEOUT is the maximum time to wait in seconds (default 30)."
             (tramp-rpc--debug "RECV-PIPE quit (user interrupted)")
             (keyboard-quit)))))
     (when remaining-ids
-      (tramp-rpc--debug "RECV-PIPE timeout, missing ids: %S" remaining-ids))
+      (tramp-rpc--debug "RECV-PIPE missing ids: %S" remaining-ids)
+      (signal
+       'remote-file-error
+       (list (if (process-live-p process)
+                 (format "Timeout waiting for pipelined RPC responses from %s (missing ids: %S)"
+                         (tramp-file-name-host vec) remaining-ids)
+               (format "RPC process died waiting for pipelined responses from %s (missing ids: %S)"
+                       (tramp-file-name-host vec) remaining-ids)))))
     ;; Convert hash table to alist in original order
     (mapcar (lambda (id)
               (cons id (gethash id responses)))
@@ -2061,6 +2106,24 @@ Returns an alist with PATH as an explicit MessagePack bin value."
 ;; File name handler operations
 ;; ============================================================================
 
+(defun tramp-rpc--mode-executable-p (mode-string remote-uid remote-gid attrs groups)
+  "Return non-nil when MODE-STRING permits the remote user to execute ATTRS."
+  (if (equal remote-uid tramp-root-id-integer)
+      ;; Root may execute only when some execute bit is set.
+      (or (memq (aref mode-string 3) '(?x ?s))
+          (memq (aref mode-string 6) '(?x ?s))
+          (memq (aref mode-string 9) '(?x ?t)))
+    (or
+     ;; World executable.
+     (memq (aref mode-string 9) '(?x ?t))
+     ;; Owner executable.
+     (and (memq (aref mode-string 3) '(?x ?s))
+          (equal remote-uid (file-attribute-user-id attrs)))
+     ;; Group executable and we are in that group.
+     (and (memq (aref mode-string 6) '(?x ?s))
+          (or (equal remote-gid (file-attribute-group-id attrs))
+              (member (file-attribute-group-id attrs) groups))))))
+
 (defun tramp-rpc-handle-file-executable-p (filename)
   "Like `file-executable-p' for TRAMP-RPC files.
 Checks execute permission from `file-attributes' mode string and
@@ -2077,18 +2140,9 @@ For symlinks, follows through to the target (like
           (when-let* ((mode-string (file-attribute-modes attrs))
                       (remote-uid (tramp-get-remote-uid v 'integer))
                       (remote-gid (tramp-get-remote-gid v 'integer)))
-            (or
-             ;; World executable.
-             (memq (aref mode-string 9) '(?x ?t))
-             ;; Owner executable and we are owner (or root).
-             (and (memq (aref mode-string 3) '(?x ?s))
-                  (or (equal remote-uid tramp-root-id-integer)
-                      (equal remote-uid (file-attribute-user-id attrs))))
-             ;; Group executable and we are in that group.
-             (and (memq (aref mode-string 6) '(?x ?s))
-                  (or (equal remote-gid (file-attribute-group-id attrs))
-                      (member (file-attribute-group-id attrs)
-                              (tramp-get-remote-groups v 'integer)))))))))))
+            (tramp-rpc--mode-executable-p
+             mode-string remote-uid remote-gid attrs
+             (tramp-get-remote-groups v 'integer))))))))
 
 (defun tramp-rpc--call-file-stat (vec localname &optional lstat)
   "Call file.stat for LOCALNAME on VEC, returning nil if file doesn't exist.
@@ -2583,6 +2637,14 @@ This is a lexical path check: the directories can be remote or not yet exist."
 ;; Directory operations
 ;; ============================================================================
 
+(defun tramp-rpc--apply-directory-count (entries count)
+  "Apply Emacs `directory-files' COUNT semantics to ENTRIES."
+  (when count
+    (unless (natnump count)
+      (signal 'wrong-type-argument (list 'wholenump count)))
+    (setq entries (seq-take entries count)))
+  entries)
+
 (defun tramp-rpc-handle-directory-files (directory &optional full match nosort count)
   "Like `directory-files' for TRAMP-RPC files.
 
@@ -2607,8 +2669,7 @@ so a single RPC can both validate and list the directory."
                     result)))
     (unless nosort
       (setq result (sort (copy-sequence result) #'string<)))
-    (when (and (natnump count) (> count 0))
-      (setq result (seq-take result count)))
+    (setq result (tramp-rpc--apply-directory-count result count))
     (if full
         (mapcar (lambda (name) (concat directory name)) result)
       result)))
@@ -2641,10 +2702,7 @@ so a single RPC can both validate and list the directory."
       ;; Sort unless nosort
       (unless nosort
         (setq entries (sort entries (lambda (a b) (string< (car a) (car b))))))
-      ;; Limit count
-      (when count
-        (setq entries (seq-take entries count)))
-      entries)))
+      (tramp-rpc--apply-directory-count entries count))))
 
 ;; Declared in Tramp 2.8.1.3+; forward-declare so byte compiler treats it as dynamic.
 (defvar tramp-fnac-add-trailing-slash)
@@ -2756,30 +2814,14 @@ network round-trip."
                             buffer-file-coding-system)
                        'utf-8-unix))
            (content-bytes (encode-coding-string content coding))
-           ;; When APPEND is an integer, it's a file offset.
-           ;; Read the existing file content first, then splice.
-           (real-append (cond
-                         ((integerp append)
-                          ;; Offset write: read file, truncate at offset, append new
-                          (let* ((existing (condition-case nil
-                                              (let ((r (tramp-rpc--call
-                                                        v "file.read"
-                                                        (tramp-rpc--encode-path localname))))
-                                                (tramp-rpc--binary-bytes
-                                                 (alist-get 'content r)))
-                                            (file-missing nil)))
-                                 (prefix (if existing
-                                             (substring existing 0 (min append (length existing)))
-                                           "")))
-                            ;; Combine prefix + new content
-                            (setq content-bytes (concat prefix content-bytes))
-                            ;; Not an append anymore, full overwrite
-                            nil))
-                         (append t)
-                         (t nil)))
+           ;; Integer APPEND is the offset understood by `file.write'; do not
+           ;; rewrite the remote prefix, which would discard its suffix.
+           (real-append (and append (not (integerp append))))
            (params (append (tramp-rpc--encode-path localname)
                            `((content . ,(msgpack-bin-make content-bytes))
-                             (append . ,(if real-append t :msgpack-false))))))
+                             (append . ,(if real-append t :msgpack-false))
+                             ,@(when (integerp append)
+                                 `((offset . ,append)))))))
 
       (let ((tramp-rpc--suppress-fs-notifications t))
         (tramp-rpc--call v "file.write" params))
@@ -2806,48 +2848,58 @@ network round-trip."
   (when-let* ((data (plist-get error :data)))
     (alist-get 'os_errno data)))
 
-(defun tramp-rpc--error-args (operation detail message filename)
-  "Build signal args for OPERATION, DETAIL, MESSAGE, and optional FILENAME."
-  (cond
-   ((and filename detail) (list operation detail filename message))
-   (filename (list operation filename message))
-   (detail (list operation detail message))
-   (t (list operation message))))
+(defun tramp-rpc--error-args (operation detail message filename &optional data)
+  "Build signal args for OPERATION, DETAIL, MESSAGE, FILENAME, and DATA."
+  (append
+   (cond
+    ((and filename detail) (list operation detail filename message))
+    (filename (list operation filename message))
+    (detail (list operation detail message))
+    (t (list operation message)))
+   (when data (list data))))
 
-(defun tramp-rpc--signal-rpc-error (operation message code os-errno &optional filename)
-  "Signal RPC error CODE/OS-ERRNO for OPERATION and optional FILENAME."
+(defun tramp-rpc--signal-rpc-error
+    (operation message code os-errno &optional filename data)
+  "Signal RPC error CODE/OS-ERRNO and optional structured DATA for OPERATION."
   (cond
    ((= code tramp-rpc-protocol-error-file-not-found)
     (signal 'file-missing
-            (tramp-rpc--error-args operation "No such file" message filename)))
+            (tramp-rpc--error-args operation "No such file" message filename data)))
    ((= code tramp-rpc-protocol-error-permission-denied)
     (signal 'permission-denied
-            (tramp-rpc--error-args operation "Permission denied" message filename)))
-   ((eql os-errno 2) ; ENOENT
+            (tramp-rpc--error-args operation "Permission denied" message filename data)))
+   ;; process.run can report ENOENT for its executable or its cwd.  Only the
+   ;; server's explicit marker represents command-not-found status 127.
+   ((and (= code tramp-rpc-protocol-error-process)
+         (eq (alist-get 'spawn_not_found data) t))
     (signal 'file-missing
-            (tramp-rpc--error-args operation "No such file" message filename)))
+            (tramp-rpc--error-args operation "No such file" message filename data)))
+   ((and (not (= code tramp-rpc-protocol-error-process))
+         (eql os-errno 2)) ; ENOENT
+    (signal 'file-missing
+            (tramp-rpc--error-args operation "No such file" message filename data)))
    ((eql os-errno 17) ; EEXIST
     (signal 'file-already-exists
-            (tramp-rpc--error-args operation nil message filename)))
+            (tramp-rpc--error-args operation nil message filename data)))
    ((eql os-errno 39) ; ENOTEMPTY
     (signal 'file-error
-            (tramp-rpc--error-args operation "Directory not empty" message filename)))
+            (tramp-rpc--error-args operation "Directory not empty" message filename data)))
    ((eql os-errno 20) ; ENOTDIR
     (signal 'file-error
-            (tramp-rpc--error-args operation "Not a directory" message filename)))
+            (tramp-rpc--error-args operation "Not a directory" message filename data)))
    ((eql os-errno 21) ; EISDIR
     (signal 'file-error
-            (tramp-rpc--error-args operation "Is a directory" message filename)))
+            (tramp-rpc--error-args operation "Is a directory" message filename data)))
    ((eql os-errno 40) ; ELOOP
     (signal 'file-error
             (tramp-rpc--error-args
-             operation "Too many levels of symbolic links" message filename)))
+             operation "Too many levels of symbolic links" message filename data)))
    ((= code tramp-rpc-protocol-error-io)
     (signal 'remote-file-error
-            (tramp-rpc--error-args operation nil message filename)))
+            (tramp-rpc--error-args operation nil message filename data)))
    (t
     (signal 'remote-file-error
-            (tramp-rpc--error-args operation nil message filename)))))
+            (tramp-rpc--error-args operation nil message filename data)))))
 
 (defun tramp-rpc--signal-batch-error (operation filename error)
   "Signal ERROR returned by a batched RPC for OPERATION on FILENAME."
@@ -2856,7 +2908,8 @@ network round-trip."
    (or (plist-get error :message) "RPC batch subrequest failed")
    (plist-get error :error)
    (tramp-rpc--batch-error-errno error)
-   filename))
+   filename
+   (plist-get error :data)))
 
 (defun tramp-rpc--batch-result-or-signal (operation filename result)
   "Return batched RESULT, or signal its embedded error for FILENAME."
@@ -3334,10 +3387,8 @@ as a no-op, so ignore the server's ENOENT mapping as well."
   "Copy remote LOCALNAME on VEC to local trash DEST using STAT metadata."
   (pcase (tramp-rpc--stat-type stat)
     ("file"
-     (let ((result (tramp-rpc--call vec "file.read"
-                                    (tramp-rpc--file-read-params localname t))))
-       (tramp-rpc--write-local-trash-file
-        dest (tramp-rpc--extract-file-read-content result) stat)))
+     (tramp-rpc--write-local-trash-file
+      dest (tramp-rpc--read-file-bytes vec localname nil nil t) stat))
     ("symlink"
      (make-symbolic-link
       (or (tramp-rpc--decode-string (alist-get 'link_target stat)) "") dest)
@@ -3388,32 +3439,48 @@ as a no-op, so ignore the server's ENOENT mapping as well."
     ;; recursively so the implementation stays small while avoiding the generic
     ;; TRAMP copy-file/stat/truename path for the common tiny test trees.
     (when regulars
-      (let ((remaining (nreverse regulars)))
-        (while remaining
-          (let ((chunk nil)
-                (count 0))
-            (while (and remaining (< count tramp-rpc--trash-read-batch-size))
-              (push (pop remaining) chunk)
-              (setq count (1+ count)))
-            (setq chunk (nreverse chunk))
-            (let ((reads (tramp-rpc--call-batch
-                          vec
-                          (mapcar
-                           (lambda (item)
-                             (cons "file.read"
-                                   (tramp-rpc--file-read-params
-                                    (file-name-concat localname (car item)) t)))
-                           chunk))))
-              (cl-mapc
-               (lambda (item result)
-                 (when (tramp-rpc--batch-error-p result)
-                   (tramp-rpc--signal-batch-error
-                    "file.read" (file-name-concat localname (car item)) result))
-                 (tramp-rpc--write-local-trash-file
-                  (expand-file-name (car item) (file-name-as-directory dest))
-                  (tramp-rpc--extract-file-read-content result)
-                  (cadr item)))
-               chunk reads))))))
+      (let (large-files small-files)
+        (dolist (item (nreverse regulars))
+          (if (> (or (alist-get 'size (cadr item)) 0)
+                 tramp-rpc--file-read-chunk-size)
+              (push item large-files)
+            (push item small-files)))
+        ;; Preserve the low-latency batch path for files that fit in one RPC.
+        (let ((remaining (nreverse small-files)))
+          (while remaining
+            (let ((chunk nil)
+                  (count 0))
+              (while (and remaining (< count tramp-rpc--trash-read-batch-size))
+                (push (pop remaining) chunk)
+                (setq count (1+ count)))
+              (setq chunk (nreverse chunk))
+              (let ((reads (tramp-rpc--call-batch
+                            vec
+                            (mapcar
+                             (lambda (item)
+                               (cons "file.read"
+                                     (tramp-rpc--file-read-params
+                                      (file-name-concat localname (car item)) t)))
+                             chunk))))
+                (cl-mapc
+                 (lambda (item result)
+                   (when (tramp-rpc--batch-error-p result)
+                     (tramp-rpc--signal-batch-error
+                      "file.read" (file-name-concat localname (car item)) result))
+                   (tramp-rpc--write-local-trash-file
+                    (expand-file-name (car item) (file-name-as-directory dest))
+                    (tramp-rpc--extract-file-read-content result)
+                    (cadr item)))
+                 chunk reads)))))
+        ;; Large files are read in bounded chunks instead of failing the
+        ;; optimized trash path at the server's per-request limit.
+        (dolist (item (nreverse large-files))
+          (let ((name (car item)))
+            (tramp-rpc--write-local-trash-file
+             (expand-file-name name (file-name-as-directory dest))
+             (tramp-rpc--read-file-bytes
+              vec (file-name-concat localname name) nil nil t)
+             (cadr item))))))
     (dolist (item (nreverse directories))
       (tramp-rpc--copy-remote-trash-directory-to-local
        vec
@@ -3873,7 +3940,7 @@ refresh), git commands are served from the prefetch cache when possible."
                                    (set-buffer-multibyte nil)
                                    (insert-file-contents-literally infile)
                                    (buffer-string))))
-               (result (condition-case _err
+               (result (condition-case nil
                            (tramp-rpc--call v "process.run"
                                             `((cmd . ,program)
                                               (args . ,(vconcat args))
@@ -3881,11 +3948,12 @@ refresh), git commands are served from the prefetch cache when possible."
                                               (env . ,env)
                                               ,@(when stdin-content
                                                   `((stdin . ,stdin-content)))))
-                         ;; When the binary doesn't exist or can't be
-                         ;; spawned, return exit code 127 (command not
-                         ;; found) instead of signaling an error.
-                         (remote-file-error nil))))
-          (if result
+                         ;; The server marks confirmed spawn ENOENT as
+                         ;; `file-missing'; other RPC failures must propagate.
+                         (file-missing 127))))
+          (if (eq result 127)
+              127
+            (if result
               (let ((exit-code (alist-get 'exit_code result))
                     (stdout (tramp-rpc--decode-output
                              (alist-get 'stdout result)
@@ -3935,8 +4003,8 @@ refresh), git commands are served from the prefetch cache when possible."
                     (let ((strings (tramp-rpc--get-signal-strings v)))
                       (aref strings (- exit-code 128)))
                   exit-code))
-            ;; Process spawn failed - return 127 (command not found)
-            127))))))
+            ;; A successful RPC result is always non-nil.
+            (signal 'remote-file-error (list "Empty process.run response")))))))))
 
 (defun tramp-rpc-handle-vc-registered (file)
   "Like `vc-registered' for TRAMP-RPC files.
@@ -4140,29 +4208,22 @@ round-trips for the common non-VISIT case."
     (let ((start (point))
           result)
       (with-parsed-tramp-file-name filename nil
-        (let* ((params (tramp-rpc--file-read-params localname)))
-          (when beg
-            (push `(offset . ,beg) params))
-          (when end
-            (push `(length . ,(- end (or beg 0))) params))
-          (let* ((rpc-result (tramp-rpc--call v "file.read" params))
-                 (content (tramp-rpc--extract-file-read-content rpc-result))
-                 (decoded-content
-                  (if enable-multibyte-characters
-                      (decode-coding-string
-                       content (or coding-system-for-read 'undecided))
-                    content)))
-            (insert decoded-content)
-            (setq result (list filename (- (point) start)))
-            (goto-char start))))
+        (let* ((content (tramp-rpc--read-file-bytes
+                         v localname beg end))
+               (decoded-content
+                (if enable-multibyte-characters
+                    (decode-coding-string
+                     content (or coding-system-for-read 'undecided))
+                  content)))
+          (insert decoded-content)
+          (setq result (list filename (- (point) start)))
+          (goto-char start)))
       result)))
 
 (defun tramp-rpc-handle-file-local-copy (filename)
   "Create a local copy of remote FILENAME using RPC."
   (tramp-skeleton-file-local-copy filename
-    (let* ((params (tramp-rpc--file-read-params localname))
-           (result (tramp-rpc--call v "file.read" params))
-           (content (tramp-rpc--extract-file-read-content result)))
+    (let ((content (tramp-rpc--read-file-bytes v localname)))
       (with-temp-file tmpfile
         (set-buffer-multibyte nil)
         (insert content)))))
