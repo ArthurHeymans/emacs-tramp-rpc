@@ -16,11 +16,49 @@ use std::process::{Command as StdCommand, ExitStatus, Stdio};
 use std::sync::{Arc, OnceLock};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 use tokio::process::{Child, ChildStderr, ChildStdin, ChildStdout, Command};
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, Semaphore};
 
 use super::HandlerResult;
 
 const MAX_PROCESS_READ_BYTES: usize = 1024 * 1024;
+
+/// A child that exits or closes stdin before consuming all input is normal
+/// shell behavior (`head`, `grep -q', a failing filter).  `tramp-sh' runs
+/// `command <infile', where the resulting SIGPIPE/EPIPE is invisible to
+/// Emacs, so these must not turn into RPC errors.
+pub(crate) fn is_benign_stdin_error(error: &std::io::Error) -> bool {
+    matches!(
+        error.kind(),
+        ErrorKind::BrokenPipe | ErrorKind::WriteZero | ErrorKind::ConnectionReset
+    )
+}
+
+async fn read_sync_output<R>(
+    mut reader: R,
+    remaining: Arc<Semaphore>,
+    output_limit: usize,
+) -> Result<Vec<u8>, RpcError>
+where
+    R: AsyncRead + Unpin,
+{
+    let mut output = Vec::new();
+    let mut buffer = [0u8; 8192];
+    loop {
+        let read = reader.read(&mut buffer).await.map_err(|error| {
+            RpcError::process_error(format!("Failed to read process output: {error}"))
+        })?;
+        if read == 0 {
+            return Ok(output);
+        }
+        let permits = u32::try_from(read).expect("output buffer length fits in u32");
+        let permit = remaining.try_acquire_many(permits).map_err(|_| {
+            RpcError::process_error(format!("Process output exceeds {output_limit} byte limit"))
+        })?;
+        // Consumed permits represent bytes retained in the response buffers.
+        permit.forget();
+        output.extend_from_slice(&buffer[..read]);
+    }
+}
 
 fn command_path(command: &str, cwd: Option<&str>) -> PathBuf {
     let path = Path::new(command);
@@ -146,6 +184,10 @@ struct ManagedProcess {
 
 /// Run a command and wait for it to complete
 pub async fn run(params: Value) -> HandlerResult {
+    run_with_output_limit(params, crate::MAX_RESPONSE_OUTPUT_BYTES).await
+}
+
+async fn run_with_output_limit(params: Value, output_limit: usize) -> HandlerResult {
     #[derive(Deserialize)]
     struct Params {
         /// Command to run
@@ -186,13 +228,17 @@ pub async fn run(params: Value) -> HandlerResult {
         }
     }
 
-    // Set up stdin if provided
-    if params.stdin.is_some() {
-        cmd.stdin(Stdio::piped());
-    }
+    // Never let a synchronous child consume the RPC transport.  A pipe is
+    // only needed when the caller supplied input.
+    cmd.stdin(if params.stdin.is_some() {
+        Stdio::piped()
+    } else {
+        Stdio::null()
+    });
 
     cmd.stdout(Stdio::piped());
     cmd.stderr(Stdio::piped());
+    cmd.kill_on_drop(true);
 
     let mut child = match cmd.spawn() {
         Ok(child) => child,
@@ -208,25 +254,62 @@ pub async fn run(params: Value) -> HandlerResult {
         }
     };
 
-    // Write stdin if provided (no base64 decoding needed!)
-    if let Some(stdin_data) = params.stdin
-        && let Some(mut stdin) = child.stdin.take()
-    {
-        let _ = stdin.write_all(&stdin_data).await;
-    }
-
-    // Wait for process to complete (async!)
-    let output = child
-        .wait_with_output()
-        .await
-        .map_err(|e| RpcError::process_error(format!("Failed to wait for process: {}", e)))?;
+    // Drive stdin, bounded output drains, and child exit concurrently.  A
+    // genuine pipe or size error cancels the other operations and kills the
+    // child; a broken stdin pipe does not, because a child that stops reading
+    // early (`head`, `grep -q', ...) is normal and its output must survive.
+    let stdin_data = params.stdin;
+    let mut stdin = child.stdin.take();
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| RpcError::process_error("Failed to capture process stdout"))?;
+    let stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| RpcError::process_error("Failed to capture process stderr"))?;
+    let write_stdin = async move {
+        if let Some(data) = stdin_data
+            && let Some(mut stdin) = stdin.take()
+            && let Err(error) = stdin.write_all(&data).await
+            && !is_benign_stdin_error(&error)
+        {
+            return Err(RpcError::process_error(format!(
+                "Failed to write stdin: {error}"
+            )));
+        }
+        Ok::<(), RpcError>(())
+    };
+    // This budget is shared by stdout and stderr for this request.  It is
+    // intentionally per-run rather than server-wide, so admission permits up
+    // to GENERAL_TASK_LIMIT concurrent allocations of this size.
+    let remaining = Arc::new(Semaphore::new(output_limit));
+    let result = tokio::try_join!(
+        write_stdin,
+        read_sync_output(stdout, Arc::clone(&remaining), output_limit),
+        read_sync_output(stderr, remaining, output_limit),
+        async {
+            child
+                .wait()
+                .await
+                .map_err(|e| RpcError::process_error(format!("Failed to wait for process: {e}")))
+        }
+    );
+    let ((), stdout, stderr, status) = match result {
+        Ok(result) => result,
+        Err(error) => {
+            let _ = child.kill().await;
+            let _ = child.wait().await;
+            return Err(error);
+        }
+    };
 
     // Return binary data directly (no encoding needed!)
-    let exit_code = crate::protocol::exit_code_from_status(output.status);
+    let exit_code = crate::protocol::exit_code_from_status(status);
     let result = ProcessResult {
         exit_code,
-        stdout: output.stdout,
-        stderr: output.stderr,
+        stdout,
+        stderr,
     };
 
     Ok(result.to_value())
@@ -1300,6 +1383,108 @@ pub async fn list_pty(_params: Value) -> HandlerResult {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn synchronous_output_reader_enforces_shared_limit() {
+        let error = read_sync_output(&b"oversized"[..], Arc::new(Semaphore::new(4)), 4)
+            .await
+            .expect_err("output above the remaining response budget should fail");
+        assert_eq!(error.code, RpcError::PROCESS_ERROR);
+        assert!(error.message.contains("output exceeds"));
+    }
+
+    #[tokio::test]
+    async fn process_run_drains_output_when_child_closes_stdin_early() {
+        let params = Value::Map(vec![
+            (Value::String("cmd".into()), Value::String("/bin/sh".into())),
+            (
+                Value::String("args".into()),
+                Value::Array(vec![
+                    Value::String("-c".into()),
+                    Value::String(
+                        "exec 0<&-; head -c 131072 /dev/zero; \
+                         head -c 131072 /dev/zero >&2; exit 3"
+                            .into(),
+                    ),
+                ]),
+            ),
+            (
+                Value::String("stdin".into()),
+                Value::Binary(vec![b'x'; 1024 * 1024]),
+            ),
+        ]);
+
+        let result = tokio::time::timeout(std::time::Duration::from_secs(10), run(params))
+            .await
+            .expect("closed stdin and full output pipes must not hang")
+            .expect("benign closed stdin must preserve the child result");
+        let stdout = map_get(&result, "stdout")
+            .and_then(Value::as_slice)
+            .expect("binary stdout");
+        let stderr = map_get(&result, "stderr")
+            .and_then(Value::as_slice)
+            .expect("binary stderr");
+        assert_eq!(stdout.len(), 131072);
+        assert_eq!(stderr.len(), 131072);
+        assert!(stdout.iter().all(|byte| *byte == 0));
+        assert!(stderr.iter().all(|byte| *byte == 0));
+        assert_eq!(
+            map_get(&result, "exit_code").and_then(Value::as_i64),
+            Some(3)
+        );
+    }
+
+    #[tokio::test]
+    async fn process_run_output_limit_kills_and_reaps_child() {
+        let tempdir = tempfile::tempdir().expect("temporary directory");
+        let pid_path = tempdir.path().join("child.pid");
+        let params = Value::Map(vec![
+            (Value::String("cmd".into()), Value::String("/bin/sh".into())),
+            (
+                Value::String("args".into()),
+                Value::Array(vec![
+                    Value::String("-c".into()),
+                    Value::String(
+                        "echo $$ > \"$1\"; while :; do printf 0123456789abcdef; done".into(),
+                    ),
+                    Value::String("sh".into()),
+                    Value::String(pid_path.to_string_lossy().into_owned().into()),
+                ]),
+            ),
+        ]);
+
+        let error = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            run_with_output_limit(params, 4096),
+        )
+        .await
+        .expect("output-limit failure must not hang")
+        .expect_err("oversized process output must fail");
+        assert_eq!(error.code, RpcError::PROCESS_ERROR);
+        assert!(error.message.contains("output exceeds 4096 byte limit"));
+
+        let pid: libc::pid_t = std::fs::read_to_string(&pid_path)
+            .expect("child pid file")
+            .trim()
+            .parse()
+            .expect("numeric child pid");
+        assert_eq!(unsafe { libc::kill(pid, 0) }, -1);
+        assert_eq!(
+            std::io::Error::last_os_error().raw_os_error(),
+            Some(libc::ESRCH),
+            "limited child must be dead"
+        );
+        let mut status = 0;
+        assert_eq!(
+            unsafe { libc::waitpid(pid, &mut status, libc::WNOHANG) },
+            -1
+        );
+        assert_eq!(
+            std::io::Error::last_os_error().raw_os_error(),
+            Some(libc::ECHILD),
+            "limited child must already be reaped"
+        );
+    }
 
     fn map_get<'a>(value: &'a Value, key: &str) -> Option<&'a Value> {
         value.as_map().and_then(|m| {

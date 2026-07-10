@@ -1443,13 +1443,22 @@ This exercises copy-then-delete for cross-remote renames."
   (tramp-rpc-test--with-temp-dir dir
     (dolist (name '("a" "b" "c"))
       (write-region name nil (expand-file-name name dir)))
-    (let ((all (directory-files-and-attributes dir)))
-      (should (equal (directory-files-and-attributes dir nil nil nil nil 2)
-                     (seq-take all 2)))
-      (should-not (directory-files-and-attributes dir nil nil nil nil 0))
-      (dolist (count '(-1 "invalid"))
-        (should-error (directory-files-and-attributes dir nil nil nil nil count)
-                      :type 'wrong-type-argument)))))
+    ;; Listing a directory updates its own access time (entry "."), so
+    ;; successive listings may legitimately disagree on atime.  Compare
+    ;; entries with atime normalized out to keep the COUNT contract check
+    ;; deterministic.
+    (cl-flet ((strip-atime (entry)
+                (let ((copy (copy-sequence entry)))
+                  (setf (nth 5 copy) nil)
+                  copy)))
+      (let ((all (directory-files-and-attributes dir)))
+        (should (equal (mapcar #'strip-atime
+                               (directory-files-and-attributes dir nil nil nil nil 2))
+                       (mapcar #'strip-atime (seq-take all 2))))))
+    (should-not (directory-files-and-attributes dir nil nil nil nil 0))
+    (dolist (count '(-1 "invalid"))
+      (should-error (directory-files-and-attributes dir nil nil nil nil count)
+                    :type 'wrong-type-argument))))
 
 (ert-deftest tramp-rpc-test07-directory-files-and-attributes ()
   "Test `directory-files-and-attributes' for TRAMP RPC files."

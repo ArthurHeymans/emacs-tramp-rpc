@@ -5,13 +5,14 @@
 //! - `ancestors.scan`: Scan ancestor directories for marker files
 
 use crate::msgpack_map;
-use crate::protocol::{IntoValue, RpcError, from_value};
+use crate::protocol::{IntoValue, RpcError, exit_code_from_status, from_value};
 use rmpv::Value;
 use serde::Deserialize;
 use std::collections::HashMap;
 use std::fs::File;
+use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 use std::thread;
 use std::time::UNIX_EPOCH;
 
@@ -51,6 +52,9 @@ pub async fn run_parallel(params: Value) -> HandlerResult {
         args: Vec<String>,
         /// Working directory (optional)
         cwd: Option<String>,
+        /// Stdin input as binary
+        #[serde(default, with = "serde_bytes")]
+        stdin: Option<Vec<u8>>,
     }
 
     #[derive(Deserialize)]
@@ -87,12 +91,70 @@ pub async fn run_parallel(params: Value) -> HandlerResult {
                         if let Some(ref cwd) = entry.cwd {
                             cmd.current_dir(super::expand_tilde(cwd));
                         }
-                        let value = match cmd.output() {
-                            Ok(output) => {
-                                msgpack_map! {
-                                    "exit_code" => output.status.code().unwrap_or(-1),
-                                    "stdout" => Value::Binary(output.stdout),
-                                    "stderr" => Value::Binary(output.stderr)
+                        cmd.stdin(if entry.stdin.is_some() {
+                            Stdio::piped()
+                        } else {
+                            Stdio::null()
+                        });
+                        cmd.stdout(Stdio::piped());
+                        cmd.stderr(Stdio::piped());
+                        let value = match cmd.spawn() {
+                            Ok(mut child) => {
+                                let stdin_data = entry.stdin;
+                                let stdin = child.stdin.take();
+                                // Keep writing and draining output concurrent: a
+                                // child may fill stdout while it reads stdin.
+                                let write_result = thread::scope(|scope| {
+                                    let writer = scope.spawn(move || {
+                                        if let Some(data) = stdin_data
+                                            && let Some(mut stdin) = stdin
+                                        {
+                                            match stdin.write_all(&data) {
+                                                // A child that stops reading
+                                                // early is not an error.
+                                                Err(error)
+                                                    if super::process::is_benign_stdin_error(
+                                                        &error,
+                                                    ) =>
+                                                {
+                                                    Ok(())
+                                                }
+                                                result => result,
+                                            }
+                                        } else {
+                                            Ok(())
+                                        }
+                                    });
+                                    let output = child.wait_with_output();
+                                    let write_result = writer.join().unwrap_or_else(|_| {
+                                        Err(std::io::Error::other("stdin writer panicked"))
+                                    });
+                                    (output, write_result)
+                                });
+                                match write_result {
+                                    (Ok(output), Ok(())) => msgpack_map! {
+                                        "exit_code" => exit_code_from_status(output.status),
+                                        "stdout" => Value::Binary(output.stdout),
+                                        "stderr" => Value::Binary(output.stderr)
+                                    },
+                                    // Report the failure without discarding
+                                    // what the child already produced.
+                                    (Ok(output), Err(error)) => {
+                                        let mut stderr = output.stderr;
+                                        stderr.extend_from_slice(
+                                            format!("Failed to write stdin: {error}\n").as_bytes(),
+                                        );
+                                        msgpack_map! {
+                                            "exit_code" => -1i32,
+                                            "stdout" => Value::Binary(output.stdout),
+                                            "stderr" => Value::Binary(stderr)
+                                        }
+                                    }
+                                    (Err(error), _) => msgpack_map! {
+                                        "exit_code" => -1i32,
+                                        "stdout" => Value::Binary(vec![]),
+                                        "stderr" => Value::Binary(error.to_string().into_bytes())
+                                    },
                                 }
                             }
                             Err(e) => {
