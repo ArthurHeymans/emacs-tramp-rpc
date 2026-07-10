@@ -167,12 +167,18 @@ fn system_statvfs(params: Value) -> HandlerResult {
 
 /// Get groups for the current user
 fn system_groups() -> HandlerResult {
-    // Get supplementary groups (use reasonable max buffer)
-    let ngroups: libc::c_int = 64;
-    let mut groups: Vec<libc::gid_t> = vec![0; ngroups as usize];
+    // Query how many groups we need.  On Linux/macOS, getgroups(0, NULL)
+    // returns the count without writing.
+    let needed = unsafe { libc::getgroups(0, std::ptr::null_mut()) };
+    if needed < 0 {
+        return Err(RpcError::io_error(std::io::Error::last_os_error()));
+    }
 
-    let actual_count = unsafe { libc::getgroups(ngroups, groups.as_mut_ptr()) };
+    // Allocate at least 1 so a zero-length result still has a valid pointer.
+    let capacity = (needed as usize).max(1);
+    let mut groups: Vec<libc::gid_t> = vec![0; capacity];
 
+    let actual_count = unsafe { libc::getgroups(capacity as libc::c_int, groups.as_mut_ptr()) };
     if actual_count < 0 {
         return Err(RpcError::io_error(std::io::Error::last_os_error()));
     }
