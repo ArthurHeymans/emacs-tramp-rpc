@@ -16,6 +16,19 @@ set -e
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
+TRAMP_SOURCE_CONFIGURED=0
+if [[ -n "${TRAMP_SOURCE:-}" ]]; then
+    TRAMP_SOURCE_CONFIGURED=1
+fi
+TRAMP_SOURCE="${TRAMP_SOURCE:-$HOME/src/tramp}"
+EMACS_LOAD_PATH_ARGS=()
+
+if [[ -d "$TRAMP_SOURCE/lisp" ]]; then
+    EMACS_LOAD_PATH_ARGS=(-L "$TRAMP_SOURCE/lisp")
+elif (( TRAMP_SOURCE_CONFIGURED )); then
+    echo "TRAMP_SOURCE does not contain a lisp/ directory: $TRAMP_SOURCE" >&2
+    exit 1
+fi
 
 # Colors
 RED='\033[0;31m'
@@ -41,47 +54,83 @@ usage() {
     echo "  EMACS                 Emacs executable (default: emacs)"
 }
 
+require_supported_tramp() {
+    ${EMACS:-emacs} -Q --batch "$@" \
+        --eval "(progn (require 'tramp) (unless (version<= \"2.8.1.4\" tramp-version) (error \"tramp-rpc tests require Tramp >= 2.8.1.4, but %s is loaded; set TRAMP_SOURCE to a supported checkout\" tramp-version)))"
+}
+
+run_ert_selector() {
+    local test_file="$1"
+    local selector="$2"
+    local expected_count="${3:-nil}"
+    shift 3
+
+    ${EMACS:-emacs} -Q --batch "$@" \
+        -l "$test_file" \
+        --eval "(let ((tramp-rpc-mock-test--isolate-tests t)) (let* ((selector $selector) (tests (ert-select-tests selector t)) (selected (length tests))) (unless (> selected 0) (error \"ERT selector %S selected zero tests\" selector)) (when $expected_count (unless (= selected $expected_count) (error \"ERT selector %S selected %d tests, expected $expected_count\" selector selected))) (let* ((stats (ert-run-tests-batch selector)) (skipped (ert-stats-skipped stats)) (executed (- (ert-stats-completed stats) skipped))) (message \"ERT counts: selected=%d executed=%d skipped=%d\" selected executed skipped) (when (= executed 0) (error \"ERT selector %S executed zero tests (all %d selected tests skipped)\" selector skipped)) (kill-emacs (if (> (ert-stats-completed-unexpected stats) 0) 1 0)))))"
+}
+
+run_mock_selector() {
+    local selector="$1"
+    local expected_count="${2:-nil}"
+
+    require_supported_tramp "${EMACS_LOAD_PATH_ARGS[@]}"
+    run_ert_selector "$SCRIPT_DIR/tramp-rpc-mock-tests.el" "\"$selector\"" "$expected_count" \
+        "${EMACS_LOAD_PATH_ARGS[@]}"
+}
+
 run_protocol_tests() {
     echo -e "${YELLOW}Running protocol tests...${NC}"
-    ${EMACS:-emacs} -Q --batch \
-        -l "$SCRIPT_DIR/tramp-rpc-mock-tests.el" \
-        --eval "(ert-run-tests-batch-and-exit '(and (tag tramp-rpc-mock-test) (not (tag :server))))"
+    run_mock_selector "^tramp-rpc-mock-test-protocol" 8
+}
+
+server_available() {
+    [[ -x "$PROJECT_DIR/target/release/tramp-rpc-server" ]] || \
+        [[ -x "$PROJECT_DIR/server/target/release/tramp-rpc-server" ]] || \
+        [[ -x "$PROJECT_DIR/target/x86_64-unknown-linux-musl/release/tramp-rpc-server" ]] || \
+        [[ -x "$PROJECT_DIR/target/debug/tramp-rpc-server" ]] || \
+        [[ -x "$PROJECT_DIR/server/target/debug/tramp-rpc-server" ]]
 }
 
 run_server_tests() {
     echo -e "${YELLOW}Running server tests...${NC}"
-    # Check if server is available
-    if [[ -x "$PROJECT_DIR/target/release/tramp-rpc-server" ]] || \
-       [[ -x "$PROJECT_DIR/target/debug/tramp-rpc-server" ]] || \
-       [[ -f "$PROJECT_DIR/server/tramp-rpc-server.py" ]]; then
-        ${EMACS:-emacs} -Q --batch \
-            -l "$SCRIPT_DIR/tramp-rpc-mock-tests.el" \
-            --eval "(ert-run-tests-batch-and-exit '(tag :server))"
+    if server_available; then
+        require_supported_tramp "${EMACS_LOAD_PATH_ARGS[@]}"
+        run_ert_selector "$SCRIPT_DIR/tramp-rpc-mock-tests.el" "'(tag :server)" nil \
+            "${EMACS_LOAD_PATH_ARGS[@]}"
     else
-        echo -e "${RED}No server found. Build with 'cargo build' or use Python server.${NC}"
+        echo -e "${RED}No server found. Build with 'cargo build'.${NC}"
         exit 1
     fi
 }
 
 run_mock_tests() {
     echo -e "${YELLOW}Running all mock tests...${NC}"
-    ${EMACS:-emacs} -Q --batch \
-        -l "$SCRIPT_DIR/tramp-rpc-mock-tests.el" \
-        --eval "(ert-run-tests-batch-and-exit \"^tramp-rpc-mock-test\")"
+    run_mock_selector "^tramp-rpc-mock-test"
 }
 
 run_remote_tests() {
     echo -e "${YELLOW}Running remote tests against ${TRAMP_RPC_TEST_HOST:-localhost}...${NC}"
-    ${EMACS:-emacs} -Q --batch \
-        -l "$SCRIPT_DIR/tramp-rpc-tests.el" \
-        --eval "(ert-run-tests-batch-and-exit \"^tramp-rpc-test\")"
+    require_supported_tramp "${EMACS_LOAD_PATH_ARGS[@]}"
+    run_ert_selector "$SCRIPT_DIR/tramp-rpc-tests.el" "\"^tramp-rpc-test\"" nil \
+        "${EMACS_LOAD_PATH_ARGS[@]}"
 }
 
 run_upstream_tests() {
+    local upstream_tramp_source="${TRAMP_TEST_SOURCE:-$TRAMP_SOURCE}"
+    local upstream_load_path_args=()
+
     echo -e "${YELLOW}Running upstream tests against ${TRAMP_RPC_TEST_HOST:-localhost}...${NC}"
-    ${EMACS:-emacs} -Q --batch \
-        -l "$SCRIPT_DIR/run-tramp-tests.el" \
-        --eval "(ert-run-tests-batch-and-exit '(not (tag :unstable)))"
+    if [[ -d "$upstream_tramp_source/lisp" ]]; then
+        upstream_load_path_args=(-L "$upstream_tramp_source/lisp")
+    elif [[ -n "${TRAMP_TEST_SOURCE:-}" ]]; then
+        echo "TRAMP_TEST_SOURCE does not contain a lisp/ directory: $upstream_tramp_source" >&2
+        exit 1
+    fi
+    require_supported_tramp "${upstream_load_path_args[@]}"
+    export TRAMP_TEST_SOURCE="$upstream_tramp_source"
+    run_ert_selector "$SCRIPT_DIR/run-tramp-tests.el" "'(not (tag :unstable))" nil \
+        "${upstream_load_path_args[@]}"
 }
 
 run_all_tests() {

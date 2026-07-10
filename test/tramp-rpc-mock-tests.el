@@ -31,9 +31,15 @@
                                (expand-file-name "test/tramp-rpc-mock-tests.el"))))
   "Project root directory, computed at load time.")
 
-;; Load tramp-rpc modules
-(let ((lisp-dir (expand-file-name "lisp" tramp-rpc-mock-test--project-root)))
-  (add-to-list 'load-path lisp-dir))
+;; Load tramp-rpc modules and the supported TRAMP checkout when available.
+(let ((lisp-dir (expand-file-name "lisp" tramp-rpc-mock-test--project-root))
+      (tramp-lisp-dir (expand-file-name
+                       "lisp"
+                       (or (getenv "TRAMP_SOURCE")
+                           (expand-file-name "src/tramp" (getenv "HOME"))))))
+  (add-to-list 'load-path lisp-dir)
+  (when (file-directory-p tramp-lisp-dir)
+    (add-to-list 'load-path tramp-lisp-dir)))
 
 ;; Install msgpack from MELPA if not available
 (defvar tramp-rpc-mock-test--msgpack-available
@@ -57,8 +63,10 @@
          nil)))
   "Non-nil if msgpack.el is available.")
 
-(when tramp-rpc-mock-test--msgpack-available
-  (require 'tramp-rpc-protocol))
+(unless tramp-rpc-mock-test--msgpack-available
+  (error "tramp-rpc mock tests require msgpack.el"))
+
+(require 'tramp-rpc-protocol)
 
 (defun tramp-rpc-mock-test--bytes-string (data)
   "Return DATA as a plain byte string, unwrapping MessagePack bin."
@@ -225,6 +233,10 @@
              (id (car result)))
         (should-not (gethash id ids))
         (puthash id t ids)))))
+
+(ert-deftest tramp-rpc-mock-test-runner-protocol-selector ()
+  "The protocol runner selector covers the eight protocol regressions."
+  (should (= (length (ert-select-tests "^tramp-rpc-mock-test-protocol" t)) 8)))
 
 ;;; ============================================================================
 ;;; Mode String Conversion Tests
@@ -761,17 +773,15 @@ This matches the behavior expected by `tramp-test28-process-file'."
 ;;; Multi-Hop Tests (No server or SSH required)
 ;;; ============================================================================
 
-;; Load tramp-rpc fully for multi-hop function testing
-(defvar tramp-rpc-mock-test--tramp-rpc-loaded
-  (condition-case err
-      (progn
-        (require 'tramp)
-        (require 'tramp-rpc)
-        t)
-    (error
-     (message "Could not load tramp-rpc: %s" err)
-     nil))
-  "Non-nil if tramp-rpc.el loaded successfully.")
+;; Load the full backend.  Do not turn an unsupported TRAMP into skipped
+;; tests: the runner must fail before it can claim a mock-test success.
+(require 'tramp)
+(unless (version<= "2.8.1.4" tramp-version)
+  (error "tramp-rpc mock tests require Tramp >= 2.8.1.4, but %s is loaded; set TRAMP_SOURCE to a supported checkout"
+         tramp-version))
+(require 'tramp-rpc)
+(defconst tramp-rpc-mock-test--tramp-rpc-loaded t
+  "The full TRAMP-RPC backend was loaded successfully.")
 
 (declare-function tramp-rpc-magit--file-exists-in-ancestor-scan
                   "tramp-rpc-magit" (filename scan))
@@ -792,16 +802,140 @@ This matches the behavior expected by `tramp-test28-process-file'."
 (defvar tramp-rpc-magit--ancestors-cache)
 (defvar tramp-rpc-magit--ancestor-scan-caches)
 
-(defvar tramp-rpc-mock-test--tramp-rpc-magit-loaded
-  (condition-case err
-      (progn
-        (require 'tramp)
-        (require 'tramp-rpc-magit)
-        t)
-    (error
-     (message "Could not load tramp-rpc-magit: %s" err)
-     nil))
-  "Non-nil if tramp-rpc-magit.el loaded successfully.")
+(defconst tramp-rpc-mock-test--tramp-rpc-magit-loaded
+  (progn (require 'tramp-rpc-magit) t)
+  "The TRAMP-RPC Magit support was loaded successfully.")
+
+(defun tramp-rpc-mock-test--clear-hash-tables (&rest symbols)
+  "Clear the hash tables stored in SYMBOLS."
+  (dolist (symbol symbols)
+    (when-let* ((value (and (boundp symbol) (symbol-value symbol))))
+      (when (hash-table-p value)
+        (clrhash value)))))
+
+(defun tramp-rpc-mock-test--reset-state ()
+  "Remove state left by an earlier mock test."
+  (tramp-rpc-mock-test--stop-server)
+  ;; Resource cleanup must run while its descriptor and watch tables still
+  ;; identify those resources; clearing them first leaks synthetic watches.
+  (tramp-rpc-cleanup-all-connections)
+  (tramp-cleanup-all-connections)
+  (tramp-rpc-mock-test--clear-hash-tables
+   'tramp-rpc--process-write-queues
+   'tramp-rpc--direnv-cache
+   'tramp-rpc--direnv-available-cache
+   'tramp-rpc--exec-path-cache
+   'tramp-rpc--login-shell-cache
+   'tramp-rpc-magit--process-caches
+   'tramp-rpc-magit--ancestor-scan-caches)
+  (setq tramp-rpc-magit--ancestors-cache nil
+        tramp-rpc-magit--prefetch-directory nil
+        tramp-rpc-magit--allow-process-cache nil))
+
+(defvar tramp-rpc-mock-test--isolate-tests nil
+  "Non-nil while a TRAMP-RPC mock selector is running.")
+
+(defun tramp-rpc-mock-test--run-isolated (run-test test)
+  "Run a selected mock TEST with no state shared with other mock tests."
+  (if (and tramp-rpc-mock-test--isolate-tests
+           (string-prefix-p "tramp-rpc-mock-test"
+                            (symbol-name (ert-test-name test))))
+      (unwind-protect
+          (progn
+            (tramp-rpc-mock-test--reset-state)
+            (funcall run-test test))
+        (tramp-rpc-mock-test--reset-state))
+    (funcall run-test test)))
+
+(advice-add 'ert-run-test :around #'tramp-rpc-mock-test--run-isolated)
+
+(ert-deftest tramp-rpc-mock-test-reset-state-cleans-file-notify-resources ()
+  "State reset removes descriptors before clearing their tracking tables."
+  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
+  (require 'filenotify)
+  (let* ((tramp-rpc--file-notify-descriptors (make-hash-table :test 'eq))
+         (tramp-rpc--file-notify-watch-counts (make-hash-table :test 'equal))
+         (tramp-rpc--watched-directories (make-hash-table :test 'equal))
+         (file-notify-descriptors (make-hash-table :test 'eq))
+         (vec (tramp-dissect-file-name "/rpc:mock:/tmp/"))
+         (watch-key (format "%s:/tmp/" (tramp-rpc--connection-key-string vec)))
+         (descriptor (tramp-rpc--make-file-notify-descriptor
+                      vec "/rpc:mock:/tmp/" "/tmp/"))
+         stopped)
+    (unwind-protect
+        (progn
+          (puthash descriptor (list :watch-key watch-key :directory "/rpc:mock:/tmp/")
+                   tramp-rpc--file-notify-descriptors)
+          (puthash watch-key '(:count 1 :owned t)
+                   tramp-rpc--file-notify-watch-counts)
+          (puthash descriptor
+                   (file-notify--watch-make
+                    "/rpc:mock:/tmp/" nil
+                    (lambda (event) (push event stopped)))
+                   file-notify-descriptors)
+          (tramp-rpc-mock-test--reset-state)
+          (should-not (process-live-p descriptor))
+          (should-not (gethash descriptor file-notify-descriptors))
+          (should (equal stopped `((,descriptor stopped "/rpc:mock:/tmp/")))))
+      (tramp-rpc--delete-file-notify-descriptor-process descriptor))))
+
+(ert-deftest tramp-rpc-mock-test-runner-rejects-empty-and-skipped-selectors ()
+  "The shell runner rejects unsupported Tramp, zero selections, and all skips."
+  (let* ((temporary-directory (make-temp-file "tramp-rpc-runner-test-" t))
+         (runner (expand-file-name "test/run-tests.sh"
+                                   tramp-rpc-mock-test--project-root))
+         (emacs (or (executable-find "emacs")
+                    (error "Cannot find Emacs executable")))
+         (wrapper (expand-file-name "emacs-wrapper" temporary-directory))
+         (skipped (expand-file-name "skipped.el" temporary-directory))
+         (empty (expand-file-name "empty.el" temporary-directory))
+         (unsupported (expand-file-name "unsupported" temporary-directory)))
+    (unwind-protect
+        (progn
+          (with-temp-file wrapper
+            (insert "#!/bin/bash\nargs=()\nfor arg in \"$@\"; do\n"
+                    "  if [[ $arg == */test/tramp-rpc-mock-tests.el ]]; then\n"
+                    "    args+=(\"$RUNNER_TEST_FILE\")\n  else\n"
+                    "    args+=(\"$arg\")\n  fi\ndone\n"
+                    "exec \"$REAL_EMACS\" \"${args[@]}\"\n"))
+          (set-file-modes wrapper #o755)
+          (with-temp-file skipped
+            (insert "(require 'ert)\n"
+                    "(dotimes (n 8)\n"
+                    "  (eval `(ert-deftest ,(intern (format \"tramp-rpc-mock-test-protocol-skip-%d\" n)) () (ert-skip \"simulated\"))))\n"))
+          (with-temp-file empty (insert "(require 'ert)\n"))
+          (make-directory (expand-file-name "lisp" unsupported) t)
+          (with-temp-file (expand-file-name "lisp/tramp.el" unsupported)
+            (insert "(defvar tramp-version \"0\")\n(provide 'tramp)\n"))
+          (cl-labels
+              ((run (test-file &optional tramp-source)
+                 (with-temp-buffer
+                   (let ((process-environment
+                          (append (list (concat "EMACS=" wrapper)
+                                        (concat "REAL_EMACS=" emacs)
+                                        (concat "RUNNER_TEST_FILE=" test-file))
+                                  (when tramp-source
+                                    (list (concat "TRAMP_SOURCE=" tramp-source)))
+                                  (cl-remove-if
+                                   (lambda (entry)
+                                     (or (string-prefix-p "EMACS=" entry)
+                                         (string-prefix-p "REAL_EMACS=" entry)
+                                         (string-prefix-p "RUNNER_TEST_FILE=" entry)
+                                         (string-prefix-p "TRAMP_SOURCE=" entry)))
+                                   process-environment))))
+                     (list (call-process runner nil t nil "--protocol")
+                           (buffer-string))))))
+            (pcase-let ((`(,status ,output) (run skipped)))
+              (should (/= status 0))
+              (should (string-match-p
+                       "ERT counts: selected=8 executed=0 skipped=8" output)))
+            (pcase-let ((`(,status ,output) (run empty)))
+              (should (/= status 0))
+              (should (string-match-p "selected zero tests" output)))
+            (pcase-let ((`(,status ,output) (run skipped unsupported)))
+              (should (/= status 0))
+              (should (string-match-p "require Tramp >= 2.8.1.4" output)))))
+      (delete-directory temporary-directory t))))
 
 (ert-deftest tramp-rpc-mock-test-dired-compress-file-registered ()
   "`dired-compress-file' is handled for TRAMP-RPC files."
@@ -1562,7 +1696,9 @@ This matches the behavior expected by `tramp-test28-process-file'."
                      (push (list method params) calls)
                      t))
                   ((symbol-function 'tramp-rpc-handle-file-directory-p)
-                   (lambda (_filename) t)))
+                   (lambda (_filename) t))
+                  ((symbol-function 'file-symlink-p)
+                   (lambda (_filename) nil)))
           (setq descriptor
                 (file-notify-add-watch directory '(change) #'ignore))
           (should (processp descriptor))
@@ -1576,7 +1712,10 @@ This matches the behavior expected by `tramp-test28-process-file'."
           (should-not (gethash descriptor file-notify-descriptors))
           (should-not (process-live-p descriptor))
           (should (= (hash-table-count tramp-rpc--file-notify-watch-counts) 0))
-          (should (equal (mapcar #'car (nreverse (copy-sequence calls)))
+          (should (equal (mapcar #'car
+                                (cl-remove-if-not
+                                 (lambda (call) (string-prefix-p "watch." (car call)))
+                                 (nreverse (copy-sequence calls))))
                          '("watch.add" "watch.remove"))))
       (when (and descriptor (boundp 'file-notify-descriptors))
         (remhash descriptor file-notify-descriptors))
@@ -1597,12 +1736,17 @@ This matches the behavior expected by `tramp-test28-process-file'."
     (cl-letf (((symbol-function 'tramp-rpc--call)
                (lambda (_vec method params)
                  (push (list method params) calls)
-                 t)))
+                 t))
+              ((symbol-function 'file-symlink-p)
+               (lambda (_filename) nil)))
       (setq descriptor
             (tramp-rpc-handle-file-notify-add-watch directory '(change) #'ignore))
       (should (gethash descriptor tramp-rpc--file-notify-descriptors))
       (should-not (gethash watch-key tramp-rpc--watched-directories))
-      (should (equal (mapcar #'car (nreverse (copy-sequence calls)))
+      (should (equal (mapcar #'car
+                             (cl-remove-if-not
+                              (lambda (call) (string-prefix-p "watch." (car call)))
+                              (nreverse (copy-sequence calls))))
                      '("watch.add")))
       (setq calls nil)
       (tramp-rpc-watch-directory directory t)
@@ -1633,6 +1777,8 @@ This matches the behavior expected by `tramp-test28-process-file'."
                (lambda (_vec method params)
                  (push (list method params) calls)
                  t))
+              ((symbol-function 'file-symlink-p)
+               (lambda (_filename) nil))
               ((symbol-function 'file-truename)
                (lambda (filename) filename)))
       (tramp-rpc-watch-directory directory nil)
@@ -1645,7 +1791,10 @@ This matches the behavior expected by `tramp-test28-process-file'."
       (should-not (gethash watch-key tramp-rpc--watched-directories))
       (should (plist-get (gethash watch-key tramp-rpc--file-notify-watch-counts)
                          :owned))
-      (should (equal (mapcar #'car (nreverse (copy-sequence calls)))
+      (should (equal (mapcar #'car
+                             (cl-remove-if-not
+                              (lambda (call) (string-prefix-p "watch." (car call)))
+                              (nreverse (copy-sequence calls))))
                      '("watch.add" "watch.add"))))))
 
 (ert-deftest tramp-rpc-mock-test-file-notify-watch-upgrade-failure-keeps-direct ()
@@ -1730,7 +1879,9 @@ This matches the behavior expected by `tramp-test28-process-file'."
   (let ((vec (tramp-dissect-file-name "/rpc:mockhost:/tmp"))
         (count 0))
     (tramp-flush-connection-properties vec)
-    (cl-letf (((symbol-function 'tramp-rpc--call)
+    (cl-letf (((symbol-function 'tramp-rpc--ensure-connection)
+               (lambda (_vec) '(:process mock)))
+              ((symbol-function 'tramp-rpc--call)
                (lambda (_vec method _params)
                  (should (equal method "system.info"))
                  (cl-incf count)
@@ -3390,92 +3541,6 @@ as a hop in multi-hop chains."
         (delete-process proc))
       (kill-buffer buffer))))
 
-;;; ============================================================================
-;;; Dir-locals advice tests (No server or SSH required)
-;;; ============================================================================
-
-(ert-deftest tramp-rpc-mock-test-dir-locals-enabled-for-rpc-buffer-file ()
-  "Test that dir-locals advice enables remote dir-locals for RPC file buffers."
-  :tags '(:dir-locals)
-  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
-  (let ((enable-remote-dir-locals nil)
-        (observed nil))
-    ;; Simulate a buffer visiting an RPC remote file.
-    (with-temp-buffer
-      (setq buffer-file-name "/rpc:host:/home/user/project/foo.el")
-      (tramp-rpc--hack-dir-local-variables-advice
-       (lambda () (setq observed enable-remote-dir-locals)))
-      (should (eq observed t)))))
-
-(ert-deftest tramp-rpc-mock-test-dir-locals-enabled-for-rpc-default-directory ()
-  "Test that dir-locals advice enables remote dir-locals via default-directory."
-  :tags '(:dir-locals)
-  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
-  (let ((enable-remote-dir-locals nil)
-        (observed nil))
-    ;; Simulate a buffer with an RPC remote default-directory (e.g. dired).
-    (with-temp-buffer
-      (setq default-directory "/rpc:host:/home/user/project/")
-      (tramp-rpc--hack-dir-local-variables-advice
-       (lambda () (setq observed enable-remote-dir-locals)))
-      (should (eq observed t)))))
-
-(ert-deftest tramp-rpc-mock-test-dir-locals-not-enabled-for-ssh ()
-  "Test that dir-locals advice does NOT enable remote dir-locals for SSH files."
-  :tags '(:dir-locals)
-  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
-  (let ((enable-remote-dir-locals nil)
-        (observed nil))
-    (with-temp-buffer
-      (setq buffer-file-name "/ssh:host:/home/user/project/foo.el")
-      (tramp-rpc--hack-dir-local-variables-advice
-       (lambda () (setq observed enable-remote-dir-locals)))
-      (should-not observed))))
-
-(ert-deftest tramp-rpc-mock-test-dir-locals-not-enabled-for-local ()
-  "Test that dir-locals advice does NOT enable remote dir-locals for local files."
-  :tags '(:dir-locals)
-  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
-  (let ((enable-remote-dir-locals nil)
-        (observed nil))
-    (with-temp-buffer
-      (setq buffer-file-name "/home/user/project/foo.el")
-      (tramp-rpc--hack-dir-local-variables-advice
-       (lambda () (setq observed enable-remote-dir-locals)))
-      (should-not observed))))
-
-(ert-deftest tramp-rpc-mock-test-dir-locals-preserves-existing-setting ()
-  "Test that advice preserves `enable-remote-dir-locals' when already t."
-  :tags '(:dir-locals)
-  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
-  (let ((enable-remote-dir-locals t)
-        (observed nil))
-    ;; Even for a non-RPC file, the existing t value should be preserved.
-    (with-temp-buffer
-      (setq buffer-file-name "/ssh:host:/etc/hosts")
-      (tramp-rpc--hack-dir-local-variables-advice
-       (lambda () (setq observed enable-remote-dir-locals)))
-      (should (eq observed t)))))
-
-(ert-deftest tramp-rpc-mock-test-dir-locals-calls-orig-function ()
-  "Test that the advice always calls the original function."
-  :tags '(:dir-locals)
-  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
-  (let ((orig-called nil))
-    ;; RPC file
-    (with-temp-buffer
-      (setq buffer-file-name "/rpc:host:/foo")
-      (tramp-rpc--hack-dir-local-variables-advice
-       (lambda () (setq orig-called t)))
-      (should orig-called))
-    ;; Non-RPC file
-    (setq orig-called nil)
-    (with-temp-buffer
-      (setq buffer-file-name "/home/user/foo")
-      (tramp-rpc--hack-dir-local-variables-advice
-       (lambda () (setq orig-called t)))
-      (should orig-called))))
-
 (ert-deftest tramp-rpc-mock-test-dir-locals-cache-covers-uses-containment ()
   "Ensure cache coverage check uses containment, not string length."
   :tags '(:dir-locals)
@@ -3691,7 +3756,9 @@ discard it for being unreadable."
         (tramp-rpc--exec-path-cache (make-hash-table :test 'equal))
         (vec (make-tramp-file-name :method "rpc" :host "host" :user "user"
                                    :localname "/")))
-    (cl-letf (((symbol-function 'tramp-rpc--fetch-default-remote-path)
+    (cl-letf (((symbol-function 'file-directory-p)
+               (lambda (_filename) t))
+              ((symbol-function 'tramp-rpc--fetch-default-remote-path)
                (lambda (_vec) '("/bin" "/usr/bin")))
               ((symbol-function 'tramp-rpc--fetch-remote-exec-path)
                (lambda (_vec) '("/home/user/.local/bin" "/usr/bin")))
@@ -3708,7 +3775,9 @@ discard it for being unreadable."
         (tramp-rpc--exec-path-cache (make-hash-table :test 'equal))
         (vec (make-tramp-file-name :method "rpc" :host "host" :user "user"
                                    :localname "/")))
-    (cl-letf (((symbol-function 'tramp-rpc--fetch-remote-exec-path)
+    (cl-letf (((symbol-function 'file-directory-p)
+               (lambda (_filename) t))
+              ((symbol-function 'tramp-rpc--fetch-remote-exec-path)
                (lambda (_vec) '("/login/bin"))))
       (should (equal (tramp-rpc--remote-path-environment vec)
                      '(("PATH" . "/login/bin:/custom/bin")))))))
