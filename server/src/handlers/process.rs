@@ -162,10 +162,13 @@ pub async fn run(params: Value) -> HandlerResult {
         }
     }
 
-    // Set up stdin if provided
-    if params.stdin.is_some() {
-        cmd.stdin(Stdio::piped());
-    }
+    // Never let a synchronous child consume the RPC transport.  A pipe is
+    // only needed when the caller supplied input.
+    cmd.stdin(if params.stdin.is_some() {
+        Stdio::piped()
+    } else {
+        Stdio::null()
+    });
 
     cmd.stdout(Stdio::piped());
     cmd.stderr(Stdio::piped());
@@ -180,18 +183,26 @@ pub async fn run(params: Value) -> HandlerResult {
         .spawn()
         .map_err(|error| spawn_error(error, executable_missing))?;
 
-    // Write stdin if provided (no base64 decoding needed!)
-    if let Some(stdin_data) = params.stdin
-        && let Some(mut stdin) = child.stdin.take()
-    {
-        let _ = stdin.write_all(&stdin_data).await;
-    }
-
-    // Wait for process to complete (async!)
-    let output = child
-        .wait_with_output()
-        .await
-        .map_err(|e| RpcError::process_error(format!("Failed to wait for process: {}", e)))?;
+    // Write stdin while collecting output.  Waiting for either side first can
+    // deadlock when both the child and its caller fill their pipe buffers.
+    let stdin_data = params.stdin;
+    let mut stdin = child.stdin.take();
+    let write_stdin = async move {
+        if let Some(data) = stdin_data
+            && let Some(mut stdin) = stdin.take()
+        {
+            stdin
+                .write_all(&data)
+                .await
+                .map_err(|e| RpcError::process_error(format!("Failed to write stdin: {e}")))?;
+            // Drop stdin after the complete write so the child observes EOF.
+        }
+        Ok::<(), RpcError>(())
+    };
+    let (write_result, output_result) = tokio::join!(write_stdin, child.wait_with_output());
+    write_result?;
+    let output = output_result
+        .map_err(|e| RpcError::process_error(format!("Failed to wait for process: {e}")))?;
 
     // Return binary data directly (no encoding needed!)
     let exit_code = crate::protocol::exit_code_from_status(output.status);
