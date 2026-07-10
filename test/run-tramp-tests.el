@@ -29,7 +29,6 @@
 ;;   TRAMP_RPC_TEST_USER  - Remote user (default: current user)
 ;;   TRAMP_VERBOSE        - Tramp verbosity level (default: 0)
 ;;   TRAMP_TEST_SOURCE    - Path to tramp source tree containing test/tramp-tests.el
-;;                          (default: "~/src/tramp")
 
 ;;; Code:
 
@@ -57,9 +56,8 @@
 ;; tramp-tests.el against the system tramp.el can fail when tests
 ;; reference variables (e.g. `tramp-local-host-names') that only exist
 ;; in the upstream version.
-(let* ((tramp-src (or (getenv "TRAMP_TEST_SOURCE")
-                      (expand-file-name "~/src/tramp")))
-       (upstream-lisp (expand-file-name "lisp" tramp-src)))
+(when-let* ((tramp-src (getenv "TRAMP_TEST_SOURCE"))
+            (upstream-lisp (expand-file-name "lisp" tramp-src)))
   (when (file-directory-p upstream-lisp)
     (add-to-list 'load-path upstream-lisp)))
 
@@ -164,7 +162,7 @@ before exiting.  Do not use `kill-emacs-hook' for this: upstream
 
 (defvar tramp-rpc-test-source
   (or (getenv "TRAMP_TEST_SOURCE")
-      (expand-file-name "~/src/tramp"))
+      (error "Set TRAMP_TEST_SOURCE to the Tramp source tree"))
   "Path to the tramp source tree containing test/tramp-tests.el.")
 
 (message "=== Running tramp-tests.el with tramp-rpc method ===")
