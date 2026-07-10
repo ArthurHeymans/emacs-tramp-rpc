@@ -175,6 +175,7 @@ Returns the integer errno, or nil if not an IO error with errno."
 (defconst tramp-rpc-protocol-error-file-not-found -32001)
 (defconst tramp-rpc-protocol-error-permission-denied -32002)
 (defconst tramp-rpc-protocol-error-io -32003)
+(defconst tramp-rpc-protocol-error-process -32004)
 
 ;; ============================================================================
 ;; Length-prefixed framing support

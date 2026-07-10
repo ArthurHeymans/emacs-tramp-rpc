@@ -167,6 +167,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_process_write_not_blocked_by_long_poll_read() {
+        let _test_lock = handlers::process::test_process_map_lock().await;
         let start_params = Value::Map(vec![
             (Value::String("cmd".into()), Value::String("cat".into())),
             (Value::String("cwd".into()), Value::String("/tmp".into())),

@@ -165,25 +165,60 @@ fn system_statvfs(params: Value) -> HandlerResult {
     })
 }
 
+fn supplementary_groups_with<F>(
+    initial_count: usize,
+    mut getgroups: F,
+) -> std::io::Result<Vec<libc::gid_t>>
+where
+    F: FnMut(&mut [libc::gid_t]) -> std::io::Result<usize>,
+{
+    let mut count = initial_count;
+    loop {
+        let mut groups = vec![0; count];
+        match getgroups(&mut groups) {
+            Ok(actual_count) => {
+                if actual_count > groups.len() {
+                    count = actual_count;
+                    continue;
+                }
+                groups.truncate(actual_count);
+                return Ok(groups);
+            }
+            // Group membership can change after the sizing call.  Retry with a
+            // larger buffer instead of relying on a fixed supplementary limit.
+            Err(error)
+                if matches!(
+                    error.raw_os_error(),
+                    Some(libc::EINVAL) | Some(libc::ERANGE)
+                ) =>
+            {
+                count = count.saturating_mul(2).max(1);
+            }
+            Err(error) => return Err(error),
+        }
+    }
+}
+
+fn supplementary_groups() -> std::io::Result<Vec<libc::gid_t>> {
+    let count = unsafe { libc::getgroups(0, std::ptr::null_mut()) };
+    if count < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+
+    supplementary_groups_with(count as usize, |groups| {
+        let actual_count =
+            unsafe { libc::getgroups(groups.len() as libc::c_int, groups.as_mut_ptr()) };
+        if actual_count < 0 {
+            Err(std::io::Error::last_os_error())
+        } else {
+            Ok(actual_count as usize)
+        }
+    })
+}
+
 /// Get groups for the current user
 fn system_groups() -> HandlerResult {
-    // Query how many groups we need.  On Linux/macOS, getgroups(0, NULL)
-    // returns the count without writing.
-    let needed = unsafe { libc::getgroups(0, std::ptr::null_mut()) };
-    if needed < 0 {
-        return Err(RpcError::io_error(std::io::Error::last_os_error()));
-    }
-
-    // Allocate at least 1 so a zero-length result still has a valid pointer.
-    let capacity = (needed as usize).max(1);
-    let mut groups: Vec<libc::gid_t> = vec![0; capacity];
-
-    let actual_count = unsafe { libc::getgroups(capacity as libc::c_int, groups.as_mut_ptr()) };
-    if actual_count < 0 {
-        return Err(RpcError::io_error(std::io::Error::last_os_error()));
-    }
-
-    groups.truncate(actual_count as usize);
+    let groups = supplementary_groups().map_err(RpcError::io_error)?;
 
     // Convert to group info with names
     let group_info: Vec<Value> = groups
@@ -372,6 +407,42 @@ async fn dispatch_inner(request: Request) -> Response {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn groups_retry_after_erange() {
+        let mut calls = 0;
+        let groups = supplementary_groups_with(1, |buffer| {
+            calls += 1;
+            if calls == 1 {
+                return Err(std::io::Error::from_raw_os_error(libc::ERANGE));
+            }
+            assert!(buffer.len() >= 2);
+            buffer[..2].copy_from_slice(&[10, 20]);
+            Ok(2)
+        })
+        .expect("retry getgroups after ERANGE");
+
+        assert_eq!(groups, vec![10, 20]);
+        assert_eq!(calls, 2);
+    }
+
+    #[test]
+    fn groups_retry_after_zero_length_sizing_call() {
+        let mut calls = 0;
+        let groups = supplementary_groups_with(0, |buffer| {
+            calls += 1;
+            if buffer.is_empty() {
+                return Ok(2);
+            }
+            buffer.copy_from_slice(&[10, 20]);
+            Ok(2)
+        })
+        .expect("retry getgroups after sizing call");
+
+        assert_eq!(groups, vec![10, 20]);
+        assert_eq!(calls, 2);
+    }
+
     use crate::msgpack_map;
     use std::os::unix::ffi::OsStrExt;
 
