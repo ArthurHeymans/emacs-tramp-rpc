@@ -10,8 +10,9 @@ use rmpv::Value;
 use serde::Deserialize;
 use std::collections::HashMap;
 use std::fs::File;
+use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 use std::thread;
 use std::time::UNIX_EPOCH;
 
@@ -51,6 +52,9 @@ pub async fn run_parallel(params: Value) -> HandlerResult {
         args: Vec<String>,
         /// Working directory (optional)
         cwd: Option<String>,
+        /// Stdin input as binary
+        #[serde(default, with = "serde_bytes")]
+        stdin: Option<Vec<u8>>,
     }
 
     #[derive(Deserialize)]
@@ -87,12 +91,51 @@ pub async fn run_parallel(params: Value) -> HandlerResult {
                         if let Some(ref cwd) = entry.cwd {
                             cmd.current_dir(super::expand_tilde(cwd));
                         }
-                        let value = match cmd.output() {
-                            Ok(output) => {
-                                msgpack_map! {
-                                    "exit_code" => output.status.code().unwrap_or(-1),
-                                    "stdout" => Value::Binary(output.stdout),
-                                    "stderr" => Value::Binary(output.stderr)
+                        cmd.stdin(if entry.stdin.is_some() {
+                            Stdio::piped()
+                        } else {
+                            Stdio::null()
+                        });
+                        cmd.stdout(Stdio::piped());
+                        cmd.stderr(Stdio::piped());
+                        let value = match cmd.spawn() {
+                            Ok(mut child) => {
+                                let stdin_data = entry.stdin;
+                                let stdin = child.stdin.take();
+                                // Keep writing and draining output concurrent: a
+                                // child may fill stdout while it reads stdin.
+                                let write_result = thread::scope(|scope| {
+                                    let writer = scope.spawn(move || {
+                                        if let Some(data) = stdin_data
+                                            && let Some(mut stdin) = stdin
+                                        {
+                                            stdin.write_all(&data)
+                                        } else {
+                                            Ok(())
+                                        }
+                                    });
+                                    let output = child.wait_with_output();
+                                    let write_result = writer.join().unwrap_or_else(|_| {
+                                        Err(std::io::Error::other("stdin writer panicked"))
+                                    });
+                                    (output, write_result)
+                                });
+                                match write_result {
+                                    (Ok(output), Ok(())) => msgpack_map! {
+                                        "exit_code" => output.status.code().unwrap_or(-1),
+                                        "stdout" => Value::Binary(output.stdout),
+                                        "stderr" => Value::Binary(output.stderr)
+                                    },
+                                    (Ok(output), Err(error)) => msgpack_map! {
+                                        "exit_code" => -1i32,
+                                        "stdout" => Value::Binary(output.stdout),
+                                        "stderr" => Value::Binary(format!("Failed to write stdin: {error}").into_bytes())
+                                    },
+                                    (Err(error), _) => msgpack_map! {
+                                        "exit_code" => -1i32,
+                                        "stdout" => Value::Binary(vec![]),
+                                        "stderr" => Value::Binary(error.to_string().into_bytes())
+                                    }
                                 }
                             }
                             Err(e) => {
