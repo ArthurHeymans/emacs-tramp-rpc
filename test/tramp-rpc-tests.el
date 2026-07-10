@@ -379,6 +379,34 @@ The directory is deleted after BODY completes."
     (should (file-directory-p dir))
     (should (file-writable-p dir))))
 
+(ert-deftest tramp-rpc-test00-remote-groups-dynamic-sizing ()
+  "The server returns the remote user's complete supplementary group list."
+  (skip-unless (tramp-rpc-test-enabled))
+  (let ((vec (tramp-dissect-file-name (tramp-rpc-test--remote-directory))))
+    (should (listp (tramp-get-remote-groups vec 'integer)))))
+
+(ert-deftest tramp-rpc-test-pipelined-timeout-signals-error ()
+  "A live connection with no response reaches the pipeline timeout branch."
+  (let* ((buffer (generate-new-buffer " *tramp-rpc-pipeline-test*"))
+         (process (start-process "tramp-rpc-pipeline-test" buffer "sh" "-c" "sleep 2"))
+         (vec (tramp-dissect-file-name "/rpc:mock:/tmp/"))
+         (timeout 0.15)
+         (started (float-time)))
+    (unwind-protect
+        (cl-letf (((symbol-function 'tramp-rpc--ensure-connection)
+                   (lambda (_vec) (list :process process :buffer buffer))))
+          (should (process-live-p process))
+          (condition-case err
+              (progn
+                (tramp-rpc--receive-responses vec '(1) timeout)
+                (error "Expected pipelined response timeout"))
+            (remote-file-error
+             (should (string-match-p "Timeout" (error-message-string err)))))
+          (should (>= (- (float-time) started) (* timeout 0.8)))
+          (should (process-live-p process)))
+      (when (process-live-p process) (delete-process process))
+      (kill-buffer buffer))))
+
 ;;; ============================================================================
 ;;; Test 01: File Name Syntax
 ;;; ============================================================================
@@ -601,6 +629,12 @@ The directory is deleted after BODY completes."
     (tramp-rpc-test--with-call-count-error 1 file-missing
       (set-file-modes missing #o644))))
 
+(ert-deftest tramp-rpc-test04-file-executable-root ()
+  "Root execution still requires at least one execute bit."
+  (let ((attrs '(nil 1 1 1 0 0 0 0 "----------")))
+    (should-not (tramp-rpc--mode-executable-p "----------" 0 0 attrs nil))
+    (should (tramp-rpc--mode-executable-p "------x---" 0 0 attrs nil))))
+
 ;;; ============================================================================
 ;;; Test 05: File Content Operations
 ;;; ============================================================================
@@ -619,6 +653,30 @@ The directory is deleted after BODY completes."
           (should (equal content (with-temp-buffer
                                    (insert-file-contents file)
                                    (buffer-string)))))
+      (ignore-errors (delete-file file)))))
+
+(ert-deftest tramp-rpc-test05-write-region-offset-preserves-suffix ()
+  "Writing at an integer offset leaves the remaining remote bytes intact."
+  (skip-unless (tramp-rpc-test-enabled))
+  (tramp-rpc-test--with-temp-file file "abcdef"
+    (write-region "XY" nil file 2)
+    (should (equal (with-temp-buffer
+                     (insert-file-contents file)
+                     (buffer-string))
+                   "abXYef"))))
+
+(ert-deftest tramp-rpc-test05-write-region-offset-creates-zero-filled-file ()
+  "An integer offset write creates a missing remote file with a zero-filled hole."
+  (skip-unless (tramp-rpc-test-enabled))
+  (let ((file (tramp-rpc-test--make-temp-name)))
+    (unwind-protect
+        (progn
+          (write-region "XY" nil file 4)
+          (should (equal (with-temp-buffer
+                           (set-buffer-multibyte nil)
+                           (insert-file-contents-literally file)
+                           (buffer-string))
+                         "\0\0\0\0XY")))
       (ignore-errors (delete-file file)))))
 
 (ert-deftest tramp-rpc-test05-write-region-multiline ()
@@ -1218,6 +1276,22 @@ signal `file-already-exists'.  With trailing slash (via
       (ignore-errors (delete-file src))
       (ignore-errors (delete-file dest)))))
 
+(ert-deftest tramp-rpc-test06-rename-dangling-symlink-no-overwrite ()
+  "No-overwrite rename rejects a dangling symlink destination."
+  (skip-unless (tramp-rpc-test-enabled))
+  (let ((src (tramp-rpc-test--make-temp-name))
+        (dest (tramp-rpc-test--make-temp-name)))
+    (unwind-protect
+        (progn
+          (write-region "source" nil src)
+          (make-symbolic-link "missing-target" dest)
+          (should-error (rename-file src dest)
+                        :type 'file-already-exists)
+          (should (file-symlink-p dest))
+          (should (file-exists-p src)))
+      (ignore-errors (delete-file src))
+      (ignore-errors (delete-file dest)))))
+
 (ert-deftest tramp-rpc-test06-delete-file ()
   "Test `delete-file' for TRAMP RPC files."
   (skip-unless (tramp-rpc-test-enabled))
@@ -1376,6 +1450,33 @@ This exercises copy-then-delete for cross-remote renames."
       (should (= (length txt-files) 2))
       (should (member "file1.txt" txt-files))
       (should (member "file2.txt" txt-files)))))
+
+(ert-deftest tramp-rpc-test07-directory-files-count ()
+  "Directory COUNT accepts natural numbers and rejects other values."
+  (skip-unless (tramp-rpc-test-enabled))
+  (tramp-rpc-test--with-temp-dir dir
+    (dolist (name '("a" "b" "c"))
+      (write-region name nil (expand-file-name name dir)))
+    (let ((all (directory-files dir)))
+      (should (equal (directory-files dir nil nil nil 2) (seq-take all 2)))
+      (should-not (directory-files dir nil nil nil 0))
+      (dolist (count '(-1 "invalid"))
+        (should-error (directory-files dir nil nil nil count)
+                      :type 'wrong-type-argument)))))
+
+(ert-deftest tramp-rpc-test07-directory-files-and-attributes-count ()
+  "Attribute directory listings implement the same COUNT contract."
+  (skip-unless (tramp-rpc-test-enabled))
+  (tramp-rpc-test--with-temp-dir dir
+    (dolist (name '("a" "b" "c"))
+      (write-region name nil (expand-file-name name dir)))
+    (let ((all (directory-files-and-attributes dir)))
+      (should (equal (directory-files-and-attributes dir nil nil nil nil 2)
+                     (seq-take all 2)))
+      (should-not (directory-files-and-attributes dir nil nil nil nil 0))
+      (dolist (count '(-1 "invalid"))
+        (should-error (directory-files-and-attributes dir nil nil nil nil count)
+                      :type 'wrong-type-argument)))))
 
 (ert-deftest tramp-rpc-test07-directory-files-and-attributes ()
   "Test `directory-files-and-attributes' for TRAMP RPC files."
