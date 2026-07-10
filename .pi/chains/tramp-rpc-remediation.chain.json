@@ -1,0 +1,334 @@
+{
+  "name": "tramp-rpc-remediation",
+  "description": "Serial, test-gated remediation of the Lisp/Rust review findings with Luna for complex reasoning and Terra for bounded implementation and validation.",
+  "chain": [
+    {
+      "agent": "planner",
+      "phase": "Planning",
+      "label": "Validate scope and sequence",
+      "as": "executionPlan",
+      "model": "openai-codex/gpt-5.6-luna",
+      "progress": true,
+      "task": "Read doc/REMEDIATION_WORKFLOW.md, AGENTS.md, README.org, and the relevant Lisp/Rust/tests. Validate the milestone ordering against the current code and produce a concise execution map. Do not edit project/source files. Call out dependencies between findings, protocol-compatibility risks, and the exact focused tests each milestone needs. Treat the workflow document as approved scope; escalate only if a required API or architecture decision is not covered. Additional run request: {task}"
+    },
+    {
+      "agent": "worker",
+      "phase": "Milestone 0",
+      "label": "Repair the validation baseline",
+      "as": "m0Implementation",
+      "model": "openai-codex/gpt-5.6-terra",
+      "progress": true,
+      "task": "You are the sole writer. Implement Milestone 0 from doc/REMEDIATION_WORKFLOW.md, guided by {outputs.executionPlan}. Fix the protocol selector, stale tests, order-dependent state, and unsupported-Tramp skip behavior. Keep changes limited to validation infrastructure and tests. Run the entire Milestone 0 test ladder, confirm non-zero executed counts, and repair failures before finishing. Do not proceed by accepting skipped tests as success."
+    },
+    {
+      "parallel": [
+        {
+          "agent": "reviewer",
+          "phase": "Milestone 0 validation",
+          "label": "Review test reliability",
+          "as": "m0Review",
+          "model": "openai-codex/gpt-5.6-luna",
+          "output": false,
+          "progress": false,
+          "task": "Review the current Milestone 0 diff for test reliability and regressions. Inspect the implementation directly. Do not modify project/source files. Verify that zero-test and mass-skip runs cannot pass and that stale/order-dependent tests were corrected rather than hidden. Run focused checks where useful. Return pass/fail findings with exact file:line evidence. Implementation handoff: {outputs.m0Implementation}"
+        },
+        {
+          "agent": "reviewer",
+          "phase": "Milestone 0 validation",
+          "label": "Rerun baseline tests",
+          "as": "m0Tests",
+          "model": "openai-codex/gpt-5.6-terra",
+          "output": false,
+          "progress": false,
+          "task": "Act as an independent test validator. Do not modify project/source files. Run the Milestone 0 test ladder from doc/REMEDIATION_WORKFLOW.md. Record commands, exit codes, executed/skipped counts, and environmental blockers. A zero-test or unexpectedly skipped run is a failure, not a pass. Implementation handoff: {outputs.m0Implementation}"
+        }
+      ],
+      "concurrency": 2,
+      "failFast": false
+    },
+    {
+      "agent": "worker",
+      "phase": "Milestone 0",
+      "label": "Stabilize validation baseline",
+      "as": "m0Stable",
+      "model": "openai-codex/gpt-5.6-terra",
+      "progress": true,
+      "task": "You are the sole writer. Apply all concrete fixes worth doing now from the Milestone 0 review and test reports. Do not start Milestone 1. If no code fix is needed, still rerun the failed or critical commands and report evidence. Review: {outputs.m0Review}\n\nTests: {outputs.m0Tests}"
+    },
+    {
+      "agent": "worker",
+      "phase": "Milestone 1",
+      "label": "Fix file and RPC semantics",
+      "as": "m1Implementation",
+      "model": "openai-codex/gpt-5.6-terra",
+      "progress": true,
+      "task": "You are the sole writer. First confirm the Milestone 0 baseline is green from {outputs.m0Stable}. Then implement only Milestone 1 from doc/REMEDIATION_WORKFLOW.md: integer-offset write-region semantics, directory COUNT behavior, root execute semantics, pipelined timeout errors, precise exit-127 mapping, dangling-symlink no-overwrite rename with structured EEXIST, dynamic supplementary groups, and bounded read allocations. Add focused regression tests for every fix. Run focused tests and the full test ladder before finishing."
+    },
+    {
+      "parallel": [
+        {
+          "agent": "reviewer",
+          "phase": "Milestone 1 validation",
+          "label": "Review file/RPC semantics",
+          "as": "m1Review",
+          "model": "openai-codex/gpt-5.6-luna",
+          "output": false,
+          "progress": false,
+          "task": "Review the current Milestone 1 diff for exact Emacs file API semantics, RPC error mapping, edge cases, and regressions. Do not modify project/source files. Run targeted reproductions where useful and cite exact file:line findings. Implementation handoff: {outputs.m1Implementation}"
+        },
+        {
+          "agent": "reviewer",
+          "phase": "Milestone 1 validation",
+          "label": "Rerun semantic tests",
+          "as": "m1Tests",
+          "model": "openai-codex/gpt-5.6-terra",
+          "output": false,
+          "progress": false,
+          "task": "Independently run all Milestone 1 focused tests plus the test ladder. Do not modify project/source files. Report commands, exit codes, test counts, skipped tests, and blockers. Implementation handoff: {outputs.m1Implementation}"
+        }
+      ],
+      "concurrency": 2,
+      "failFast": false
+    },
+    {
+      "agent": "worker",
+      "phase": "Milestone 1",
+      "label": "Stabilize file/RPC semantics",
+      "as": "m1Stable",
+      "model": "openai-codex/gpt-5.6-terra",
+      "progress": true,
+      "task": "You are the sole writer. Apply concrete Milestone 1 review fixes, remain within Milestone 1 scope, and rerun focused and broad tests. Review: {outputs.m1Review}\n\nTests: {outputs.m1Tests}"
+    },
+    {
+      "agent": "worker",
+      "phase": "Milestone 2",
+      "label": "Fix synchronous Rust process lifecycle",
+      "as": "m2Implementation",
+      "model": "openai-codex/gpt-5.6-luna",
+      "progress": true,
+      "task": "You are the sole writer. Confirm Milestone 1 is green from {outputs.m1Stable}, then implement only Milestone 2 from doc/REMEDIATION_WORKFLOW.md. Focus on null stdin, concurrent stdin/output, JoinSet reaping and bounded concurrency, parse-vs-invalid-request errors, final EOF cleanup, and child reaping. Add deterministic regression/stress tests. Run Rust checks, Lisp protocol/server integration checks, byte compilation, and the broad test ladder."
+    },
+    {
+      "parallel": [
+        {
+          "agent": "reviewer",
+          "phase": "Milestone 2 validation",
+          "label": "Review Rust process concurrency",
+          "as": "m2Review",
+          "model": "openai-codex/gpt-5.6-luna",
+          "output": false,
+          "progress": false,
+          "task": "Review Milestone 2 for deadlocks, task leaks, zombie processes, output loss, protocol error correctness, and bounded resource use. Do not modify project/source files. Inspect tests and run targeted checks. Handoff: {outputs.m2Implementation}"
+        },
+        {
+          "agent": "reviewer",
+          "phase": "Milestone 2 validation",
+          "label": "Run Rust and integration tests",
+          "as": "m2Tests",
+          "model": "openai-codex/gpt-5.6-terra",
+          "output": false,
+          "progress": false,
+          "task": "Independently run Milestone 2 regression tests, cargo fmt/test/clippy, protocol tests, local-server integration tests, and byte compilation. Do not modify project/source files. Report exact evidence and blockers. Handoff: {outputs.m2Implementation}"
+        }
+      ],
+      "concurrency": 2,
+      "failFast": false
+    },
+    {
+      "agent": "worker",
+      "phase": "Milestone 2",
+      "label": "Stabilize Rust process lifecycle",
+      "as": "m2Stable",
+      "model": "openai-codex/gpt-5.6-luna",
+      "progress": true,
+      "task": "You are the sole writer. Apply all concrete Milestone 2 fixes and rerun the full Milestone 2 validation set. Review: {outputs.m2Review}\n\nTests: {outputs.m2Tests}"
+    },
+    {
+      "agent": "worker",
+      "phase": "Milestone 3",
+      "label": "Fix async transport cleanup and coding",
+      "as": "m3Implementation",
+      "model": "openai-codex/gpt-5.6-luna",
+      "progress": true,
+      "task": "You are the sole writer. Confirm Milestone 2 is green from {outputs.m2Stable}, then implement only Milestone 3 from doc/REMEDIATION_WORKFLOW.md. Address connection-qualified queues, callback cleanup races, explicit queue-drain failure, transport-death sentinel cleanup, remote process termination/reaping, closed-stdin errors, and exact process coding-system behavior with raw bytes. Add multi-connection, transport-death, binary, Latin-1, and slow-write regression tests. Run the full test ladder and relevant temporary-directory remote tests when configured."
+    },
+    {
+      "parallel": [
+        {
+          "agent": "reviewer",
+          "phase": "Milestone 3 validation",
+          "label": "Review async transport and coding",
+          "as": "m3Review",
+          "model": "openai-codex/gpt-5.6-luna",
+          "output": false,
+          "progress": false,
+          "task": "Review Milestone 3 for cross-connection contamination, callback/queue races, transport-death cleanup, data loss, and exact Emacs coding semantics. Do not modify project/source files. Cite concrete evidence and run focused reproductions. Handoff: {outputs.m3Implementation}"
+        },
+        {
+          "agent": "reviewer",
+          "phase": "Milestone 3 validation",
+          "label": "Run async/coding regressions",
+          "as": "m3Tests",
+          "model": "openai-codex/gpt-5.6-terra",
+          "output": false,
+          "progress": false,
+          "task": "Independently run Milestone 3 focused tests and the full test ladder, including binary/non-UTF-8 and transport-death cases. Use temporary remote deployment paths for remote tests. Do not modify project/source files. Report exact evidence. Handoff: {outputs.m3Implementation}"
+        }
+      ],
+      "concurrency": 2,
+      "failFast": false
+    },
+    {
+      "agent": "worker",
+      "phase": "Milestone 3",
+      "label": "Stabilize async transport and coding",
+      "as": "m3Stable",
+      "model": "openai-codex/gpt-5.6-luna",
+      "progress": true,
+      "task": "You are the sole writer. Apply concrete Milestone 3 review fixes and rerun focused, broad, and configured remote tests. Review: {outputs.m3Review}\n\nTests: {outputs.m3Tests}"
+    },
+    {
+      "agent": "worker",
+      "phase": "Milestone 4",
+      "label": "Fix PTY correctness and concurrency",
+      "as": "m4Implementation",
+      "model": "openai-codex/gpt-5.6-luna",
+      "progress": true,
+      "task": "You are the sole writer. Confirm Milestone 3 is green from {outputs.m3Stable}, then implement only Milestone 4 from doc/REMEDIATION_WORKFLOW.md. Guarantee ordered complete PTY writes, remove registry-lock awaits, drain PTY output through EOF after child exit, terminate on RPC read errors, eliminate raw-fd lifetime races, and reap children. Add stress tests for large paste/write backpressure, large final output, concurrent kill/close, and read errors. Run Rust, Lisp, integration, byte-compile, and configured remote PTY tests."
+    },
+    {
+      "parallel": [
+        {
+          "agent": "reviewer",
+          "phase": "Milestone 4 validation",
+          "label": "Review PTY concurrency",
+          "as": "m4Review",
+          "model": "openai-codex/gpt-5.6-luna",
+          "output": false,
+          "progress": false,
+          "task": "Review Milestone 4 for partial/reordered writes, output truncation, lock inversion, fd reuse, close/kill races, and zombie processes. Do not modify project/source files. Inspect and run stress tests. Handoff: {outputs.m4Implementation}"
+        },
+        {
+          "agent": "reviewer",
+          "phase": "Milestone 4 validation",
+          "label": "Run PTY stress tests",
+          "as": "m4Tests",
+          "model": "openai-codex/gpt-5.6-terra",
+          "output": false,
+          "progress": false,
+          "task": "Independently run Milestone 4 PTY stress/regression tests and the full test ladder. Run configured remote PTY tests using a temporary deployment directory. Do not modify project/source files. Report exact evidence. Handoff: {outputs.m4Implementation}"
+        }
+      ],
+      "concurrency": 2,
+      "failFast": false
+    },
+    {
+      "agent": "worker",
+      "phase": "Milestone 4",
+      "label": "Stabilize PTY implementation",
+      "as": "m4Stable",
+      "model": "openai-codex/gpt-5.6-luna",
+      "progress": true,
+      "task": "You are the sole writer. Apply concrete Milestone 4 review fixes and rerun PTY stress, broad, and configured remote tests. Review: {outputs.m4Review}\n\nTests: {outputs.m4Tests}"
+    },
+    {
+      "agent": "worker",
+      "phase": "Milestone 5",
+      "label": "Harden deployment and consolidate safely",
+      "as": "m5Implementation",
+      "model": "openai-codex/gpt-5.6-terra",
+      "progress": true,
+      "task": "You are the sole writer. Confirm Milestone 4 is green from {outputs.m4Stable}, then implement only Milestone 5 from doc/REMEDIATION_WORKFLOW.md. Require release checksum verification or source-build fallback, check remote activation command success, align README method documentation, and perform only low-risk deduplication supported by existing regression tests. Remove only demonstrably unused private helpers. Run deployment-focused tests, the full local ladder, and configured temporary-directory remote deployment tests."
+    },
+    {
+      "parallel": [
+        {
+          "agent": "reviewer",
+          "phase": "Milestone 5 validation",
+          "label": "Review deployment and consolidation",
+          "as": "m5Review",
+          "model": "openai-codex/gpt-5.6-luna",
+          "output": false,
+          "progress": false,
+          "task": "Review Milestone 5 for supply-chain safety, deployment failure handling, documentation accuracy, and refactor regressions. Do not modify project/source files. Cite exact evidence and run focused checks. Handoff: {outputs.m5Implementation}"
+        },
+        {
+          "agent": "reviewer",
+          "phase": "Milestone 5 validation",
+          "label": "Run deployment and full tests",
+          "as": "m5Tests",
+          "model": "openai-codex/gpt-5.6-terra",
+          "output": false,
+          "progress": false,
+          "task": "Independently run deployment-focused tests and the complete test ladder. If configured, test deployment only in a temporary remote directory. Do not modify project/source files. Report commands, exit codes, counts, and blockers. Handoff: {outputs.m5Implementation}"
+        }
+      ],
+      "concurrency": 2,
+      "failFast": false
+    },
+    {
+      "agent": "worker",
+      "phase": "Milestone 5",
+      "label": "Stabilize deployment and cleanup",
+      "as": "m5Stable",
+      "model": "openai-codex/gpt-5.6-terra",
+      "progress": true,
+      "task": "You are the sole writer. Apply concrete Milestone 5 review fixes and rerun deployment-focused and broad validation. Review: {outputs.m5Review}\n\nTests: {outputs.m5Tests}"
+    },
+    {
+      "parallel": [
+        {
+          "agent": "reviewer",
+          "phase": "Final review",
+          "label": "Final correctness and regression review",
+          "as": "finalCorrectness",
+          "model": "openai-codex/gpt-5.6-luna",
+          "output": false,
+          "progress": false,
+          "task": "Perform a fresh final review of the complete working-copy diff against doc/REMEDIATION_WORKFLOW.md. Do not modify project/source files. Focus on correctness, concurrency, lifecycle, protocol compatibility, security, and missing regression tests. Report blockers and smallest safe fixes with exact file:line evidence. Final milestone handoff: {outputs.m5Stable}"
+        },
+        {
+          "agent": "reviewer",
+          "phase": "Final review",
+          "label": "Final simplicity and maintainability review",
+          "as": "finalMaintainability",
+          "model": "openai-codex/gpt-5.6-luna",
+          "output": false,
+          "progress": false,
+          "task": "Perform a fresh final review of the complete diff for unnecessary complexity, duplicated logic, dead code, and test maintainability. Do not modify project/source files. Do not request optional polish unless it materially reduces risk. Cite exact evidence."
+        },
+        {
+          "agent": "reviewer",
+          "phase": "Final validation",
+          "label": "Run final test matrix",
+          "as": "finalTests",
+          "model": "openai-codex/gpt-5.6-terra",
+          "output": false,
+          "progress": false,
+          "task": "Run the complete final acceptance test matrix from doc/REMEDIATION_WORKFLOW.md. Do not modify project/source files. Record exact commands, exit codes, executed/skipped counts, remote-test status, and environment information. Zero-test or mass-skip runs are failures."
+        }
+      ],
+      "concurrency": 3,
+      "failFast": false
+    },
+    {
+      "agent": "worker",
+      "phase": "Finalization",
+      "label": "Apply final accepted fixes",
+      "as": "finalImplementation",
+      "model": "openai-codex/gpt-5.6-luna",
+      "progress": true,
+      "task": "You are the sole writer. Apply only concrete final-review fixes worth doing now, without expanding scope. If the reviews are clean, make no speculative edits. Then rerun every affected focused test and the complete final test matrix. Correctness review: {outputs.finalCorrectness}\n\nMaintainability review: {outputs.finalMaintainability}\n\nTest report: {outputs.finalTests}"
+    },
+    {
+      "agent": "reviewer",
+      "phase": "Final validation",
+      "label": "Independent final acceptance",
+      "as": "finalAcceptance",
+      "model": "openai-codex/gpt-5.6-terra",
+      "output": false,
+      "progress": false,
+      "task": "Independently inspect the final diff and rerun the complete acceptance matrix. Do not modify project/source files. Return a concise PASS/FAIL report with exact commands, exit codes, test counts, skipped tests, remote-test status, and any residual blocker. Final implementation handoff: {outputs.finalImplementation}"
+    }
+  ]
+}
