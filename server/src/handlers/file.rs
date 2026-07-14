@@ -69,7 +69,7 @@ pub async fn get_file_attributes(path: &Path, lstat: bool) -> Result<FileAttribu
     }
     .map_err(|e| map_io_error(e, &path.to_string_lossy()))?;
 
-    let file_type = get_file_type(&metadata);
+    let file_type = file_type_from_metadata_ft(&metadata.file_type());
 
     let link_target = if file_type == FileType::Symlink {
         fs::read_link(path)
@@ -101,9 +101,7 @@ pub async fn get_file_attributes(path: &Path, lstat: bool) -> Result<FileAttribu
     })
 }
 
-fn get_file_type(metadata: &std::fs::Metadata) -> FileType {
-    let ft = metadata.file_type();
-
+pub(crate) fn file_type_from_metadata_ft(ft: &std::fs::FileType) -> FileType {
     if ft.is_file() {
         FileType::File
     } else if ft.is_dir() {

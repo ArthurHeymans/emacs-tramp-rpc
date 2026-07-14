@@ -160,8 +160,6 @@ TRAMP-RPC exposes these method categories:
 | Method             | Parameters              | Returns                            |
 |--------------------+-------------------------+------------------------------------|
 | file.stat          | path, lstat             | FileAttributes (or null if absent) |
-| file.stat_batch    | paths, lstat            | [FileAttributes or null]           |
-| file.executable    | path                    | boolean                            |
 | file.truename      | path                    | string (canonical path)            |
 | file.read          | path, offset?, length?  | {content: binary, size: int}       |
 | file.write         | path, content, append?  | {written: int}                     |
@@ -180,7 +178,6 @@ TRAMP-RPC exposes these method categories:
 | dir.list         | path, include_attrs      | [{name, type, attrs?}]   |
 | dir.create       | path, parents?           | boolean                  |
 | dir.remove       | path, recursive?         | boolean                  |
-| dir.completions  | directory, prefix        | [string]                 |
 
 **** Process Operations
 | Method            | Parameters                   | Returns                    |

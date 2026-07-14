@@ -697,9 +697,16 @@ never one authorized by stale provenance."
 Returns the path to the extracted binary, or nil on failure."
   (let ((default-directory dest-dir))
     (make-directory dest-dir t)
-    (if (zerop (call-process "tar" nil nil nil "-xzf" tarball "-C" dest-dir))
-        (let ((binary (expand-file-name tramp-rpc-deploy-binary-name dest-dir)))
-          (when (file-exists-p binary)
+    ;; Extract only the expected member, so unrelated archive paths cannot
+    ;; escape DEST-DIR or place content that influences promotion.
+    (if (zerop (call-process "tar" nil nil nil "-xzf" tarball "-C" dest-dir
+                             "--" tramp-rpc-deploy-binary-name))
+        (let* ((binary (expand-file-name tramp-rpc-deploy-binary-name dest-dir))
+               (attributes (and (not (file-symlink-p binary))
+                                (file-attributes binary 'integer))))
+          (when (and attributes
+                     (file-regular-p binary)
+                     (= (file-attribute-link-number attributes) 1))
             (set-file-modes binary #o755)
             binary))
       nil)))
@@ -935,14 +942,14 @@ Returns the path to the local binary."
 ;;; ============================================================================
 
 (defun tramp-rpc-deploy--remote-binary-exists-p (vec)
-  "Check if the correct version of the binary exists on remote VEC."
-  (let ((remote-path (tramp-rpc-deploy--remote-binary-path vec)))
-    ;; Use tramp-sh operations for checking since we're bootstrapping
+  "Check if a regular non-symlink executable binary exists on remote VEC."
+  (let* ((remote-path (tramp-rpc-deploy--remote-binary-path vec))
+         (path (tramp-shell-quote-argument
+                (tramp-file-local-name remote-path))))
+    ;; Use tramp-sh operations for checking since we're bootstrapping.
     (tramp-send-command-and-check
-     vec
-     (format "test -x %s"
-             (tramp-shell-quote-argument
-              (tramp-file-local-name remote-path))))))
+     vec (format "test -f %s && ! test -L %s && test -x %s"
+                 path path path))))
 
 (defun tramp-rpc-deploy--ensure-remote-directory (vec)
   "Ensure the remote deployment directory exists on VEC."
@@ -1024,36 +1031,30 @@ to inline encoding (base64 through the shell), which can be fragile."
 		 'remote-file-error
 		 (list "Temp file not created or is empty after copy")))
 
-              ;; Verify checksum
-              (let ((remote-checksum (tramp-rpc-deploy--remote-checksum vec remote-tmp-local)))
-                (unless remote-checksum
-                  (signal
-		   'remote-file-error
-		   (list "Could not compute remote checksum (sha256sum/shasum not available?)")))
-                (if (string= local-checksum remote-checksum)
-                    (progn
-                      ;; `mv' is atomic within the deployment directory.  Check
-                      ;; activation before claiming success, preserving the old
-                      ;; binary if either chmod or mv fails.
-                      (unless (tramp-send-command-and-check
-                               vec
-                               (format "chmod +x %s && mv -f %s %s"
-                                       (tramp-shell-quote-argument remote-tmp-local)
-                                       (tramp-shell-quote-argument remote-tmp-local)
-                                       (tramp-shell-quote-argument remote-local)))
-                        (signal 'remote-file-error
-                                (list "Remote activation failed; existing binary was preserved")))
-                      (setq success t)
-                      (message "Transfer completed successfully"))
-                  ;; Checksum mismatch - clean up and retry
-                  (let ((err-msg (format "Attempt %d: Checksum mismatch (local: %s, remote: %s)"
-                                         attempt
-                                         (substring local-checksum 0 12)
-                                         (substring remote-checksum 0 12))))
-                    (push err-msg errors)
-                    (message "%s" err-msg))
-                  (ignore-errors (delete-file remote-tmp-path))
-                  (setq retries (1+ retries)))))
+              ;; Verify and activate in one remote shell operation.  The final
+              ;; type and digest checks immediately precede the atomic rename.
+              ;; ponytail: a same-user process can still swap the pathname in
+              ;; that tiny window; full inode binding needs a remote helper.
+              (let ((tmp (tramp-shell-quote-argument remote-tmp-local))
+                    (dest (tramp-shell-quote-argument remote-local))
+                    (digest (tramp-shell-quote-argument local-checksum)))
+                (unless (tramp-send-command-and-check
+                         vec
+                         (format
+                          (concat "test -f %s && ! test -L %s && chmod +x %s && "
+                                  "test -f %s && ! test -L %s && "
+                                  "(test ! -e %s && ! test -L %s || "
+                                  "test -f %s && ! test -L %s) && "
+                                  "actual=$({ sha256sum %s 2>/dev/null || "
+                                  "shasum -a 256 %s 2>/dev/null; } | cut -d' ' -f1) && "
+                                  "test \"$actual\" = %s && mv -f %s %s && "
+                                  "test -f %s && ! test -L %s && test -x %s")
+                          tmp tmp tmp tmp tmp dest dest dest dest tmp tmp digest tmp dest
+                          dest dest dest))
+                  (signal 'remote-file-error
+                          (list "Remote verification or activation failed; existing binary was preserved"))))
+              (setq success t)
+              (message "Transfer completed successfully"))
           (error
            ;; Clean up on error and retry
            (let ((err-msg (format "Attempt %d: %s" attempt (error-message-string err))))

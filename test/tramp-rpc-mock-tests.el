@@ -3936,6 +3936,54 @@ This matches the behavior expected by `tramp-test28-process-file'."
                 (should (equal id1 (tramp-rpc-deploy--binary-id)))))))
       (delete-directory dir t))))
 
+(ert-deftest tramp-rpc-mock-test-deploy-extraction-rejects-links ()
+  "Extracted symbolic and hard links cannot be promoted as the release binary."
+  :tags '(:deploy)
+  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
+  (let* ((dir (make-temp-file "tramp-rpc-extract" t))
+         (dest (expand-file-name "dest" dir))
+         (outside (expand-file-name "outside" dir))
+         (binary (expand-file-name tramp-rpc-deploy-binary-name dest))
+         process-args)
+    (unwind-protect
+        (progn
+          (with-temp-file outside (insert "outside content"))
+          (cl-letf (((symbol-function 'call-process)
+                     (lambda (_program _infile _destination _display &rest args)
+                       (setq process-args args)
+                       (make-symbolic-link outside binary)
+                       0)))
+            (should-not (tramp-rpc-deploy--extract-tarball "archive.tar.gz" dest)))
+          (delete-file binary)
+          (cl-letf (((symbol-function 'call-process)
+                     (lambda (&rest _args)
+                       (add-name-to-file outside binary)
+                       0)))
+            (should-not (tramp-rpc-deploy--extract-tarball "archive.tar.gz" dest)))
+          (should (equal process-args
+                         (list "-xzf" "archive.tar.gz" "-C" dest "--"
+                               tramp-rpc-deploy-binary-name)))
+          (should (equal (with-temp-buffer
+                           (insert-file-contents-literally outside)
+                           (buffer-string))
+                         "outside content")))
+      (delete-directory dir t))))
+
+(ert-deftest tramp-rpc-mock-test-deploy-remote-present-requires-regular-file ()
+  "Remote presence rejects directories and symbolic links."
+  :tags '(:deploy)
+  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
+  (let ((vec (tramp-dissect-file-name "/scp:mock:/tmp/"))
+        command)
+    (cl-letf (((symbol-function 'tramp-rpc-deploy--remote-binary-path)
+               (lambda (remote-vec)
+                 (tramp-make-tramp-file-name remote-vec "/tmp/server")))
+              ((symbol-function 'tramp-send-command-and-check)
+               (lambda (_vec value) (setq command value) t)))
+      (should (tramp-rpc-deploy--remote-binary-exists-p vec))
+      (should (equal command
+                     "test -f /tmp/server && ! test -L /tmp/server && test -x /tmp/server")))))
+
 (ert-deftest tramp-rpc-mock-test-deploy-checksum-required ()
   "A missing checksum prevents a release binary from reaching the cache."
   :tags '(:deploy)
@@ -4207,11 +4255,9 @@ This matches the behavior expected by `tramp-test28-process-file'."
                     ((symbol-function 'delete-file)
                      (lambda (file &rest _args)
                        (funcall delete-file-function (tramp-file-local-name file))))
-                    ((symbol-function 'tramp-rpc-deploy--remote-checksum)
-                     (lambda (_vec path) (tramp-rpc-deploy--compute-checksum path)))
                     ((symbol-function 'tramp-send-command-and-check)
                      (lambda (_vec command)
-                       (when (string-prefix-p "chmod +x" command)
+                       (when (string-match-p "mv -f" command)
                          (setq activation-command command))
                        (let ((process-environment
                               (cons (concat "PATH=" fake-bin path-separator
@@ -4221,14 +4267,26 @@ This matches the behavior expected by `tramp-test28-process-file'."
             (condition-case err
                 (tramp-rpc-deploy--transfer-binary vec local)
               (remote-file-error (setq error-message (error-message-string err))))
-            (should (string-match-p "Remote activation failed" error-message))
+            (should (string-match-p "Remote verification or activation failed"
+                                    error-message))
             (should (equal (file-name-directory remote-tmp)
                            (file-name-directory remote-local)))
-            (should (equal activation-command
-                           (format "chmod +x %s && mv -f %s %s"
-                                   (tramp-shell-quote-argument remote-tmp)
-                                   (tramp-shell-quote-argument remote-tmp)
-                                   (tramp-shell-quote-argument remote-local))))
+            (let ((tmp (tramp-shell-quote-argument remote-tmp))
+                  (dest (tramp-shell-quote-argument remote-local))
+                  (digest (tramp-rpc-deploy--compute-checksum local)))
+              (should (string-prefix-p
+                       (format "test -f %s && ! test -L %s && chmod +x %s"
+                               tmp tmp tmp)
+                       activation-command))
+              (should (string-match-p
+                       (regexp-quote
+                        (format "test \"$actual\" = %s && mv -f %s %s"
+                                digest tmp dest))
+                       activation-command))
+              (should (string-suffix-p
+                       (format "test -f %s && ! test -L %s && test -x %s"
+                               dest dest dest)
+                       activation-command)))
             (should (equal (with-temp-buffer
                              (insert-file-contents-literally remote-local)
                              (buffer-string))
