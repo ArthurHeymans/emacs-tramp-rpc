@@ -1350,6 +1350,50 @@ This matches the behavior expected by `tramp-test28-process-file'."
       (dolist (buf (list buffer replacement-buffer))
         (when (buffer-live-p buf) (kill-buffer buf))))))
 
+(ert-deftest tramp-rpc-mock-test-pty-read-error-is-terminal ()
+  "A PTY read RPC error terminates without scheduling another poll."
+  (let ((process (make-pipe-process
+                  :name "tramp-rpc-pty-read-error-mock"
+                  :noquery t))
+        exit-code)
+    (unwind-protect
+        (progn
+          (puthash process '(:vec mock :pid 42 :poll-timer nil)
+                   tramp-rpc--pty-processes)
+          (cl-letf (((symbol-function 'tramp-rpc--handle-pty-exit)
+                     (lambda (_process code)
+                       (setq exit-code code))))
+            (tramp-rpc--pty-handle-async-response
+             process '(:error (:code -32004 :message "read failed"))))
+          (should (= exit-code -1))
+          (should-not (plist-get (gethash process tramp-rpc--pty-processes)
+                                 :poll-timer)))
+      (remhash process tramp-rpc--pty-processes)
+      (when (process-live-p process) (delete-process process)))))
+
+(ert-deftest tramp-rpc-mock-test-pty-terminal-read-error-calls-user-sentinel-once ()
+  "A terminal PTY read error invokes the real user sentinel exactly once."
+  (let* ((process (start-process "tramp-rpc-pty-terminal-error" nil "cat"))
+         (tramp-rpc--pty-processes (make-hash-table :test 'eq))
+         (calls 0))
+    (unwind-protect
+        (progn
+          (process-put process :tramp-rpc-user-sentinel
+                       (lambda (_ _event) (cl-incf calls)))
+          (puthash process '(:poll-timer nil) tramp-rpc--pty-processes)
+          (set-process-sentinel process #'tramp-rpc--pty-sentinel)
+          (tramp-rpc--pty-handle-async-response
+           process '(:error (:code -32004 :message "read failed")))
+          ;; `delete-process' queues the real sentinel callback.
+          (accept-process-output process 0.1)
+          (should (= calls 1))
+          (should-not (gethash process tramp-rpc--pty-processes))
+          ;; A duplicate terminal response cannot invoke it again.
+          (tramp-rpc--pty-handle-async-response
+           process '(:error (:code -32004 :message "read failed")))
+          (should (= calls 1)))
+      (when (process-live-p process) (delete-process process)))))
+
 (ert-deftest tramp-rpc-mock-test-transport-death-wakes-sync-call ()
   "A synchronous call reports transport death without waiting for timeout."
   (let* ((vec (tramp-dissect-file-name "/rpc:sync-death:/tmp/"))

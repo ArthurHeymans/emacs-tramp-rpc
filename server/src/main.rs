@@ -171,11 +171,6 @@ where
     R: AsyncRead + Unpin + Send + 'static,
     W: AsyncWrite + Unpin + Send + 'static,
 {
-    #[cfg(test)]
-    // Process-local registries are shared by tests even though production
-    // gives each transport its own server process; serialize test loops.
-    let _process_test_lock = handlers::process::test_process_map_lock().await;
-
     let (sender, mut frames) = mpsc::channel(FRAME_CHANNEL_SIZE);
     tokio::spawn(read_frames(reader, sender));
     let mut tasks: JoinSet<()> = JoinSet::new();
@@ -374,6 +369,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_connection_handles_fragmented_frame_while_writing_response() {
+        let _test_lock = handlers::process::test_process_map_lock().await;
         let (mut client, server_reader) = tokio::io::duplex(1024);
         let (server_writer, mut client_reader) = tokio::io::duplex(1024);
         let writer = Arc::new(Mutex::new(server_writer));
@@ -406,6 +402,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_connection_recovers_admission_after_panicked_tasks() {
+        let _test_lock = handlers::process::test_process_map_lock().await;
         let (mut client, server_reader) = tokio::io::duplex(4096);
         let (server_writer, mut client_reader) = tokio::io::duplex(4096);
         let connection = tokio::spawn(run_connection(
@@ -566,6 +563,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_connection_eof_sigkills_blocked_pipe_and_pty_requests() {
+        let _test_lock = handlers::process::test_process_map_lock().await;
         let (mut client, server_reader) = tokio::io::duplex(4096);
         let (server_writer, mut client_reader) = tokio::io::duplex(4096);
         let connection = tokio::spawn(run_connection(
@@ -680,6 +678,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_general_overload_preserves_id_and_control_is_reserved() {
+        let _test_lock = handlers::process::test_process_map_lock().await;
         let (mut client, server_reader) = tokio::io::duplex(4096);
         let (server_writer, mut client_reader) = tokio::io::duplex(4096);
         let connection = tokio::spawn(run_connection(
