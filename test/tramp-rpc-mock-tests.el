@@ -1014,6 +1014,8 @@ This matches the behavior expected by `tramp-test28-process-file'."
 
 (declare-function tramp-rpc-magit--file-exists-in-ancestor-scan
                   "tramp-rpc-magit" (filename scan))
+(declare-function tramp-rpc-magit--file-exists-p
+                  "tramp-rpc-magit" (filename))
 (declare-function tramp-rpc-magit--get-cache-key "tramp-rpc-magit" (vec directory))
 (declare-function tramp-rpc-magit--process-cache-key "tramp-rpc-magit" (&rest args))
 (declare-function tramp-rpc-magit--process-cache-lookup "tramp-rpc-magit" (program args))
@@ -1029,6 +1031,7 @@ This matches the behavior expected by `tramp-test28-process-file'."
 (defvar tramp-rpc-magit--prefetch-directory)
 (defvar tramp-rpc-magit--process-caches)
 (defvar tramp-rpc-magit--ancestors-cache)
+(defvar tramp-rpc-magit--ancestors-cache-timestamp)
 (defvar tramp-rpc-magit--ancestor-scan-caches)
 
 (defconst tramp-rpc-mock-test--tramp-rpc-magit-loaded
@@ -1058,6 +1061,7 @@ This matches the behavior expected by `tramp-test28-process-file'."
    'tramp-rpc-magit--process-caches
    'tramp-rpc-magit--ancestor-scan-caches)
   (setq tramp-rpc-magit--ancestors-cache nil
+        tramp-rpc-magit--ancestors-cache-timestamp nil
         tramp-rpc-magit--prefetch-directory nil
         tramp-rpc-magit--allow-process-cache nil))
 
@@ -1334,6 +1338,38 @@ This matches the behavior expected by `tramp-test28-process-file'."
       (kill-buffer buffer-b)
       (clrhash tramp-rpc--process-write-queues))))
 
+(ert-deftest tramp-rpc-mock-test-rpc-pty-write-uses-creation-generation ()
+  "An RPC PTY write after reconnect stays on its creation generation."
+  (let* ((vec (tramp-dissect-file-name "/rpc:pty-reconnect:/tmp/"))
+         (connection-a (list :process 'connection-a))
+         (connection-b (list :process 'connection-b))
+         (current-connection connection-a)
+         (tramp-rpc--pty-processes (make-hash-table :test 'eq))
+         process write-connection)
+    (unwind-protect
+        (cl-letf (((symbol-function 'tramp-rpc--get-terminal-size)
+                   (lambda (_buffer) '(80 . 24)))
+                  ((symbol-function 'tramp-rpc--get-connection)
+                   (lambda (_vec) current-connection))
+                  ((symbol-function 'tramp-rpc--pty-start-async-read) #'ignore)
+                  ((symbol-function 'tramp-rpc--call)
+                   (lambda (_vec method _params &optional connection)
+                     (if (equal method "process.start_pty")
+                         '((pid . 42) (tty_name . "/dev/pts/mock"))
+                       (setq write-connection connection)))))
+          (setq process
+                (tramp-rpc--make-rpc-pty-process
+                 vec "tramp-rpc-pty-reconnect" nil '("cat") nil t
+                 nil nil "/tmp/"))
+          (setq current-connection connection-b)
+          (tramp-rpc-handle-process-send-string process "input")
+          (should (eq write-connection connection-a)))
+      (when (processp process)
+        (remhash process tramp-rpc--pty-processes)
+        (set-process-sentinel process nil)
+        (when (process-live-p process)
+          (delete-process process))))))
+
 (ert-deftest tramp-rpc-mock-test-cleanup-async-processes-preserves-replacement-generation ()
   "Old cleanup for one vector must not remove its replacement generation."
   (let* ((vec (tramp-dissect-file-name "/rpc:cleanup-generation:/tmp/"))
@@ -1363,6 +1399,23 @@ This matches the behavior expected by `tramp-test28-process-file'."
       (dolist (process (list relay-a relay-b connection-a connection-b))
         (when (process-live-p process)
           (delete-process process))))))
+
+(ert-deftest tramp-rpc-mock-test-call-async-send-failure-rolls-back-callback ()
+  "A rejected async send must not leave callback state behind."
+  (let ((tramp-rpc--async-callbacks (make-hash-table :test 'eql))
+        (tramp-rpc--async-callback-processes (make-hash-table :test 'eql))
+        (process 'dead-transport))
+    (cl-letf (((symbol-function 'tramp-rpc-protocol-encode-request-with-id)
+               (lambda (_method _params) (cons 77 "request")))
+              ((symbol-function 'process-send-string)
+               (lambda (_process _request)
+                 (error "transport is dead"))))
+      (should-error
+       (tramp-rpc--call-async nil "test" nil #'ignore
+                              (list :process process))
+       :type 'error)
+      (should-not (gethash 77 tramp-rpc--async-callbacks))
+      (should-not (gethash 77 tramp-rpc--async-callback-processes)))))
 
 (ert-deftest tramp-rpc-mock-test-transport-death-cleans-one-generation ()
   "A dead RPC transport wakes waiters and removes only its generation."
@@ -1963,6 +2016,24 @@ This matches the behavior expected by `tramp-test28-process-file'."
                      "/rpc:mock:/tmp/file.gz"))
       (should (equal calls
                      '((dired-compress-file ("/rpc:mock:/tmp/file"))))))))
+
+(ert-deftest tramp-rpc-mock-test-ancestor-scan-honors-cache-inhibition ()
+  "Ancestor marker scans honor numeric and timestamp invalidation."
+  (let ((tramp-rpc-magit--ancestor-scan-caches
+         (make-hash-table :test 'equal))
+        (tramp-rpc-magit--ancestors-cache nil)
+        (tramp-rpc-magit--prefetch-directory nil)
+        (tramp-rpc--cache-ttl 300)
+        (key (cons "/rpc:mock:" "/repo/sub/"))
+        (scan '((".git" . "/repo"))))
+    (dolist (inhibition (list 1 (current-time)))
+      (clrhash tramp-rpc-magit--ancestor-scan-caches)
+      (puthash key (cons (- (float-time) 2) scan)
+               tramp-rpc-magit--ancestor-scan-caches)
+      (let ((remote-file-name-inhibit-cache inhibition))
+        (should (eq (tramp-rpc-magit--file-exists-p
+                     "/rpc:mock:/repo/.git")
+                    'not-cached))))))
 
 (ert-deftest tramp-rpc-mock-test-ancestor-scan-parent-falls-through ()
   "Closest-only ancestor scan must not cache false negatives above the hit."
@@ -2998,6 +3069,44 @@ This matches the behavior expected by `tramp-test28-process-file'."
       (set-file-modes "/rpc:mockhost:/tmp/file" #o644)
       (should (equal (nreverse calls) '("file.set_modes"))))))
 
+(ert-deftest tramp-rpc-mock-test-metadata-cache-honors-numeric-remote-ttl ()
+  "Numeric `remote-file-name-inhibit-cache' caps custom metadata TTLs."
+  (let ((cache (make-hash-table :test 'equal))
+        (remote-file-name-inhibit-cache 1)
+        (tramp-rpc--cache-ttl 300))
+    (puthash 'key (cons (- (float-time) 2) 'stale) cache)
+    (should (eq (tramp-rpc--cache-lookup cache 'key) 'not-cached))
+    (should-not (gethash 'key cache))))
+
+(ert-deftest tramp-rpc-mock-test-metadata-cache-honors-timestamp-invalidation ()
+  "Timestamp cache inhibition rejects entries created before the threshold."
+  (let ((cache (make-hash-table :test 'equal))
+        (remote-file-name-inhibit-cache (current-time))
+        (tramp-rpc--cache-ttl 300))
+    (puthash 'old (cons (- (float-time) 1) 'stale) cache)
+    (puthash 'new (cons (+ (float-time) 1) 'fresh) cache)
+    (should (eq (tramp-rpc--cache-lookup cache 'old) 'not-cached))
+    (should (eq (tramp-rpc--cache-lookup cache 'new) 'fresh))))
+
+(ert-deftest tramp-rpc-mock-test-file-stat-honors-remote-cache-inhibition ()
+  "A cache-inhibited stat must ignore stale custom metadata entries."
+  (let* ((vec (tramp-dissect-file-name "/rpc:cache-inhibit:/tmp/file"))
+         (localname "/tmp/file")
+         (key (tramp-rpc--file-stat-cache-key vec localname nil))
+         (tramp-rpc--file-stat-cache (make-hash-table :test 'equal))
+         (remote-file-name-inhibit-cache t)
+         (calls 0))
+    (tramp-rpc--cache-put tramp-rpc--file-stat-cache key nil)
+    (cl-letf (((symbol-function 'tramp-rpc--call)
+               (lambda (_vec method _params &optional _connection)
+                 (should (equal method "file.stat"))
+                 (setq calls (1+ calls))
+                 '((type . "file")))))
+      (should (equal (alist-get 'type
+                                (tramp-rpc--call-file-stat vec localname))
+                     "file"))
+      (should (= calls 1)))))
+
 (ert-deftest tramp-rpc-mock-test-set-file-modes-invalidates-metadata-caches ()
   "`set-file-modes' clears cached metadata that depends on file mode bits."
   (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
@@ -3997,6 +4106,34 @@ This matches the behavior expected by `tramp-test28-process-file'."
       (should (tramp-rpc-deploy--remote-binary-exists-p vec))
       (should (equal command
                      "test -f /tmp/server && ! test -L /tmp/server && test -x /tmp/server")))))
+
+(ert-deftest tramp-rpc-mock-test-deploy-replaces-mismatched-existing-binary ()
+  "An executable at the expected path is reused only after checksum verification."
+  :tags '(:deploy)
+  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
+  (let* ((vec (tramp-dissect-file-name "/ssh:host:/"))
+         (tramp-rpc-deploy-never-deploy nil)
+         (tramp-rpc-deploy-auto-deploy t)
+         transferred)
+    (cl-letf (((symbol-function 'tramp-rpc-deploy--bootstrap-vec)
+               (lambda (_vec) vec))
+              ((symbol-function 'tramp-rpc-deploy--remote-binary-path)
+               (lambda (_vec) "/ssh:host:/tmp/tramp-rpc-server"))
+              ((symbol-function 'tramp-rpc-deploy--remote-binary-exists-p)
+               (lambda (_vec) t))
+              ((symbol-function 'tramp-rpc-deploy--detect-remote-arch)
+               (lambda (_vec) "x86_64-linux"))
+              ((symbol-function 'tramp-rpc-deploy--ensure-local-binary)
+               (lambda (_arch) "/tmp/local-server"))
+              ((symbol-function 'tramp-rpc-deploy--remote-binary-matches-p)
+               (lambda (_vec _local) nil))
+              ((symbol-function 'tramp-rpc-deploy--transfer-binary)
+               (lambda (_vec local)
+                 (setq transferred local)
+                 "/ssh:host:/tmp/tramp-rpc-server")))
+      (should (equal (tramp-rpc-deploy-ensure-binary vec)
+                     "/tmp/tramp-rpc-server"))
+      (should (equal transferred "/tmp/local-server")))))
 
 (ert-deftest tramp-rpc-mock-test-deploy-checksum-required ()
   "A missing checksum prevents a release binary from reaching the cache."

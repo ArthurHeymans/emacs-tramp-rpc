@@ -1175,6 +1175,7 @@ DIRENV-ENV is an optional alist of environment variables for the process."
                      :rpc-pty t
                      :poll-timer nil)
                tramp-rpc--pty-processes)
+      (process-put local-process :tramp-rpc-connection connection)
       (process-put local-process :tramp-rpc-connection-process
                    (plist-get connection :process)))
 
