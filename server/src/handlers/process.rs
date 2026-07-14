@@ -1010,6 +1010,10 @@ async fn terminate_pipe_process(pid: u32, signal: i32, escalate: bool) -> Result
         if let Some(managed) = get_process_map().lock().await.get_mut(&pid) {
             managed.exit_status = Some(exit_status);
         }
+        if signal == libc::SIGKILL {
+            get_process_map().lock().await.remove(&pid);
+        }
+        return Ok(true);
     }
     if signal == libc::SIGKILL {
         // Explicit SIGKILL is the caller's opt-out from drain-preserving
@@ -1017,6 +1021,12 @@ async fn terminate_pipe_process(pid: u32, signal: i32, escalate: bool) -> Result
         // this call did; already in-flight reads retain the shared state.
         get_process_map().lock().await.remove(&pid);
     }
+
+    // Signal delivery is the success criterion, matching local
+    // `signal-process': a signal is a request, not a guarantee that the
+    // process exits within the bounded wait.  The entry stays reachable so
+    // the caller can escalate (e.g. retry with SIGKILL) and later reads
+    // still drain buffered output; the reap above is purely opportunistic.
     Ok(true)
 }
 
@@ -1951,12 +1961,19 @@ async fn terminate_pty_process(
         } else if let Some(managed) = processes.get_mut(&pid) {
             managed.exit_status = Some(exit_code);
         }
-    } else if remove {
-        // A missing wait status is still safe to discard: cancellation was
-        // published before removal and the child will not be reused by this
-        // server process while its descriptor remains owned by this request.
-        get_pty_process_map().lock().await.remove(&pid);
+        return Ok(true);
     }
+
+    if remove {
+        // Explicit close discards the PTY even if its status was already
+        // consumed by another status poll.
+        get_pty_process_map().lock().await.remove(&pid);
+        return Ok(true);
+    }
+
+    // As for pipe children: delivery is success; termination is not
+    // guaranteed within the bounded wait and the entry stays for escalation
+    // and draining.
     Ok(true)
 }
 
@@ -2777,12 +2794,14 @@ mod tests {
             .unwrap() as u32;
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
 
+        // Delivery is success even when the child ignores the signal,
+        // matching local `signal-process'; the entry stays for escalation.
         kill(Value::Map(vec![(
             Value::String("pid".into()),
             Value::Integer(pid.into()),
         )]))
         .await
-        .expect("SIGTERM");
+        .expect("ignored SIGTERM is still delivered successfully");
         assert!(get_process_map().lock().await.contains_key(&pid));
 
         let os_pid = pipe_os_pid(pid).await;
@@ -3056,6 +3075,45 @@ mod tests {
         }
         assert!(exited);
         assert_eq!(exit_code, Some(128 + libc::SIGTERM as i64));
+        assert!(!get_pty_process_map().lock().await.contains_key(&pid));
+    }
+
+    #[tokio::test]
+    async fn pty_kill_ignored_sigterm_then_sigkill_reaps_child() {
+        let _test_lock = test_process_map_lock().await;
+        let temp = tempfile::tempdir().expect("temporary PTY directory");
+        let marker = temp.path().join("ready");
+        let pid = start_signal_ignoring_pty(&marker).await;
+        let os_pid = pty_os_pid(pid).await;
+
+        // Delivery is success even when the child ignores the signal.
+        kill_pty(Value::Map(vec![
+            (Value::String("pid".into()), Value::Integer(pid.into())),
+            (
+                Value::String("signal".into()),
+                Value::Integer((libc::SIGTERM as i64).into()),
+            ),
+        ]))
+        .await
+        .expect("ignored SIGTERM is still delivered successfully");
+        assert!(get_pty_process_map().lock().await.contains_key(&pid));
+
+        kill_pty(Value::Map(vec![
+            (Value::String("pid".into()), Value::Integer(pid.into())),
+            (
+                Value::String("signal".into()),
+                Value::Integer((libc::SIGKILL as i64).into()),
+            ),
+        ]))
+        .await
+        .expect("SIGKILL should terminate and reap the PTY child");
+        assert_reaped(os_pid);
+        close_pty(Value::Map(vec![(
+            Value::String("pid".into()),
+            Value::Integer(pid.into()),
+        )]))
+        .await
+        .expect("close PTY after SIGKILL");
         assert!(!get_pty_process_map().lock().await.contains_key(&pid));
     }
 

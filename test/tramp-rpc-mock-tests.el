@@ -2426,6 +2426,22 @@ This matches the behavior expected by `tramp-test28-process-file'."
                     tramp-rpc--file-truename-cache "/rpc:mock:/repo")
                    "/rpc:mock:/home/arthur/src/doom"))))
 
+(ert-deftest tramp-rpc-mock-test-magit-metadata-prefetch-bounds-batches ()
+  "Large Magit metadata prefetches stay within the server batch limit."
+  (skip-unless tramp-rpc-mock-test--tramp-rpc-magit-loaded)
+  (let ((vec (tramp-dissect-file-name "/rpc:mock:/repo/"))
+        (files (cl-loop for i below 40
+                        collect (format "/repo/file-%02d" i)))
+        batch-sizes)
+    (cl-letf (((symbol-function 'tramp-rpc--call-batch)
+               (lambda (_vec requests)
+                 (push (length requests) batch-sizes)
+                 (make-list (length requests) '(:error -1)))))
+      (tramp-rpc-magit--prefetch-file-metadata vec files))
+    ;; Forty same-directory files produce two per-file requests plus one
+    ;; shared directory stat: 81 requests, split at the server's 64-entry cap.
+    (should (equal (nreverse batch-sizes) '(64 17)))))
+
 (defun tramp-rpc-mock-test--sudo-helper-available-p ()
   "Return non-nil when the sudo path helpers needed by this test are available."
   (and (require 'tramp-cmds nil t)
