@@ -136,6 +136,15 @@
       (msgpack-bin-string data)
     data))
 
+(defun tramp-rpc-mock-test--wait-for (predicate description &optional process)
+  "Run the event loop until PREDICATE succeeds or report DESCRIPTION."
+  (let ((deadline (+ (float-time) 1.0)))
+    (while (and (< (float-time) deadline) (not (funcall predicate)))
+      (accept-process-output process 0.01))
+    (unless (funcall predicate)
+      (error "Timed out waiting for %s (process status: %S)"
+             description (and (processp process) (process-status process))))))
+
 ;;; ============================================================================
 ;;; Protocol Tests (No server required)
 ;;; ============================================================================
@@ -1580,7 +1589,10 @@ This matches the behavior expected by `tramp-test28-process-file'."
             (should (timerp (plist-get info :delivery-timer)))
             (should (timerp (plist-get info :poll-timer))))
           (tramp-rpc--cleanup-async-processes vec nil)
-          (sleep-for 0.05)
+          (let ((barrier nil))
+            (run-at-time 0 nil (lambda () (setq barrier t)))
+            (tramp-rpc-mock-test--wait-for
+             (lambda () barrier) "cancelled timer barrier"))
           (should-not fired)
           (should-not (gethash process tramp-rpc--async-processes)))
       (when (process-live-p process) (delete-process process)))))
@@ -1636,7 +1648,10 @@ This matches the behavior expected by `tramp-test28-process-file'."
           (puthash process '(:direct-ssh t) tramp-rpc--pty-processes)
           (set-process-sentinel process #'tramp-rpc--direct-ssh-pty-sentinel)
           (delete-process process)
-          (sleep-for 0.02)
+          (tramp-rpc-mock-test--wait-for
+           (lambda () (and (not (gethash process tramp-rpc--pty-processes))
+                           (= calls 1)))
+           "direct PTY sentinel")
           (should-not (gethash process tramp-rpc--pty-processes))
           (should (= calls 1)))
       (when (process-live-p process) (delete-process process)))))
@@ -1656,7 +1671,10 @@ This matches the behavior expected by `tramp-test28-process-file'."
           (set-process-sentinel process (lambda (_process _event) (cl-incf calls)))
           (tramp-rpc--install-direct-ssh-pty-sentinel process)
           (delete-process process)
-          (sleep-for 0.02)
+          (tramp-rpc-mock-test--wait-for
+           (lambda () (and (not (gethash process tramp-rpc--pty-processes))
+                           (= calls 1)))
+           "replacement direct PTY sentinel")
           (should-not (gethash process tramp-rpc--pty-processes))
           (should (= calls 1)))
       (when (process-live-p process) (delete-process process)))))
