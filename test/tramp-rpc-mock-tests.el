@@ -4320,20 +4320,26 @@ This matches the behavior expected by `tramp-test28-process-file'."
           (make-directory (expand-file-name "server/src" dir) t)
           (with-temp-file (expand-file-name "Cargo.toml" dir)
             (insert "[package]\nname = \"tramp-rpc-server\"\n"))
-          (with-temp-file (expand-file-name "server/src/main.rs" dir)
-            (insert "fn main() {}\n"))
-          (let ((tramp-rpc-deploy-source-directory dir)
-                (tramp-rpc-deploy-git-build-policy 'auto))
-            (cl-letf (((symbol-function 'tramp-rpc-deploy--git-revision)
-                       (lambda () "abcdef123456")))
-              (let ((id1 (tramp-rpc-deploy--binary-id)))
-                (should (string-prefix-p "git-abcdef123456-" id1))
-                (should (string-match-p
-                         (concat "tramp-rpc-server-" (regexp-quote id1))
-                         (tramp-rpc-deploy-expected-binary-localname)))
-                (with-temp-file (expand-file-name "server/src/main.rs" dir)
-                  (insert "fn main() { println!(\"changed\"); }\n"))
-                (should-not (equal id1 (tramp-rpc-deploy--binary-id)))))))
+          (let ((source (expand-file-name "server/src/main.rs" dir)))
+            (with-temp-file source
+              (insert "fn main() { 1; }\n"))
+            (let ((tramp-rpc-deploy-source-directory dir)
+                  (tramp-rpc-deploy-git-build-policy 'auto))
+              (cl-letf (((symbol-function 'tramp-rpc-deploy--git-revision)
+                         (lambda () "abcdef123456")))
+                (let ((id1 (tramp-rpc-deploy--binary-id))
+                      (mtime (file-attribute-modification-time
+                              (file-attributes source))))
+                  (should (string-prefix-p "git-abcdef123456-" id1))
+                  (should (string-match-p
+                           (concat "tramp-rpc-server-" (regexp-quote id1))
+                           (tramp-rpc-deploy-expected-binary-localname)))
+                  ;; Equal-length content with the original timestamp must not
+                  ;; reuse a metadata-only source identity.
+                  (with-temp-file source
+                    (insert "fn main() { 2; }\n"))
+                  (set-file-times source mtime)
+                  (should-not (equal id1 (tramp-rpc-deploy--binary-id))))))))
       (delete-directory dir t))))
 
 (ert-deftest tramp-rpc-mock-test-deploy-binary-id-release-policy ()
@@ -4378,6 +4384,54 @@ This matches the behavior expected by `tramp-test28-process-file'."
                   (insert ";; lisp-only change\n"))
                 (should (equal id1 (tramp-rpc-deploy--binary-id)))))))
       (delete-directory dir t))))
+
+(ert-deftest tramp-rpc-mock-test-deploy-extraction-rejects-links ()
+  "Extracted symbolic and hard links cannot be promoted as the release binary."
+  :tags '(:deploy)
+  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
+  (let* ((dir (make-temp-file "tramp-rpc-extract" t))
+         (dest (expand-file-name "dest" dir))
+         (outside (expand-file-name "outside" dir))
+         (binary (expand-file-name tramp-rpc-deploy-binary-name dest))
+         process-args)
+    (unwind-protect
+        (progn
+          (with-temp-file outside (insert "outside content"))
+          (cl-letf (((symbol-function 'call-process)
+                     (lambda (_program _infile _destination _display &rest args)
+                       (setq process-args args)
+                       (make-symbolic-link outside binary)
+                       0)))
+            (should-not (tramp-rpc-deploy--extract-tarball "archive.tar.gz" dest)))
+          (delete-file binary)
+          (cl-letf (((symbol-function 'call-process)
+                     (lambda (&rest _args)
+                       (add-name-to-file outside binary)
+                       0)))
+            (should-not (tramp-rpc-deploy--extract-tarball "archive.tar.gz" dest)))
+          (should (equal process-args
+                         (list "-xzf" "archive.tar.gz" "-C" dest "--"
+                               tramp-rpc-deploy-binary-name)))
+          (should (equal (with-temp-buffer
+                           (insert-file-contents-literally outside)
+                           (buffer-string))
+                         "outside content")))
+      (delete-directory dir t))))
+
+(ert-deftest tramp-rpc-mock-test-deploy-remote-present-requires-regular-file ()
+  "Remote presence rejects directories and symbolic links."
+  :tags '(:deploy)
+  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
+  (let ((vec (tramp-dissect-file-name "/scp:mock:/tmp/"))
+        command)
+    (cl-letf (((symbol-function 'tramp-rpc-deploy--remote-binary-path)
+               (lambda (remote-vec)
+                 (tramp-make-tramp-file-name remote-vec "/tmp/server")))
+              ((symbol-function 'tramp-send-command-and-check)
+               (lambda (_vec value) (setq command value) t)))
+      (should (tramp-rpc-deploy--remote-binary-exists-p vec))
+      (should (equal command
+                     "test -f /tmp/server && ! test -L /tmp/server && test -x /tmp/server")))))
 
 (ert-deftest tramp-rpc-mock-test-deploy-checksum-required ()
   "A missing checksum prevents a release binary from reaching the cache."
@@ -4738,9 +4792,9 @@ This matches the behavior expected by `tramp-test28-process-file'."
     (with-temp-buffer
       (insert-file-contents
        (expand-file-name "server/src/handlers/mod.rs" tramp-rpc-mock-test--project-root))
-      (re-search-forward "async fn dispatch_inner" nil t)
+      (should (re-search-forward "async fn dispatch_inner" nil t))
       (let ((start (point))
-            (end (progn (re-search-forward "^    match result {" nil t)
+            (end (progn (should (re-search-forward "^ *match result {" nil t))
                         (match-beginning 0))))
         (goto-char start)
         (while (re-search-forward "\\\"\\([[:alnum:]_.]+\\)\\\" =>" end t)
@@ -4748,13 +4802,17 @@ This matches the behavior expected by `tramp-test28-process-file'."
     (push "batch" dispatcher)
     (with-temp-buffer
       (insert-file-contents (expand-file-name "README.org" tramp-rpc-mock-test--project-root))
-      (re-search-forward "^\\*\\* RPC Server Methods$" nil t)
+      (should (re-search-forward "^\\*\\* RPC Server Methods$" nil t))
       (let ((start (point))
             (end (or (and (re-search-forward "^\\* " nil t) (match-beginning 0))
                      (point-max))))
         (goto-char start)
         (while (re-search-forward "~\\([[:alnum:]_.]+\\)~" end t)
-          (push (match-string 1) documented))))
+          (when (or (string-match-p "\\." (match-string 1))
+                    (equal (match-string 1) "batch"))
+            (push (match-string 1) documented)))))
+    (should dispatcher)
+    (should documented)
     (should (equal (sort (delete-dups dispatcher) #'string<)
                    (sort (delete-dups documented) #'string<)))))
 

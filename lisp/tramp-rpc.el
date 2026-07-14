@@ -966,15 +966,6 @@ Otherwise clear all entries."
   "Cache of executable paths keyed by (connection-key . program).
 Value is the full path or :not-found.")
 
-;; Forward-declare caches used by tramp-rpc--remove-connection (defined
-;; later in the exec-path section).  The byte-compiler needs to see
-;; these defvars before their first reference.
-(defvar tramp-rpc--exec-path-cache (make-hash-table :test 'equal)
-  "Cache of remote exec-path keyed by connection-key.")
-
-(defvar tramp-rpc--login-shell-cache (make-hash-table :test 'equal)
-  "Cache of remote login shell keyed by connection-key.")
-
 (defun tramp-rpc--clear-executable-cache (&optional vec)
   "Clear the executable cache.
 If VEC is provided, only clear entries for that connection.
@@ -991,6 +982,15 @@ Otherwise clear all entries."
         (dolist (key keys-to-remove)
           (remhash key tramp-rpc--executable-cache)))
     (clrhash tramp-rpc--executable-cache)))
+
+;; Forward-declare caches used by tramp-rpc--remove-connection (defined
+;; later in the exec-path section).  The byte-compiler needs to see
+;; these defvars before their first reference.
+(defvar tramp-rpc--exec-path-cache (make-hash-table :test 'equal)
+  "Cache of remote exec-path keyed by connection-key.")
+
+(defvar tramp-rpc--login-shell-cache (make-hash-table :test 'equal)
+  "Cache of remote login shell keyed by connection-key.")
 
 (defun tramp-rpc--environment-with (env key value)
   "Return ENV with KEY set to VALUE.
@@ -1211,7 +1211,7 @@ new generation is made visible."
 
 (defun tramp-rpc--remove-connection (vec &optional process)
   "Remove VEC's connection, optionally only when PROCESS is current.
-Also clears the executable, exec-path, and login shell caches."
+Also clears the executable, exec-path, and login-shell caches."
   (let* ((key (tramp-rpc--connection-key vec))
          (current (gethash key tramp-rpc--connections)))
     (when (and current

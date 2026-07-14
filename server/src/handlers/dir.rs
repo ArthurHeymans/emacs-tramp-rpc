@@ -13,7 +13,7 @@ use std::path::{Path, PathBuf};
 use tokio::fs;
 
 use super::HandlerResult;
-use super::file::{bytes_to_path, map_io_error};
+use super::file::{bytes_to_path, file_type_from_metadata_ft, map_io_error};
 
 use crate::protocol::path_or_bytes;
 
@@ -272,28 +272,6 @@ fn list_dir_sync(
     results.sort_by(|a, b| a.name.cmp(&b.name));
 
     Ok(results)
-}
-
-/// Convert std::fs::FileType to our FileType
-fn file_type_from_metadata_ft(ft: &std::fs::FileType) -> FileType {
-    use std::os::unix::fs::FileTypeExt;
-    if ft.is_file() {
-        FileType::File
-    } else if ft.is_dir() {
-        FileType::Directory
-    } else if ft.is_symlink() {
-        FileType::Symlink
-    } else if ft.is_char_device() {
-        FileType::CharDevice
-    } else if ft.is_block_device() {
-        FileType::BlockDevice
-    } else if ft.is_fifo() {
-        FileType::Fifo
-    } else if ft.is_socket() {
-        FileType::Socket
-    } else {
-        FileType::Unknown
-    }
 }
 
 /// Return the directory components that do not exist yet, from top to bottom.
