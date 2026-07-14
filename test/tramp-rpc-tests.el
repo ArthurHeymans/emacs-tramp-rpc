@@ -1893,6 +1893,106 @@ This matches the upstream `tramp-test28-process-file' test."
         (when (processp proc)
           (ignore-errors (delete-process proc)))))))
 
+(ert-deftest tramp-rpc-test13d-coding-byte-boundary ()
+  "Process coding crosses RPC chunks exactly once."
+  (let* ((utf8 (encode-coding-string "é" 'binary))
+         (binary (string-make-unibyte "\xff\x00\xc3"))
+         (p (start-process "tramp-rpc-coding-boundary" nil "cat"))
+         (output ""))
+    (unwind-protect
+        (progn
+          (sleep-for .05)
+          (tramp-rpc--configure-relay-coding p '(utf-8-unix . utf-8-unix))
+          (set-process-filter p (lambda (_process string)
+                                  (setq output (concat output string))))
+          (let ((tramp-rpc--delivering-output t))
+            (process-send-string p (substring utf8 0 1))
+            (accept-process-output nil .05)
+            (process-send-string p (concat (substring utf8 1) "\n"))
+            (accept-process-output nil .2))
+          (should (equal output "é\n"))
+          (should (equal (tramp-rpc--decode-output
+                          (msgpack-bin-make (string-make-unibyte "\351"))
+                          'latin-1-unix)
+                         "é"))
+          (should (equal (tramp-rpc--decode-output binary 'binary) binary))
+          (should (equal (string-to-list
+                          (tramp-rpc--encode-process-input
+                           p "é"))
+                         '(195 169)))
+          (set-process-coding-system p 'latin-1-unix 'latin-1-unix)
+          (should (equal (process-coding-system p)
+                         '(latin-1-unix . latin-1-unix)))
+          (should (equal (string-to-list
+                          (tramp-rpc--encode-process-input p "é"))
+                         '(233)))
+          (should (equal (tramp-rpc--encode-process-input
+                          p (string-make-unibyte "\xff\x00"))
+                         (string-make-unibyte "\xff\x00"))))
+      (when (processp p)
+        (delete-process p)))))
+
+(ert-deftest tramp-rpc-test13e-separate-stderr-coding-relay ()
+  "Separate stderr relays use the same requested decoder without mixing bytes."
+  (let* ((stdout (start-process "tramp-rpc-coding-stdout" nil "cat"))
+         (stderr (start-process "tramp-rpc-coding-stderr" nil "cat"))
+         (stdout-output "")
+         (stderr-output ""))
+    (unwind-protect
+        (progn
+          (sleep-for .05)
+          (tramp-rpc--configure-relay-coding stdout
+                                             '(utf-8-unix . latin-1-unix))
+          (tramp-rpc--configure-relay-coding stderr
+                                             '(utf-8-unix . latin-1-unix))
+          (set-process-filter stdout
+                              (lambda (_process string)
+                                (setq stdout-output (concat stdout-output string))))
+          (set-process-filter stderr
+                              (lambda (_process string)
+                                (setq stderr-output (concat stderr-output string))))
+          (puthash stdout (list :stderr-process stderr)
+                   tramp-rpc--async-processes)
+          (tramp-rpc--deliver-process-output
+           stdout (encode-coding-string "sortie\n" 'binary)
+           (encode-coding-string "erreur\n" 'binary) t)
+          (accept-process-output nil .2)
+          (should (equal stdout-output "sortie\n"))
+          (should (equal stderr-output "erreur\n"))
+          (should (equal (process-coding-system stdout)
+                         '(utf-8-unix . latin-1-unix))))
+      (remhash stdout tramp-rpc--async-processes)
+      (delete-process stdout)
+      (delete-process stderr))))
+
+(ert-deftest tramp-rpc-test13f-pty-coding-byte-boundary ()
+  "RPC PTY output remains raw until the local incremental decoder."
+  (let* ((process (start-process "tramp-rpc-coding-pty" nil "cat"))
+         (bytes (encode-coding-string "é" 'binary))
+         (output ""))
+    (unwind-protect
+        (progn
+          (sleep-for .05)
+          (tramp-rpc--configure-relay-coding process
+                                             '(utf-8-unix . latin-1-unix))
+          (set-process-filter process
+                              (lambda (_process string)
+                                (setq output (concat output string))))
+          (process-put process :tramp-rpc-pty t)
+          (puthash process '(:poll-timer nil) tramp-rpc--pty-processes)
+          (cl-letf (((symbol-function 'tramp-rpc--pty-start-async-read)
+                     (lambda (&rest _args) nil)))
+            (tramp-rpc--pty-handle-async-response
+             process `(:result ((output . ,(substring bytes 0 1))
+                                (exited . nil))))
+            (tramp-rpc--pty-handle-async-response
+             process `(:result ((output . ,(concat (substring bytes 1) "\n"))
+                                (exited . nil))))
+            (accept-process-output nil .2))
+          (should (equal output "é\n")))
+      (remhash process tramp-rpc--pty-processes)
+      (delete-process process))))
+
 (ert-deftest tramp-rpc-test13d-async-read-rpc-error-exits-process ()
   "Test async read RPC errors terminate the local process state."
   (let ((proc (make-pipe-process

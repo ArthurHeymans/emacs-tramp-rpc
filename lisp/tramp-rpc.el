@@ -2143,11 +2143,19 @@ text strings.  Returns nil if DATA is nil."
     (encode-coding-string data 'utf-8-unix))
    (t data)))
 
-(defun tramp-rpc--decode-output (data _encoding)
-  "Decode binary process DATA to a multibyte UTF-8 string.
-ENCODING is ignored (kept for API compatibility)."
+(defun tramp-rpc--decode-output (data encoding)
+  "Decode binary process DATA using ENCODING.
+This helper is for synchronous command/file paths.  Async relays keep their
+bytes raw and let the relay process decoder handle incremental output."
   (if data
-      (decode-coding-string (tramp-rpc--binary-bytes data) 'utf-8-unix)
+      (let ((coding (cond
+                     ((null encoding) 'utf-8-unix)
+                     ((coding-system-p encoding) encoding)
+                     ((stringp encoding)
+                      (or (coding-system-from-name encoding)
+                          'utf-8-unix))
+                     (t 'utf-8-unix))))
+        (decode-coding-string (tramp-rpc--binary-bytes data) coding))
     ""))
 
 (defun tramp-rpc--decode-filename (entry)

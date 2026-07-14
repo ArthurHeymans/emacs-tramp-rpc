@@ -40,6 +40,7 @@
 
 ;; Functions from tramp-rpc-process.el
 (declare-function tramp-rpc--write-remote-process "tramp-rpc-process")
+(declare-function tramp-rpc--encode-process-input "tramp-rpc-process")
 (declare-function tramp-rpc--close-remote-stdin "tramp-rpc-process")
 (declare-function tramp-rpc--kill-remote-process "tramp-rpc-process")
 (declare-function tramp-rpc--cleanup-async-processes "tramp-rpc-process")
@@ -69,6 +70,33 @@
 (defvar tramp-file-name-for-operation-external)
 
 ;; ============================================================================
+;; Process coding state
+;; ============================================================================
+
+(defun tramp-rpc--process-coding-advised-p (process)
+  "Return non-nil when PROCESS has a public relay coding state."
+  (and (processp process)
+       (process-get process :tramp-rpc-coding)))
+
+(defun tramp-rpc--set-process-coding-system-advice
+    (orig-fun process decoding encoding)
+  "Keep relay output binary while exposing the requested coding pair.
+RPC relays receive raw bytes through their write side, so only their read side
+is configured with DECODING.  ENCODING is retained for RPC stdin writes and
+for `process-coding-system' callers."
+  (if (tramp-rpc--process-coding-advised-p process)
+      (progn
+        (funcall orig-fun process decoding 'binary)
+        (process-put process :tramp-rpc-coding (cons decoding encoding)))
+    (funcall orig-fun process decoding encoding)))
+
+(defun tramp-rpc--process-coding-system-advice (orig-fun process)
+  "Return a relay's requested coding pair rather than its binary write side."
+  (or (and (tramp-rpc--process-coding-advised-p process)
+           (process-get process :tramp-rpc-coding))
+      (funcall orig-fun process)))
+
+;; ============================================================================
 ;; Process I/O handler
 ;; ============================================================================
 
@@ -93,10 +121,8 @@
         (let ((vec (process-get proc :tramp-rpc-vec))
               (pid (process-get proc :tramp-rpc-pid)))
           (tramp-rpc--debug "SEND-STRING PTY pid=%s len=%d" pid (length string))
-          ;; Send write request asynchronously - data must be binary for MessagePack
-          (let ((data-bytes (if (multibyte-string-p string)
-                                (encode-coding-string string 'utf-8-unix)
-                              string)))
+          ;; Encode user input exactly once with the public write side.
+          (let ((data-bytes (tramp-rpc--encode-process-input proc string)))
             (tramp-rpc--call-async vec "process.write_pty"
                                    `((pid . ,pid)
                                      (data . ,(msgpack-bin-make data-bytes)))
@@ -112,7 +138,7 @@
         (tramp-rpc--write-remote-process
          (process-get proc :tramp-rpc-vec)
          (process-get proc :tramp-rpc-pid)
-         string
+         (tramp-rpc--encode-process-input proc string)
          proc))
        ;; Not an RPC process, use original function
        (t (tramp-run-real-handler #'process-send-string (list process string)))))))
@@ -138,9 +164,7 @@
               (pid (process-get proc :tramp-rpc-pid))
               (string (buffer-substring-no-properties start end)))
           (tramp-rpc--debug "SEND-REGION PTY pid=%s len=%d" pid (length string))
-          (let ((data-bytes (if (multibyte-string-p string)
-                                (encode-coding-string string 'utf-8-unix)
-                              string)))
+          (let ((data-bytes (tramp-rpc--encode-process-input proc string)))
             (tramp-rpc--call-async vec "process.write_pty"
                                    `((pid . ,pid)
                                      (data . ,(msgpack-bin-make data-bytes)))
@@ -157,7 +181,7 @@
           (tramp-rpc--write-remote-process
            (process-get proc :tramp-rpc-vec)
            (process-get proc :tramp-rpc-pid)
-           string
+           (tramp-rpc--encode-process-input proc string)
            proc)))
        ;; Not an RPC process, use original function
        (t (tramp-run-real-handler #'process-send-region (list process start end)))))))
@@ -476,6 +500,14 @@ exited (remote side finished), delete it so the refresh can proceed."
 
 (defun tramp-rpc-handler-install ()
   "Install all process handler for tramp-rpc."
+  (unless (advice-member-p #'tramp-rpc--set-process-coding-system-advice
+                           'set-process-coding-system)
+    (advice-add 'set-process-coding-system :around
+                #'tramp-rpc--set-process-coding-system-advice))
+  (unless (advice-member-p #'tramp-rpc--process-coding-system-advice
+                           'process-coding-system)
+    (advice-add 'process-coding-system :around
+                #'tramp-rpc--process-coding-system-advice))
   (with-eval-after-load 'tramp-rpc
     (tramp-add-external-operation
      'process-send-string
@@ -552,6 +584,10 @@ exited (remote side finished), delete it so the refresh can proceed."
 
 (defun tramp-rpc-handler-remove ()
   "Remove all process handler installed by tramp-rpc."
+  (advice-remove 'set-process-coding-system
+                 #'tramp-rpc--set-process-coding-system-advice)
+  (advice-remove 'process-coding-system
+                 #'tramp-rpc--process-coding-system-advice)
   (tramp-remove-external-operation 'process-send-string 'tramp-rpc)
   (tramp-remove-external-operation 'process-send-region 'tramp-rpc)
   (tramp-remove-external-operation 'process-send-eof 'tramp-rpc)
