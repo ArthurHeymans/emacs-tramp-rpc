@@ -212,18 +212,54 @@ Centralizes all advice functions:
 
 ** RPC Server Methods
 
-The server exposes RPC methods for:
+The dispatcher exposes these public methods:
 
-| Category  | Methods                                                            |
-|-----------+--------------------------------------------------------------------|
-| File      | ~file.stat~, ~file.stat_batch~, ~file.executable~, ~file.truename~ |
-| File I/O  | ~file.read~, ~file.write~, ~file.copy~, ~file.rename~, ~file.delete~, ~file.set_modes~, ~file.set_times~, ~file.make_symlink~, ~file.make_hardlink~, ~file.chown~ |
-| Directory | ~dir.list~, ~dir.create~, ~dir.remove~, ~dir.completions~         |
-| Process   | ~process.run~, ~process.start~, ~process.read~, ~process.write~, ~process.close_stdin~, ~process.kill~, ~process.list~ |
-| PTY       | ~process.start_pty~, ~process.read_pty~, ~process.write_pty~, ~process.resize_pty~, ~process.kill_pty~, ~process.close_pty~, ~process.list_pty~ |
-| System    | ~system.info~, ~system.getenv~, ~system.expand_path~, ~system.statvfs~, ~system.groups~ |
-| Batch     | ~batch~, ~commands.run_parallel~, ~ancestors.scan~                 |
-| Watch     | ~watch.add~, ~watch.remove~, ~watch.list~                         |
+| Category | Method | Description |
+|----------+--------+-------------|
+| Batch | ~batch~ | Execute multiple requests concurrently. |
+| File | ~file.stat~ | Return file metadata. |
+| File | ~file.truename~ | Resolve a file's canonical path. |
+| Directory | ~dir.list~ | List directory entries, optionally with attributes. |
+| Directory | ~dir.create~ | Create a directory. |
+| Directory | ~dir.remove~ | Remove a directory. |
+| File I/O | ~file.read~ | Read file bytes. |
+| File I/O | ~file.write~ | Write file bytes. |
+| File I/O | ~file.copy~ | Copy a file. |
+| File I/O | ~file.rename~ | Rename a file. |
+| File I/O | ~file.delete~ | Delete a file. |
+| File I/O | ~file.set_modes~ | Set file mode bits. |
+| File I/O | ~file.set_times~ | Set file timestamps. |
+| File I/O | ~file.make_symlink~ | Create a symbolic link. |
+| File I/O | ~file.make_hardlink~ | Create a hard link. |
+| File I/O | ~file.chown~ | Change file ownership. |
+| Process | ~process.run~ | Run a command synchronously. |
+| Process | ~process.start~ | Start a managed pipe process. |
+| Process | ~process.write~ | Write to managed process stdin. |
+| Process | ~process.read~ | Read managed process output. |
+| Process | ~process.status~ | Return managed process status. |
+| Process | ~process.close_stdin~ | Close managed process stdin. |
+| Process | ~process.kill~ | Signal a managed process. |
+| Process | ~process.list~ | List managed processes. |
+| PTY | ~process.start_pty~ | Start a pseudo-terminal process. |
+| PTY | ~process.read_pty~ | Read pseudo-terminal output. |
+| PTY | ~process.write_pty~ | Write pseudo-terminal input. |
+| PTY | ~process.resize_pty~ | Resize a pseudo-terminal. |
+| PTY | ~process.kill_pty~ | Signal a pseudo-terminal process. |
+| PTY | ~process.close_pty~ | Close a pseudo-terminal process. |
+| PTY | ~process.list_pty~ | List pseudo-terminal processes. |
+| System | ~system.info~ | Return server and host information. |
+| System | ~system.getenv~ | Read an environment variable. |
+| System | ~system.expand_path~ | Expand home-directory paths. |
+| System | ~system.statvfs~ | Return filesystem capacity information. |
+| System | ~system.groups~ | Return supplementary groups. |
+| Commands | ~commands.run_parallel~ | Run commands concurrently. |
+| Commands | ~ancestors.scan~ | Scan ancestor directories. |
+| High-level | ~highlevel.test_files_in_dir~ | Find named files in a directory. |
+| High-level | ~highlevel.locate_dominating_file_multi~ | Find an ancestor containing one of several names. |
+| High-level | ~highlevel.dir_locals_find_file_cache_update~ | Update directory-local file cache data. |
+| Watch | ~watch.add~ | Add a filesystem watch. |
+| Watch | ~watch.remove~ | Remove a filesystem watch. |
+| Watch | ~watch.list~ | List filesystem watches. |
 
 * Binary Deployment
 
