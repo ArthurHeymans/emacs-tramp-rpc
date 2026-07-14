@@ -115,30 +115,18 @@
              (file-directory-p (expand-file-name "lisp" source)))
     (add-to-list 'load-path (expand-file-name "lisp" source))))
 
-;; Install msgpack from MELPA if not available
+;; Mock tests use the installed msgpack dependency; they never install or
+;; refresh packages, which could turn a local test run into network I/O.
 (defvar tramp-rpc-mock-test--msgpack-available
   (or (require 'msgpack nil t)
-      ;; Try to install from MELPA
-      (condition-case err
-          (progn
-            (require 'package)
-            (unless (assoc 'msgpack package-alist)
-              ;; Add MELPA if not present
-              (add-to-list 'package-archives
-                           '("melpa" . "https://melpa.org/packages/") t)
-              (package-initialize)
-              (unless package-archive-contents
-                (package-refresh-contents))
-              (package-install 'msgpack))
-            (require 'msgpack)
-            t)
-        (error
-         (message "Could not install msgpack: %s" err)
-         nil)))
+      (progn
+        (require 'package)
+        (package-initialize)
+        (require 'msgpack nil t)))
   "Non-nil if msgpack.el is available.")
 
 (unless tramp-rpc-mock-test--msgpack-available
-  (error "tramp-rpc mock tests require msgpack.el"))
+  (error "tramp-rpc mock tests require an installed msgpack.el"))
 
 (require 'tramp-rpc-protocol)
 
@@ -969,6 +957,9 @@ This matches the behavior expected by `tramp-test28-process-file'."
 (defconst tramp-rpc-mock-test--tramp-rpc-loaded t
   "The full TRAMP-RPC backend was loaded successfully.")
 
+(load (expand-file-name "tramp-rpc-request-tests.el"
+                        (file-name-directory (or load-file-name buffer-file-name))))
+
 (ert-deftest tramp-rpc-mock-test-file-executable-root ()
   "Root requires an execute bit, rather than bypassing all mode checks."
   (let ((attrs '(nil 1 1 1 0 0 0 0 "----------")))
@@ -988,22 +979,27 @@ This matches the behavior expected by `tramp-test28-process-file'."
 (ert-deftest tramp-rpc-mock-test-pipelined-timeout-signals-error ()
   "A live connection with no response reaches the pipeline timeout branch."
   (let* ((buffer (generate-new-buffer " *tramp-rpc-pipeline-test*"))
-         (process (start-process "tramp-rpc-pipeline-test" buffer "sh" "-c" "sleep 2"))
+         (process (make-pipe-process :name "tramp-rpc-pipeline-test"
+                                     :buffer buffer :noquery t))
          (vec (tramp-dissect-file-name "/rpc:mock:/tmp/"))
-         (timeout 0.15)
-         (started (float-time)))
+         (calls 0))
     (unwind-protect
         (cl-letf (((symbol-function 'tramp-rpc--ensure-connection)
-                   (lambda (_vec) (list :process process :buffer buffer))))
+                   (lambda (_vec) (list :process process :buffer buffer)))
+                  ((symbol-function 'float-time)
+                   (lambda (&rest _)
+                     (setq calls (1+ calls))
+                     (if (<= calls 2) 0 1))))
           (should (process-live-p process))
           (condition-case err
               (progn
-                (tramp-rpc--receive-responses vec '(1) timeout)
+                (tramp-rpc--receive-responses vec '(1) 0.15)
                 (error "Expected pipelined response timeout"))
             (remote-file-error
              (should (string-match-p "Timeout" (error-message-string err)))))
-          (should (>= (- (float-time) started) (* timeout 0.8)))
-          (should (process-live-p process)))
+          (should (process-live-p process))
+          (should-not (process-get process :tramp-rpc-pending-ids))
+          (should-not (gethash buffer tramp-rpc--pending-responses)))
       (when (process-live-p process) (delete-process process))
       (kill-buffer buffer))))
 

@@ -160,9 +160,9 @@ Value is a cons cell (CHECKED . RESULT).")
                  (cl-incf count)
                  (funcall orig-call-async vec method params callback connection)))
               ((symbol-function 'tramp-rpc--send-requests)
-               (lambda (vec requests)
+               (lambda (vec requests &optional connection)
                  (cl-incf count (length requests))
-                 (funcall orig-send-requests vec requests))))
+                 (funcall orig-send-requests vec requests connection))))
       (setq result (funcall thunk))
       (cons result count))))
 
@@ -192,9 +192,9 @@ when THUNK signals so tests can assert error-path roundtrips."
                  (cl-incf count)
                  (funcall orig-call-async vec method params callback connection)))
               ((symbol-function 'tramp-rpc--send-requests)
-               (lambda (vec requests)
+               (lambda (vec requests &optional connection)
                  (cl-incf count (length requests))
-                 (funcall orig-send-requests vec requests))))
+                 (funcall orig-send-requests vec requests connection))))
       (condition-case err
           (setq result (funcall thunk))
         (error (setq error err)))
@@ -399,6 +399,7 @@ The directory is deleted after BODY completes."
   (skip-unless (tramp-rpc-test-enabled))
   (let ((vec (tramp-dissect-file-name (tramp-rpc-test--remote-directory))))
     (should (listp (tramp-get-remote-groups vec 'integer)))))
+
 
 ;;; ============================================================================
 ;;; Test 01: File Name Syntax
