@@ -107,30 +107,18 @@
   (when (file-directory-p tramp-lisp-dir)
     (add-to-list 'load-path tramp-lisp-dir)))
 
-;; Install msgpack from MELPA if not available
+;; Mock tests use the installed msgpack dependency; they never install or
+;; refresh packages, which could turn a local test run into network I/O.
 (defvar tramp-rpc-mock-test--msgpack-available
   (or (require 'msgpack nil t)
-      ;; Try to install from MELPA
-      (condition-case err
-          (progn
-            (require 'package)
-            (unless (assoc 'msgpack package-alist)
-              ;; Add MELPA if not present
-              (add-to-list 'package-archives
-                           '("melpa" . "https://melpa.org/packages/") t)
-              (package-initialize)
-              (unless package-archive-contents
-                (package-refresh-contents))
-              (package-install 'msgpack))
-            (require 'msgpack)
-            t)
-        (error
-         (message "Could not install msgpack: %s" err)
-         nil)))
+      (progn
+        (require 'package)
+        (package-initialize)
+        (require 'msgpack nil t)))
   "Non-nil if msgpack.el is available.")
 
 (unless tramp-rpc-mock-test--msgpack-available
-  (error "tramp-rpc mock tests require msgpack.el"))
+  (error "tramp-rpc mock tests require an installed msgpack.el"))
 
 (require 'tramp-rpc-protocol)
 
@@ -937,6 +925,9 @@ This matches the behavior expected by `tramp-test28-process-file'."
 (require 'tramp-rpc)
 (defconst tramp-rpc-mock-test--tramp-rpc-loaded t
   "The full TRAMP-RPC backend was loaded successfully.")
+
+(load (expand-file-name "tramp-rpc-request-tests.el"
+                        (file-name-directory (or load-file-name buffer-file-name))))
 
 (ert-deftest tramp-rpc-mock-test-file-executable-root ()
   "Root requires an execute bit, rather than bypassing all mode checks."

@@ -160,9 +160,9 @@ Value is a cons cell (CHECKED . RESULT).")
                  (cl-incf count)
                  (funcall orig-call-async vec method params callback connection)))
               ((symbol-function 'tramp-rpc--send-requests)
-               (lambda (vec requests)
+               (lambda (vec requests &optional connection)
                  (cl-incf count (length requests))
-                 (funcall orig-send-requests vec requests))))
+                 (funcall orig-send-requests vec requests connection))))
       (setq result (funcall thunk))
       (cons result count))))
 
@@ -192,9 +192,9 @@ when THUNK signals so tests can assert error-path roundtrips."
                  (cl-incf count)
                  (funcall orig-call-async vec method params callback connection)))
               ((symbol-function 'tramp-rpc--send-requests)
-               (lambda (vec requests)
+               (lambda (vec requests &optional connection)
                  (cl-incf count (length requests))
-                 (funcall orig-send-requests vec requests))))
+                 (funcall orig-send-requests vec requests connection))))
       (condition-case err
           (setq result (funcall thunk))
         (error (setq error err)))
@@ -403,22 +403,27 @@ The directory is deleted after BODY completes."
 (ert-deftest tramp-rpc-test-pipelined-timeout-signals-error ()
   "A live connection with no response reaches the pipeline timeout branch."
   (let* ((buffer (generate-new-buffer " *tramp-rpc-pipeline-test*"))
-         (process (start-process "tramp-rpc-pipeline-test" buffer "sh" "-c" "sleep 2"))
+         (process (make-pipe-process :name "tramp-rpc-pipeline-test"
+                                     :buffer buffer :noquery t))
          (vec (tramp-dissect-file-name "/rpc:mock:/tmp/"))
-         (timeout 0.15)
-         (started (float-time)))
+         (calls 0))
     (unwind-protect
         (cl-letf (((symbol-function 'tramp-rpc--ensure-connection)
-                   (lambda (_vec) (list :process process :buffer buffer))))
+                   (lambda (_vec) (list :process process :buffer buffer)))
+                  ((symbol-function 'float-time)
+                   (lambda (&rest _)
+                     (setq calls (1+ calls))
+                     (if (<= calls 2) 0 1))))
           (should (process-live-p process))
           (condition-case err
               (progn
-                (tramp-rpc--receive-responses vec '(1) timeout)
+                (tramp-rpc--receive-responses vec '(1) 0.15)
                 (error "Expected pipelined response timeout"))
             (remote-file-error
              (should (string-match-p "Timeout" (error-message-string err)))))
-          (should (>= (- (float-time) started) (* timeout 0.8)))
-          (should (process-live-p process)))
+          (should (process-live-p process))
+          (should-not (process-get process :tramp-rpc-pending-ids))
+          (should-not (gethash buffer tramp-rpc--pending-responses)))
       (when (process-live-p process) (delete-process process))
       (kill-buffer buffer))))
 
