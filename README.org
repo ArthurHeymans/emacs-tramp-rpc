@@ -373,6 +373,28 @@ cargo build --release --target aarch64-unknown-linux-gnu
 (setq tramp-rpc-deploy-download-timeout 60)
 #+end_src
 
+** Deployment fallback policy
+
+When the expected remote binary already exists and is executable, TRAMP-RPC
+reuses it if no trusted local artifact can be obtained (for example because
+download, build, or local-cache access is unavailable).  This fallback never
+covers a missing remote binary.  Whenever a trusted local artifact is
+available, TRAMP-RPC compares SHA256 digests and either reuses the match or,
+with automatic deployment enabled, replaces a mismatch through the verified
+staging-and-activation operation.  With automatic deployment disabled, a
+verified mismatch remains an explicit error.
+
+** Process compatibility notes
+
+- RPC PTYs disable kernel ~ECHO~, ~ECHONL~, and ~ONLCR~.  Emacs terminal
+  consumers such as comint and eat perform local echo and line handling; code
+  that relies directly on kernel echo or CRLF conversion will observe different
+  PTY semantics.
+- RPC PTY writes wait for the remote write acknowledgement and can therefore
+  block for up to the RPC timeout when the remote program stops reading.
+  Pipe writes remain queued by default; set
+  ~tramp-rpc-synchronous-pipe-writes~ non-nil to make them synchronous too.
+
 * Troubleshooting
 
 ** Check deployment status

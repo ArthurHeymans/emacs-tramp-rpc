@@ -32,8 +32,8 @@ pub async fn dispatch(request: Request) -> Response {
 }
 
 /// Signal and reap managed async children before a connection task exits.
-pub async fn cleanup_managed_processes() {
-    process::cleanup_managed_processes().await;
+pub async fn cleanup_managed_processes() -> Result<(), RpcError> {
+    process::cleanup_managed_processes().await
 }
 
 pub type HandlerResult = Result<Value, RpcError>;

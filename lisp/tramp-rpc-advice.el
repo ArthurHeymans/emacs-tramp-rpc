@@ -41,6 +41,7 @@
 ;; Functions from tramp-rpc-process.el
 (declare-function tramp-rpc--write-remote-process "tramp-rpc-process"
                   (vec pid data &optional owner-process))
+(declare-function tramp-rpc--drain-write-queue "tramp-rpc-process")
 (declare-function tramp-rpc--encode-process-input "tramp-rpc-process")
 (declare-function tramp-rpc--close-remote-stdin "tramp-rpc-process"
                   (vec pid &optional owner-process))
@@ -51,7 +52,6 @@
 ;; Functions from tramp-rpc.el
 (declare-function tramp-rpc--debug "tramp-rpc")
 (declare-function tramp-rpc--call "tramp-rpc")
-(declare-function tramp-rpc--call-async "tramp-rpc")
 (declare-function tramp-rpc-file-name-p "tramp-rpc")
 
 ;; Variables from tramp-rpc.el / tramp-rpc-process.el
@@ -59,6 +59,7 @@
 (defvar tramp-rpc--closing-local-relay)
 (defvar tramp-rpc--pty-processes)
 (defvar tramp-rpc--async-processes)
+(defvar tramp-rpc-synchronous-pipe-writes)
 
 ;; Functions from vc-dispatcher.el (used by vc-exec-after handler)
 (declare-function vc-exec-after "vc-dispatcher")
@@ -130,12 +131,13 @@ for `process-coding-system' callers."
         (let ((vec (process-get proc :tramp-rpc-vec))
               (pid (process-get proc :tramp-rpc-pid)))
           (tramp-rpc--debug "SEND-STRING PTY pid=%s len=%d" pid (length string))
-          ;; Encode user input exactly once with the public write side.
+          ;; Match local `process-send-string' semantics: return only after the
+          ;; bytes reached the remote PTY's kernel buffer.
           (let ((data-bytes (tramp-rpc--encode-process-input proc string)))
-            (tramp-rpc--call-async vec "process.write_pty"
-                                   `((pid . ,pid)
-                                     (data . ,(msgpack-bin-make data-bytes)))
-                                   #'ignore))  ; Ignore the response
+            (tramp-rpc--call vec "process.write_pty"
+                             `((pid . ,pid)
+                               (data . ,(msgpack-bin-make data-bytes)))
+                             (process-get proc :tramp-rpc-connection)))
           nil))
        ;; Regular async RPC process (pipe-based)
        ((and proc
@@ -144,11 +146,12 @@ for `process-coding-system' callers."
              (not (process-get proc :tramp-rpc-pty)))
         (tramp-rpc--debug "SEND-STRING pipe pid=%s len=%d"
                          (process-get proc :tramp-rpc-pid) (length string))
-        (tramp-rpc--write-remote-process
-         (process-get proc :tramp-rpc-vec)
-         (process-get proc :tramp-rpc-pid)
-         (tramp-rpc--encode-process-input proc string)
-         proc))
+        (let ((vec (process-get proc :tramp-rpc-vec))
+              (pid (process-get proc :tramp-rpc-pid)))
+          (tramp-rpc--write-remote-process
+           vec pid (tramp-rpc--encode-process-input proc string) proc)
+          (when tramp-rpc-synchronous-pipe-writes
+            (tramp-rpc--drain-write-queue vec pid proc))))
        ;; Not an RPC process, use original function
        (t (tramp-run-real-handler #'process-send-string (list process string)))))))
 
@@ -174,10 +177,10 @@ for `process-coding-system' callers."
               (string (buffer-substring-no-properties start end)))
           (tramp-rpc--debug "SEND-REGION PTY pid=%s len=%d" pid (length string))
           (let ((data-bytes (tramp-rpc--encode-process-input proc string)))
-            (tramp-rpc--call-async vec "process.write_pty"
-                                   `((pid . ,pid)
-                                     (data . ,(msgpack-bin-make data-bytes)))
-                                   #'ignore))
+            (tramp-rpc--call vec "process.write_pty"
+                             `((pid . ,pid)
+                               (data . ,(msgpack-bin-make data-bytes)))
+                             (process-get proc :tramp-rpc-connection)))
           nil))
        ;; Regular async RPC process (pipe-based)
        ((and proc
@@ -187,11 +190,12 @@ for `process-coding-system' callers."
         (let ((string (buffer-substring-no-properties start end)))
           (tramp-rpc--debug "SEND-REGION pipe pid=%s len=%d"
                            (process-get proc :tramp-rpc-pid) (length string))
-          (tramp-rpc--write-remote-process
-           (process-get proc :tramp-rpc-vec)
-           (process-get proc :tramp-rpc-pid)
-           (tramp-rpc--encode-process-input proc string)
-           proc)))
+          (let ((vec (process-get proc :tramp-rpc-vec))
+                (pid (process-get proc :tramp-rpc-pid)))
+            (tramp-rpc--write-remote-process
+             vec pid (tramp-rpc--encode-process-input proc string) proc)
+            (when tramp-rpc-synchronous-pipe-writes
+              (tramp-rpc--drain-write-queue vec pid proc)))))
        ;; Not an RPC process, use original function
        (t (tramp-run-real-handler #'process-send-region (list process start end)))))))
 
@@ -220,10 +224,10 @@ for `process-coding-system' callers."
             (if (process-get proc :tramp-rpc-pty)
                 ;; PTY processes: send Ctrl-D (EOF character) via the PTY.
                 (let ((eof-char (string ?\C-d))) ; ASCII 4 = Ctrl-D
-                  (tramp-rpc--call-async vec "process.write_pty"
-                                         `((pid . ,pid)
-                                           (data . ,(msgpack-bin-make eof-char)))
-                                         #'ignore))
+                  (tramp-rpc--call vec "process.write_pty"
+                                   `((pid . ,pid)
+                                     (data . ,(msgpack-bin-make eof-char)))
+                                   (process-get proc :tramp-rpc-connection)))
               ;; Pipe processes: a queue failure must reach the caller.
               (tramp-rpc--close-remote-stdin vec pid proc)))))
        ;; Not a tramp-rpc process

@@ -999,6 +999,15 @@ Tries sha256sum first, then shasum -a 256 for macOS compatibility."
     (tramp-send-command-and-check
      vec (format "rm -rf %s" (tramp-shell-quote-argument directory)))))
 
+(defun tramp-rpc-deploy--remote-binary-matches-p (vec local-path)
+  "Return non-nil when VEC's deployed binary matches LOCAL-PATH."
+  (let* ((remote-local
+          (tramp-file-local-name (tramp-rpc-deploy--remote-binary-path vec)))
+         (local-checksum (tramp-rpc-deploy--compute-checksum local-path))
+         (remote-checksum (tramp-rpc-deploy--remote-checksum vec remote-local)))
+    (and remote-checksum (string= local-checksum remote-checksum))))
+
+
 (defun tramp-rpc-deploy--transfer-binary (vec local-path)
   "Transfer the binary at LOCAL-PATH to the remote host VEC.
 Uses TRAMP's `copy-file' with the bootstrap method for binary transfer.
@@ -1139,7 +1148,13 @@ attempted.  Returns `tramp-rpc-deploy-remote-binary-path' if set,
 otherwise the bare binary name \"tramp-rpc-server\".
 
 Otherwise, if `tramp-rpc-deploy-auto-deploy' is nil and the binary
-is missing, signals an error."
+is missing, signals an error.
+
+An existing executable is reused when no trusted local artifact can be
+obtained (for example, download, build, or cache access is unavailable).
+When a trusted local artifact is available, its checksum is always compared:
+a mismatch is replaced only with auto-deploy enabled, and otherwise signals
+an explicit error.  A missing remote binary never uses this fallback."
   (if tramp-rpc-deploy-never-deploy
       ;; Never deploy mode: use explicit path or bare binary name
       (let ((path (or tramp-rpc-deploy-remote-binary-path
@@ -1151,22 +1166,59 @@ is missing, signals an error."
 	   ;; For simplified Tramp syntax.
 	   (tramp-default-method (tramp-file-name-method bootstrap-vec))
 	   tramp-default-method-alist)
-      (if (tramp-rpc-deploy--remote-binary-exists-p bootstrap-vec)
-          ;; Binary already exists
-          (tramp-file-local-name (tramp-rpc-deploy--remote-binary-path bootstrap-vec))
-        ;; Need to deploy
-        (if tramp-rpc-deploy-auto-deploy
-            (let* ((arch (tramp-rpc-deploy--detect-remote-arch bootstrap-vec))
-                   (local-binary (tramp-rpc-deploy--ensure-local-binary arch)))
-              (message "Deploying tramp-rpc-server (%s) to %s..."
-                       arch (tramp-file-name-host vec))
+      (let* ((remote-present
+              (tramp-rpc-deploy--remote-binary-exists-p bootstrap-vec))
+             (remote-local
               (tramp-file-local-name
-               (tramp-rpc-deploy--transfer-binary bootstrap-vec local-binary)))
+               (tramp-rpc-deploy--remote-binary-path bootstrap-vec))))
+        (cond
+         ((and (not remote-present) (not tramp-rpc-deploy-auto-deploy))
           (signal
-	   'remote-file-error
-	   (list "tramp-rpc-server not found on"
-		 (tramp-file-name-host vec)
-		 "and auto-deploy is disabled")))))))
+           'remote-file-error
+           (list "tramp-rpc-server not found on"
+                 (tramp-file-name-host vec)
+                 "and auto-deploy is disabled")))
+         (t
+          ;; The pre-existing remote executable is a usable fallback only when
+          ;; local artifact acquisition itself failed.  Once we have a trusted
+          ;; artifact, retain strict checksum comparison and replacement.
+          (let* ((artifact
+                  (condition-case err
+                      (let* ((arch
+                              (tramp-rpc-deploy--detect-remote-arch bootstrap-vec))
+                             (local-binary
+                              (tramp-rpc-deploy--ensure-local-binary arch)))
+                        (list :arch arch :local-binary local-binary))
+                    (remote-file-error
+                     (if remote-present
+                         (list :unavailable err)
+                       (signal (car err) (cdr err))))))
+                 (arch (plist-get artifact :arch))
+                 (local-binary (plist-get artifact :local-binary)))
+            (if (eq (car artifact) :unavailable)
+                (progn
+                  (message
+                   "Using existing remote tramp-rpc-server; no trusted local artifact is available: %s"
+                   (error-message-string (cadr artifact)))
+                  remote-local)
+              (cond
+               ((and remote-present
+                     (tramp-rpc-deploy--remote-binary-matches-p
+                      bootstrap-vec local-binary))
+                remote-local)
+               (tramp-rpc-deploy-auto-deploy
+                (when remote-present
+                  (message "Existing remote tramp-rpc-server failed checksum verification; replacing it"))
+                (message "Deploying tramp-rpc-server (%s) to %s..."
+                         arch (tramp-file-name-host vec))
+                (tramp-file-local-name
+                 (tramp-rpc-deploy--transfer-binary bootstrap-vec local-binary)))
+               (remote-present
+                (signal
+                 'remote-file-error
+                 (list "Existing tramp-rpc-server on"
+                       (tramp-file-name-host vec)
+                       "failed checksum verification and auto-deploy is disabled"))))))))))))
 
 (defun tramp-rpc-deploy-remove-binary (vec)
   "Remove the tramp-rpc-server binary from remote VEC."
