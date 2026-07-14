@@ -30,6 +30,12 @@ const CONTROL_TASK_LIMIT: usize = 4;
 const RESPONSE_TASK_LIMIT: usize = 4;
 const EOF_TASK_JOIN_WAIT: std::time::Duration = std::time::Duration::from_millis(500);
 
+#[cfg(test)]
+struct CleanupBarrier {
+    first_pass_complete: tokio::sync::Notify,
+    continue_cleanup: tokio::sync::Notify,
+}
+
 /// Shared handle to the stdout writer, used by both response writing
 /// and the watcher's notification sending.
 pub type WriterHandle = Arc<Mutex<BufWriter<tokio::io::Stdout>>>;
@@ -84,10 +90,15 @@ struct Admissions {
 
 struct AdmissionPermit {
     count: Arc<AtomicUsize>,
+    permits: usize,
 }
 
 impl Admissions {
     fn try_acquire(&self, class: TaskClass) -> Option<AdmissionPermit> {
+        self.try_acquire_many(class, 1)
+    }
+
+    fn try_acquire_many(&self, class: TaskClass, permits: usize) -> Option<AdmissionPermit> {
         let (count, limit) = match class {
             TaskClass::General => (&self.general, GENERAL_TASK_LIMIT),
             TaskClass::Control => (&self.control, CONTROL_TASK_LIMIT),
@@ -95,11 +106,12 @@ impl Admissions {
         };
         count
             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
-                (current < limit).then_some(current + 1)
+                current.checked_add(permits).filter(|next| *next <= limit)
             })
             .ok()
             .map(|_| AdmissionPermit {
                 count: Arc::clone(count),
+                permits,
             })
     }
 }
@@ -119,7 +131,7 @@ impl Drop for AdmissionPermit {
         let released = self
             .count
             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
-                current.checked_sub(1)
+                current.checked_sub(self.permits)
             })
             .is_ok();
         debug_assert!(released, "admission count underflow");
@@ -134,6 +146,14 @@ fn task_class(method: &str) -> TaskClass {
             TaskClass::Control
         }
         _ => TaskClass::General,
+    }
+}
+
+fn request_permit_count(method: &str) -> usize {
+    if method == "batch" {
+        handlers::BATCH_CONCURRENCY
+    } else {
+        1
     }
 }
 
@@ -198,8 +218,11 @@ fn spawn_response<W>(
     });
 }
 
-async fn run_connection<R, W>(reader: R, writer: Arc<Mutex<W>>)
-where
+async fn run_connection<R, W>(
+    reader: R,
+    writer: Arc<Mutex<W>>,
+    #[cfg(test)] cleanup_barrier: Option<Arc<CleanupBarrier>>,
+) where
     R: AsyncRead + Unpin + Send + 'static,
     W: AsyncWrite + Unpin + Send + 'static,
 {
@@ -234,6 +257,23 @@ where
     })
     .await;
     tasks.abort_all();
+    let _ = tokio::time::timeout(EOF_TASK_JOIN_WAIT, async {
+        while tasks.join_next().await.is_some() {}
+    })
+    .await;
+    // A request can register a child after the first map snapshot while its
+    // task is being joined or aborted.  The second pass closes that race.
+    #[cfg(test)]
+    if let Some(barrier) = cleanup_barrier {
+        barrier.first_pass_complete.notify_one();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            barrier.continue_cleanup.notified(),
+        )
+        .await
+        .expect("test should release the connection cleanup barrier");
+    }
+    handlers::cleanup_managed_processes().await;
 }
 
 fn accept_frame<W>(
@@ -256,7 +296,10 @@ fn accept_frame<W>(
         }
     };
     let class = task_class(&request.method);
-    let Some(permit) = admissions.try_acquire(class) else {
+    // A batch reserves its full subrequest concurrency from the shared general
+    // admission bound, so concurrent batches cannot multiply that limit.
+    let Some(permit) = admissions.try_acquire_many(class, request_permit_count(&request.method))
+    else {
         if let Some(permit) = admissions.try_acquire(TaskClass::Response) {
             let response = Response::error(
                 Some(request.id.clone()),
@@ -282,7 +325,13 @@ async fn main() {
         watcher::init(manager);
     }
 
-    run_connection(tokio::io::stdin(), stdout).await;
+    run_connection(
+        tokio::io::stdin(),
+        stdout,
+        #[cfg(test)]
+        None,
+    )
+    .await;
 }
 
 fn decode_request(payload: &[u8]) -> Result<Request, Box<Response>> {
@@ -379,6 +428,35 @@ mod tests {
         assert_eq!(response.error.unwrap().code, RpcError::INVALID_REQUEST);
     }
 
+    #[test]
+    fn test_batches_reserve_shared_general_admission() {
+        let admissions = Admissions::default();
+        let mut permits = Vec::new();
+        for _ in 0..GENERAL_TASK_LIMIT / handlers::BATCH_CONCURRENCY {
+            permits.push(
+                admissions
+                    .try_acquire_many(TaskClass::General, request_permit_count("batch"))
+                    .expect("batch reservation should fit"),
+            );
+        }
+        assert_eq!(
+            admissions.general.load(Ordering::Acquire),
+            GENERAL_TASK_LIMIT
+        );
+        assert!(
+            admissions
+                .try_acquire_many(TaskClass::General, request_permit_count("batch"))
+                .is_none()
+        );
+        assert!(admissions.try_acquire(TaskClass::General).is_none());
+
+        permits.pop();
+        assert_eq!(
+            admissions.general.load(Ordering::Acquire),
+            GENERAL_TASK_LIMIT - handlers::BATCH_CONCURRENCY
+        );
+    }
+
     #[tokio::test]
     async fn test_blocked_error_responses_do_not_block_control_admission() {
         let (server_writer, _client_reader) = tokio::io::duplex(1);
@@ -442,7 +520,7 @@ mod tests {
         let (mut client, server_reader) = tokio::io::duplex(1024);
         let (server_writer, mut client_reader) = tokio::io::duplex(1024);
         let writer = Arc::new(Mutex::new(server_writer));
-        let connection = tokio::spawn(run_connection(server_reader, writer));
+        let connection = tokio::spawn(run_connection(server_reader, writer, None));
         let first = make_request("missing.first", Value::Map(vec![]));
         let second = make_request("missing.second", Value::Map(vec![]));
 
@@ -477,6 +555,7 @@ mod tests {
         let connection = tokio::spawn(run_connection(
             server_reader,
             Arc::new(Mutex::new(server_writer)),
+            None,
         ));
 
         for id in 1..=GENERAL_TASK_LIMIT as i64 {
@@ -636,6 +715,56 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_connection_eof_second_cleanup_catches_late_registration() {
+        let _test_lock = handlers::process::test_process_map_lock().await;
+        let barrier = Arc::new(CleanupBarrier {
+            first_pass_complete: tokio::sync::Notify::new(),
+            continue_cleanup: tokio::sync::Notify::new(),
+        });
+        let (client, server_reader) = tokio::io::duplex(4096);
+        let (server_writer, _client_reader) = tokio::io::duplex(4096);
+        let connection = tokio::spawn(run_connection(
+            server_reader,
+            Arc::new(Mutex::new(server_writer)),
+            Some(Arc::clone(&barrier)),
+        ));
+
+        drop(client);
+        tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            barrier.first_pass_complete.notified(),
+        )
+        .await
+        .expect("connection should reach the second cleanup pass");
+        let start = handlers::process::start(Value::Map(vec![
+            (Value::String("cmd".into()), Value::String("sleep".into())),
+            (
+                Value::String("args".into()),
+                Value::Array(vec![Value::String("30".into())]),
+            ),
+        ]))
+        .await
+        .expect("register child between cleanup passes");
+        assert!(map_get(&start, "pid").and_then(Value::as_u64).is_some());
+        let managed_pids = handlers::process::test_managed_os_pids().await;
+        assert_eq!(managed_pids.len(), 1);
+        let os_pid = managed_pids[0];
+        barrier.continue_cleanup.notify_one();
+        tokio::time::timeout(std::time::Duration::from_secs(3), connection)
+            .await
+            .expect("second cleanup should be bounded")
+            .expect("connection task should not panic");
+        assert!(handlers::process::test_managed_maps_empty().await);
+        assert!(matches!(
+            nix::sys::wait::waitpid(
+                nix::unistd::Pid::from_raw(os_pid),
+                Some(nix::sys::wait::WaitPidFlag::WNOHANG)
+            ),
+            Err(nix::errno::Errno::ECHILD)
+        ));
+    }
+
+    #[tokio::test]
     async fn test_connection_eof_sigkills_blocked_pipe_and_pty_requests() {
         let _test_lock = handlers::process::test_process_map_lock().await;
         let (mut client, server_reader) = tokio::io::duplex(4096);
@@ -643,6 +772,7 @@ mod tests {
         let connection = tokio::spawn(run_connection(
             server_reader,
             Arc::new(Mutex::new(server_writer)),
+            None,
         ));
         let temp = tempfile::tempdir().expect("temporary marker directory");
         let markers = [
@@ -758,6 +888,7 @@ mod tests {
         let connection = tokio::spawn(run_connection(
             server_reader,
             Arc::new(Mutex::new(server_writer)),
+            None,
         ));
 
         let start = make_request(

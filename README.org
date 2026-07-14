@@ -216,7 +216,7 @@ The dispatcher exposes these public methods:
 
 | Category | Method | Description |
 |----------+--------+-------------|
-| Batch | ~batch~ | Execute multiple requests concurrently. |
+| Batch | ~batch~ | Execute up to 64 requests with bounded concurrency. |
 | File | ~file.stat~ | Return file metadata. |
 | File | ~file.truename~ | Resolve a file's canonical path. |
 | Directory | ~dir.list~ | List directory entries, optionally with attributes. |
