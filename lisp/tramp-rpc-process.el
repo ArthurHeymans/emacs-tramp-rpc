@@ -252,17 +252,6 @@ Returns the remote process PID."
                                    ,@(when env `((env . ,env)))))))
     (alist-get 'pid result)))
 
-(defun tramp-rpc--read-remote-process (vec pid)
-  "Read output from remote process PID on VEC.
-Returns plist with :stdout, :stderr, :exited, :exit-code."
-  (let ((result (tramp-rpc--call vec "process.read" `((pid . ,pid)))))
-    (list :stdout (when-let* ((s (alist-get 'stdout result)))
-                    (tramp-rpc--binary-bytes s))
-          :stderr (when-let* ((s (alist-get 'stderr result)))
-                    (tramp-rpc--binary-bytes s))
-          :exited (alist-get 'exited result)
-          :exit-code (alist-get 'exit_code result))))
-
 (defun tramp-rpc--write-remote-process (vec pid data &optional owner-process)
   "Write DATA to stdin of remote process PID on VEC.
 The queue remains bound to OWNER-PROCESS's original connection generation."
