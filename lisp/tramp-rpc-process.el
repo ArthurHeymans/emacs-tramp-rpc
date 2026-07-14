@@ -49,7 +49,7 @@
 (declare-function tramp-rpc--call-async "tramp-rpc" (vec method params callback &optional connection))
 (declare-function tramp-rpc--get-direnv-environment "tramp-rpc")
 (declare-function tramp-rpc--get-remote-login-shell "tramp-rpc")
-(declare-function tramp-rpc--decode-output "tramp-rpc")
+(declare-function tramp-rpc--binary-bytes "tramp-rpc")
 (declare-function tramp-rpc--controlmaster-socket-path "tramp-rpc")
 (declare-function tramp-rpc--hops-to-proxyjump "tramp-rpc")
 (declare-function tramp-rpc--port-to-string "tramp-rpc")
@@ -154,10 +154,66 @@ CONNECTION is the captured RPC connection process."
          (or (not (processp owner)) (process-live-p owner)))))
 
 (defun tramp-rpc--process-write-data-bytes (data)
-  "Return DATA in the binary representation sent to the server."
+  "Return already-encoded DATA as a unibyte string for the server.
+The process I/O handlers perform the requested input encoding before DATA
+enters the queue.  Keep this helper byte-preserving so queued data cannot be
+encoded a second time."
   (if (multibyte-string-p data)
-      (encode-coding-string data 'utf-8-unix)
+      (encode-coding-string data 'binary)
     data))
+
+(defun tramp-rpc--process-coding (process)
+  "Return PROCESS's public (DECODING . ENCODING) coding pair."
+  (or (process-get process :tramp-rpc-coding)
+      (cons (car default-process-coding-system)
+            (cdr default-process-coding-system))))
+
+(defun tramp-rpc--encode-process-input (process data)
+  "Encode DATA once with PROCESS's public encoding coding system.
+Return raw unibyte bytes suitable for MessagePack bin payloads."
+  ;; Coding unibyte input preserves arbitrary bytes for binary and
+  ;; no-conversion, while Latin-1 and UTF-8 apply their normal semantics.
+  (encode-coding-string data (cdr (tramp-rpc--process-coding process))))
+
+(defun tramp-rpc--start-cat-relays (name buffer stderr-buffer cleanup)
+  "Start local cat relays for NAME, BUFFER, and STDERR-BUFFER.
+If relay construction fails, delete any relay already created and call CLEANUP
+before propagating the original error.
+Return (STDOUT-PROCESS . STDERR-PROCESS)."
+  (let (stdout-process stderr-process complete)
+    (unwind-protect
+        (prog1
+            (progn
+              (let ((process-connection-type nil))
+                (setq stdout-process
+                      (start-process name buffer "cat")))
+              (when stderr-buffer
+                (let ((process-connection-type nil))
+                  (setq stderr-process
+                        (start-process (format "%s-stderr" name)
+                                       stderr-buffer "cat")))
+                (set-process-query-on-exit-flag stderr-process nil))
+              (cons stdout-process stderr-process))
+          (setq complete t))
+      (unless complete
+        (dolist (process (list stderr-process stdout-process))
+          (when (process-live-p process)
+            (ignore-errors (delete-process process))))
+        (ignore-errors (funcall cleanup))))))
+
+(defun tramp-rpc--configure-relay-coding (process coding)
+  "Configure PROCESS's binary relay and remember public CODING.
+The relay's write side stays binary because output delivered to it is already
+raw remote bytes.  Its read side remains the requested decoder, allowing
+Emacs to retain decoder state across RPC chunks."
+  (let* ((requested (tramp-rpc--normalize-coding
+                     (or coding default-process-coding-system)))
+         (pair (if (consp requested)
+                   requested
+                 (cons requested requested))))
+    (set-process-coding-system process (car pair) 'binary)
+    (process-put process :tramp-rpc-coding pair)
+    pair))
 
 (defun tramp-rpc--process-write-queue-pending-bytes (queue)
   "Return the number of bytes still held by QUEUE, including its current write."
@@ -227,11 +283,9 @@ Returns the remote process PID."
 Returns plist with :stdout, :stderr, :exited, :exit-code."
   (let ((result (tramp-rpc--call vec "process.read" `((pid . ,pid)))))
     (list :stdout (when-let* ((s (alist-get 'stdout result)))
-                    (tramp-rpc--decode-output
-                     s (alist-get 'stdout_encoding result)))
+                    (tramp-rpc--binary-bytes s))
           :stderr (when-let* ((s (alist-get 'stderr result)))
-                    (tramp-rpc--decode-output
-                     s (alist-get 'stderr_encoding result)))
+                    (tramp-rpc--binary-bytes s))
           :exited (alist-get 'exited result)
           :exit-code (alist-get 'exit_code result))))
 
@@ -525,12 +579,12 @@ RESPONSE is the decoded RPC response plist."
           (let* ((info (gethash local-process tramp-rpc--async-processes))
                  (stderr-buffer (plist-get info :stderr-buffer))
                  (result (plist-get response :result))
+                 ;; RPC process streams are MessagePack bin values.  Keep
+                 ;; them raw until the local relay's incremental decoder.
                  (stdout (when-let* ((s (alist-get 'stdout result)))
-                           (tramp-rpc--decode-output
-                            s (alist-get 'stdout_encoding result))))
+                           (tramp-rpc--binary-bytes s)))
                  (stderr (when-let* ((s (alist-get 'stderr result)))
-                           (tramp-rpc--decode-output
-                            s (alist-get 'stderr_encoding result))))
+                           (tramp-rpc--binary-bytes s)))
                  (exited (alist-get 'exited result))
                  (exit-code (alist-get 'exit_code result)))
 
@@ -778,7 +832,10 @@ Resolves program path and loads direnv environment from working directory."
              (use-pty (eq connection-type 'pty))
              (pipe-sudo (and sudo-command (not use-pty)))
              (sudo-password nil)
-             (coding (tramp-rpc--normalize-coding coding)))
+             ;; Native process creation resolves omitted/nil coding from
+             ;; `default-process-coding-system'.
+             (coding (tramp-rpc--normalize-coding
+                      (or coding default-process-coding-system))))
         ;; For non-PTY literal sudo commands, validate sudo in the same RPC pipe
         ;; execution context that will run the command.  If a password is needed,
         ;; use sudo's stdin wrapper; a separate PTY preauth can miss tty-scoped
@@ -822,40 +879,38 @@ Resolves program path and loads direnv environment from working directory."
                    (program-args (cdr command))
                    (remote-pid (tramp-rpc--start-remote-process
                                 v program program-args localname process-env))
-                   ;; Use a local cat process as relay: we write output to its
-                   ;; stdin and it echoes to stdout, triggering proper I/O events.
-                   (local-process (let ((process-connection-type nil))
-                                    (start-process (or name "tramp-rpc-async")
-                                                   buffer
-                                                   "cat")))
+                   (connection (tramp-rpc--get-connection v))
                    (stderr-buffer (cond
                                    ((bufferp stderr) stderr)
                                    ((stringp stderr) (get-buffer-create stderr))
                                    (t nil)))
-                   ;; Create a stderr cat relay so that
-                   ;; (get-buffer-process stderr-buffer) returns a process,
-                   ;; matching the contract of native `make-process' with :stderr.
-                   (stderr-process
-                    (when stderr-buffer
-                      (let* ((process-connection-type nil)
-                             (proc (start-process
-                                    (format "%s-stderr" (or name "tramp-rpc-async"))
-                                    stderr-buffer
-                                    "cat")))
-                        (set-process-query-on-exit-flag proc nil)
-                        proc))))
+                   ;; Construct both local relays as one transaction.  If the
+                   ;; second `cat' fails, tear down the first and the remote
+                   ;; process rather than leaving either orphaned.
+                   (relays
+                    (tramp-rpc--start-cat-relays
+                     (or name "tramp-rpc-async") buffer stderr-buffer
+                     (lambda ()
+                       (ignore-errors
+                         (tramp-rpc--kill-remote-process
+                          v remote-pid 9 connection)))))
+                   (local-process (car relays))
+                   (stderr-process (cdr relays)))
+
+              ;; The public pair controls user input encoding.  The local
+              ;; relay itself reads with the requested decoder and writes
+              ;; binary remote bytes without another encoding pass.
+              (tramp-rpc--configure-relay-coding local-process coding)
+              (when stderr-process
+                (tramp-rpc--configure-relay-coding stderr-process coding))
+              (set-process-query-on-exit-flag local-process (not noquery))
 
               ;; Feed sudo's stdin password before exposing the relay to callers;
               ;; subsequent writes use the same queue and stay ordered after it.
               (when sudo-password
                 (tramp-rpc--write-remote-process
-                 v remote-pid (concat sudo-password "\n")))
-
-              ;; Configure the local relay process.
-              (when coding
-                (apply #'set-process-coding-system local-process
-                       (tramp-rpc--coding-args coding)))
-              (set-process-query-on-exit-flag local-process (not noquery))
+                 v remote-pid (tramp-rpc--encode-process-input
+                               local-process (concat sudo-password "\n"))))
 
               (process-put local-process :tramp-rpc-vec v)
               (process-put local-process :tramp-rpc-pid remote-pid)
@@ -1122,29 +1177,32 @@ DIRENV-ENV is an optional alist of environment variables for the process."
                                      (env . ,full-env))))
          (remote-pid (alist-get 'pid result))
          (tty-name (alist-get 'tty_name result))
+         (connection (tramp-rpc--get-connection vec))
          ;; Normalize buffer - it can be t, nil, a buffer, or a string
          (actual-buffer (cond
                          ((bufferp buffer) buffer)
                          ((stringp buffer) (get-buffer-create buffer))
                          ((eq buffer t) (current-buffer))
                          (t nil)))
-         ;; Create a local pipe process as a relay
-         ;; We use make-pipe-process for the local side - all actual I/O
-         ;; goes through our PTY RPC calls, not through this process.
-         (local-process (make-pipe-process
-                         :name (or name "tramp-rpc-pty")
-                         :buffer actual-buffer
-                         :coding (or (tramp-rpc--normalize-coding coding)
-                                     'utf-8-unix)
-                         :noquery t)))
+         ;; Use a local cat relay so Emacs owns incremental decoding of raw
+         ;; PTY bytes, exactly as it does for pipe process output.  If local
+         ;; construction fails, close the already-created remote PTY through
+         ;; the generation that created it.
+         (relays
+          (tramp-rpc--start-cat-relays
+           (or name "tramp-rpc-pty") actual-buffer nil
+           (lambda ()
+             (ignore-errors
+               (tramp-rpc--call vec "process.close_pty"
+                                `((pid . ,remote-pid)) connection)))))
+         (local-process (car relays)))
 
-    ;; Configure the local relay process
+    ;; Configure the local relay process.  Its write side is binary; the
+    ;; public coding pair is retained for process API and input encoding.
+    (tramp-rpc--configure-relay-coding local-process coding)
     (set-process-filter local-process (or filter #'tramp-rpc--pty-default-filter))
     (set-process-sentinel local-process #'tramp-rpc--pty-sentinel)
     (set-process-query-on-exit-flag local-process (not noquery))
-    (when coding
-      (apply #'set-process-coding-system local-process
-             (tramp-rpc--coding-args coding)))
 
     ;; Store process info
     (process-put local-process :tramp-rpc-pty t)
@@ -1162,18 +1220,17 @@ DIRENV-ENV is an optional alist of environment variables for the process."
                  #'tramp-rpc--adjust-pty-window-size)
 
     ;; Track the PTY process and its exact transport generation.
-    (let ((connection (tramp-rpc--get-connection vec)))
-      (puthash local-process
-               (list :vec vec :pid remote-pid
-                     :connection-process (plist-get connection :process)
-                     :rpc-pty t
-                     :poll-timer nil)
-               tramp-rpc--pty-processes)
-      ;; Preserve the connection plist itself: PTY exit uses it to send its
-      ;; close request through the exact transport generation that created it.
-      (process-put local-process :tramp-rpc-connection connection)
-      (process-put local-process :tramp-rpc-connection-process
-                   (plist-get connection :process)))
+    (puthash local-process
+             (list :vec vec :pid remote-pid
+                   :connection-process (plist-get connection :process)
+                   :rpc-pty t
+                   :poll-timer nil)
+             tramp-rpc--pty-processes)
+    ;; Preserve the connection plist itself: PTY exit uses it to send its
+    ;; close request through the exact transport generation that created it.
+    (process-put local-process :tramp-rpc-connection connection)
+    (process-put local-process :tramp-rpc-connection-process
+                 (plist-get connection :process))
 
     ;; Start async read loop
     (tramp-rpc--pty-start-async-read local-process)
@@ -1234,22 +1291,20 @@ RESPONSE is the decoded RPC response plist."
              (process-live-p local-process)
              (gethash local-process tramp-rpc--pty-processes))
     (condition-case nil
-        (let* ((result (plist-get response :result))
+               (let* ((result (plist-get response :result))
+               ;; Keep PTY bytes raw; the relay decoder owns character
+               ;; conversion and preserves split multibyte sequences.
                (output (when-let* ((o (alist-get 'output result)))
-                         (tramp-rpc--decode-output
-                          o (alist-get 'output_encoding result))))
+                         (tramp-rpc--binary-bytes o)))
                (exited (alist-get 'exited result))
                 (exit-code (alist-get 'exit_code result)))
 
-          ;; Deliver output via filter
+          ;; Feed raw bytes to the relay.  Its read-side decoder is
+          ;; incremental, so a character split across RPC responses is kept
+          ;; intact instead of being decoded once per chunk.
           (when (and output (> (length output) 0))
-            (if-let* ((filter (process-filter local-process)))
-                (funcall filter local-process output)
-              (when-let* ((buf (process-buffer local-process)))
-                (when (buffer-live-p buf)
-                  (with-current-buffer buf
-                    (goto-char (point-max))
-                    (insert output))))))
+            (let ((tramp-rpc--delivering-output t))
+              (process-send-string local-process output)))
 
           ;; Handle process exit or chain next read
           (if exited
@@ -1275,8 +1330,13 @@ RESPONSE is the decoded RPC response plist."
         (tramp-rpc--call vec "process.close_pty" `((pid . ,pid)) connection)))
     (process-put local-process :tramp-rpc-exit-code (or exit-code 0))
     (process-put local-process :tramp-rpc-exited t)
+    ;; Close the relay's local stdin and let cat flush the final PTY bytes
+    ;; before exiting naturally.  A zero-timeout `accept-process-output' after
+    ;; `process-send-string' does not wait for the relay round trip, while
+    ;; deleting it here discards the final output returned with EXITED.
     (when (process-live-p local-process)
-      (delete-process local-process))))
+      (let ((tramp-rpc--closing-local-relay t))
+        (ignore-errors (process-send-eof local-process))))))
 
 (defun tramp-rpc--pty-sentinel (process event)
   "Sentinel for PTY relay PROCESS, preserving its user sentinel once."
