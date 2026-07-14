@@ -635,6 +635,11 @@ using the current `tab-width' instead."
   :type 'boolean
   :group 'tramp-rpc)
 
+(defconst tramp-rpc-magit--metadata-batch-size 64
+  "Maximum metadata requests sent in one RPC batch.
+The server rejects batches larger than 64 entries, so status prefetches for
+large worktrees must be split without losing item/result ordering.")
+
 (defvar tramp-rpc-magit--ancestors-cache nil
   "Cached ancestor scan data from server-side RPC.
 This is populated by `tramp-rpc-magit--prefetch' for file existence checks.")
@@ -1087,16 +1092,26 @@ whitespace."
           (push (cons "file.truename" (tramp-rpc--encode-path local-file))
                 requests))))
     (when requests
-      (let ((results (tramp-rpc--call-batch vec (nreverse requests))))
-        (cl-mapc
-         (lambda (item result)
-           (unless (and (consp result) (plist-get result :error))
-             (pcase (car item)
-               ('stat (tramp-rpc-magit--cache-file-stat vec (cadr item) result))
-               ('truename (tramp-rpc-magit--cache-file-truename
-                           vec (cadr item) result)))))
-         (nreverse items)
-         results)))))
+      (setq items (nreverse items)
+            requests (nreverse requests))
+      (while requests
+        (let (batch-items batch-requests)
+          (dotimes (_ tramp-rpc-magit--metadata-batch-size)
+            (when requests
+              (push (pop items) batch-items)
+              (push (pop requests) batch-requests)))
+          (setq batch-items (nreverse batch-items)
+                batch-requests (nreverse batch-requests))
+          (cl-mapc
+           (lambda (item result)
+             (unless (and (consp result) (plist-get result :error))
+               (pcase (car item)
+                 ('stat (tramp-rpc-magit--cache-file-stat
+                         vec (cadr item) result))
+                 ('truename (tramp-rpc-magit--cache-file-truename
+                             vec (cadr item) result)))))
+           batch-items
+           (tramp-rpc--call-batch vec batch-requests)))))))
 
 (defun tramp-rpc-magit--prefetch-dynamic-status (vec directory root-local)
   "Prefetch status data that depends on initial git output.

@@ -38,6 +38,12 @@ const DEFERRED_REQUEST_LIMIT: usize = 64;
 const ERROR_RESPONSE_CHANNEL_SIZE: usize = 16;
 const EOF_TASK_JOIN_WAIT: std::time::Duration = std::time::Duration::from_millis(500);
 
+#[cfg(test)]
+struct CleanupBarrier {
+    first_pass_complete: tokio::sync::Notify,
+    continue_cleanup: tokio::sync::Notify,
+}
+
 /// Shared handle to the stdout writer, used by both response writing
 /// and the watcher's notification sending.
 pub type WriterHandle = Arc<Mutex<BufWriter<tokio::io::Stdout>>>;
@@ -94,7 +100,7 @@ async fn read_frames<R>(
     }
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum TaskClass {
     General,
     Control,
@@ -108,13 +114,27 @@ struct Admissions {
 }
 
 impl Admissions {
+    #[cfg(test)]
     fn try_acquire(&self, class: TaskClass) -> Option<OwnedSemaphorePermit> {
-        let semaphore = match class {
+        self.try_acquire_many(class, 1)
+    }
+
+    fn semaphore(&self, class: TaskClass) -> &Arc<Semaphore> {
+        match class {
             TaskClass::General => &self.general,
             TaskClass::Control => &self.control,
             TaskClass::PtyWrite => &self.pty_write,
-        };
-        Arc::clone(semaphore).try_acquire_owned().ok()
+        }
+    }
+
+    fn available_permits(&self, class: TaskClass) -> usize {
+        self.semaphore(class).available_permits()
+    }
+
+    fn try_acquire_many(&self, class: TaskClass, permits: usize) -> Option<OwnedSemaphorePermit> {
+        Arc::clone(self.semaphore(class))
+            .try_acquire_many_owned(u32::try_from(permits).ok()?)
+            .ok()
     }
 }
 
@@ -140,6 +160,14 @@ fn task_class(method: &str) -> TaskClass {
         // lifecycle operations retain their separately reserved control slots.
         "process.write_pty" => TaskClass::PtyWrite,
         _ => TaskClass::General,
+    }
+}
+
+fn request_permit_count(method: &str) -> usize {
+    if method == "batch" {
+        handlers::BATCH_CONCURRENCY
+    } else {
+        1
     }
 }
 
@@ -189,8 +217,11 @@ fn spawn_request<W>(
     });
 }
 
-async fn run_connection<R, W>(reader: R, writer: Arc<Mutex<W>>)
-where
+async fn run_connection<R, W>(
+    reader: R,
+    writer: Arc<Mutex<W>>,
+    #[cfg(test)] cleanup_barrier: Option<Arc<CleanupBarrier>>,
+) where
     R: AsyncRead + Unpin + Send + 'static,
     W: AsyncWrite + Unpin + Send + 'static,
 {
@@ -213,9 +244,16 @@ where
     let mut tasks: JoinSet<()> = JoinSet::new();
     let admissions = Admissions::default();
     let mut deferred: VecDeque<Request> = VecDeque::new();
+    let mut general_bypass_budget = None;
 
     loop {
-        start_admissible(&mut deferred, &mut tasks, &writer, &admissions);
+        start_admissible(
+            &mut deferred,
+            &mut tasks,
+            &writer,
+            &admissions,
+            &mut general_bypass_budget,
+        );
         // Stop pulling frames while the backlog is full.  The bounded frame
         // channel then stops draining the pipe, which is the throttle the
         // client can actually observe.
@@ -259,34 +297,109 @@ where
     // children before joining request tasks: a task blocked on their pipes or
     // a descendant-held descriptor must not prevent SIGKILL escalation.
     handlers::cleanup_managed_processes().await;
-    let _ = tokio::time::timeout(EOF_TASK_JOIN_WAIT, async {
-        while tasks.join_next().await.is_some() {}
-    })
-    .await;
+    drain_tasks_for(&mut tasks, EOF_TASK_JOIN_WAIT).await;
     tasks.abort_all();
+    // `spawn_blocking` work cannot be cancelled once it has started.  Do not
+    // let such a task hold EOF teardown forever; the second managed-child
+    // cleanup below still catches registrations completed before this deadline.
+    drain_tasks_for(&mut tasks, EOF_TASK_JOIN_WAIT).await;
     frame_reader.abort();
+    // A request can register a child after the first map snapshot while its
+    // task is being joined or aborted.  The second pass closes that race.
+    #[cfg(test)]
+    if let Some(barrier) = cleanup_barrier {
+        barrier.first_pass_complete.notify_one();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            barrier.continue_cleanup.notified(),
+        )
+        .await
+        .expect("test should release the connection cleanup barrier");
+    }
+    handlers::cleanup_managed_processes().await;
     drop(errors);
     let _ = tokio::time::timeout(EOF_TASK_JOIN_WAIT, error_writer).await;
 }
 
+async fn drain_tasks_for(tasks: &mut JoinSet<()>, wait: std::time::Duration) {
+    let _ = tokio::time::timeout(wait, async { while tasks.join_next().await.is_some() {} }).await;
+}
+
 /// Start every queued request that currently fits in its class.
 ///
-/// Requests are kept in arrival order, but a class with free slots is never
-/// blocked by a queued request of a saturated class -- that is what keeps
-/// `process.kill' responsive behind a backlog of long-polling reads.
+/// Requests of different classes do not block one another.  Within the general
+/// class, a large request gets a bounded bypass budget equal to the permits
+/// that were idle when it first became blocked.  Those permits may serve
+/// already-arriving one-permit work once, but are then reserved as they return,
+/// preventing both head-of-line idling and indefinite batch starvation.
 fn start_admissible<W>(
     deferred: &mut VecDeque<Request>,
     tasks: &mut JoinSet<()>,
     writer: &Arc<Mutex<W>>,
     admissions: &Admissions,
+    general_bypass_budget: &mut Option<usize>,
 ) where
     W: AsyncWrite + Unpin + Send + 'static,
 {
     let mut still_deferred = VecDeque::with_capacity(deferred.len());
+    let mut general_waiting = false;
+    let mut control_blocked = false;
+    let mut pty_write_blocked = false;
     while let Some(request) = deferred.pop_front() {
-        match admissions.try_acquire(task_class(&request.method)) {
-            Some(permit) => spawn_request(tasks, request, permit, writer),
-            None => still_deferred.push_back(request),
+        let class = task_class(&request.method);
+        let permit_count = request_permit_count(&request.method);
+
+        if class == TaskClass::General && general_waiting {
+            let Some(budget) = general_bypass_budget.as_mut() else {
+                still_deferred.push_back(request);
+                continue;
+            };
+            if permit_count > *budget {
+                still_deferred.push_back(request);
+                continue;
+            }
+            if let Some(permit) = admissions.try_acquire_many(class, permit_count) {
+                *budget -= permit_count;
+                spawn_request(tasks, request, permit, writer);
+            } else {
+                still_deferred.push_back(request);
+            }
+            continue;
+        }
+
+        let blocked = match class {
+            TaskClass::General => false,
+            TaskClass::Control => control_blocked,
+            TaskClass::PtyWrite => pty_write_blocked,
+        };
+        if blocked {
+            still_deferred.push_back(request);
+            continue;
+        }
+
+        match admissions.try_acquire_many(class, permit_count) {
+            Some(permit) => {
+                if class == TaskClass::General && permit_count > 1 {
+                    *general_bypass_budget = None;
+                }
+                spawn_request(tasks, request, permit, writer);
+            }
+            None => {
+                if class == TaskClass::General && permit_count > 1 {
+                    if general_bypass_budget.is_none() {
+                        *general_bypass_budget =
+                            Some(admissions.available_permits(TaskClass::General));
+                    }
+                    general_waiting = true;
+                } else {
+                    match class {
+                        TaskClass::General => general_waiting = true,
+                        TaskClass::Control => control_blocked = true,
+                        TaskClass::PtyWrite => pty_write_blocked = true,
+                    }
+                }
+                still_deferred.push_back(request);
+            }
         }
     }
     *deferred = still_deferred;
@@ -311,7 +424,21 @@ async fn accept_frame<W>(
             return;
         }
     };
-    match admissions.try_acquire(task_class(&request.method)) {
+    // Never let a newly arrived request bypass an older deferred request in
+    // the same class.  Otherwise a stream of one-permit requests can consume
+    // each newly freed slot before an older batch can reserve all its permits.
+    let class = task_class(&request.method);
+    if deferred
+        .iter()
+        .any(|queued| task_class(&queued.method) == class)
+    {
+        deferred.push_back(request);
+        return;
+    }
+
+    // A batch reserves its full subrequest concurrency from the shared general
+    // admission bound, so concurrent batches cannot multiply that limit.
+    match admissions.try_acquire_many(class, request_permit_count(&request.method)) {
         Some(permit) => spawn_request(tasks, request, permit, writer),
         // Queue rather than reject.  The caller stops reading frames once the
         // queue is full, so the client is throttled instead of being handed a
@@ -333,7 +460,13 @@ async fn main() {
         watcher::init(manager);
     }
 
-    run_connection(tokio::io::stdin(), stdout).await;
+    run_connection(
+        tokio::io::stdin(),
+        stdout,
+        #[cfg(test)]
+        None,
+    )
+    .await;
 }
 
 fn decode_request(payload: &[u8]) -> Result<Request, Box<Response>> {
@@ -411,6 +544,36 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_abort_joinset_drain_is_bounded_for_blocking_task() {
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let mut tasks = JoinSet::new();
+        tasks.spawn_blocking(move || {
+            started_tx.send(()).expect("test should observe task start");
+            release_rx
+                .recv()
+                .expect("test should release blocking task");
+        });
+        started_rx.await.expect("blocking task should start");
+
+        tasks.abort_all();
+        tokio::time::timeout(
+            std::time::Duration::from_millis(100),
+            drain_tasks_for(&mut tasks, std::time::Duration::from_millis(10)),
+        )
+        .await
+        .expect("aborted JoinSet drain must not wait for blocking work");
+        assert_eq!(tasks.len(), 1);
+
+        release_tx.send(()).expect("release blocking task");
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            while tasks.join_next().await.is_some() {}
+        })
+        .await
+        .expect("released blocking task should join");
+    }
+
+    #[tokio::test]
     async fn test_parse_request() {
         let params = Value::Map(vec![(
             Value::String("path".into()),
@@ -475,6 +638,149 @@ mod tests {
         assert_eq!(frames_rx.recv().await, Some(vec![0xc0]));
     }
 
+    #[test]
+    fn test_batches_reserve_shared_general_admission() {
+        let admissions = Admissions::default();
+        let mut permits = Vec::new();
+        for _ in 0..GENERAL_TASK_LIMIT / handlers::BATCH_CONCURRENCY {
+            permits.push(
+                admissions
+                    .try_acquire_many(TaskClass::General, request_permit_count("batch"))
+                    .expect("batch reservation should fit"),
+            );
+        }
+        assert_eq!(admissions.general.available_permits(), 0);
+        assert!(
+            admissions
+                .try_acquire_many(TaskClass::General, request_permit_count("batch"))
+                .is_none()
+        );
+        assert!(admissions.try_acquire(TaskClass::General).is_none());
+
+        permits.pop();
+        assert_eq!(
+            admissions.general.available_permits(),
+            handlers::BATCH_CONCURRENCY
+        );
+    }
+
+    #[tokio::test]
+    async fn test_older_batch_blocks_later_general_requests_until_it_fits() {
+        let admissions = Admissions::default();
+        let _held = admissions
+            .try_acquire_many(
+                TaskClass::General,
+                GENERAL_TASK_LIMIT - handlers::BATCH_CONCURRENCY + 1,
+            )
+            .expect("hold all but three general permits");
+        let mut deferred = VecDeque::from([
+            Request {
+                version: "2.0".into(),
+                id: RequestId::Number(1),
+                method: "batch".into(),
+                params: Value::Nil,
+            },
+            Request {
+                version: "2.0".into(),
+                id: RequestId::Number(2),
+                method: "process.status".into(),
+                params: Value::Nil,
+            },
+            Request {
+                version: "2.0".into(),
+                id: RequestId::Number(3),
+                method: "process.status".into(),
+                params: Value::Nil,
+            },
+            Request {
+                version: "2.0".into(),
+                id: RequestId::Number(4),
+                method: "process.status".into(),
+                params: Value::Nil,
+            },
+            Request {
+                version: "2.0".into(),
+                id: RequestId::Number(5),
+                method: "process.status".into(),
+                params: Value::Nil,
+            },
+        ]);
+        let writer = Arc::new(Mutex::new(tokio::io::sink()));
+        let mut tasks = JoinSet::new();
+        let mut bypass_budget = None;
+
+        start_admissible(
+            &mut deferred,
+            &mut tasks,
+            &writer,
+            &admissions,
+            &mut bypass_budget,
+        );
+
+        assert_eq!(tasks.len(), 3);
+        assert_eq!(bypass_budget, Some(0));
+        assert_eq!(deferred.len(), 2);
+        assert_eq!(deferred[0].method, "batch");
+        assert!(matches!(&deferred[1].id, RequestId::Number(5)));
+        tasks.abort_all();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_new_general_requests_share_bounded_batch_bypass_budget() {
+        let admissions = Admissions::default();
+        let _held = admissions
+            .try_acquire_many(
+                TaskClass::General,
+                GENERAL_TASK_LIMIT - handlers::BATCH_CONCURRENCY + 1,
+            )
+            .expect("hold all but three general permits");
+        let mut deferred = VecDeque::from([Request {
+            version: "2.0".into(),
+            id: RequestId::Number(1),
+            method: "batch".into(),
+            params: Value::Nil,
+        }]);
+        let writer = Arc::new(Mutex::new(tokio::io::sink()));
+        let mut tasks = JoinSet::new();
+        let mut bypass_budget = None;
+        let (errors, _error_responses) = mpsc::channel(1);
+
+        start_admissible(
+            &mut deferred,
+            &mut tasks,
+            &writer,
+            &admissions,
+            &mut bypass_budget,
+        );
+        assert_eq!(bypass_budget, Some(3));
+
+        for id in 2..=5 {
+            accept_frame(
+                make_request_with_id(id, "process.status", Value::Nil),
+                &mut deferred,
+                &admissions,
+                &mut tasks,
+                &writer,
+                &errors,
+            )
+            .await;
+        }
+        start_admissible(
+            &mut deferred,
+            &mut tasks,
+            &writer,
+            &admissions,
+            &mut bypass_budget,
+        );
+
+        assert_eq!(tasks.len(), 3);
+        assert_eq!(bypass_budget, Some(0));
+        assert_eq!(deferred.len(), 2);
+        assert_eq!(deferred[0].method, "batch");
+        assert!(matches!(&deferred[1].id, RequestId::Number(5)));
+        tasks.abort_all();
+    }
+
     /// Malformed frames must always be answered.  A dropped response leaves
     /// the client blocked on its own timeout with no diagnosis.
     #[tokio::test]
@@ -488,6 +794,7 @@ mod tests {
         let connection = tokio::spawn(run_connection(
             server_reader,
             Arc::new(Mutex::new(server_writer)),
+            None,
         ));
 
         let malformed = ERROR_RESPONSE_CHANNEL_SIZE * 3;
@@ -511,7 +818,7 @@ mod tests {
         }
 
         drop(writes.await.unwrap());
-        connection.await.unwrap();
+        connection.await.expect("connection task should not panic");
     }
 
     fn frame(payload: &[u8]) -> Vec<u8> {
@@ -546,7 +853,7 @@ mod tests {
         let (mut client, server_reader) = tokio::io::duplex(1024);
         let (server_writer, mut client_reader) = tokio::io::duplex(1024);
         let writer = Arc::new(Mutex::new(server_writer));
-        let connection = tokio::spawn(run_connection(server_reader, writer));
+        let connection = tokio::spawn(run_connection(server_reader, writer, None));
         let first = make_request("missing.first", Value::Map(vec![]));
         let second = make_request("missing.second", Value::Map(vec![]));
 
@@ -581,6 +888,7 @@ mod tests {
         let connection = tokio::spawn(run_connection(
             server_reader,
             Arc::new(Mutex::new(server_writer)),
+            None,
         ));
 
         for id in 1..=GENERAL_TASK_LIMIT as i64 {
@@ -848,6 +1156,56 @@ mod tests {
     /// still be SIGKILLed and reaped when the transport reaches EOF, so the
     /// connection task terminates within its bounded cleanup window.
     #[tokio::test]
+    async fn test_connection_eof_second_cleanup_catches_late_registration() {
+        let _test_lock = handlers::process::test_process_map_lock().await;
+        let barrier = Arc::new(CleanupBarrier {
+            first_pass_complete: tokio::sync::Notify::new(),
+            continue_cleanup: tokio::sync::Notify::new(),
+        });
+        let (client, server_reader) = tokio::io::duplex(4096);
+        let (server_writer, _client_reader) = tokio::io::duplex(4096);
+        let connection = tokio::spawn(run_connection(
+            server_reader,
+            Arc::new(Mutex::new(server_writer)),
+            Some(Arc::clone(&barrier)),
+        ));
+
+        drop(client);
+        tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            barrier.first_pass_complete.notified(),
+        )
+        .await
+        .expect("connection should reach the second cleanup pass");
+        let start = handlers::process::start(Value::Map(vec![
+            (Value::String("cmd".into()), Value::String("sleep".into())),
+            (
+                Value::String("args".into()),
+                Value::Array(vec![Value::String("30".into())]),
+            ),
+        ]))
+        .await
+        .expect("register child between cleanup passes");
+        assert!(map_get(&start, "pid").and_then(Value::as_u64).is_some());
+        let managed_pids = handlers::process::test_managed_os_pids().await;
+        assert_eq!(managed_pids.len(), 1);
+        let os_pid = managed_pids[0];
+        barrier.continue_cleanup.notify_one();
+        tokio::time::timeout(std::time::Duration::from_secs(3), connection)
+            .await
+            .expect("second cleanup should be bounded")
+            .expect("connection task should not panic");
+        assert!(handlers::process::test_managed_maps_empty().await);
+        assert!(matches!(
+            nix::sys::wait::waitpid(
+                nix::unistd::Pid::from_raw(os_pid),
+                Some(nix::sys::wait::WaitPidFlag::WNOHANG)
+            ),
+            Err(nix::errno::Errno::ECHILD)
+        ));
+    }
+
+    #[tokio::test]
     async fn test_connection_eof_sigkills_blocked_pipe_and_pty_requests() {
         let _test_lock = handlers::process::test_process_map_lock().await;
         let (mut client, server_reader) = tokio::io::duplex(4096);
@@ -855,6 +1213,7 @@ mod tests {
         let connection = tokio::spawn(run_connection(
             server_reader,
             Arc::new(Mutex::new(server_writer)),
+            None,
         ));
         let temp = tempfile::tempdir().expect("temporary marker directory");
         let markers = [
@@ -975,6 +1334,7 @@ mod tests {
         let connection = tokio::spawn(run_connection(
             server_reader,
             Arc::new(Mutex::new(server_writer)),
+            None,
         ));
 
         let start = make_request(
