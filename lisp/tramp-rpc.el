@@ -1137,13 +1137,23 @@ Used by `tramp-rpc--action-controlmaster-established'.")
 (defun tramp-rpc--action-controlmaster-established (proc _vec)
   "Succeed when the ControlMaster socket file appears, fail on process death.
 The target socket path is read from the dynamic variable
-`tramp-rpc--controlmaster-socket-path'."
+`tramp-rpc--controlmaster-socket-path'.
+
+When SSH detects a controlling terminal (Emacs gave it a PTY via
+`process-connection-type'), it may fork to background, causing the
+foreground process to exit.  The socket file is created by the
+backgrounded process just before/after the fork.  We check one more
+time after process death to catch this common race."
   (cond
    ((file-exists-p tramp-rpc--controlmaster-socket-path)
     (throw 'tramp-action 'ok))
    ((not (process-live-p proc))
     (while (tramp-accept-process-output proc))
-    (throw 'tramp-action 'process-died))))
+    ;; SSH may have backgrounded itself (forked to detach from our PTY).
+    ;; The background process creates the socket; give it a final chance.
+    (if (file-exists-p tramp-rpc--controlmaster-socket-path)
+        (throw 'tramp-action 'ok)
+      (throw 'tramp-action 'process-died)))))
 
 (defconst tramp-rpc--controlmaster-actions
   '((tramp-password-prompt-regexp tramp-action-password)
@@ -1287,9 +1297,20 @@ Returns non-nil on success."
       (ignore-errors (delete-file socket-path)))
     (with-current-buffer buffer
       (erase-buffer))
-    ;; Start SSH with PTY for interactive password prompt
-    (let ((process-connection-type t))  ; Use PTY for password prompts
-      (setq process (apply #'start-process process-name buffer ssh-args)))
+    ;; Start SSH with pipe connection (not PTY).  PTYs cause SSH to
+    ;; allocate a remote pseudo-terminal which can interfere with
+    ;; ControlMaster socket creation on ProxyJump/multi-hop connections.
+    ;; `tramp-process-actions' reads process output from the buffer and
+    ;; handles password prompts via regexp matching, so a PTY is not needed.
+    (setq process
+          (make-process
+           :name process-name
+           :buffer buffer
+           :command ssh-args
+           :connection-type 'pipe
+           :noquery t
+           :stderr (get-buffer-create
+                    (format " *tramp-rpc-auth-stderr %s*" host))))
     (set-process-query-on-exit-flag process nil)
     (set-process-sentinel process #'ignore)
     ;; Set up process properties for tramp-process-actions / tramp-read-passwd.
