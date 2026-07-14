@@ -147,18 +147,18 @@ Value is a cons cell (CHECKED . RESULT).")
         (orig-send-requests (symbol-function 'tramp-rpc--send-requests)))
     (tramp-rpc-test--clear-call-count-caches)
     (cl-letf (((symbol-function 'tramp-rpc--call-with-timeout)
-               (lambda (vec method params total-timeout poll-interval)
+               (lambda (vec method params total-timeout poll-interval &optional connection)
                  (cl-incf count)
                  (funcall orig-call-with-timeout
-                          vec method params total-timeout poll-interval)))
+                          vec method params total-timeout poll-interval connection)))
               ((symbol-function 'tramp-rpc--call-batch)
                (lambda (vec requests)
                  (cl-incf count)
                  (funcall orig-call-batch vec requests)))
               ((symbol-function 'tramp-rpc--call-async)
-               (lambda (vec method params callback)
+               (lambda (vec method params callback &optional connection)
                  (cl-incf count)
-                 (funcall orig-call-async vec method params callback)))
+                 (funcall orig-call-async vec method params callback connection)))
               ((symbol-function 'tramp-rpc--send-requests)
                (lambda (vec requests)
                  (cl-incf count (length requests))
@@ -179,18 +179,18 @@ when THUNK signals so tests can assert error-path roundtrips."
         (orig-send-requests (symbol-function 'tramp-rpc--send-requests)))
     (tramp-rpc-test--clear-call-count-caches)
     (cl-letf (((symbol-function 'tramp-rpc--call-with-timeout)
-               (lambda (vec method params total-timeout poll-interval)
+               (lambda (vec method params total-timeout poll-interval &optional connection)
                  (cl-incf count)
                  (funcall orig-call-with-timeout
-                          vec method params total-timeout poll-interval)))
+                          vec method params total-timeout poll-interval connection)))
               ((symbol-function 'tramp-rpc--call-batch)
                (lambda (vec requests)
                  (cl-incf count)
                  (funcall orig-call-batch vec requests)))
               ((symbol-function 'tramp-rpc--call-async)
-               (lambda (vec method params callback)
+               (lambda (vec method params callback &optional connection)
                  (cl-incf count)
-                 (funcall orig-call-async vec method params callback)))
+                 (funcall orig-call-async vec method params callback connection)))
               ((symbol-function 'tramp-rpc--send-requests)
                (lambda (vec requests)
                  (cl-incf count (length requests))
@@ -226,6 +226,21 @@ Returns BODY's result."
             (signal (car ,err) (cdr ,err))
           (ert-fail "Expected an error, but body returned normally")))
       :type ',error-type)))
+
+(ert-deftest tramp-rpc-test-call-count-wrappers-accept-connection ()
+  "Call-count wrappers preserve the captured connection argument."
+  (let ((connection '(:process test-connection)))
+    (cl-letf (((symbol-function 'tramp-rpc--call-with-timeout)
+               (lambda (_vec method _params _timeout _poll-interval &optional passed-connection)
+                 (should (eq passed-connection connection))
+                 (if (equal method "error")
+                     (signal 'file-missing '("missing"))
+                   'ok))))
+      (should (eq (tramp-rpc-test--with-call-count 1
+                    (tramp-rpc--call 'vec "ok" nil connection))
+                  'ok))
+      (tramp-rpc-test--with-call-count-error 1 file-missing
+        (tramp-rpc--call 'vec "error" nil connection)))))
 
 (defun tramp-rpc-test--make-remote-path (filename)
   "Make a full TRAMP RPC path for FILENAME."
@@ -1930,7 +1945,7 @@ This matches the upstream `tramp-test28-process-file' test."
          proc)
     (unwind-protect
         (cl-letf (((symbol-function 'tramp-rpc--call-async)
-                   (lambda (vec method params callback)
+                   (lambda (vec method params callback &optional connection)
                      (if (equal method "process.read")
                          (let ((params (cons '(max_bytes . 1) params)))
                            (if delay-first-read
@@ -1940,11 +1955,11 @@ This matches the upstream `tramp-test28-process-file' test."
                                  ;; first bounded read.  The old server returned
                                  ;; exited with the first byte and lost the rest.
                                  (run-at-time 0.2 nil orig-call-async
-                                              vec method params callback))
+                                              vec method params callback connection))
                              (funcall orig-call-async
-                                      vec method params callback)))
+                                      vec method params callback connection)))
                        (funcall orig-call-async
-                                vec method params callback)))))
+                                vec method params callback connection)))))
           (setq proc
                 (make-process
                  :name "tramp-rpc-eof-race"

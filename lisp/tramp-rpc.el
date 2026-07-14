@@ -1564,17 +1564,19 @@ accidentally routing file operations through tramp-sh."
 
 (defun tramp-rpc--disconnect (vec)
   "Disconnect the RPC connection to VEC."
-  ;; First, clean up any async and PTY processes for this connection
-  (tramp-rpc--cleanup-async-processes vec)
-  (tramp-rpc--cleanup-pty-processes vec)
-  ;; Clean up watched directory entries for this connection.
-  (tramp-rpc--cleanup-watches-for-connection vec)
-  (tramp-rpc--cleanup-file-notify-for-connection vec)
-  (let ((conn (tramp-rpc--get-connection vec)))
+  (let* ((conn (tramp-rpc--get-connection vec))
+         (connection-process (plist-get conn :process)))
+    ;; A reconnect can replace VEC's connection before old cleanup runs.
+    ;; Keep this cleanup scoped to the captured connection generation.
     (when conn
-      (let ((process (plist-get conn :process)))
-        (when (process-live-p process)
-          (delete-process process)))
+      (tramp-rpc--cleanup-async-processes vec connection-process))
+    (tramp-rpc--cleanup-pty-processes vec)
+    ;; Clean up watched directory entries for this connection.
+    (tramp-rpc--cleanup-watches-for-connection vec)
+    (tramp-rpc--cleanup-file-notify-for-connection vec)
+    (when conn
+      (when (process-live-p connection-process)
+        (delete-process connection-process))
       (tramp-rpc--remove-connection vec)))
   ;; Flush TRAMP caches so a reconnect gets fresh data (home dir, uid, etc.)
   (tramp-flush-directory-properties vec "/")
@@ -1655,11 +1657,12 @@ Uses length-prefixed binary framing: <4-byte BE length><msgpack payload>."
                   (tramp-rpc--debug "FILTER storing sync response id=%s" id)
                   (puthash id response (tramp-rpc--get-pending-responses buffer)))))))))))
 
-(defun tramp-rpc--call-async (vec method params callback)
+(defun tramp-rpc--call-async (vec method params callback &optional connection)
   "Call METHOD with PARAMS asynchronously on the RPC server for VEC.
-CALLBACK is called with the response plist when it arrives.
+CALLBACK is called with the response plist when it arrives.  CONNECTION, when
+non-nil, is the captured connection generation to use.
 Returns the request ID."
-  (let* ((conn (tramp-rpc--ensure-connection vec))
+  (let* ((conn (or connection (tramp-rpc--ensure-connection vec)))
          (process (plist-get conn :process))
          (id-and-request (let ((tramp-rpc-protocol--message-target process))
                            (tramp-rpc-protocol-encode-request-with-id
@@ -1673,10 +1676,11 @@ Returns the request ID."
     (process-send-string process request)
     id))
 
-(defun tramp-rpc--call (vec method params)
+(defun tramp-rpc--call (vec method params &optional connection)
   "Call METHOD with PARAMS on the RPC server for VEC.
+CONNECTION, when non-nil, is the captured connection generation to use.
 Returns the result or signals an error."
-  (tramp-rpc--call-with-timeout vec method params 30 0.1))
+  (tramp-rpc--call-with-timeout vec method params 30 0.1 connection))
 
 (defun tramp-rpc--call-fast (vec method params)
   "Call METHOD with PARAMS with shorter timeout for low-latency ops.
@@ -1722,12 +1726,14 @@ and blocking SSH or the remote server."
          (max (point-min) (- (point-max) (or max-bytes 1024)))
          (point-max))))))
 
-(defun tramp-rpc--call-with-timeout (vec method params total-timeout poll-interval)
+(defun tramp-rpc--call-with-timeout (vec method params total-timeout poll-interval
+                                          &optional connection)
   "Call METHOD with PARAMS on the RPC server for VEC.
 TOTAL-TIMEOUT is maximum seconds to wait.
 POLL-INTERVAL is seconds between accept-process-output checks.
+CONNECTION, when non-nil, is the captured connection generation to use.
 Returns the result or signals an error."
-  (let* ((conn (tramp-rpc--ensure-connection vec))
+  (let* ((conn (or connection (tramp-rpc--ensure-connection vec)))
          (process (plist-get conn :process))
          (buffer (plist-get conn :buffer))
          (id-and-request (let ((tramp-rpc-protocol--message-target process))
