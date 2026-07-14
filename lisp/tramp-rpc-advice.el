@@ -43,7 +43,8 @@
                   (vec pid data &optional owner-process))
 (declare-function tramp-rpc--close-remote-stdin "tramp-rpc-process"
                   (vec pid &optional owner-process))
-(declare-function tramp-rpc--kill-remote-process "tramp-rpc-process")
+(declare-function tramp-rpc--kill-remote-process "tramp-rpc-process"
+                  (vec pid &optional signal connection))
 (declare-function tramp-rpc--cleanup-async-processes "tramp-rpc-process")
 
 ;; Functions from tramp-rpc.el
