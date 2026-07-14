@@ -221,7 +221,8 @@ async fn run_connection<R, W>(
     reader: R,
     writer: Arc<Mutex<W>>,
     #[cfg(test)] cleanup_barrier: Option<Arc<CleanupBarrier>>,
-) where
+) -> Result<(), RpcError>
+where
     R: AsyncRead + Unpin + Send + 'static,
     W: AsyncWrite + Unpin + Send + 'static,
 {
@@ -296,7 +297,9 @@ async fn run_connection<R, W>(
     // Once the transport is gone no response can be relied on.  Reap managed
     // children before joining request tasks: a task blocked on their pipes or
     // a descendant-held descriptor must not prevent SIGKILL escalation.
-    handlers::cleanup_managed_processes().await;
+    // A failed first pass leaves its map entries registered so the final pass
+    // can retry after all request tasks have stopped.
+    let _ = handlers::cleanup_managed_processes().await;
     drain_tasks_for(&mut tasks, EOF_TASK_JOIN_WAIT).await;
     tasks.abort_all();
     // `spawn_blocking` work cannot be cancelled once it has started.  Do not
@@ -316,9 +319,10 @@ async fn run_connection<R, W>(
         .await
         .expect("test should release the connection cleanup barrier");
     }
-    handlers::cleanup_managed_processes().await;
+    let cleanup_result = handlers::cleanup_managed_processes().await;
     drop(errors);
     let _ = tokio::time::timeout(EOF_TASK_JOIN_WAIT, error_writer).await;
+    cleanup_result
 }
 
 async fn drain_tasks_for(tasks: &mut JoinSet<()>, wait: std::time::Duration) {
@@ -448,7 +452,7 @@ async fn accept_frame<W>(
 }
 
 #[tokio::main]
-async fn main() {
+async fn main() -> std::process::ExitCode {
     let stdout: WriterHandle = Arc::new(Mutex::new(BufWriter::new(tokio::io::stdout())));
 
     // Initialize the filesystem watcher for cache invalidation notifications.
@@ -460,13 +464,19 @@ async fn main() {
         watcher::init(manager);
     }
 
-    run_connection(
+    match run_connection(
         tokio::io::stdin(),
         stdout,
         #[cfg(test)]
         None,
     )
-    .await;
+    .await
+    {
+        Ok(()) => std::process::ExitCode::SUCCESS,
+        // stderr shares the SSH transport with the binary protocol, so report
+        // cleanup failure only through the server's nonzero exit status.
+        Err(_) => std::process::ExitCode::FAILURE,
+    }
 }
 
 fn decode_request(payload: &[u8]) -> Result<Request, Box<Response>> {
@@ -603,26 +613,6 @@ mod tests {
         assert_eq!(response.error.unwrap().code, RpcError::INVALID_REQUEST);
     }
 
-    #[test]
-    fn test_blocked_pty_writes_use_dedicated_admission() {
-        let admissions = Admissions::default();
-        let mut general = Vec::new();
-        for _ in 0..GENERAL_TASK_LIMIT {
-            general.push(
-                admissions
-                    .try_acquire(TaskClass::General)
-                    .expect("reserve a general permit"),
-            );
-        }
-
-        assert!(matches!(
-            task_class("process.write_pty"),
-            TaskClass::PtyWrite
-        ));
-        assert!(admissions.try_acquire(TaskClass::PtyWrite).is_some());
-        assert!(admissions.try_acquire(TaskClass::Control).is_some());
-    }
-
     #[tokio::test]
     async fn test_oversized_frame_is_answered_and_drained() {
         let oversized = frame(b"oversized");
@@ -664,8 +654,8 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn test_older_batch_blocks_later_general_requests_until_it_fits() {
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_blocked_batch_uses_idle_permits_without_unbounded_bypass() {
         let admissions = Admissions::default();
         let _held = admissions
             .try_acquire_many(
@@ -781,6 +771,18 @@ mod tests {
         tasks.abort_all();
     }
 
+    #[test]
+    fn test_blocked_pty_writes_use_dedicated_admission() {
+        let admissions = Admissions::default();
+        let _general = admissions
+            .try_acquire_many(TaskClass::General, GENERAL_TASK_LIMIT)
+            .expect("reserve every general permit");
+
+        assert_eq!(task_class("process.write_pty"), TaskClass::PtyWrite);
+        assert!(admissions.try_acquire(TaskClass::PtyWrite).is_some());
+        assert!(admissions.try_acquire(TaskClass::Control).is_some());
+    }
+
     /// Malformed frames must always be answered.  A dropped response leaves
     /// the client blocked on its own timeout with no diagnosis.
     #[tokio::test]
@@ -818,7 +820,10 @@ mod tests {
         }
 
         drop(writes.await.unwrap());
-        connection.await.expect("connection task should not panic");
+        connection
+            .await
+            .expect("connection task should not panic")
+            .expect("connection cleanup should succeed");
     }
 
     fn frame(payload: &[u8]) -> Vec<u8> {
@@ -877,7 +882,10 @@ mod tests {
         );
 
         drop(client);
-        connection.await.unwrap();
+        connection
+            .await
+            .expect("connection task should not panic")
+            .expect("connection cleanup should succeed");
     }
 
     #[tokio::test]
@@ -932,7 +940,10 @@ mod tests {
         );
 
         drop(client);
-        connection.await.unwrap();
+        connection
+            .await
+            .expect("connection task should not panic")
+            .expect("connection cleanup should succeed");
     }
 
     #[tokio::test]
@@ -1126,6 +1137,109 @@ mod tests {
     }
 
     #[tokio::test]
+    /// A child that closes stdin early must still report its own output and
+    /// exit status: `tramp-sh' runs `command <infile', where EPIPE never
+    /// reaches Emacs.
+    async fn test_commands_run_parallel_stdin_closed_early_completes() {
+        let command = Value::Map(vec![
+            (Value::String("key".into()), Value::String("closed".into())),
+            (Value::String("cmd".into()), Value::String("/bin/sh".into())),
+            (
+                Value::String("args".into()),
+                Value::Array(vec![
+                    Value::String("-c".into()),
+                    Value::String("exec 0<&-; printf done; exit 7".into()),
+                ]),
+            ),
+            (
+                Value::String("stdin".into()),
+                Value::Binary(vec![b'x'; 1024 * 1024]),
+            ),
+        ]);
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            handlers::commands::run_parallel(Value::Map(vec![(
+                Value::String("commands".into()),
+                Value::Array(vec![command]),
+            )])),
+        )
+        .await
+        .expect("closed stdin must not hang")
+        .unwrap();
+        let entry = map_get(&result, "closed").unwrap();
+        assert_eq!(
+            map_get(entry, "stdout"),
+            Some(&Value::Binary(b"done".to_vec()))
+        );
+        assert_eq!(map_get(entry, "exit_code").and_then(Value::as_i64), Some(7));
+        assert_eq!(map_get(entry, "stderr"), Some(&Value::Binary(vec![])));
+    }
+
+    #[tokio::test]
+    async fn test_connection_eof_kills_synchronous_process_groups() {
+        let _test_lock = handlers::process::test_process_map_lock().await;
+        for (index, method) in ["process.run", "commands.run_parallel"]
+            .into_iter()
+            .enumerate()
+        {
+            let temp = tempfile::tempdir().expect("temporary marker directory");
+            let marker = temp.path().join("pid");
+            let args = Value::Array(vec![
+                Value::String("-c".into()),
+                Value::String(
+                    format!(
+                        "import os,time; p={marker:?}; open(p+'.tmp', 'w').write(str(os.getpid())); os.replace(p+'.tmp', p); time.sleep(30)"
+                    )
+                    .into(),
+                ),
+            ]);
+            let command = Value::Map(vec![
+                (Value::String("cmd".into()), Value::String("python3".into())),
+                (Value::String("args".into()), args),
+            ]);
+            let params = if method == "process.run" {
+                command
+            } else {
+                let mut entry = command.as_map().unwrap().clone();
+                entry.push((Value::String("key".into()), Value::String("test".into())));
+                Value::Map(vec![(
+                    Value::String("commands".into()),
+                    Value::Array(vec![Value::Map(entry)]),
+                )])
+            };
+
+            let (mut client, server_reader) = tokio::io::duplex(4096);
+            let (server_writer, _client_reader) = tokio::io::duplex(4096);
+            let connection = tokio::spawn(run_connection(
+                server_reader,
+                Arc::new(Mutex::new(server_writer)),
+                None,
+            ));
+            client
+                .write_all(&frame(&make_request_with_id(
+                    700 + index as i64,
+                    method,
+                    params,
+                )))
+                .await
+                .unwrap();
+            wait_for_marker(&marker).await;
+            let child_pid: i32 = std::fs::read_to_string(&marker)
+                .expect("read child PID")
+                .parse()
+                .expect("parse child PID");
+            drop(client);
+            tokio::time::timeout(std::time::Duration::from_secs(3), connection)
+                .await
+                .expect("connection cleanup should be bounded")
+                .expect("connection task should not panic")
+                .expect("connection cleanup should succeed");
+
+            handlers::process::wait_for_process_exit(child_pid).await;
+        }
+    }
+
+    #[tokio::test]
     async fn test_method_not_found() {
         let params = Value::Map(vec![]);
         let payload = make_request("nonexistent.method", params);
@@ -1194,7 +1308,8 @@ mod tests {
         tokio::time::timeout(std::time::Duration::from_secs(3), connection)
             .await
             .expect("second cleanup should be bounded")
-            .expect("connection task should not panic");
+            .expect("connection task should not panic")
+            .expect("connection cleanup should succeed");
         assert!(handlers::process::test_managed_maps_empty().await);
         assert!(matches!(
             nix::sys::wait::waitpid(
@@ -1310,7 +1425,8 @@ mod tests {
         tokio::time::timeout(std::time::Duration::from_secs(5), connection)
             .await
             .expect("EOF cleanup should be bounded")
-            .expect("connection task should not panic");
+            .expect("connection task should not panic")
+            .expect("connection cleanup should succeed");
         assert!(handlers::process::test_managed_maps_empty().await);
         for os_pid in managed_pids {
             assert!(matches!(
@@ -1417,7 +1533,10 @@ mod tests {
         assert_eq!(seen, expected);
 
         drop(client);
-        connection.await.unwrap();
+        connection
+            .await
+            .expect("connection task should not panic")
+            .expect("connection cleanup should succeed");
     }
 
     #[tokio::test]

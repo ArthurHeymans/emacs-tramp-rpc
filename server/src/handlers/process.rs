@@ -4,6 +4,7 @@ use crate::msgpack_map;
 use crate::protocol::{ProcessResult, RpcError, from_value};
 use nix::pty::{OpenptyResult, openpty};
 use nix::sys::signal::Signal;
+use nix::sys::termios::{LocalFlags, OutputFlags, SetArg, tcgetattr, tcsetattr};
 use nix::sys::wait::{WaitPidFlag, WaitStatus, waitpid};
 use nix::unistd::{Pid, tcgetpgrp};
 use rmpv::Value;
@@ -35,26 +36,24 @@ pub(crate) fn is_benign_stdin_error(error: &std::io::Error) -> bool {
     )
 }
 
-async fn read_sync_output<R>(
+pub(crate) async fn read_sync_output<R>(
     mut reader: R,
     remaining: Arc<Semaphore>,
     output_limit: usize,
-) -> Result<Vec<u8>, RpcError>
+) -> std::io::Result<Vec<u8>>
 where
     R: AsyncRead + Unpin,
 {
     let mut output = Vec::new();
     let mut buffer = [0u8; 8192];
     loop {
-        let read = reader.read(&mut buffer).await.map_err(|error| {
-            RpcError::process_error(format!("Failed to read process output: {error}"))
-        })?;
+        let read = reader.read(&mut buffer).await?;
         if read == 0 {
             return Ok(output);
         }
         let permits = u32::try_from(read).expect("output buffer length fits in u32");
         let permit = remaining.try_acquire_many(permits).map_err(|_| {
-            RpcError::process_error(format!("Process output exceeds {output_limit} byte limit"))
+            std::io::Error::other(format!("Process output exceeds {output_limit} byte limit"))
         })?;
         // Consumed permits represent bytes retained in the response buffers.
         permit.forget();
@@ -141,6 +140,51 @@ fn spawn_error(error: std::io::Error, executable_missing: bool) -> RpcError {
     }
 }
 
+/// Own a newly spawned child process group until its request finishes.
+///
+/// Request tasks are aborted when their RPC transport disappears.  Tokio can
+/// kill the direct child on drop, but descendants would otherwise survive, so
+/// this guard synchronously kills the whole group when the request future is
+/// cancelled.  It is disarmed immediately after the direct child is reaped.
+pub(crate) struct ProcessGroupGuard {
+    pgid: Option<u32>,
+}
+
+impl ProcessGroupGuard {
+    pub(crate) fn new(pgid: u32) -> Self {
+        Self { pgid: Some(pgid) }
+    }
+
+    pub(crate) fn disarm(&mut self) {
+        self.pgid = None;
+    }
+}
+
+impl Drop for ProcessGroupGuard {
+    fn drop(&mut self) {
+        if let Some(pgid) = self.pgid {
+            // Best effort only: Drop cannot report an error and ESRCH means the
+            // group already exited.  Negating PGID targets the whole group.
+            unsafe {
+                libc::kill(-(pgid as i32), libc::SIGKILL);
+            }
+        }
+    }
+}
+
+pub(crate) fn configure_process_group(cmd: &mut Command) {
+    // Keep descendants in a group owned by this request, separate from the
+    // server and unrelated processes.
+    unsafe {
+        cmd.pre_exec(|| {
+            if libc::setpgid(0, 0) < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+}
+
 #[cfg(test)]
 pub(crate) async fn wait_for_process_exit(pid: i32) {
     for _ in 0..100 {
@@ -194,7 +238,13 @@ pub(crate) async fn test_process_map_lock() -> tokio::sync::MutexGuard<'static, 
 
 #[cfg(test)]
 pub(crate) async fn test_managed_maps_empty() -> bool {
-    get_process_map().lock().await.is_empty() && get_pty_process_map().lock().await.is_empty()
+    get_process_map().lock().await.is_empty()
+        && get_pty_process_map().lock().await.is_empty()
+        && TERMINATED_PTY_STATUSES
+            .get_or_init(|| StdMutex::new(HashMap::new()))
+            .lock()
+            .expect("terminated PTY status lock")
+            .is_empty()
 }
 
 #[cfg(test)]
@@ -203,7 +253,7 @@ pub(crate) async fn test_managed_os_pids() -> Vec<i32> {
         .lock()
         .await
         .values()
-        .filter_map(|managed| managed.child.id().map(|pid| pid as i32))
+        .map(|managed| managed.child_pid as i32)
         .collect();
     pids.extend(
         get_pty_process_map()
@@ -231,6 +281,7 @@ struct ManagedProcess {
     child: Child,
     child_pid: u32,
     lifecycle: Arc<Mutex<()>>,
+    read_lock: Arc<Mutex<()>>,
     exit_status: Option<ExitStatus>,
     shared_exit_status: Arc<StdMutex<Option<ExitStatus>>>,
     stdin: Arc<Mutex<Option<ChildStdin>>>,
@@ -300,6 +351,7 @@ async fn run_with_output_limit(params: Value, output_limit: usize) -> HandlerRes
     cmd.stdout(Stdio::piped());
     cmd.stderr(Stdio::piped());
     cmd.kill_on_drop(true);
+    configure_process_group(&mut cmd);
 
     let mut child = match cmd.spawn() {
         Ok(child) => child,
@@ -314,6 +366,10 @@ async fn run_with_output_limit(params: Value, output_limit: usize) -> HandlerRes
             return Err(spawn_error(error, executable_missing));
         }
     };
+    let child_pid = child
+        .id()
+        .ok_or_else(|| RpcError::process_error("Spawned process has no PID"))?;
+    let mut process_group = ProcessGroupGuard::new(child_pid);
 
     // Drive stdin, bounded output drains, and child exit concurrently.  A
     // genuine pipe or size error cancels the other operations and kills the
@@ -335,11 +391,11 @@ async fn run_with_output_limit(params: Value, output_limit: usize) -> HandlerRes
             && let Err(error) = stdin.write_all(&data).await
             && !is_benign_stdin_error(&error)
         {
-            return Err(RpcError::process_error(format!(
+            return Err(std::io::Error::other(format!(
                 "Failed to write stdin: {error}"
             )));
         }
-        Ok::<(), RpcError>(())
+        Ok::<(), std::io::Error>(())
     };
     // This budget is shared by stdout and stderr for this request.  It is
     // intentionally per-run rather than server-wide, so admission permits up
@@ -353,7 +409,7 @@ async fn run_with_output_limit(params: Value, output_limit: usize) -> HandlerRes
             child
                 .wait()
                 .await
-                .map_err(|e| RpcError::process_error(format!("Failed to wait for process: {e}")))
+                .map_err(|e| std::io::Error::other(format!("Failed to wait for process: {e}")))
         }
     );
     let ((), stdout, stderr, status) = match result {
@@ -361,9 +417,10 @@ async fn run_with_output_limit(params: Value, output_limit: usize) -> HandlerRes
         Err(error) => {
             let _ = child.kill().await;
             let _ = child.wait().await;
-            return Err(error);
+            return Err(RpcError::process_error(error.to_string()));
         }
     };
+    process_group.disarm();
 
     // Return binary data directly (no encoding needed!)
     let exit_code = crate::protocol::exit_code_from_status(status);
@@ -417,17 +474,12 @@ pub async fn start(params: Value) -> HandlerResult {
     cmd.stdin(Stdio::piped());
     cmd.stdout(Stdio::piped());
     cmd.stderr(Stdio::piped());
+    // If the request is cancelled before registry ownership transfers, dropping
+    // the child must terminate the direct process while the group guard below
+    // terminates descendants.
+    cmd.kill_on_drop(true);
 
-    // Keep descendants in a group we can terminate without affecting the
-    // server or unrelated processes.
-    unsafe {
-        cmd.pre_exec(|| {
-            if libc::setpgid(0, 0) < 0 {
-                return Err(std::io::Error::last_os_error());
-            }
-            Ok(())
-        });
-    }
+    configure_process_group(&mut cmd);
 
     let mut child = match cmd.spawn() {
         Ok(child) => child,
@@ -442,25 +494,30 @@ pub async fn start(params: Value) -> HandlerResult {
             return Err(spawn_error(error, executable_missing));
         }
     };
-
     let child_pid = child
         .id()
         .ok_or_else(|| RpcError::process_error("Spawned process has no PID"))?;
+    let mut process_group = ProcessGroupGuard::new(child_pid);
+
     let pid = get_next_pid().await;
 
     let managed = ManagedProcess {
-        child_pid,
         lifecycle: Arc::new(Mutex::new(())),
+        read_lock: Arc::new(Mutex::new(())),
         exit_status: None,
         shared_exit_status: Arc::new(StdMutex::new(None)),
         stdin: Arc::new(Mutex::new(child.stdin.take())),
         stdout: Arc::new(Mutex::new(child.stdout.take())),
         stderr: Arc::new(Mutex::new(child.stderr.take())),
         child,
+        child_pid,
         cmd: params.cmd.clone(),
     };
 
     get_process_map().lock().await.insert(pid, managed);
+    // The registry now owns termination and reaping.  There are no await points
+    // between insertion and disarming, so cancellation cannot strand the child.
+    process_group.disarm();
 
     Ok(msgpack_map! {
         "pid" => pid
@@ -540,7 +597,7 @@ pub async fn read(params: Value) -> HandlerResult {
 
     let timeout = params.timeout_ms.unwrap_or(0);
 
-    let (stdout, stderr, lifecycle, shared_exit_status) = {
+    let (stdout, stderr, lifecycle, read_lock, shared_exit_status) = {
         let processes = get_process_map().lock().await;
         let managed = processes
             .get(&params.pid)
@@ -549,9 +606,15 @@ pub async fn read(params: Value) -> HandlerResult {
             managed.stdout.clone(),
             managed.stderr.clone(),
             managed.lifecycle.clone(),
+            managed.read_lock.clone(),
             managed.shared_exit_status.clone(),
         )
     };
+
+    // A read owns output consumption through the terminal map-removal decision.
+    // This prevents a concurrent EOF reader from removing bytes another request
+    // has already consumed but not yet returned.
+    let _read_guard = read_lock.lock().await;
 
     // Try to read stdout/stderr (with optional blocking timeout) without
     // holding the global process map lock.  `process.read` is long-polled by
@@ -816,7 +879,27 @@ pub async fn close_stdin(params: Value) -> HandlerResult {
     Ok(Value::Boolean(true))
 }
 
+#[cfg(test)]
+static TEST_PROCESS_GROUP_SIGNAL_ERROR: OnceLock<StdMutex<Option<i32>>> = OnceLock::new();
+
+#[cfg(test)]
+fn set_test_process_group_signal_error(error: Option<i32>) {
+    *TEST_PROCESS_GROUP_SIGNAL_ERROR
+        .get_or_init(|| StdMutex::new(None))
+        .lock()
+        .expect("test process-group signal error lock") = error;
+}
+
 fn signal_process_group(pid: u32, signal: i32) -> std::io::Result<()> {
+    #[cfg(test)]
+    if let Some(error) = *TEST_PROCESS_GROUP_SIGNAL_ERROR
+        .get_or_init(|| StdMutex::new(None))
+        .lock()
+        .expect("test process-group signal error lock")
+    {
+        return Err(std::io::Error::from_raw_os_error(error));
+    }
+
     let result = unsafe { libc::kill(-(pid as libc::pid_t), signal) };
     if result == 0 {
         Ok(())
@@ -887,6 +970,7 @@ async fn wait_pipe_child(os_pid: u32) -> Result<Option<ExitStatus>, nix::errno::
             // lifecycle lock is not held.  The map entry remains until its
             // streams reach EOF, even in that case.
             Err(nix::errno::Errno::ECHILD) => return Ok(None),
+            Err(nix::errno::Errno::EINTR) => continue,
             Err(error) => return Err(error),
             Ok(_) => return Err(nix::errno::Errno::EINVAL),
         }
@@ -934,7 +1018,7 @@ async fn terminate_pipe_process(pid: u32, signal: i32, escalate: bool) -> Result
             )
         })
     }) else {
-        return Ok(true);
+        return Err(RpcError::process_error(format!("Process not found: {pid}")));
     };
 
     let _lifecycle_guard = lifecycle.lock().await;
@@ -971,13 +1055,14 @@ async fn terminate_pipe_process(pid: u32, signal: i32, escalate: bool) -> Result
         return Ok(true);
     }
 
-    let mut reap = if let Some(exit_status) = cached {
-        Some(Some(exit_status))
+    let mut reap = if cached.is_some() {
+        cached
     } else {
         tokio::time::timeout(MANAGED_CHILD_WAIT, wait_pipe_child(os_pid))
             .await
             .ok()
             .and_then(Result::ok)
+            .flatten()
     };
     // Give the whole process group its own grace period after the bounded
     // direct-child reap wait.  Starting this deadline before that wait would
@@ -994,14 +1079,14 @@ async fn terminate_pipe_process(pid: u32, signal: i32, escalate: bool) -> Result
     if reap.is_none() && escalate {
         reap = tokio::time::timeout(MANAGED_CHILD_WAIT, wait_pipe_child(os_pid))
             .await
-            .ok()
-            .and_then(Result::ok);
+            .map_err(|_| {
+                RpcError::process_error(format!("Timed out reaping process {pid} after SIGKILL"))
+            })?
+            .map_err(|error| {
+                RpcError::process_error(format!("Failed to reap process {pid}: {error}"))
+            })?;
     }
-    // `reap` is `Some(None)` when the child was already reaped (ECHILD), for
-    // example by an earlier kill.  Never overwrite a recorded status with
-    // `None` in that case: `try_wait` cannot recover it after an external
-    // waitpid, so clobbering it would wedge every subsequent read.
-    if let Some(exit_status) = reap.flatten() {
+    if let Some(exit_status) = reap {
         // Publish before any destructive cleanup so a read which captured the
         // streams before SIGKILL removed the entry can still report its exit.
         *shared_exit_status
@@ -1011,6 +1096,7 @@ async fn terminate_pipe_process(pid: u32, signal: i32, escalate: bool) -> Result
             managed.exit_status = Some(exit_status);
         }
         if signal == libc::SIGKILL {
+            // Explicit SIGKILL is the caller's opt-out from output draining.
             get_process_map().lock().await.remove(&pid);
         }
         return Ok(true);
@@ -1067,11 +1153,18 @@ pub async fn status(params: Value) -> HandlerResult {
 
     let params: Params = from_value(params).map_err(|e| RpcError::invalid_params(e.to_string()))?;
 
+    let lifecycle = {
+        let processes = get_process_map().lock().await;
+        processes
+            .get(&params.pid)
+            .map(|managed| managed.lifecycle.clone())
+            .ok_or_else(|| RpcError::process_error(format!("Process not found: {}", params.pid)))?
+    };
+    let _lifecycle_guard = lifecycle.lock().await;
     let mut processes = get_process_map().lock().await;
     let managed = processes
         .get_mut(&params.pid)
         .ok_or_else(|| RpcError::process_error(format!("Process not found: {}", params.pid)))?;
-
     let exit_status = poll_exit_status(managed)
         .map_err(|e| RpcError::process_error(format!("Failed to query process status: {e}")))?;
 
@@ -1083,21 +1176,30 @@ pub async fn status(params: Value) -> HandlerResult {
 
 /// List all managed async processes
 pub async fn list(_params: Value) -> HandlerResult {
-    let mut processes = get_process_map().lock().await;
-
-    let list: Vec<Value> = processes
-        .iter_mut()
-        .map(|(pid, managed)| {
-            let exited = poll_exit_status(managed).ok().flatten();
-            msgpack_map! {
-                "pid" => *pid,
-                "os_pid" => managed.child_pid,
-                "cmd" => managed.cmd.clone(),
-                "exited" => exited.is_some(),
-                "exit_code" => exited.map(crate::protocol::exit_code_from_status).map(|c| Value::Integer(c.into())).unwrap_or(Value::Nil)
-            }
-        })
-        .collect();
+    let entries: Vec<(u32, Arc<Mutex<()>>)> = {
+        let processes = get_process_map().lock().await;
+        processes
+            .iter()
+            .map(|(pid, managed)| (*pid, managed.lifecycle.clone()))
+            .collect()
+    };
+    let mut list = Vec::with_capacity(entries.len());
+    for (pid, lifecycle) in entries {
+        let _lifecycle_guard = lifecycle.lock().await;
+        let mut processes = get_process_map().lock().await;
+        let Some(managed) = processes.get_mut(&pid) else {
+            continue;
+        };
+        let exited = poll_exit_status(managed)
+            .map_err(|e| RpcError::process_error(format!("Failed to query process status: {e}")))?;
+        list.push(msgpack_map! {
+            "pid" => pid,
+            "os_pid" => Value::Integer((managed.child_pid as i64).into()),
+            "cmd" => managed.cmd.clone(),
+            "exited" => exited.is_some(),
+            "exit_code" => exited.map(crate::protocol::exit_code_from_status).map(|c| Value::Integer(c.into())).unwrap_or(Value::Nil)
+        });
+    }
 
     Ok(Value::Array(list))
 }
@@ -1112,10 +1214,39 @@ use tokio::io::Interest;
 use tokio::io::unix::AsyncFd;
 
 static PTY_PROCESS_MAP: OnceLock<Mutex<HashMap<u32, ManagedPtyProcess>>> = OnceLock::new();
+static TERMINATED_PTY_STATUSES: OnceLock<StdMutex<HashMap<u32, i32>>> = OnceLock::new();
 static PTY_PID_COUNTER: OnceLock<Mutex<u32>> = OnceLock::new();
 
 fn get_pty_process_map() -> &'static Mutex<HashMap<u32, ManagedPtyProcess>> {
     PTY_PROCESS_MAP.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn record_terminated_pty_status(pid: u32, exit_code: i32) {
+    TERMINATED_PTY_STATUSES
+        .get_or_init(|| StdMutex::new(HashMap::new()))
+        .lock()
+        .expect("terminated PTY status lock")
+        .insert(pid, exit_code);
+}
+
+fn take_terminated_pty_status(pid: u32) -> Option<i32> {
+    TERMINATED_PTY_STATUSES
+        .get_or_init(|| StdMutex::new(HashMap::new()))
+        .lock()
+        .expect("terminated PTY status lock")
+        .remove(&pid)
+}
+
+fn discard_terminated_pty_status(pid: u32) {
+    let _ = take_terminated_pty_status(pid);
+}
+
+fn clear_terminated_pty_statuses() {
+    TERMINATED_PTY_STATUSES
+        .get_or_init(|| StdMutex::new(HashMap::new()))
+        .lock()
+        .expect("terminated PTY status lock")
+        .clear();
 }
 
 async fn get_next_pty_pid() -> u32 {
@@ -1160,6 +1291,9 @@ struct ManagedPtyProcess {
     child_pid: Pid,
     cmd: String,
     exit_status: Option<i32>,
+    // Retain an observed terminal status for a read that captured the PTY
+    // before explicit SIGKILL removes its registry entry.
+    shared_exit_status: Arc<StdMutex<Option<i32>>>,
     output_eof: bool,
 }
 
@@ -1307,6 +1441,18 @@ impl Drop for PtyStartupGuard {
 fn do_fork_exec(params: PtyStartParams) -> Result<PtyStartupGuard, RpcError> {
     let OpenptyResult { master, slave } = openpty(None, None)
         .map_err(|e| RpcError::process_error(format!("Failed to open PTY: {}", e)))?;
+
+    // Emacs inserts interactive input into comint buffers itself.  Disable
+    // kernel echo to avoid delivering every input line twice, and preserve LF
+    // output instead of the terminal driver's CRLF conversion.
+    let mut termios = tcgetattr(&slave)
+        .map_err(|e| RpcError::process_error(format!("Failed to read PTY termios: {e}")))?;
+    termios
+        .local_flags
+        .remove(LocalFlags::ECHO | LocalFlags::ECHONL);
+    termios.output_flags.remove(OutputFlags::ONLCR);
+    tcsetattr(&slave, SetArg::TCSANOW, &termios)
+        .map_err(|e| RpcError::process_error(format!("Failed to configure PTY termios: {e}")))?;
 
     set_fd_cloexec(master.as_raw_fd())
         .map_err(|e| RpcError::process_error(format!("Failed to mark PTY CLOEXEC: {}", e)))?;
@@ -1472,6 +1618,7 @@ pub async fn start_pty(params: Value) -> HandlerResult {
         child_pid,
         cmd: params.cmd.clone(),
         exit_status: None,
+        shared_exit_status: Arc::new(StdMutex::new(None)),
         output_eof: false,
     };
 
@@ -1598,30 +1745,42 @@ async fn read_pty_now(pid: u32, max_bytes: usize) -> Result<PtyReadResult, RpcEr
     // readiness.  Registry removal can then safely close the original fd
     // without invalidating this read or allowing fd-number reuse to target a
     // newly-created PTY.
-    let (lifecycle, io, fd) = {
+    let (lifecycle, io, shared_exit_status, fd) = {
         let processes = get_pty_process_map().lock().await;
         let Some(managed) = processes.get(&pid) else {
             return Ok(PtyReadResult {
                 output: Vec::new(),
                 pending: false,
                 exited: true,
-                exit_code: None,
+                exit_code: take_terminated_pty_status(pid),
             });
         };
         let fd = dup_cloexec(managed.async_fd.get_ref().as_raw_fd())
             .map_err(|e| RpcError::process_error(format!("Failed to duplicate PTY: {e}")))?;
-        (managed.lifecycle.clone(), managed.io.clone(), fd)
+        (
+            managed.lifecycle.clone(),
+            managed.io.clone(),
+            managed.shared_exit_status.clone(),
+            fd,
+        )
     };
     // SAFETY: dup_cloexec returned a fresh descriptor owned by this read.
     let owned_fd = unsafe { OwnedFd::from_raw_fd(fd) };
     let _lifecycle_guard = lifecycle.lock().await;
     let mut processes = get_pty_process_map().lock().await;
     let Some(managed) = processes.get_mut(&pid) else {
+        // Explicit SIGKILL intentionally discards output and removes registry
+        // ownership.  A read already in flight still owns this status handle,
+        // so report the terminal remote result rather than local success.
+        let shared_status = *shared_exit_status
+            .lock()
+            .expect("shared PTY exit status lock");
+        let retained_status = take_terminated_pty_status(pid);
         return Ok(PtyReadResult {
             output: Vec::new(),
             pending: false,
             exited: true,
-            exit_code: None,
+            exit_code: shared_status.or(retained_status),
         });
     };
 
@@ -1691,11 +1850,19 @@ fn check_exit_status(managed: &mut ManagedPtyProcess) -> (bool, Option<i32>) {
         match waitpid(managed.child_pid, Some(WaitPidFlag::WNOHANG)) {
             Ok(WaitStatus::Exited(_, code)) => {
                 managed.exit_status = Some(code);
+                *managed
+                    .shared_exit_status
+                    .lock()
+                    .expect("shared PTY exit status lock") = Some(code);
                 (true, Some(code))
             }
             Ok(WaitStatus::Signaled(_, signal, _)) => {
                 let code = 128 + signal as i32;
                 managed.exit_status = Some(code);
+                *managed
+                    .shared_exit_status
+                    .lock()
+                    .expect("shared PTY exit status lock") = Some(code);
                 (true, Some(code))
             }
             Ok(WaitStatus::StillAlive) => (false, None),
@@ -1853,6 +2020,7 @@ async fn wait_pty_pid(child_pid: Pid) -> Result<Option<i32>, nix::errno::Errno> 
                 tokio::time::sleep(std::time::Duration::from_millis(5)).await;
             }
             Err(nix::errno::Errno::ECHILD) => return Ok(None),
+            Err(nix::errno::Errno::EINTR) => continue,
             Err(error) => return Err(error),
             Ok(_) => return Err(nix::errno::Errno::EINVAL),
         }
@@ -1864,18 +2032,26 @@ async fn terminate_pty_process(
     signal: i32,
     escalate: bool,
     remove: bool,
+    retain_removed_status: bool,
 ) -> Result<bool, RpcError> {
-    let Some((os_pid, lifecycle, io)) = ({
+    let Some((os_pid, lifecycle, io, shared_exit_status)) = ({
         let processes = get_pty_process_map().lock().await;
         processes.get(&pid).map(|managed| {
             (
                 managed.child_pid.as_raw() as u32,
                 managed.lifecycle.clone(),
                 managed.io.clone(),
+                managed.shared_exit_status.clone(),
             )
         })
     }) else {
-        return Ok(true);
+        return if remove {
+            Ok(true)
+        } else {
+            Err(RpcError::process_error(format!(
+                "PTY process not found: {pid}"
+            )))
+        };
     };
     // Explicit teardown and SIGKILL must wake a writer blocked on readiness
     // immediately.  Other forwarded signals (notably SIGINT) are survivable
@@ -1896,25 +2072,33 @@ async fn terminate_pty_process(
         .await
         .get(&pid)
         .and_then(|managed| managed.exit_status);
-    if cached.is_some() && !escalate {
+    if let Some(cached_exit_code) = cached
+        && !escalate
+    {
         // A previously reaped direct child is confirmed terminal death, even
         // when a caller used a non-fatal signal for this request.
         io.cancel();
         if remove {
+            *shared_exit_status
+                .lock()
+                .expect("shared PTY exit status lock") = Some(cached_exit_code);
+            if retain_removed_status {
+                record_terminated_pty_status(pid, cached_exit_code);
+            }
             get_pty_process_map().lock().await.remove(&pid);
         }
         return Ok(true);
     }
 
     // As with pipe children: only wait for death on signals expected to
-    // terminate the child; non-fatal forwarded signals must not stall the
+    // terminate the child; a surviving SIGINT/SIGUSR1 must not stall the
     // client for the wait budget.  Exits are reaped by later read polls.
     if !(escalate || signal == libc::SIGTERM || signal == libc::SIGKILL) {
         return Ok(true);
     }
 
-    let mut reap = if let Some(exit_code) = cached {
-        Some(Some(exit_code))
+    let mut reap = if cached.is_some() {
+        cached
     } else {
         tokio::time::timeout(
             MANAGED_PTY_CHILD_WAIT,
@@ -1923,6 +2107,7 @@ async fn terminate_pty_process(
         .await
         .ok()
         .and_then(Result::ok)
+        .flatten()
     };
     // Start the process-group grace only after the direct-child reap wait.
     // Otherwise a TERM-ignoring child consumes all of its descendants' grace.
@@ -1939,16 +2124,18 @@ async fn terminate_pty_process(
     }
     if reap.is_none() && escalate {
         reap = tokio::time::timeout(
-            MANAGED_PTY_CHILD_WAIT,
+            MANAGED_CHILD_WAIT,
             wait_pty_pid(Pid::from_raw(os_pid as i32)),
         )
         .await
-        .ok()
-        .and_then(Result::ok);
+        .map_err(|_| {
+            RpcError::process_error(format!("Timed out reaping PTY process {pid} after SIGKILL"))
+        })?
+        .map_err(|error| {
+            RpcError::process_error(format!("Failed to reap PTY process {pid}: {error}"))
+        })?;
     }
-    // `reap` is `Some(None)` when the child was already reaped (ECHILD); do
-    // not overwrite a previously recorded exit status in that case.
-    if let Some(exit_code) = reap.flatten() {
+    if let Some(exit_code) = reap {
         // Reaping confirms terminal death, so no further PTY input can be
         // admitted.  This also wakes a writer that was waiting for readiness.
         io.cancel();
@@ -1957,6 +2144,15 @@ async fn terminate_pty_process(
         // explicit close.
         let mut processes = get_pty_process_map().lock().await;
         if remove {
+            // Publish before discarding registry ownership.  An in-flight
+            // read holds this Arc and must report the killed remote process,
+            // not nil/zero local relay success.
+            *shared_exit_status
+                .lock()
+                .expect("shared PTY exit status lock") = Some(exit_code);
+            if retain_removed_status {
+                record_terminated_pty_status(pid, exit_code);
+            }
             processes.remove(&pid);
         } else if let Some(managed) = processes.get_mut(&pid) {
             managed.exit_status = Some(exit_code);
@@ -1965,8 +2161,18 @@ async fn terminate_pty_process(
     }
 
     if remove {
-        // Explicit close discards the PTY even if its status was already
-        // consumed by another status poll.
+        // SIGKILL was delivered but the bounded reap did not observe a status
+        // (for example, another waiter consumed it).  The explicit kill still
+        // has deterministic abnormal process semantics for an in-flight read.
+        let exit_code = {
+            let mut status = shared_exit_status
+                .lock()
+                .expect("shared PTY exit status lock");
+            *status.get_or_insert(128 + libc::SIGKILL)
+        };
+        if retain_removed_status {
+            record_terminated_pty_status(pid, exit_code);
+        }
         get_pty_process_map().lock().await.remove(&pid);
         return Ok(true);
     }
@@ -2003,7 +2209,15 @@ pub async fn kill_pty(params: Value) -> HandlerResult {
     // Match local signal-process semantics: forward the requested signal
     // without turning a survivable signal such as SIGINT into SIGKILL.
     // Explicit close and connection cleanup retain escalation authority.
-    terminate_pty_process(params.pid, params.signal, false, false).await?;
+    // Explicit SIGKILL also opts out of output draining.
+    terminate_pty_process(
+        params.pid,
+        params.signal,
+        false,
+        params.signal == libc::SIGKILL,
+        params.signal == libc::SIGKILL,
+    )
+    .await?;
     Ok(Value::Boolean(true))
 }
 
@@ -2016,35 +2230,42 @@ pub async fn close_pty(params: Value) -> HandlerResult {
 
     let params: Params = from_value(params).map_err(|e| RpcError::invalid_params(e.to_string()))?;
     // Explicit close is the opt-out from kill's drain-preserving ownership.
-    terminate_pty_process(params.pid, libc::SIGKILL, true, true).await?;
+    terminate_pty_process(params.pid, libc::SIGKILL, true, true, false).await?;
+    discard_terminated_pty_status(params.pid);
     Ok(Value::Boolean(true))
 }
 
 /// List all PTY processes
 pub async fn list_pty(_params: Value) -> HandlerResult {
-    let mut processes = get_pty_process_map().lock().await;
-
-    let list: Vec<Value> = processes
-        .iter_mut()
-        .map(|(pid, managed)| {
-            let (exited, exit_code) = check_exit_status(managed);
-
-            msgpack_map! {
-                "pid" => *pid,
-                "os_pid" => managed.child_pid.as_raw(),
-                "cmd" => managed.cmd.clone(),
-                "exited" => exited,
-                "exit_code" => exit_code.map(|c| Value::Integer(c.into())).unwrap_or(Value::Nil)
-            }
-        })
-        .collect();
+    let entries: Vec<(u32, Arc<Mutex<()>>)> = {
+        let processes = get_pty_process_map().lock().await;
+        processes
+            .iter()
+            .map(|(pid, managed)| (*pid, managed.lifecycle.clone()))
+            .collect()
+    };
+    let mut list = Vec::with_capacity(entries.len());
+    for (pid, lifecycle) in entries {
+        let _lifecycle_guard = lifecycle.lock().await;
+        let mut processes = get_pty_process_map().lock().await;
+        let Some(managed) = processes.get_mut(&pid) else {
+            continue;
+        };
+        let (exited, exit_code) = check_exit_status(managed);
+        list.push(msgpack_map! {
+            "pid" => pid,
+            "os_pid" => managed.child_pid.as_raw(),
+            "cmd" => managed.cmd.clone(),
+            "exited" => exited,
+            "exit_code" => exit_code.map(|c| Value::Integer(c.into())).unwrap_or(Value::Nil)
+        });
+    }
 
     Ok(Value::Array(list))
 }
 
-/// Stop all managed children after the transport is gone.  Signal every group
-/// before awaiting any child so descendants cannot keep another child alive.
-pub async fn cleanup_managed_processes() {
+/// Stop and reap managed children after the transport is gone.
+pub async fn cleanup_managed_processes() -> Result<(), RpcError> {
     let pipe_pids: Vec<(u32, u32)> = {
         let processes = get_process_map().lock().await;
         processes
@@ -2060,25 +2281,51 @@ pub async fn cleanup_managed_processes() {
             .collect()
     };
 
-    for (_, os_pid) in pipe_pids.iter().chain(pty_pids.iter()) {
-        let _ = signal_process_group(*os_pid, libc::SIGTERM);
-    }
-
-    let pipe_reaps = pipe_pids
-        .into_iter()
-        .map(|(pid, _)| terminate_pipe_process(pid, libc::SIGTERM, true));
-    let pty_reaps = pty_pids
-        .into_iter()
-        .map(|(pid, _)| terminate_pty_process(pid, libc::SIGTERM, true, true));
-    tokio::join!(
+    let pipe_reaps = pipe_pids.into_iter().map(|(pid, _)| async move {
+        (pid, terminate_pipe_process(pid, libc::SIGTERM, true).await)
+    });
+    let pty_reaps = pty_pids.into_iter().map(|(pid, _)| async move {
+        (
+            pid,
+            terminate_pty_process(pid, libc::SIGTERM, true, true, false).await,
+        )
+    });
+    let (pipe_results, pty_results) = tokio::join!(
         futures::future::join_all(pipe_reaps),
         futures::future::join_all(pty_reaps)
     );
 
-    // The transport is gone, so there is no reader left to drain these
-    // streams.  Unlike ordinary kill, connection cleanup may discard them.
-    get_process_map().lock().await.clear();
-    get_pty_process_map().lock().await.clear();
+    // The transport is gone, so successful reaps may discard unread pipes.
+    // Failed entries stay registered for the final cleanup pass to retry.
+    let mut failures = Vec::new();
+    {
+        let mut processes = get_process_map().lock().await;
+        for (pid, result) in pipe_results {
+            match result {
+                Ok(_) => {
+                    processes.remove(&pid);
+                }
+                Err(error) => failures.push(format!("pipe process {pid}: {}", error.message)),
+            }
+        }
+    }
+    for (pid, result) in pty_results {
+        if let Err(error) = result {
+            failures.push(format!("PTY process {pid}: {}", error.message));
+        }
+    }
+    // The transport is gone, so no client can consume retained terminal
+    // statuses.  Do not keep tombstones alive for the lifetime of the server.
+    clear_terminated_pty_statuses();
+
+    if failures.is_empty() {
+        Ok(())
+    } else {
+        Err(RpcError::process_error(format!(
+            "Managed process cleanup failed: {}",
+            failures.join("; ")
+        )))
+    }
 }
 
 #[cfg(test)]
@@ -2105,12 +2352,48 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn unregistered_pipe_start_guard_kills_child() {
+        let _test_lock = test_process_map_lock().await;
+        let mut cmd = Command::new("sleep");
+        cmd.arg("30");
+        cmd.kill_on_drop(true);
+        configure_process_group(&mut cmd);
+        let child = cmd.spawn().expect("start unregistered pipe child");
+        let child_pid = child.id().expect("child PID");
+        let guard = ProcessGroupGuard::new(child_pid);
+
+        // This is the cancellation path before insertion into PROCESS_MAP.
+        drop(guard);
+        drop(child);
+        wait_for_process_exit(child_pid as i32).await;
+        assert!(!process_is_running(child_pid as i32));
+    }
+
+    #[tokio::test]
+    async fn cleanup_reports_signal_failure_and_retains_managed_process() {
+        let _test_lock = test_process_map_lock().await;
+        let pid = start_pipe_process("sleep 30").await;
+
+        set_test_process_group_signal_error(Some(libc::EPERM));
+        let result = cleanup_managed_processes().await;
+        set_test_process_group_signal_error(None);
+
+        let error = result.expect_err("cleanup must report an unsignalled process group");
+        assert!(error.message.contains("Operation not permitted"));
+        assert!(get_process_map().lock().await.contains_key(&pid));
+
+        cleanup_managed_processes()
+            .await
+            .expect("cleanup retry after removing injected error");
+        assert!(!get_process_map().lock().await.contains_key(&pid));
+    }
+
+    #[tokio::test]
     async fn synchronous_output_reader_enforces_shared_limit() {
         let error = read_sync_output(&b"oversized"[..], Arc::new(Semaphore::new(4)), 4)
             .await
             .expect_err("output above the remaining response budget should fail");
-        assert_eq!(error.code, RpcError::PROCESS_ERROR);
-        assert!(error.message.contains("output exceeds"));
+        assert!(error.to_string().contains("output exceeds"));
     }
 
     #[tokio::test]
@@ -2772,6 +3055,31 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn concurrent_pipe_reads_do_not_lose_consumed_output() {
+        let _test_lock = test_process_map_lock().await;
+        for _ in 0..25 {
+            let pid = start_pipe_process("sleep 0.01; printf final").await;
+            let (first, second) = tokio::join!(
+                read_pipe_process(pid, 65_536, 500),
+                read_pipe_process(pid, 65_536, 500)
+            );
+            let tail = if get_process_map().lock().await.contains_key(&pid) {
+                collect_pipe_output(pid, 65_536).await.0
+            } else {
+                Vec::new()
+            };
+            let mut stdout = Vec::new();
+            for result in [&first, &second] {
+                if let Some(Value::Binary(bytes)) = map_get(result, "stdout") {
+                    stdout.extend_from_slice(bytes);
+                }
+            }
+            stdout.extend_from_slice(&tail);
+            assert_eq!(stdout, b"final");
+        }
+    }
+
+    #[tokio::test]
     async fn kill_default_term_and_explicit_kill_reap_process_group() {
         let _test_lock = test_process_map_lock().await;
         let start_result = start(Value::Map(vec![
@@ -2816,6 +3124,68 @@ mod tests {
         .expect("SIGKILL");
         assert_reaped(os_pid);
         assert!(!get_process_map().lock().await.contains_key(&pid));
+    }
+
+    #[tokio::test]
+    async fn kill_rejects_unknown_pid_and_signal_zero_returns_promptly() {
+        let _test_lock = test_process_map_lock().await;
+        let unknown = kill(Value::Map(vec![(
+            Value::String("pid".into()),
+            Value::Integer(u32::MAX.into()),
+        )]))
+        .await
+        .expect_err("unknown PID must fail");
+        assert_eq!(unknown.code, RpcError::PROCESS_ERROR);
+
+        let pid = start_pipe_process("sleep 30").await;
+        tokio::time::timeout(
+            std::time::Duration::from_millis(250),
+            kill(Value::Map(vec![
+                (Value::String("pid".into()), Value::Integer(pid.into())),
+                (Value::String("signal".into()), Value::Integer(0.into())),
+            ])),
+        )
+        .await
+        .expect("signal zero must not wait for process exit")
+        .expect("signal zero");
+        assert!(get_process_map().lock().await.contains_key(&pid));
+        kill(Value::Map(vec![
+            (Value::String("pid".into()), Value::Integer(pid.into())),
+            (
+                Value::String("signal".into()),
+                Value::Integer((libc::SIGKILL as i64).into()),
+            ),
+        ]))
+        .await
+        .expect("cleanup process");
+    }
+
+    #[tokio::test]
+    async fn status_and_list_serialize_with_kill_reaping() {
+        let _test_lock = test_process_map_lock().await;
+        for _ in 0..25 {
+            let pid = start_pipe_process("sleep 30").await;
+            let kill_params = Value::Map(vec![
+                (Value::String("pid".into()), Value::Integer(pid.into())),
+                (
+                    Value::String("signal".into()),
+                    Value::Integer((libc::SIGTERM as i64).into()),
+                ),
+            ]);
+            let status_params = Value::Map(vec![(
+                Value::String("pid".into()),
+                Value::Integer(pid.into()),
+            )]);
+            let (kill_result, status_result, list_result) = tokio::join!(
+                kill(kill_params),
+                status(status_params),
+                list(Value::Map(vec![]))
+            );
+            kill_result.expect("kill process");
+            status_result.expect("status must not race with reaping");
+            list_result.expect("list must not race with reaping");
+            let _ = collect_pipe_output(pid, 65_536).await;
+        }
     }
 
     async fn wait_for_marker(path: &std::path::Path) {
@@ -3079,6 +3449,112 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn pty_sigkill_publishes_status_for_in_flight_read_after_removal() {
+        let _test_lock = test_process_map_lock().await;
+        let start = start_pty(Value::Map(vec![
+            (Value::String("cmd".into()), Value::String("sleep".into())),
+            (
+                Value::String("args".into()),
+                Value::Array(vec![Value::String("30".into())]),
+            ),
+        ]))
+        .await
+        .expect("start PTY");
+        let pid = map_get(&start, "pid").and_then(Value::as_u64).unwrap() as u32;
+        let (lifecycle, io, shared_exit_status) = {
+            let processes = get_pty_process_map().lock().await;
+            let managed = processes.get(&pid).expect("managed PTY process");
+            (
+                managed.lifecycle.clone(),
+                managed.io.clone(),
+                managed.shared_exit_status.clone(),
+            )
+        };
+        let lifecycle_guard = lifecycle.lock().await;
+        let kill_task = tokio::spawn(kill_pty(Value::Map(vec![
+            (Value::String("pid".into()), Value::Integer(pid.into())),
+            (
+                Value::String("signal".into()),
+                Value::Integer((libc::SIGKILL as i64).into()),
+            ),
+        ])));
+        for _ in 0..100 {
+            if io.is_closed() {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert!(io.is_closed(), "SIGKILL did not publish PTY cancellation");
+
+        let read_task = tokio::spawn(read_pty(Value::Map(vec![
+            (Value::String("pid".into()), Value::Integer(pid.into())),
+            (
+                Value::String("timeout_ms".into()),
+                Value::Integer(500.into()),
+            ),
+        ])));
+        for _ in 0..100 {
+            if Arc::strong_count(&shared_exit_status) >= 4 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            Arc::strong_count(&shared_exit_status) >= 4,
+            "read never captured managed PTY state"
+        );
+        drop(lifecycle_guard);
+
+        kill_task.await.expect("join SIGKILL").expect("SIGKILL PTY");
+        assert!(!get_pty_process_map().lock().await.contains_key(&pid));
+        let read_result = read_task.await.expect("join read").expect("read PTY");
+        assert_eq!(map_get(&read_result, "exited"), Some(&Value::Boolean(true)));
+        assert_eq!(
+            map_get(&read_result, "exit_code").and_then(Value::as_i64),
+            Some(128 + libc::SIGKILL as i64)
+        );
+    }
+
+    #[tokio::test]
+    async fn pty_sigkill_retains_status_for_follow_up_read() {
+        let _test_lock = test_process_map_lock().await;
+        let start = start_pty(Value::Map(vec![
+            (Value::String("cmd".into()), Value::String("sleep".into())),
+            (
+                Value::String("args".into()),
+                Value::Array(vec![Value::String("30".into())]),
+            ),
+        ]))
+        .await
+        .expect("start PTY");
+        let pid = map_get(&start, "pid").and_then(Value::as_u64).unwrap() as u32;
+
+        kill_pty(Value::Map(vec![
+            (Value::String("pid".into()), Value::Integer(pid.into())),
+            (
+                Value::String("signal".into()),
+                Value::Integer((libc::SIGKILL as i64).into()),
+            ),
+        ]))
+        .await
+        .expect("SIGKILL PTY");
+        assert!(!get_pty_process_map().lock().await.contains_key(&pid));
+
+        let read = read_pty(Value::Map(vec![(
+            Value::String("pid".into()),
+            Value::Integer(pid.into()),
+        )]))
+        .await
+        .expect("read retained PTY status");
+        assert_eq!(map_get(&read, "exited"), Some(&Value::Boolean(true)));
+        assert_eq!(
+            map_get(&read, "exit_code").and_then(Value::as_i64),
+            Some(128 + libc::SIGKILL as i64)
+        );
+        assert_eq!(take_terminated_pty_status(pid), None);
+    }
+
+    #[tokio::test]
     async fn pty_kill_ignored_sigterm_then_sigkill_reaps_child() {
         let _test_lock = test_process_map_lock().await;
         let temp = tempfile::tempdir().expect("temporary PTY directory");
@@ -3108,13 +3584,46 @@ mod tests {
         .await
         .expect("SIGKILL should terminate and reap the PTY child");
         assert_reaped(os_pid);
-        close_pty(Value::Map(vec![(
+        assert!(!get_pty_process_map().lock().await.contains_key(&pid));
+        let unknown = kill_pty(Value::Map(vec![(
             Value::String("pid".into()),
             Value::Integer(pid.into()),
         )]))
         .await
-        .expect("close PTY after SIGKILL");
-        assert!(!get_pty_process_map().lock().await.contains_key(&pid));
+        .expect_err("unknown PTY PID must fail");
+        assert_eq!(unknown.code, RpcError::PROCESS_ERROR);
+    }
+
+    #[tokio::test]
+    async fn pty_list_serializes_with_kill_reaping() {
+        let _test_lock = test_process_map_lock().await;
+        for _ in 0..25 {
+            let start = start_pty(Value::Map(vec![
+                (Value::String("cmd".into()), Value::String("sleep".into())),
+                (
+                    Value::String("args".into()),
+                    Value::Array(vec![Value::String("30".into())]),
+                ),
+            ]))
+            .await
+            .expect("start PTY");
+            let pid = map_get(&start, "pid").and_then(Value::as_u64).unwrap() as u32;
+            let (kill_result, list_result) = tokio::join!(
+                kill_pty(Value::Map(vec![(
+                    Value::String("pid".into()),
+                    Value::Integer(pid.into()),
+                )])),
+                list_pty(Value::Map(vec![]))
+            );
+            kill_result.expect("kill PTY");
+            list_result.expect("PTY list must not race with reaping");
+            close_pty(Value::Map(vec![(
+                Value::String("pid".into()),
+                Value::Integer(pid.into()),
+            )]))
+            .await
+            .expect("close PTY");
+        }
     }
 
     #[tokio::test]
@@ -3171,7 +3680,10 @@ mod tests {
         let _test_lock = test_process_map_lock().await;
         let temp = tempfile::tempdir().expect("temporary marker directory");
         let marker = temp.path().join("descendant-pid");
-        let script = format!("sleep 30 & echo $! > '{}'", marker.display());
+        let script = format!(
+            "python3 -c 'import signal,time; signal.signal(signal.SIGTERM, signal.SIG_IGN); time.sleep(30)' & echo $! > '{}'",
+            marker.display()
+        );
         let pid = start_pipe_process(&script).await;
         wait_for_marker(&marker).await;
         wait_for_child_exit(pid).await;
@@ -3183,7 +3695,9 @@ mod tests {
             .expect("parse descendant PID");
         assert_eq!(unsafe { libc::kill(descendant_pid, 0) }, 0);
 
-        cleanup_managed_processes().await;
+        cleanup_managed_processes()
+            .await
+            .expect("cleanup pipe descendants");
         wait_for_process_exit(descendant_pid).await;
     }
 
@@ -3196,7 +3710,9 @@ mod tests {
         let os_pid = pty_os_pid(pid).await;
 
         let started = tokio::time::Instant::now();
-        cleanup_managed_processes().await;
+        cleanup_managed_processes()
+            .await
+            .expect("cleanup PTY group");
         // Direct-child reaping gets one bounded wait and the process group
         // gets a separate one.  Leave scheduling slack while still rejecting
         // the old one-wait escalation behavior.
@@ -3235,7 +3751,9 @@ mod tests {
         wait_for_marker(&marker).await;
 
         let started = tokio::time::Instant::now();
-        cleanup_managed_processes().await;
+        cleanup_managed_processes()
+            .await
+            .expect("cleanup pipe group");
         // Direct-child reaping gets one bounded wait and the process group
         // gets a separate one.  Leave scheduling slack while still rejecting
         // the old one-wait escalation behavior.
@@ -3245,6 +3763,66 @@ mod tests {
         );
         assert_reaped(os_pid);
         assert!(get_process_map().lock().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn cleanup_kills_pty_descendants_after_status_reaps_direct_child() {
+        let _test_lock = test_process_map_lock().await;
+        let temp = tempfile::tempdir().expect("temporary PTY marker directory");
+        let marker = temp.path().join("pty-descendant-pid");
+        let script = format!(
+            "import os,signal,time; pid=os.fork(); (open({:?},'w').write(str(pid)), os._exit(0)) if pid else (signal.signal(signal.SIGHUP, signal.SIG_IGN), signal.signal(signal.SIGTERM, signal.SIG_IGN), time.sleep(30))",
+            marker
+        );
+        let start_result = start_pty(Value::Map(vec![
+            (Value::String("cmd".into()), Value::String("python3".into())),
+            (
+                Value::String("args".into()),
+                Value::Array(vec![
+                    Value::String("-c".into()),
+                    Value::String(script.into()),
+                ]),
+            ),
+        ]))
+        .await
+        .expect("start PTY parent");
+        let pid = map_get(&start_result, "pid")
+            .and_then(Value::as_u64)
+            .expect("PTY pid") as u32;
+        wait_for_marker(&marker).await;
+
+        for _ in 0..100 {
+            let exited = {
+                let mut processes = get_pty_process_map().lock().await;
+                let managed = processes.get_mut(&pid).expect("managed PTY");
+                check_exit_status(managed).0
+            };
+            if exited {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        assert!(
+            get_pty_process_map()
+                .lock()
+                .await
+                .get(&pid)
+                .and_then(|managed| managed.exit_status)
+                .is_some(),
+            "direct PTY child should be reaped before cleanup"
+        );
+
+        let descendant_pid: i32 = std::fs::read_to_string(&marker)
+            .expect("read PTY descendant PID")
+            .trim()
+            .parse()
+            .expect("parse PTY descendant PID");
+        assert_eq!(unsafe { libc::kill(descendant_pid, 0) }, 0);
+
+        cleanup_managed_processes()
+            .await
+            .expect("cleanup PTY descendants");
+        wait_for_process_exit(descendant_pid).await;
     }
 
     #[tokio::test]
@@ -3721,6 +4299,7 @@ mod tests {
                     child_pid: Pid::from_raw(-1),
                     cmd: String::new(),
                     exit_status: None,
+                    shared_exit_status: Arc::new(StdMutex::new(None)),
                     output_eof: false,
                 },
             );

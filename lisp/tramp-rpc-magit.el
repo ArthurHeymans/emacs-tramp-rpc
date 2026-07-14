@@ -90,13 +90,38 @@ Keys are expanded filenames, values are (TIMESTAMP . TRUENAME).")
 Keys are (EXPANDED-FILENAME . LSTAT), values are (TIMESTAMP . STAT).
 STAT may be nil, which records a missing file.")
 
+(defun tramp-rpc--effective-cache-ttl ()
+  "Return the current TTL for TRAMP-RPC metadata caches.
+`remote-file-name-inhibit-cache' t disables caching, while a numeric value
+caps the project-specific TTL.  Nil retains the explicit TRAMP-RPC TTL."
+  (cond
+   ((eq remote-file-name-inhibit-cache t) 0)
+   ((numberp remote-file-name-inhibit-cache)
+    (min tramp-rpc--cache-ttl (max 0 remote-file-name-inhibit-cache)))
+   (t tramp-rpc--cache-ttl)))
+
+(defun tramp-rpc--cache-entry-valid-p (timestamp)
+  "Return non-nil when a cache entry created at TIMESTAMP is reusable."
+  (let ((age (- (float-time) timestamp)))
+    (cond
+     ((eq remote-file-name-inhibit-cache t) nil)
+     ((numberp remote-file-name-inhibit-cache)
+      (< age (tramp-rpc--effective-cache-ttl)))
+     ;; TRAMP also binds this to `current-time' to invalidate entries older
+     ;; than the start of a compound operation.
+     ((consp remote-file-name-inhibit-cache)
+      (and (not (time-less-p (seconds-to-time timestamp)
+                             remote-file-name-inhibit-cache))
+           (< age tramp-rpc--cache-ttl)))
+     (t (< age tramp-rpc--cache-ttl)))))
+
 (defun tramp-rpc--cache-get (cache key)
   "Get value for KEY from CACHE if not expired.
 Returns the cached value, or nil if not found or expired."
   (when-let* ((entry (gethash key cache)))
     (let ((timestamp (car entry))
           (value (cdr entry)))
-      (if (< (- (float-time) timestamp) tramp-rpc--cache-ttl)
+      (if (tramp-rpc--cache-entry-valid-p timestamp)
           value
         ;; Expired, remove it
         (remhash key cache)
@@ -118,7 +143,7 @@ Unlike `tramp-rpc--cache-get', this preserves cached nil values."
         'not-cached
       (let ((timestamp (car entry))
             (value (cdr entry)))
-        (if (< (- (float-time) timestamp) tramp-rpc--cache-ttl)
+        (if (tramp-rpc--cache-entry-valid-p timestamp)
             value
           (remhash key cache)
           'not-cached)))))
@@ -158,14 +183,15 @@ must still report symlink type for lstat."
 
 (defvar tramp-rpc-magit--ancestors-cache)
 (defvar tramp-rpc-magit--prefetch-directory)
+(defvar tramp-rpc-magit--ancestors-cache-timestamp)
 (defvar tramp-rpc-magit--ancestor-scan-caches)
-(defvar tramp-rpc-magit--prefetch-directory)
 
 (defun tramp-rpc-magit--clear-ancestor-caches ()
   "Clear cached ancestor marker scans."
   (when (boundp 'tramp-rpc-magit--ancestor-scan-caches)
     (clrhash tramp-rpc-magit--ancestor-scan-caches))
-  (setq tramp-rpc-magit--ancestors-cache nil))
+  (setq tramp-rpc-magit--ancestors-cache nil
+        tramp-rpc-magit--ancestors-cache-timestamp nil))
 
 (defun tramp-rpc-magit--clear-ancestor-caches-for-connection (vec)
   "Clear ancestor caches belonging to the connection identified by VEC."
@@ -182,6 +208,7 @@ must still report symlink type for lstat."
       (with-parsed-tramp-file-name tramp-rpc-magit--prefetch-directory nil
         (when (equal (format "%S" (tramp-rpc--connection-key v)) connection-key)
           (setq tramp-rpc-magit--ancestors-cache nil
+                tramp-rpc-magit--ancestors-cache-timestamp nil
                 tramp-rpc-magit--prefetch-directory nil))))))
 
 (defun tramp-rpc--invalidate-cache-for-path (filename)
@@ -643,6 +670,9 @@ large worktrees must be split without losing item/result ordering.")
 (defvar tramp-rpc-magit--ancestors-cache nil
   "Cached ancestor scan data from server-side RPC.
 This is populated by `tramp-rpc-magit--prefetch' for file existence checks.")
+
+(defvar tramp-rpc-magit--ancestors-cache-timestamp nil
+  "Creation time of `tramp-rpc-magit--ancestors-cache'.")
 
 (defconst tramp-rpc-magit--ancestor-marker-names
   '(".git" ".svn" ".hg" ".bzr" "_darcs"
@@ -1389,7 +1419,8 @@ as the process-file cache.  Also fetches ancestor markers."
         ;; Fetch ancestor markers for project/VC detection
         (setq tramp-rpc-magit--ancestors-cache
               (tramp-rpc-ancestors-scan
-               directory tramp-rpc-magit--ancestor-marker-names))
+               directory tramp-rpc-magit--ancestor-marker-names)
+              tramp-rpc-magit--ancestors-cache-timestamp (float-time))
         (when tramp-rpc-magit--debug
           (let ((cache (tramp-rpc-magit--get-process-cache)))
             (tramp-rpc--debug "tramp-rpc-magit: prefetched %d commands + ancestors for %s"
@@ -1452,12 +1483,17 @@ the server scans the entire tree in one operation."
 (defun tramp-rpc-magit--ancestor-scan-for-directory (directory)
   "Return cached ancestor marker scan for DIRECTORY, fetching it if needed."
   (let* ((directory (file-name-as-directory (expand-file-name directory)))
-         (key (tramp-rpc-magit--ancestor-scan-cache-key directory)))
-    (or (gethash key tramp-rpc-magit--ancestor-scan-caches)
-        (puthash key
-                 (tramp-rpc-ancestors-scan
-                  directory tramp-rpc-magit--ancestor-marker-names)
-                 tramp-rpc-magit--ancestor-scan-caches))))
+         (key (tramp-rpc-magit--ancestor-scan-cache-key directory))
+         (entry (gethash key tramp-rpc-magit--ancestor-scan-caches)))
+    (if (and entry (tramp-rpc--cache-entry-valid-p (car entry)))
+        (cdr entry)
+      (when entry
+        (remhash key tramp-rpc-magit--ancestor-scan-caches))
+      (let ((scan (tramp-rpc-ancestors-scan
+                   directory tramp-rpc-magit--ancestor-marker-names)))
+        (puthash key (cons (float-time) scan)
+                 tramp-rpc-magit--ancestor-scan-caches)
+        scan))))
 
 (defun tramp-rpc-magit--ancestor-cache-covers-p (scan-directory candidate-dir)
   "Return non-nil if SCAN-DIRECTORY's ancestor scan covers CANDIDATE-DIR."
@@ -1504,18 +1540,22 @@ Returns t, nil, or \\='not-cached if not in cache."
       ;; Reuse any dynamic scan whose root is below this candidate directory;
       ;; ancestor scans cover all parents of their search root.
       (maphash
-       (lambda (key scan)
+       (lambda (key entry)
          (when (and (eq answer 'not-cached)
+                    (tramp-rpc--cache-entry-valid-p (car entry))
                     (equal (car key)
                            (tramp-rpc-magit--file-connection-key expanded))
                     (tramp-rpc-magit--ancestor-cache-covers-p
                      (cdr key) file-dir))
            (setq answer
                  (tramp-rpc-magit--file-exists-in-ancestor-scan
-                  expanded scan))))
+                  expanded (cdr entry)))))
        tramp-rpc-magit--ancestor-scan-caches)
       (when (and (eq answer 'not-cached)
                  tramp-rpc-magit--ancestors-cache
+                 tramp-rpc-magit--ancestors-cache-timestamp
+                 (tramp-rpc--cache-entry-valid-p
+                  tramp-rpc-magit--ancestors-cache-timestamp)
                  tramp-rpc-magit--prefetch-directory
                  (equal (tramp-rpc-magit--file-connection-key expanded)
                         (tramp-rpc-magit--file-connection-key

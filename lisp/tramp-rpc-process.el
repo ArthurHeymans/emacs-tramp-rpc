@@ -1215,8 +1215,7 @@ DIRENV-ENV is an optional alist of environment variables for the process."
                    :rpc-pty t
                    :poll-timer nil)
              tramp-rpc--pty-processes)
-    ;; Preserve the connection plist itself: PTY exit uses it to send its
-    ;; close request through the exact transport generation that created it.
+    ;; PTY exit uses the exact transport generation that created it.
     (process-put local-process :tramp-rpc-connection connection)
     (process-put local-process :tramp-rpc-connection-process
                  (plist-get connection :process))
@@ -1327,7 +1326,10 @@ RESPONSE is the decoded RPC response plist."
                (connection (process-get local-process :tramp-rpc-connection)))
       (ignore-errors
         (tramp-rpc--call vec "process.close_pty" `((pid . ,pid)) connection)))
-    (process-put local-process :tramp-rpc-exit-code (or exit-code 0))
+    ;; A terminal server response without a status is abnormal.  In
+    ;; particular, do not translate a killed remote PTY into local success.
+    (process-put local-process :tramp-rpc-exit-code
+                 (if (integerp exit-code) exit-code -1))
     (process-put local-process :tramp-rpc-exited t)
     ;; Close the relay's local stdin and let cat flush the final PTY bytes
     ;; before exiting naturally.  A zero-timeout `accept-process-output' after

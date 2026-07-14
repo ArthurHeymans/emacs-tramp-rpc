@@ -10,11 +10,13 @@ use rmpv::Value;
 use serde::Deserialize;
 use std::collections::HashMap;
 use std::fs::File;
-use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
-use std::thread;
+use std::process::Stdio;
+use std::sync::Arc;
 use std::time::UNIX_EPOCH;
+use tokio::io::AsyncWriteExt;
+use tokio::process::Command;
+use tokio::sync::Semaphore;
 
 use super::HandlerResult;
 
@@ -22,10 +24,10 @@ use super::HandlerResult;
 /// Prevents resource exhaustion from excessively large batches.
 const MAX_PARALLEL_COMMANDS: usize = 256;
 
-/// Run multiple commands in parallel using OS threads.
+/// Run multiple commands concurrently.
 ///
-/// Each command is spawned as an OS thread via `thread::scope`, giving true
-/// parallelism for I/O-bound operations like git commands.  Returns a map
+/// Each command is driven by Tokio, allowing transport cancellation to stop
+/// its whole process group.  Returns a map
 /// of key -> {exit_code, stdout, stderr} for each command.
 ///
 /// This replaces the old `magit.status` handler: instead of hardcoding
@@ -77,115 +79,108 @@ pub async fn run_parallel(params: Value) -> HandlerResult {
         )));
     }
 
-    // Run all commands in parallel using OS threads (not async tasks)
-    // to get true parallelism for blocking process spawning.
-    tokio::task::spawn_blocking(move || {
-        let results: Vec<(String, Value)> = thread::scope(|s| {
-            let handles: Vec<_> = params
-                .commands
-                .into_iter()
-                .map(|entry| {
-                    s.spawn(move || {
-                        let mut cmd = Command::new(&entry.cmd);
-                        cmd.args(&entry.args);
-                        if let Some(ref cwd) = entry.cwd {
-                            cmd.current_dir(super::expand_tilde(cwd));
+    // This budget is shared by every command in the batch, so one chatty
+    // command cannot push the combined response over the frame limit.
+    let remaining = Arc::new(Semaphore::new(crate::MAX_RESPONSE_OUTPUT_BYTES));
+    let results = futures::future::join_all(params.commands.into_iter().map(|entry| {
+        let remaining = Arc::clone(&remaining);
+        async move {
+            let mut cmd = Command::new(&entry.cmd);
+            cmd.args(&entry.args);
+            if let Some(ref cwd) = entry.cwd {
+                cmd.current_dir(super::expand_tilde(cwd));
+            }
+            cmd.stdin(if entry.stdin.is_some() {
+                Stdio::piped()
+            } else {
+                Stdio::null()
+            });
+            cmd.stdout(Stdio::piped());
+            cmd.stderr(Stdio::piped());
+            cmd.kill_on_drop(true);
+            super::process::configure_process_group(&mut cmd);
+
+            let value = match cmd.spawn() {
+                Ok(mut child) => {
+                    let Some(child_pid) = child.id() else {
+                        return (
+                            entry.key,
+                            msgpack_map! {
+                                "exit_code" => -1i32,
+                                "stdout" => Value::Binary(vec![]),
+                                "stderr" => Value::Binary(b"Spawned process has no PID".to_vec())
+                            },
+                        );
+                    };
+                    let mut process_group = super::process::ProcessGroupGuard::new(child_pid);
+                    let stdin_data = entry.stdin;
+                    let mut stdin = child.stdin.take();
+                    let stdout = child.stdout.take().expect("piped stdout");
+                    let stderr = child.stderr.take().expect("piped stderr");
+                    let write_stdin = async move {
+                        if let Some(data) = stdin_data
+                            && let Some(mut stdin) = stdin.take()
+                            && let Err(error) = stdin.write_all(&data).await
+                            // A child that stops reading early is not an error.
+                            && !super::process::is_benign_stdin_error(&error)
+                        {
+                            return Err(std::io::Error::other(format!(
+                                "Failed to write stdin: {error}"
+                            )));
                         }
-                        cmd.stdin(if entry.stdin.is_some() {
-                            Stdio::piped()
-                        } else {
-                            Stdio::null()
-                        });
-                        cmd.stdout(Stdio::piped());
-                        cmd.stderr(Stdio::piped());
-                        let value = match cmd.spawn() {
-                            Ok(mut child) => {
-                                let stdin_data = entry.stdin;
-                                let stdin = child.stdin.take();
-                                // Keep writing and draining output concurrent: a
-                                // child may fill stdout while it reads stdin.
-                                let write_result = thread::scope(|scope| {
-                                    let writer = scope.spawn(move || {
-                                        if let Some(data) = stdin_data
-                                            && let Some(mut stdin) = stdin
-                                        {
-                                            match stdin.write_all(&data) {
-                                                // A child that stops reading
-                                                // early is not an error.
-                                                Err(error)
-                                                    if super::process::is_benign_stdin_error(
-                                                        &error,
-                                                    ) =>
-                                                {
-                                                    Ok(())
-                                                }
-                                                result => result,
-                                            }
-                                        } else {
-                                            Ok(())
-                                        }
-                                    });
-                                    let output = child.wait_with_output();
-                                    let write_result = writer.join().unwrap_or_else(|_| {
-                                        Err(std::io::Error::other("stdin writer panicked"))
-                                    });
-                                    (output, write_result)
-                                });
-                                match write_result {
-                                    (Ok(output), Ok(())) => msgpack_map! {
-                                        "exit_code" => exit_code_from_status(output.status),
-                                        "stdout" => Value::Binary(output.stdout),
-                                        "stderr" => Value::Binary(output.stderr)
-                                    },
-                                    // Report the failure without discarding
-                                    // what the child already produced.
-                                    (Ok(output), Err(error)) => {
-                                        let mut stderr = output.stderr;
-                                        stderr.extend_from_slice(
-                                            format!("Failed to write stdin: {error}\n").as_bytes(),
-                                        );
-                                        msgpack_map! {
-                                            "exit_code" => -1i32,
-                                            "stdout" => Value::Binary(output.stdout),
-                                            "stderr" => Value::Binary(stderr)
-                                        }
-                                    }
-                                    (Err(error), _) => msgpack_map! {
-                                        "exit_code" => -1i32,
-                                        "stdout" => Value::Binary(vec![]),
-                                        "stderr" => Value::Binary(error.to_string().into_bytes())
-                                    },
-                                }
+                        Ok(())
+                    };
+                    let result = tokio::try_join!(
+                        write_stdin,
+                        super::process::read_sync_output(
+                            stdout,
+                            Arc::clone(&remaining),
+                            crate::MAX_RESPONSE_OUTPUT_BYTES,
+                        ),
+                        super::process::read_sync_output(
+                            stderr,
+                            remaining,
+                            crate::MAX_RESPONSE_OUTPUT_BYTES,
+                        ),
+                        child.wait()
+                    );
+                    match result {
+                        Ok(((), stdout, stderr, status)) => {
+                            process_group.disarm();
+                            msgpack_map! {
+                                "exit_code" => exit_code_from_status(status),
+                                "stdout" => Value::Binary(stdout),
+                                "stderr" => Value::Binary(stderr)
                             }
-                            Err(e) => {
-                                msgpack_map! {
-                                    "exit_code" => -1i32,
-                                    "stdout" => Value::Binary(vec![]),
-                                    "stderr" => Value::Binary(e.to_string().into_bytes())
-                                }
+                        }
+                        Err(error) => {
+                            let _ = child.kill().await;
+                            let _ = child.wait().await;
+                            msgpack_map! {
+                                "exit_code" => -1i32,
+                                "stdout" => Value::Binary(vec![]),
+                                "stderr" => Value::Binary(error.to_string().into_bytes())
                             }
-                        };
-                        (entry.key, value)
-                    })
-                })
-                .collect();
+                        }
+                    }
+                }
+                Err(error) => msgpack_map! {
+                    "exit_code" => -1i32,
+                    "stdout" => Value::Binary(vec![]),
+                    "stderr" => Value::Binary(error.to_string().into_bytes())
+                },
+            };
+            (entry.key, value)
+        }
+    }))
+    .await;
 
-            // Recover from thread panics instead of unwinding
-            handles
-                .into_iter()
-                .filter_map(|h| h.join().ok()) // thread panicked; skip this result
-                .collect()
-        });
-
-        let pairs: Vec<(Value, Value)> = results
+    Ok(Value::Map(
+        results
             .into_iter()
-            .map(|(k, v)| (Value::String(k.into()), v))
-            .collect();
-
-        Ok(Value::Map(pairs))
-    })
-    .await
-    .map_err(|e| RpcError::internal_error(format!("Task join error: {}", e)))?
+            .map(|(key, value)| (Value::String(key.into()), value))
+            .collect(),
+    ))
 }
 
 /// Scan ancestor directories for marker files
