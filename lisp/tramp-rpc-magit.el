@@ -39,6 +39,7 @@
 ;; Functions from tramp-rpc.el
 (declare-function tramp-rpc--debug "tramp-rpc")
 (declare-function tramp-rpc--call "tramp-rpc")
+(declare-function tramp-rpc--get-connection "tramp-rpc")
 (declare-function tramp-rpc--call-batch "tramp-rpc")
 (declare-function tramp-rpc--connection-key "tramp-rpc")
 (declare-function tramp-rpc--decode-output "tramp-rpc")
@@ -471,8 +472,10 @@ When RECURSIVE is non-nil, watch subdirectories too."
             (plist-put file-notify-entry :owned nil)
             (puthash watch-key
                      (list :recursive t
-                           :directory directory
-                           :canonical-directory canonical-directory)
+                         :directory directory
+                         :canonical-directory canonical-directory
+                         :connection-process (plist-get (tramp-rpc--get-connection v)
+                                                        :process))
                      tramp-rpc--watched-directories))
         (let* ((result (tramp-rpc--call
                         v "watch.add"
@@ -483,8 +486,10 @@ When RECURSIVE is non-nil, watch subdirectories too."
           (puthash watch-key
                    (list :recursive (or recursive
                                         (tramp-rpc--watch-entry-recursive-p entry))
-                         :directory directory
-                         :canonical-directory canonical-directory)
+                           :directory directory
+                           :canonical-directory canonical-directory
+                           :connection-process (plist-get (tramp-rpc--get-connection v)
+                                                          :process))
                    tramp-rpc--watched-directories))))
     (tramp-rpc--debug "Watching: %s (recursive=%s)" localname recursive)))
 
@@ -523,12 +528,16 @@ When RECURSIVE is non-nil, watch subdirectories too."
                       localname))))))
     (tramp-rpc--debug "Unwatched: %s" localname)))
 
-(defun tramp-rpc--cleanup-watches-for-connection (vec)
-  "Remove all watched directory entries for connection VEC."
+(defun tramp-rpc--cleanup-watches-for-connection (vec &optional connection-process)
+  "Remove watched directory entries for VEC's CONNECTION-PROCESS."
   (let ((conn-key (tramp-rpc--connection-key-string vec))
         (keys-to-remove nil))
-    (maphash (lambda (key _value)
-               (when (string-prefix-p (concat conn-key ":") key)
+    (maphash (lambda (key value)
+               (when (and (string-prefix-p (concat conn-key ":") key)
+                          (or (null connection-process)
+                              (null (plist-get value :connection-process))
+                              (eq connection-process
+                                  (plist-get value :connection-process))))
                  (push key keys-to-remove)))
              tramp-rpc--watched-directories)
     (dolist (key keys-to-remove)

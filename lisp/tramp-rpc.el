@@ -502,7 +502,11 @@ proxy hops remain."
 (declare-function tramp-rpc-clear-file-stat-cache "tramp-rpc-magit")
 (declare-function tramp-rpc--clear-file-metadata-caches "tramp-rpc-magit")
 (declare-function tramp-rpc--cleanup-watches-for-connection "tramp-rpc-magit")
+(declare-function tramp-rpc--cleanup-async-processes "tramp-rpc-process")
+(declare-function tramp-rpc--cleanup-pty-processes "tramp-rpc-process")
+(declare-function tramp-rpc--cleanup-process-write-queues "tramp-rpc-process")
 (declare-function tramp-rpc--clear-file-caches-for-connection "tramp-rpc-magit")
+(declare-function tramp-rpc-magit--clear-cache "tramp-rpc-magit")
 (declare-function tramp-rpc-magit--process-cache-lookup "tramp-rpc-magit")
 (declare-function tramp-rpc-magit--process-cache-store "tramp-rpc-magit")
 (declare-function tramp-rpc-magit--file-exists-p "tramp-rpc-magit")
@@ -709,6 +713,9 @@ and optional :stderr-buffer.")
 
 (defvar tramp-rpc--async-callbacks (make-hash-table :test 'eql)
   "Hash table mapping request IDs to callback functions for async RPC calls.")
+
+(defvar tramp-rpc--async-callback-processes (make-hash-table :test 'eql)
+  "Hash table mapping async request IDs to their transport process.")
 
 (defvar tramp-rpc--pending-responses (make-hash-table :test 'eq)
   "Hash table mapping buffers to their pending response hash tables.
@@ -1071,19 +1078,139 @@ hop."
   (gethash (tramp-rpc--connection-key vec) tramp-rpc--connections))
 
 (defun tramp-rpc--set-connection (vec process buffer &optional stderr-buffer)
-  "Store the RPC connection for VEC."
+  "Store the RPC connection for VEC.
+Caches keyed only by the TRAMP connection spelling are invalidated before a
+new generation is made visible."
+  (tramp-rpc--clear-direnv-cache vec)
+  (tramp-rpc--clear-file-caches-for-connection vec)
+  (tramp-rpc-magit--clear-cache)
   (puthash (tramp-rpc--connection-key vec)
-           (list :process process :buffer buffer :stderr-buffer stderr-buffer)
+           (list :process process :buffer buffer :stderr-buffer stderr-buffer
+                 :generation process)
            tramp-rpc--connections))
 
-(defun tramp-rpc--remove-connection (vec)
-  "Remove the RPC connection for VEC.
+(defun tramp-rpc--remove-connection (vec &optional process)
+  "Remove VEC's connection, optionally only when PROCESS is current.
 Also clears the executable, exec-path, and login shell caches."
-  (let ((key (tramp-rpc--connection-key vec)))
-    (remhash key tramp-rpc--connections)
-    (remhash key tramp-rpc--exec-path-cache)
-    (remhash key tramp-rpc--login-shell-cache))
-  (tramp-rpc--clear-executable-cache vec))
+  (let* ((key (tramp-rpc--connection-key vec))
+         (current (gethash key tramp-rpc--connections)))
+    (when (and current
+               (or (null process) (eq process (plist-get current :process))))
+      (remhash key tramp-rpc--connections)
+      (remhash key tramp-rpc--exec-path-cache)
+      (remhash key tramp-rpc--login-shell-cache)
+      (tramp-rpc--clear-executable-cache vec))))
+
+(defun tramp-rpc--connection-error-response (vec event)
+  "Return an RPC error response for a transport failure on VEC."
+  (list :error
+        (list :code -32098
+              :type 'remote-file-error
+              :message (format "RPC transport closed for %s%s"
+                               (tramp-file-name-host vec)
+                               (if event (format " (%s)" (string-trim event)) "")))))
+
+(defun tramp-rpc--track-pending-request (process id)
+  "Record synchronous request ID ID as pending on PROCESS."
+  (process-put process :tramp-rpc-pending-ids
+               (cons id (delete id (process-get process :tramp-rpc-pending-ids)))))
+
+(defun tramp-rpc--untrack-pending-request (process id)
+  "Forget synchronous request ID ID on PROCESS."
+  (when (processp process)
+    (process-put process :tramp-rpc-pending-ids
+                 (delete id (process-get process :tramp-rpc-pending-ids)))))
+
+(defun tramp-rpc--cleanup-connection-generation
+    (process vec event reason &optional remote-cleanup)
+  "Clean up one PROCESS generation for VEC.
+REASON and EVENT are retained on PROCESS and used for both explicit disconnect
+and unexpected transport death.  REMOTE-CLEANUP requests termination before
+local relay deletion when PROCESS is still live."
+  (when (and (processp process)
+             (not (process-get process :tramp-rpc-transport-cleaned)))
+    (process-put process :tramp-rpc-transport-cleaned t)
+    (process-put process :tramp-rpc-transport-dead t)
+    (process-put process :tramp-rpc-cleanup-reason reason)
+    (process-put process :tramp-rpc-cleanup-event event)
+    (let* ((conn (tramp-rpc--get-connection vec))
+           (current-p (or (null conn)
+                          (eq process (plist-get conn :process))))
+           (generation-buffer (or (process-get process :tramp-rpc-buffer)
+                                  (and current-p conn
+                                       (plist-get conn :buffer))))
+           (error-response (tramp-rpc--connection-error-response vec event))
+           callbacks)
+      ;; Wake synchronous callers before removing any generation state.
+      (dolist (id (process-get process :tramp-rpc-pending-ids))
+        (when (buffer-live-p generation-buffer)
+          (puthash id error-response
+                   (tramp-rpc--get-pending-responses generation-buffer))))
+      ;; Detach callbacks before invoking them, so callback code cannot observe
+      ;; or recreate a callback belonging to this dead generation.
+      (maphash
+       (lambda (id callback-process)
+         (when (eq callback-process process)
+           (when-let* ((callback (gethash id tramp-rpc--async-callbacks)))
+             (push callback callbacks))
+           (remhash id tramp-rpc--async-callbacks)
+           (remhash id tramp-rpc--async-callback-processes)))
+       tramp-rpc--async-callback-processes)
+      ;; These caches are keyed only by the connection spelling.  Clear the old
+      ;; generation while it is current, before relay sentinels or callbacks can
+      ;; reconnect and populate replacement-generation entries.
+      (when current-p
+        (tramp-rpc--clear-direnv-cache vec)
+        (tramp-rpc--clear-file-caches-for-connection vec)
+        (tramp-rpc-magit--clear-cache))
+      ;; These functions keep local relays tracked through delete-process so
+      ;; their wrapped sentinels can preserve the user's sentinel.
+      (tramp-rpc--cleanup-async-processes vec process remote-cleanup)
+      (tramp-rpc--cleanup-pty-processes vec process remote-cleanup)
+      (tramp-rpc--cleanup-watches-for-connection vec process)
+      (tramp-rpc--cleanup-file-notify-for-connection vec process)
+      (when current-p
+        (tramp-rpc--remove-connection vec process))
+      (dolist (callback callbacks)
+        (condition-case callback-error
+            (funcall callback error-response)
+          (error
+           (tramp-rpc--debug "transport cleanup callback failed: %S"
+                             callback-error))))
+      (process-put process :tramp-rpc-pending-ids nil)
+      ;; Explicit disconnect owns transport deletion; unexpected death is
+      ;; already dispatched by Emacs and this is harmlessly idempotent.
+      (when (and remote-cleanup (process-live-p process))
+        (delete-process process)))))
+
+(defun tramp-rpc--connection-transport-death (process vec event)
+  "Clean up unexpected death of PROCESS generation for VEC."
+  (tramp-rpc--cleanup-connection-generation
+   process vec event :transport-death nil))
+
+(defun tramp-rpc--remove-connection-requests (process)
+  "Remove asynchronous request callbacks belonging to PROCESS."
+  (let (ids)
+    (maphash (lambda (id callback-process)
+               (when (eq callback-process process)
+                 (push id ids)))
+             tramp-rpc--async-callback-processes)
+    (dolist (id ids)
+      (remhash id tramp-rpc--async-callbacks)
+      (remhash id tramp-rpc--async-callback-processes))))
+
+(defun tramp-rpc--install-connection-sentinel (process vec)
+  "Install the transport sentinel on PROCESS for VEC's generation."
+  (unless (process-get process :tramp-rpc-connection-sentinel-installed)
+    (process-put process :tramp-rpc-connection-sentinel-installed t)
+    (let ((sentinel (process-sentinel process)))
+      (set-process-sentinel
+       process
+       (lambda (proc event)
+         (when sentinel
+           (funcall sentinel proc event))
+         (when (memq (process-status proc) '(exit signal))
+           (tramp-rpc--connection-transport-death proc vec event)))))))
 
 (defun tramp-rpc--ensure-connection (vec)
   "Ensure we have an active RPC connection to VEC.
@@ -1409,8 +1536,11 @@ Returns the connection plist.  Signals `remote-file-error' on failure."
     (tramp-rpc--set-connection vec process buffer stderr-buffer)
 
     ;; Store vec on the process so notifications can identify the connection
+    ;; and install the generation sentinel before the first RPC can be sent.
     (process-put process :tramp-rpc-vec vec)
+    (process-put process :tramp-rpc-buffer buffer)
     (process-put process 'tramp-vector vec)
+    (tramp-rpc--install-connection-sentinel process vec)
 
     ;; Wait for server to be ready by sending a ping, and seed the
     ;; connection-local system.info cache for later uid/gid/home/shell lookups.
@@ -1526,22 +1656,15 @@ accidentally routing file operations through tramp-sh."
          (tramp-rpc--start-server-process vec binary-path sudo-password)))))))
 
 (defun tramp-rpc--disconnect (vec)
-  "Disconnect the RPC connection to VEC."
-  (let* ((conn (tramp-rpc--get-connection vec))
-         (connection-process (plist-get conn :process)))
-    ;; A reconnect can replace VEC's connection before old cleanup runs.
-    ;; Keep this cleanup scoped to the captured connection generation.
-    (when conn
-      (tramp-rpc--cleanup-async-processes vec connection-process))
-    (tramp-rpc--cleanup-pty-processes vec)
-    ;; Clean up watched directory entries for this connection.
-    (tramp-rpc--cleanup-watches-for-connection vec)
-    (tramp-rpc--cleanup-file-notify-for-connection vec)
-    (when conn
-      (when (process-live-p connection-process)
-        (delete-process connection-process))
-      (tramp-rpc--remove-connection vec)))
-  ;; Flush TRAMP caches so a reconnect gets fresh data (home dir, uid, etc.)
+  "Disconnect the RPC connection to VEC explicitly."
+  (when-let* ((conn (tramp-rpc--get-connection vec))
+              (connection-process (plist-get conn :process)))
+    ;; Marking this state suppresses recursive sentinel work, but the common
+    ;; cleanup core still wakes waiters and fails callbacks before removal.
+    (process-put connection-process :tramp-rpc-disconnecting t)
+    (tramp-rpc--cleanup-connection-generation
+     connection-process vec "explicit disconnect\n" :explicit-disconnect t))
+  ;; Flush TRAMP caches so a reconnect gets fresh data (home dir, uid, etc.).
   (tramp-flush-directory-properties vec "/")
   (tramp-flush-connection-properties vec))
 
@@ -1615,6 +1738,7 @@ Uses length-prefixed binary framing: <4-byte BE length><msgpack payload>."
                     (progn
                       (tramp-rpc--debug "FILTER dispatching async id=%s" id)
                       (remhash id tramp-rpc--async-callbacks)
+                      (remhash id tramp-rpc--async-callback-processes)
                       (funcall callback response))
                   ;; Not an async response - store for sync code
                   (tramp-rpc--debug "FILTER storing sync response id=%s" id)
@@ -1633,8 +1757,9 @@ Returns the request ID."
          (id (car id-and-request))
          (request (cdr id-and-request)))
     (tramp-rpc--debug "SEND-ASYNC id=%s method=%s" id method)
-    ;; Register callback
+    ;; Register callback with its exact transport generation.
     (puthash id callback tramp-rpc--async-callbacks)
+    (puthash id process tramp-rpc--async-callback-processes)
     ;; Send request (binary data with length prefix, no newline)
     (process-send-string process request)
     id))
@@ -1658,6 +1783,8 @@ Returns the response plist if found and removes it from pending, nil otherwise."
          (response (gethash expected-id pending)))
     (when response
       (remhash expected-id pending)
+      (tramp-rpc--untrack-pending-request
+       (get-buffer-process (current-buffer)) expected-id)
       response)))
 
 (defun tramp-rpc--process-accessible-p (process)
@@ -1706,6 +1833,7 @@ Returns the result or signals an error."
          (request (cdr id-and-request)))
 
     (tramp-rpc--debug "SEND id=%s method=%s" expected-id method)
+    (tramp-rpc--track-pending-request process expected-id)
 
     ;; Send request (binary data with length prefix, no newline)
     (process-send-string process request)
@@ -1760,20 +1888,25 @@ Returns the result or signals an error."
               (keyboard-quit))))
 
         (unless response
-          (let ((elapsed (- (float-time) start-time))
-                (stderr-tail (tramp-rpc--connection-stderr-tail conn)))
-            (tramp-rpc--debug
-             "TIMEOUT id=%s method=%s elapsed=%.1fs buffer-size=%d process-live=%s stderr-tail=%S"
-             expected-id method elapsed (buffer-size) (process-live-p process)
-             stderr-tail)
-            (signal
-	     'remote-file-error
-	     (list (concat
-                    (format
-		     "Timeout waiting for RPC response from %s (id=%s, method=%s, waited %.1fs)"
-                     (tramp-file-name-host vec) expected-id method elapsed)
-                    (when stderr-tail
-                      (format "; SSH stderr: %s" stderr-tail)))))))
+          (if (or (process-get process :tramp-rpc-transport-dead)
+                  (not (process-live-p process)))
+              (signal 'remote-file-error
+                      (list (format "RPC transport disconnected from %s"
+                                    (tramp-file-name-host vec))))
+            (let ((elapsed (- (float-time) start-time))
+                  (stderr-tail (tramp-rpc--connection-stderr-tail conn)))
+              (tramp-rpc--debug
+               "TIMEOUT id=%s method=%s elapsed=%.1fs buffer-size=%d process-live=%s stderr-tail=%S"
+               expected-id method elapsed (buffer-size) (process-live-p process)
+               stderr-tail)
+              (signal
+               'remote-file-error
+               (list (concat
+                      (format
+                       "Timeout waiting for RPC response from %s (id=%s, method=%s, waited %.1fs)"
+                       (tramp-file-name-host vec) expected-id method elapsed)
+                      (when stderr-tail
+                        (format "; SSH stderr: %s" stderr-tail))))))))
 
         (tramp-rpc--debug "RECV id=%s (found)" expected-id)
         (if (tramp-rpc-protocol-error-p response)
@@ -1811,6 +1944,7 @@ Returns:
          (request (cdr id-and-request)))
 
     (tramp-rpc--debug "SEND-BATCH id=%s count=%d" expected-id (length requests))
+    (tramp-rpc--track-pending-request process expected-id)
 
     ;; Send batch request (binary data with length prefix, no newline)
     (process-send-string process request)
@@ -1847,20 +1981,25 @@ Returns:
               (keyboard-quit))))
 
         (unless response
-          (let ((elapsed (- (float-time) start-time))
-                (stderr-tail (tramp-rpc--connection-stderr-tail conn)))
-            (tramp-rpc--debug
-             "TIMEOUT-BATCH id=%s elapsed=%.1fs buffer-size=%d process-live=%s stderr-tail=%S"
-             expected-id elapsed (buffer-size) (process-live-p process)
-             stderr-tail)
-            (signal
-	     'remote-file-error
-	     (list (concat
-                    (format
-		     "Timeout waiting for batch RPC response from %s (id=%s, waited %.1fs)"
-		     (tramp-file-name-host vec) expected-id elapsed)
-                    (when stderr-tail
-                      (format "; SSH stderr: %s" stderr-tail)))))))
+          (if (or (process-get process :tramp-rpc-transport-dead)
+                  (not (process-live-p process)))
+              (signal 'remote-file-error
+                      (list (format "RPC transport disconnected from %s"
+                                    (tramp-file-name-host vec))))
+            (let ((elapsed (- (float-time) start-time))
+                  (stderr-tail (tramp-rpc--connection-stderr-tail conn)))
+              (tramp-rpc--debug
+               "TIMEOUT-BATCH id=%s elapsed=%.1fs buffer-size=%d process-live=%s stderr-tail=%S"
+               expected-id elapsed (buffer-size) (process-live-p process)
+               stderr-tail)
+              (signal
+               'remote-file-error
+               (list (concat
+                      (format
+                       "Timeout waiting for batch RPC response from %s (id=%s, waited %.1fs)"
+                       (tramp-file-name-host vec) expected-id elapsed)
+                      (when stderr-tail
+                        (format "; SSH stderr: %s" stderr-tail))))))))
 
         (tramp-rpc--debug "RECV-BATCH id=%s (found)" expected-id)
         (if (tramp-rpc-protocol-error-p response)
@@ -1892,6 +2031,7 @@ Returns a list of request IDs in the same order."
              (bytes (cdr id-and-bytes)))
         (tramp-rpc--debug "SEND-PIPE id=%s method=%s" id (car req))
         (push id ids)
+        (tramp-rpc--track-pending-request process id)
         ;; Send binary data with length prefix, no newline
         (process-send-string process bytes)))
     (nreverse ids)))
@@ -4436,25 +4576,34 @@ Both explicit watch entries and file-notify watch entries count as owners."
        tramp-rpc--file-notify-watch-counts))
     active))
 
-(defun tramp-rpc--cleanup-file-notify-for-connection (&optional vec)
-  "Remove TRAMP-RPC file notification state for VEC.
-When VEC is nil, remove all TRAMP-RPC file notification state.  This also
-removes matching descriptors from Emacs' global `file-notify-descriptors'
-table when it is loaded, so `file-notify-valid-p' cannot retain stale
-descriptors after connection cleanup."
+(defun tramp-rpc--cleanup-file-notify-for-connection
+    (&optional vec connection-process)
+  "Remove file notification state for VEC's CONNECTION-PROCESS.
+When VEC is nil, remove all state."
   (let* ((prefix (and vec (concat (tramp-rpc--connection-key-string vec) ":")))
          (descriptors-to-remove nil)
          (watch-keys-to-remove nil))
     (maphash
      (lambda (descriptor data)
-       (let ((watch-key (plist-get data :watch-key)))
-         (when (or (null prefix)
-                   (and watch-key (string-prefix-p prefix watch-key)))
+       (let* ((watch-key (plist-get data :watch-key))
+              (entry (and watch-key
+                          (gethash watch-key tramp-rpc--file-notify-watch-counts)))
+              (owner (or (plist-get data :connection-process)
+                         (plist-get entry :connection-process))))
+         (when (and (or (null prefix)
+                        (and watch-key (string-prefix-p prefix watch-key)))
+                    (or (null connection-process)
+                        (null owner)
+                        (eq connection-process owner)))
            (push descriptor descriptors-to-remove))))
      tramp-rpc--file-notify-descriptors)
     (maphash
-     (lambda (watch-key _data)
-       (when (or (null prefix) (string-prefix-p prefix watch-key))
+     (lambda (watch-key data)
+       (when (and (or (null prefix) (string-prefix-p prefix watch-key))
+                  (or (null connection-process)
+                      (null (plist-get data :connection-process))
+                      (eq connection-process
+                          (plist-get data :connection-process))))
          (push watch-key watch-keys-to-remove)))
      tramp-rpc--file-notify-watch-counts)
     (dolist (descriptor descriptors-to-remove)
@@ -4730,7 +4879,9 @@ DIRECTORY is the remote directory passed by `file-notify-add-watch'."
                          :owned (and (not preexisting) (not synthetic))
                          :synthetic synthetic
                          :directory directory
-                         :canonical-directory canonical-directory)
+                         :canonical-directory canonical-directory
+                         :connection-process (plist-get (tramp-rpc--get-connection v)
+                                                        :process))
                    tramp-rpc--file-notify-watch-counts)))
       (let ((watch-entry (gethash watch-key tramp-rpc--file-notify-watch-counts)))
         (puthash descriptor
@@ -4739,7 +4890,9 @@ DIRECTORY is the remote directory passed by `file-notify-add-watch'."
                                                        :canonical-directory)
                        :flags flags
                        :localname localname
-                       :watch-key watch-key)
+                       :watch-key watch-key
+                       :connection-process (plist-get (tramp-rpc--get-connection v)
+                                                      :process))
                  tramp-rpc--file-notify-descriptors))
       descriptor)))
 
@@ -5045,41 +5198,38 @@ file-truename)."
   "Clean up all TRAMP-RPC connections.
 Called from `tramp-cleanup-all-connections-hook' after TRAMP's generic
 cleanup of all connections has run."
-  ;; Collect vecs before clearing connections hash so we can close
-  ;; their ControlMaster sockets afterward.
-  (let ((vecs nil))
+  ;; Snapshot actual generations, then run the same explicit cleanup core for
+  ;; each live transport.  In particular, do not pass a nil process to the
+  ;; per-process cleanup helpers: that would allow one generation to clean
+  ;; another and would skip remote termination ordering.
+  (let (generations)
     (maphash (lambda (_key conn)
-               (when-let* ((proc (plist-get conn :process))
-                           (v (process-get proc :tramp-rpc-vec)))
-                 (push v vecs)))
+               (when-let* ((process (plist-get conn :process))
+                           (vec (process-get process :tramp-rpc-vec)))
+                 (push (cons vec process) generations)))
              tramp-rpc--connections)
-    ;; Clean up all async and PTY processes (no vec = all connections).
-    (tramp-rpc--cleanup-async-processes)
-    (tramp-rpc--cleanup-pty-processes)
-    ;; Clean up all filesystem watches.
+    (dolist (generation generations)
+      (let ((vec (car generation))
+            (process (cdr generation)))
+        (when (processp process)
+          (process-put process :tramp-rpc-disconnecting t)
+          (tramp-rpc--cleanup-connection-generation
+           process vec "explicit global disconnect\n" :explicit-disconnect t)
+          (tramp-rpc--cleanup-controlmaster vec))))
     (clrhash tramp-rpc--watched-directories)
     (tramp-rpc--cleanup-file-notify-for-connection)
-    ;; Kill any remaining RPC server processes and clear connections hash.
-    (maphash (lambda (_key conn)
-               (let ((process (plist-get conn :process)))
-                 (when (process-live-p process)
-                   (delete-process process))))
-             tramp-rpc--connections)
-    (clrhash tramp-rpc--connections)
-    ;; Close ControlMaster sockets and kill auth processes/buffers.
-    (dolist (vec vecs)
-      (tramp-rpc--cleanup-controlmaster vec))
-    ;; Also kill any orphaned auth buffers not associated with a
-    ;; tracked connection (e.g. from a failed connection attempt).
+    ;; Also kill orphaned auth buffers from failed connection attempts.
     (dolist (buf (buffer-list))
       (when (string-match-p "\\` \\*tramp-rpc-auth " (buffer-name buf))
         (when-let* ((proc (get-buffer-process buf)))
           (when (process-live-p proc)
             (delete-process proc)))
-        (kill-buffer buf))))
+        (kill-buffer buf)))
+    (clrhash tramp-rpc--connections))
   ;; Clear all RPC-specific caches.
   (clrhash tramp-rpc--pending-responses)
   (clrhash tramp-rpc--async-callbacks)
+  (clrhash tramp-rpc--async-callback-processes)
   (clrhash tramp-rpc--executable-cache)
   (tramp-rpc--clear-direnv-cache)
   (tramp-rpc--clear-file-metadata-caches)
