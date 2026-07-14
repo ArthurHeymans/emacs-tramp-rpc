@@ -39,6 +39,7 @@
 ;; Functions from tramp-rpc.el
 (declare-function tramp-rpc--debug "tramp-rpc")
 (declare-function tramp-rpc--call "tramp-rpc")
+(declare-function tramp-rpc--get-connection "tramp-rpc" (vec))
 (declare-function tramp-rpc--call-batch "tramp-rpc")
 (declare-function tramp-rpc--connection-key "tramp-rpc")
 (declare-function tramp-rpc--decode-output "tramp-rpc")
@@ -156,7 +157,9 @@ must still report symlink type for lstat."
           (setq entries (cdr entries)))))))
 
 (defvar tramp-rpc-magit--ancestors-cache)
+(defvar tramp-rpc-magit--prefetch-directory)
 (defvar tramp-rpc-magit--ancestor-scan-caches)
+(defvar tramp-rpc-magit--prefetch-directory)
 
 (defun tramp-rpc-magit--clear-ancestor-caches ()
   "Clear cached ancestor marker scans."
@@ -164,9 +167,30 @@ must still report symlink type for lstat."
     (clrhash tramp-rpc-magit--ancestor-scan-caches))
   (setq tramp-rpc-magit--ancestors-cache nil))
 
+(defun tramp-rpc-magit--clear-ancestor-caches-for-connection (vec)
+  "Clear ancestor caches belonging to the connection identified by VEC."
+  (let ((connection-key (format "%S" (tramp-rpc--connection-key vec)))
+        ancestor-keys)
+    (maphash
+     (lambda (key _entry)
+       (when (and (consp key) (equal (car key) connection-key))
+         (push key ancestor-keys)))
+     tramp-rpc-magit--ancestor-scan-caches)
+    (dolist (key ancestor-keys)
+      (remhash key tramp-rpc-magit--ancestor-scan-caches))
+    (when tramp-rpc-magit--prefetch-directory
+      (with-parsed-tramp-file-name tramp-rpc-magit--prefetch-directory nil
+        (when (equal (format "%S" (tramp-rpc--connection-key v)) connection-key)
+          (setq tramp-rpc-magit--ancestors-cache nil
+                tramp-rpc-magit--prefetch-directory nil))))))
+
 (defun tramp-rpc--invalidate-cache-for-path (filename)
   "Invalidate cache entries for FILENAME."
-  (tramp-rpc-magit--clear-ancestor-caches)
+  ;; Ancestor scans are keyed by connection.  A mutation on one remote must
+  ;; not evict Magit's repository discovery results for every other remote.
+  (when (tramp-tramp-file-p filename)
+    (with-parsed-tramp-file-name filename nil
+      (tramp-rpc-magit--clear-ancestor-caches-for-connection v)))
   (cl-labels ((drop (candidate)
                 (remhash candidate tramp-rpc--file-exists-cache)
                 (remhash candidate tramp-rpc--file-truename-cache)
@@ -203,7 +227,6 @@ must still report symlink type for lstat."
 
 (defun tramp-rpc--invalidate-cache-for-subtree (directory)
   "Invalidate cache entries for DIRECTORY and all cached descendants."
-  (tramp-rpc-magit--clear-ancestor-caches)
   (let* ((expanded-dir (file-name-as-directory (expand-file-name directory)))
          (expanded-file (directory-file-name expanded-dir)))
     (tramp-rpc--invalidate-cache-for-path expanded-file)
@@ -278,7 +301,7 @@ must still report symlink type for lstat."
   "Clear file-exists and file-truename cache entries for connection VEC.
 Entries are keyed by expanded TRAMP filenames; this removes those
 matching the remote prefix of VEC."
-  (tramp-rpc-magit--clear-ancestor-caches)
+  (tramp-rpc-magit--clear-ancestor-caches-for-connection vec)
   (ignore-errors (tramp-flush-directory-properties vec "/"))
   (let ((prefix (tramp-make-tramp-file-name vec "/")))
     ;; Match the prefix up to the colon-slash that starts the localname.
@@ -401,10 +424,12 @@ DIRECTORY itself returns the empty string.  Descendants can contain slashes."
     (when events
       (tramp-rpc--debug "fs.events: %d events" (length events))
       (tramp-message process 6 "%s" events)
-      (when-let* ((vec (process-get process :tramp-rpc-vec)))
+      (when-let* ((vec (process-get process :tramp-rpc-vec))
+                  (connection (tramp-rpc--get-connection vec))
+                  ((eq process (plist-get connection :process))))
         (unless tramp-rpc--suppress-fs-notifications
-          ;; Also clear the magit process-file cache since git state may have changed.
-          (tramp-rpc-magit--clear-status-cache))
+          ;; Git state changed on this transport, not every remote connection.
+          (tramp-rpc-magit--clear-status-cache-for-connection vec))
         (let (renamed-pairs)
           ;; Linux/inotify can report the same rename as both a combined pair
           ;; and as cookie-tracked from/to events in one debounce batch.  Emacs'
@@ -472,8 +497,10 @@ When RECURSIVE is non-nil, watch subdirectories too."
             (plist-put file-notify-entry :owned nil)
             (puthash watch-key
                      (list :recursive t
-                           :directory directory
-                           :canonical-directory canonical-directory)
+                         :directory directory
+                         :canonical-directory canonical-directory
+                         :connection-process (plist-get (tramp-rpc--get-connection v)
+                                                        :process))
                      tramp-rpc--watched-directories))
         (let* ((result (tramp-rpc--call
                         v "watch.add"
@@ -484,8 +511,10 @@ When RECURSIVE is non-nil, watch subdirectories too."
           (puthash watch-key
                    (list :recursive (or recursive
                                         (tramp-rpc--watch-entry-recursive-p entry))
-                         :directory directory
-                         :canonical-directory canonical-directory)
+                           :directory directory
+                           :canonical-directory canonical-directory
+                           :connection-process (plist-get (tramp-rpc--get-connection v)
+                                                          :process))
                    tramp-rpc--watched-directories))))
     (tramp-rpc--debug "Watching: %s (recursive=%s)" localname recursive)))
 
@@ -524,12 +553,16 @@ When RECURSIVE is non-nil, watch subdirectories too."
                       localname))))))
     (tramp-rpc--debug "Unwatched: %s" localname)))
 
-(defun tramp-rpc--cleanup-watches-for-connection (vec)
-  "Remove all watched directory entries for connection VEC."
+(defun tramp-rpc--cleanup-watches-for-connection (vec &optional connection-process)
+  "Remove watched directory entries for VEC's CONNECTION-PROCESS."
   (let ((conn-key (tramp-rpc--connection-key-string vec))
         (keys-to-remove nil))
-    (maphash (lambda (key _value)
-               (when (string-prefix-p (concat conn-key ":") key)
+    (maphash (lambda (key value)
+               (when (and (string-prefix-p (concat conn-key ":") key)
+                          (or (null connection-process)
+                              (null (plist-get value :connection-process))
+                              (eq connection-process
+                                  (plist-get value :connection-process))))
                  (push key keys-to-remove)))
              tramp-rpc--watched-directories)
     (dolist (key keys-to-remove)
@@ -632,6 +665,12 @@ run normally instead of using a possibly stale status snapshot.")
 (defvar tramp-rpc-magit--status-setup-prefetch-active nil
   "Non-nil while a status setup prefetch covers nested refresh calls.")
 
+
+(defun tramp-rpc-magit--file-connection-key (filename)
+  "Return the normalized connection key for remote FILENAME, or nil."
+  (when (file-remote-p filename)
+    (with-parsed-tramp-file-name filename nil
+      (tramp-rpc--connection-key-string v))))
 
 (defun tramp-rpc-magit--get-cache-key (vec directory)
   "Build a cache key for VEC and DIRECTORY.
@@ -1392,7 +1431,8 @@ the server scans the entire tree in one operation."
 
 (defun tramp-rpc-magit--ancestor-scan-cache-key (directory)
   "Return cache key for ancestor scan rooted at DIRECTORY."
-  (cons (file-remote-p directory) (tramp-file-local-name directory)))
+  (cons (tramp-rpc-magit--file-connection-key directory)
+        (tramp-file-local-name directory)))
 
 (defun tramp-rpc-magit--ancestor-scan-for-directory (directory)
   "Return cached ancestor marker scan for DIRECTORY, fetching it if needed."
@@ -1451,7 +1491,8 @@ Returns t, nil, or \\='not-cached if not in cache."
       (maphash
        (lambda (key scan)
          (when (and (eq answer 'not-cached)
-                    (equal (car key) (file-remote-p expanded))
+                    (equal (car key)
+                           (tramp-rpc-magit--file-connection-key expanded))
                     (tramp-rpc-magit--ancestor-cache-covers-p
                      (cdr key) file-dir))
            (setq answer
@@ -1461,6 +1502,9 @@ Returns t, nil, or \\='not-cached if not in cache."
       (when (and (eq answer 'not-cached)
                  tramp-rpc-magit--ancestors-cache
                  tramp-rpc-magit--prefetch-directory
+                 (equal (tramp-rpc-magit--file-connection-key expanded)
+                        (tramp-rpc-magit--file-connection-key
+                         tramp-rpc-magit--prefetch-directory))
                  (tramp-rpc-magit--ancestor-cache-covers-p
                   (tramp-file-local-name tramp-rpc-magit--prefetch-directory)
                   file-dir))
@@ -1473,8 +1517,9 @@ Returns t, nil, or \\='not-cached if not in cache."
       ;; a real cached answer, not as "try the next fallback".
       (when (and (eq answer 'not-cached)
                  tramp-rpc-magit--prefetch-directory
-                 (equal (file-remote-p expanded)
-                        (file-remote-p tramp-rpc-magit--prefetch-directory))
+                 (equal (tramp-rpc-magit--file-connection-key expanded)
+                        (tramp-rpc-magit--file-connection-key
+                         tramp-rpc-magit--prefetch-directory))
                  (string-prefix-p
                   (file-name-as-directory
                    (directory-file-name
@@ -1492,8 +1537,32 @@ Returns t, nil, or \\='not-cached if not in cache."
 ;; ============================================================================
 
 (defun tramp-rpc-magit--clear-status-cache ()
-  "Clear only the status cache (git state that changes frequently)."
+  "Clear all status caches (git state that changes frequently)."
   (clrhash tramp-rpc-magit--process-caches))
+
+(defun tramp-rpc-magit--clear-status-cache-for-connection (vec)
+  "Clear status caches belonging to the connection identified by VEC."
+  (let ((connection-key (tramp-rpc--connection-key-string vec))
+        process-keys)
+    (maphash
+     (lambda (key _entry)
+       (when (and (consp key) (equal (car key) connection-key))
+         (push key process-keys)))
+     tramp-rpc-magit--process-caches)
+    (dolist (key process-keys)
+      (remhash key tramp-rpc-magit--process-caches))))
+
+(defun tramp-rpc-magit--clear-cache-for-connection (vec)
+  "Clear Magit caches belonging to the connection identified by VEC."
+  (tramp-rpc-magit--clear-status-cache-for-connection vec)
+  (tramp-rpc-magit--clear-ancestor-caches-for-connection vec))
+
+(defun tramp-rpc-magit--clear-caches-for-directory (directory)
+  "Clear Magit and file metadata caches for remote DIRECTORY only."
+  (when (file-remote-p directory)
+    (with-parsed-tramp-file-name directory nil
+      (tramp-rpc-magit--clear-cache-for-connection v)
+      (tramp-rpc--clear-file-caches-for-connection v))))
 
 (defun tramp-rpc-magit--clear-cache ()
   "Clear all magit-related caches."
@@ -1561,20 +1630,13 @@ clearing caches mid-refresh."
               nil
             (and (boundp 'magit-diff-adjust-tab-width)
                  magit-diff-adjust-tab-width))))
-    (tramp-rpc-magit--clear-status-cache)
-    ;; Drop stale metadata before refresh.  Fresh metadata prefetched during the
-    ;; refresh must survive so lazy Magit section expansion can reuse it.
-    (let ((default-directory (if (directory-name-p directory)
-                                 directory
-                               (concat directory "/"))))
-      (tramp-rpc--clear-file-metadata-caches))
+    ;; Drop only this connection's stale Magit and metadata state.  Fresh
+    ;; metadata prefetched during the refresh must survive for lazy sections.
+    (tramp-rpc-magit--clear-caches-for-directory directory)
     (condition-case err
         (tramp-run-real-handler 'magit-status-setup-buffer (list directory))
       (error
-       (let ((default-directory (if (directory-name-p directory)
-                                    directory
-                                  (concat directory "/"))))
-         (tramp-rpc--clear-file-metadata-caches))
+       (tramp-rpc-magit--clear-caches-for-directory directory)
        (signal (car err) (cdr err))))))
 
 (defun tramp-rpc-handle-magit-status-refresh-buffer ()
@@ -1582,7 +1644,7 @@ clearing caches mid-refresh."
 Suppresses fs.events cache handling during refresh to prevent
 inotify events from clearing caches mid-refresh."
   (unless tramp-rpc-magit--status-setup-prefetch-active
-    (tramp-rpc-magit--clear-status-cache))
+    (tramp-rpc-magit--clear-caches-for-directory default-directory))
   (let ((tramp-rpc--suppress-fs-notifications t)
         (tramp-rpc-magit--allow-process-cache t)
         (magit-diff-adjust-tab-width
@@ -1592,13 +1654,12 @@ inotify events from clearing caches mid-refresh."
              nil
            (and (boundp 'magit-diff-adjust-tab-width)
                 magit-diff-adjust-tab-width))))
-    ;; Drop stale metadata before refresh.  Fresh metadata prefetched during the
-    ;; refresh must survive so lazy Magit section expansion can reuse it.
-    (tramp-rpc--clear-file-metadata-caches)
+    ;; The scoped clear above drops stale metadata.  Fresh metadata prefetched
+    ;; during the refresh must survive so lazy Magit sections can reuse it.
     (condition-case err
         (tramp-run-real-handler 'magit-status-refresh-buffer nil)
       (error
-       (tramp-rpc--clear-file-metadata-caches)
+       (tramp-rpc-magit--clear-caches-for-directory default-directory)
        (signal (car err) (cdr err))))))
 
 ;;;###autoload
