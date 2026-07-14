@@ -145,6 +145,17 @@ impl RpcError {
         }
     }
 
+    pub fn process_error_with_kind(msg: impl Into<String>, kind: &str) -> Self {
+        Self {
+            code: Self::PROCESS_ERROR,
+            message: msg.into(),
+            data: Some(Value::Map(vec![(
+                Value::String("process_error".into()),
+                Value::String(kind.into()),
+            )])),
+        }
+    }
+
     pub fn io_error(err: std::io::Error) -> Self {
         // Include the raw OS errno in the data field so clients can
         // match on it structurally rather than parsing the message text.

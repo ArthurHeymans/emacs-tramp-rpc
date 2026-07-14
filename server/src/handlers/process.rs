@@ -485,18 +485,27 @@ pub async fn write(params: Value) -> HandlerResult {
         let processes = get_process_map().lock().await;
         processes
             .get(&params.pid)
-            .ok_or_else(|| RpcError::process_error(format!("Process not found: {}", params.pid)))?
+            .ok_or_else(|| {
+                RpcError::process_error_with_kind(
+                    format!("Process not found: {}", params.pid),
+                    "not_found",
+                )
+            })?
             .stdin
             .clone()
     };
 
     let mut stdin_guard = stdin.lock().await;
-    if let Some(stdin) = stdin_guard.as_mut() {
-        stdin
-            .write_all(&data)
-            .await
-            .map_err(|e| RpcError::process_error(format!("Failed to write to stdin: {}", e)))?;
-    }
+    let Some(stdin) = stdin_guard.as_mut() else {
+        return Err(RpcError::process_error_with_kind(
+            format!("Process stdin is closed: {}", params.pid),
+            "stdin_closed",
+        ));
+    };
+    stdin
+        .write_all(&data)
+        .await
+        .map_err(|e| RpcError::process_error(format!("Failed to write to stdin: {}", e)))?;
 
     Ok(msgpack_map! {
         "written" => data.len()
@@ -783,7 +792,12 @@ pub async fn close_stdin(params: Value) -> HandlerResult {
         let processes = get_process_map().lock().await;
         processes
             .get(&params.pid)
-            .ok_or_else(|| RpcError::process_error(format!("Process not found: {}", params.pid)))?
+            .ok_or_else(|| {
+                RpcError::process_error_with_kind(
+                    format!("Process not found: {}", params.pid),
+                    "not_found",
+                )
+            })?
             .stdin
             .clone()
     };
@@ -2071,6 +2085,72 @@ mod tests {
 
         remove_pipe_process(pid).await;
         panic!("process {pid} did not reach EOF");
+    }
+
+    #[tokio::test]
+    async fn write_closed_stdin_is_process_error() {
+        let _test_lock = test_process_map_lock().await;
+        let pid = start_pipe_process("sleep 1").await;
+        close_stdin(Value::Map(vec![(
+            Value::String("pid".into()),
+            Value::Integer(pid.into()),
+        )]))
+        .await
+        .expect("close stdin");
+
+        let error = write(Value::Map(vec![
+            (Value::String("pid".into()), Value::Integer(pid.into())),
+            (
+                Value::String("data".into()),
+                Value::Binary(b"data".to_vec()),
+            ),
+        ]))
+        .await
+        .expect_err("writing closed stdin should fail");
+        assert_eq!(error.code, RpcError::PROCESS_ERROR);
+        assert!(error.message.contains("Process stdin is closed"));
+        assert_eq!(
+            error.data,
+            Some(Value::Map(vec![(
+                Value::String("process_error".into()),
+                Value::String("stdin_closed".into()),
+            )]))
+        );
+
+        let missing = write(Value::Map(vec![
+            (Value::String("pid".into()), Value::Integer(u32::MAX.into())),
+            (
+                Value::String("data".into()),
+                Value::Binary(b"data".to_vec()),
+            ),
+        ]))
+        .await
+        .expect_err("writing to a missing process should fail");
+        assert_eq!(missing.code, RpcError::PROCESS_ERROR);
+        assert!(missing.message.contains("Process not found"));
+        assert_eq!(
+            missing.data,
+            Some(Value::Map(vec![(
+                Value::String("process_error".into()),
+                Value::String("not_found".into()),
+            )]))
+        );
+
+        let missing_close = close_stdin(Value::Map(vec![(
+            Value::String("pid".into()),
+            Value::Integer(u32::MAX.into()),
+        )]))
+        .await
+        .expect_err("closing stdin for a missing process should fail");
+        assert_eq!(missing_close.code, RpcError::PROCESS_ERROR);
+        assert_eq!(
+            missing_close.data,
+            Some(Value::Map(vec![(
+                Value::String("process_error".into()),
+                Value::String("not_found".into()),
+            )]))
+        );
+        remove_pipe_process(pid).await;
     }
 
     #[tokio::test]
