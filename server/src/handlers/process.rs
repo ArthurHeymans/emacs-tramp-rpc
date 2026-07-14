@@ -10,14 +10,15 @@ use rmpv::Value;
 use serde::Deserialize;
 use std::collections::HashMap;
 use std::io::ErrorKind;
-use std::os::fd::{AsRawFd, BorrowedFd, RawFd};
+use std::os::fd::{AsRawFd, RawFd};
 use std::os::unix::process::ExitStatusExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command as StdCommand, ExitStatus, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex as StdMutex, OnceLock};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 use tokio::process::{Child, ChildStderr, ChildStdin, ChildStdout, Command};
-use tokio::sync::{Mutex, Semaphore};
+use tokio::sync::{Mutex, Notify, Semaphore};
 
 use super::HandlerResult;
 
@@ -824,6 +825,32 @@ fn signal_process_group(pid: u32, signal: i32) -> std::io::Result<()> {
     }
 }
 
+#[cfg(target_os = "macos")]
+fn signal_process(pid: u32, signal: i32) -> std::io::Result<()> {
+    let result = unsafe { libc::kill(pid as libc::pid_t, signal) };
+    if result == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
+}
+
+fn signal_pty_process_group(pid: u32, signal: i32, action: &str) -> Result<(), RpcError> {
+    match signal_process_group(pid, signal) {
+        Ok(()) => Ok(()),
+        #[cfg(target_os = "macos")]
+        Err(error) if error.raw_os_error() == Some(libc::EPERM) => {
+            // Darwin can reject a process-group signal with EPERM even when
+            // the PTY leader remains signalable by this server.  Signal the
+            // leader directly and continue through the normal reap/group-exit
+            // checks.  If an unsignalable descendant really remains, the
+            // later group check still observes it and reports the EPERM.
+            require_process_group_signal(signal_process(pid, signal), action)
+        }
+        Err(error) => require_process_group_signal(Err(error), action),
+    }
+}
+
 fn validate_signal(signal: i32) -> Result<(), RpcError> {
     if signal == 0 || Signal::try_from(signal).is_ok() {
         Ok(())
@@ -877,6 +904,9 @@ fn exit_status_from_wait_status(status: WaitStatus) -> ExitStatus {
 }
 
 const MANAGED_CHILD_WAIT: std::time::Duration = std::time::Duration::from_millis(500);
+// PTY signal handlers may need a scheduler turn to flush their final output
+// before exit; retain that output before escalating to SIGKILL.
+const MANAGED_PTY_CHILD_WAIT: std::time::Duration = std::time::Duration::from_secs(2);
 
 fn process_group_exists(pgid: u32) -> bool {
     let result = unsafe { libc::kill(-(pgid as i32), 0) };
@@ -1066,7 +1096,7 @@ pub async fn list(_params: Value) -> HandlerResult {
 // PTY (Pseudo-Terminal) Process Management
 // ============================================================================
 
-use std::os::unix::io::{FromRawFd, IntoRawFd, OwnedFd};
+use std::os::unix::io::{FromRawFd, OwnedFd};
 use std::os::unix::process::CommandExt;
 use tokio::io::Interest;
 use tokio::io::unix::AsyncFd;
@@ -1086,9 +1116,37 @@ async fn get_next_pty_pid() -> u32 {
     current
 }
 
+struct PtyIoState {
+    // The write lock covers the whole logical input stream, not just one
+    // syscall, so concurrent requests cannot interleave their bytes.
+    write_lock: Mutex<()>,
+    // Serialize the close transition with the final nonblocking write syscall.
+    syscall_lock: StdMutex<()>,
+    // This is retained state: cancellation publishes `closed` before the
+    // permit notification.  There is at most one waiter because writes are
+    // serialized, so notify_one cannot lose a wakeup.
+    closed: AtomicBool,
+    cancelled: Notify,
+}
+
+impl PtyIoState {
+    /// Publish cancellation after any in-flight write syscall finishes.
+    fn cancel(&self) {
+        let _syscall_guard = self.syscall_lock.lock().expect("PTY syscall lock");
+        if !self.closed.swap(true, Ordering::AcqRel) {
+            self.cancelled.notify_one();
+        }
+    }
+
+    fn is_closed(&self) -> bool {
+        self.closed.load(Ordering::Acquire)
+    }
+}
+
 struct ManagedPtyProcess {
     async_fd: AsyncFd<OwnedFd>,
     lifecycle: Arc<Mutex<()>>,
+    io: Arc<PtyIoState>,
     child_pid: Pid,
     cmd: String,
     exit_status: Option<i32>,
@@ -1145,13 +1203,98 @@ struct PtyStartParams {
     cols: u16,
 }
 
-struct ForkResult2 {
-    master_fd: RawFd,
-    child_pid: Pid,
+struct PtyStartupGuard {
+    master_fd: Option<OwnedFd>,
+    child: Option<std::process::Child>,
     tty_name: String,
 }
 
-fn do_fork_exec(params: PtyStartParams) -> Result<ForkResult2, RpcError> {
+impl PtyStartupGuard {
+    fn master_fd(&self) -> RawFd {
+        self.master_fd.as_ref().expect("PTY master fd").as_raw_fd()
+    }
+
+    fn take_master_fd(&mut self) -> OwnedFd {
+        self.master_fd.take().expect("PTY master fd")
+    }
+
+    fn disarm(mut self) -> (Pid, String) {
+        let child = self.child.take().expect("PTY child");
+        let child_pid = Pid::from_raw(child.id() as i32);
+        // Child does not kill or reap on Drop.  Once registered, lifecycle
+        // handlers own reaping through waitpid.
+        drop(child);
+        (child_pid, std::mem::take(&mut self.tty_name))
+    }
+}
+
+fn spawn_async_pty_startup_reaper(mut child: std::process::Child) {
+    if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+        runtime.spawn(async move {
+            loop {
+                match child.try_wait() {
+                    Ok(Some(_)) | Err(_) => return,
+                    Ok(None) => tokio::time::sleep(std::time::Duration::from_millis(10)).await,
+                }
+            }
+        });
+    } else {
+        // Production startup runs inside Tokio.  During runtime teardown the
+        // server process itself is exiting, so make only a nonblocking reap
+        // attempt rather than risking an indefinite wait in Drop.
+        let _ = child.try_wait();
+    }
+}
+
+fn reap_pty_startup_child_with<F>(child: std::process::Child, spawn_reaper: F)
+where
+    F: FnOnce(Arc<StdMutex<Option<std::process::Child>>>) -> std::io::Result<()>,
+{
+    // Keep ownership outside the reaper closure until thread creation has
+    // succeeded.  Builder::spawn consumes and drops its closure on failure;
+    // moving Child directly into that closure would then leave a zombie.
+    let shared_child = Arc::new(StdMutex::new(Some(child)));
+    if spawn_reaper(Arc::clone(&shared_child)).is_err()
+        && let Some(child) = shared_child.lock().expect("PTY startup child lock").take()
+    {
+        // Thread exhaustion must not turn Drop into an unbounded child.wait().
+        // Poll from the existing Tokio runtime instead, retaining Child until
+        // it has been reaped without occupying a blocking worker.
+        spawn_async_pty_startup_reaper(child);
+    }
+}
+
+fn spawn_pty_startup_reaper(child: std::process::Child) {
+    reap_pty_startup_child_with(child, |shared_child| {
+        std::thread::Builder::new()
+            .name("tramp-rpc-pty-startup-reaper".into())
+            .spawn(move || {
+                if let Some(mut child) = shared_child.lock().expect("PTY startup child lock").take()
+                {
+                    let _ = child.wait();
+                }
+            })
+            .map(drop)
+    });
+}
+
+impl Drop for PtyStartupGuard {
+    fn drop(&mut self) {
+        let Some(child) = self.child.take() else {
+            return;
+        };
+        let child_pid = child.id() as i32;
+        // Dropping an aborted spawn_blocking result must not orphan its child.
+        // Reap on a detached thread so a pathological child cannot block a
+        // Tokio worker while the master fd closes through OwnedFd.
+        unsafe {
+            libc::kill(-child_pid, libc::SIGKILL);
+        }
+        spawn_pty_startup_reaper(child);
+    }
+}
+
+fn do_fork_exec(params: PtyStartParams) -> Result<PtyStartupGuard, RpcError> {
     let OpenptyResult { master, slave } = openpty(None, None)
         .map_err(|e| RpcError::process_error(format!("Failed to open PTY: {}", e)))?;
 
@@ -1199,17 +1342,30 @@ fn do_fork_exec(params: PtyStartParams) -> Result<ForkResult2, RpcError> {
 
     let slave_fd = slave.as_raw_fd();
     let master_fd = master.as_raw_fd();
-    let stdin_fd = dup_cloexec(slave_fd)
-        .map_err(|e| RpcError::process_error(format!("Failed to duplicate PTY: {}", e)))?;
-    let stdout_fd = dup_cloexec(slave_fd)
-        .map_err(|e| RpcError::process_error(format!("Failed to duplicate PTY: {}", e)))?;
-    let stderr_fd = dup_cloexec(slave_fd)
-        .map_err(|e| RpcError::process_error(format!("Failed to duplicate PTY: {}", e)))?;
+    // Wrap every successful duplicate immediately so a later duplication
+    // failure closes the descriptors already acquired.
+    let stdin_fd = unsafe {
+        OwnedFd::from_raw_fd(
+            dup_cloexec(slave_fd)
+                .map_err(|e| RpcError::process_error(format!("Failed to duplicate PTY: {}", e)))?,
+        )
+    };
+    let stdout_fd = unsafe {
+        OwnedFd::from_raw_fd(
+            dup_cloexec(slave_fd)
+                .map_err(|e| RpcError::process_error(format!("Failed to duplicate PTY: {}", e)))?,
+        )
+    };
+    let stderr_fd = unsafe {
+        OwnedFd::from_raw_fd(
+            dup_cloexec(slave_fd)
+                .map_err(|e| RpcError::process_error(format!("Failed to duplicate PTY: {}", e)))?,
+        )
+    };
 
-    // SAFETY: `dup_cloexec` returned fresh owned file descriptors; `Stdio` takes ownership.
-    cmd.stdin(unsafe { Stdio::from_raw_fd(stdin_fd) });
-    cmd.stdout(unsafe { Stdio::from_raw_fd(stdout_fd) });
-    cmd.stderr(unsafe { Stdio::from_raw_fd(stderr_fd) });
+    cmd.stdin(Stdio::from(stdin_fd));
+    cmd.stdout(Stdio::from(stdout_fd));
+    cmd.stderr(Stdio::from(stderr_fd));
 
     // SAFETY: the pre-exec hook only calls async-signal-safe libc syscalls.
     unsafe {
@@ -1233,9 +1389,9 @@ fn do_fork_exec(params: PtyStartParams) -> Result<ForkResult2, RpcError> {
         .map_err(|e| RpcError::process_error(format!("Failed to spawn PTY process: {}", e)))?;
     drop(slave);
 
-    Ok(ForkResult2 {
-        master_fd: master.into_raw_fd(),
-        child_pid: Pid::from_raw(child.id() as i32),
+    Ok(PtyStartupGuard {
+        master_fd: Some(master),
+        child: Some(child),
         tty_name,
     })
 }
@@ -1278,34 +1434,44 @@ pub async fn start_pty(params: Value) -> HandlerResult {
         cols: params.cols,
     };
 
-    let fork_result = tokio::task::spawn_blocking(move || do_fork_exec(start_params))
+    let mut startup = tokio::task::spawn_blocking(move || do_fork_exec(start_params))
         .await
         .map_err(|e| RpcError::process_error(format!("Task join error: {}", e)))??;
 
-    set_fd_nonblocking(fork_result.master_fd)
+    set_fd_nonblocking(startup.master_fd())
         .map_err(|e| RpcError::process_error(format!("Failed to set non-blocking: {}", e)))?;
 
-    let owned_fd = unsafe { OwnedFd::from_raw_fd(fork_result.master_fd) };
-    let async_fd = AsyncFd::new(owned_fd)
+    let async_fd = AsyncFd::new(startup.take_master_fd())
         .map_err(|e| RpcError::process_error(format!("Failed to create AsyncFd: {}", e)))?;
 
     let our_pid = get_next_pty_pid().await;
+    let mut processes = get_pty_process_map().lock().await;
+    // Disarm only after the final await.  Cancellation anywhere before this
+    // point drops STARTUP, closes the PTY, and kills/reaps the unregistered child.
+    let (child_pid, tty_name) = startup.disarm();
 
     let managed = ManagedPtyProcess {
         async_fd,
         lifecycle: Arc::new(Mutex::new(())),
-        child_pid: fork_result.child_pid,
+        io: Arc::new(PtyIoState {
+            write_lock: Mutex::new(()),
+            syscall_lock: StdMutex::new(()),
+            closed: AtomicBool::new(false),
+            cancelled: Notify::new(),
+        }),
+        child_pid,
         cmd: params.cmd.clone(),
         exit_status: None,
         output_eof: false,
     };
 
-    get_pty_process_map().lock().await.insert(our_pid, managed);
+    processes.insert(our_pid, managed);
+    drop(processes);
 
     Ok(msgpack_map! {
         "pid" => our_pid,
-        "os_pid" => fork_result.child_pid.as_raw(),
-        "tty_name" => fork_result.tty_name
+        "os_pid" => child_pid.as_raw(),
+        "tty_name" => tty_name
     })
 }
 
@@ -1320,25 +1486,44 @@ pub async fn resize_pty(params: Value) -> HandlerResult {
 
     let params: Params = from_value(params).map_err(|e| RpcError::invalid_params(e.to_string()))?;
 
-    let processes = get_pty_process_map().lock().await;
-    let managed = processes
-        .get(&params.pid)
-        .ok_or_else(|| RpcError::process_error(format!("PTY process not found: {}", params.pid)))?;
+    let lifecycle = {
+        let processes = get_pty_process_map().lock().await;
+        processes
+            .get(&params.pid)
+            .map(|managed| managed.lifecycle.clone())
+            .ok_or_else(|| {
+                RpcError::process_error(format!("PTY process not found: {}", params.pid))
+            })?
+    };
+    let _lifecycle_guard = lifecycle.lock().await;
+    let (fd, child_pid, io) = {
+        // Re-check the registry after acquiring lifecycle ownership: close or
+        // terminal read may have removed the process while resize was waiting.
+        let processes = get_pty_process_map().lock().await;
+        let managed = processes.get(&params.pid).ok_or_else(|| {
+            RpcError::process_error(format!("PTY process not found: {}", params.pid))
+        })?;
+        let fd = dup_cloexec(managed.async_fd.get_ref().as_raw_fd())
+            .map_err(|e| RpcError::process_error(format!("Failed to duplicate PTY: {e}")))?;
+        (fd, managed.child_pid, managed.io.clone())
+    };
+    let owned_fd = unsafe { OwnedFd::from_raw_fd(fd) };
+    if io.is_closed() {
+        return Err(RpcError::process_error(format!(
+            "PTY process is closed: {}",
+            params.pid
+        )));
+    }
 
-    let fd = managed.async_fd.get_ref().as_raw_fd();
-
-    set_window_size(fd, params.rows, params.cols)
+    set_window_size(owned_fd.as_raw_fd(), params.rows, params.cols)
         .map_err(|e| RpcError::process_error(format!("Failed to resize PTY: {}", e)))?;
 
-    match tcgetpgrp(unsafe { BorrowedFd::borrow_raw(fd) }) {
+    match tcgetpgrp(&owned_fd) {
         Ok(fg_pgrp) => {
             let _ = nix::sys::signal::kill(Pid::from_raw(-fg_pgrp.as_raw()), Signal::SIGWINCH);
         }
         Err(_) => {
-            let _ = nix::sys::signal::kill(
-                Pid::from_raw(-managed.child_pid.as_raw()),
-                Signal::SIGWINCH,
-            );
+            let _ = nix::sys::signal::kill(Pid::from_raw(-child_pid.as_raw()), Signal::SIGWINCH);
         }
     }
 
@@ -1399,18 +1584,26 @@ struct PtyReadResult {
 }
 
 async fn read_pty_now(pid: u32, max_bytes: usize) -> Result<PtyReadResult, RpcError> {
-    let lifecycle = {
+    // Take an owned descriptor before awaiting either lifecycle lock or
+    // readiness.  Registry removal can then safely close the original fd
+    // without invalidating this read or allowing fd-number reuse to target a
+    // newly-created PTY.
+    let (lifecycle, io, fd) = {
         let processes = get_pty_process_map().lock().await;
-        processes.get(&pid).map(|managed| managed.lifecycle.clone())
+        let Some(managed) = processes.get(&pid) else {
+            return Ok(PtyReadResult {
+                output: Vec::new(),
+                pending: false,
+                exited: true,
+                exit_code: None,
+            });
+        };
+        let fd = dup_cloexec(managed.async_fd.get_ref().as_raw_fd())
+            .map_err(|e| RpcError::process_error(format!("Failed to duplicate PTY: {e}")))?;
+        (managed.lifecycle.clone(), managed.io.clone(), fd)
     };
-    let Some(lifecycle) = lifecycle else {
-        return Ok(PtyReadResult {
-            output: Vec::new(),
-            pending: false,
-            exited: true,
-            exit_code: None,
-        });
-    };
+    // SAFETY: dup_cloexec returned a fresh descriptor owned by this read.
+    let owned_fd = unsafe { OwnedFd::from_raw_fd(fd) };
     let _lifecycle_guard = lifecycle.lock().await;
     let mut processes = get_pty_process_map().lock().await;
     let Some(managed) = processes.get_mut(&pid) else {
@@ -1423,46 +1616,55 @@ async fn read_pty_now(pid: u32, max_bytes: usize) -> Result<PtyReadResult, RpcEr
     };
 
     let mut output = vec![0u8; max_bytes];
-    let fd = managed.async_fd.get_ref().as_raw_fd();
-    let (pending, eof) =
-        match unsafe { libc::read(fd, output.as_mut_ptr() as *mut libc::c_void, output.len()) } {
-            n if n > 0 => {
-                output.truncate(n as usize);
-                (false, false)
-            }
-            0 => {
-                output.clear();
-                (false, true)
-            }
-            -1 if matches!(
-                std::io::Error::last_os_error().raw_os_error(),
-                Some(errno) if errno == libc::EAGAIN || errno == libc::EWOULDBLOCK
-            ) =>
-            {
-                output.clear();
-                (true, false)
-            }
-            // Linux reports PTY master EOF as EIO after the slave closes.
-            -1 if std::io::Error::last_os_error().raw_os_error() == Some(libc::EIO) => {
-                output.clear();
-                (false, true)
-            }
-            -1 => {
-                return Err(RpcError::process_error(format!(
-                    "Failed to read PTY: {}",
-                    std::io::Error::last_os_error()
-                )));
-            }
-            _ => unreachable!(),
-        };
+    let (pending, eof) = match unsafe {
+        libc::read(
+            owned_fd.as_raw_fd(),
+            output.as_mut_ptr() as *mut libc::c_void,
+            output.len(),
+        )
+    } {
+        n if n > 0 => {
+            output.truncate(n as usize);
+            (false, false)
+        }
+        0 => {
+            output.clear();
+            (false, true)
+        }
+        -1 if matches!(
+            std::io::Error::last_os_error().raw_os_error(),
+            Some(errno) if errno == libc::EAGAIN || errno == libc::EWOULDBLOCK
+        ) =>
+        {
+            output.clear();
+            (true, false)
+        }
+        // Linux reports PTY master EOF as EIO after the slave closes.
+        -1 if std::io::Error::last_os_error().raw_os_error() == Some(libc::EIO) => {
+            output.clear();
+            (false, true)
+        }
+        -1 => {
+            return Err(RpcError::process_error(format!(
+                "Failed to read PTY: {}",
+                std::io::Error::last_os_error()
+            )));
+        }
+        _ => unreachable!(),
+    };
     if eof {
         managed.output_eof = true;
     }
 
     let (child_exited, exit_code) = check_exit_status(managed);
     let exited = child_exited && managed.output_eof;
+    drop(processes);
     if exited {
-        processes.remove(&pid);
+        // Do not hold the registry lock while waiting for an in-flight write
+        // syscall to finish.  The lifecycle guard keeps close/kill ordered
+        // with this terminal read.
+        io.cancel();
+        get_pty_process_map().lock().await.remove(&pid);
     }
     Ok(PtyReadResult {
         output,
@@ -1513,6 +1715,32 @@ async fn wait_for_pty_readable(pid: u32) -> bool {
     async_fd.readable().await.is_ok()
 }
 
+enum PtyWriteAction {
+    Progress,
+    Retry,
+}
+
+fn apply_pty_write(
+    offset: &mut usize,
+    total: usize,
+    result: std::io::Result<usize>,
+) -> Result<PtyWriteAction, RpcError> {
+    match result {
+        Ok(written) if written > 0 => {
+            *offset += written;
+            Ok(PtyWriteAction::Progress)
+        }
+        Ok(_) => Err(RpcError::process_error("PTY write returned zero bytes")),
+        Err(error) if matches!(error.kind(), ErrorKind::Interrupted | ErrorKind::WouldBlock) => {
+            debug_assert!(*offset <= total);
+            Ok(PtyWriteAction::Retry)
+        }
+        Err(error) => Err(RpcError::process_error(format!(
+            "Failed to write to PTY: {error}"
+        ))),
+    }
+}
+
 /// Write to a PTY process (async)
 pub async fn write_pty(params: Value) -> HandlerResult {
     #[derive(Deserialize)]
@@ -1528,32 +1756,62 @@ pub async fn write_pty(params: Value) -> HandlerResult {
     // Data is already binary, no decoding needed!
     let data = params.data;
 
-    // Duplicate the master while briefly holding the registry lock.  Readiness
-    // and the write itself must not hold that global lock: kill, close, read,
-    // and connection cleanup all need to make progress independently.
-    let fd = {
+    // Capture the descriptor and cancellation state while briefly holding the
+    // registry lock.  All waits and writes happen on owned state afterwards.
+    let (fd, io) = {
         let processes = get_pty_process_map().lock().await;
         let managed = processes.get(&params.pid).ok_or_else(|| {
             RpcError::process_error(format!("PTY process not found: {}", params.pid))
         })?;
-        dup_cloexec(managed.async_fd.get_ref().as_raw_fd())
-            .map_err(|e| RpcError::process_error(format!("Failed to duplicate PTY: {}", e)))?
+        let fd = dup_cloexec(managed.async_fd.get_ref().as_raw_fd())
+            .map_err(|e| RpcError::process_error(format!("Failed to duplicate PTY: {}", e)))?;
+        (fd, managed.io.clone())
     };
     let owned_fd = unsafe { OwnedFd::from_raw_fd(fd) };
     let async_fd = AsyncFd::new(owned_fd)
         .map_err(|e| RpcError::process_error(format!("Failed to monitor PTY: {}", e)))?;
-    loop {
-        let mut guard = async_fd
-            .ready(Interest::WRITABLE)
-            .await
-            .map_err(|e| RpcError::process_error(format!("Failed to wait for writable: {}", e)))?;
+    let _write_guard = io.write_lock.lock().await;
+    if io.is_closed() {
+        return Err(RpcError::process_error(format!(
+            "PTY write cancelled: {}",
+            params.pid
+        )));
+    }
 
-        match guard.try_io(|inner| {
+    let mut offset = 0;
+    while offset < data.len() {
+        let cancelled = io.cancelled.notified();
+        if io.is_closed() {
+            return Err(RpcError::process_error(format!(
+                "PTY write cancelled: {}",
+                params.pid
+            )));
+        }
+        let mut guard = tokio::select! {
+            result = async_fd.ready(Interest::WRITABLE) => result
+                .map_err(|e| RpcError::process_error(format!("Failed to wait for writable: {e}")))?,
+            _ = cancelled => {
+                return Err(RpcError::process_error(format!(
+                    "PTY write cancelled: {}", params.pid
+                )));
+            }
+        };
+
+        // Cancellation and the final closed check are atomic with the
+        // nonblocking syscall: no write can begin after close is published.
+        let _syscall_guard = io.syscall_lock.lock().expect("PTY syscall lock");
+        if io.is_closed() {
+            return Err(RpcError::process_error(format!(
+                "PTY write cancelled: {}",
+                params.pid
+            )));
+        }
+        let result = guard.try_io(|inner| {
             let n = unsafe {
                 libc::write(
                     inner.get_ref().as_raw_fd(),
-                    data.as_ptr() as *const libc::c_void,
-                    data.len(),
+                    data[offset..].as_ptr() as *const libc::c_void,
+                    data.len() - offset,
                 )
             };
             if n >= 0 {
@@ -1561,24 +1819,19 @@ pub async fn write_pty(params: Value) -> HandlerResult {
             } else {
                 Err(std::io::Error::last_os_error())
             }
-        }) {
-            Ok(Ok(written)) => {
-                return Ok(msgpack_map! {
-                    "written" => written
-                });
+        });
+        match result {
+            Ok(result) => {
+                apply_pty_write(&mut offset, data.len(), result)?;
             }
-            Ok(Err(error)) => {
-                return Err(RpcError::process_error(format!(
-                    "Failed to write to PTY: {error}"
-                )));
-            }
-            // `AsyncFd` clears the stale writable readiness before retrying.
-            // A single (possibly short) write is performed per request and
-            // the byte count is reported; completing partial writes in order
-            // is left to the write-queue follow-up.
-            Err(_would_block) => continue,
+            // `AsyncFd` clears stale writable readiness before retrying.
+            Err(_would_block) => {}
         }
     }
+
+    Ok(msgpack_map! {
+        "written" => data.len()
+    })
 }
 
 async fn wait_pty_pid(child_pid: Pid) -> Result<Option<i32>, nix::errno::Errno> {
@@ -1596,23 +1849,51 @@ async fn wait_pty_pid(child_pid: Pid) -> Result<Option<i32>, nix::errno::Errno> 
     }
 }
 
-async fn terminate_pty_process(pid: u32, signal: i32, escalate: bool) -> Result<bool, RpcError> {
-    let Some((os_pid, lifecycle)) = ({
+async fn terminate_pty_process(
+    pid: u32,
+    signal: i32,
+    escalate: bool,
+    remove: bool,
+) -> Result<bool, RpcError> {
+    let Some((os_pid, lifecycle, io)) = ({
         let processes = get_pty_process_map().lock().await;
-        processes
-            .get(&pid)
-            .map(|managed| (managed.child_pid.as_raw() as u32, managed.lifecycle.clone()))
+        processes.get(&pid).map(|managed| {
+            (
+                managed.child_pid.as_raw() as u32,
+                managed.lifecycle.clone(),
+                managed.io.clone(),
+            )
+        })
     }) else {
         return Ok(true);
     };
+    // Explicit teardown and SIGKILL must wake a writer blocked on readiness
+    // immediately.  Other forwarded signals (notably SIGINT) are survivable
+    // for an interactive shell, so leave the PTY I/O state usable until a
+    // terminal exit has actually been confirmed.
+    if remove || signal == libc::SIGKILL {
+        io.cancel();
+    }
     let _lifecycle_guard = lifecycle.lock().await;
-    if let Err(error) = signal_process_group(os_pid, signal)
-        && error.kind() != ErrorKind::NotFound
-        && error.raw_os_error() != Some(libc::ESRCH)
-    {
-        return Err(RpcError::process_error(format!(
-            "Failed to send signal: {error}"
-        )));
+    signal_pty_process_group(os_pid, signal, "send signal")?;
+
+    if matches!(signal, 0 | libc::SIGSTOP | libc::SIGCONT) {
+        return Ok(true);
+    }
+
+    let cached = get_pty_process_map()
+        .lock()
+        .await
+        .get(&pid)
+        .and_then(|managed| managed.exit_status);
+    if cached.is_some() && !escalate {
+        // A previously reaped direct child is confirmed terminal death, even
+        // when a caller used a non-fatal signal for this request.
+        io.cancel();
+        if remove {
+            get_pty_process_map().lock().await.remove(&pid);
+        }
+        return Ok(true);
     }
 
     // As with pipe children: only wait for death on signals expected to
@@ -1622,17 +1903,33 @@ async fn terminate_pty_process(pid: u32, signal: i32, escalate: bool) -> Result<
         return Ok(true);
     }
 
-    let mut reap = tokio::time::timeout(
-        MANAGED_CHILD_WAIT,
-        wait_pty_pid(Pid::from_raw(os_pid as i32)),
-    )
-    .await
-    .ok()
-    .and_then(Result::ok);
+    let mut reap = if let Some(exit_code) = cached {
+        Some(Some(exit_code))
+    } else {
+        tokio::time::timeout(
+            MANAGED_PTY_CHILD_WAIT,
+            wait_pty_pid(Pid::from_raw(os_pid as i32)),
+        )
+        .await
+        .ok()
+        .and_then(Result::ok)
+    };
+    // Start the process-group grace only after the direct-child reap wait.
+    // Otherwise a TERM-ignoring child consumes all of its descendants' grace.
+    let escalation_deadline = tokio::time::Instant::now()
+        + if signal == libc::SIGKILL {
+            std::time::Duration::ZERO
+        } else {
+            MANAGED_PTY_CHILD_WAIT
+        };
+    if escalate && wait_for_process_group_exit(os_pid, escalation_deadline).await {
+        // A reaped PTY leader does not prove that TERM-ignoring descendants
+        // left the process group.  Escalate the whole group during cleanup.
+        signal_pty_process_group(os_pid, libc::SIGKILL, "send SIGKILL")?;
+    }
     if reap.is_none() && escalate {
-        let _ = signal_process_group(os_pid, libc::SIGKILL);
         reap = tokio::time::timeout(
-            MANAGED_CHILD_WAIT,
+            MANAGED_PTY_CHILD_WAIT,
             wait_pty_pid(Pid::from_raw(os_pid as i32)),
         )
         .await
@@ -1642,11 +1939,23 @@ async fn terminate_pty_process(pid: u32, signal: i32, escalate: bool) -> Result<
     // `reap` is `Some(None)` when the child was already reaped (ECHILD); do
     // not overwrite a previously recorded exit status in that case.
     if let Some(exit_code) = reap.flatten() {
+        // Reaping confirms terminal death, so no further PTY input can be
+        // admitted.  This also wakes a writer that was waiting for readiness.
+        io.cancel();
         // Kill reaps the direct child but deliberately leaves the PTY master
-        // registered until read_pty observes terminal EOF.
-        if let Some(managed) = get_pty_process_map().lock().await.get_mut(&pid) {
+        // registered until read_pty observes terminal EOF, unless this is an
+        // explicit close.
+        let mut processes = get_pty_process_map().lock().await;
+        if remove {
+            processes.remove(&pid);
+        } else if let Some(managed) = processes.get_mut(&pid) {
             managed.exit_status = Some(exit_code);
         }
+    } else if remove {
+        // A missing wait status is still safe to discard: cancellation was
+        // published before removal and the child will not be reused by this
+        // server process while its descriptor remains owned by this request.
+        get_pty_process_map().lock().await.remove(&pid);
     }
     Ok(true)
 }
@@ -1674,7 +1983,10 @@ pub async fn kill_pty(params: Value) -> HandlerResult {
             params.pid
         )));
     }
-    terminate_pty_process(params.pid, params.signal, false).await?;
+    // Match local signal-process semantics: forward the requested signal
+    // without turning a survivable signal such as SIGINT into SIGKILL.
+    // Explicit close and connection cleanup retain escalation authority.
+    terminate_pty_process(params.pid, params.signal, false, false).await?;
     Ok(Value::Boolean(true))
 }
 
@@ -1686,9 +1998,8 @@ pub async fn close_pty(params: Value) -> HandlerResult {
     }
 
     let params: Params = from_value(params).map_err(|e| RpcError::invalid_params(e.to_string()))?;
-    terminate_pty_process(params.pid, libc::SIGKILL, false).await?;
     // Explicit close is the opt-out from kill's drain-preserving ownership.
-    get_pty_process_map().lock().await.remove(&params.pid);
+    terminate_pty_process(params.pid, libc::SIGKILL, true, true).await?;
     Ok(Value::Boolean(true))
 }
 
@@ -1741,7 +2052,7 @@ pub async fn cleanup_managed_processes() {
         .map(|(pid, _)| terminate_pipe_process(pid, libc::SIGTERM, true));
     let pty_reaps = pty_pids
         .into_iter()
-        .map(|(pid, _)| terminate_pty_process(pid, libc::SIGTERM, true));
+        .map(|(pid, _)| terminate_pty_process(pid, libc::SIGTERM, true, true));
     tokio::join!(
         futures::future::join_all(pipe_reaps),
         futures::future::join_all(pty_reaps)
@@ -1980,6 +2291,15 @@ mod tests {
             .as_raw()
     }
 
+    #[cfg(target_os = "linux")]
+    fn fd_target_count(target: &Path) -> usize {
+        std::fs::read_dir("/proc/self/fd")
+            .expect("list open file descriptors")
+            .filter_map(Result::ok)
+            .filter(|entry| std::fs::read_link(entry.path()).ok().as_deref() == Some(target))
+            .count()
+    }
+
     fn full_nonblocking_pipe() -> (OwnedFd, OwnedFd) {
         let mut fds = [-1; 2];
         assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0, "create pipe");
@@ -2051,6 +2371,57 @@ mod tests {
             waitpid(Pid::from_raw(os_pid), Some(WaitPidFlag::WNOHANG)),
             Err(nix::errno::Errno::ECHILD)
         ));
+    }
+
+    #[tokio::test]
+    async fn failed_startup_reaper_spawn_reaps_asynchronously() {
+        let child = StdCommand::new("sh")
+            .args(["-c", "exit 0"])
+            .spawn()
+            .expect("start short-lived child");
+        let os_pid = child.id() as i32;
+
+        reap_pty_startup_child_with(child, |_shared_child| {
+            Err(std::io::Error::other("injected thread creation failure"))
+        });
+
+        for _ in 0..200 {
+            if unsafe { libc::kill(os_pid, 0) } < 0 {
+                assert_reaped(os_pid);
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        panic!("asynchronous startup fallback did not reap child {os_pid}");
+    }
+
+    #[tokio::test]
+    async fn dropped_pty_startup_guard_kills_and_reaps_child() {
+        let guard = tokio::task::spawn_blocking(|| {
+            do_fork_exec(PtyStartParams {
+                cmd: "sh".into(),
+                args: vec!["-c".into(), "sleep 30".into()],
+                cwd: None,
+                env: None,
+                clear_env: false,
+                rows: 24,
+                cols: 80,
+            })
+        })
+        .await
+        .expect("startup task")
+        .expect("start PTY child");
+        let os_pid = guard.child.as_ref().expect("PTY child").id() as i32;
+
+        drop(guard);
+        for _ in 0..200 {
+            if unsafe { libc::kill(os_pid, 0) } < 0 {
+                assert_reaped(os_pid);
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        panic!("startup guard did not kill and reap child {os_pid}");
     }
 
     async fn collect_pipe_output(pid: u32, max_bytes: usize) -> (Vec<u8>, Vec<u8>, i64) {
@@ -2553,6 +2924,91 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn pty_sigint_survival_keeps_subsequent_writes_open() {
+        let _test_lock = test_process_map_lock().await;
+        let start = start_pty(Value::Map(vec![
+            (Value::String("cmd".into()), Value::String("/bin/sh".into())),
+            (
+                Value::String("args".into()),
+                Value::Array(vec![
+                    Value::String("-c".into()),
+                    Value::String(
+                        "trap '' INT; printf 'ready\\n'; IFS= read -r input; printf 'received:%s\\n' \"$input\""
+                            .into(),
+                    ),
+                ]),
+            ),
+        ]))
+        .await
+        .expect("start SIGINT-surviving PTY");
+        let pid = map_get(&start, "pid").and_then(Value::as_u64).unwrap() as u32;
+
+        let ready = read_pty(Value::Map(vec![
+            (Value::String("pid".into()), Value::Integer(pid.into())),
+            (
+                Value::String("timeout_ms".into()),
+                Value::Integer(1_000.into()),
+            ),
+        ]))
+        .await
+        .expect("read PTY readiness");
+        assert!(
+            matches!(map_get(&ready, "output"), Some(Value::Binary(output)) if output.windows(5).any(|window| window == b"ready"))
+        );
+
+        kill_pty(Value::Map(vec![
+            (Value::String("pid".into()), Value::Integer(pid.into())),
+            (
+                Value::String("signal".into()),
+                Value::Integer((libc::SIGINT as i64).into()),
+            ),
+        ]))
+        .await
+        .expect("forward SIGINT without escalating");
+
+        let write = write_pty(Value::Map(vec![
+            (Value::String("pid".into()), Value::Integer(pid.into())),
+            (
+                Value::String("data".into()),
+                Value::Binary(b"after-int\n".to_vec()),
+            ),
+        ]))
+        .await
+        .expect("write after survivable SIGINT");
+        assert_eq!(map_get(&write, "written").and_then(Value::as_u64), Some(10));
+
+        let mut output = Vec::new();
+        let mut exited = false;
+        for _ in 0..40 {
+            let read = read_pty(Value::Map(vec![
+                (Value::String("pid".into()), Value::Integer(pid.into())),
+                (
+                    Value::String("timeout_ms".into()),
+                    Value::Integer(100.into()),
+                ),
+            ]))
+            .await
+            .expect("read PTY response");
+            if let Some(Value::Binary(chunk)) = map_get(&read, "output") {
+                output.extend_from_slice(chunk);
+            }
+            exited = map_get(&read, "exited").and_then(Value::as_bool) == Some(true);
+            if exited {
+                break;
+            }
+        }
+        assert!(
+            output
+                .windows(b"received:after-int".len())
+                .any(|window| window == b"received:after-int"),
+            "missing shell response in PTY output: {:?}",
+            String::from_utf8_lossy(&output)
+        );
+        assert!(exited, "PTY should exit after processing its input");
+        assert!(!get_pty_process_map().lock().await.contains_key(&pid));
+    }
+
+    #[tokio::test]
     async fn repeated_pty_kill_after_reap_preserves_exit_status() {
         let _test_lock = test_process_map_lock().await;
         let start = start_pty(Value::Map(vec![
@@ -2671,6 +3127,27 @@ mod tests {
 
         cleanup_managed_processes().await;
         wait_for_process_exit(descendant_pid).await;
+    }
+
+    #[tokio::test]
+    async fn cleanup_gives_term_ignoring_pty_group_its_full_grace_period() {
+        let _test_lock = test_process_map_lock().await;
+        let temp = tempfile::tempdir().expect("temporary PTY marker directory");
+        let marker = temp.path().join("ready");
+        let pid = start_signal_ignoring_pty(&marker).await;
+        let os_pid = pty_os_pid(pid).await;
+
+        let started = tokio::time::Instant::now();
+        cleanup_managed_processes().await;
+        // Direct-child reaping gets one bounded wait and the process group
+        // gets a separate one.  Leave scheduling slack while still rejecting
+        // the old one-wait escalation behavior.
+        assert!(
+            started.elapsed() >= std::time::Duration::from_millis(3_500),
+            "PTY process-group grace was consumed by direct-child reap wait"
+        );
+        assert_reaped(os_pid);
+        assert!(get_pty_process_map().lock().await.is_empty());
     }
 
     #[tokio::test]
@@ -2905,6 +3382,100 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn pty_read_drains_output_larger_than_max_bytes_after_exit() {
+        let _test_lock = test_process_map_lock().await;
+        let start = start_pty(Value::Map(vec![
+            (Value::String("cmd".into()), Value::String("python3".into())),
+            (
+                Value::String("args".into()),
+                Value::Array(vec![
+                    Value::String("-c".into()),
+                    Value::String("import os; os.write(1, b'x' * 131072)".into()),
+                ]),
+            ),
+        ]))
+        .await
+        .expect("start pty");
+        let pid = map_get(&start, "pid").and_then(Value::as_u64).unwrap() as u32;
+        let mut output = Vec::new();
+        let mut exited = false;
+        // macOS TTYs hand out at most ~1 KiB per read, so draining 128 KiB
+        // takes well over a hundred reads; size the loop for that, not for
+        // Linux's larger PTY chunks.
+        for _ in 0..512 {
+            let result = read_pty(Value::Map(vec![
+                (Value::String("pid".into()), Value::Integer(pid.into())),
+                (
+                    Value::String("max_bytes".into()),
+                    Value::Integer(4096.into()),
+                ),
+                (
+                    Value::String("timeout_ms".into()),
+                    Value::Integer(500.into()),
+                ),
+            ]))
+            .await
+            .expect("read pty output");
+            if let Some(Value::Binary(bytes)) = map_get(&result, "output") {
+                output.extend_from_slice(bytes);
+            }
+            exited = map_get(&result, "exited").and_then(Value::as_bool) == Some(true);
+            if exited {
+                break;
+            }
+        }
+        assert!(exited);
+        assert_eq!(output.len(), 131072);
+        assert!(output.iter().all(|byte| *byte == b'x'));
+        assert!(!get_pty_process_map().lock().await.contains_key(&pid));
+    }
+
+    #[tokio::test]
+    async fn pty_read_errors_are_terminal_process_errors() {
+        let _test_lock = test_process_map_lock().await;
+        let start = start_pty(Value::Map(vec![
+            (
+                Value::String("cmd".into()),
+                Value::String("/bin/sleep".into()),
+            ),
+            (
+                Value::String("args".into()),
+                Value::Array(vec![Value::String("30".into())]),
+            ),
+        ]))
+        .await
+        .expect("start pty");
+        let pid = map_get(&start, "pid").and_then(Value::as_u64).unwrap() as u32;
+
+        let mut fds = [-1; 2];
+        assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
+        let _read_end = unsafe { OwnedFd::from_raw_fd(fds[0]) };
+        let write_end = unsafe { OwnedFd::from_raw_fd(fds[1]) };
+        set_fd_nonblocking(write_end.as_raw_fd()).expect("make test fd nonblocking");
+        let async_fd = AsyncFd::new(write_end).expect("monitor test fd");
+        get_pty_process_map()
+            .lock()
+            .await
+            .get_mut(&pid)
+            .expect("PTY process")
+            .async_fd = async_fd;
+
+        let error = read_pty(Value::Map(vec![(
+            Value::String("pid".into()),
+            Value::Integer(pid.into()),
+        )]))
+        .await
+        .expect_err("reading a write-only descriptor should fail");
+        assert_eq!(error.code, RpcError::PROCESS_ERROR);
+        close_pty(Value::Map(vec![(
+            Value::String("pid".into()),
+            Value::Integer(pid.into()),
+        )]))
+        .await
+        .expect("close broken PTY");
+    }
+
+    #[tokio::test]
     async fn close_pty_is_idempotent_and_reaps_child() {
         let _test_lock = test_process_map_lock().await;
         let start = start_pty(Value::Map(vec![
@@ -2933,6 +3504,296 @@ mod tests {
         .await
         .expect("second close");
         assert!(!get_pty_process_map().lock().await.contains_key(&pid));
+    }
+
+    #[tokio::test]
+    async fn pty_writes_are_serialized_in_acquisition_order() {
+        let io = Arc::new(PtyIoState {
+            write_lock: Mutex::new(()),
+            syscall_lock: StdMutex::new(()),
+            closed: AtomicBool::new(false),
+            cancelled: Notify::new(),
+        });
+        let first_acquired = Arc::new(Notify::new());
+        let release_first = Arc::new(Notify::new());
+        let order = Arc::new(Mutex::new(Vec::new()));
+
+        let first = {
+            let io = io.clone();
+            let first_acquired = first_acquired.clone();
+            let release_first = release_first.clone();
+            let order = order.clone();
+            tokio::spawn(async move {
+                let _guard = io.write_lock.lock().await;
+                order.lock().await.push(1);
+                first_acquired.notify_one();
+                release_first.notified().await;
+                order.lock().await.push(2);
+            })
+        };
+        first_acquired.notified().await;
+
+        let second = {
+            let io = io.clone();
+            let order = order.clone();
+            tokio::spawn(async move {
+                let _guard = io.write_lock.lock().await;
+                order.lock().await.push(3);
+            })
+        };
+        tokio::task::yield_now().await;
+        assert_eq!(*order.lock().await, vec![1]);
+        release_first.notify_one();
+        first.await.expect("first writer");
+        second.await.expect("second writer");
+        assert_eq!(*order.lock().await, vec![1, 2, 3]);
+    }
+
+    #[test]
+    fn pty_write_loop_handles_partial_eintr_and_eagain() {
+        let mut offset = 0;
+        let mut readiness_waits = 0;
+        let script = [
+            Ok(2),
+            Err(std::io::Error::from_raw_os_error(libc::EINTR)),
+            Err(std::io::Error::from_raw_os_error(libc::EAGAIN)),
+            Ok(3),
+        ];
+        for result in script {
+            match apply_pty_write(&mut offset, 5, result).expect("scripted write") {
+                PtyWriteAction::Progress => {}
+                PtyWriteAction::Retry => readiness_waits += 1,
+            }
+        }
+        assert_eq!(offset, 5);
+        assert_eq!(readiness_waits, 2);
+    }
+
+    #[tokio::test]
+    async fn pty_fd_duplication_survives_concurrent_read_write_close() {
+        let _test_lock = test_process_map_lock().await;
+        let start = start_pty(Value::Map(vec![
+            (Value::String("cmd".into()), Value::String("sleep".into())),
+            (
+                Value::String("args".into()),
+                Value::Array(vec![Value::String("30".into())]),
+            ),
+        ]))
+        .await
+        .expect("start PTY");
+        let pid = map_get(&start, "pid").and_then(Value::as_u64).unwrap() as u32;
+        let read = tokio::spawn(read_pty(Value::Map(vec![
+            (Value::String("pid".into()), Value::Integer(pid.into())),
+            (
+                Value::String("timeout_ms".into()),
+                Value::Integer(1_000.into()),
+            ),
+        ])));
+        let write = tokio::spawn(write_pty(Value::Map(vec![
+            (Value::String("pid".into()), Value::Integer(pid.into())),
+            (
+                Value::String("data".into()),
+                Value::Binary(b"concurrent".to_vec()),
+            ),
+        ])));
+        tokio::task::yield_now().await;
+        close_pty(Value::Map(vec![(
+            Value::String("pid".into()),
+            Value::Integer(pid.into()),
+        )]))
+        .await
+        .expect("close PTY");
+
+        let read_result = tokio::time::timeout(std::time::Duration::from_secs(1), read)
+            .await
+            .expect("duplicated read should finish")
+            .expect("read task should join");
+        let write_result = tokio::time::timeout(std::time::Duration::from_secs(1), write)
+            .await
+            .expect("duplicated write should finish")
+            .expect("write task should join");
+        assert!(matches!(
+            read_result,
+            Ok(_)
+                | Err(RpcError {
+                    code: RpcError::PROCESS_ERROR,
+                    ..
+                })
+        ));
+        assert!(matches!(
+            write_result,
+            Ok(_)
+                | Err(RpcError {
+                    code: RpcError::PROCESS_ERROR,
+                    ..
+                })
+        ));
+        assert!(test_managed_maps_empty().await);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn pty_read_close_race_does_not_leak_duplicated_fds() {
+        let _test_lock = test_process_map_lock().await;
+
+        for iteration in 0..100 {
+            let pid = u32::MAX - iteration;
+            let mut fds = [-1; 2];
+            assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0, "create pipe");
+            let read_end = unsafe { OwnedFd::from_raw_fd(fds[0]) };
+            let write_end = unsafe { OwnedFd::from_raw_fd(fds[1]) };
+            drop(read_end);
+            set_fd_nonblocking(write_end.as_raw_fd()).expect("make test fd nonblocking");
+            let fd_target = std::fs::read_link(format!("/proc/self/fd/{}", write_end.as_raw_fd()))
+                .expect("resolve test fd target");
+
+            let lifecycle = Arc::new(Mutex::new(()));
+            let lifecycle_guard = lifecycle.lock().await;
+            get_pty_process_map().lock().await.insert(
+                pid,
+                ManagedPtyProcess {
+                    async_fd: AsyncFd::new(write_end).expect("monitor test fd"),
+                    lifecycle: lifecycle.clone(),
+                    io: Arc::new(PtyIoState {
+                        write_lock: Mutex::new(()),
+                        syscall_lock: StdMutex::new(()),
+                        closed: AtomicBool::new(false),
+                        cancelled: Notify::new(),
+                    }),
+                    child_pid: Pid::from_raw(-1),
+                    cmd: String::new(),
+                    exit_status: None,
+                    output_eof: false,
+                },
+            );
+            assert_eq!(fd_target_count(&fd_target), 1);
+            let reader = tokio::spawn(read_pty_now(pid, 1));
+
+            for _ in 0..100 {
+                if fd_target_count(&fd_target) == 2 {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+            assert_eq!(
+                fd_target_count(&fd_target),
+                2,
+                "read did not duplicate the PTY descriptor"
+            );
+            assert!(get_pty_process_map().lock().await.remove(&pid).is_some());
+            drop(lifecycle_guard);
+
+            let result = tokio::time::timeout(std::time::Duration::from_secs(1), reader)
+                .await
+                .expect("read should finish after PTY removal")
+                .expect("read task should join")
+                .expect("read should report removed PTY");
+            assert!(result.exited);
+            assert_eq!(
+                fd_target_count(&fd_target),
+                0,
+                "iteration {iteration} leaked an fd"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn pty_write_completes_large_data_under_backpressure() {
+        let _test_lock = test_process_map_lock().await;
+        let start = start_pty(Value::Map(vec![
+            (
+                Value::String("cmd".into()),
+                Value::String("/bin/sleep".into()),
+            ),
+            (
+                Value::String("args".into()),
+                Value::Array(vec![Value::String("30".into())]),
+            ),
+        ]))
+        .await
+        .expect("start backpressure PTY");
+        let pid = map_get(&start, "pid").and_then(Value::as_u64).unwrap() as u32;
+        let read_fd = install_full_pipe_pty(pid).await;
+
+        // Remove the synthetic fill without sleeping; the writer starts with
+        // no available capacity and must therefore exercise partial writes.
+        let mut scratch = [0u8; 8192];
+        loop {
+            let read = unsafe {
+                libc::read(
+                    read_fd.as_raw_fd(),
+                    scratch.as_mut_ptr() as *mut libc::c_void,
+                    scratch.len(),
+                )
+            };
+            if read < 0 {
+                assert_eq!(
+                    std::io::Error::last_os_error().raw_os_error(),
+                    Some(libc::EAGAIN)
+                );
+                break;
+            }
+        }
+
+        let reader_fd = AsyncFd::new(read_fd).expect("monitor backpressure reader");
+        let data = vec![b'z'; 256 * 1024];
+        let expected = data.clone();
+        let reader_expected = expected.clone();
+        let reader = tokio::spawn(async move {
+            let mut output = Vec::with_capacity(reader_expected.len());
+            while output.len() < reader_expected.len() {
+                let mut guard = reader_fd
+                    .readable()
+                    .await
+                    .expect("backpressure reader readiness");
+                match guard.try_io(|inner| {
+                    let mut chunk = [0u8; 8192];
+                    let read = unsafe {
+                        libc::read(
+                            inner.get_ref().as_raw_fd(),
+                            chunk.as_mut_ptr() as *mut libc::c_void,
+                            chunk.len(),
+                        )
+                    };
+                    if read >= 0 {
+                        Ok(chunk[..read as usize].to_vec())
+                    } else {
+                        Err(std::io::Error::last_os_error())
+                    }
+                }) {
+                    Ok(Ok(chunk)) => output.extend_from_slice(&chunk),
+                    Ok(Err(error)) if error.kind() == ErrorKind::Interrupted => {}
+                    Ok(Err(error)) => panic!("backpressure reader: {error}"),
+                    Err(_) => {}
+                }
+            }
+            output
+        });
+        let writer = tokio::spawn(write_pty(Value::Map(vec![
+            (Value::String("pid".into()), Value::Integer(pid.into())),
+            (Value::String("data".into()), Value::Binary(data)),
+        ])));
+
+        let result = tokio::time::timeout(std::time::Duration::from_secs(2), writer)
+            .await
+            .expect("large PTY write should complete")
+            .expect("large PTY writer should join")
+            .expect("large PTY write should succeed");
+        assert_eq!(
+            map_get(&result, "written").and_then(Value::as_u64),
+            Some(262144)
+        );
+        let output = tokio::time::timeout(std::time::Duration::from_secs(2), reader)
+            .await
+            .expect("backpressure reader should complete")
+            .expect("backpressure reader should join");
+        assert_eq!(output, expected);
+        close_pty(Value::Map(vec![(
+            Value::String("pid".into()),
+            Value::Integer(pid.into()),
+        )]))
+        .await
+        .expect("close backpressure PTY");
     }
 
     #[tokio::test]
@@ -2980,9 +3841,8 @@ mod tests {
                 .await
             };
 
-            blocked_write.abort();
             let writer_result =
-                tokio::time::timeout(std::time::Duration::from_secs(1), blocked_write).await;
+                tokio::time::timeout(std::time::Duration::from_secs(1), &mut blocked_write).await;
             // Remove the drain-preserving entry left by kill.  This is also
             // harmless after close, which is deliberately idempotent.
             let close_result = tokio::time::timeout(
@@ -2998,9 +3858,11 @@ mod tests {
             lifecycle_result
                 .expect("PTY lifecycle operation should not wait for write")
                 .expect("PTY lifecycle operation should succeed");
-            writer_result
-                .expect("aborted writer should join")
-                .expect_err("writer should be aborted");
+            match writer_result.expect("cancelled writer should join") {
+                Ok(Err(error)) => assert_eq!(error.code, RpcError::PROCESS_ERROR),
+                Err(_) => {}
+                Ok(Ok(_)) => panic!("writer should be cancelled"),
+            }
             close_result
                 .expect("PTY cleanup should be bounded")
                 .expect("PTY cleanup should succeed");
@@ -3026,6 +3888,7 @@ mod tests {
 
     #[tokio::test]
     async fn start_pty_applies_env_without_mutating_process_env() {
+        let _test_lock = test_process_map_lock().await;
         let parent_value = std::env::var("TRAMP_RPC_PTY_TEST").ok();
         let start = start_pty(Value::Map(vec![
             (Value::String("cmd".into()), Value::String("/bin/sh".into())),

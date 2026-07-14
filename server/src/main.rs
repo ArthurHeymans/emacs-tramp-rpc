@@ -27,6 +27,7 @@ pub(crate) const MAX_RESPONSE_OUTPUT_BYTES: usize = MAX_FRAME_SIZE - 1024 * 1024
 const FRAME_CHANNEL_SIZE: usize = 2;
 const GENERAL_TASK_LIMIT: usize = 16;
 const CONTROL_TASK_LIMIT: usize = 4;
+const PTY_WRITE_TASK_LIMIT: usize = 16;
 /// How many decoded-but-not-yet-started requests are buffered before the
 /// connection stops reading frames.  Past this point the bounded frame
 /// channel and the OS pipe throttle the client, which is the only
@@ -97,11 +98,13 @@ async fn read_frames<R>(
 enum TaskClass {
     General,
     Control,
+    PtyWrite,
 }
 
 struct Admissions {
     general: Arc<Semaphore>,
     control: Arc<Semaphore>,
+    pty_write: Arc<Semaphore>,
 }
 
 impl Admissions {
@@ -109,6 +112,7 @@ impl Admissions {
         let semaphore = match class {
             TaskClass::General => &self.general,
             TaskClass::Control => &self.control,
+            TaskClass::PtyWrite => &self.pty_write,
         };
         Arc::clone(semaphore).try_acquire_owned().ok()
     }
@@ -119,6 +123,7 @@ impl Default for Admissions {
         Self {
             general: Arc::new(Semaphore::new(GENERAL_TASK_LIMIT)),
             control: Arc::new(Semaphore::new(CONTROL_TASK_LIMIT)),
+            pty_write: Arc::new(Semaphore::new(PTY_WRITE_TASK_LIMIT)),
         }
     }
 }
@@ -130,6 +135,10 @@ fn task_class(method: &str) -> TaskClass {
         "process.kill" | "process.close_stdin" | "process.kill_pty" | "process.close_pty" => {
             TaskClass::Control
         }
+        // PTY writes can remain blocked until the remote program reads input.
+        // Isolate them so they cannot consume every general request permit;
+        // lifecycle operations retain their separately reserved control slots.
+        "process.write_pty" => TaskClass::PtyWrite,
         _ => TaskClass::General,
     }
 }
@@ -185,11 +194,6 @@ where
     R: AsyncRead + Unpin + Send + 'static,
     W: AsyncWrite + Unpin + Send + 'static,
 {
-    #[cfg(test)]
-    // Process-local registries are shared by tests even though production
-    // gives each transport its own server process; serialize test loops.
-    let _process_test_lock = handlers::process::test_process_map_lock().await;
-
     // Protocol-level failures are answered by a dedicated writer so they can
     // never be dropped: a missing response leaves the client blocked until
     // its own timeout with no indication of what went wrong.
@@ -436,6 +440,26 @@ mod tests {
         assert_eq!(response.error.unwrap().code, RpcError::INVALID_REQUEST);
     }
 
+    #[test]
+    fn test_blocked_pty_writes_use_dedicated_admission() {
+        let admissions = Admissions::default();
+        let mut general = Vec::new();
+        for _ in 0..GENERAL_TASK_LIMIT {
+            general.push(
+                admissions
+                    .try_acquire(TaskClass::General)
+                    .expect("reserve a general permit"),
+            );
+        }
+
+        assert!(matches!(
+            task_class("process.write_pty"),
+            TaskClass::PtyWrite
+        ));
+        assert!(admissions.try_acquire(TaskClass::PtyWrite).is_some());
+        assert!(admissions.try_acquire(TaskClass::Control).is_some());
+    }
+
     #[tokio::test]
     async fn test_oversized_frame_is_answered_and_drained() {
         let oversized = frame(b"oversized");
@@ -455,6 +479,10 @@ mod tests {
     /// the client blocked on its own timeout with no diagnosis.
     #[tokio::test]
     async fn test_every_malformed_frame_is_answered() {
+        // Even though this test never starts a process, its connection runs
+        // cleanup_managed_processes at EOF, which kills and clears the
+        // process-wide registries.  Serialize with tests that own children.
+        let _test_lock = handlers::process::test_process_map_lock().await;
         let (mut client, server_reader) = tokio::io::duplex(4096);
         let (server_writer, mut client_reader) = tokio::io::duplex(4096);
         let connection = tokio::spawn(run_connection(
@@ -514,6 +542,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_connection_handles_fragmented_frame_while_writing_response() {
+        let _test_lock = handlers::process::test_process_map_lock().await;
         let (mut client, server_reader) = tokio::io::duplex(1024);
         let (server_writer, mut client_reader) = tokio::io::duplex(1024);
         let writer = Arc::new(Mutex::new(server_writer));
@@ -546,6 +575,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_connection_recovers_admission_after_panicked_tasks() {
+        let _test_lock = handlers::process::test_process_map_lock().await;
         let (mut client, server_reader) = tokio::io::duplex(4096);
         let (server_writer, mut client_reader) = tokio::io::duplex(4096);
         let connection = tokio::spawn(run_connection(
@@ -819,6 +849,7 @@ mod tests {
     /// connection task terminates within its bounded cleanup window.
     #[tokio::test]
     async fn test_connection_eof_sigkills_blocked_pipe_and_pty_requests() {
+        let _test_lock = handlers::process::test_process_map_lock().await;
         let (mut client, server_reader) = tokio::io::duplex(4096);
         let (server_writer, mut client_reader) = tokio::io::duplex(4096);
         let connection = tokio::spawn(run_connection(
@@ -915,7 +946,9 @@ mod tests {
         // output.  EOF must still finish after cleanup escalates to SIGKILL.
         drop(client);
         drop(client_reader);
-        tokio::time::timeout(std::time::Duration::from_secs(3), connection)
+        // PTY cleanup gives the direct child and its process group separate
+        // grace periods before escalating, so allow both to elapse.
+        tokio::time::timeout(std::time::Duration::from_secs(5), connection)
             .await
             .expect("EOF cleanup should be bounded")
             .expect("connection task should not panic");
@@ -936,6 +969,7 @@ mod tests {
     /// as a spurious `remote-file-error' for a perfectly valid request.
     #[tokio::test]
     async fn test_general_overload_queues_and_control_is_reserved() {
+        let _test_lock = handlers::process::test_process_map_lock().await;
         let (mut client, server_reader) = tokio::io::duplex(4096);
         let (server_writer, mut client_reader) = tokio::io::duplex(4096);
         let connection = tokio::spawn(run_connection(

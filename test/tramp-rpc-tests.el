@@ -82,6 +82,8 @@
 (require 'tramp-rpc)
 
 (declare-function tramp-rpc--handle-async-read-response "tramp-rpc-process")
+(declare-function tramp-rpc--pty-handle-async-response
+                  "tramp-rpc-process" (local-process response))
 
 ;;; ============================================================================
 ;;; Test Configuration
@@ -2054,6 +2056,27 @@ This matches the upstream `tramp-test28-process-file' test."
              proc '(:error (:code -32004 :message "read failed"))))
           (should (= exit-code -1)))
       (remhash proc tramp-rpc--async-processes)
+      (ignore-errors (delete-process proc)))))
+
+(ert-deftest tramp-rpc-test13d-pty-read-rpc-error-exits-process ()
+  "PTY read RPC errors stop polling and use an abnormal sentinel exit."
+  (let ((proc (make-pipe-process
+               :name "tramp-rpc-pty-read-error-test"
+               :noquery t))
+        exit-code)
+    (unwind-protect
+        (progn
+          (puthash proc '(:vec mock :pid 12345 :poll-timer nil)
+                   tramp-rpc--pty-processes)
+          (cl-letf (((symbol-function 'tramp-rpc--handle-pty-exit)
+                     (lambda (_proc code)
+                       (setq exit-code code))))
+            (tramp-rpc--pty-handle-async-response
+             proc '(:error (:code -32004 :message "read failed"))))
+          (should (= exit-code -1))
+          (should-not (plist-get (gethash proc tramp-rpc--pty-processes)
+                                 :poll-timer)))
+      (remhash proc tramp-rpc--pty-processes)
       (ignore-errors (delete-process proc)))))
 
 ;;; ============================================================================
