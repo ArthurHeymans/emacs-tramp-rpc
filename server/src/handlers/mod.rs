@@ -8,6 +8,7 @@ pub mod process;
 
 use crate::msgpack_map;
 use crate::protocol::{Request, RequestId, Response, RpcError, from_value};
+use futures::{StreamExt, TryStreamExt};
 use rmpv::Value;
 
 /// Dispatch a request to the appropriate handler
@@ -92,6 +93,21 @@ fn login_shell() -> Option<String> {
 }
 
 use crate::protocol::IntoValue;
+
+/// Maximum entries accepted by one batch request.  This remains well above
+/// the existing 10-stat benchmark while bounding per-request work.
+const MAX_BATCH_ENTRIES: usize = 64;
+/// Keep nested batch work below the global general-request admission limit.
+const BATCH_CONCURRENCY: usize = 4;
+
+fn bounded_batch_futures<F>(
+    futures: impl IntoIterator<Item = F>,
+) -> impl futures::Stream<Item = F::Output>
+where
+    F: std::future::Future,
+{
+    futures::stream::iter(futures).buffered(BATCH_CONCURRENCY)
+}
 
 fn hostname() -> String {
     let mut buf = [0u8; 256];
@@ -255,6 +271,20 @@ pub(crate) fn expand_tilde(path: &str) -> String {
     path.to_string()
 }
 
+fn validate_batch_response_size(value: &Value, max_frame_size: usize) -> Result<(), RpcError> {
+    let encoded_size = rmp_serde::to_vec_named(value)
+        .map_err(|error| {
+            RpcError::internal_error(format!("Failed to encode batch response: {error}"))
+        })?
+        .len();
+    if encoded_size >= max_frame_size {
+        return Err(RpcError::internal_error(
+            "Batch response exceeds maximum frame size",
+        ));
+    }
+    Ok(())
+}
+
 /// Execute multiple RPC requests in a single batch
 async fn batch_execute(params: Value) -> HandlerResult {
     #[derive(serde::Deserialize)]
@@ -275,53 +305,75 @@ async fn batch_execute(params: Value) -> HandlerResult {
 
     let batch_params: BatchParams =
         from_value(params).map_err(|e| RpcError::invalid_params(e.to_string()))?;
+    if batch_params.requests.len() > MAX_BATCH_ENTRIES {
+        return Err(RpcError::invalid_params(format!(
+            "batch requests cannot exceed {MAX_BATCH_ENTRIES} entries"
+        )));
+    }
 
-    // Execute all requests concurrently using tokio::join_all
-    let futures: Vec<_> = batch_params
-        .requests
-        .into_iter()
-        .map(|req| async move {
-            // Create a fake Request to reuse dispatch logic
-            let fake_request = Request {
-                version: "2.0".to_string(),
-                id: RequestId::Number(0), // Dummy ID, not used in batch
-                method: req.method,
-                params: req.params,
-            };
+    let results = bounded_batch_futures(batch_params.requests.into_iter().map(|req| async move {
+        // Create a fake Request to reuse dispatch logic.
+        let fake_request = Request {
+            version: "2.0".to_string(),
+            id: RequestId::Number(0), // Dummy ID, not used in batch
+            method: req.method,
+            params: req.params,
+        };
 
-            // Get the result by calling the handler directly (not full dispatch)
-            let response = dispatch_inner(fake_request).await;
+        // Get the result by calling the handler directly (not full dispatch).
+        let response = dispatch_inner(fake_request).await;
 
-            // Convert Response to a result object
-            match (response.result, response.error) {
-                (Some(result), None) => msgpack_map! { "result" => result },
-                (None, Some(error)) => {
-                    let mut error_fields = vec![
-                        (
-                            Value::String("code".into()),
-                            Value::Integer(error.code.into()),
-                        ),
-                        (
-                            Value::String("message".into()),
-                            Value::String(error.message.into()),
-                        ),
-                    ];
-                    if let Some(data) = error.data {
-                        error_fields.push((Value::String("data".into()), data));
-                    }
-                    msgpack_map! {
-                        "error" => Value::Map(error_fields)
-                    }
+        // Convert Response to a result object.
+        let result = match (response.result, response.error) {
+            (Some(result), None) => msgpack_map! { "result" => result },
+            (None, Some(error)) => {
+                let mut error_fields = vec![
+                    (
+                        Value::String("code".into()),
+                        Value::Integer(error.code.into()),
+                    ),
+                    (
+                        Value::String("message".into()),
+                        Value::String(error.message.into()),
+                    ),
+                ];
+                if let Some(data) = error.data {
+                    error_fields.push((Value::String("data".into()), data));
                 }
-                _ => msgpack_map! { "result" => Value::Nil },
+                msgpack_map! {
+                    "error" => Value::Map(error_fields)
+                }
             }
-        })
-        .collect();
+            _ => msgpack_map! { "result" => Value::Nil },
+        };
+        Ok::<Value, RpcError>(result)
+    }))
+    .try_fold(
+        (Vec::new(), 0usize),
+        |(mut results, size), result| async move {
+            let result_size = rmp_serde::to_vec_named(&result)
+                .map_err(|error| {
+                    RpcError::internal_error(format!("Failed to encode batch entry: {error}"))
+                })?
+                .len();
+            let size = size
+                .checked_add(result_size)
+                .ok_or_else(|| RpcError::internal_error("Batch response size overflow"))?;
+            if size >= crate::MAX_FRAME_SIZE {
+                return Err(RpcError::internal_error(
+                    "Batch response exceeds maximum frame size",
+                ));
+            }
+            results.push(result);
+            Ok((results, size))
+        },
+    )
+    .await
+    .map(|(results, _)| results)?;
 
-    // Run all batch requests concurrently
-    let results = futures::future::join_all(futures).await;
-
-    Ok(msgpack_map! { "results" => Value::Array(results) })
+    let result = msgpack_map! { "results" => Value::Array(results) };
+    validate_batch_response_size(&result, crate::MAX_FRAME_SIZE)?;
+    Ok(result)
 }
 
 /// Inner dispatch that handles the actual method routing
@@ -428,7 +480,138 @@ mod tests {
     }
 
     use crate::msgpack_map;
+    use futures::StreamExt;
     use std::os::unix::ffi::OsStrExt;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use tokio::sync::{Barrier, Semaphore};
+
+    #[tokio::test]
+    async fn batch_accepts_max_entries_in_order() {
+        let result = batch_execute(msgpack_map! {
+            "requests" => Value::Array(
+                (0..MAX_BATCH_ENTRIES)
+                    .map(|index| msgpack_map! {
+                        "method" => "system.expand_path",
+                        "params" => msgpack_map! {
+                            "path" => format!("/batch-order-{index}"),
+                        },
+                    })
+                    .collect(),
+            ),
+        })
+        .await
+        .expect("maximum-sized batch should be accepted");
+
+        let results = result
+            .as_map()
+            .and_then(|map| map.iter().find(|(key, _)| key.as_str() == Some("results")))
+            .and_then(|(_, value)| value.as_array())
+            .expect("results array");
+        assert_eq!(results.len(), MAX_BATCH_ENTRIES);
+        for (index, entry) in results.iter().enumerate() {
+            let value = entry
+                .as_map()
+                .and_then(|map| map.iter().find(|(key, _)| key.as_str() == Some("result")))
+                .and_then(|(_, value)| value.as_str())
+                .expect("ordered batch result");
+            assert_eq!(value, format!("/batch-order-{index}"));
+        }
+    }
+
+    #[tokio::test]
+    async fn batch_executor_limits_in_flight_subrequests() {
+        let active = Arc::new(AtomicUsize::new(0));
+        let peak = Arc::new(AtomicUsize::new(0));
+        let ready = Arc::new(Barrier::new(BATCH_CONCURRENCY + 1));
+        let release = Arc::new(Semaphore::new(0));
+        let total = BATCH_CONCURRENCY * 2;
+        let worker_active = Arc::clone(&active);
+        let worker_peak = Arc::clone(&peak);
+        let worker_ready = Arc::clone(&ready);
+        let worker_release = Arc::clone(&release);
+        let futures = (0..total).map(move |index| {
+            let active = Arc::clone(&worker_active);
+            let peak = Arc::clone(&worker_peak);
+            let ready = Arc::clone(&worker_ready);
+            let release = Arc::clone(&worker_release);
+            async move {
+                let in_flight = active.fetch_add(1, Ordering::AcqRel) + 1;
+                peak.fetch_max(in_flight, Ordering::AcqRel);
+                if index < BATCH_CONCURRENCY {
+                    ready.wait().await;
+                }
+                let _permit = release.acquire().await.expect("release semaphore is open");
+                active.fetch_sub(1, Ordering::AcqRel);
+                index
+            }
+        });
+        let executor =
+            tokio::spawn(async move { bounded_batch_futures(futures).collect::<Vec<_>>().await });
+
+        tokio::time::timeout(std::time::Duration::from_secs(1), ready.wait())
+            .await
+            .expect("executor should reach the configured concurrency");
+        assert_eq!(active.load(Ordering::Acquire), BATCH_CONCURRENCY);
+        assert!(peak.load(Ordering::Acquire) <= BATCH_CONCURRENCY);
+        assert_eq!(peak.load(Ordering::Acquire), BATCH_CONCURRENCY);
+
+        release.add_permits(total);
+        assert_eq!(
+            executor
+                .await
+                .expect("bounded executor task should complete"),
+            (0..total).collect::<Vec<_>>()
+        );
+    }
+
+    #[tokio::test]
+    async fn batch_rejects_too_many_entries_and_keeps_nested_non_recursive() {
+        let too_many = batch_execute(msgpack_map! {
+            "requests" => Value::Array(
+                (0..=MAX_BATCH_ENTRIES)
+                    .map(|_| msgpack_map! { "method" => "system.info" })
+                    .collect(),
+            ),
+        })
+        .await
+        .expect_err("oversized batch should be rejected");
+        assert_eq!(too_many.code, RpcError::INVALID_PARAMS);
+
+        let nested = batch_execute(msgpack_map! {
+            "requests" => Value::Array(vec![msgpack_map! {
+                "method" => "batch",
+                "params" => msgpack_map! {
+                    "requests" => Value::Array(vec![msgpack_map! {
+                        "method" => "system.info",
+                    }]),
+                },
+            }]),
+        })
+        .await
+        .expect("nested batch should remain a bounded per-entry error");
+        let nested_error_code = nested
+            .as_map()
+            .and_then(|map| map.iter().find(|(key, _)| key.as_str() == Some("results")))
+            .and_then(|(_, value)| value.as_array())
+            .and_then(|results| results.first())
+            .and_then(Value::as_map)
+            .and_then(|entry| entry.iter().find(|(key, _)| key.as_str() == Some("error")))
+            .and_then(|(_, value)| value.as_map())
+            .and_then(|error| error.iter().find(|(key, _)| key.as_str() == Some("code")))
+            .and_then(|(_, value)| value.as_i64());
+        assert_eq!(
+            nested_error_code,
+            Some(i64::from(RpcError::METHOD_NOT_FOUND))
+        );
+
+        let oversized = msgpack_map! {
+            "results" => Value::Array(vec![Value::Binary(vec![0; 64])]),
+        };
+        let frame_error = validate_batch_response_size(&oversized, 32)
+            .expect_err("oversized serialized response should be rejected");
+        assert_eq!(frame_error.code, RpcError::INTERNAL_ERROR);
+    }
 
     #[tokio::test]
     async fn batch_errors_preserve_data() {

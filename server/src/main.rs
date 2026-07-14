@@ -22,11 +22,47 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufWriter};
 use tokio::sync::{Mutex, mpsc};
 use tokio::task::JoinSet;
 
-const MAX_FRAME_SIZE: usize = 100 * 1024 * 1024;
+pub(crate) const MAX_FRAME_SIZE: usize = 100 * 1024 * 1024;
 const FRAME_CHANNEL_SIZE: usize = 2;
 const GENERAL_TASK_LIMIT: usize = 16;
 const CONTROL_TASK_LIMIT: usize = 4;
 const EOF_TASK_JOIN_WAIT: std::time::Duration = std::time::Duration::from_millis(500);
+
+#[cfg(test)]
+struct CleanupBarrier {
+    first_pass_complete: tokio::sync::Notify,
+    continue_cleanup: tokio::sync::Notify,
+}
+
+#[cfg(test)]
+static CLEANUP_BARRIER: std::sync::OnceLock<Mutex<Option<Arc<CleanupBarrier>>>> =
+    std::sync::OnceLock::new();
+
+#[cfg(test)]
+async fn test_install_cleanup_barrier() -> Arc<CleanupBarrier> {
+    let barrier = Arc::new(CleanupBarrier {
+        first_pass_complete: tokio::sync::Notify::new(),
+        continue_cleanup: tokio::sync::Notify::new(),
+    });
+    *CLEANUP_BARRIER
+        .get_or_init(|| Mutex::new(None))
+        .lock()
+        .await = Some(Arc::clone(&barrier));
+    barrier
+}
+
+#[cfg(test)]
+async fn wait_before_second_cleanup() {
+    let barrier = CLEANUP_BARRIER
+        .get_or_init(|| Mutex::new(None))
+        .lock()
+        .await
+        .take();
+    if let Some(barrier) = barrier {
+        barrier.first_pass_complete.notify_one();
+        barrier.continue_cleanup.notified().await;
+    }
+}
 
 /// Shared handle to the stdout writer, used by both response writing
 /// and the watcher's notification sending.
@@ -202,6 +238,15 @@ where
     })
     .await;
     tasks.abort_all();
+    let _ = tokio::time::timeout(EOF_TASK_JOIN_WAIT, async {
+        while tasks.join_next().await.is_some() {}
+    })
+    .await;
+    // A request can register a child after the first map snapshot while its
+    // task is being joined or aborted.  The second pass closes that race.
+    #[cfg(test)]
+    wait_before_second_cleanup().await;
+    handlers::cleanup_managed_processes().await;
 }
 
 async fn accept_frame<W>(
@@ -559,6 +604,47 @@ mod tests {
 
     fn map_get_id(value: &Value) -> Option<i64> {
         map_get(value, "id").and_then(Value::as_i64)
+    }
+
+    #[tokio::test]
+    async fn test_connection_eof_second_cleanup_catches_late_registration() {
+        let _test_lock = handlers::process::test_process_map_lock().await;
+        let barrier = test_install_cleanup_barrier().await;
+        let (client, server_reader) = tokio::io::duplex(4096);
+        let (server_writer, _client_reader) = tokio::io::duplex(4096);
+        let connection = tokio::spawn(run_connection(
+            server_reader,
+            Arc::new(Mutex::new(server_writer)),
+        ));
+
+        drop(client);
+        barrier.first_pass_complete.notified().await;
+        let start = handlers::process::start(Value::Map(vec![
+            (Value::String("cmd".into()), Value::String("sleep".into())),
+            (
+                Value::String("args".into()),
+                Value::Array(vec![Value::String("30".into())]),
+            ),
+        ]))
+        .await
+        .expect("register child between cleanup passes");
+        assert!(map_get(&start, "pid").and_then(Value::as_u64).is_some());
+        let managed_pids = handlers::process::test_managed_os_pids().await;
+        assert_eq!(managed_pids.len(), 1);
+        let os_pid = managed_pids[0];
+        barrier.continue_cleanup.notify_one();
+        tokio::time::timeout(std::time::Duration::from_secs(3), connection)
+            .await
+            .expect("second cleanup should be bounded")
+            .expect("connection task should not panic");
+        assert!(handlers::process::test_managed_maps_empty().await);
+        assert!(matches!(
+            nix::sys::wait::waitpid(
+                nix::unistd::Pid::from_raw(os_pid),
+                Some(nix::sys::wait::WaitPidFlag::WNOHANG)
+            ),
+            Err(nix::errno::Errno::ECHILD)
+        ));
     }
 
     #[tokio::test]
