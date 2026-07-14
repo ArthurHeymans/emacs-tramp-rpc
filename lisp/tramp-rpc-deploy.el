@@ -189,9 +189,8 @@ and how shell commands are run during deployment.
 
 Recommended methods:
   \"scp\"   - Uses the scp protocol for file transfer (out-of-band).
-             Shell commands use a separate SSH session.  This is the
-             default and most reliable option for transferring large
-             binaries.
+             Shell commands use a separate SSH session.  This is a
+             reliable option for transferring large binaries.
   \"rsync\" - Uses rsync for file transfer (out-of-band).  Requires
              rsync to be installed on both local and remote hosts.
              Efficient for repeated deployments due to delta transfer.
@@ -202,7 +201,8 @@ Legacy methods (use inline encoding for file transfer):
              to PTY input buffer size limits.
   \"ssh\"   - Similar to sshx but with PTY allocation.  Same inline
              encoding limitations apply.
-  \"scpx\"  - Like scp but uses a PTY for the shell session."
+  \"scpx\"  - Like scp but uses a PTY for the shell session; this is the
+             default."
   :type '(choice (const :tag "SCP - out-of-band transfer (recommended)" "scp")
                  (const :tag "rsync - out-of-band transfer (requires rsync)" "rsync")
                  (const :tag "sshx - inline encoding (legacy)" "sshx")
