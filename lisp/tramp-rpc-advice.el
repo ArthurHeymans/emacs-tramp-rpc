@@ -109,13 +109,11 @@
              (not (process-get proc :tramp-rpc-pty)))
         (tramp-rpc--debug "SEND-STRING pipe pid=%s len=%d"
                          (process-get proc :tramp-rpc-pid) (length string))
-        (condition-case err
-            (tramp-rpc--write-remote-process
-           (process-get proc :tramp-rpc-vec)
-           (process-get proc :tramp-rpc-pid)
-           string)
-        (error
-         (message "tramp-rpc: Error writing to process: %s" err))))
+        (tramp-rpc--write-remote-process
+         (process-get proc :tramp-rpc-vec)
+         (process-get proc :tramp-rpc-pid)
+         string
+         proc))
        ;; Not an RPC process, use original function
        (t (tramp-run-real-handler #'process-send-string (list process string)))))))
 
@@ -156,13 +154,11 @@
         (let ((string (buffer-substring-no-properties start end)))
           (tramp-rpc--debug "SEND-REGION pipe pid=%s len=%d"
                            (process-get proc :tramp-rpc-pid) (length string))
-          (condition-case err
-              (tramp-rpc--write-remote-process
-               (process-get proc :tramp-rpc-vec)
-               (process-get proc :tramp-rpc-pid)
-               string)
-            (error
-             (message "tramp-rpc: Error writing to process: %s" err)))))
+          (tramp-rpc--write-remote-process
+           (process-get proc :tramp-rpc-vec)
+           (process-get proc :tramp-rpc-pid)
+           string
+           proc)))
        ;; Not an RPC process, use original function
        (t (tramp-run-real-handler #'process-send-region (list process start end)))))))
 
@@ -188,22 +184,15 @@
           ;; process-send-eof, which is fine - stdin was already closed on exit.
           (unless (or (process-get proc :tramp-rpc-exited)
                       (not (process-live-p proc)))
-            (condition-case err
-                (if (process-get proc :tramp-rpc-pty)
-                    ;; PTY processes: send Ctrl-D (EOF character) via the PTY
-                    (let ((eof-char (string ?\C-d))) ; ASCII 4 = Ctrl-D
-                      (tramp-rpc--call-async vec "process.write_pty"
-                                             `((pid . ,pid)
-                                               (data . ,(msgpack-bin-make eof-char)))
-                                             #'ignore))
-                  ;; Pipe processes: close the stdin pipe
-                  (tramp-rpc--close-remote-stdin vec pid))
-              (error
-               ;; Ignore "Process not found" errors - they just mean the process
-               ;; exited before we could close stdin, which is expected for
-               ;; short-lived processes like git apply in magit hunk staging.
-               (unless (string-match-p "Process not found" (error-message-string err))
-                 (message "tramp-rpc: Error closing stdin: %s" err)))))))
+            (if (process-get proc :tramp-rpc-pty)
+                ;; PTY processes: send Ctrl-D (EOF character) via the PTY.
+                (let ((eof-char (string ?\C-d))) ; ASCII 4 = Ctrl-D
+                  (tramp-rpc--call-async vec "process.write_pty"
+                                         `((pid . ,pid)
+                                           (data . ,(msgpack-bin-make eof-char)))
+                                         #'ignore))
+              ;; Pipe processes: a queue failure must reach the caller.
+              (tramp-rpc--close-remote-stdin vec pid proc)))))
        ;; Not a tramp-rpc process
        (t (tramp-run-real-handler #'process-send-eof (and process (list process))))))))
 

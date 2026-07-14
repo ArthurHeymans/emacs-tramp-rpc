@@ -351,12 +351,16 @@ pub async fn write(params: Value) -> HandlerResult {
     };
 
     let mut stdin_guard = stdin.lock().await;
-    if let Some(stdin) = stdin_guard.as_mut() {
-        stdin
-            .write_all(&data)
-            .await
-            .map_err(|e| RpcError::process_error(format!("Failed to write to stdin: {}", e)))?;
-    }
+    let Some(stdin) = stdin_guard.as_mut() else {
+        return Err(RpcError::process_error(format!(
+            "Process stdin is closed: {}",
+            params.pid
+        )));
+    };
+    stdin
+        .write_all(&data)
+        .await
+        .map_err(|e| RpcError::process_error(format!("Failed to write to stdin: {}", e)))?;
 
     Ok(msgpack_map! {
         "written" => data.len()
@@ -1653,6 +1657,41 @@ mod tests {
 
         remove_pipe_process(pid).await;
         panic!("process {pid} did not reach EOF");
+    }
+
+    #[tokio::test]
+    async fn write_closed_stdin_is_process_error() {
+        let _test_lock = test_process_map_lock().await;
+        let pid = start_pipe_process("sleep 1").await;
+        close_stdin(Value::Map(vec![(
+            Value::String("pid".into()),
+            Value::Integer(pid.into()),
+        )]))
+        .await
+        .expect("close stdin");
+
+        let error = write(Value::Map(vec![
+            (Value::String("pid".into()), Value::Integer(pid.into())),
+            (
+                Value::String("data".into()),
+                Value::Binary(b"data".to_vec()),
+            ),
+        ]))
+        .await
+        .expect_err("writing closed stdin should fail");
+        assert_eq!(error.code, RpcError::PROCESS_ERROR);
+
+        let missing = write(Value::Map(vec![
+            (Value::String("pid".into()), Value::Integer(u32::MAX.into())),
+            (
+                Value::String("data".into()),
+                Value::Binary(b"data".to_vec()),
+            ),
+        ]))
+        .await
+        .expect_err("writing to a missing process should fail");
+        assert_eq!(missing.code, RpcError::PROCESS_ERROR);
+        remove_pipe_process(pid).await;
     }
 
     #[tokio::test]

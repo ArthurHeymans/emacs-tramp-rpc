@@ -44,9 +44,9 @@
 ;; Functions from tramp-rpc.el (loaded before us)
 (declare-function tramp-rpc--debug "tramp-rpc")
 (declare-function tramp-rpc--ensure-connection "tramp-rpc")
-(declare-function tramp-rpc--call "tramp-rpc")
+(declare-function tramp-rpc--call "tramp-rpc" (vec method params &optional connection))
 (declare-function tramp-rpc--call-fast "tramp-rpc")
-(declare-function tramp-rpc--call-async "tramp-rpc")
+(declare-function tramp-rpc--call-async "tramp-rpc" (vec method params callback &optional connection))
 (declare-function tramp-rpc--get-direnv-environment "tramp-rpc")
 (declare-function tramp-rpc--get-remote-login-shell "tramp-rpc")
 (declare-function tramp-rpc--decode-output "tramp-rpc")
@@ -78,15 +78,101 @@
 
 (defvar tramp-rpc--async-processes (make-hash-table :test 'eq)
   "Hash table mapping local relay processes to their remote process info.
-Value is a plist with :vec, :pid, :timer, :stderr-buffer.")
+Value is a plist with :vec, :pid, :connection-process, :timer, :stderr-buffer.")
 
 (defvar tramp-rpc--pty-processes (make-hash-table :test 'eq)
   "Hash table mapping local relay processes to their remote PTY process info.
 Value is a plist with :vec, :pid.")
 
-(defvar tramp-rpc--process-write-queues (make-hash-table :test 'eql)
-  "Hash table mapping remote PIDs to write queue state.
-Value is a plist with :pending (list of pending write data) and :writing (bool).")
+(defvar tramp-rpc--process-write-queues (make-hash-table :test 'equal)
+  "Hash table mapping (connection process . remote PID) to write queue state.
+Value is a plist with :vec, :connection, :connection-process, :owner-process,
+:pending, :current, :writing, and :failure.")
+
+(defvar tramp-rpc-write-queue-drain-timeout 5.0
+  "Seconds to wait for queued process writes before signaling an error.")
+
+(define-error 'tramp-rpc-process-write-error
+  "TRAMP-RPC process write failed" 'remote-file-error)
+
+(declare-function tramp-rpc--get-connection "tramp-rpc" (vec))
+
+(defun tramp-rpc--process-write-queue-key (vec pid &optional connection)
+  "Return the write queue key for VEC and remote PID.
+CONNECTION is the captured RPC connection process."
+  (list (or connection
+            (plist-get (tramp-rpc--get-connection vec) :process)
+            vec)
+        pid))
+
+(defun tramp-rpc--process-write-queue-current-p (queue)
+  "Return non-nil when QUEUE still belongs to VEC's current connection."
+  (let ((connection (plist-get queue :connection-process))
+        (current (tramp-rpc--get-connection (plist-get queue :vec))))
+    (and connection current
+         (eq connection (plist-get current :process)))))
+
+(defun tramp-rpc--process-write-queue-live-p (queue)
+  "Return non-nil when QUEUE still owns live local and RPC processes."
+  (let ((connection (plist-get queue :connection-process))
+        (owner (plist-get queue :owner-process)))
+    (and queue
+         (or (not (processp connection)) (process-live-p connection))
+         (or (not (processp owner)) (process-live-p owner)))))
+
+(defun tramp-rpc--process-write-data-bytes (data)
+  "Return DATA in the binary representation sent to the server."
+  (if (multibyte-string-p data)
+      (encode-coding-string data 'utf-8-unix)
+    data))
+
+(defun tramp-rpc--process-write-queue-pending-bytes (queue)
+  "Return the number of bytes still held by QUEUE, including its current write."
+  (+ (length (tramp-rpc--process-write-data-bytes
+              (or (plist-get queue :current) "")))
+     (cl-loop for item in (plist-get queue :pending)
+              sum (length (tramp-rpc--process-write-data-bytes
+                           (plist-get item :data))))))
+
+(defun tramp-rpc--process-write-queue-fail (queue reason &optional error)
+  "Mark QUEUE failed for REASON, preserving its unsent bytes and ERROR."
+  (unless (plist-get queue :failure)
+    (setq queue
+          (plist-put queue :failure
+                     (list :reason reason :error error
+                           :pending-bytes
+                           (tramp-rpc--process-write-queue-pending-bytes queue)))))
+  (plist-put queue :writing nil))
+
+(defun tramp-rpc--signal-process-write-failure (queue)
+  "Signal QUEUE's structured write failure."
+  (let ((failure (plist-get queue :failure)))
+    (when failure
+      (signal 'tramp-rpc-process-write-error
+              (list (format "Process write failed (%s; %d pending bytes)"
+                            (plist-get failure :reason)
+                            (plist-get failure :pending-bytes))
+                    failure)))))
+
+(defun tramp-rpc--process-write-queue-key-for-owner (vec pid owner)
+  "Return the exact queue key for VEC, PID, and OWNER.
+Capture a connection only when this is the first operation for OWNER."
+  (or (and (processp owner) (process-get owner :tramp-rpc-write-queue-key))
+      (let (key)
+        (maphash (lambda (candidate queue)
+                   (when (and owner (eq owner (plist-get queue :owner-process)))
+                     (setq key candidate)))
+                 tramp-rpc--process-write-queues)
+        key)
+      (let* ((connection (or (and (processp owner)
+                                  (process-get owner :tramp-rpc-connection))
+                             (tramp-rpc--ensure-connection vec)))
+             (key (tramp-rpc--process-write-queue-key
+                   vec pid (plist-get connection :process))))
+        (when (processp owner)
+          (process-put owner :tramp-rpc-connection connection)
+          (process-put owner :tramp-rpc-write-queue-key key))
+        key)))
 
 ;; ============================================================================
 ;; Remote process primitives
@@ -116,80 +202,145 @@ Returns plist with :stdout, :stderr, :exited, :exit-code."
           :exited (alist-get 'exited result)
           :exit-code (alist-get 'exit_code result))))
 
-(defun tramp-rpc--write-remote-process (vec pid data)
+(defun tramp-rpc--write-remote-process (vec pid data &optional owner-process)
   "Write DATA to stdin of remote process PID on VEC.
-Uses async RPC with queuing to preserve write order without making
-`process-send-string' wait for a remote round-trip.  This is important
-for LSP servers, where didChange notifications are sent while typing."
-  (let* ((queue-key pid)
+The queue remains bound to OWNER-PROCESS's original connection generation."
+  (let* ((queue-key (tramp-rpc--process-write-queue-key-for-owner
+                     vec pid owner-process))
          (queue (gethash queue-key tramp-rpc--process-write-queues))
-         (pending (plist-get queue :pending))
-         (writing (plist-get queue :writing)))
-    ;; Add to pending queue.
-    (setq pending (append pending (list (list :vec vec :pid pid :data data))))
-    (puthash queue-key (list :pending pending :writing writing)
-             tramp-rpc--process-write-queues)
-    ;; If not currently writing, start processing the queue.
-    (unless writing
-      (tramp-rpc--process-write-queue queue-key))))
+         (connection (or (plist-get queue :connection)
+                         (and (processp owner-process)
+                              (process-get owner-process :tramp-rpc-connection))
+                         (tramp-rpc--ensure-connection vec)))
+         (state (or queue
+                    (list :vec vec :pid pid :connection connection
+                          :connection-process (plist-get connection :process)
+                          :owner-process owner-process :pending nil
+                          :current nil :writing nil))))
+    (cond
+     ((plist-get state :failure)
+      (tramp-rpc--signal-process-write-failure state))
+     ((not (tramp-rpc--process-write-queue-current-p state))
+      (setq state (tramp-rpc--process-write-queue-fail
+                   state :connection-replaced))
+      (puthash queue-key state tramp-rpc--process-write-queues)
+      (tramp-rpc--signal-process-write-failure state))
+     (t
+      (setq state (plist-put state :pending
+                             (append (plist-get state :pending)
+                                     (list (list :vec vec :pid pid :data data)))))
+      (puthash queue-key state tramp-rpc--process-write-queues)
+      (unless (plist-get state :writing)
+        (tramp-rpc--process-write-queue queue-key))))))
 
 (defun tramp-rpc--process-write-queue (queue-key)
-  "Process the next pending write for QUEUE-KEY (remote PID)."
+  "Process the next pending write for QUEUE-KEY."
   (let* ((queue (gethash queue-key tramp-rpc--process-write-queues))
          (pending (plist-get queue :pending)))
-    (when pending
-      (let* ((item (car pending))
-             (vec (plist-get item :vec))
-             (pid (plist-get item :pid))
-             (data (plist-get item :data)))
-        ;; Mark as writing and remove from pending
-        (puthash queue-key (list :pending (cdr pending) :writing t)
-                 tramp-rpc--process-write-queues)
-        ;; Send the write - data must be binary for MessagePack
-        (let ((data-bytes (if (multibyte-string-p data)
-                              (encode-coding-string data 'utf-8-unix)
-                            data)))
-          (tramp-rpc--call-async vec "process.write"
-                                 `((pid . ,pid)
-                                   (data . ,(msgpack-bin-make data-bytes)))
-                               (lambda (response)
-                                 (when (plist-get response :error)
-                                   (tramp-rpc--debug "WRITE-ERROR pid=%s: %s"
-                                                    pid (plist-get response :error)))
-                                 ;; Mark as not writing and process next item
-                                 (let ((q (gethash queue-key tramp-rpc--process-write-queues)))
-                                   (puthash queue-key
-                                            (list :pending (plist-get q :pending) :writing nil)
-                                            tramp-rpc--process-write-queues))
-                                 (tramp-rpc--process-write-queue queue-key))))))))
+    (when (and pending (not (plist-get queue :failure)))
+      (cond
+       ((not (tramp-rpc--process-write-queue-current-p queue))
+        (puthash queue-key (tramp-rpc--process-write-queue-fail
+                            queue :connection-replaced)
+                 tramp-rpc--process-write-queues))
+       ((not (tramp-rpc--process-write-queue-live-p queue))
+        (puthash queue-key (tramp-rpc--process-write-queue-fail
+                            queue :connection-unavailable)
+                 tramp-rpc--process-write-queues))
+       (t
+        (let* ((item (car pending))
+               (vec (plist-get item :vec))
+               (pid (plist-get item :pid))
+               (data (plist-get item :data))
+               (state (plist-put (plist-put (copy-sequence queue)
+                                            :pending (cdr pending))
+                                 :current data)))
+          (setq state (plist-put state :writing t))
+          (puthash queue-key state tramp-rpc--process-write-queues)
+          (condition-case err
+              (tramp-rpc--call-async
+               vec "process.write"
+               `((pid . ,pid)
+                 (data . ,(msgpack-bin-make
+                            (tramp-rpc--process-write-data-bytes data))))
+               (lambda (response)
+                 ;; Cleanup may have removed the queue while this response was
+                 ;; in flight.  Never recreate it or affect another generation.
+                 (when-let* ((q (gethash queue-key
+                                         tramp-rpc--process-write-queues)))
+                   (cond
+                    ((not (tramp-rpc--process-write-queue-current-p q))
+                     (puthash queue-key (tramp-rpc--process-write-queue-fail
+                                         q :connection-replaced)
+                              tramp-rpc--process-write-queues))
+                    ((plist-get response :error)
+                     (puthash queue-key (tramp-rpc--process-write-queue-fail
+                                         q :rpc-error (plist-get response :error))
+                              tramp-rpc--process-write-queues))
+                    (t
+                     (setq q (plist-put q :current nil))
+                     (setq q (plist-put q :writing nil))
+                     (puthash queue-key q tramp-rpc--process-write-queues)
+                     (tramp-rpc--process-write-queue queue-key)))))
+               (plist-get state :connection))
+            (error
+             (let ((q (gethash queue-key tramp-rpc--process-write-queues)))
+               (when q
+                 (puthash queue-key
+                          (tramp-rpc--process-write-queue-fail
+                           q :send-error err)
+                          tramp-rpc--process-write-queues)))
+             (signal (car err) (cdr err))))))))))
 
-(defun tramp-rpc--drain-write-queue (pid)
-  "Wait for all pending writes to PID to complete.
-Spins the event loop so that async RPC write callbacks fire and the
-queue drains.  Returns once no writes are pending or in-flight, or
-after a safety timeout of 5 seconds."
-  (let ((deadline (+ (float-time) 5.0)))
-    (while (let ((queue (gethash pid tramp-rpc--process-write-queues)))
-             (and queue
-                  (or (plist-get queue :writing)
-                      (plist-get queue :pending))
+(defun tramp-rpc--drain-write-queue (vec pid &optional owner-process)
+  "Wait for VEC and PID's exact captured write queue to complete."
+  (let* ((queue-key (tramp-rpc--process-write-queue-key-for-owner
+                     vec pid owner-process))
+         (deadline (+ (float-time) tramp-rpc-write-queue-drain-timeout)))
+    (while (let ((queue (gethash queue-key tramp-rpc--process-write-queues)))
+             (and queue (not (plist-get queue :failure))
+                  (tramp-rpc--process-write-queue-current-p queue)
+                  (tramp-rpc--process-write-queue-live-p queue)
+                  (or (plist-get queue :writing) (plist-get queue :pending))
                   (< (float-time) deadline)))
-      ;; Let the event loop process async RPC responses (write callbacks)
-      (accept-process-output nil 0.01))))
+      (accept-process-output nil 0.01))
+    (when-let* ((queue (gethash queue-key tramp-rpc--process-write-queues)))
+      (cond
+       ((not (tramp-rpc--process-write-queue-current-p queue))
+        (setq queue (tramp-rpc--process-write-queue-fail
+                     queue :connection-replaced))
+        (puthash queue-key queue tramp-rpc--process-write-queues))
+       ((not (tramp-rpc--process-write-queue-live-p queue))
+        (setq queue (tramp-rpc--process-write-queue-fail
+                     queue :connection-unavailable))
+        (puthash queue-key queue tramp-rpc--process-write-queues))
+       ((or (plist-get queue :writing) (plist-get queue :pending))
+        (setq queue (tramp-rpc--process-write-queue-fail queue :timeout))
+        (puthash queue-key queue tramp-rpc--process-write-queues))
+       )
+      (tramp-rpc--signal-process-write-failure queue))))
 
-(defun tramp-rpc--close-remote-stdin (vec pid)
-  "Close stdin of remote process PID on VEC.
-Drains the write queue first so that all pending data reaches the
-remote process before the pipe is closed.  Without this, the
-server may process close_stdin before process.write when they
-arrive as concurrent RPC requests."
-  ;; Ensure all queued writes have been acknowledged by the server
-  ;; before we send close_stdin.  Both requests are dispatched as
-  ;; separate concurrent tokio tasks on the server; without draining,
-  ;; close_stdin can win the process-map lock race and drop the stdin
-  ;; handle before the write task delivers the data.
-  (tramp-rpc--drain-write-queue pid)
-  (tramp-rpc--call vec "process.close_stdin" `((pid . ,pid))))
+(defun tramp-rpc--close-remote-stdin (vec pid &optional owner-process)
+  "Close stdin on OWNER-PROCESS's original RPC connection generation."
+  (let* ((queue-key (tramp-rpc--process-write-queue-key-for-owner
+                     vec pid owner-process))
+         (queue (gethash queue-key tramp-rpc--process-write-queues))
+         (connection (or (plist-get queue :connection)
+                         (and (processp owner-process)
+                              (process-get owner-process :tramp-rpc-connection))
+                         (tramp-rpc--ensure-connection vec))))
+    (tramp-rpc--drain-write-queue vec pid owner-process)
+    (when (and queue (not (tramp-rpc--process-write-queue-current-p queue)))
+      (setq queue (tramp-rpc--process-write-queue-fail
+                   queue :connection-replaced))
+      (puthash queue-key queue tramp-rpc--process-write-queues)
+      (tramp-rpc--signal-process-write-failure queue))
+    (unless (eq (plist-get connection :process)
+                (plist-get (tramp-rpc--get-connection vec) :process))
+      (signal 'tramp-rpc-process-write-error
+              (list "Process write failed (:connection-replaced; 0 pending bytes)"
+                    (list :reason :connection-replaced :pending-bytes 0))))
+    (tramp-rpc--call vec "process.close_stdin" `((pid . ,pid)) connection)))
 
 (defun tramp-rpc--kill-remote-process (vec pid &optional signal)
   "Send SIGNAL to remote process PID on VEC."
@@ -362,9 +513,13 @@ before the cat relay drains its pipe causes a stale FD that makes
 `input-pending-p' return t permanently, starving keyboard input."
   (let ((info (gethash local-process tramp-rpc--async-processes)))
     (when info
-      ;; Clean up write queue for this process's PID
-      (when-let* ((pid (plist-get info :pid)))
-        (remhash pid tramp-rpc--process-write-queues))
+      ;; Clean up only this connection's write queue for this process.
+      (when-let* ((pid (plist-get info :pid))
+                   (vec (plist-get info :vec)))
+        (remhash (or (process-get local-process :tramp-rpc-write-queue-key)
+                     (tramp-rpc--process-write-queue-key
+                      vec pid (plist-get info :connection-process)))
+                 tramp-rpc--process-write-queues))
       ;; Store exit code (the sentinel reads this to construct the event
       ;; string).  Do NOT set :tramp-rpc-exited yet — the process-status
       ;; handler returns 'exit when that flag is set, which makes
@@ -617,6 +772,10 @@ Resolves program path and loads direnv environment from working directory."
 
               (process-put local-process :tramp-rpc-vec v)
               (process-put local-process :tramp-rpc-pid remote-pid)
+              (let ((connection (tramp-rpc--get-connection v)))
+                (process-put local-process :tramp-rpc-connection connection)
+                (process-put local-process :tramp-rpc-connection-process
+                             (plist-get connection :process)))
               (process-put local-process 'tramp-vector v)
               (process-put local-process 'remote-command orig-command)
 
@@ -633,6 +792,8 @@ Resolves program path and loads direnv environment from working directory."
               (puthash local-process
                        (list :vec v
                              :pid remote-pid
+                             :connection-process
+                             (process-get local-process :tramp-rpc-connection-process)
                              :stderr-buffer stderr-buffer
                              :stderr-process stderr-process)
                        tramp-rpc--async-processes)
@@ -1149,13 +1310,38 @@ For direct SSH PTY, let the original function handle it (SSH handles resize)."
        (remhash local-process tramp-rpc--pty-processes)))
    tramp-rpc--pty-processes))
 
-(defun tramp-rpc--cleanup-async-processes (&optional vec)
-  "Clean up async processes, optionally only those for VEC."
+(defun tramp-rpc--cleanup-process-write-queues (&optional vec connection-process)
+  "Remove write queues for VEC and CONNECTION-PROCESS.
+When CONNECTION-PROCESS is non-nil, remove only that exact connection
+generation.  With VEC nil, remove all queues."
+  (let (stale)
+    (maphash
+     (lambda (key queue)
+       (when (and (or (null vec)
+                      (equal (tramp-rpc--connection-key (plist-get queue :vec))
+                             (tramp-rpc--connection-key vec)))
+                  (or (null connection-process)
+                      (eq (plist-get queue :connection-process)
+                          connection-process)))
+         (push key stale)))
+     tramp-rpc--process-write-queues)
+    (dolist (key stale)
+      (remhash key tramp-rpc--process-write-queues))))
+
+(defun tramp-rpc--cleanup-async-processes (&optional vec connection-process)
+  "Clean up async processes for VEC and CONNECTION-PROCESS.
+When CONNECTION-PROCESS is non-nil, clean only that exact connection
+generation.  With VEC nil, clean all async processes."
+  ;; Remove queues even when the local relay has already disappeared.
+  (tramp-rpc--cleanup-process-write-queues vec connection-process)
   (maphash
    (lambda (local-process info)
-     (when (or (null vec)
-               (equal (tramp-rpc--connection-key (plist-get info :vec))
-                      (tramp-rpc--connection-key vec)))
+     (when (and (or (null vec)
+                    (equal (tramp-rpc--connection-key (plist-get info :vec))
+                           (tramp-rpc--connection-key vec)))
+                (or (null connection-process)
+                    (eq (plist-get info :connection-process)
+                        connection-process)))
        ;; Cancel timer
        (when-let* ((timer (plist-get info :timer)))
          (cancel-timer timer))
