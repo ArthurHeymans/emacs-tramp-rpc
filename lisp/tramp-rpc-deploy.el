@@ -247,11 +247,6 @@ FORMAT-STRING and ARGS are passed to `format'."
               (write-region line nil log-file 'append 'silent))
           (error nil))))))
 
-(defvar tramp-rpc-deploy--source-tree-hash-cache nil
-  "Cache for the source tree hash.
-The value is a list (ROOT FINGERPRINT HASH), where FINGERPRINT is derived
-from source file names, mtimes, and sizes.")
-
 ;;; ============================================================================
 ;;; Architecture detection and path helpers
 ;;; ============================================================================
@@ -394,37 +389,22 @@ Linux targets use musl for fully static binaries."
                 (push file files)))))))
     (sort files #'string<)))
 
-(defun tramp-rpc-deploy--source-file-fingerprint (root files)
-  "Return a cache fingerprint for FILES under ROOT."
-  (mapcar (lambda (file)
-            (let ((attrs (file-attributes file)))
-              (list (file-relative-name file root)
-                    (file-attribute-modification-time attrs)
-                    (file-attribute-size attrs))))
-          files))
-
 (defun tramp-rpc-deploy--source-tree-hash ()
-  "Return a SHA256 hash for files that affect the server build, or nil."
+  "Return a SHA256 hash for files that affect the server build, or nil.
+Hash contents on every call: names, sizes, and mtimes cannot reliably detect
+same-size edits made within coarse timestamp resolution or by tools that
+preserve timestamps."
   (let ((root (tramp-rpc-deploy--source-root))
         (files (tramp-rpc-deploy--source-file-list)))
     (when (and root files)
-      (let ((fingerprint (tramp-rpc-deploy--source-file-fingerprint root files)))
-        (if (and tramp-rpc-deploy--source-tree-hash-cache
-                 (equal root (nth 0 tramp-rpc-deploy--source-tree-hash-cache))
-                 (equal fingerprint (nth 1 tramp-rpc-deploy--source-tree-hash-cache)))
-            (nth 2 tramp-rpc-deploy--source-tree-hash-cache)
-          (let ((hash
-                 (with-temp-buffer
-                   (set-buffer-multibyte nil)
-                   (dolist (file files)
-                     (insert (file-relative-name file root) "\0")
-                     (let ((coding-system-for-read 'binary))
-                       (insert-file-contents-literally file))
-                     (insert "\0"))
-                   (secure-hash 'sha256 (current-buffer)))))
-            (setq tramp-rpc-deploy--source-tree-hash-cache
-                  (list root fingerprint hash))
-            hash))))))
+      (with-temp-buffer
+        (set-buffer-multibyte nil)
+        (dolist (file files)
+          (insert (file-relative-name file root) "\0")
+          (let ((coding-system-for-read 'binary))
+            (insert-file-contents-literally file))
+          (insert "\0"))
+        (secure-hash 'sha256 (current-buffer))))))
 
 (defun tramp-rpc-deploy--git-revision ()
   "Return the short git revision for the source checkout, or nil."
@@ -576,11 +556,12 @@ Returns t on success, nil on failure."
             (unwind-protect
                 (with-current-buffer buffer
                   (goto-char (point-min))
-                  (unless (re-search-forward "^HTTP/[0-9.]+ 200" nil t)
-                    (if (re-search-forward "^HTTP/[0-9.]+ \\([0-9]+\\)" nil t)
+                  (unless (looking-at "HTTP/[0-9.]+ 200\\(?:[ \t]\\|$\\)")
+                    (if (looking-at "HTTP/[0-9.]+ \\([0-9]+\\)")
                         (signal 'remote-file-error (list "HTTP error" (match-string 1)))
                       (signal 'remote-file-error (list "Invalid HTTP response"))))
-                  (re-search-forward "^\\r?\\n" nil t)
+                  (unless (re-search-forward "^\\r?\\n" nil t)
+                    (signal 'remote-file-error (list "Malformed HTTP response")))
                   (let ((coding-system-for-write 'binary))
                     (write-region (point) (point-max) dest nil 'silent))
                   t)
@@ -700,9 +681,16 @@ never one authorized by stale provenance."
 Returns the path to the extracted binary, or nil on failure."
   (let ((default-directory dest-dir))
     (make-directory dest-dir t)
-    (if (zerop (call-process "tar" nil nil nil "-xzf" tarball "-C" dest-dir))
-        (let ((binary (expand-file-name tramp-rpc-deploy-binary-name dest-dir)))
-          (when (file-exists-p binary)
+    ;; Extract only the expected member, so unrelated archive paths cannot
+    ;; escape DEST-DIR or place content that influences promotion.
+    (if (zerop (call-process "tar" nil nil nil "-xzf" tarball "-C" dest-dir
+                             "--" tramp-rpc-deploy-binary-name))
+        (let* ((binary (expand-file-name tramp-rpc-deploy-binary-name dest-dir))
+               (attributes (and (not (file-symlink-p binary))
+                                (file-attributes binary 'integer))))
+          (when (and attributes
+                     (file-regular-p binary)
+                     (= (file-attribute-link-number attributes) 1))
             (set-file-modes binary #o755)
             binary))
       nil)))
@@ -938,14 +926,14 @@ Returns the path to the local binary."
 ;;; ============================================================================
 
 (defun tramp-rpc-deploy--remote-binary-exists-p (vec)
-  "Check if the correct version of the binary exists on remote VEC."
-  (let ((remote-path (tramp-rpc-deploy--remote-binary-path vec)))
-    ;; Use tramp-sh operations for checking since we're bootstrapping
+  "Check if a regular non-symlink executable binary exists on remote VEC."
+  (let* ((remote-path (tramp-rpc-deploy--remote-binary-path vec))
+         (path (tramp-shell-quote-argument
+                (tramp-file-local-name remote-path))))
+    ;; Use tramp-sh operations for checking since we're bootstrapping.
     (tramp-send-command-and-check
-     vec
-     (format "test -x %s"
-             (tramp-shell-quote-argument
-              (tramp-file-local-name remote-path))))))
+     vec (format "test -f %s && ! test -L %s && test -x %s"
+                 path path path))))
 
 (defun tramp-rpc-deploy--ensure-remote-directory (vec)
   "Ensure the remote deployment directory exists on VEC."
@@ -1053,7 +1041,7 @@ to inline encoding (base64 through the shell), which can be fragile."
                        (remote-tmp-path
                         (tramp-make-tramp-file-name vec remote-tmp-local)))
                   ;; The atomically-created private directory guarantees that
-                  ;; the destination does not exist.  Do not permit copy-file
+                  ;; the destination does not exist.  Do not permit `copy-file'
                   ;; to follow or replace a pre-planted pathname.
                   (copy-file local-path remote-tmp-path nil)
 
