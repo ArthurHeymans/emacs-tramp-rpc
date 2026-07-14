@@ -488,6 +488,7 @@ proxy hops remain."
 (declare-function tramp-rpc--cache-get "tramp-rpc-magit")
 (declare-function tramp-rpc--cache-put "tramp-rpc-magit")
 (declare-function tramp-rpc--cache-lookup "tramp-rpc-magit")
+(declare-function tramp-rpc--cache-entry-valid-p "tramp-rpc-magit")
 (declare-function tramp-rpc--file-stat-cache-key "tramp-rpc-magit")
 (declare-function tramp-rpc--cache-file-stat-result "tramp-rpc-magit")
 (declare-function tramp-rpc--invalidate-cache-for-path "tramp-rpc-magit")
@@ -1711,12 +1712,23 @@ Returns the request ID."
          (id (car id-and-request))
          (request (cdr id-and-request)))
     (tramp-rpc--debug "SEND-ASYNC id=%s method=%s" id method)
-    ;; Register callback with its exact transport generation.
+    ;; Register callback with its exact transport generation.  Roll registration
+    ;; back if the transport rejects the send; no response can arrive for a
+    ;; request that was never accepted by the process object.
     (puthash id callback tramp-rpc--async-callbacks)
     (puthash id process tramp-rpc--async-callback-processes)
-    ;; Send request (binary data with length prefix, no newline)
-    (process-send-string process request)
-    id))
+    (let (sent)
+      (unwind-protect
+          (prog1
+              (progn
+                ;; Send request (binary data with length prefix, no newline)
+                (process-send-string process request)
+                id)
+            (setq sent t))
+        ;; Cover errors, user quits, and any other non-local exit.
+        (unless sent
+          (remhash id tramp-rpc--async-callbacks)
+          (remhash id tramp-rpc--async-callback-processes))))))
 
 (defun tramp-rpc--call (vec method params &optional connection)
   "Call METHOD with PARAMS on the RPC server for VEC.
@@ -2216,18 +2228,23 @@ For symlinks, follows through to the target (like
 If LSTAT is non-nil, don't follow symlinks.
 Uses `tramp-rpc--call' internally but converts file-missing and
 ELOOP errors to nil (the file effectively doesn't exist for stat)."
-  (let* ((cache-key (tramp-rpc--file-stat-cache-key vec localname lstat))
-         (cached (tramp-rpc--cache-lookup tramp-rpc--file-stat-cache cache-key)))
+  (let* ((use-cache (not (eq remote-file-name-inhibit-cache t)))
+         (cache-key (tramp-rpc--file-stat-cache-key vec localname lstat))
+         (cached (if use-cache
+                     (tramp-rpc--cache-lookup tramp-rpc--file-stat-cache cache-key)
+                   'not-cached)))
     (if (not (eq cached 'not-cached))
         cached
       (let ((params (append (tramp-rpc--encode-path localname)
                             (when lstat '((lstat . t))))))
         (condition-case err
             (let ((stat (tramp-rpc--call vec "file.stat" params)))
-              (tramp-rpc--cache-file-stat-result vec localname stat lstat)
+              (when use-cache
+                (tramp-rpc--cache-file-stat-result vec localname stat lstat))
               stat)
           (file-missing
-           (tramp-rpc--cache-file-stat-result vec localname nil lstat)
+           (when use-cache
+             (tramp-rpc--cache-file-stat-result vec localname nil lstat))
            nil)
           (file-error
            ;; Return nil for ELOOP (symlink loop) and ENOTDIR (path component
@@ -2237,23 +2254,26 @@ ELOOP errors to nil (the file effectively doesn't exist for stat)."
              (if (or (string-match-p "Too many levels of symbolic links" message)
                      (string-match-p "Not a directory" message))
                  (progn
-                   (tramp-rpc--cache-file-stat-result vec localname nil lstat)
+                   (when use-cache
+                     (tramp-rpc--cache-file-stat-result vec localname nil lstat))
                    nil)
                (signal (car err) (cdr err))))))))))
 
 (defun tramp-rpc--file-exists-cache-lookup (filename)
   "Return cached `file-exists-p' value for FILENAME, or `not-cached'.
 Unlike `tramp-rpc--cache-get', this preserves cached nil values."
-  (let* ((expanded (expand-file-name filename))
+  (if (eq remote-file-name-inhibit-cache t)
+      'not-cached
+    (let* ((expanded (expand-file-name filename))
          (entry (gethash expanded tramp-rpc--file-exists-cache)))
     (if (not entry)
         'not-cached
       (let ((timestamp (car entry))
             (value (cdr entry)))
-        (if (< (- (float-time) timestamp) tramp-rpc--cache-ttl)
+        (if (tramp-rpc--cache-entry-valid-p timestamp)
             value
           (remhash expanded tramp-rpc--file-exists-cache)
-          'not-cached)))))
+          'not-cached))))))
 
 (defun tramp-rpc-handle-file-exists-p (filename)
   "Like `file-exists-p' for TRAMP-RPC files.
@@ -2275,15 +2295,18 @@ Projectile, project.el, and editorconfig during Magit section expansion."
                       (fa (tramp-get-file-property v localname "file-attributes"))
                       ((not (stringp (car fa)))))))
           (t
-           (pcase (tramp-rpc-magit--file-exists-p filename)
+           (pcase (if (eq remote-file-name-inhibit-cache t)
+                      'not-cached
+                    (tramp-rpc-magit--file-exists-p filename))
              ('not-cached
               (pcase (tramp-rpc--file-exists-cache-lookup filename)
                 ('not-cached
                  (let* ((stat (tramp-rpc--call-file-stat v localname))
                         (exists (if stat t nil)))
-                   (tramp-rpc--cache-put tramp-rpc--file-exists-cache
-                                         (expand-file-name filename)
-                                         exists)
+                   (unless (eq remote-file-name-inhibit-cache t)
+                     (tramp-rpc--cache-put tramp-rpc--file-exists-cache
+                                           (expand-file-name filename)
+                                           exists))
                    exists))
                 (cached cached)))
              (cached cached)))))))))
@@ -2335,8 +2358,9 @@ which would otherwise perform another remote stat."
 Resolves symlinks in the path.  For non-existing files, returns the
 path unchanged (after resolving any symlinks in parent directories)."
   (let* ((expanded (expand-file-name filename))
-         (cached (tramp-rpc--cache-get tramp-rpc--file-truename-cache
-                                      expanded)))
+         (cached (and (not (eq remote-file-name-inhibit-cache t))
+                      (tramp-rpc--cache-get tramp-rpc--file-truename-cache
+                                            expanded))))
     (or cached
         (let ((truename
                ;; Use tramp-skeleton-file-truename which handles:
@@ -2378,7 +2402,8 @@ path unchanged (after resolving any symlinks in parent directories)."
                            v 'file-error
                            "Maximum number (%d) of symlinks exceeded" numchase-limit)))
                       (directory-file-name result)))))))
-          (tramp-rpc--cache-put tramp-rpc--file-truename-cache expanded truename)
+          (unless (eq remote-file-name-inhibit-cache t)
+            (tramp-rpc--cache-put tramp-rpc--file-truename-cache expanded truename))
           truename))))
 
 
@@ -2392,7 +2417,8 @@ path unchanged (after resolving any symlinks in parent directories)."
         ;; for follow semantics.  For symlinks, lstat success does not tell us
         ;; whether the target exists (dangling symlink), so leave file-exists-p
         ;; uncached.
-        (unless (and result (equal (alist-get 'type result) "symlink"))
+        (unless (or (eq remote-file-name-inhibit-cache t)
+                    (and result (equal (alist-get 'type result) "symlink")))
           (let ((expanded (expand-file-name filename)))
             (tramp-rpc--cache-put tramp-rpc--file-exists-cache
                                   expanded (if result t nil))))

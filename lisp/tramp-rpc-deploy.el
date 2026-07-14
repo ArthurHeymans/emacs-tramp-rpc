@@ -935,12 +935,15 @@ Returns the path to the local binary."
 ;;; ============================================================================
 
 (defun tramp-rpc-deploy--remote-binary-exists-p (vec)
-  "Check if the correct version of the binary exists on remote VEC."
+  "Check if a regular executable binary exists on remote VEC."
   (let ((remote-path (tramp-rpc-deploy--remote-binary-path vec)))
-    ;; Use tramp-sh operations for checking since we're bootstrapping
+    ;; Use tramp-sh operations for checking since we're bootstrapping.  `-f'
+    ;; rejects executable directories and other non-regular filesystem nodes.
     (tramp-send-command-and-check
      vec
-     (format "test -x %s"
+     (format "test -f %s && test -x %s"
+             (tramp-shell-quote-argument
+              (tramp-file-local-name remote-path))
              (tramp-shell-quote-argument
               (tramp-file-local-name remote-path))))))
 
@@ -970,6 +973,14 @@ Tries sha256sum first, then shasum -a 256 for macOS compatibility."
     ;; Match exactly 64 hex chars to avoid false positives from error messages
     (when (looking-at "\\([a-f0-9]\\{64\\}\\)")
       (match-string 1))))
+
+(defun tramp-rpc-deploy--remote-binary-matches-p (vec local-path)
+  "Return non-nil when VEC's deployed binary matches LOCAL-PATH."
+  (let* ((remote-local
+          (tramp-file-local-name (tramp-rpc-deploy--remote-binary-path vec)))
+         (local-checksum (tramp-rpc-deploy--compute-checksum local-path))
+         (remote-checksum (tramp-rpc-deploy--remote-checksum vec remote-local)))
+    (and remote-checksum (string= local-checksum remote-checksum))))
 
 (defun tramp-rpc-deploy--transfer-binary (vec local-path)
   "Transfer the binary at LOCAL-PATH to the remote host VEC.
@@ -1110,22 +1121,39 @@ is missing, signals an error."
 	   ;; For simplified Tramp syntax.
 	   (tramp-default-method (tramp-file-name-method bootstrap-vec))
 	   tramp-default-method-alist)
-      (if (tramp-rpc-deploy--remote-binary-exists-p bootstrap-vec)
-          ;; Binary already exists
-          (tramp-file-local-name (tramp-rpc-deploy--remote-binary-path bootstrap-vec))
-        ;; Need to deploy
-        (if tramp-rpc-deploy-auto-deploy
-            (let* ((arch (tramp-rpc-deploy--detect-remote-arch bootstrap-vec))
-                   (local-binary (tramp-rpc-deploy--ensure-local-binary arch)))
-              (message "Deploying tramp-rpc-server (%s) to %s..."
-                       arch (tramp-file-name-host vec))
+      (let* ((remote-present
+              (tramp-rpc-deploy--remote-binary-exists-p bootstrap-vec))
+             (arch (and (or remote-present tramp-rpc-deploy-auto-deploy)
+                        (tramp-rpc-deploy--detect-remote-arch bootstrap-vec)))
+             (local-binary (and arch
+                                (tramp-rpc-deploy--ensure-local-binary arch)))
+             (remote-local
               (tramp-file-local-name
-               (tramp-rpc-deploy--transfer-binary bootstrap-vec local-binary)))
+               (tramp-rpc-deploy--remote-binary-path bootstrap-vec))))
+        (cond
+         ((and remote-present
+               (tramp-rpc-deploy--remote-binary-matches-p
+                bootstrap-vec local-binary))
+          remote-local)
+         (tramp-rpc-deploy-auto-deploy
+          (when remote-present
+            (message "Existing remote tramp-rpc-server failed checksum verification; replacing it"))
+          (message "Deploying tramp-rpc-server (%s) to %s..."
+                   arch (tramp-file-name-host vec))
+          (tramp-file-local-name
+           (tramp-rpc-deploy--transfer-binary bootstrap-vec local-binary)))
+         (remote-present
           (signal
-	   'remote-file-error
-	   (list "tramp-rpc-server not found on"
-		 (tramp-file-name-host vec)
-		 "and auto-deploy is disabled")))))))
+           'remote-file-error
+           (list "Existing tramp-rpc-server on"
+                 (tramp-file-name-host vec)
+                 "failed checksum verification and auto-deploy is disabled")))
+         (t
+          (signal
+           'remote-file-error
+           (list "tramp-rpc-server not found on"
+                 (tramp-file-name-host vec)
+                 "and auto-deploy is disabled"))))))))
 
 (defun tramp-rpc-deploy-remove-binary (vec)
   "Remove the tramp-rpc-server binary from remote VEC."

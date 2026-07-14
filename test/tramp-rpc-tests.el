@@ -141,10 +141,23 @@ Value is a cons cell (CHECKED . RESULT).")
      (let* ((proc (plist-get conn :process))
             (vec (and proc (process-get proc :tramp-rpc-vec))))
        (when vec
-         (tramp-flush-directory-properties vec "/")
-         (tramp-flush-connection-properties vec)
+         ;; Keep the startup system.info response warm.  It is connection
+         ;; metadata, not a file-operation cache, and refetching it makes call
+         ;; counts depend on whether this connection was just replaced.
+         (let ((system-info
+                (tramp-get-connection-property
+                 vec tramp-rpc--system-info-property nil)))
+           (tramp-flush-directory-properties vec "/")
+           (tramp-flush-connection-properties vec)
+           (when system-info
+             (tramp-rpc--cache-system-info vec system-info)))
          (tramp-rpc--clear-file-caches-for-connection vec))))
    tramp-rpc--connections))
+
+(defun tramp-rpc-test--flush-file-properties (filename)
+  "Flush TRAMP file properties for FILENAME."
+  (with-parsed-tramp-file-name filename nil
+    (tramp-flush-file-properties v localname)))
 
 (defun tramp-rpc-test--run-with-call-count (thunk)
   "Run THUNK and return (RESULT . RPC-CALL-COUNT)."
@@ -387,6 +400,8 @@ The directory is deleted after BODY completes."
   (skip-unless (tramp-rpc-test-enabled))
 
   (let ((vec (tramp-dissect-file-name (tramp-rpc-test--remote-directory))))
+    ;; This test alone measures the cold connection-metadata lookup.
+    (tramp-flush-connection-properties vec)
     (let ((result (tramp-rpc-test--with-call-count 1
                     (list (tramp-get-remote-uid vec 'integer)
                           (tramp-get-remote-gid vec 'integer)
@@ -496,9 +511,10 @@ The directory is deleted after BODY completes."
   "Test `file-writable-p' for TRAMP RPC files."
   (skip-unless (tramp-rpc-test-enabled))
 
-  ;; Existing file.  TRAMP's generic writable check probes access and metadata.
+  ;; Existing file.  TRAMP's generic writable check probes access and file
+  ;; metadata; one-time connection system information is primed separately.
   (tramp-rpc-test--with-temp-file tmp "test content"
-    (should (tramp-rpc-test--with-call-count 3
+    (should (tramp-rpc-test--with-call-count 2
               (file-writable-p tmp))))
 
   ;; Non-existent file in writable directory
@@ -1805,6 +1821,9 @@ This matches the upstream `tramp-test28-process-file' test."
     (write-region "" nil (concat dir "/file-aab.txt"))
     (write-region "" nil (concat dir "/other.txt"))
 
+    ;; The completion skeleton first checks that DIR is a directory.  Flush the
+    ;; exact predicate cache so this cold-call assertion is order-independent.
+    (tramp-rpc-test--flush-file-properties dir)
     (let ((completions (tramp-rpc-test--with-call-count 2
                          (file-name-all-completions "file-" dir))))
       (should (member "file-aaa.txt" completions))
@@ -1820,6 +1839,8 @@ This matches the upstream `tramp-test28-process-file' test."
           (link-dir (concat dir "/link-dir")))
       (make-directory real-dir t)
       (make-symbolic-link "real-dir" link-dir)
+      ;; Keep the RPC-count assertion independent of earlier directory probes.
+      (tramp-rpc-test--flush-file-properties dir)
       (let ((completions (tramp-rpc-test--with-call-count 2
                            (file-name-all-completions "" dir))))
         (should (member "real-dir/" completions))
