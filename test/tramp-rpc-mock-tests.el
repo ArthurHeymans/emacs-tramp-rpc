@@ -3936,6 +3936,391 @@ This matches the behavior expected by `tramp-test28-process-file'."
                 (should (equal id1 (tramp-rpc-deploy--binary-id)))))))
       (delete-directory dir t))))
 
+(ert-deftest tramp-rpc-mock-test-deploy-extraction-rejects-links ()
+  "Extracted symbolic and hard links cannot be promoted as the release binary."
+  :tags '(:deploy)
+  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
+  (let* ((dir (make-temp-file "tramp-rpc-extract" t))
+         (dest (expand-file-name "dest" dir))
+         (outside (expand-file-name "outside" dir))
+         (binary (expand-file-name tramp-rpc-deploy-binary-name dest))
+         process-args)
+    (unwind-protect
+        (progn
+          (with-temp-file outside (insert "outside content"))
+          (cl-letf (((symbol-function 'call-process)
+                     (lambda (_program _infile _destination _display &rest args)
+                       (setq process-args args)
+                       (make-symbolic-link outside binary)
+                       0)))
+            (should-not (tramp-rpc-deploy--extract-tarball "archive.tar.gz" dest)))
+          (delete-file binary)
+          (cl-letf (((symbol-function 'call-process)
+                     (lambda (&rest _args)
+                       (add-name-to-file outside binary)
+                       0)))
+            (should-not (tramp-rpc-deploy--extract-tarball "archive.tar.gz" dest)))
+          (should (equal process-args
+                         (list "-xzf" "archive.tar.gz" "-C" dest "--"
+                               tramp-rpc-deploy-binary-name)))
+          (should (equal (with-temp-buffer
+                           (insert-file-contents-literally outside)
+                           (buffer-string))
+                         "outside content")))
+      (delete-directory dir t))))
+
+(ert-deftest tramp-rpc-mock-test-deploy-remote-present-requires-regular-file ()
+  "Remote presence rejects directories and symbolic links."
+  :tags '(:deploy)
+  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
+  (let ((vec (tramp-dissect-file-name "/scp:mock:/tmp/"))
+        command)
+    (cl-letf (((symbol-function 'tramp-rpc-deploy--remote-binary-path)
+               (lambda (remote-vec)
+                 (tramp-make-tramp-file-name remote-vec "/tmp/server")))
+              ((symbol-function 'tramp-send-command-and-check)
+               (lambda (_vec value) (setq command value) t)))
+      (should (tramp-rpc-deploy--remote-binary-exists-p vec))
+      (should (equal command
+                     "test -f /tmp/server && ! test -L /tmp/server && test -x /tmp/server")))))
+
+(ert-deftest tramp-rpc-mock-test-deploy-checksum-required ()
+  "A missing checksum prevents a release binary from reaching the cache."
+  :tags '(:deploy)
+  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
+  (let* ((dir (make-temp-file "tramp-rpc-checksum" t))
+         (arch "x86_64-linux")
+         (tramp-rpc-deploy-local-cache-directory dir)
+         (tramp-rpc-deploy-source-directory nil)
+         (cache (tramp-rpc-deploy--local-cache-path arch)))
+    (unwind-protect
+        (cl-letf (((symbol-function 'tramp-rpc-deploy--download-file)
+                   (lambda (url dest)
+                     (if (string-suffix-p ".sha256" url)
+                         nil
+                       (with-temp-file dest (insert "unverified release"))))))
+          (should-error (tramp-rpc-deploy--download-binary arch)
+                        :type 'remote-file-error)
+          (should-not (file-exists-p cache)))
+      (delete-directory dir t))))
+
+(ert-deftest tramp-rpc-mock-test-deploy-malformed-or-mismatched-checksum ()
+  "Malformed, wrong-artifact, and mismatched checksums fail closed."
+  :tags '(:deploy)
+  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
+  (let* ((jka-compr-inhibit t)
+         (dir (make-temp-file "tramp-rpc-checksum" t))
+         (arch "x86_64-linux")
+         (tramp-rpc-deploy-local-cache-directory dir)
+         (tramp-rpc-deploy-source-directory nil)
+         (asset (tramp-rpc-deploy--release-asset-name arch)))
+    (unwind-protect
+        (dolist (metadata (list "not a checksum"
+                                (format "%064x  different-artifact.tar.gz" 0)
+                                (format "%064x  %s" 0 asset)))
+          (cl-letf (((symbol-function 'tramp-rpc-deploy--download-file)
+                     (lambda (url dest)
+                       (with-temp-file dest
+                         (insert (if (string-suffix-p ".sha256" url)
+                                     metadata
+                                   "release payload")))
+                       t))
+                    ((symbol-function 'tramp-rpc-deploy--extract-tarball)
+                     (lambda (&rest _args)
+                       (error "unverified archive was extracted"))))
+            (should-error (tramp-rpc-deploy--download-binary arch)
+                          :type 'remote-file-error)))
+      (delete-directory dir t))))
+
+(ert-deftest tramp-rpc-mock-test-deploy-verified-release-is-cached ()
+  "Only a verified release archive is extracted and marked for cache reuse."
+  :tags '(:deploy)
+  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
+  (let* ((jka-compr-inhibit t)
+         (dir (make-temp-file "tramp-rpc-checksum" t))
+         (arch "x86_64-linux")
+         (payload "verified release payload")
+         (tramp-rpc-deploy-local-cache-directory dir)
+         (tramp-rpc-deploy-source-directory nil)
+         (asset (tramp-rpc-deploy--release-asset-name arch))
+         (cache (tramp-rpc-deploy--local-cache-path arch)))
+    (unwind-protect
+        (cl-letf (((symbol-function 'tramp-rpc-deploy--download-file)
+                   (lambda (url dest)
+                     (with-temp-file dest
+                       (insert (if (string-suffix-p ".sha256" url)
+                                   (format "%s  %s"
+                                           (secure-hash 'sha256 payload) asset)
+                                 payload)))
+                     t))
+                  ((symbol-function 'tramp-rpc-deploy--extract-tarball)
+                   (lambda (_tarball dest)
+                     (make-directory dest t)
+                     (let ((binary (expand-file-name tramp-rpc-deploy-binary-name dest)))
+                       (with-temp-file binary (insert "server binary"))
+                       binary))))
+          (should (equal (tramp-rpc-deploy--download-binary arch) cache))
+          (should (file-exists-p cache))
+          (should (tramp-rpc-deploy--cached-binary-trusted-p cache)))
+      (delete-directory dir t))))
+
+(ert-deftest tramp-rpc-mock-test-deploy-source-cache-records-digest-and-reuses ()
+  "A source build records a digest which authorizes an unchanged cache entry."
+  :tags '(:deploy)
+  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
+  (let* ((dir (make-temp-file "tramp-rpc-source-cache" t))
+         (arch "x86_64-linux")
+         (source (expand-file-name "source" dir))
+         (cache-dir (expand-file-name "cache" dir))
+         cache
+         (output (expand-file-name
+                  (format "target/%s/release/%s"
+                          (tramp-rpc-deploy--arch-to-rust-target arch)
+                          tramp-rpc-deploy-binary-name)
+                  source)))
+    (unwind-protect
+        (progn
+          (make-directory (file-name-directory output) t)
+          (with-temp-file output (insert "source build"))
+          (let ((tramp-rpc-deploy-source-directory source)
+                (tramp-rpc-deploy-local-cache-directory cache-dir))
+            (setq cache (tramp-rpc-deploy--local-cache-path arch))
+            (cl-letf (((symbol-function 'tramp-rpc-deploy--cargo-available-p) (lambda () t))
+                      ((symbol-function 'tramp-rpc-deploy--can-build-for-arch-p) (lambda (_arch) t))
+                      ((symbol-function 'call-process) (lambda (&rest _args) 0)))
+              (should (equal (tramp-rpc-deploy--build-binary arch) cache)))
+          (should (string-match-p
+                   "\\`source-build-sha256:[[:xdigit:]]\\{64\\}\n\\'"
+                   (with-temp-buffer
+                     (insert-file-contents-literally
+                      (tramp-rpc-deploy--cache-provenance-path cache))
+                     (buffer-string))))
+          (let ((tramp-rpc-deploy-source-directory nil)
+                (tramp-rpc-deploy-bundled-binary-directory nil)
+                (tramp-rpc-deploy-local-cache-directory cache-dir))
+            (cl-letf (((symbol-function 'tramp-rpc-deploy--download-binary)
+                       (lambda (&rest _args) (error "valid source cache was not reused")))
+                      ((symbol-function 'tramp-rpc-deploy--build-binary)
+                       (lambda (&rest _args) (error "valid source cache was not reused"))))
+              (should (equal (tramp-rpc-deploy--ensure-local-binary arch) cache)))))
+      (delete-directory dir t)))))
+
+(ert-deftest tramp-rpc-mock-test-deploy-modified-source-cache-is-invalidated ()
+  "A modified source-built cache binary is removed rather than reused."
+  :tags '(:deploy)
+  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
+  (let* ((dir (make-temp-file "tramp-rpc-source-cache" t))
+         (cache (expand-file-name "server" dir)))
+    (unwind-protect
+        (progn
+          (with-temp-file cache (insert "source build"))
+          (set-file-modes cache #o755)
+          (tramp-rpc-deploy--write-cache-provenance
+           cache "source-build" (tramp-rpc-deploy--compute-checksum cache))
+          (with-temp-file cache (insert "modified source build"))
+          (should-not (tramp-rpc-deploy--cached-binary-trusted-p cache))
+          (should-not (file-exists-p cache))
+          (should-not (file-exists-p (tramp-rpc-deploy--cache-provenance-path cache))))
+      (delete-directory dir t))))
+
+(ert-deftest tramp-rpc-mock-test-deploy-corrupt-source-cache-is-invalidated ()
+  "A corrupt source-built cache binary is removed rather than reused."
+  :tags '(:deploy)
+  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
+  (let* ((dir (make-temp-file "tramp-rpc-source-cache" t))
+         (cache (expand-file-name "server" dir)))
+    (unwind-protect
+        (progn
+          (with-temp-file cache (insert "source build"))
+          (set-file-modes cache #o755)
+          (tramp-rpc-deploy--write-cache-provenance
+           cache "source-build" (tramp-rpc-deploy--compute-checksum cache))
+          (let ((coding-system-for-write 'binary))
+            (with-temp-file cache (insert "\0corrupt source build")))
+          (should-not (tramp-rpc-deploy--cached-binary-trusted-p cache))
+          (should-not (file-exists-p cache))
+          (should-not (file-exists-p (tramp-rpc-deploy--cache-provenance-path cache))))
+      (delete-directory dir t))))
+
+(ert-deftest tramp-rpc-mock-test-deploy-source-cache-missing-or-malformed-digest-is-invalidated ()
+  "Missing or malformed source-build digests cannot authorize cache reuse."
+  :tags '(:deploy)
+  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
+  (let* ((dir (make-temp-file "tramp-rpc-source-cache" t))
+         (cache (expand-file-name "server" dir)))
+    (unwind-protect
+        (dolist (provenance '("source-build\n" "source-build-sha256:not-a-digest\n"))
+          (with-temp-file cache (insert "source build"))
+          (set-file-modes cache #o755)
+          (with-temp-file (tramp-rpc-deploy--cache-provenance-path cache)
+            (insert provenance))
+          (should-not (tramp-rpc-deploy--cached-binary-trusted-p cache))
+          (should-not (file-exists-p cache))
+          (should-not (file-exists-p (tramp-rpc-deploy--cache-provenance-path cache))))
+      (delete-directory dir t))))
+
+(ert-deftest tramp-rpc-mock-test-deploy-invalid-source-cache-rebuilds ()
+  "An invalid source cache falls through to the source-build fallback."
+  :tags '(:deploy)
+  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
+  (let* ((dir (make-temp-file "tramp-rpc-source-cache" t))
+         (arch "x86_64-linux")
+         (cache-dir (expand-file-name "cache" dir))
+         cache
+         (built (expand-file-name "rebuilt-server" dir))
+         calls)
+    (unwind-protect
+        (progn
+          (with-temp-file built (insert "rebuilt source build"))
+          (let ((tramp-rpc-deploy-source-directory nil)
+                (tramp-rpc-deploy-bundled-binary-directory nil)
+                (tramp-rpc-deploy-local-cache-directory cache-dir)
+                (tramp-rpc-deploy-git-build-policy 'release))
+            (setq cache (tramp-rpc-deploy--local-cache-path arch))
+            (make-directory (file-name-directory cache) t)
+            (with-temp-file cache (insert "source build"))
+            (set-file-modes cache #o755)
+            (tramp-rpc-deploy--write-cache-provenance
+             cache "source-build" (tramp-rpc-deploy--compute-checksum cache))
+            (with-temp-file cache (insert "corrupt source build"))
+            (cl-letf (((symbol-function 'tramp-rpc-deploy--download-binary)
+                       (lambda (_arch)
+                         (push 'download calls)
+                         (signal 'remote-file-error '("release unavailable"))))
+                      ((symbol-function 'tramp-rpc-deploy--build-binary)
+                       (lambda (_arch)
+                         (push 'build calls)
+                         built)))
+              (should (equal (tramp-rpc-deploy--ensure-local-binary arch) built))
+              (should (equal (nreverse calls) '(download build)))))
+          (should-not (file-exists-p cache)))
+      (delete-directory dir t))))
+
+(ert-deftest tramp-rpc-mock-test-deploy-checksum-failure-falls-back-to-source-build ()
+  "A rejected release download tries the existing source-build fallback."
+  :tags '(:deploy)
+  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
+  (let* ((dir (make-temp-file "tramp-rpc-checksum" t))
+         (built (expand-file-name "built-server" dir))
+         (tramp-rpc-deploy-local-cache-directory (expand-file-name "cache" dir))
+         (tramp-rpc-deploy-source-directory nil)
+         (tramp-rpc-deploy-bundled-binary-directory nil)
+         (tramp-rpc-deploy-git-build-policy 'release)
+         calls)
+    (unwind-protect
+        (progn
+          (with-temp-file built (insert "source build"))
+          (cl-letf (((symbol-function 'tramp-rpc-deploy--download-binary)
+                     (lambda (_arch)
+                       (push 'download calls)
+                       (signal 'remote-file-error '("bad checksum"))))
+                    ((symbol-function 'tramp-rpc-deploy--build-binary)
+                     (lambda (_arch)
+                       (push 'build calls)
+                       built)))
+            (should (equal (tramp-rpc-deploy--ensure-local-binary "x86_64-linux") built))
+            (should (equal (nreverse calls) '(download build)))))
+      (delete-directory dir t))))
+
+(ert-deftest tramp-rpc-mock-test-deploy-chmod-mv-failure-preserves-old-binary ()
+  "A failed chmod prevents mv from replacing the old same-directory binary."
+  :tags '(:deploy)
+  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
+  (let* ((dir (make-temp-file "tramp-rpc-transfer" t))
+         (remote-dir (expand-file-name "remote-cache" dir))
+         (fake-bin (expand-file-name "bin" dir))
+         (fake-chmod (expand-file-name "chmod" fake-bin))
+         (local (expand-file-name "server" dir))
+         (vec (tramp-dissect-file-name "/scp:mock:/tmp/"))
+         (tramp-rpc-deploy-remote-directory remote-dir)
+         (tramp-rpc-deploy-max-retries 1)
+         (remote-local (tramp-file-local-name
+                        (tramp-rpc-deploy--remote-binary-path vec)))
+         (copy-file-function (symbol-function 'copy-file))
+         (delete-file-function (symbol-function 'delete-file))
+         remote-tmp activation-command error-message)
+    (unwind-protect
+        (progn
+          (make-directory fake-bin t)
+          (with-temp-file fake-chmod (insert "#!/bin/sh\nexit 1\n"))
+          (set-file-modes fake-chmod #o755)
+          (make-directory remote-dir t)
+          (with-temp-file local (insert "new binary"))
+          (with-temp-file remote-local (insert "old binary"))
+          (cl-letf (((symbol-function 'tramp-rpc-deploy--ensure-remote-directory) #'ignore)
+                    ((symbol-function 'copy-file)
+                     (lambda (from to &rest _args)
+                       (setq remote-tmp (tramp-file-local-name to))
+                       (funcall copy-file-function from remote-tmp t)))
+                    ((symbol-function 'delete-file)
+                     (lambda (file &rest _args)
+                       (funcall delete-file-function (tramp-file-local-name file))))
+                    ((symbol-function 'tramp-send-command-and-check)
+                     (lambda (_vec command)
+                       (when (string-match-p "mv -f" command)
+                         (setq activation-command command))
+                       (let ((process-environment
+                              (cons (concat "PATH=" fake-bin path-separator
+                                            (getenv "PATH"))
+                                    process-environment)))
+                         (zerop (call-process "sh" nil nil nil "-c" command))))))
+            (condition-case err
+                (tramp-rpc-deploy--transfer-binary vec local)
+              (remote-file-error (setq error-message (error-message-string err))))
+            (should (string-match-p "Remote verification or activation failed"
+                                    error-message))
+            (should (equal (file-name-directory remote-tmp)
+                           (file-name-directory remote-local)))
+            (let ((tmp (tramp-shell-quote-argument remote-tmp))
+                  (dest (tramp-shell-quote-argument remote-local))
+                  (digest (tramp-rpc-deploy--compute-checksum local)))
+              (should (string-prefix-p
+                       (format "test -f %s && ! test -L %s && chmod +x %s"
+                               tmp tmp tmp)
+                       activation-command))
+              (should (string-match-p
+                       (regexp-quote
+                        (format "test \"$actual\" = %s && mv -f %s %s"
+                                digest tmp dest))
+                       activation-command))
+              (should (string-suffix-p
+                       (format "test -f %s && ! test -L %s && test -x %s"
+                               dest dest dest)
+                       activation-command)))
+            (should (equal (with-temp-buffer
+                             (insert-file-contents-literally remote-local)
+                             (buffer-string))
+                           "old binary"))
+            (should-not (file-exists-p remote-tmp))))
+      (delete-directory dir t))))
+
+(ert-deftest tramp-rpc-mock-test-deploy-method-table-matches-dispatcher ()
+  "README's RPC table documents exactly the dispatcher's public methods."
+  :tags '(:deploy)
+  (let (dispatcher documented)
+    (with-temp-buffer
+      (insert-file-contents
+       (expand-file-name "server/src/handlers/mod.rs" tramp-rpc-mock-test--project-root))
+      (re-search-forward "async fn dispatch_inner" nil t)
+      (let ((start (point))
+            (end (progn (re-search-forward "^    match result {" nil t)
+                        (match-beginning 0))))
+        (goto-char start)
+        (while (re-search-forward "\\\"\\([[:alnum:]_.]+\\)\\\" =>" end t)
+          (push (match-string 1) dispatcher))))
+    (push "batch" dispatcher)
+    (with-temp-buffer
+      (insert-file-contents (expand-file-name "README.org" tramp-rpc-mock-test--project-root))
+      (re-search-forward "^\\*\\* RPC Server Methods$" nil t)
+      (let ((start (point))
+            (end (or (and (re-search-forward "^\\* " nil t) (match-beginning 0))
+                     (point-max))))
+        (goto-char start)
+        (while (re-search-forward "~\\([[:alnum:]_.]+\\)~" end t)
+          (push (match-string 1) documented))))
+    (should (equal (sort (delete-dups dispatcher) #'string<)
+                   (sort (delete-dups documented) #'string<)))))
+
 ;; With latest tramp, tramp-file-name-with-sudo natively produces
 ;; /rpc:user@host|sudo:root@host:/path for rpc paths since the rpc
 ;; method is now multi-hop capable (inherits ssh connection params).

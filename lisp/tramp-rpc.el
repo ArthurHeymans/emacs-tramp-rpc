@@ -896,10 +896,6 @@ Otherwise clear all entries."
     (clrhash tramp-rpc--direnv-cache)
     (clrhash tramp-rpc--direnv-available-cache)))
 
-(defvar tramp-rpc--executable-cache (make-hash-table :test 'equal)
-  "Cache of executable paths keyed by (connection-key . program).
-Value is the full path or :not-found.")
-
 ;; Forward-declare caches used by tramp-rpc--remove-connection (defined
 ;; later in the exec-path section).  The byte-compiler needs to see
 ;; these defvars before their first reference.
@@ -908,23 +904,6 @@ Value is the full path or :not-found.")
 
 (defvar tramp-rpc--login-shell-cache (make-hash-table :test 'equal)
   "Cache of remote login shell keyed by connection-key.")
-
-(defun tramp-rpc--clear-executable-cache (&optional vec)
-  "Clear the executable cache.
-If VEC is provided, only clear entries for that connection.
-Otherwise clear all entries."
-  (if vec
-      (let ((conn-key (tramp-rpc--connection-key vec))
-            (keys-to-remove nil))
-        ;; Collect keys first (can't modify hash table during maphash)
-        (maphash (lambda (key _value)
-                   (when (equal (car key) conn-key)
-                     (push key keys-to-remove)))
-                 tramp-rpc--executable-cache)
-        ;; Now remove them
-        (dolist (key keys-to-remove)
-          (remhash key tramp-rpc--executable-cache)))
-    (clrhash tramp-rpc--executable-cache)))
 
 (defun tramp-rpc--environment-with (env key value)
   "Return ENV with KEY set to VALUE.
@@ -1028,54 +1007,6 @@ by `with-environment-variables') are returned as an alist of
         (push (cons (match-string 1 elt) (match-string 2 elt)) env)))
     (nreverse env)))
 
-(defun tramp-rpc--resolve-executable (vec program)
-  "Resolve PROGRAM to its full path on VEC.
-Returns the full path if found, otherwise the original PROGRAM.
-Results are cached per connection."
-  (if (file-name-absolute-p program)
-      program
-    (let* ((cache-key (cons (tramp-rpc--connection-key vec) program))
-           (cached (gethash cache-key tramp-rpc--executable-cache)))
-      (cond
-       ((stringp cached) cached)  ; Cached full path
-       ((eq cached :not-found) program)  ; Known not found, use original
-       (t  ; Not cached, look it up
-        (let ((found (tramp-rpc--find-executable vec program)))
-          (puthash cache-key (or found :not-found) tramp-rpc--executable-cache)
-           (or found program)))))))
-
-(defun tramp-rpc--find-executable (vec program)
-  "Find PROGRAM in the remote PATH on VEC.
-Returns the absolute path or nil.
-Uses `command -v` via the user's login shell for lookup, so that
-executables in shell-specific PATH entries are found.
-Uses a unique marker to separate MOTD/banner text from actual output,
-following the pattern used by standard TRAMP."
-  (condition-case err
-      (let* (;; Use a unique marker (MD5 hash) to delimit output from MOTD text
-             ;; This is the same approach used by tramp-sh.el
-             (marker (md5 (format "tramp-rpc-%s-%s" program (float-time))))
-             (shell (tramp-rpc--get-remote-login-shell vec))
-             (result (tramp-rpc--call vec "process.run"
-                                       `((cmd . ,shell)
-                                         (args . ["-l" "-c"
-                                                  ,(format "echo %s; command -v %s"
-                                                            marker (tramp-shell-quote-argument program))])
-                                         (cwd . "/"))))
-             (exit-code (alist-get 'exit_code result))
-             (stdout (tramp-rpc--decode-output
-                      (alist-get 'stdout result)
-                      (alist-get 'stdout_encoding result))))
-        (when (and (eq exit-code 0) (> (length stdout) 0))
-          ;; Find the marker and extract the path after it
-          (when (string-match (concat (regexp-quote marker) "\n\\([^\n]+\\)") stdout)
-            (let ((path (string-trim (match-string 1 stdout))))
-              (when (string-prefix-p "/" path)
-                path)))))
-    (error
-     (tramp-rpc--debug "find-executable failed for %s: %S" program err)
-     nil)))
-
 (defsubst tramp-rpc--port-to-string (port)
   "Normalize PORT to a string, or return nil.
 PORT may be a number (from defaults), a string (from filename
@@ -1128,15 +1059,14 @@ new generation is made visible."
 
 (defun tramp-rpc--remove-connection (vec &optional process)
   "Remove VEC's connection, optionally only when PROCESS is current.
-Also clears the executable, exec-path, and login shell caches."
+Also clears the exec-path and login shell caches."
   (let* ((key (tramp-rpc--connection-key vec))
          (current (gethash key tramp-rpc--connections)))
     (when (and current
                (or (null process) (eq process (plist-get current :process))))
       (remhash key tramp-rpc--connections)
       (remhash key tramp-rpc--exec-path-cache)
-      (remhash key tramp-rpc--login-shell-cache)
-      (tramp-rpc--clear-executable-cache vec))))
+      (remhash key tramp-rpc--login-shell-cache))))
 
 (defun tramp-rpc--connection-error-response (vec event)
   "Return an RPC error response for a transport failure on VEC."
@@ -5282,7 +5212,6 @@ cleanup of all connections has run."
   (clrhash tramp-rpc--pending-responses)
   (clrhash tramp-rpc--async-callbacks)
   (clrhash tramp-rpc--async-callback-processes)
-  (clrhash tramp-rpc--executable-cache)
   (tramp-rpc--clear-direnv-cache)
   (tramp-rpc--clear-file-metadata-caches)
   ;; Note: recentf cleanup is handled by `tramp-recentf-cleanup-all'

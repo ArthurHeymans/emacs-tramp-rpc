@@ -565,86 +565,194 @@ Returns t on success, nil on failure."
         (message "Downloading %s..." url)
         (with-timeout (tramp-rpc-deploy-download-timeout
                        (signal 'remote-file-error
-			       (list (format
-				      "Download timed out after %d seconds"
-				      tramp-rpc-deploy-download-timeout))))
-          (with-current-buffer (url-retrieve-synchronously url t t)
-            (goto-char (point-min))
-            ;; Check for HTTP errors
-            (unless (re-search-forward "^HTTP/[0-9.]+ 200" nil t)
-              (if (re-search-forward "^HTTP/[0-9.]+ \\([0-9]+\\)" nil t)
-                  (signal 'remote-file-error (list "HTTP error" (match-string 1)))
-                (signal 'remote-file-error (list "Invalid HTTP response"))))
-            ;; Find body (after blank line)
-            (re-search-forward "^\r?\n" nil t)
-            ;; Write body to file
-            (let ((coding-system-for-write 'binary))
-              (write-region (point) (point-max) dest nil 'silent))
-            (kill-buffer)
-            t)))
+                               (list (format "Download timed out after %d seconds"
+                                             tramp-rpc-deploy-download-timeout))))
+          (let ((buffer (url-retrieve-synchronously url t t)))
+            (unless buffer
+              (signal 'remote-file-error (list "No HTTP response" url)))
+            (unwind-protect
+                (with-current-buffer buffer
+                  (goto-char (point-min))
+                  (unless (re-search-forward "^HTTP/[0-9.]+ 200" nil t)
+                    (if (re-search-forward "^HTTP/[0-9.]+ \\([0-9]+\\)" nil t)
+                        (signal 'remote-file-error (list "HTTP error" (match-string 1)))
+                      (signal 'remote-file-error (list "Invalid HTTP response"))))
+                  (re-search-forward "^\\r?\\n" nil t)
+                  (let ((coding-system-for-write 'binary))
+                    (write-region (point) (point-max) dest nil 'silent))
+                  t)
+              (when (buffer-live-p buffer)
+                (kill-buffer buffer))))))
     (error
      (message "Download failed: %s" (error-message-string err))
      nil)))
 
+(defun tramp-rpc-deploy--release-checksum (metadata asset)
+  "Return the SHA256 in METADATA for exactly ASSET.
+Release metadata must be one standard sha256sum line.  Rejecting ambiguous
+or differently named entries prevents a valid checksum for another artifact
+from authorizing this download."
+  (let ((lines (split-string (string-trim metadata) "[\r\n]+" t)))
+    (unless (= (length lines) 1)
+      (signal 'remote-file-error (list "Malformed checksum metadata")))
+    (let ((line (car lines)))
+      (unless (string-match
+               "\\`\\([[:xdigit:]]\\{64\\}\\)[[:space:]]+\\*?\\([^[:space:]]+\\)\\'"
+               line)
+        (signal 'remote-file-error (list "Malformed checksum metadata")))
+      (let ((checksum (downcase (match-string 1 line)))
+            (named-asset (match-string 2 line)))
+        (unless (string= named-asset asset)
+          (signal 'remote-file-error
+                  (list "Checksum metadata names" named-asset "not" asset)))
+        checksum))))
+
 (defun tramp-rpc-deploy--verify-checksum (file expected-checksum)
-  "Verify that FILE has EXPECTED-CHECKSUM.
+  "Verify that FILE has the SHA256 EXPECTED-CHECKSUM.
 Returns t if checksum matches, nil otherwise."
-  (when (and file (file-exists-p file) expected-checksum)
-    (let ((actual (with-temp-buffer
-                    (set-buffer-multibyte nil)
-                    (insert-file-contents-literally file)
-                    (secure-hash 'sha256 (current-buffer)))))
-      (string= actual (car (split-string expected-checksum))))))
+  (when (and file (file-exists-p file)
+             (stringp expected-checksum)
+             (string-match-p "\\`[[:xdigit:]]\\{64\\}\\'" expected-checksum))
+    (string= (tramp-rpc-deploy--compute-checksum file)
+             (downcase expected-checksum))))
+
+(defun tramp-rpc-deploy--cache-provenance-path (cache-path)
+  "Return the provenance sidecar path for CACHE-PATH."
+  (concat cache-path ".provenance"))
+
+(defun tramp-rpc-deploy--write-file-atomically (path contents)
+  "Write CONTENTS to PATH without exposing a partial file."
+  (let ((temp-path (make-temp-file (concat path ".tmp."))))
+    (unwind-protect
+        (progn
+          (with-temp-file temp-path
+            (insert contents))
+          (rename-file temp-path path t)
+          (setq temp-path nil))
+      (when temp-path
+        (ignore-errors (delete-file temp-path))))))
+
+(defun tramp-rpc-deploy--write-cache-provenance (cache-path kind digest)
+  "Atomically record KIND and SHA256 DIGEST for CACHE-PATH."
+  (unless (and (member kind '("release" "source-build"))
+               (stringp digest)
+               (string-match-p "\\`[[:xdigit:]]\\{64\\}\\'" digest))
+    (signal 'remote-file-error (list "Invalid cache provenance")))
+  (tramp-rpc-deploy--write-file-atomically
+   (tramp-rpc-deploy--cache-provenance-path cache-path)
+   (format "%s-sha256:%s\n" kind (downcase digest))))
+
+(defun tramp-rpc-deploy--invalidate-cache (cache-path)
+  "Remove CACHE-PATH and its provenance after failed source-cache validation."
+  (ignore-errors (delete-file cache-path))
+  (ignore-errors (delete-file (tramp-rpc-deploy--cache-provenance-path cache-path))))
+
+(defun tramp-rpc-deploy--promote-cached-binary (source cache-path kind)
+  "Atomically promote SOURCE to CACHE-PATH with KIND and a recorded digest.
+A crash after removing provenance can leave an untrusted cache entry, but
+never one authorized by stale provenance."
+  (make-directory (file-name-directory cache-path) t)
+  (let ((temp-path (make-temp-file (concat cache-path ".tmp.")))
+        (provenance-path (tramp-rpc-deploy--cache-provenance-path cache-path)))
+    (unwind-protect
+        (progn
+          (copy-file source temp-path t)
+          (set-file-modes temp-path #o755)
+          (let ((digest (tramp-rpc-deploy--compute-checksum temp-path)))
+            ;; Remove stale authority before changing the cache binary.
+            (ignore-errors (delete-file provenance-path))
+            (rename-file temp-path cache-path t)
+            (setq temp-path nil)
+            (tramp-rpc-deploy--write-cache-provenance cache-path kind digest)
+            cache-path))
+      (when temp-path
+        (ignore-errors (delete-file temp-path))))))
+
+(defun tramp-rpc-deploy--cached-binary-trusted-p (cache-path)
+  "Return non-nil when CACHE-PATH matches a recorded provenance digest."
+  (let* ((provenance-path (tramp-rpc-deploy--cache-provenance-path cache-path))
+         (provenance (and (file-exists-p provenance-path)
+                          (with-temp-buffer
+                            (insert-file-contents-literally provenance-path)
+                            (buffer-string)))))
+    (cond
+     ((and provenance
+           (string-match
+            "\\`\\(release\\|source-build\\)-sha256:\\([[:xdigit:]]\\{64\\}\\)\n?\\'"
+            provenance))
+      (let ((kind (match-string 1 provenance))
+            (digest (match-string 2 provenance)))
+        (if (tramp-rpc-deploy--verify-checksum cache-path digest)
+            t
+          (when (string= kind "source-build")
+            (tramp-rpc-deploy--invalidate-cache cache-path))
+          nil)))
+     ;; Legacy and malformed source-build records must never authorize reuse.
+     ((and provenance (string-prefix-p "source-build" provenance))
+      (tramp-rpc-deploy--invalidate-cache cache-path)
+      nil))))
 
 (defun tramp-rpc-deploy--extract-tarball (tarball dest-dir)
   "Extract TARBALL to DEST-DIR.
 Returns the path to the extracted binary, or nil on failure."
   (let ((default-directory dest-dir))
     (make-directory dest-dir t)
-    (if (zerop (call-process "tar" nil nil nil "-xzf" tarball "-C" dest-dir))
-        (let ((binary (expand-file-name tramp-rpc-deploy-binary-name dest-dir)))
-          (when (file-exists-p binary)
+    ;; Extract only the expected member, so unrelated archive paths cannot
+    ;; escape DEST-DIR or place content that influences promotion.
+    (if (zerop (call-process "tar" nil nil nil "-xzf" tarball "-C" dest-dir
+                             "--" tramp-rpc-deploy-binary-name))
+        (let* ((binary (expand-file-name tramp-rpc-deploy-binary-name dest-dir))
+               (attributes (and (not (file-symlink-p binary))
+                                (file-attributes binary 'integer))))
+          (when (and attributes
+                     (file-regular-p binary)
+                     (= (file-attribute-link-number attributes) 1))
             (set-file-modes binary #o755)
             binary))
       nil)))
 
 (defun tramp-rpc-deploy--download-binary (arch)
-  "Download pre-compiled binary for ARCH from GitHub releases.
-Returns the path to the binary on success, signals error on failure."
+  "Download a checksum-verified pre-compiled binary for ARCH.
+Returns the cached binary path on success, and never promotes an unverified
+release artifact into the cache."
   (let* ((cache-path (tramp-rpc-deploy--local-cache-path arch))
-         (cache-dir (file-name-directory cache-path))
+         (asset (tramp-rpc-deploy--release-asset-name arch))
          (tarball-url (tramp-rpc-deploy--download-url arch))
          (checksum-url (tramp-rpc-deploy--checksum-url arch))
          (temp-dir (make-temp-file "tramp-rpc-" t))
          (tarball-path (expand-file-name "server.tar.gz" temp-dir))
-         (checksum-path (expand-file-name "server.tar.gz.sha256" temp-dir)))
+         (checksum-path (expand-file-name "server.tar.gz.sha256" temp-dir))
+         (extract-dir (expand-file-name "extract" temp-dir)))
     (unwind-protect
         (progn
-          ;; Download checksum first
           (message "Fetching checksum for %s..." arch)
-          (let ((checksum-ok (tramp-rpc-deploy--download-file checksum-url checksum-path)))
-            ;; Download tarball
+          (unless (tramp-rpc-deploy--download-file checksum-url checksum-path)
+            (signal 'remote-file-error
+                    (list "Checksum metadata unavailable; refusing unverified release binary"
+                          checksum-url)))
+          (let ((expected (tramp-rpc-deploy--release-checksum
+                           (with-temp-buffer
+                             (insert-file-contents-literally checksum-path)
+                             (buffer-string))
+                           asset)))
             (message "Downloading tramp-rpc-server for %s..." arch)
             (unless (tramp-rpc-deploy--download-file tarball-url tarball-path)
-              (signal
-	       'remote-file-error
-	       (list "Download failed from" tarball-url "(release may not exist)")))
-            ;; Verify checksum if we got one
-            (when checksum-ok
-              (let ((expected (with-temp-buffer
-                                (insert-file-contents checksum-path)
-                                (buffer-string))))
-                (unless (tramp-rpc-deploy--verify-checksum tarball-path expected)
-                  (signal 'remote-file-error (list "Checksum verification failed")))))
-            ;; Extract
+              (signal 'remote-file-error
+                      (list "Download failed from" tarball-url "(release may not exist)")))
+            (unless (tramp-rpc-deploy--verify-checksum tarball-path expected)
+              (signal 'remote-file-error
+                      (list "Checksum verification failed for" asset)))
+            ;; Extract outside the cache: only a verified release can be promoted.
             (message "Extracting binary...")
-            (make-directory cache-dir t)
-            (unless (tramp-rpc-deploy--extract-tarball tarball-path cache-dir)
-              (signal 'remote-file-error (list "Failed to extract tarball")))
-            (message "Downloaded tramp-rpc-server for %s" arch)
+            (let ((binary (tramp-rpc-deploy--extract-tarball tarball-path extract-dir)))
+              (unless binary
+                (signal 'remote-file-error (list "Failed to extract tarball")))
+              (tramp-rpc-deploy--promote-cached-binary
+               binary cache-path "release"))
+            (message "Downloaded and verified tramp-rpc-server for %s" arch)
             cache-path))
-      ;; Cleanup temp dir
-      (delete-directory temp-dir t))))
+      ;; Never leave downloaded archives or unpromoted extraction behind.
+      (ignore-errors (delete-directory temp-dir t)))))
 
 ;;; ============================================================================
 ;;; Build from source
@@ -675,7 +783,6 @@ Returns the path to the binary on success, nil on failure."
   (let* ((default-directory tramp-rpc-deploy-source-directory)
          (target (tramp-rpc-deploy--arch-to-rust-target arch))
          (cache-path (tramp-rpc-deploy--local-cache-path arch))
-         (cache-dir (file-name-directory cache-path))
          (build-output (expand-file-name
                         (format "target/%s/release/%s"
                                 target tramp-rpc-deploy-binary-name)
@@ -695,10 +802,9 @@ Returns the path to the binary on success, nil on failure."
                          (expand-file-name "Cargo.toml" tramp-rpc-deploy-source-directory))))
       (if (zerop exit-code)
           (progn
-            ;; Copy to cache
-            (make-directory cache-dir t)
-            (copy-file build-output cache-path t)
-            (set-file-modes cache-path #o755)
+            ;; Promote only a complete binary with its recorded digest.
+            (tramp-rpc-deploy--promote-cached-binary
+             build-output cache-path "source-build")
             (message "Built tramp-rpc-server for %s" arch)
             cache-path)
         (with-current-buffer build-buffer
@@ -758,7 +864,8 @@ Returns the path to the local binary."
 
      ;; Check cache
      ((and (file-exists-p cache-path)
-           (file-executable-p cache-path))
+           (file-executable-p cache-path)
+           (tramp-rpc-deploy--cached-binary-trusted-p cache-path))
       (message "Using cached binary for %s" arch)
       cache-path)
 
@@ -835,14 +942,14 @@ Returns the path to the local binary."
 ;;; ============================================================================
 
 (defun tramp-rpc-deploy--remote-binary-exists-p (vec)
-  "Check if the correct version of the binary exists on remote VEC."
-  (let ((remote-path (tramp-rpc-deploy--remote-binary-path vec)))
-    ;; Use tramp-sh operations for checking since we're bootstrapping
+  "Check if a regular non-symlink executable binary exists on remote VEC."
+  (let* ((remote-path (tramp-rpc-deploy--remote-binary-path vec))
+         (path (tramp-shell-quote-argument
+                (tramp-file-local-name remote-path))))
+    ;; Use tramp-sh operations for checking since we're bootstrapping.
     (tramp-send-command-and-check
-     vec
-     (format "test -x %s"
-             (tramp-shell-quote-argument
-              (tramp-file-local-name remote-path))))))
+     vec (format "test -f %s && ! test -L %s && test -x %s"
+                 path path path))))
 
 (defun tramp-rpc-deploy--ensure-remote-directory (vec)
   "Ensure the remote deployment directory exists on VEC."
@@ -924,32 +1031,30 @@ to inline encoding (base64 through the shell), which can be fragile."
 		 'remote-file-error
 		 (list "Temp file not created or is empty after copy")))
 
-              ;; Verify checksum
-              (let ((remote-checksum (tramp-rpc-deploy--remote-checksum vec remote-tmp-local)))
-                (unless remote-checksum
-                  (signal
-		   'remote-file-error
-		   (list "Could not compute remote checksum (sha256sum/shasum not available?)")))
-                (if (string= local-checksum remote-checksum)
-                    (progn
-                      ;; Checksum matches - make executable and atomically move
-                      (tramp-send-command
-                       vec
-                       (format "chmod +x %s && mv -f %s %s"
-                               (tramp-shell-quote-argument remote-tmp-local)
-                               (tramp-shell-quote-argument remote-tmp-local)
-                               (tramp-shell-quote-argument remote-local)))
-                      (setq success t)
-                      (message "Transfer completed successfully"))
-                  ;; Checksum mismatch - clean up and retry
-                  (let ((err-msg (format "Attempt %d: Checksum mismatch (local: %s, remote: %s)"
-                                         attempt
-                                         (substring local-checksum 0 12)
-                                         (substring remote-checksum 0 12))))
-                    (push err-msg errors)
-                    (message "%s" err-msg))
-                  (ignore-errors (delete-file remote-tmp-path))
-                  (setq retries (1+ retries)))))
+              ;; Verify and activate in one remote shell operation.  The final
+              ;; type and digest checks immediately precede the atomic rename.
+              ;; ponytail: a same-user process can still swap the pathname in
+              ;; that tiny window; full inode binding needs a remote helper.
+              (let ((tmp (tramp-shell-quote-argument remote-tmp-local))
+                    (dest (tramp-shell-quote-argument remote-local))
+                    (digest (tramp-shell-quote-argument local-checksum)))
+                (unless (tramp-send-command-and-check
+                         vec
+                         (format
+                          (concat "test -f %s && ! test -L %s && chmod +x %s && "
+                                  "test -f %s && ! test -L %s && "
+                                  "(test ! -e %s && ! test -L %s || "
+                                  "test -f %s && ! test -L %s) && "
+                                  "actual=$({ sha256sum %s 2>/dev/null || "
+                                  "shasum -a 256 %s 2>/dev/null; } | cut -d' ' -f1) && "
+                                  "test \"$actual\" = %s && mv -f %s %s && "
+                                  "test -f %s && ! test -L %s && test -x %s")
+                          tmp tmp tmp tmp tmp dest dest dest dest tmp tmp digest tmp dest
+                          dest dest dest))
+                  (signal 'remote-file-error
+                          (list "Remote verification or activation failed; existing binary was preserved"))))
+              (setq success t)
+              (message "Transfer completed successfully"))
           (error
            ;; Clean up on error and retry
            (let ((err-msg (format "Attempt %d: %s" attempt (error-message-string err))))
