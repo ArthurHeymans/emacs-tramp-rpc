@@ -688,6 +688,105 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_commands_run_parallel_stdin_failure_kills_child_promptly() {
+        let command = Value::Map(vec![
+            (Value::String("key".into()), Value::String("broken".into())),
+            (Value::String("cmd".into()), Value::String("/bin/sh".into())),
+            (
+                Value::String("args".into()),
+                Value::Array(vec![
+                    Value::String("-c".into()),
+                    Value::String("exec 0<&-; sleep 30".into()),
+                ]),
+            ),
+            (
+                Value::String("stdin".into()),
+                Value::Binary(vec![b'x'; 1024 * 1024]),
+            ),
+        ]);
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            handlers::commands::run_parallel(Value::Map(vec![(
+                Value::String("commands".into()),
+                Value::Array(vec![command]),
+            )])),
+        )
+        .await
+        .expect("stdin failure should kill the command promptly")
+        .unwrap();
+        let stderr = map_get(map_get(&result, "broken").unwrap(), "stderr")
+            .and_then(|value| match value {
+                Value::Binary(bytes) => Some(bytes),
+                _ => None,
+            })
+            .unwrap();
+        assert!(String::from_utf8_lossy(stderr).contains("Failed to write stdin"));
+    }
+
+    #[tokio::test]
+    async fn test_connection_eof_kills_synchronous_process_groups() {
+        let _test_lock = handlers::process::test_process_map_lock().await;
+        for (index, method) in ["process.run", "commands.run_parallel"]
+            .into_iter()
+            .enumerate()
+        {
+            let temp = tempfile::tempdir().expect("temporary marker directory");
+            let marker = temp.path().join("pid");
+            let args = Value::Array(vec![
+                Value::String("-c".into()),
+                Value::String(
+                    format!(
+                        "import os,time; p={marker:?}; open(p+'.tmp', 'w').write(str(os.getpid())); os.replace(p+'.tmp', p); time.sleep(30)"
+                    )
+                    .into(),
+                ),
+            ]);
+            let command = Value::Map(vec![
+                (Value::String("cmd".into()), Value::String("python3".into())),
+                (Value::String("args".into()), args),
+            ]);
+            let params = if method == "process.run" {
+                command
+            } else {
+                let mut entry = command.as_map().unwrap().clone();
+                entry.push((Value::String("key".into()), Value::String("test".into())));
+                Value::Map(vec![(
+                    Value::String("commands".into()),
+                    Value::Array(vec![Value::Map(entry)]),
+                )])
+            };
+
+            let (mut client, server_reader) = tokio::io::duplex(4096);
+            let (server_writer, _client_reader) = tokio::io::duplex(4096);
+            let connection = tokio::spawn(run_connection(
+                server_reader,
+                Arc::new(Mutex::new(server_writer)),
+                None,
+            ));
+            client
+                .write_all(&frame(&make_request_with_id(
+                    700 + index as i64,
+                    method,
+                    params,
+                )))
+                .await
+                .unwrap();
+            wait_for_marker(&marker).await;
+            let child_pid: i32 = std::fs::read_to_string(&marker)
+                .expect("read child PID")
+                .parse()
+                .expect("parse child PID");
+            drop(client);
+            tokio::time::timeout(std::time::Duration::from_secs(3), connection)
+                .await
+                .expect("connection cleanup should be bounded")
+                .expect("connection task should not panic");
+
+            handlers::process::wait_for_process_exit(child_pid).await;
+        }
+    }
+
+    #[tokio::test]
     async fn test_method_not_found() {
         let params = Value::Map(vec![]);
         let payload = make_request("nonexistent.method", params);
