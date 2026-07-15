@@ -13,6 +13,7 @@ use std::io::ErrorKind;
 use std::os::fd::{AsRawFd, BorrowedFd, RawFd};
 use std::path::{Path, PathBuf};
 use std::process::{Command as StdCommand, ExitStatus, Stdio};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 use tokio::process::{Child, ChildStderr, ChildStdin, ChildStdout, Command};
@@ -21,6 +22,37 @@ use tokio::sync::Mutex;
 use super::HandlerResult;
 
 const MAX_PROCESS_READ_BYTES: usize = 1024 * 1024;
+
+async fn read_sync_output<R>(
+    mut reader: R,
+    remaining: Arc<AtomicUsize>,
+) -> Result<Vec<u8>, RpcError>
+where
+    R: AsyncRead + Unpin,
+{
+    let mut output = Vec::new();
+    let mut buffer = [0u8; 8192];
+    loop {
+        let read = reader.read(&mut buffer).await.map_err(|error| {
+            RpcError::process_error(format!("Failed to read process output: {error}"))
+        })?;
+        if read == 0 {
+            return Ok(output);
+        }
+        if remaining
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+                current.checked_sub(read)
+            })
+            .is_err()
+        {
+            return Err(RpcError::process_error(format!(
+                "Process output exceeds {} byte limit",
+                crate::MAX_RESPONSE_OUTPUT_BYTES
+            )));
+        }
+        output.extend_from_slice(&buffer[..read]);
+    }
+}
 
 fn command_path(command: &str, cwd: Option<&str>) -> PathBuf {
     let path = Path::new(command);
@@ -186,13 +218,17 @@ pub async fn run(params: Value) -> HandlerResult {
         }
     }
 
-    // Set up stdin if provided
-    if params.stdin.is_some() {
-        cmd.stdin(Stdio::piped());
-    }
+    // Never let a synchronous child consume the RPC transport.  A pipe is
+    // only needed when the caller supplied input.
+    cmd.stdin(if params.stdin.is_some() {
+        Stdio::piped()
+    } else {
+        Stdio::null()
+    });
 
     cmd.stdout(Stdio::piped());
     cmd.stderr(Stdio::piped());
+    cmd.kill_on_drop(true);
 
     let mut child = match cmd.spawn() {
         Ok(child) => child,
@@ -208,25 +244,56 @@ pub async fn run(params: Value) -> HandlerResult {
         }
     };
 
-    // Write stdin if provided (no base64 decoding needed!)
-    if let Some(stdin_data) = params.stdin
-        && let Some(mut stdin) = child.stdin.take()
-    {
-        let _ = stdin.write_all(&stdin_data).await;
-    }
-
-    // Wait for process to complete (async!)
-    let output = child
-        .wait_with_output()
-        .await
-        .map_err(|e| RpcError::process_error(format!("Failed to wait for process: {}", e)))?;
+    // Drive stdin, bounded output drains, and child exit concurrently.  Any
+    // pipe or size error cancels the other operations and kills the child.
+    let stdin_data = params.stdin;
+    let mut stdin = child.stdin.take();
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| RpcError::process_error("Failed to capture process stdout"))?;
+    let stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| RpcError::process_error("Failed to capture process stderr"))?;
+    let write_stdin = async move {
+        if let Some(data) = stdin_data
+            && let Some(mut stdin) = stdin.take()
+        {
+            stdin
+                .write_all(&data)
+                .await
+                .map_err(|e| RpcError::process_error(format!("Failed to write stdin: {e}")))?;
+        }
+        Ok::<(), RpcError>(())
+    };
+    let remaining = Arc::new(AtomicUsize::new(crate::MAX_RESPONSE_OUTPUT_BYTES));
+    let result = tokio::try_join!(
+        write_stdin,
+        read_sync_output(stdout, Arc::clone(&remaining)),
+        read_sync_output(stderr, remaining),
+        async {
+            child
+                .wait()
+                .await
+                .map_err(|e| RpcError::process_error(format!("Failed to wait for process: {e}")))
+        }
+    );
+    let ((), stdout, stderr, status) = match result {
+        Ok(result) => result,
+        Err(error) => {
+            let _ = child.kill().await;
+            let _ = child.wait().await;
+            return Err(error);
+        }
+    };
 
     // Return binary data directly (no encoding needed!)
-    let exit_code = crate::protocol::exit_code_from_status(output.status);
+    let exit_code = crate::protocol::exit_code_from_status(status);
     let result = ProcessResult {
         exit_code,
-        stdout: output.stdout,
-        stderr: output.stderr,
+        stdout,
+        stderr,
     };
 
     Ok(result.to_value())
@@ -1279,6 +1346,15 @@ pub async fn list_pty(_params: Value) -> HandlerResult {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn synchronous_output_reader_enforces_shared_limit() {
+        let error = read_sync_output(&b"oversized"[..], Arc::new(AtomicUsize::new(4)))
+            .await
+            .expect_err("output above the remaining response budget should fail");
+        assert_eq!(error.code, RpcError::PROCESS_ERROR);
+        assert!(error.message.contains("output exceeds"));
+    }
 
     fn map_get<'a>(value: &'a Value, key: &str) -> Option<&'a Value> {
         value.as_map().and_then(|m| {
