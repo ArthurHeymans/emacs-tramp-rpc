@@ -28,6 +28,7 @@ const FRAME_CHANNEL_SIZE: usize = 2;
 const GENERAL_TASK_LIMIT: usize = 16;
 const CONTROL_TASK_LIMIT: usize = 4;
 const RESPONSE_TASK_LIMIT: usize = 4;
+const EOF_TASK_JOIN_WAIT: std::time::Duration = std::time::Duration::from_millis(500);
 
 /// Shared handle to the stdout writer, used by both response writing
 /// and the watcher's notification sending.
@@ -202,6 +203,11 @@ where
     R: AsyncRead + Unpin + Send + 'static,
     W: AsyncWrite + Unpin + Send + 'static,
 {
+    #[cfg(test)]
+    // Process-local registries are shared by tests even though production
+    // gives each transport its own server process; serialize test loops.
+    let _process_test_lock = handlers::process::test_process_map_lock().await;
+
     let (sender, mut frames) = mpsc::channel(FRAME_CHANNEL_SIZE);
     tokio::spawn(read_frames(reader, sender));
     let mut tasks: JoinSet<()> = JoinSet::new();
@@ -224,7 +230,15 @@ where
         }
     }
 
-    while tasks.join_next().await.is_some() {}
+    // Once the transport is gone no response can be relied on.  Reap managed
+    // children before joining request tasks: a task blocked on their pipes or
+    // a descendant-held descriptor must not prevent SIGKILL escalation.
+    handlers::cleanup_managed_processes().await;
+    let _ = tokio::time::timeout(EOF_TASK_JOIN_WAIT, async {
+        while tasks.join_next().await.is_some() {}
+    })
+    .await;
+    tasks.abort_all();
 }
 
 fn accept_frame<W>(
@@ -415,6 +429,16 @@ mod tests {
         let mut payload = vec![0; u32::from_be_bytes(len) as usize];
         reader.read_exact(&mut payload).await.unwrap();
         rmp_serde::from_slice(&payload).unwrap()
+    }
+
+    async fn wait_for_marker(path: &std::path::Path) {
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            while !path.exists() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("marker was not created: {}", path.display()));
     }
 
     #[tokio::test]
@@ -612,6 +636,120 @@ mod tests {
 
     fn map_get_id(value: &Value) -> Option<i64> {
         map_get(value, "id").and_then(Value::as_i64)
+    }
+
+    #[tokio::test]
+    async fn test_connection_eof_sigkills_blocked_pipe_and_pty_requests() {
+        let (mut client, server_reader) = tokio::io::duplex(4096);
+        let (server_writer, mut client_reader) = tokio::io::duplex(4096);
+        let connection = tokio::spawn(run_connection(
+            server_reader,
+            Arc::new(Mutex::new(server_writer)),
+        ));
+        let temp = tempfile::tempdir().expect("temporary marker directory");
+        let markers = [
+            temp.path().join("pipe-ready"),
+            temp.path().join("pty-ready"),
+        ];
+
+        for ((id, method), marker) in [(101, "process.start"), (102, "process.start_pty")]
+            .into_iter()
+            .zip(&markers)
+        {
+            let ignore_term = Value::Array(vec![
+                Value::String("-c".into()),
+                Value::String(
+                    format!(
+                        "import signal,time; signal.signal(signal.SIGTERM, signal.SIG_IGN); open({marker:?}, 'w').close(); time.sleep(30)"
+                    )
+                    .into(),
+                ),
+            ]);
+            client
+                .write_all(&frame(&make_request_with_id(
+                    id,
+                    method,
+                    Value::Map(vec![
+                        (Value::String("cmd".into()), Value::String("python3".into())),
+                        (Value::String("args".into()), ignore_term),
+                    ]),
+                )))
+                .await
+                .unwrap();
+        }
+        let mut pipe_pid = None;
+        let mut pty_pid = None;
+        for _ in 0..2 {
+            let response = read_frame(&mut client_reader).await;
+            assert!(map_get(&response, "error").is_none(), "{response:?}");
+            let pid = map_get(&response, "result")
+                .and_then(|result| map_get(result, "pid"))
+                .and_then(Value::as_u64)
+                .expect("start response pid") as i64;
+            match map_get_id(&response) {
+                Some(101) => pipe_pid = Some(pid),
+                Some(102) => pty_pid = Some(pid),
+                id => panic!("unexpected start response id: {id:?}"),
+            }
+        }
+
+        for marker in &markers {
+            wait_for_marker(marker).await;
+        }
+
+        let managed_pids = handlers::process::test_managed_os_pids().await;
+        assert_eq!(managed_pids.len(), 2);
+        client
+            .write_all(&frame(&make_request(
+                "process.read",
+                Value::Map(vec![
+                    (
+                        Value::String("pid".into()),
+                        Value::Integer(pipe_pid.expect("pipe pid").into()),
+                    ),
+                    (
+                        Value::String("timeout_ms".into()),
+                        Value::Integer(30_000.into()),
+                    ),
+                ]),
+            )))
+            .await
+            .unwrap();
+        client
+            .write_all(&frame(&make_request(
+                "process.read_pty",
+                Value::Map(vec![
+                    (
+                        Value::String("pid".into()),
+                        Value::Integer(pty_pid.expect("pty pid").into()),
+                    ),
+                    (
+                        Value::String("timeout_ms".into()),
+                        Value::Integer(30_000.into()),
+                    ),
+                ]),
+            )))
+            .await
+            .unwrap();
+
+        // The children ignore SIGTERM and both requests are blocked on their
+        // output.  EOF must still finish after cleanup escalates to SIGKILL.
+        drop(client);
+        drop(client_reader);
+        tokio::time::timeout(std::time::Duration::from_secs(3), connection)
+            .await
+            .expect("EOF cleanup should be bounded")
+            .expect("connection task should not panic");
+        assert!(handlers::process::test_managed_maps_empty().await);
+        for os_pid in managed_pids {
+            assert!(matches!(
+                nix::sys::wait::waitpid(
+                    nix::unistd::Pid::from_raw(os_pid),
+                    Some(nix::sys::wait::WaitPidFlag::WNOHANG)
+                ),
+                Err(nix::errno::Errno::ECHILD)
+            ));
+        }
     }
 
     #[tokio::test]
