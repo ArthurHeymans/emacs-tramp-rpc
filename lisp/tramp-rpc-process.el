@@ -1247,35 +1247,43 @@ RESPONSE is the decoded RPC response plist."
   (when (and (processp local-process)
              (process-live-p local-process)
              (gethash local-process tramp-rpc--pty-processes))
-    (condition-case nil
-               (let* ((result (plist-get response :result))
-               ;; Keep PTY bytes raw; the relay decoder owns character
-               ;; conversion and preserves split multibyte sequences.
-               (output (when-let* ((o (alist-get 'output result)))
-                         (tramp-rpc--binary-bytes o)))
-               (exited (alist-get 'exited result))
-                (exit-code (alist-get 'exit_code result)))
+    (condition-case err
+        (if-let ((rpc-error (plist-get response :error)))
+            ;; A read error is terminal.  Do not schedule another poll: the
+            ;; remote descriptor may be invalid and retrying would spin
+            ;; forever.  -1 preserves the abnormal-exit sentinel contract.
+            (progn
+              (tramp-rpc--debug "PTY read RPC error: %S" rpc-error)
+              (tramp-rpc--handle-pty-exit local-process -1))
+          (let* ((result (plist-get response :result))
+                 ;; Keep PTY bytes raw; the relay decoder owns character
+                 ;; conversion and preserves split multibyte sequences.
+                 (output (when-let* ((o (alist-get 'output result)))
+                           (tramp-rpc--binary-bytes o)))
+                 (exited (alist-get 'exited result))
+                 (exit-code (alist-get 'exit_code result)))
 
-          ;; Feed raw bytes to the relay.  Its read-side decoder is
-          ;; incremental, so a character split across RPC responses is kept
-          ;; intact instead of being decoded once per chunk.
-          (when (and output (> (length output) 0))
-            (let ((tramp-rpc--delivering-output t))
-              (process-send-string local-process output)
-              ;; Exit handling deletes the relay immediately; service the
-              ;; just-written bytes before that lifecycle transition.
-              (accept-process-output local-process 0 nil t)))
+            ;; Feed raw bytes to the relay.  Its read-side decoder is
+            ;; incremental, so a character split across RPC responses is kept
+            ;; intact instead of being decoded once per chunk.
+            (when (and output (> (length output) 0))
+              (let ((tramp-rpc--delivering-output t))
+                (process-send-string local-process output)
+                ;; Exit handling deletes the relay immediately; service the
+                ;; just-written bytes before that lifecycle transition.
+                (accept-process-output local-process 0 nil t)))
 
-          ;; Handle process exit or chain next read
-          (if exited
-              (tramp-rpc--handle-pty-exit local-process exit-code)
-            ;; Chain via a tracked timer so cleanup can cancel it.
-            (tramp-rpc--schedule-process-timer
-             tramp-rpc--pty-processes local-process :poll-timer
-             #'tramp-rpc--pty-start-async-read local-process)))
+            ;; Handle process exit or chain next read
+            (if exited
+                (tramp-rpc--handle-pty-exit local-process exit-code)
+              ;; Chain via a tracked timer so cleanup can cancel it.
+              (tramp-rpc--schedule-process-timer
+               tramp-rpc--pty-processes local-process :poll-timer
+               #'tramp-rpc--pty-start-async-read local-process))))
       (error
-       ;; On error, clean up
-       (tramp-rpc--handle-pty-exit local-process nil)))))
+       ;; Malformed successful responses are terminal too; never keep polling.
+       (tramp-rpc--debug "PTY read response error: %S" err)
+       (tramp-rpc--handle-pty-exit local-process -1)))))
 
 (defun tramp-rpc--handle-pty-exit (local-process exit-code)
   "Handle exit of PTY process associated with LOCAL-PROCESS."
