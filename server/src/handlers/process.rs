@@ -800,8 +800,23 @@ async fn terminate_pipe_process(pid: u32, signal: i32, escalate: bool) -> Result
         if let Some(managed) = get_process_map().lock().await.get_mut(&pid) {
             managed.exit_status = exit_status;
         }
+        return Ok(true);
     }
-    Ok(true)
+
+    // A signal request is not successful merely because it was sent.  Keep
+    // the entry reachable so the caller can retry with SIGKILL.
+    let already_reaped = get_process_map()
+        .lock()
+        .await
+        .get(&pid)
+        .is_some_and(|managed| managed.exit_status.is_some());
+    if already_reaped {
+        Ok(true)
+    } else {
+        Err(RpcError::process_error(format!(
+            "Signal {signal} did not terminate process {pid} within the bounded wait"
+        )))
+    }
 }
 
 /// Kill an async process and reap its direct child.
@@ -1580,13 +1595,28 @@ async fn terminate_pty_process(
         } else if let Some(managed) = processes.get_mut(&pid) {
             managed.exit_status = exit_code;
         }
-    } else if remove {
-        // A missing wait status is still safe to discard: cancellation was
-        // published before removal and the child will not be reused by this
-        // server process while its descriptor remains owned by this request.
-        get_pty_process_map().lock().await.remove(&pid);
+        return Ok(true);
     }
-    Ok(true)
+
+    if remove {
+        // Explicit close discards the PTY even if its status was already
+        // consumed by another status poll.
+        get_pty_process_map().lock().await.remove(&pid);
+        return Ok(true);
+    }
+
+    let already_reaped = get_pty_process_map()
+        .lock()
+        .await
+        .get(&pid)
+        .is_some_and(|managed| managed.exit_status.is_some());
+    if already_reaped {
+        Ok(true)
+    } else {
+        Err(RpcError::process_error(format!(
+            "Signal {signal} did not terminate PTY process {pid} within the bounded wait"
+        )))
+    }
 }
 
 /// Kill a PTY process group and reap its direct child.
@@ -1608,9 +1638,9 @@ pub async fn kill_pty(params: Value) -> HandlerResult {
         message: format!("Invalid signal: {}", params.signal),
         data: None,
     })?;
-    // A requested signal gets a bounded grace period; escalation guarantees
-    // that a successful kill never leaves an unreaped child behind.
-    terminate_pty_process(params.pid, params.signal, true, false).await?;
+    // Do not silently turn SIGTERM (or another requested signal) into
+    // SIGKILL.  The caller can retry explicitly with SIGKILL.
+    terminate_pty_process(params.pid, params.signal, false, false).await?;
     Ok(Value::Boolean(true))
 }
 
@@ -2158,12 +2188,13 @@ mod tests {
             .unwrap() as u32;
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
 
-        kill(Value::Map(vec![(
+        let term_error = kill(Value::Map(vec![(
             Value::String("pid".into()),
             Value::Integer(pid.into()),
         )]))
         .await
-        .expect("SIGTERM");
+        .expect_err("ignored SIGTERM must report failure");
+        assert_eq!(term_error.code, RpcError::PROCESS_ERROR);
         assert!(get_process_map().lock().await.contains_key(&pid));
 
         let os_pid = pipe_os_pid(pid).await;
@@ -2190,6 +2221,45 @@ mod tests {
             tokio::time::sleep(std::time::Duration::from_millis(5)).await;
         }
         panic!("marker was not created: {}", path.display());
+    }
+
+    #[tokio::test]
+    async fn pty_kill_ignored_sigterm_then_sigkill_reaps_child() {
+        let _test_lock = test_process_map_lock().await;
+        let temp = tempfile::tempdir().expect("temporary PTY directory");
+        let marker = temp.path().join("ready");
+        let pid = start_signal_ignoring_pty(&marker).await;
+        let os_pid = pty_os_pid(pid).await;
+
+        let term_error = kill_pty(Value::Map(vec![
+            (Value::String("pid".into()), Value::Integer(pid.into())),
+            (
+                Value::String("signal".into()),
+                Value::Integer((libc::SIGTERM as i64).into()),
+            ),
+        ]))
+        .await
+        .expect_err("ignored SIGTERM must report failure");
+        assert_eq!(term_error.code, RpcError::PROCESS_ERROR);
+        assert!(get_pty_process_map().lock().await.contains_key(&pid));
+
+        kill_pty(Value::Map(vec![
+            (Value::String("pid".into()), Value::Integer(pid.into())),
+            (
+                Value::String("signal".into()),
+                Value::Integer((libc::SIGKILL as i64).into()),
+            ),
+        ]))
+        .await
+        .expect("SIGKILL should terminate and reap the PTY child");
+        assert_reaped(os_pid);
+        close_pty(Value::Map(vec![(
+            Value::String("pid".into()),
+            Value::Integer(pid.into()),
+        )]))
+        .await
+        .expect("close PTY after SIGKILL");
+        assert!(!get_pty_process_map().lock().await.contains_key(&pid));
     }
 
     #[tokio::test]

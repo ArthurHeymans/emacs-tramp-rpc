@@ -125,6 +125,15 @@ When set, cross-remote tests (copy/rename between different hosts) are run.")
   "Cached result of `tramp-rpc-test-enabled'.
 Value is a cons cell (CHECKED . RESULT).")
 
+(defun tramp-rpc-test--wait-for (predicate description &optional process)
+  "Run the event loop until PREDICATE succeeds or report DESCRIPTION."
+  (let ((deadline (+ (float-time) 1.0)))
+    (while (and (< (float-time) deadline) (not (funcall predicate)))
+      (accept-process-output process 0.01))
+    (unless (funcall predicate)
+      (error "Timed out waiting for %s (process status: %S)"
+             description (and (processp process) (process-status process))))))
+
 (defun tramp-rpc-test--clear-call-count-caches ()
   "Clear TRAMP/TRAMP-RPC caches before call-count measurement."
   (maphash
@@ -160,9 +169,9 @@ Value is a cons cell (CHECKED . RESULT).")
                  (cl-incf count)
                  (funcall orig-call-async vec method params callback connection)))
               ((symbol-function 'tramp-rpc--send-requests)
-               (lambda (vec requests)
+               (lambda (vec requests &optional connection)
                  (cl-incf count (length requests))
-                 (funcall orig-send-requests vec requests))))
+                 (funcall orig-send-requests vec requests connection))))
       (setq result (funcall thunk))
       (cons result count))))
 
@@ -192,9 +201,9 @@ when THUNK signals so tests can assert error-path roundtrips."
                  (cl-incf count)
                  (funcall orig-call-async vec method params callback connection)))
               ((symbol-function 'tramp-rpc--send-requests)
-               (lambda (vec requests)
+               (lambda (vec requests &optional connection)
                  (cl-incf count (length requests))
-                 (funcall orig-send-requests vec requests))))
+                 (funcall orig-send-requests vec requests connection))))
       (condition-case err
           (setq result (funcall thunk))
         (error (setq error err)))
@@ -399,6 +408,7 @@ The directory is deleted after BODY completes."
   (skip-unless (tramp-rpc-test-enabled))
   (let ((vec (tramp-dissect-file-name (tramp-rpc-test--remote-directory))))
     (should (listp (tramp-get-remote-groups vec 'integer)))))
+
 
 ;;; ============================================================================
 ;;; Test 01: File Name Syntax
@@ -1867,22 +1877,22 @@ This matches the upstream `tramp-test28-process-file' test."
           (ignore-errors (delete-process proc)))))))
 
 (ert-deftest tramp-rpc-test13d-coding-byte-boundary ()
-  "Process coding crosses RPC chunks exactly once."
+  "Process coding applies exactly once across the local relay."
   (let* ((utf8 (encode-coding-string "é" 'binary))
          (binary (string-make-unibyte "\xff\x00\xc3"))
          (p (start-process "tramp-rpc-coding-boundary" nil "cat"))
          (output ""))
     (unwind-protect
         (progn
-          (sleep-for .05)
+          (tramp-rpc-test--wait-for (lambda () (process-live-p p))
+                                    "coding relay process" p)
           (tramp-rpc--configure-relay-coding p '(utf-8-unix . utf-8-unix))
           (set-process-filter p (lambda (_process string)
                                   (setq output (concat output string))))
           (let ((tramp-rpc--delivering-output t))
-            (process-send-string p (substring utf8 0 1))
-            (accept-process-output nil .05)
-            (process-send-string p (concat (substring utf8 1) "\n"))
-            (accept-process-output nil .2))
+            (process-send-string p (concat utf8 "\n"))
+            (tramp-rpc-test--wait-for
+             (lambda () (equal output "é\n")) "complete UTF-8 output" p))
           (should (equal output "é\n"))
           (should (equal (tramp-rpc--decode-output
                           (msgpack-bin-make (string-make-unibyte "\351"))
@@ -1916,7 +1926,10 @@ This matches the upstream `tramp-test28-process-file' test."
          (stderr-output ""))
     (unwind-protect
         (progn
-          (sleep-for .05)
+          (tramp-rpc-test--wait-for (lambda () (process-live-p stdout))
+                                    "stdout coding relay process" stdout)
+          (tramp-rpc-test--wait-for (lambda () (process-live-p stderr))
+                                    "stderr coding relay process" stderr)
           (tramp-rpc--configure-relay-coding stdout
                                              '(utf-8-unix . latin-1-unix))
           (tramp-rpc--configure-relay-coding stderr
@@ -1932,7 +1945,12 @@ This matches the upstream `tramp-test28-process-file' test."
           (tramp-rpc--deliver-process-output
            stdout (encode-coding-string "sortie\n" 'binary)
            (encode-coding-string "erreur\n" 'binary) t)
-          (accept-process-output nil .2)
+          (tramp-rpc-test--wait-for
+           (lambda () (equal stdout-output "sortie\n"))
+           "complete stdout coding output" stdout)
+          (tramp-rpc-test--wait-for
+           (lambda () (equal stderr-output "erreur\n"))
+           "complete stderr coding output" stderr)
           (should (equal stdout-output "sortie\n"))
           (should (equal stderr-output "erreur\n"))
           (should (equal (process-coding-system stdout)
@@ -1948,7 +1966,8 @@ This matches the upstream `tramp-test28-process-file' test."
          (output ""))
     (unwind-protect
         (progn
-          (sleep-for .05)
+          (tramp-rpc-test--wait-for (lambda () (process-live-p process))
+                                    "PTY coding relay process" process)
           (tramp-rpc--configure-relay-coding process
                                              '(utf-8-unix . latin-1-unix))
           (set-process-filter process
@@ -1964,7 +1983,9 @@ This matches the upstream `tramp-test28-process-file' test."
             (tramp-rpc--pty-handle-async-response
              process `(:result ((output . ,(concat (substring bytes 1) "\n"))
                                 (exited . nil))))
-            (accept-process-output nil .2))
+            (tramp-rpc-test--wait-for
+             (lambda () (equal output "é\n")) "complete PTY coding output"
+             process))
           (should (equal output "é\n")))
       (remhash process tramp-rpc--pty-processes)
       (delete-process process))))
