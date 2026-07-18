@@ -143,6 +143,53 @@ On first connection, the server binary is automatically obtained and deployed:
 
 The binary is cached locally in =~/.emacs.d/tramp-rpc/= and deployed to =~/.cache/emacs/tramp-rpc/= on the remote host.
 
+** Terminal frontends
+
+Some terminal packages special-case stock TRAMP method names such as ~ssh~ when
+choosing a remote login shell.  Since ~rpc~ is a separate method, add it to the
+package's TRAMP shell table if remote terminals open with ~/bin/sh~ instead of
+your normal login shell.  ~tramp-rpc~ does not load or configure these optional
+terminal packages automatically.
+
+For Ghostel:
+
+#+begin_src elisp
+(with-eval-after-load 'ghostel
+  (add-to-list 'ghostel-tramp-shells '("rpc" login-shell)))
+#+end_src
+
+For vterm:
+
+#+begin_src elisp
+(with-eval-after-load 'vterm
+  (add-to-list 'vterm-tramp-shells '("rpc" login-shell)))
+#+end_src
+
+For ~M-x shell~, this is separate from Ghostel/vterm.  Do not set a global
+hard-coded shell unless you really want one for that host.  TRAMP's generic
+remote default is ~/bin/sh~; stock ~ssh~ process handling runs commands through
+TRAMP's established remote shell connection, while ~tramp-rpc~'s direct PTY path
+opens a fresh SSH command.  That difference can show up as a missing
+login-shell environment.
+
+If you need a user-side workaround for one host, prefer a host-scoped
+connection-local override:
+
+#+begin_src elisp
+(connection-local-set-profile-variables
+ 'tramp-rpc-example-shell-profile
+ '((shell-file-name . "/bin/bash")))
+
+(connection-local-set-profiles
+ '(:application tramp :protocol "rpc" :machine "example.org")
+ 'tramp-rpc-example-shell-profile)
+#+end_src
+
+Replace ~/bin/bash~ and ~example.org~ with that host's login shell and name.
+If your config uses ~with-editor~ in terminal buffers and the terminal displays
+literal ~export EDITOR=...~ lines, disable that hook for remote terminal buffers
+or use the terminal package's native editor integration.
+
 ** Deployment Commands
 
 | Command                          | Description                    |
