@@ -898,7 +898,8 @@ entry is appended."
 ENV is an alist of (KEY . VALUE) string pairs, or nil.
 If INSIDE_EMACS is not already present, it is added with the value
 from `tramp-inside-emacs'.  Returns the (possibly augmented) alist."
-  (if (assoc "INSIDE_EMACS" env)
+  (if-let* ((ie (cdr (assoc "INSIDE_EMACS" env)))
+	    ((string-match-p "tramp" ie)))
       env
     (tramp-rpc--environment-with env "INSIDE_EMACS" (tramp-inside-emacs))))
 
@@ -963,6 +964,13 @@ stdout/stderr."
         (unless (member elt baseline)
           (push elt dynamic)))
       (tramp-rpc--environment-list-to-alist (nreverse dynamic)))))
+
+(defun tramp-rpc--emacsclient-tramp-environment (vec)
+  "Return an EMACSCLIENT_TRAMP entry for VEC.
+Depends on `tramp-propagate-emacsclient-tramp' being non-nil."
+  ;; `tramp-propagate-emacsclient-tramp' exists since Tramp 2.8.1.5.
+  (when (bound-and-true-p tramp-propagate-emacsclient-tramp)
+    `(("EMACSCLIENT_TRAMP" . ,(tramp-make-tramp-file-name vec 'noloc)))))
 
 (defun tramp-rpc--caller-environment ()
   "Extract environment variable overrides from `process-environment'.
@@ -3835,6 +3843,7 @@ refresh), git commands are served from the prefetch cache when possible."
                      (tramp-rpc--merge-environments
                       (tramp-rpc--remote-path-environment v)
                       (tramp-rpc--tramp-remote-process-environment)
+                      (tramp-rpc--emacsclient-tramp-environment v)
                       (tramp-rpc--get-direnv-environment v localname)
                       (tramp-rpc--caller-environment))))
                (stdin-content (when (and infile (not (eq infile t)))

@@ -57,6 +57,7 @@
 (declare-function tramp-rpc--merge-environments "tramp-rpc")
 (declare-function tramp-rpc--remote-path-environment "tramp-rpc")
 (declare-function tramp-rpc--tramp-remote-process-environment "tramp-rpc")
+(declare-function tramp-rpc--emacsclient-tramp-environment "tramp-rpc")
 (declare-function tramp-rpc--caller-environment "tramp-rpc")
 (declare-function tramp-rpc--ssh-detail-user "tramp-rpc")
 (declare-function tramp-rpc--sudo-rpc-hop-vec "tramp-rpc")
@@ -563,6 +564,7 @@ Resolves program path and loads direnv environment from working directory."
                             (tramp-rpc--merge-environments
                              (tramp-rpc--remote-path-environment v)
                              (tramp-rpc--tramp-remote-process-environment)
+                             (tramp-rpc--emacsclient-tramp-environment v)
                              (tramp-rpc--get-direnv-environment v localname)
                              (tramp-rpc--caller-environment)))))
           (if use-pty

@@ -183,8 +183,10 @@ before exiting.  Do not use `kill-emacs-hook' for this: upstream
 (setf (symbol-function #'tramp--test-supports-processes-p) #'always)
 ;; tramp-rpc supports set-file-modes via file.set_modes RPC
 (setf (symbol-function #'tramp--test-supports-set-file-modes-p) #'always)
-;; tramp-rpc supports set-file-modes via file.set_times RPC
+;; tramp-rpc supports set-file-times via file.set_times RPC
 (setf (symbol-function #'tramp--test-supports-set-file-times-p) #'always)
+;; tramp-rpc supports setting environment variables
+(setf (symbol-function #'tramp--test-supports-environment-variables-p) #'always)
 
 (provide 'run-tramp-tests)
 ;;; run-tramp-tests.el ends here
