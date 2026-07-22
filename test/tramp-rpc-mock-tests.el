@@ -76,6 +76,11 @@
 
 (require 'tramp-rpc-protocol)
 
+(declare-function tramp-rpc-protocol--clear-deferred-polls-for-target
+                  "tramp-rpc-protocol" (target))
+(declare-function tramp-rpc-protocol--clear-deferred-polls
+                  "tramp-rpc-protocol" ())
+
 (defun tramp-rpc-mock-test--bytes-string (data)
   "Return DATA as a plain byte string, unwrapping MessagePack bin."
   (if (and tramp-rpc-mock-test--msgpack-available (msgpack-bin-p data))
@@ -144,6 +149,74 @@
         (should (tramp-rpc-protocol-error-p response))
         (should (= (tramp-rpc-protocol-error-code response) -32001))
         (should (equal (tramp-rpc-protocol-error-message response) "File not found"))))))
+
+(ert-deftest tramp-rpc-mock-test-protocol-suppresses-empty-process-polls ()
+  "Empty process polls do not flood level-6 protocol logging."
+  (skip-unless tramp-rpc-mock-test--msgpack-available)
+  (let ((tramp-rpc-protocol--deferred-poll-messages
+         (make-hash-table :test 'eql))
+        (tramp-rpc-protocol--message-target 'target-a)
+        logged)
+    (cl-labels
+        ((roundtrip
+          (method response-fields)
+          (let* ((encoded (tramp-rpc-protocol-encode-request-with-id
+                           method '((pid . 1) (timeout_ms . 200))))
+                 (id (car encoded))
+                 (response-bytes
+                  (msgpack-encode
+                   (append `((version . "2.0") (id . ,id))
+                           response-fields))))
+            (with-temp-buffer
+              (set-buffer-multibyte nil)
+              (insert response-bytes)
+              ;; Deferred messages must use the target captured when the
+              ;; request was encoded, not the decoder's dynamic target.
+              (let ((tramp-rpc-protocol--message-target 'decode-target))
+                (tramp-rpc-protocol-decode-response
+                 (current-buffer) (point-min)))))))
+      (cl-letf (((symbol-function 'tramp-message)
+                 (lambda (target _level _format object)
+                   (push (cons target object) logged))))
+        ;; Successful empty pipe and PTY polls are omitted entirely.
+        (roundtrip "process.read"
+                   '((result . ((stdout) (stderr) (exited) (exit_code)))))
+        (roundtrip "process.read_pty"
+                   '((result . ((output) (exited) (exit_code)))))
+        (should-not logged)
+
+        ;; Output, exit, and error responses retain both sides of the trace.
+        (roundtrip "process.read"
+                   '((result . ((stdout . "output") (stderr)
+                                (exited) (exit_code)))))
+        (should (= 2 (length logged)))
+        (roundtrip "process.read_pty"
+                   '((result . ((output . "output") (exited) (exit_code)))))
+        (should (= 4 (length logged)))
+        (roundtrip "process.read"
+                   '((result . ((stdout) (stderr) (exited . t)
+                                (exit_code . 0)))))
+        (should (= 6 (length logged)))
+        (roundtrip "process.read"
+                   '((error . ((code . -32000) (message . "read failed")))))
+        (should (= 8 (length logged)))
+        (should (cl-every (lambda (entry) (eq (car entry) 'target-a))
+                          logged))
+        (should (= 0 (hash-table-count
+                      tramp-rpc-protocol--deferred-poll-messages)))
+
+        ;; Connection cleanup removes only that connection's pending polls.
+        (tramp-rpc-protocol-encode-request-with-id "process.read" nil)
+        (let ((tramp-rpc-protocol--message-target 'target-b))
+          (tramp-rpc-protocol-encode-request-with-id "process.read_pty" nil))
+        (should (= 2 (hash-table-count
+                      tramp-rpc-protocol--deferred-poll-messages)))
+        (tramp-rpc-protocol--clear-deferred-polls-for-target 'target-a)
+        (should (= 1 (hash-table-count
+                      tramp-rpc-protocol--deferred-poll-messages)))
+        (tramp-rpc-protocol--clear-deferred-polls)
+        (should (= 0 (hash-table-count
+                      tramp-rpc-protocol--deferred-poll-messages)))))))
 
 (ert-deftest tramp-rpc-mock-test-protocol-batch-encode ()
   "Test MessagePack-RPC batch request encoding."
@@ -243,8 +316,8 @@
         (puthash id t ids)))))
 
 (ert-deftest tramp-rpc-mock-test-runner-protocol-selector ()
-  "The protocol runner selector covers the eight protocol regressions."
-  (should (= (length (ert-select-tests "^tramp-rpc-mock-test-protocol" t)) 8)))
+  "The protocol runner selector covers the nine protocol regressions."
+  (should (= (length (ert-select-tests "^tramp-rpc-mock-test-protocol" t)) 9)))
 
 ;;; ============================================================================
 ;;; Mode String Conversion Tests
@@ -910,7 +983,7 @@ This matches the behavior expected by `tramp-test28-process-file'."
           (set-file-modes wrapper #o755)
           (with-temp-file skipped
             (insert "(require 'ert)\n"
-                    "(dotimes (n 8)\n"
+                    "(dotimes (n 9)\n"
                     "  (eval `(ert-deftest ,(intern (format \"tramp-rpc-mock-test-protocol-skip-%d\" n)) () (ert-skip \"simulated\"))))\n"))
           (with-temp-file empty (insert "(require 'ert)\n"))
           (make-directory (expand-file-name "lisp" unsupported) t)
@@ -937,7 +1010,7 @@ This matches the behavior expected by `tramp-test28-process-file'."
             (pcase-let ((`(,status ,output) (run skipped supported-source)))
               (should (/= status 0))
               (should (string-match-p
-                       "ERT counts: selected=8 executed=0 skipped=8" output)))
+                       "ERT counts: selected=9 executed=0 skipped=9" output)))
             (pcase-let ((`(,status ,output) (run empty supported-source)))
               (should (/= status 0))
               (should (string-match-p "selected zero tests" output)))
