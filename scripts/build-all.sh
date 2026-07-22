@@ -11,6 +11,7 @@ OUTPUT_DIR="$PROJECT_DIR/lisp/binaries"
 TARGETS=(
     "x86_64-unknown-linux-musl"
     "aarch64-unknown-linux-musl"
+    "i686-unknown-linux-musl"
     "x86_64-apple-darwin"
     "aarch64-apple-darwin"
 )
@@ -20,6 +21,8 @@ target_to_dir() {
     case "$1" in
         x86_64-unknown-linux-musl) echo "x86_64-linux" ;;
         aarch64-unknown-linux-musl) echo "aarch64-linux" ;;
+        i686-unknown-linux-musl) echo "i686-linux" ;;
+        i586-unknown-linux-musl) echo "i586-linux" ;;
         x86_64-apple-darwin) echo "x86_64-darwin" ;;
         aarch64-apple-darwin) echo "aarch64-darwin" ;;
         *) echo "$1" ;;
@@ -84,6 +87,16 @@ build() {
                 export CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER=musl-gcc
             else
                 export CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER=rust-lld
+            fi
+            ;;
+        i686-unknown-linux-musl)
+            rustflags="-C target-feature=+crt-static $rustflags"
+            if command -v i686-unknown-linux-musl-gcc &> /dev/null; then
+                export CARGO_TARGET_I686_UNKNOWN_LINUX_MUSL_LINKER=i686-unknown-linux-musl-gcc
+            elif command -v musl-gcc &> /dev/null; then
+                export CARGO_TARGET_I686_UNKNOWN_LINUX_MUSL_LINKER=musl-gcc
+            else
+                export CARGO_TARGET_I686_UNKNOWN_LINUX_MUSL_LINKER=rust-lld
             fi
             ;;
         aarch64-unknown-linux-musl)
@@ -155,6 +168,7 @@ main() {
             echo "  (none)                       Build for x86_64-unknown-linux-musl"
             echo "  x86_64-unknown-linux-musl    Build for x86_64 Linux (static)"
             echo "  aarch64-unknown-linux-musl   Build for aarch64 Linux (static)"
+            echo "  i686-unknown-linux-musl      Build for i686 Linux (static)"
             echo "  x86_64-apple-darwin          Build for x86_64 macOS"
             echo "  aarch64-apple-darwin         Build for aarch64 macOS (Apple Silicon)"
             echo "  --all                        Build for all targets"
