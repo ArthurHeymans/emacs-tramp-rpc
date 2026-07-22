@@ -321,6 +321,7 @@ Returns a string like \"x86_64-linux\" or \"aarch64-darwin\"."
                  ("amd64" "x86_64")
                  ("aarch64" "aarch64")
                  ("arm64" "aarch64")
+                 ("i686" "i686")
                  (_ uname-m)))
          (os (pcase (downcase uname-s)
                ("linux" "linux")
@@ -340,6 +341,7 @@ Returns a string like \"x86_64-linux\" or \"aarch64-darwin\"."
                                ("x86_64" "x86_64")
                                ("aarch64" "aarch64")
                                ("arm64" "aarch64")
+                               ("i686" "i686")
                                (_ machine))))
     (format "%s-%s" normalized-machine arch)))
 
@@ -350,6 +352,7 @@ Linux targets use musl for fully static binaries."
   (pcase arch
     ("x86_64-linux" "x86_64-unknown-linux-musl")
     ("aarch64-linux" "aarch64-unknown-linux-musl")
+    ("i686-linux" "i686-unknown-linux-musl")
     ("x86_64-darwin" "x86_64-apple-darwin")
     ("aarch64-darwin" "aarch64-apple-darwin")
     (_ (signal 'remote-file-error (list "Unknown architecture" arch)))))
@@ -1117,7 +1120,7 @@ binary lookup, and remote installation target."
 
       (insert "Cached Binaries:\n")
       (insert "----------------\n")
-      (dolist (arch '("x86_64-linux" "aarch64-linux" "x86_64-darwin" "aarch64-darwin"))
+      (dolist (arch '("x86_64-linux" "aarch64-linux" "i686-linux" "x86_64-darwin" "aarch64-darwin"))
         (let ((path (tramp-rpc-deploy--local-cache-path arch)))
           (insert (format "  %s: %s\n"
                           arch
@@ -1129,7 +1132,7 @@ binary lookup, and remote installation target."
       (insert "\n")
       (insert "Download URLs:\n")
       (insert "--------------\n")
-      (dolist (arch '("x86_64-linux" "aarch64-linux" "x86_64-darwin" "aarch64-darwin"))
+      (dolist (arch '("x86_64-linux" "aarch64-linux" "i686-linux" "x86_64-darwin" "aarch64-darwin"))
         (insert (format "  %s:\n    %s\n" arch (tramp-rpc-deploy--download-url arch)))))
     (display-buffer buf)))
 
@@ -1241,7 +1244,7 @@ This helps troubleshoot deployment issues."
         ;; Local binary availability
         (cl-incf test-num)
         (insert (format "\n%d. Checking local binary cache...\n" test-num))
-        (dolist (arch '("x86_64-linux" "aarch64-linux" "x86_64-darwin" "aarch64-darwin"))
+        (dolist (arch '("x86_64-linux" "aarch64-linux" "i686-linux" "x86_64-darwin" "aarch64-darwin"))
           (let ((path (tramp-rpc-deploy--local-cache-path arch))
                 (bundled (tramp-rpc-deploy--bundled-binary-path arch)))
             (cond
