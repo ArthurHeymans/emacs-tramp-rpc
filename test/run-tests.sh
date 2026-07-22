@@ -109,7 +109,7 @@ run_mock_selector() {
 
 run_protocol_tests() {
     echo -e "${YELLOW}Running protocol tests...${NC}"
-    run_mock_selector "^tramp-rpc-mock-test-protocol" 8
+    run_mock_selector "^tramp-rpc-mock-test-protocol" 9
 }
 
 server_available() {

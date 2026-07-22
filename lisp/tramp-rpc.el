@@ -477,7 +477,13 @@ proxy hops remain."
 ;; Silence byte-compiler warnings for functions defined elsewhere
 ;; (vterm variables are declared in tramp-rpc-process.el)
 
-;; Forward declarations for cache/watch functions (tramp-rpc-magit.el)
+;; Forward declarations for protocol and cache/watch functions.
+(declare-function tramp-rpc-protocol--clear-deferred-polls-for-target
+                  "tramp-rpc-protocol" (target))
+(declare-function tramp-rpc-protocol--clear-deferred-polls
+                  "tramp-rpc-protocol" ())
+
+;; Cache/watch functions (tramp-rpc-magit.el).
 (defvar tramp-rpc--cache-ttl)
 (defvar tramp-rpc--file-exists-cache)
 (defvar tramp-rpc--file-truename-cache)
@@ -1087,7 +1093,11 @@ hop."
 (defun tramp-rpc--remove-connection (vec)
   "Remove the RPC connection for VEC.
 Also clears the executable, exec-path, and login shell caches."
-  (let ((key (tramp-rpc--connection-key vec)))
+  (let* ((key (tramp-rpc--connection-key vec))
+         (conn (gethash key tramp-rpc--connections))
+         (process (plist-get conn :process)))
+    (when process
+      (tramp-rpc-protocol--clear-deferred-polls-for-target process))
     (remhash key tramp-rpc--connections)
     (remhash key tramp-rpc--exec-path-cache)
     (remhash key tramp-rpc--login-shell-cache))
@@ -1316,6 +1326,11 @@ Returns non-nil on success."
     (sleep-for 0.1)
     t))
 
+(defun tramp-rpc--connection-sentinel (process _event)
+  "Discard deferred protocol state when RPC connection PROCESS closes."
+  (unless (process-live-p process)
+    (tramp-rpc-protocol--clear-deferred-polls-for-target process)))
+
 (defun tramp-rpc--start-server-process (vec binary-path &optional sudo-password)
   "Start the RPC server on VEC at BINARY-PATH and verify it responds.
 BINARY-PATH is the remote localname of the server binary (may contain ~).
@@ -1386,10 +1401,16 @@ Returns the connection plist.  Signals `remote-file-error' on failure."
     ;; if they are mixed into the stdout buffer the length-prefixed reader loses
     ;; framing and every call waits for the full RPC timeout.
     (with-current-buffer buffer
+      ;; This internal transport buffer is continuously appended to and
+      ;; drained by the process filter.  Recording those binary changes in an
+      ;; undo list wastes memory and can exceed `undo-outer-limit'.  Disable
+      ;; undo before clearing a reused buffer so that erase is not recorded.
+      (buffer-disable-undo)
       (erase-buffer)
       (set-buffer-multibyte nil)
       (set-marker (mark-marker) (point-min)))
     (with-current-buffer stderr-buffer
+      (buffer-disable-undo)
       (erase-buffer))
 
     ;; Start the process with pipe connection (not PTY).  PTYs have line
@@ -1405,7 +1426,8 @@ Returns the connection plist.  Signals `remote-file-error' on failure."
            :coding 'binary
            :noquery t
            :stderr stderr-buffer
-           :filter #'tramp-rpc--connection-filter))
+           :filter #'tramp-rpc--connection-filter
+           :sentinel #'tramp-rpc--connection-sentinel))
 
     ;; If sudo is reading the password from stdin, send it before the RPC
     ;; server starts.  sudo consumes this line; after exec, the same pipe
@@ -5066,6 +5088,7 @@ cleanup of all connections has run."
   ;; Clear all RPC-specific caches.
   (clrhash tramp-rpc--pending-responses)
   (clrhash tramp-rpc--async-callbacks)
+  (tramp-rpc-protocol--clear-deferred-polls)
   (clrhash tramp-rpc--executable-cache)
   (tramp-rpc--clear-direnv-cache)
   (tramp-rpc--clear-file-metadata-caches)

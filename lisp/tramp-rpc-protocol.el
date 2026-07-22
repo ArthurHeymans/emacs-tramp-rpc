@@ -33,6 +33,45 @@
 (defvar tramp-rpc-protocol--message-target nil
   "TRAMP vector or process used for level-6 protocol debug messages.")
 
+(defvar tramp-rpc-protocol--deferred-poll-messages (make-hash-table :test 'eql)
+  "Idle polling requests awaiting a response, keyed by request ID.
+Each value is a cons cell containing the target connection and request.")
+
+(defun tramp-rpc-protocol--clear-deferred-polls-for-target (target)
+  "Discard deferred poll messages associated with TARGET."
+  (let (ids)
+    (maphash
+     (lambda (id target-and-request)
+       (when (eq target (car target-and-request))
+         (push id ids)))
+     tramp-rpc-protocol--deferred-poll-messages)
+    (dolist (id ids)
+      (remhash id tramp-rpc-protocol--deferred-poll-messages))))
+
+(defun tramp-rpc-protocol--clear-deferred-polls ()
+  "Discard all deferred poll messages."
+  (clrhash tramp-rpc-protocol--deferred-poll-messages))
+
+(defun tramp-rpc-protocol--polling-method-p (method)
+  "Return non-nil when METHOD is a long-polling process read method."
+  (member method '("process.read" "process.read_pty")))
+
+(defun tramp-rpc-protocol--empty-poll-response-p (method response)
+  "Return non-nil when RESPONSE is an uneventful poll for METHOD."
+  (let ((result (plist-get response :result)))
+    (and (not (plist-get response :error))
+         (not (alist-get 'exited result))
+         (pcase method
+           ("process.read"
+            (and (assq 'stdout result)
+                 (assq 'stderr result)
+                 (not (alist-get 'stdout result))
+                 (not (alist-get 'stderr result))))
+           ("process.read_pty"
+            (and (assq 'output result)
+                 (not (alist-get 'output result))))
+           (_ nil)))))
+
 (defun tramp-rpc-protocol--message (object)
   "Log OBJECT as a level-6 Tramp debug message when possible."
   (when (and tramp-rpc-protocol--message-target
@@ -57,7 +96,13 @@ Returns a cons cell (ID . BYTES) for pipelining support."
                     (method . ,method)
                     (params . ,params)))
          (payload (msgpack-encode request)))
-    (tramp-rpc-protocol--message request)
+    ;; Idle process reads are continuous long polls.  Defer their request log
+    ;; until the response is known so empty polls produce no debug noise while
+    ;; output, exits, and errors still retain the complete request/response pair.
+    (if (tramp-rpc-protocol--polling-method-p method)
+        (puthash id (cons tramp-rpc-protocol--message-target request)
+                 tramp-rpc-protocol--deferred-poll-messages)
+      (tramp-rpc-protocol--message request))
     (cons id (tramp-rpc-protocol--length-prefix payload))))
 
 (defun tramp-rpc-protocol-decode-response (buffer start)
@@ -89,7 +134,17 @@ with :notification t, :method, and :params keys."
                              (list :code (alist-get 'code error-obj)
                                    :message (alist-get 'message error-obj)
                                    :data (alist-get 'data error-obj))))))))
-    (tramp-rpc-protocol--message result)
+    (if-let* ((target-and-request
+               (gethash id tramp-rpc-protocol--deferred-poll-messages))
+              (request (cdr target-and-request)))
+        (let ((tramp-rpc-protocol--message-target
+               (car target-and-request)))
+          (remhash id tramp-rpc-protocol--deferred-poll-messages)
+          (unless (tramp-rpc-protocol--empty-poll-response-p
+                   (alist-get 'method request) result)
+            (tramp-rpc-protocol--message request)
+            (tramp-rpc-protocol--message result)))
+      (tramp-rpc-protocol--message result))
     result))
 
 (defun tramp-rpc-protocol-error-p (response)
