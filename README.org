@@ -139,7 +139,7 @@ Access remote files using the ~rpc~ method:
 On first connection, the server binary is automatically obtained and deployed:
 
 1. *Release/package installs*: download from GitHub Releases first (fastest, ~850KB download), then build from source if Rust is installed and download fails.
-2. *Git checkout installs*: build from the checked-out source by default and cache the result under a source-tree keyed id.  This avoids reusing a stale release binary when latest git contains server changes without a version bump.
+2. *Git checkout installs*: reuse a fresh source build or source-tree keyed cache.  Automatic file operations do not prompt when a binary is missing; run ~M-x tramp-rpc-deploy-install-binary~ to choose whether to download a checksum-verified release binary, build the checkout with Cargo, or skip.  A downloaded fallback remains keyed to that source tree, while strict ~build~ policy uses a separate identity.
 
 The binary is cached locally in =~/.emacs.d/tramp-rpc/= and deployed to =~/.cache/emacs/tramp-rpc/= on the remote host.
 
@@ -147,6 +147,7 @@ The binary is cached locally in =~/.emacs.d/tramp-rpc/= and deployed to =~/.cach
 
 | Command                          | Description                    |
 |----------------------------------+--------------------------------|
+| ~M-x tramp-rpc-deploy-install-binary~ | Choose and deploy a missing git-checkout binary; use ~C-u~ to replace one |
 | ~M-x tramp-rpc-deploy-status~    | Show binary deployment status  |
 | ~M-x tramp-rpc-deploy-clear-cache~ | Clear local binary cache     |
 | ~M-x tramp-rpc-deploy-remove-binary~ | Remove binary from remote  |
@@ -354,8 +355,17 @@ cargo build --release --target aarch64-unknown-linux-gnu
 * Configuration
 
 #+begin_src elisp
-;; Prefer building from source over downloading (default: nil)
+;; Prefer building from source over downloading for release/package installs
+;; (default: nil)
 (setq tramp-rpc-deploy-prefer-build t)
+
+;; Git checkout policy (default: auto):
+;; - auto: reuse source-keyed artifacts; use
+;;   M-x tramp-rpc-deploy-install-binary when one must be obtained;
+;;   use C-u M-x tramp-rpc-deploy-install-binary to replace an existing one
+;; - build: strictly build from source, using a build-only binary identity
+;; - release: use release-version binaries and paths
+(setq tramp-rpc-deploy-git-build-policy 'build)
 
 ;; Local cache directory (default: ~/.emacs.d/tramp-rpc/)
 (setq tramp-rpc-deploy-local-cache-directory "~/.cache/emacs/tramp-rpc-binaries")
