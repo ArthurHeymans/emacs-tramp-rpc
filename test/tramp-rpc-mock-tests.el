@@ -495,6 +495,8 @@ Returns the result or signals an error."
           (should (assoc 'uid result))
           (should (assoc 'gid result))
           (should (assoc 'home result))
+          (should (= (alist-get 'max_read_chunk_bytes result)
+                     (* 16 1024 1024)))
           (should (member (alist-get 'watcher result)
                           '("inotify" "fsevent" "kqueue" "poll"
                             "windows" "null" "unknown")))
@@ -596,27 +598,53 @@ Returns the result or signals an error."
     (tramp-rpc-mock-test--stop-server)))
 
 (ert-deftest tramp-rpc-mock-test-file-read-chunks-past-rpc-limit ()
-  "File reads continue across the server's per-request byte limit."
+  "File reads pipeline chunks beyond the server's per-request byte limit."
   (let ((source "abcdefghij")
         (tramp-rpc--file-read-chunk-size 4)
         (tramp-rpc-compress-file-read nil)
-        calls)
-    (cl-letf (((symbol-function 'tramp-rpc--call)
-               (lambda (_vec method params &rest _)
-                 (should (equal method "file.read"))
+        (report-file-size t)
+        calls batch-sizes stat-calls)
+    (cl-labels ((read-result
+                 (params)
                  (let* ((offset (or (alist-get 'offset params) 0))
                         (requested (alist-get 'length params))
                         (end (min (length source) (+ offset requested))))
                    (push (cons offset requested) calls)
-                   `((content . ,(substring source offset end)))))))
-      (should (equal (tramp-rpc--read-file-bytes 'vec "/tmp/file")
-                     source))
-      (should (equal (nreverse calls) '((0 . 4) (4 . 4) (8 . 4))))
-      (setq calls nil)
-      (should (equal (tramp-rpc--read-file-bytes
-                      'vec "/tmp/file" 2 9)
-                     "cdefghi"))
-      (should (equal (nreverse calls) '((2 . 4) (6 . 3)))))))
+                   `((content . ,(substring source offset end))
+                     ,@(when report-file-size
+                         `((file_size . ,(length source))))))))
+      (cl-letf (((symbol-function 'tramp-rpc--cached-system-info)
+                 (lambda (_vec) '((max_read_chunk_bytes . 16))))
+                ;; Only the old-server fallback may stat; the primary path
+                ;; must plan chunks from the first response's `file_size'.
+                ((symbol-function 'tramp-rpc--call-file-stat)
+                 (lambda (&rest _)
+                   (setq stat-calls (1+ (or stat-calls 0)))
+                   `((size . ,(length source)))))
+                ((symbol-function 'tramp-rpc--call)
+                 (lambda (_vec method params &rest _)
+                   (should (equal method "file.read"))
+                   (read-result params)))
+                ((symbol-function 'tramp-rpc--call-batch)
+                 (lambda (_vec requests)
+                   (push (length requests) batch-sizes)
+                   (mapcar (lambda (request) (read-result (cdr request))) requests))))
+        (should (equal (tramp-rpc--read-file-bytes 'vec "/tmp/file") source))
+        (should (equal (nreverse calls) '((0 . 4) (4 . 4) (8 . 2))))
+        (should (equal (nreverse batch-sizes) '(2)))
+        (should-not stat-calls)
+        (setq calls nil batch-sizes nil)
+        (should (equal (tramp-rpc--read-file-bytes 'vec "/tmp/file" 2 9)
+                       "cdefghi"))
+        (should (equal (nreverse calls) '((2 . 4) (6 . 3))))
+        (should (equal (nreverse batch-sizes) '(1)))
+        (should-not stat-calls)
+        ;; Old servers omit `file_size'; one file.stat fallback plans the rest.
+        (setq calls nil batch-sizes nil report-file-size nil)
+        (should (equal (tramp-rpc--read-file-bytes 'vec "/tmp/file") source))
+        (should (equal (nreverse calls) '((0 . 4) (4 . 4) (8 . 2))))
+        (should (equal (nreverse batch-sizes) '(2)))
+        (should (equal stat-calls 1))))))
 
 (ert-deftest tramp-rpc-mock-test-server-rename-dangling-symlink-no-overwrite ()
   "No-overwrite rename treats a dangling symlink as an existing destination."
@@ -2959,6 +2987,43 @@ This matches the behavior expected by `tramp-test28-process-file'."
             (should (file-exists-p (expand-file-name name
                                                      (expand-file-name "dir" trash-root))))))
       (delete-directory trash-root t))))
+
+(ert-deftest tramp-rpc-mock-test-trash-small-file-growth-retries-chunked ()
+  "A small trash file that grows past the RPC limit is retried chunked."
+  :tags '(:delete)
+  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
+  (let* ((dest (make-temp-file "tramp-rpc-trash-copy" t))
+         (tramp-rpc--file-read-chunk-size 4)
+         (dir-stat '((type . "directory") (mode . 16877)))
+         (file-stat '((type . "file") (size . 1) (mode . 33188)))
+         retry-called)
+    (unwind-protect
+        (cl-letf (((symbol-function 'tramp-rpc--cached-system-info)
+                   (lambda (_vec) '((max_read_chunk_bytes . 4))))
+                  ((symbol-function 'tramp-rpc--call-file-stat)
+                   (lambda (&rest _) '((size . 4))))
+                  ((symbol-function 'tramp-rpc--call)
+                   (lambda (_vec method _params &rest _)
+                     (pcase method
+                       ("dir.list"
+                        `(((name . "grown") (type . "file")
+                           (attrs . ,file-stat))))
+                       ("file.read"
+                        (setq retry-called t)
+                        '((content . "data")))
+                       (_ (error "Unexpected RPC method: %s" method)))))
+                  ((symbol-function 'tramp-rpc--call-batch)
+                   (lambda (_vec _requests)
+                     '((:error -32602 :message "file grew")))))
+          (tramp-rpc--copy-remote-trash-directory-to-local
+           'vec "/tmp/source" (expand-file-name "copied" dest) dir-stat)
+          (should retry-called)
+          (should (equal (with-temp-buffer
+                           (insert-file-contents-literally
+                            (expand-file-name "copied/grown" dest))
+                           (buffer-string))
+                         "data")))
+      (delete-directory dest t))))
 
 (ert-deftest tramp-rpc-mock-test-delete-file-trash-can-be-inhibited ()
   "Test `remote-file-name-inhibit-delete-by-moving-to-trash' forces unlink."
