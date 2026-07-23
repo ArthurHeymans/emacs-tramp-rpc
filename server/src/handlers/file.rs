@@ -146,10 +146,7 @@ fn getent_name(database: &str, id: u32) -> Option<String> {
     if !output.status.success() {
         return None;
     }
-    let line = std::str::from_utf8(&output.stdout)
-        .ok()?
-        .lines()
-        .next()?;
+    let line = std::str::from_utf8(&output.stdout).ok()?.lines().next()?;
     let name = line.split(':').next()?;
     if name.is_empty() {
         None
