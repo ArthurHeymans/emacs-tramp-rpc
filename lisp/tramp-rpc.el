@@ -235,6 +235,7 @@ This is called from `tramp-multi-hop-p-hook'."
 ;; Silence byte-compiler warnings for functions defined in with-eval-after-load
 (declare-function tramp-add-external-operation "tramp")
 (declare-function tramp-remove-external-operation "tramp")
+(declare-function tramp-handle-insert-directory "tramp")
 (declare-function dired-compress-file "dired-aux")
 (declare-function tramp-rpc--sudo-file-name-p "tramp-rpc")
 (declare-function tramp-rpc-multi-hop-p "tramp-rpc")
