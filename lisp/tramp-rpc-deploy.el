@@ -168,9 +168,11 @@ By default, downloading is attempted first as it's faster."
 This only applies when `tramp-rpc-deploy-source-directory' points at a
 git checkout that contains the Rust server sources.
 
-`auto' means use release binaries for release/package installs, but build
-from source for git checkouts.  This keeps latest-git users from using a
-stale release binary whose version number has not been bumped yet.
+`auto' means use release binaries for release/package installs.  For git
+checkouts, existing source builds and caches are reused; when a binary must
+be obtained, `tramp-rpc-deploy-install-binary' asks whether to download a
+release binary, build from source, or stop.  Automatic file operations never
+prompt; they report how to run that command instead.
 
 `release' always uses the release-oriented versioned binary id and obtain
 order, preserving the historical behavior.
@@ -181,6 +183,45 @@ only builds from source; release downloads are not used as a fallback."
                  (const :tag "Release binaries" release)
                  (const :tag "Build from source" build))
   :group 'tramp-rpc-deploy)
+
+(defvar tramp-rpc-deploy--allow-prompt nil
+  "Non-nil while deploying the target of an explicit installation.
+Only `tramp-rpc-deploy-ensure-binary' binds this, and only for the remote
+that `tramp-rpc-deploy-install-binary' was invoked for.")
+
+(defvar tramp-rpc-deploy--force-obtain nil
+  "Non-nil while the current deploy must replace existing artifacts.
+Scoped exactly like `tramp-rpc-deploy--allow-prompt'.")
+
+(defvar tramp-rpc-deploy--explicit-target nil
+  "Target key of the in-progress explicit installation, or nil.
+Explicit installation can block for a long time in `read-char-choice',
+downloads, or builds, during which timers may deploy to other remotes.
+Keying the request to one target keeps those reentrant deploys automatic.")
+
+(defvar tramp-rpc-deploy--explicit-force nil
+  "Non-nil when the in-progress explicit installation must replace artifacts.")
+
+(defvar tramp-rpc-deploy--pre-explicit-auto-deploy nil
+  "Value of `tramp-rpc-deploy-auto-deploy' before the explicit installation.
+Reentrant deploys for other remotes during an explicit installation use this
+value so the explicit auto-deploy override does not leak to them.")
+
+(defun tramp-rpc-deploy--target-key (vec)
+  "Return a comparable deployment target key for VEC."
+  (if (tramp-file-name-p vec)
+      (list (tramp-file-name-method vec)
+            (tramp-file-name-user vec)
+            (tramp-file-name-host vec)
+            (tramp-file-name-port vec)
+            (tramp-file-name-hop vec))
+    vec))
+
+(defun tramp-rpc-deploy--explicit-target-p (vec)
+  "Return non-nil when VEC is the target of the explicit installation."
+  (and tramp-rpc-deploy--explicit-target
+       (equal tramp-rpc-deploy--explicit-target
+              (tramp-rpc-deploy--target-key vec))))
 
 (defcustom tramp-rpc-deploy-bootstrap-method "scpx"
   "TRAMP method to use for bootstrapping (deploying the binary).
@@ -440,9 +481,12 @@ preserve timestamps."
   "Return a binary id derived from the current git checkout contents."
   (let ((hash (tramp-rpc-deploy--source-tree-hash)))
     (when hash
-      (format "git-%s-%s"
+      (format "git-%s-%s%s"
               (or (tramp-rpc-deploy--git-revision) "unknown")
-              (substring hash 0 12)))))
+              (substring hash 0 12)
+              (if (eq tramp-rpc-deploy-git-build-policy 'build)
+                  "-build"
+                "")))))
 
 (defun tramp-rpc-deploy--binary-id ()
   "Return the id used for cache and remote binary paths.
@@ -800,14 +844,54 @@ Returns the path to the binary on success, nil on failure."
 ;;; Main logic: ensure local binary exists
 ;;; ============================================================================
 
-(defun tramp-rpc-deploy--obtain-methods ()
-  "Return the methods to use for obtaining a missing local binary."
+(defun tramp-rpc-deploy--ask-git-install-action (arch)
+  "Ask how to obtain a git-checkout server binary for ARCH.
+Return `download', `build', or nil.  Building is offered only when Cargo is
+available and ARCH can be built natively."
+  (unless tramp-rpc-deploy--allow-prompt
+    (signal
+     'remote-file-error
+     (list
+      "TRAMP-RPC needs a server binary for this git checkout.  Run M-x tramp-rpc-deploy-install-binary to choose whether to download or build it, or customize `tramp-rpc-deploy-git-build-policy' to `release' or `build'")))
+  (let* ((can-build (and (tramp-rpc-deploy--cargo-available-p)
+                         (tramp-rpc-deploy--can-build-for-arch-p arch)))
+         (choices (if can-build '(?d ?b ?s) '(?d ?s)))
+         (build-line
+          (cond
+           (can-build "  [b] Build the checked-out sources with Cargo\n")
+           ((not (tramp-rpc-deploy--cargo-available-p))
+            "      Build unavailable: Cargo was not found\n")
+           (t
+            (format "      Build unavailable: cannot build %s natively\n" arch))))
+         (choice
+          (read-char-choice
+           (concat
+            "TRAMP-RPC needs a server binary for this git checkout.\n\n"
+            "  [d] Download the checksum-verified release binary\n"
+            "      Warning: it may not exactly match the checked-out sources\n"
+            build-line
+            "  [s] Skip and install the server manually\n\n"
+            "Choice: ")
+           choices)))
+    (pcase choice
+      (?d 'download)
+      (?b 'build)
+      (?s nil))))
+
+(defun tramp-rpc-deploy--git-install-action (arch)
+  "Ask for the action used to obtain a git binary for ARCH."
+  (or (tramp-rpc-deploy--ask-git-install-action arch)
+      (signal
+       'remote-file-error
+       (list "TRAMP-RPC server installation skipped; install it manually or run M-x tramp-rpc-deploy-install-binary again"))))
+
+(defun tramp-rpc-deploy--obtain-methods (arch)
+  "Return the methods to use for obtaining a missing binary for ARCH."
   (cond
-   ;; Git checkouts should not silently fall back to release artifacts: the
-   ;; release binary may be stale when the lisp/server protocol changed without
-   ;; a version bump.
    ((tramp-rpc-deploy--use-source-binary-id-p)
-    '(build))
+    (list (if (eq tramp-rpc-deploy-git-build-policy 'build)
+              'build
+            (tramp-rpc-deploy--git-install-action arch))))
    (tramp-rpc-deploy-prefer-build
     '(build download))
    (t
@@ -834,7 +918,8 @@ Returns the path to the local binary."
      ;; source-id mode, only trust a bundled binary when it is newer than the
      ;; source files; otherwise a stale bundled artifact can be deployed under
      ;; the fresh git hash and recreate the exact mismatch source-id mode avoids.
-     ((and bundled-path
+     ((and (not tramp-rpc-deploy--force-obtain)
+           bundled-path
            (or (not (tramp-rpc-deploy--use-source-binary-id-p))
                (tramp-rpc-deploy--newer-than-source-p bundled-path)))
       (message "Using bundled binary for %s" arch)
@@ -842,12 +927,13 @@ Returns the path to the local binary."
 
      ;; Check source-tree build output.  This supports CI jobs that download a
      ;; just-built server artifact into target/<triple>/release/.
-     (source-build-path
+     ((and (not tramp-rpc-deploy--force-obtain) source-build-path)
       (message "Using source-tree build output for %s" arch)
       source-build-path)
 
      ;; Check cache
-     ((and (file-exists-p cache-path)
+     ((and (not tramp-rpc-deploy--force-obtain)
+           (file-exists-p cache-path)
            (file-executable-p cache-path)
            (tramp-rpc-deploy--cached-binary-trusted-p cache-path))
       (message "Using cached binary for %s" arch)
@@ -855,7 +941,7 @@ Returns the path to the local binary."
 
      ;; Need to obtain binary
      (t
-      (let ((methods (tramp-rpc-deploy--obtain-methods))
+      (let ((methods (tramp-rpc-deploy--obtain-methods arch))
             (result nil)
             (errors nil))
 
@@ -888,9 +974,9 @@ Returns the path to the local binary."
   (let ((local-arch (tramp-rpc-deploy--detect-local-arch)))
     (if (tramp-rpc-deploy--use-source-binary-id-p)
         (concat
-         "This installation is using a git-checkout binary id, so release\n"
-         "artifacts are not used as a fallback.  This avoids running a stale\n"
-         "server binary when latest-git Lisp changed without a version bump.\n\n"
+         "This installation is using a git-checkout binary id.  Automatic\n"
+         "release fallback is disabled because the release server may be stale\n"
+         "when checkout sources changed without a version bump.\n\n"
          "To resolve this, you can:\n\n"
          (if (string= arch local-arch)
              (concat
@@ -901,7 +987,9 @@ Returns the path to the local binary."
             "1. Build on a %s machine and copy to:\n   %s\n\n"
             arch
             (tramp-rpc-deploy--local-cache-path arch)))
-         "2. To force release artifacts instead, customize:\n"
+         "2. Run M-x tramp-rpc-deploy-install-binary and choose download.\n"
+         "   The release fallback will remain keyed to this source tree.\n\n"
+         "3. To always use release-version paths for checkouts, customize:\n"
          "   (setq tramp-rpc-deploy-git-build-policy 'release)\n\n"
          (format "Binary should be placed at:\n   %s"
                  (tramp-rpc-deploy--local-cache-path arch)))
@@ -1161,13 +1249,28 @@ an explicit error.  A missing remote binary never uses this fallback."
                       tramp-rpc-deploy-binary-name)))
         (message "tramp-rpc: never-deploy mode, using %s on remote" path)
         path)
-    ;; Normal deployment flow
-    (let* ((bootstrap-vec (tramp-rpc-deploy--bootstrap-vec vec))
+    ;; Normal deployment flow.  Prompting and forced replacement apply only to
+    ;; the remote an explicit installation was requested for; deploys that run
+    ;; reentrantly for other remotes stay fully automatic.
+    (let* ((explicit (tramp-rpc-deploy--explicit-target-p vec))
+           (tramp-rpc-deploy--allow-prompt explicit)
+           (tramp-rpc-deploy--force-obtain
+            (and explicit tramp-rpc-deploy--explicit-force))
+           (tramp-rpc-deploy-auto-deploy
+            (cond (explicit t)
+                  ;; Inside another remote's explicit installation window:
+                  ;; use the pre-override value so the explicit auto-deploy
+                  ;; override does not leak to unrelated remotes.
+                  (tramp-rpc-deploy--explicit-target
+                   tramp-rpc-deploy--pre-explicit-auto-deploy)
+                  (t tramp-rpc-deploy-auto-deploy)))
+           (bootstrap-vec (tramp-rpc-deploy--bootstrap-vec vec))
 	   ;; For simplified Tramp syntax.
 	   (tramp-default-method (tramp-file-name-method bootstrap-vec))
 	   tramp-default-method-alist)
       (let* ((remote-present
-              (tramp-rpc-deploy--remote-binary-exists-p bootstrap-vec))
+              (and (not tramp-rpc-deploy--force-obtain)
+                   (tramp-rpc-deploy--remote-binary-exists-p bootstrap-vec)))
              (remote-local
               (tramp-file-local-name
                (tramp-rpc-deploy--remote-binary-path bootstrap-vec))))
@@ -1219,6 +1322,28 @@ an explicit error.  A missing remote binary never uses this fallback."
                  (list "Existing tramp-rpc-server on"
                        (tramp-file-name-host vec)
                        "failed checksum verification and auto-deploy is disabled"))))))))))))
+
+;;;###autoload
+(defun tramp-rpc-deploy-install-binary (vec &optional force)
+  "Interactively obtain and deploy tramp-rpc-server for remote VEC.
+For git checkouts using the `auto' policy, this is the only entry point that
+may ask whether to download a release binary or build the checked-out sources.
+Automatic file operations never open this prompt.
+
+With prefix argument FORCE, replace an existing remote or cached artifact and
+ask again in `auto' mode.  Explicit installation overrides
+`tramp-rpc-deploy-auto-deploy', but refuses to run when
+`tramp-rpc-deploy-never-deploy' is non-nil."
+  (interactive
+   (list (tramp-dissect-file-name
+          (read-file-name "Remote TRAMP-RPC host: " "/rpc:"))
+         current-prefix-arg))
+  (when tramp-rpc-deploy-never-deploy
+    (user-error "Deployment is disabled by `tramp-rpc-deploy-never-deploy'"))
+  (let ((tramp-rpc-deploy--explicit-target (tramp-rpc-deploy--target-key vec))
+        (tramp-rpc-deploy--explicit-force force)
+        (tramp-rpc-deploy--pre-explicit-auto-deploy tramp-rpc-deploy-auto-deploy))
+    (tramp-rpc-deploy-ensure-binary vec)))
 
 (defun tramp-rpc-deploy-remove-binary (vec)
   "Remove the tramp-rpc-server binary from remote VEC."

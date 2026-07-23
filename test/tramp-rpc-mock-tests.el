@@ -4481,6 +4481,258 @@ This matches the behavior expected by `tramp-test28-process-file'."
                            (file-name-as-directory repo)))))
       (delete-directory dir t))))
 
+(ert-deftest tramp-rpc-mock-test-deploy-git-install-ask-without-cargo ()
+  "Test the git install prompt offers download but not build without Cargo."
+  :tags '(:deploy)
+  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
+  (let ((tramp-rpc-deploy--allow-prompt t)
+        prompt choices)
+    (cl-letf (((symbol-function 'tramp-rpc-deploy--cargo-available-p)
+               (lambda () nil))
+              ((symbol-function 'read-char-choice)
+               (lambda (text allowed)
+                 (setq prompt text
+                       choices allowed)
+                 ?d)))
+      (should (eq (tramp-rpc-deploy--ask-git-install-action "x86_64-linux")
+                  'download))
+      (should (equal choices '(?d ?s)))
+      (should (string-match-p "Cargo was not found" prompt))
+      (should (string-match-p "may not exactly match" prompt)))))
+
+(ert-deftest tramp-rpc-mock-test-deploy-git-install-ask-build-available ()
+  "Test the git install prompt offers a source build when available."
+  :tags '(:deploy)
+  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
+  (let ((tramp-rpc-deploy--allow-prompt t)
+        choices)
+    (cl-letf (((symbol-function 'tramp-rpc-deploy--cargo-available-p)
+               (lambda () t))
+              ((symbol-function 'tramp-rpc-deploy--can-build-for-arch-p)
+               (lambda (_arch) t))
+              ((symbol-function 'read-char-choice)
+               (lambda (_text allowed)
+                 (setq choices allowed)
+                 ?b)))
+      (should (eq (tramp-rpc-deploy--ask-git-install-action "x86_64-linux")
+                  'build))
+      (should (equal choices '(?d ?b ?s))))))
+
+(ert-deftest tramp-rpc-mock-test-deploy-git-install-never-prompts-implicitly ()
+  "Test automatic deployment reports the explicit install command."
+  :tags '(:deploy)
+  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
+  (let ((tramp-rpc-deploy--allow-prompt nil))
+    (let ((err (should-error
+                (tramp-rpc-deploy--ask-git-install-action "x86_64-linux")
+                :type 'remote-file-error)))
+      (should (string-match-p "tramp-rpc-deploy-install-binary"
+                              (error-message-string err))))))
+
+(defmacro tramp-rpc-mock-test--with-deploy-stubs (record &rest body)
+  "Run BODY with deploy stubs recording per-deploy flags into RECORD.
+Each entry is (HOST ALLOW-PROMPT FORCE-OBTAIN AUTO-DEPLOY)."
+  (declare (indent 1))
+  `(cl-letf (((symbol-function 'tramp-rpc-deploy--bootstrap-vec)
+              (lambda (vec) vec))
+             ((symbol-function 'tramp-rpc-deploy--remote-binary-exists-p)
+              (lambda (_vec) t))
+             ((symbol-function 'tramp-rpc-deploy--remote-binary-path)
+              (lambda (vec)
+                (tramp-make-tramp-file-name vec "/tmp/tramp-rpc-server")))
+             ((symbol-function 'tramp-rpc-deploy--remote-binary-matches-p)
+              (lambda (vec _binary)
+                (push (list (tramp-file-name-host vec)
+                            tramp-rpc-deploy--allow-prompt
+                            tramp-rpc-deploy--force-obtain
+                            tramp-rpc-deploy-auto-deploy)
+                      ,record)
+                t))
+             ((symbol-function 'tramp-rpc-deploy--detect-remote-arch)
+              (lambda (_vec) "x86_64-linux"))
+             ((symbol-function 'tramp-rpc-deploy--ensure-local-binary)
+              (lambda (_arch) "/tmp/local-server"))
+             ((symbol-function 'tramp-rpc-deploy--transfer-binary)
+              (lambda (vec _binary)
+                (push (list (tramp-file-name-host vec)
+                            tramp-rpc-deploy--allow-prompt
+                            tramp-rpc-deploy--force-obtain
+                            tramp-rpc-deploy-auto-deploy)
+                      ,record)
+                (tramp-make-tramp-file-name vec "/tmp/tramp-rpc-server"))))
+     ,@body))
+
+(ert-deftest tramp-rpc-mock-test-deploy-install-command-overrides-auto-deploy ()
+  "Test explicit installation enables prompts, forcing, and deployment."
+  :tags '(:deploy)
+  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
+  (let ((vec (tramp-dissect-file-name "/rpc:user@target:/"))
+        (tramp-rpc-deploy-auto-deploy nil)
+        (tramp-rpc-deploy-never-deploy nil)
+        (deploys nil))
+    (tramp-rpc-mock-test--with-deploy-stubs deploys
+      (tramp-rpc-deploy-install-binary vec t))
+    (should (equal deploys '(("target" t t t))))
+    (should-not tramp-rpc-deploy--allow-prompt)
+    (should-not tramp-rpc-deploy--force-obtain)
+    (should-not tramp-rpc-deploy--explicit-target)
+    (should-not tramp-rpc-deploy-auto-deploy)))
+
+(ert-deftest tramp-rpc-mock-test-deploy-install-flags-scoped-to-target ()
+  "Test reentrant deploys for other remotes stay automatic and unforced."
+  :tags '(:deploy)
+  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
+  (let ((vec (tramp-dissect-file-name "/rpc:user@target:/"))
+        (other (tramp-dissect-file-name "/rpc:user@other:/"))
+        (tramp-rpc-deploy-auto-deploy t)
+        (tramp-rpc-deploy-never-deploy nil)
+        (deploys nil))
+    (let ((tramp-rpc-deploy--explicit-target
+           (tramp-rpc-deploy--target-key vec))
+          (tramp-rpc-deploy--explicit-force t)
+          (tramp-rpc-deploy--pre-explicit-auto-deploy t))
+      (tramp-rpc-mock-test--with-deploy-stubs deploys
+        (tramp-rpc-deploy-ensure-binary other)))
+    (should (equal deploys '(("other" nil nil t))))))
+
+(ert-deftest tramp-rpc-mock-test-deploy-install-auto-deploy-does-not-leak ()
+  "Test the explicit auto-deploy override is invisible to other remotes."
+  :tags '(:deploy)
+  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
+  (let ((vec (tramp-dissect-file-name "/rpc:user@target:/"))
+        (other (tramp-dissect-file-name "/rpc:user@other:/"))
+        (tramp-rpc-deploy-never-deploy nil)
+        (deploys nil))
+    ;; Simulate the dynamic environment inside an explicit installation for
+    ;; "target" invoked while the user has auto-deploy disabled:
+    ;; `tramp-rpc-deploy-ensure-binary' has already rebound
+    ;; `tramp-rpc-deploy-auto-deploy' to t for the explicit target when a
+    ;; reentrant deploy for "other" runs.
+    (let ((tramp-rpc-deploy--explicit-target
+           (tramp-rpc-deploy--target-key vec))
+          (tramp-rpc-deploy--explicit-force nil)
+          (tramp-rpc-deploy--pre-explicit-auto-deploy nil)
+          (tramp-rpc-deploy-auto-deploy t))
+      (tramp-rpc-mock-test--with-deploy-stubs deploys
+        (tramp-rpc-deploy-ensure-binary other)))
+    (should (equal deploys '(("other" nil nil nil))))))
+
+(ert-deftest tramp-rpc-mock-test-deploy-install-command-rejects-never-deploy ()
+  "Test explicit installation respects the absolute deployment prohibition."
+  :tags '(:deploy)
+  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
+  (let ((tramp-rpc-deploy-never-deploy t))
+    (should-error (tramp-rpc-deploy-install-binary
+                   (tramp-dissect-file-name "/rpc:user@target:/"))
+                  :type 'user-error)))
+
+(ert-deftest tramp-rpc-mock-test-deploy-force-replaces-cached-binary ()
+  "Test a forced install obtains a new artifact instead of reusing cache."
+  :tags '(:deploy)
+  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
+  (let ((binary (make-temp-file "tramp-rpc-cached"))
+        (replacement "replacement")
+        (tramp-rpc-deploy--force-obtain t))
+    (unwind-protect
+        (progn
+          (set-file-modes binary #o755)
+          (cl-letf (((symbol-function 'tramp-rpc-deploy--bundled-binary-path)
+                     (lambda (_arch) nil))
+                    ((symbol-function 'tramp-rpc-deploy--source-build-output-path)
+                     (lambda (_arch) nil))
+                    ((symbol-function 'tramp-rpc-deploy--local-cache-path)
+                     (lambda (_arch) binary))
+                    ((symbol-function 'tramp-rpc-deploy--obtain-methods)
+                     (lambda (_arch) '(download)))
+                    ((symbol-function 'tramp-rpc-deploy--download-binary)
+                     (lambda (_arch) replacement)))
+            (should (equal (tramp-rpc-deploy--ensure-local-binary
+                            "x86_64-linux")
+                           replacement))))
+      (delete-file binary))))
+
+(ert-deftest tramp-rpc-mock-test-deploy-git-obtain-method-follows-policy ()
+  "Test strict build bypasses the prompt while auto uses its answer."
+  :tags '(:deploy)
+  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
+  (cl-letf (((symbol-function 'tramp-rpc-deploy--use-source-binary-id-p)
+             (lambda () t)))
+    (let ((tramp-rpc-deploy-git-build-policy 'auto))
+      (cl-letf (((symbol-function 'tramp-rpc-deploy--git-install-action)
+                 (lambda (_arch) 'download)))
+        (should (equal (tramp-rpc-deploy--obtain-methods "x86_64-linux")
+                       '(download)))))
+    (let ((tramp-rpc-deploy-git-build-policy 'build))
+      (cl-letf (((symbol-function 'tramp-rpc-deploy--git-install-action)
+                 (lambda (_arch) (ert-fail "Strict build prompted"))))
+        (should (equal (tramp-rpc-deploy--obtain-methods "x86_64-linux")
+                       '(build)))))))
+
+(ert-deftest tramp-rpc-mock-test-deploy-release-checksum-is-strict ()
+  "Test checksum metadata contains exactly one matching sha256sum record."
+  :tags '(:deploy)
+  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
+  (let* ((asset "server.tar.gz")
+         (digest (make-string 64 ?a)))
+    (should (equal (tramp-rpc-deploy--release-checksum
+                    (format "%s  %s\n" digest asset) asset)
+                   digest))
+    (should-error
+     (tramp-rpc-deploy--release-checksum "abcd  server.tar.gz\n" asset)
+     :type 'remote-file-error)
+    (should-error
+     (tramp-rpc-deploy--release-checksum
+      (format "%s  other.tar.gz\n" digest) asset)
+     :type 'remote-file-error)
+    (should-error
+     (tramp-rpc-deploy--release-checksum
+      (format "%s  %s\n%s  other.tar.gz\n" digest asset digest) asset)
+     :type 'remote-file-error)))
+
+(ert-deftest tramp-rpc-mock-test-deploy-download-requires-checksum ()
+  "Test release artifacts are rejected when checksum retrieval fails."
+  :tags '(:deploy)
+  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
+  (let ((cache (make-temp-file "tramp-rpc-cache" t)))
+    (unwind-protect
+        (cl-letf (((symbol-function 'tramp-rpc-deploy--local-cache-path)
+                   (lambda (_arch) (expand-file-name "server" cache)))
+                  ((symbol-function 'tramp-rpc-deploy--download-file)
+                   (lambda (_url _dest) nil))
+                  ((symbol-function 'tramp-rpc-deploy--extract-tarball)
+                   (lambda (&rest _args)
+                     (ert-fail "Unverified artifact was extracted"))))
+          (should-error
+           (tramp-rpc-deploy--download-binary "x86_64-linux")
+           :type 'remote-file-error))
+      (delete-directory cache t))))
+
+(ert-deftest tramp-rpc-mock-test-deploy-cached-binary-does-not-prompt ()
+  "Test a usable cache is returned before resolving interactive policy."
+  :tags '(:deploy)
+  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
+  (let ((binary (make-temp-file "tramp-rpc-cached")))
+    (unwind-protect
+        (progn
+          (set-file-modes binary #o755)
+          (cl-letf (((symbol-function 'tramp-rpc-deploy--bundled-binary-path)
+                     (lambda (_arch) nil))
+                    ((symbol-function 'tramp-rpc-deploy--source-build-output-path)
+                     (lambda (_arch) nil))
+                    ((symbol-function 'tramp-rpc-deploy--local-cache-path)
+                     (lambda (_arch) binary))
+                    ((symbol-function 'tramp-rpc-deploy--use-source-binary-id-p)
+                     (lambda () t))
+                    ((symbol-function 'tramp-rpc-deploy--cached-binary-trusted-p)
+                     (lambda (_path) t))
+                    ((symbol-function 'tramp-rpc-deploy--obtain-methods)
+                     (lambda (_arch)
+                       (ert-fail "Install policy was consulted for cached binary"))))
+            (should (equal (tramp-rpc-deploy--ensure-local-binary
+                            "x86_64-linux")
+                           binary))))
+      (delete-file binary))))
+
 (ert-deftest tramp-rpc-mock-test-deploy-skips-stale-bundled-source-binary ()
   "Test source-id mode does not deploy stale bundled binaries."
   :tags '(:deploy)
@@ -4503,7 +4755,7 @@ This matches the behavior expected by `tramp-test28-process-file'."
           (set-file-modes bundled #o755)
           (set-file-times bundled (seconds-to-time 0))
           (let ((tramp-rpc-deploy-source-directory dir)
-                (tramp-rpc-deploy-git-build-policy 'auto)
+                (tramp-rpc-deploy-git-build-policy 'build)
                 (tramp-rpc-deploy-bundled-binary-directory bundled-dir)
                 (tramp-rpc-deploy-local-cache-directory
                  (expand-file-name "cache" dir)))
@@ -4538,9 +4790,14 @@ This matches the behavior expected by `tramp-test28-process-file'."
                       (mtime (file-attribute-modification-time
                               (file-attributes source))))
                   (should (string-prefix-p "git-abcdef123456-" id1))
+                  (should-not (string-suffix-p "-build" id1))
                   (should (string-match-p
                            (concat "tramp-rpc-server-" (regexp-quote id1))
                            (tramp-rpc-deploy-expected-binary-localname)))
+                  (let ((tramp-rpc-deploy-git-build-policy 'build))
+                    (let ((build-id (tramp-rpc-deploy--binary-id)))
+                      (should (string-suffix-p "-build" build-id))
+                      (should-not (equal id1 build-id))))
                   ;; Equal-length content with the original timestamp must not
                   ;; reuse a metadata-only source identity.
                   (with-temp-file source
