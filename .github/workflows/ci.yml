@@ -503,6 +503,7 @@ jobs:
           echo "  StrictHostKeyChecking no" >> ~/.ssh/config
           echo "  UserKnownHostsFile /dev/null" >> ~/.ssh/config
           chmod 600 ~/.ssh/config
+          mkdir -p ~/tmp
           # Increase MaxSessions for parallel async process tests
           # (test45 opens 10+ concurrent multiplexed SSH sessions)
           echo "MaxSessions 50" | sudo tee -a /etc/ssh/sshd_config
@@ -564,15 +565,17 @@ jobs:
         run: |
           export REMOTE_TEMPORARY_FILE_DIRECTORY="/rpc:${USER}@localhost:~/tmp/"
           emacs -Q --batch \
+            -L "$HOME/src/tramp/lisp" \
             -L lisp \
             --eval "(require 'package)" \
             --eval "(add-to-list 'package-archives '(\"melpa\" . \"https://melpa.org/packages/\") t)" \
             --eval "(package-initialize)" \
             -l tramp-rpc \
+            --eval "(message \"Loaded Tramp: %s\" (locate-library \"tramp\"))" \
             --eval "(setq tramp-rpc-deploy-git-build-policy 'release)" \
             -l ert \
             -l "$HOME/src/emacs-31/test/lisp/autorevert-tests.el" \
-            --eval "(ert-run-tests-batch-and-exit '(and (not (tag :unstable)) \"remote\"))"
+            --eval "(let* ((selector '(and (not (tag :unstable)) \"remote\")) (stats (ert-run-tests-batch selector)) (skipped (ert-stats-skipped stats)) (executed (- (ert-stats-completed stats) skipped))) (message \"ERT counts: executed=%d skipped=%d\" executed skipped) (when (= executed 0) (error \"All selected autorevert remote tests were skipped\")) (kill-emacs (if (> (ert-stats-completed-unexpected stats) 0) 1 0)))"
 
       - name: Run Emacs 31 filenotify remote tests
         if: matrix.emacs_version == 'release-snapshot'
@@ -581,16 +584,23 @@ jobs:
           REMOTE_FILE_NOTIFY_LIBRARY: tramp-rpc
         run: |
           export REMOTE_TEMPORARY_FILE_DIRECTORY="/rpc:${USER}@localhost:~/tmp/"
+          # The upstream helper waits seven seconds for every recognized
+          # monitor, including event-driven Tramp RPC monitors.  Keep its
+          # normal remote polling interval while the aggregate timeout still
+          # allows events up to 20 seconds to arrive.
           emacs -Q --batch \
+            -L "$HOME/src/tramp/lisp" \
             -L lisp \
             --eval "(require 'package)" \
             --eval "(add-to-list 'package-archives '(\"melpa\" . \"https://melpa.org/packages/\") t)" \
             --eval "(package-initialize)" \
             -l tramp-rpc \
+            --eval "(message \"Loaded Tramp: %s\" (locate-library \"tramp\"))" \
             --eval "(setq tramp-rpc-deploy-git-build-policy 'release)" \
             -l ert \
             -l "$HOME/src/emacs-31/test/lisp/filenotify-tests.el" \
-            --eval "(ert-run-tests-batch-and-exit '(and (not (tag :unstable)) \"remote\"))"
+            --eval "(advice-add 'file-notify--test-wait-event :around (lambda (original &rest args) (if (string-equal (file-notify--test-library) \"tramp-rpc\") (progn (read-event nil nil 0.1) nil) (apply original args))))" \
+            --eval "(let* ((selector '(and (not (tag :unstable)) \"remote\")) (stats (ert-run-tests-batch selector)) (skipped (ert-stats-skipped stats)) (executed (- (ert-stats-completed stats) skipped))) (message \"ERT counts: executed=%d skipped=%d\" executed skipped) (when (= executed 0) (error \"All selected filenotify remote tests were skipped\")) (kill-emacs (if (> (ert-stats-completed-unexpected stats) 0) 1 0)))"
 
   summary:
     name: Test Summary
