@@ -11,6 +11,7 @@ use serde::Deserialize;
 use std::collections::HashMap;
 use std::io::ErrorKind;
 use std::os::fd::{AsRawFd, BorrowedFd, RawFd};
+use std::path::{Path, PathBuf};
 use std::process::{Command as StdCommand, ExitStatus, Stdio};
 use std::sync::{Arc, OnceLock};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
@@ -19,12 +20,104 @@ use tokio::sync::Mutex;
 
 use super::HandlerResult;
 
+const MAX_PROCESS_READ_BYTES: usize = 1024 * 1024;
+
+fn command_path(command: &str, cwd: Option<&str>) -> PathBuf {
+    let path = Path::new(command);
+    if path.is_relative() && command.contains('/') {
+        cwd.map_or_else(
+            || path.to_path_buf(),
+            |dir| PathBuf::from(super::expand_tilde(dir)).join(path),
+        )
+    } else {
+        path.to_path_buf()
+    }
+}
+
+fn executable_is_missing_sync(
+    command: &str,
+    cwd: Option<&str>,
+    env: Option<&HashMap<String, String>>,
+    clear_env: bool,
+) -> bool {
+    if cwd.is_some_and(|dir| !Path::new(&super::expand_tilde(dir)).is_dir()) {
+        return false;
+    }
+
+    if command.contains('/') {
+        return matches!(
+            std::fs::metadata(command_path(command, cwd)),
+            Err(error) if error.kind() == ErrorKind::NotFound
+        );
+    }
+
+    let path = env
+        .and_then(|variables| variables.get("PATH").cloned())
+        .or_else(|| (!clear_env).then(|| std::env::var("PATH").ok()).flatten())
+        .unwrap_or_else(|| "/usr/bin:/bin".to_string());
+    let cwd = cwd.map(|dir| PathBuf::from(super::expand_tilde(dir)));
+    std::env::split_paths(&path).all(|dir| {
+        let dir = if dir.is_relative() {
+            cwd.as_ref().map_or(dir.clone(), |cwd| cwd.join(dir))
+        } else {
+            dir
+        };
+        !dir.join(command).is_file()
+    })
+}
+
+async fn executable_is_missing(
+    command: &str,
+    cwd: Option<&str>,
+    env: Option<&HashMap<String, String>>,
+    clear_env: bool,
+) -> bool {
+    let command = command.to_owned();
+    let cwd = cwd.map(str::to_owned);
+    let env = env.cloned();
+    tokio::task::spawn_blocking(move || {
+        executable_is_missing_sync(&command, cwd.as_deref(), env.as_ref(), clear_env)
+    })
+    .await
+    .unwrap_or(false)
+}
+
+fn spawn_error(error: std::io::Error, executable_missing: bool) -> RpcError {
+    let mut data = Vec::new();
+    if let Some(errno) = error.raw_os_error() {
+        data.push((
+            Value::String("os_errno".into()),
+            Value::Integer(errno.into()),
+        ));
+    }
+    data.push((
+        Value::String("spawn_not_found".into()),
+        Value::Boolean(error.kind() == ErrorKind::NotFound && executable_missing),
+    ));
+    RpcError {
+        code: RpcError::PROCESS_ERROR,
+        message: format!("Failed to spawn process: {error}"),
+        data: Some(Value::Map(data)),
+    }
+}
+
 // ============================================================================
 // Process management for async processes
 // ============================================================================
 
 static PROCESS_MAP: OnceLock<Mutex<HashMap<u32, ManagedProcess>>> = OnceLock::new();
 static PID_COUNTER: OnceLock<Mutex<u32>> = OnceLock::new();
+
+#[cfg(test)]
+static PROCESS_TEST_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+
+#[cfg(test)]
+pub(crate) async fn test_process_map_lock() -> tokio::sync::MutexGuard<'static, ()> {
+    PROCESS_TEST_LOCK
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        .await
+}
 
 fn get_process_map() -> &'static Mutex<HashMap<u32, ManagedProcess>> {
     PROCESS_MAP.get_or_init(|| Mutex::new(HashMap::new()))
@@ -101,9 +194,19 @@ pub async fn run(params: Value) -> HandlerResult {
     cmd.stdout(Stdio::piped());
     cmd.stderr(Stdio::piped());
 
-    let mut child = cmd
-        .spawn()
-        .map_err(|e| RpcError::process_error(format!("Failed to spawn process: {}", e)))?;
+    let mut child = match cmd.spawn() {
+        Ok(child) => child,
+        Err(error) => {
+            let executable_missing = executable_is_missing(
+                &params.cmd,
+                params.cwd.as_deref(),
+                params.env.as_ref(),
+                params.clear_env,
+            )
+            .await;
+            return Err(spawn_error(error, executable_missing));
+        }
+    };
 
     // Write stdin if provided (no base64 decoding needed!)
     if let Some(stdin_data) = params.stdin
@@ -171,9 +274,19 @@ pub async fn start(params: Value) -> HandlerResult {
     cmd.stdout(Stdio::piped());
     cmd.stderr(Stdio::piped());
 
-    let mut child = cmd
-        .spawn()
-        .map_err(|e| RpcError::process_error(format!("Failed to spawn process: {}", e)))?;
+    let mut child = match cmd.spawn() {
+        Ok(child) => child,
+        Err(error) => {
+            let executable_missing = executable_is_missing(
+                &params.cmd,
+                params.cwd.as_deref(),
+                params.env.as_ref(),
+                params.clear_env,
+            )
+            .await;
+            return Err(spawn_error(error, executable_missing));
+        }
+    };
 
     let pid = get_next_pid().await;
 
@@ -249,10 +362,10 @@ pub async fn read(params: Value) -> HandlerResult {
 
     let params: Params = from_value(params).map_err(|e| RpcError::invalid_params(e.to_string()))?;
 
-    if params.max_bytes == 0 {
-        return Err(RpcError::invalid_params(
-            "max_bytes must be greater than zero",
-        ));
+    if params.max_bytes == 0 || params.max_bytes > MAX_PROCESS_READ_BYTES {
+        return Err(RpcError::invalid_params(format!(
+            "max_bytes must be between 1 and {MAX_PROCESS_READ_BYTES}"
+        )));
     }
 
     let timeout = params.timeout_ms.unwrap_or(0);
@@ -862,6 +975,12 @@ pub async fn read_pty(params: Value) -> HandlerResult {
 
     let params: Params = from_value(params).map_err(|e| RpcError::invalid_params(e.to_string()))?;
 
+    if params.max_bytes == 0 || params.max_bytes > MAX_PROCESS_READ_BYTES {
+        return Err(RpcError::invalid_params(format!(
+            "max_bytes must be between 1 and {MAX_PROCESS_READ_BYTES}"
+        )));
+    }
+
     let timeout = params.timeout_ms.unwrap_or(0);
     let mut buf = vec![0u8; params.max_bytes];
 
@@ -1204,7 +1323,7 @@ mod tests {
         .expect("read pipe process")
     }
 
-    async fn wait_for_child_exit(pid: u32) {
+    async fn child_has_exited(pid: u32) -> bool {
         for _ in 0..100 {
             let result = status(Value::Map(vec![(
                 Value::String("pid".into()),
@@ -1213,12 +1332,35 @@ mod tests {
             .await
             .expect("query pipe process status");
             if map_get(&result, "exited").and_then(Value::as_bool) == Some(true) {
-                return;
+                return true;
             }
             tokio::time::sleep(std::time::Duration::from_millis(5)).await;
         }
 
-        panic!("process {pid} did not exit");
+        false
+    }
+
+    async fn wait_for_child_exit(pid: u32) {
+        assert!(child_has_exited(pid).await, "process {pid} did not exit");
+    }
+
+    async fn pipe_streams_at_eof(pid: u32) -> bool {
+        let (stdout, stderr) = {
+            let processes = get_process_map().lock().await;
+            let managed = processes.get(&pid).expect("pipe process");
+            (managed.stdout.clone(), managed.stderr.clone())
+        };
+        stdout.lock().await.is_none() && stderr.lock().await.is_none()
+    }
+
+    async fn remove_pipe_process(pid: u32) {
+        let managed = get_process_map().lock().await.remove(&pid);
+        if let Some(mut managed) = managed
+            && managed.exit_status.is_none()
+        {
+            let _ = managed.child.start_kill();
+            let _ = managed.child.wait().await;
+        }
     }
 
     async fn collect_pipe_output(pid: u32, max_bytes: usize) -> (Vec<u8>, Vec<u8>, i64) {
@@ -1238,11 +1380,20 @@ mod tests {
                 let exit_code = map_get(&result, "exit_code")
                     .and_then(Value::as_i64)
                     .expect("exit code");
-                get_process_map().lock().await.remove(&pid);
+                remove_pipe_process(pid).await;
                 return (stdout, stderr, exit_code);
+            }
+
+            if pipe_streams_at_eof(pid).await {
+                tokio::task::yield_now().await;
+                if !child_has_exited(pid).await {
+                    remove_pipe_process(pid).await;
+                    panic!("process {pid} did not exit after pipe EOF");
+                }
             }
         }
 
+        remove_pipe_process(pid).await;
         panic!("process {pid} did not reach EOF");
     }
 
@@ -1258,8 +1409,94 @@ mod tests {
         assert_eq!(error.code, RpcError::INVALID_PARAMS);
     }
 
+    #[test]
+    fn executable_lookup_resolves_relative_path_against_cwd() {
+        let tmp = tempfile::tempdir().expect("create tempdir");
+        let bin = tmp.path().join("bin");
+        std::fs::create_dir(&bin).unwrap();
+        std::fs::write(bin.join("tool"), b"").unwrap();
+        let env = HashMap::from([("PATH".to_string(), "bin".to_string())]);
+
+        assert!(!executable_is_missing_sync(
+            "tool",
+            tmp.path().to_str(),
+            Some(&env),
+            true
+        ));
+    }
+
+    #[tokio::test]
+    async fn process_spawn_not_found_preserves_errno() {
+        let error = run(Value::Map(vec![(
+            Value::String("cmd".into()),
+            Value::String("/definitely/not/a/tramp-rpc-command".into()),
+        )]))
+        .await
+        .expect_err("missing command should fail to spawn");
+
+        assert_eq!(error.code, RpcError::PROCESS_ERROR);
+        let errno = error
+            .data
+            .as_ref()
+            .and_then(Value::as_map)
+            .and_then(|data| {
+                data.iter()
+                    .find(|(key, _)| key.as_str() == Some("os_errno"))
+            })
+            .and_then(|(_, value)| value.as_i64());
+        assert_eq!(errno, Some(i64::from(libc::ENOENT)));
+        assert_eq!(
+            map_get(error.data.as_ref().unwrap(), "spawn_not_found"),
+            Some(&Value::Boolean(true))
+        );
+    }
+
+    #[tokio::test]
+    async fn process_spawn_missing_cwd_is_not_command_not_found() {
+        let tmp = tempfile::tempdir().expect("create tempdir");
+        let missing_cwd = tmp.path().join("missing");
+        let error = run(Value::Map(vec![
+            (
+                Value::String("cmd".into()),
+                Value::String("/bin/true".into()),
+            ),
+            (
+                Value::String("cwd".into()),
+                Value::String(missing_cwd.to_string_lossy().into_owned().into()),
+            ),
+        ]))
+        .await
+        .expect_err("missing cwd should fail to spawn");
+
+        assert_eq!(error.code, RpcError::PROCESS_ERROR);
+        assert_eq!(
+            map_get(error.data.as_ref().unwrap(), "os_errno").and_then(Value::as_i64),
+            Some(i64::from(libc::ENOENT))
+        );
+        assert_eq!(
+            map_get(error.data.as_ref().unwrap(), "spawn_not_found"),
+            Some(&Value::Boolean(false))
+        );
+    }
+
+    #[tokio::test]
+    async fn read_size_limit_rejects_oversized_request() {
+        let error = read(Value::Map(vec![
+            (Value::String("pid".into()), Value::Integer(1.into())),
+            (
+                Value::String("max_bytes".into()),
+                Value::Integer(((MAX_PROCESS_READ_BYTES + 1) as u64).into()),
+            ),
+        ]))
+        .await
+        .expect_err("oversized process read should be rejected");
+
+        assert_eq!(error.code, RpcError::INVALID_PARAMS);
+    }
+
     #[tokio::test]
     async fn process_read_drains_pipes_after_status_reports_exit() {
+        let _test_lock = test_process_map_lock().await;
         let pid = start_pipe_process("printf abc; printf XYZ >&2").await;
         wait_for_child_exit(pid).await;
 
@@ -1271,12 +1508,8 @@ mod tests {
 
     #[tokio::test]
     async fn process_read_waits_for_eof_after_child_exit() {
+        let _test_lock = test_process_map_lock().await;
         let pid = start_pipe_process("printf first; sleep 0.1; printf second").await;
-
-        // Ensure the first chunk is buffered before the long-polling read.  The
-        // stderr read then remains pending until the shell exits, reproducing
-        // the race where try_wait succeeds while stdout still contains data.
-        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
 
         let (stdout, stderr, exit_code) = collect_pipe_output(pid, 65_536).await;
         assert_eq!(stdout, b"firstsecond");
@@ -1286,6 +1519,7 @@ mod tests {
 
     #[tokio::test]
     async fn process_read_drains_output_larger_than_max_bytes() {
+        let _test_lock = test_process_map_lock().await;
         let pid = start_pipe_process("printf 0123456789abcdef").await;
         let (stdout, stderr, exit_code) = collect_pipe_output(pid, 3).await;
 
@@ -1296,8 +1530,8 @@ mod tests {
 
     #[tokio::test]
     async fn process_read_returns_stdout_before_idle_stderr_timeout() {
+        let _test_lock = test_process_map_lock().await;
         let pid = start_pipe_process("printf stdout; sleep 1").await;
-        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
 
         let started = std::time::Instant::now();
         let first = read_pipe_process(pid, 65_536, 500).await;
@@ -1323,6 +1557,7 @@ mod tests {
 
     #[tokio::test]
     async fn process_read_delivers_output_written_immediately_before_exit() {
+        let _test_lock = test_process_map_lock().await;
         let pid = start_pipe_process("sleep 0.05; printf final").await;
         let (stdout, stderr, exit_code) = collect_pipe_output(pid, 65_536).await;
 
@@ -1333,12 +1568,28 @@ mod tests {
 
     #[tokio::test]
     async fn process_read_drains_stdout_and_stderr_separately() {
+        let _test_lock = test_process_map_lock().await;
         let pid = start_pipe_process("printf stdout; printf stderr >&2").await;
         let (stdout, stderr, exit_code) = collect_pipe_output(pid, 65_536).await;
 
         assert_eq!(stdout, b"stdout");
         assert_eq!(stderr, b"stderr");
         assert_eq!(exit_code, 0);
+    }
+
+    #[tokio::test]
+    async fn read_pty_rejects_oversized_max_bytes() {
+        let error = read_pty(Value::Map(vec![
+            (Value::String("pid".into()), Value::Integer(1.into())),
+            (
+                Value::String("max_bytes".into()),
+                Value::Integer(((MAX_PROCESS_READ_BYTES + 1) as u64).into()),
+            ),
+        ]))
+        .await
+        .expect_err("oversized PTY read should be rejected");
+
+        assert_eq!(error.code, RpcError::INVALID_PARAMS);
     }
 
     #[tokio::test]

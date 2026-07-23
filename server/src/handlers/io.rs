@@ -17,6 +17,8 @@ use super::file::{bytes_to_path, map_io_error};
 
 use crate::protocol::path_or_bytes;
 
+pub(crate) const MAX_FILE_READ_CHUNK_BYTES: usize = 16 * 1024 * 1024;
+
 /// Read file contents
 pub async fn read(params: Value) -> HandlerResult {
     #[derive(Deserialize)]
@@ -36,12 +38,29 @@ pub async fn read(params: Value) -> HandlerResult {
 
     let params: Params = from_value(params).map_err(|e| RpcError::invalid_params(e.to_string()))?;
 
+    if params
+        .length
+        .is_some_and(|length| length > MAX_FILE_READ_CHUNK_BYTES)
+    {
+        return Err(RpcError::invalid_params(format!(
+            "length exceeds maximum read size of {MAX_FILE_READ_CHUNK_BYTES} bytes"
+        )));
+    }
+
     let path = bytes_to_path(&params.path);
     let path_str = path.to_string_lossy().into_owned();
 
     let mut file = File::open(&path)
         .await
         .map_err(|e| map_io_error(e, &path_str))?;
+
+    // fstat on the open fd: lets chunked clients learn the total size from the
+    // first chunk response instead of spending a separate file.stat RPC.
+    let metadata = file
+        .metadata()
+        .await
+        .map_err(|e| map_io_error(e, &path_str))?;
+    let file_size = metadata.len();
 
     // Seek to offset if specified
     if let Some(offset) = params.offset {
@@ -50,7 +69,7 @@ pub async fn read(params: Value) -> HandlerResult {
             .map_err(|e| map_io_error(e, &path_str))?;
     }
 
-    // Read the content
+    // Read the content.
     let content = if let Some(length) = params.length {
         // Read up to LENGTH bytes in a single pass. `take` keeps reads bounded.
         let mut buf = Vec::with_capacity(length);
@@ -61,19 +80,12 @@ pub async fn read(params: Value) -> HandlerResult {
             .map_err(|e| map_io_error(e, &path_str))?;
         buf
     } else {
-        // Pre-size from metadata to avoid repeated reallocations on large reads.
-        let mut buf = Vec::new();
-        if let Ok(metadata) = file.metadata().await {
-            let mut expected_len = metadata.len() as usize;
-            if let Some(offset) = params.offset {
-                expected_len = expected_len.saturating_sub(offset as usize);
-            }
-            buf.reserve(expected_len);
-        }
-        file.read_to_end(&mut buf)
-            .await
-            .map_err(|e| map_io_error(e, &path_str))?;
-        buf
+        read_default_bounded(
+            &mut file,
+            file_size.saturating_sub(params.offset.unwrap_or(0)),
+            &path_str,
+        )
+        .await?
     };
 
     // Return binary content directly (no base64!). Compression is opt-in.
@@ -89,6 +101,7 @@ pub async fn read(params: Value) -> HandlerResult {
         Ok(msgpack_map! {
             "content" => Value::Binary(compressed),
             "size" => size,
+            "file_size" => file_size,
             "compressed" => true,
             "compression" => "zlib"
         })
@@ -96,10 +109,35 @@ pub async fn read(params: Value) -> HandlerResult {
         Ok(msgpack_map! {
             "content" => Value::Binary(content),
             "size" => size,
+            "file_size" => file_size,
             "compressed" => false,
             "compression" => Value::Nil
         })
     }
+}
+
+async fn read_default_bounded(
+    file: &mut File,
+    expected_len: u64,
+    path: &str,
+) -> Result<Vec<u8>, RpcError> {
+    if expected_len > MAX_FILE_READ_CHUNK_BYTES as u64 {
+        return Err(RpcError::invalid_params(format!(
+            "file exceeds maximum read size of {MAX_FILE_READ_CHUNK_BYTES} bytes"
+        )));
+    }
+
+    let mut buf = Vec::with_capacity(expected_len as usize);
+    file.take(MAX_FILE_READ_CHUNK_BYTES as u64 + 1)
+        .read_to_end(&mut buf)
+        .await
+        .map_err(|e| map_io_error(e, path))?;
+    if buf.len() > MAX_FILE_READ_CHUNK_BYTES {
+        return Err(RpcError::invalid_params(format!(
+            "file exceeds maximum read size of {MAX_FILE_READ_CHUNK_BYTES} bytes"
+        )));
+    }
+    Ok(buf)
 }
 
 /// Write file contents
@@ -136,7 +174,9 @@ pub async fn write(params: Value) -> HandlerResult {
     if params.append {
         options.append(true).create(true);
     } else if params.offset.is_some() {
-        options.write(true);
+        // Seeking past EOF then writing is the sparse, zero-filled behavior
+        // Emacs expects for an integer `write-region' offset.
+        options.write(true).create(true);
     } else {
         options.write(true).create(true).truncate(true);
     }
@@ -157,6 +197,8 @@ pub async fn write(params: Value) -> HandlerResult {
     file.write_all(&content)
         .await
         .map_err(|e| map_io_error(e, &path_str))?;
+    // Do not report success until Tokio has completed the pending file writes.
+    file.flush().await.map_err(|e| map_io_error(e, &path_str))?;
 
     // Set permissions if specified
     if let Some(mode) = params.mode {
@@ -451,6 +493,62 @@ async fn remove_path_for_overwrite(path: &Path) -> std::io::Result<()> {
     }
 }
 
+async fn rename_no_overwrite_fallback(src: &Path, dest: &Path) -> std::io::Result<()> {
+    match fs::symlink_metadata(dest).await {
+        Ok(_) => return Err(already_exists(dest)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e),
+    }
+    fs::rename(src, dest).await
+}
+
+#[cfg(target_os = "linux")]
+async fn rename_no_overwrite(src: &Path, dest: &Path) -> std::io::Result<()> {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+
+    let owned_src = src.to_owned();
+    let owned_dest = dest.to_owned();
+    let result = tokio::task::spawn_blocking(move || {
+        let src = CString::new(owned_src.as_os_str().as_bytes())?;
+        let dest = CString::new(owned_dest.as_os_str().as_bytes())?;
+        let result = unsafe {
+            libc::syscall(
+                libc::SYS_renameat2,
+                libc::AT_FDCWD,
+                src.as_ptr(),
+                libc::AT_FDCWD,
+                dest.as_ptr(),
+                libc::RENAME_NOREPLACE,
+            )
+        };
+        if result == 0 {
+            Ok(())
+        } else {
+            Err(std::io::Error::last_os_error())
+        }
+    })
+    .await
+    .map_err(std::io::Error::other)?;
+
+    match result {
+        Err(error)
+            if matches!(
+                error.raw_os_error(),
+                Some(libc::EINVAL) | Some(libc::ENOSYS)
+            ) =>
+        {
+            rename_no_overwrite_fallback(src, dest).await
+        }
+        result => result,
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+async fn rename_no_overwrite(src: &Path, dest: &Path) -> std::io::Result<()> {
+    rename_no_overwrite_fallback(src, dest).await
+}
+
 /// Rename/move a file
 pub async fn rename(params: Value) -> HandlerResult {
     #[derive(Deserialize)]
@@ -471,18 +569,18 @@ pub async fn rename(params: Value) -> HandlerResult {
     let dest_str = dest.to_string_lossy().into_owned();
     let src_str = src.to_string_lossy().into_owned();
 
-    // Check if destination exists and overwrite is false
-    if !params.overwrite && dest.exists() {
-        return Err(RpcError {
-            code: RpcError::IO_ERROR,
-            message: format!("Destination already exists: {}", dest_str),
-            data: None,
-        });
-    }
-
-    fs::rename(&src, &dest)
-        .await
-        .map_err(|e| map_io_error(e, &src_str))?;
+    let result = if params.overwrite {
+        fs::rename(&src, &dest).await
+    } else {
+        rename_no_overwrite(&src, &dest).await
+    };
+    result.map_err(|e| {
+        if e.kind() == std::io::ErrorKind::AlreadyExists {
+            map_io_error(already_exists(&dest), &dest_str)
+        } else {
+            map_io_error(e, &format!("{src_str} -> {dest_str}"))
+        }
+    })?;
 
     Ok(Value::Boolean(true))
 }
@@ -734,6 +832,153 @@ mod tests {
 
     fn path_value(path: &Path) -> Value {
         Value::Binary(path.as_os_str().as_bytes().to_vec())
+    }
+
+    #[tokio::test]
+    async fn write_offset_preserves_suffix() {
+        let tmp = tempfile::tempdir().expect("create tempdir");
+        let path = tmp.path().join("file");
+        fs::write(&path, b"abcdef").await.unwrap();
+
+        write(msgpack_map! {
+            "path" => path_value(&path),
+            "content" => Value::Binary(b"XY".to_vec()),
+            "offset" => 2u64,
+        })
+        .await
+        .expect("write at offset");
+
+        assert_eq!(fs::read(path).await.unwrap(), b"abXYef");
+    }
+
+    #[tokio::test]
+    async fn write_offset_creates_zero_filled_file() {
+        let tmp = tempfile::tempdir().expect("create tempdir");
+        let path = tmp.path().join("file");
+
+        write(msgpack_map! {
+            "path" => path_value(&path),
+            "content" => Value::Binary(b"XY".to_vec()),
+            "offset" => 4u64,
+        })
+        .await
+        .expect("write at offset creates file");
+
+        assert_eq!(fs::read(path).await.unwrap(), b"\0\0\0\0XY");
+    }
+
+    #[tokio::test]
+    async fn rename_no_overwrite_fallback_checks_destination_and_renames() {
+        let tmp = tempfile::tempdir().expect("create tempdir");
+        let src = tmp.path().join("src");
+        let dest = tmp.path().join("dest");
+        fs::write(&src, b"source").await.unwrap();
+        tokio::fs::symlink("missing-target", &dest).await.unwrap();
+
+        let error = rename_no_overwrite_fallback(&src, &dest)
+            .await
+            .expect_err("dangling symlink is an existing destination");
+        assert_eq!(error.kind(), std::io::ErrorKind::AlreadyExists);
+        assert!(fs::symlink_metadata(&dest).await.is_ok());
+        assert!(fs::metadata(&src).await.is_ok());
+
+        fs::remove_file(&dest).await.unwrap();
+        rename_no_overwrite_fallback(&src, &dest)
+            .await
+            .expect("missing destination is renamed");
+        assert_eq!(fs::read(&dest).await.unwrap(), b"source");
+        assert!(fs::metadata(&src).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn rename_no_overwrite_rejects_dangling_symlink() {
+        let tmp = tempfile::tempdir().expect("create tempdir");
+        let src = tmp.path().join("src");
+        let dest = tmp.path().join("dest");
+        fs::write(&src, b"source").await.unwrap();
+        tokio::fs::symlink("missing-target", &dest).await.unwrap();
+
+        let error = rename(msgpack_map! {
+            "src" => path_value(&src),
+            "dest" => path_value(&dest),
+        })
+        .await
+        .expect_err("dangling symlink is an existing destination");
+
+        assert_eq!(error.code, RpcError::IO_ERROR);
+        let errno = error
+            .data
+            .as_ref()
+            .and_then(Value::as_map)
+            .and_then(|data| {
+                data.iter()
+                    .find(|(key, _)| key.as_str() == Some("os_errno"))
+            })
+            .and_then(|(_, value)| value.as_i64());
+        assert_eq!(errno, Some(i64::from(libc::EEXIST)));
+        assert!(fs::symlink_metadata(&dest).await.is_ok());
+        assert!(fs::metadata(&src).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn read_reports_total_file_size_with_partial_chunk() {
+        let tmp = tempfile::tempdir().expect("create tempdir");
+        let path = tmp.path().join("file");
+        fs::write(&path, b"0123456789").await.unwrap();
+
+        let result = read(msgpack_map! {
+            "path" => path_value(&path),
+            "offset" => 2u64,
+            "length" => 4u64,
+        })
+        .await
+        .expect("read partial chunk");
+
+        let field = |name: &str| {
+            result
+                .as_map()
+                .unwrap()
+                .iter()
+                .find(|(key, _)| key.as_str() == Some(name))
+                .map(|(_, value)| value.clone())
+        };
+        assert_eq!(field("content"), Some(Value::Binary(b"2345".to_vec())));
+        assert_eq!(field("size").and_then(|v| v.as_u64()), Some(4));
+        assert_eq!(field("file_size").and_then(|v| v.as_u64()), Some(10));
+    }
+
+    #[tokio::test]
+    async fn read_size_limit_rejects_oversized_request() {
+        let tmp = tempfile::tempdir().expect("create tempdir");
+        let path = tmp.path().join("file");
+        fs::write(&path, b"x").await.unwrap();
+
+        let error = read(msgpack_map! {
+            "path" => path_value(&path),
+            "length" => (MAX_FILE_READ_CHUNK_BYTES + 1) as u64,
+        })
+        .await
+        .expect_err("oversized read must fail before allocating");
+
+        assert_eq!(error.code, RpcError::INVALID_PARAMS);
+    }
+
+    #[tokio::test]
+    async fn default_read_rejects_file_that_grows_after_metadata() {
+        let tmp = tempfile::tempdir().expect("create tempdir");
+        let path = tmp.path().join("file");
+        fs::write(&path, b"x").await.unwrap();
+        let mut file = File::open(&path).await.unwrap();
+        let expected_len = file.metadata().await.unwrap().len();
+        fs::write(&path, vec![b'x'; MAX_FILE_READ_CHUNK_BYTES + 1])
+            .await
+            .unwrap();
+
+        let error = read_default_bounded(&mut file, expected_len, &path.to_string_lossy())
+            .await
+            .expect_err("grown file must remain bounded");
+
+        assert_eq!(error.code, RpcError::INVALID_PARAMS);
     }
 
     #[tokio::test]

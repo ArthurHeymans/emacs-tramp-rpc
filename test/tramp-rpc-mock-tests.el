@@ -473,7 +473,9 @@ Returns the result or signals an error."
         (unless response
           (error "Timeout waiting for RPC response"))
         (if (tramp-rpc-protocol-error-p response)
-            (list :error (tramp-rpc-protocol-error-message response))
+            (list :error (tramp-rpc-protocol-error-message response)
+                  :code (tramp-rpc-protocol-error-code response)
+                  :data (tramp-rpc-protocol-error-data response))
           (plist-get response :result))))))
 
 ;;; Server tests (require server to be available)
@@ -493,6 +495,8 @@ Returns the result or signals an error."
           (should (assoc 'uid result))
           (should (assoc 'gid result))
           (should (assoc 'home result))
+          (should (= (alist-get 'max_read_chunk_bytes result)
+                     (* 16 1024 1024)))
           (should (member (alist-get 'watcher result)
                           '("inotify" "fsevent" "kqueue" "poll"
                             "windows" "null" "unknown")))
@@ -550,6 +554,118 @@ Returns the result or signals an error."
           (let ((result (tramp-rpc-mock-test--rpc-call
                          "file.stat" `((path . ,(encode-coding-string test-file 'utf-8))))))
             (should (not result)))))
+    (tramp-rpc-mock-test--stop-server)))
+
+(ert-deftest tramp-rpc-mock-test-server-write-offset-preserves-suffix ()
+  "The file.write offset field replaces bytes without truncating the suffix."
+  :tags '(:server)
+  (skip-unless tramp-rpc-mock-test--msgpack-available)
+  (skip-unless (tramp-rpc-mock-test--find-server))
+  (unwind-protect
+      (progn
+        (tramp-rpc-mock-test--start-server)
+        (let ((path (expand-file-name "offset" tramp-rpc-mock-test-temp-dir)))
+          (tramp-rpc-mock-test--rpc-call
+           "file.write" `((path . ,(encode-coding-string path 'utf-8))
+                          (content . "abcdef")))
+          (tramp-rpc-mock-test--rpc-call
+           "file.write" `((path . ,(encode-coding-string path 'utf-8))
+                          (content . "XY")
+                          (offset . 2)))
+          (let* ((result (tramp-rpc-mock-test--rpc-call
+                          "file.read" `((path . ,(encode-coding-string path 'utf-8)))))
+                 (content (alist-get 'content result)))
+            (should (equal (msgpack-bin-string content) "abXYef")))))
+    (tramp-rpc-mock-test--stop-server)))
+
+(ert-deftest tramp-rpc-mock-test-server-write-offset-creates-zero-filled-file ()
+  "An offset write creates a missing file with its leading hole zero-filled."
+  :tags '(:server)
+  (skip-unless tramp-rpc-mock-test--msgpack-available)
+  (skip-unless (tramp-rpc-mock-test--find-server))
+  (unwind-protect
+      (progn
+        (tramp-rpc-mock-test--start-server)
+        (let ((path (expand-file-name "offset-missing" tramp-rpc-mock-test-temp-dir)))
+          (tramp-rpc-mock-test--rpc-call
+           "file.write" `((path . ,(encode-coding-string path 'utf-8))
+                          (content . "XY")
+                          (offset . 4)))
+          (let* ((result (tramp-rpc-mock-test--rpc-call
+                          "file.read" `((path . ,(encode-coding-string path 'utf-8)))))
+                 (content (alist-get 'content result)))
+            (should (equal (msgpack-bin-string content) "\0\0\0\0XY")))))
+    (tramp-rpc-mock-test--stop-server)))
+
+(ert-deftest tramp-rpc-mock-test-file-read-chunks-past-rpc-limit ()
+  "File reads pipeline chunks beyond the server's per-request byte limit."
+  (let ((source "abcdefghij")
+        (tramp-rpc--file-read-chunk-size 4)
+        (tramp-rpc-compress-file-read nil)
+        (report-file-size t)
+        calls batch-sizes stat-calls)
+    (cl-labels ((read-result
+                 (params)
+                 (let* ((offset (or (alist-get 'offset params) 0))
+                        (requested (alist-get 'length params))
+                        (end (min (length source) (+ offset requested))))
+                   (push (cons offset requested) calls)
+                   `((content . ,(substring source offset end))
+                     ,@(when report-file-size
+                         `((file_size . ,(length source))))))))
+      (cl-letf (((symbol-function 'tramp-rpc--cached-system-info)
+                 (lambda (_vec) '((max_read_chunk_bytes . 16))))
+                ;; Only the old-server fallback may stat; the primary path
+                ;; must plan chunks from the first response's `file_size'.
+                ((symbol-function 'tramp-rpc--call-file-stat)
+                 (lambda (&rest _)
+                   (setq stat-calls (1+ (or stat-calls 0)))
+                   `((size . ,(length source)))))
+                ((symbol-function 'tramp-rpc--call)
+                 (lambda (_vec method params &rest _)
+                   (should (equal method "file.read"))
+                   (read-result params)))
+                ((symbol-function 'tramp-rpc--call-batch)
+                 (lambda (_vec requests)
+                   (push (length requests) batch-sizes)
+                   (mapcar (lambda (request) (read-result (cdr request))) requests))))
+        (should (equal (tramp-rpc--read-file-bytes 'vec "/tmp/file") source))
+        (should (equal (nreverse calls) '((0 . 4) (4 . 4) (8 . 2))))
+        (should (equal (nreverse batch-sizes) '(2)))
+        (should-not stat-calls)
+        (setq calls nil batch-sizes nil)
+        (should (equal (tramp-rpc--read-file-bytes 'vec "/tmp/file" 2 9)
+                       "cdefghi"))
+        (should (equal (nreverse calls) '((2 . 4) (6 . 3))))
+        (should (equal (nreverse batch-sizes) '(1)))
+        (should-not stat-calls)
+        ;; Old servers omit `file_size'; one file.stat fallback plans the rest.
+        (setq calls nil batch-sizes nil report-file-size nil)
+        (should (equal (tramp-rpc--read-file-bytes 'vec "/tmp/file") source))
+        (should (equal (nreverse calls) '((0 . 4) (4 . 4) (8 . 2))))
+        (should (equal (nreverse batch-sizes) '(2)))
+        (should (equal stat-calls 1))))))
+
+(ert-deftest tramp-rpc-mock-test-server-rename-dangling-symlink-no-overwrite ()
+  "No-overwrite rename treats a dangling symlink as an existing destination."
+  :tags '(:server)
+  (skip-unless tramp-rpc-mock-test--msgpack-available)
+  (skip-unless (tramp-rpc-mock-test--find-server))
+  (unwind-protect
+      (progn
+        (tramp-rpc-mock-test--start-server)
+        (let ((src (expand-file-name "rename-src" tramp-rpc-mock-test-temp-dir))
+              (dest (expand-file-name "rename-dest" tramp-rpc-mock-test-temp-dir)))
+          (with-temp-file src (insert "source"))
+          (make-symbolic-link "missing-target" dest)
+          (let ((result (tramp-rpc-mock-test--rpc-call
+                         "file.rename"
+                         `((src . ,(encode-coding-string src 'utf-8))
+                           (dest . ,(encode-coding-string dest 'utf-8))))))
+            (should (= (plist-get result :code) -32003))
+            (should (= (alist-get 'os_errno (plist-get result :data)) 17))
+            (should (file-symlink-p dest))
+            (should (file-exists-p src)))))
     (tramp-rpc-mock-test--stop-server)))
 
 (ert-deftest tramp-rpc-mock-test-server-directory-operations ()
@@ -808,6 +924,30 @@ Returns the result or signals an error."
             (should (string-match-p "hello world" (msgpack-bin-string stdout))))))
     (tramp-rpc-mock-test--stop-server)))
 
+(ert-deftest tramp-rpc-mock-test-server-process-spawn-enoent-is-classified ()
+  "Local process.run distinguishes a missing executable from a missing cwd."
+  :tags '(:server :process)
+  (skip-unless tramp-rpc-mock-test--msgpack-available)
+  (skip-unless (tramp-rpc-mock-test--find-server))
+  (unwind-protect
+      (progn
+        (tramp-rpc-mock-test--start-server)
+        (let ((missing-command
+               (tramp-rpc-mock-test--rpc-call
+                "process.run" `((cmd . "/definitely/not/tramp-rpc-command"))))
+              (missing-cwd
+               (tramp-rpc-mock-test--rpc-call
+                "process.run" `((cmd . "/bin/true")
+                                 (cwd . ,(expand-file-name "missing-cwd"
+                                                            tramp-rpc-mock-test-temp-dir))))))
+          (should (= (plist-get missing-command :code) -32004))
+          (should (= (alist-get 'os_errno (plist-get missing-command :data)) 2))
+          (should (alist-get 'spawn_not_found (plist-get missing-command :data)))
+          (should (= (plist-get missing-cwd :code) -32004))
+          (should (= (alist-get 'os_errno (plist-get missing-cwd :data)) 2))
+          (should-not (alist-get 'spawn_not_found (plist-get missing-cwd :data)))))
+    (tramp-rpc-mock-test--stop-server)))
+
 (ert-deftest tramp-rpc-mock-test-server-process-signal-exit ()
   "Test process.run returns 128+signal for signal-killed processes.
 This matches the behavior expected by `tramp-test28-process-file'."
@@ -863,6 +1003,44 @@ This matches the behavior expected by `tramp-test28-process-file'."
 (require 'tramp-rpc)
 (defconst tramp-rpc-mock-test--tramp-rpc-loaded t
   "The full TRAMP-RPC backend was loaded successfully.")
+
+(ert-deftest tramp-rpc-mock-test-file-executable-root ()
+  "Root requires an execute bit, rather than bypassing all mode checks."
+  (let ((attrs '(nil 1 1 1 0 0 0 0 "----------")))
+    (should-not (tramp-rpc--mode-executable-p "----------" 0 0 attrs nil))
+    (should (tramp-rpc--mode-executable-p "------x---" 0 0 attrs nil))))
+
+(ert-deftest tramp-rpc-mock-test-directory-count-semantics ()
+  "Both directory handlers share Emacs COUNT semantics."
+  (let ((entries '("a" "b" "c")))
+    (should (equal (tramp-rpc--apply-directory-count entries nil) entries))
+    (should (equal (tramp-rpc--apply-directory-count entries 2) '("a" "b")))
+    (should-not (tramp-rpc--apply-directory-count entries 0))
+    (dolist (count '(-1 "invalid"))
+      (should-error (tramp-rpc--apply-directory-count entries count)
+                    :type 'wrong-type-argument))))
+
+(ert-deftest tramp-rpc-mock-test-pipelined-timeout-signals-error ()
+  "A live connection with no response reaches the pipeline timeout branch."
+  (let* ((buffer (generate-new-buffer " *tramp-rpc-pipeline-test*"))
+         (process (start-process "tramp-rpc-pipeline-test" buffer "sh" "-c" "sleep 2"))
+         (vec (tramp-dissect-file-name "/rpc:mock:/tmp/"))
+         (timeout 0.15)
+         (started (float-time)))
+    (unwind-protect
+        (cl-letf (((symbol-function 'tramp-rpc--ensure-connection)
+                   (lambda (_vec) (list :process process :buffer buffer))))
+          (should (process-live-p process))
+          (condition-case err
+              (progn
+                (tramp-rpc--receive-responses vec '(1) timeout)
+                (error "Expected pipelined response timeout"))
+            (remote-file-error
+             (should (string-match-p "Timeout" (error-message-string err)))))
+          (should (>= (- (float-time) started) (* timeout 0.8)))
+          (should (process-live-p process)))
+      (when (process-live-p process) (delete-process process))
+      (kill-buffer buffer))))
 
 (declare-function tramp-rpc-magit--file-exists-in-ancestor-scan
                   "tramp-rpc-magit" (filename scan))
@@ -2810,6 +2988,43 @@ This matches the behavior expected by `tramp-test28-process-file'."
                                                      (expand-file-name "dir" trash-root))))))
       (delete-directory trash-root t))))
 
+(ert-deftest tramp-rpc-mock-test-trash-small-file-growth-retries-chunked ()
+  "A small trash file that grows past the RPC limit is retried chunked."
+  :tags '(:delete)
+  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
+  (let* ((dest (make-temp-file "tramp-rpc-trash-copy" t))
+         (tramp-rpc--file-read-chunk-size 4)
+         (dir-stat '((type . "directory") (mode . 16877)))
+         (file-stat '((type . "file") (size . 1) (mode . 33188)))
+         retry-called)
+    (unwind-protect
+        (cl-letf (((symbol-function 'tramp-rpc--cached-system-info)
+                   (lambda (_vec) '((max_read_chunk_bytes . 4))))
+                  ((symbol-function 'tramp-rpc--call-file-stat)
+                   (lambda (&rest _) '((size . 4))))
+                  ((symbol-function 'tramp-rpc--call)
+                   (lambda (_vec method _params &rest _)
+                     (pcase method
+                       ("dir.list"
+                        `(((name . "grown") (type . "file")
+                           (attrs . ,file-stat))))
+                       ("file.read"
+                        (setq retry-called t)
+                        '((content . "data")))
+                       (_ (error "Unexpected RPC method: %s" method)))))
+                  ((symbol-function 'tramp-rpc--call-batch)
+                   (lambda (_vec _requests)
+                     '((:error -32602 :message "file grew")))))
+          (tramp-rpc--copy-remote-trash-directory-to-local
+           'vec "/tmp/source" (expand-file-name "copied" dest) dir-stat)
+          (should retry-called)
+          (should (equal (with-temp-buffer
+                           (insert-file-contents-literally
+                            (expand-file-name "copied/grown" dest))
+                           (buffer-string))
+                         "data")))
+      (delete-directory dest t))))
+
 (ert-deftest tramp-rpc-mock-test-delete-file-trash-can-be-inhibited ()
   "Test `remote-file-name-inhibit-delete-by-moving-to-trash' forces unlink."
   :tags '(:delete)
@@ -3964,6 +4179,45 @@ discard it for being unreadable."
       (should (equal (alist-get 'args captured-params) ["pattern"]))
       (should (equal (assoc "PATH" (alist-get 'env captured-params))
                      '("PATH" . "/home/user/.cargo/bin:/usr/bin:/bin"))))))
+
+(ert-deftest tramp-rpc-mock-test-process-file-not-found-returns-127 ()
+  "Only a structured spawn ENOENT becomes process-file status 127."
+  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
+  (let ((default-directory "/rpc:user@host:/work/"))
+    (cl-letf (((symbol-function 'tramp-rpc--cached-remote-path)
+               (lambda (_vec) '("/usr/bin")))
+              ((symbol-function 'tramp-rpc--get-direnv-environment)
+               (lambda (&rest _) nil))
+              ((symbol-function 'tramp-rpc--caller-environment)
+               (lambda () nil))
+              ((symbol-function 'tramp-rpc-magit--process-cache-lookup)
+               (lambda (&rest _) nil))
+               ((symbol-function 'tramp-rpc--call)
+                (lambda (&rest _)
+                  (tramp-rpc--signal-rpc-error
+                   "RPC" "missing executable" tramp-rpc-protocol-error-process 2
+                   nil '((spawn_not_found . t))))))
+       (should (= (tramp-rpc-handle-process-file "missing" nil nil nil) 127)))))
+
+(ert-deftest tramp-rpc-mock-test-process-file-preserves-other-rpc-errors ()
+  "A process cwd ENOENT remains a remote-file-error, not status 127."
+  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
+  (let ((default-directory "/rpc:user@host:/work/"))
+    (cl-letf (((symbol-function 'tramp-rpc--cached-remote-path)
+               (lambda (_vec) '("/usr/bin")))
+              ((symbol-function 'tramp-rpc--get-direnv-environment)
+               (lambda (&rest _) nil))
+              ((symbol-function 'tramp-rpc--caller-environment)
+               (lambda () nil))
+              ((symbol-function 'tramp-rpc-magit--process-cache-lookup)
+               (lambda (&rest _) nil))
+               ((symbol-function 'tramp-rpc--call)
+                (lambda (&rest _)
+                  (tramp-rpc--signal-rpc-error
+                   "RPC" "missing cwd" tramp-rpc-protocol-error-process 2 nil
+                   '((os_errno . 2) (spawn_not_found . :msgpack-false))))))
+       (should-error (tramp-rpc-handle-process-file "broken" nil nil nil)
+                     :type 'remote-file-error))))
 
 (ert-deftest tramp-rpc-mock-test-process-file-passes-tramp-remote-environment ()
   "Test `process-file' forwards dynamic TRAMP remote process env vars."
