@@ -17,7 +17,7 @@ use super::file::{bytes_to_path, map_io_error};
 
 use crate::protocol::path_or_bytes;
 
-const MAX_FILE_READ_CHUNK_BYTES: usize = 16 * 1024 * 1024;
+pub(crate) const MAX_FILE_READ_CHUNK_BYTES: usize = 16 * 1024 * 1024;
 
 /// Read file contents
 pub async fn read(params: Value) -> HandlerResult {
@@ -54,6 +54,14 @@ pub async fn read(params: Value) -> HandlerResult {
         .await
         .map_err(|e| map_io_error(e, &path_str))?;
 
+    // fstat on the open fd: lets chunked clients learn the total size from the
+    // first chunk response instead of spending a separate file.stat RPC.
+    let metadata = file
+        .metadata()
+        .await
+        .map_err(|e| map_io_error(e, &path_str))?;
+    let file_size = metadata.len();
+
     // Seek to offset if specified
     if let Some(offset) = params.offset {
         file.seek(SeekFrom::Start(offset))
@@ -72,13 +80,9 @@ pub async fn read(params: Value) -> HandlerResult {
             .map_err(|e| map_io_error(e, &path_str))?;
         buf
     } else {
-        let metadata = file
-            .metadata()
-            .await
-            .map_err(|e| map_io_error(e, &path_str))?;
         read_default_bounded(
             &mut file,
-            metadata.len().saturating_sub(params.offset.unwrap_or(0)),
+            file_size.saturating_sub(params.offset.unwrap_or(0)),
             &path_str,
         )
         .await?
@@ -97,6 +101,7 @@ pub async fn read(params: Value) -> HandlerResult {
         Ok(msgpack_map! {
             "content" => Value::Binary(compressed),
             "size" => size,
+            "file_size" => file_size,
             "compressed" => true,
             "compression" => "zlib"
         })
@@ -104,6 +109,7 @@ pub async fn read(params: Value) -> HandlerResult {
         Ok(msgpack_map! {
             "content" => Value::Binary(content),
             "size" => size,
+            "file_size" => file_size,
             "compressed" => false,
             "compression" => Value::Nil
         })
@@ -487,16 +493,25 @@ async fn remove_path_for_overwrite(path: &Path) -> std::io::Result<()> {
     }
 }
 
+async fn rename_no_overwrite_fallback(src: &Path, dest: &Path) -> std::io::Result<()> {
+    match fs::symlink_metadata(dest).await {
+        Ok(_) => return Err(already_exists(dest)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e),
+    }
+    fs::rename(src, dest).await
+}
+
 #[cfg(target_os = "linux")]
 async fn rename_no_overwrite(src: &Path, dest: &Path) -> std::io::Result<()> {
     use std::ffi::CString;
     use std::os::unix::ffi::OsStrExt;
 
-    let src = src.to_owned();
-    let dest = dest.to_owned();
-    tokio::task::spawn_blocking(move || {
-        let src = CString::new(src.as_os_str().as_bytes())?;
-        let dest = CString::new(dest.as_os_str().as_bytes())?;
+    let owned_src = src.to_owned();
+    let owned_dest = dest.to_owned();
+    let result = tokio::task::spawn_blocking(move || {
+        let src = CString::new(owned_src.as_os_str().as_bytes())?;
+        let dest = CString::new(owned_dest.as_os_str().as_bytes())?;
         let result = unsafe {
             libc::syscall(
                 libc::SYS_renameat2,
@@ -514,17 +529,24 @@ async fn rename_no_overwrite(src: &Path, dest: &Path) -> std::io::Result<()> {
         }
     })
     .await
-    .map_err(std::io::Error::other)?
+    .map_err(std::io::Error::other)?;
+
+    match result {
+        Err(error)
+            if matches!(
+                error.raw_os_error(),
+                Some(libc::EINVAL) | Some(libc::ENOSYS)
+            ) =>
+        {
+            rename_no_overwrite_fallback(src, dest).await
+        }
+        result => result,
+    }
 }
 
 #[cfg(not(target_os = "linux"))]
 async fn rename_no_overwrite(src: &Path, dest: &Path) -> std::io::Result<()> {
-    match fs::symlink_metadata(dest).await {
-        Ok(_) => return Err(already_exists(dest)),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-        Err(e) => return Err(e),
-    }
-    fs::rename(src, dest).await
+    rename_no_overwrite_fallback(src, dest).await
 }
 
 /// Rename/move a file
@@ -846,6 +868,29 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn rename_no_overwrite_fallback_checks_destination_and_renames() {
+        let tmp = tempfile::tempdir().expect("create tempdir");
+        let src = tmp.path().join("src");
+        let dest = tmp.path().join("dest");
+        fs::write(&src, b"source").await.unwrap();
+        tokio::fs::symlink("missing-target", &dest).await.unwrap();
+
+        let error = rename_no_overwrite_fallback(&src, &dest)
+            .await
+            .expect_err("dangling symlink is an existing destination");
+        assert_eq!(error.kind(), std::io::ErrorKind::AlreadyExists);
+        assert!(fs::symlink_metadata(&dest).await.is_ok());
+        assert!(fs::metadata(&src).await.is_ok());
+
+        fs::remove_file(&dest).await.unwrap();
+        rename_no_overwrite_fallback(&src, &dest)
+            .await
+            .expect("missing destination is renamed");
+        assert_eq!(fs::read(&dest).await.unwrap(), b"source");
+        assert!(fs::metadata(&src).await.is_err());
+    }
+
+    #[tokio::test]
     async fn rename_no_overwrite_rejects_dangling_symlink() {
         let tmp = tempfile::tempdir().expect("create tempdir");
         let src = tmp.path().join("src");
@@ -873,6 +918,33 @@ mod tests {
         assert_eq!(errno, Some(i64::from(libc::EEXIST)));
         assert!(fs::symlink_metadata(&dest).await.is_ok());
         assert!(fs::metadata(&src).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn read_reports_total_file_size_with_partial_chunk() {
+        let tmp = tempfile::tempdir().expect("create tempdir");
+        let path = tmp.path().join("file");
+        fs::write(&path, b"0123456789").await.unwrap();
+
+        let result = read(msgpack_map! {
+            "path" => path_value(&path),
+            "offset" => 2u64,
+            "length" => 4u64,
+        })
+        .await
+        .expect("read partial chunk");
+
+        let field = |name: &str| {
+            result
+                .as_map()
+                .unwrap()
+                .iter()
+                .find(|(key, _)| key.as_str() == Some(name))
+                .map(|(_, value)| value.clone())
+        };
+        assert_eq!(field("content"), Some(Value::Binary(b"2345".to_vec())));
+        assert_eq!(field("size").and_then(|v| v.as_u64()), Some(4));
+        assert_eq!(field("file_size").and_then(|v| v.as_u64()), Some(10));
     }
 
     #[tokio::test]

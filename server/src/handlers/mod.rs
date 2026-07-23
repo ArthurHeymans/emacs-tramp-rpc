@@ -36,6 +36,7 @@ fn system_info() -> HandlerResult {
         "os" => std::env::consts::OS,
         "arch" => std::env::consts::ARCH,
         "watcher" => watcher_kind(),
+        "max_read_chunk_bytes" => io::MAX_FILE_READ_CHUNK_BYTES as u64,
         "hostname" => hostname(),
         "uid" => unsafe { libc::getuid() },
         "gid" => unsafe { libc::getgid() },

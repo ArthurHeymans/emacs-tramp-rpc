@@ -691,7 +691,20 @@ Signals `remote-file-error' on compressed payload decode failures."
       content)))
 
 (defconst tramp-rpc--file-read-chunk-size (* 16 1024 1024)
-  "Maximum bytes requested by one `file.read' RPC.")
+  "Default maximum bytes requested by one `file.read' RPC.")
+
+(defun tramp-rpc--read-chunk-size (vec)
+  "Return the maximum `file.read' request size advertised for VEC.
+Never exceed `tramp-rpc--file-read-chunk-size', which remains the fallback and
+can be let-bound by tests and callers that need smaller requests.  Only the
+system.info cached at connection setup is consulted; this never issues an RPC,
+so a flushed cache simply falls back to the default."
+  (let ((advertised
+         (alist-get 'max_read_chunk_bytes
+                    (tramp-rpc--cached-system-info vec))))
+    (if (and (integerp advertised) (> advertised 0))
+        (min advertised tramp-rpc--file-read-chunk-size)
+      tramp-rpc--file-read-chunk-size)))
 
 (defun tramp-rpc--file-read-params (localname &optional force-uncompressed)
   "Build params for `file.read' on LOCALNAME.
@@ -705,37 +718,76 @@ FORCE-UNCOMPRESSED is non-nil."
 
 (defun tramp-rpc--read-file-bytes
     (vec localname &optional beg end force-uncompressed)
-  "Read bytes from LOCALNAME on VEC in bounded RPC chunks.
-BEG and END are byte offsets.  When END is nil, read through end of file.
+  "Read bytes from LOCALNAME on VEC in bounded, pipelined RPC chunks.
+BEG and END are byte offsets.  The total length is fixed by END, or by the
+`file_size' snapshot the server reports with the first chunk when END is nil
+\(one `file.stat' fallback for servers without that field).  Concurrent
+appends are excluded; concurrent truncation can yield a short result.  If no
+size can be determined, only the first chunk is returned.
 FORCE-UNCOMPRESSED is passed to `tramp-rpc--file-read-params'."
-  (let ((offset (or beg 0))
-        (remaining (and end (- end (or beg 0))))
-        done)
-    (when (and remaining (< remaining 0))
+  (let* ((offset (or beg 0))
+         (chunk-size (tramp-rpc--read-chunk-size vec))
+         (requested (if end (min (- end offset) chunk-size) chunk-size)))
+    (when (< requested 0)
       (signal 'args-out-of-range (list beg end)))
-    (with-temp-buffer
-      (set-buffer-multibyte nil)
-      (while (not done)
-        (let* ((requested (if remaining
-                              (min remaining tramp-rpc--file-read-chunk-size)
-                            tramp-rpc--file-read-chunk-size))
-               (params (tramp-rpc--file-read-params
-                        localname force-uncompressed)))
-          (if (= requested 0)
-              (setq done t)
-            (push `(offset . ,offset) params)
-            (push `(length . ,requested) params)
-            (let* ((result (tramp-rpc--call vec "file.read" params))
-                   (content (tramp-rpc--extract-file-read-content result))
-                   (received (length content)))
-              (insert content)
-              (setq offset (+ offset received))
-              (when remaining
-                (setq remaining (- remaining received)))
-              (when (or (< received requested)
-                        (and remaining (= remaining 0)))
-                (setq done t))))))
-      (buffer-string))))
+    (if (= requested 0)
+        ""
+      (let* ((params (tramp-rpc--file-read-params localname force-uncompressed))
+             (_ (push `(offset . ,offset) params))
+             (_ (push `(length . ,requested) params))
+             (first-result (tramp-rpc--call vec "file.read" params))
+             (first (tramp-rpc--extract-file-read-content first-result))
+             (received (length first)))
+        ;; Keep the common one-chunk path to one RPC.  Only discover the total
+        ;; length after a completely full first chunk indicates more may exist.
+        (if (< received requested)
+            first
+          (let* ((total (if end
+                            (- end offset)
+                          ;; Fix the END-nil read length to one size snapshot:
+                          ;; prefer the fstat `file_size' the server sent with
+                          ;; the first chunk (no extra RPC); fall back to one
+                          ;; `file.stat' for older servers.
+                          (max 0 (- (or (alist-get 'file_size first-result)
+                                        (alist-get 'size
+                                                   (tramp-rpc--call-file-stat
+                                                    vec localname))
+                                         received)
+                                    offset))))
+                 (next-offset (+ offset received))
+                 (remaining (max 0 (- total received)))
+                 (pieces (list first))
+                 done)
+            (while (and (> remaining 0) (not done))
+              (let (requests sizes)
+                (dotimes (_ 3)
+                  (when (> remaining 0)
+                    (let ((size (min remaining chunk-size))
+                          (chunk-params
+                           (tramp-rpc--file-read-params
+                            localname force-uncompressed)))
+                      (push `(offset . ,next-offset) chunk-params)
+                      (push `(length . ,size) chunk-params)
+                      (push (cons "file.read" chunk-params) requests)
+                      (push size sizes)
+                      (setq next-offset (+ next-offset size)
+                            remaining (- remaining size)))))
+                (cl-mapc
+                 (lambda (result size)
+                   ;; A short chunk means the file shrank, so later offsets
+                   ;; are stale.  Discard trailing responses already received
+                   ;; in this batch; `done' also prevents later batches.
+                   (unless done
+                     (when (tramp-rpc--batch-error-p result)
+                       (tramp-rpc--signal-batch-error
+                        "file.read" localname result))
+                     (let ((content (tramp-rpc--extract-file-read-content result)))
+                       (push content pieces)
+                       (when (< (length content) size)
+                         (setq done t)))))
+                 (tramp-rpc--call-batch vec (nreverse requests))
+                 (nreverse sizes))))
+            (apply #'concat (nreverse pieces))))))))
 
 ;; ============================================================================
 ;; Connection management
@@ -2839,6 +2891,9 @@ network round-trip."
   "Return file type string from STAT, or nil."
   (and stat (alist-get 'type stat)))
 
+(defconst tramp-rpc--invalid-params-error-code -32602
+  "JSON-RPC error code for invalid request parameters.")
+
 (defun tramp-rpc--batch-error-p (value)
   "Return non-nil when VALUE is an error object from `tramp-rpc--call-batch'."
   (and (consp value) (plist-get value :error)))
@@ -3442,7 +3497,7 @@ as a no-op, so ignore the server's ENOENT mapping as well."
       (let (large-files small-files)
         (dolist (item (nreverse regulars))
           (if (> (or (alist-get 'size (cadr item)) 0)
-                 tramp-rpc--file-read-chunk-size)
+                 (tramp-rpc--read-chunk-size vec))
               (push item large-files)
             (push item small-files)))
         ;; Preserve the low-latency batch path for files that fit in one RPC.
@@ -3464,13 +3519,22 @@ as a no-op, so ignore the server's ENOENT mapping as well."
                              chunk))))
                 (cl-mapc
                  (lambda (item result)
-                   (when (tramp-rpc--batch-error-p result)
-                     (tramp-rpc--signal-batch-error
-                      "file.read" (file-name-concat localname (car item)) result))
-                   (tramp-rpc--write-local-trash-file
-                    (expand-file-name (car item) (file-name-as-directory dest))
-                    (tramp-rpc--extract-file-read-content result)
-                    (cadr item)))
+                   (let* ((path (file-name-concat localname (car item)))
+                          (content
+                           (if (and (tramp-rpc--batch-error-p result)
+                                    (= (plist-get result :error)
+                                       tramp-rpc--invalid-params-error-code))
+                               ;; The file may have grown beyond the advertised
+                               ;; limit since dir.list supplied its size.
+                               (tramp-rpc--read-file-bytes vec path nil nil t)
+                             (when (tramp-rpc--batch-error-p result)
+                               (tramp-rpc--signal-batch-error
+                                "file.read" path result))
+                             (tramp-rpc--extract-file-read-content result))))
+                     (tramp-rpc--write-local-trash-file
+                      (expand-file-name (car item) (file-name-as-directory dest))
+                      content
+                      (cadr item))))
                  chunk reads)))))
         ;; Large files are read in bounded chunks instead of failing the
         ;; optimized trash path at the server's per-request limit.
@@ -4261,9 +4325,13 @@ round-trips for the common non-VISIT case."
           (tramp-set-connection-property vec (concat "~" user) home)))))
   info)
 
+(defun tramp-rpc--cached-system-info (vec)
+  "Return the system.info cached for VEC, or nil.  Never issues an RPC."
+  (tramp-get-connection-property vec tramp-rpc--system-info-property nil))
+
 (defun tramp-rpc--system-info (vec)
   "Return cached system.info for VEC, fetching it at most once per connection."
-  (or (tramp-get-connection-property vec tramp-rpc--system-info-property nil)
+  (or (tramp-rpc--cached-system-info vec)
       (progn
         ;; Establishing a new connection already performs and caches a
         ;; `system.info' call as its readiness ping.  Re-check the property after
