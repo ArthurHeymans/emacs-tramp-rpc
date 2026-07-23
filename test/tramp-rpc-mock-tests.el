@@ -3868,6 +3868,31 @@ discard it for being unreadable."
       (should (equal (tramp-rpc--remote-path-environment vec)
                      '(("PATH" . "/login/bin:/custom/bin")))))))
 
+(ert-deftest tramp-rpc-mock-test-find-executable-uses-configured-remote-path ()
+  "Executable lookup must preserve `tramp-remote-path' ordering."
+  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
+  (let ((vec (make-tramp-file-name :method "rpc" :host "host" :user "user"
+                                   :localname "/")))
+    (cl-letf (((symbol-function 'tramp-rpc--get-remote-login-shell)
+               (lambda (_vec) "/bin/zsh"))
+              ((symbol-function 'tramp-rpc--remote-path-environment)
+               (lambda (_vec)
+                 '(("PATH" . "/tool/git/bin:/usr/bin"))))
+              ((symbol-function 'tramp-rpc--decode-output)
+               (lambda (output _encoding) output))
+              ((symbol-function 'tramp-rpc--call)
+               (lambda (_vec method params)
+                 (should (equal method "process.run"))
+                 (should (equal (alist-get 'cmd params) "/bin/zsh"))
+                 (should (equal (alist-get 'env params)
+                                '(("PATH" . "/tool/git/bin:/usr/bin"))))
+                 (should (equal (alist-get 'args params)
+                                ["-c" "command -v git"]))
+                 '((exit_code . 0)
+                   (stdout . "/tool/git/bin/git\n")))))
+      (should (equal (tramp-rpc--find-executable vec "git")
+                     "/tool/git/bin/git")))))
+
 (ert-deftest tramp-rpc-mock-test-fetch-remote-exec-path-ignores-banner ()
   "Test login shell PATH parsing ignores startup output before the marker."
   (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
