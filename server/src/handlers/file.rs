@@ -4,10 +4,12 @@ use crate::protocol::{FileAttributes, FileType, RpcError, from_value};
 use rmpv::Value;
 use serde::Deserialize;
 use std::collections::HashMap;
+use std::io::Read;
 use std::os::unix::fs::{FileTypeExt, MetadataExt};
 use std::path::Path;
-use std::process::Command;
+use std::process::{Command, Stdio};
 use std::sync::Mutex;
+use std::time::{Duration, Instant};
 use tokio::fs;
 
 use super::HandlerResult;
@@ -124,7 +126,10 @@ fn get_file_type(metadata: &std::fs::Metadata) -> FileType {
     }
 }
 
-static USER_NAMES: std::sync::LazyLock<Mutex<HashMap<u32, String>>> =
+/// Cache of uid -> resolved name. A cached `None` records a *failed*
+/// resolution so repeated lookups of an unknown uid neither re-enter the
+/// libc NSS call nor re-spawn `getent`.
+static USER_NAMES: std::sync::LazyLock<Mutex<HashMap<u32, Option<String>>>> =
     std::sync::LazyLock::new(|| Mutex::new(HashMap::new()));
 
 /// Initial buffer size hint from sysconf, or a reasonable default.
@@ -137,16 +142,62 @@ fn sysconf_bufsize(name: libc::c_int, fallback: usize) -> usize {
 /// Used for both getpwuid_r and getgrgid_r retry loops.
 const MAX_NSS_BUFSIZE: usize = 1024 * 1024;
 
+/// Maximum wall-clock time to wait for a `getent` fallback lookup before
+/// giving up. NSS backends (LDAP, SSSD) can hang indefinitely when the
+/// directory service is unreachable; without a bound this would stall
+/// attribute generation for every unresolved id.
+const GETENT_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// Poll interval while waiting for the child to exit.
+const GETENT_POLL_INTERVAL: Duration = Duration::from_millis(10);
+
+/// Resolve a uid/gid to a name via the `getent` command, used only as a
+/// fallback when the reentrant libc lookup fails.
+///
+/// The child runs on this (dedicated blocking) thread but is bounded by a
+/// finite deadline: if `getent` does not exit within `GETENT_TIMEOUT` the
+/// child is killed and `None` is returned, so a hung NSS backend can never
+/// block attribute generation indefinitely. The `Option`-based contract of
+/// the previous implementation is preserved.
 fn getent_name(database: &str, id: u32) -> Option<String> {
-    let output = Command::new("getent")
+    let mut child = Command::new("getent")
         .arg(database)
         .arg(id.to_string())
-        .output()
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
         .ok()?;
-    if !output.status.success() {
+
+    let deadline = Instant::now() + GETENT_TIMEOUT;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) => {
+                if Instant::now() >= deadline {
+                    // Deadline expired: terminate the child and give up.
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return None;
+                }
+                std::thread::sleep(GETENT_POLL_INTERVAL);
+            }
+            Err(_) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return None;
+            }
+        }
+    };
+
+    if !status.success() {
         return None;
     }
-    let line = std::str::from_utf8(&output.stdout).ok()?.lines().next()?;
+
+    let mut stdout = child.stdout.take()?;
+    let mut buf = Vec::new();
+    stdout.read_to_end(&mut buf).ok()?;
+    let line = std::str::from_utf8(&buf).ok()?.lines().next()?;
     let name = line.split(':').next()?;
     if name.is_empty() {
         None
@@ -170,7 +221,7 @@ pub fn get_user_name(uid: u32) -> Option<String> {
     {
         let cache = USER_NAMES.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(result) = cache.get(&uid) {
-            return Some(result.clone());
+            return result.clone();
         }
     }
 
@@ -206,16 +257,20 @@ pub fn get_user_name(uid: u32) -> Option<String> {
         break cname.to_str().ok().map(|s| s.to_string());
     };
 
-    // Re-acquire lock to insert into cache.
-    if let Some(ref n) = name {
+    // Re-acquire lock to cache the result -- including a failed (`None`)
+    // resolution, so an unknown uid is not looked up repeatedly.
+    {
         let mut cache = USER_NAMES.lock().unwrap_or_else(|e| e.into_inner());
-        cache.insert(uid, n.clone());
+        cache.insert(uid, name.clone());
     }
 
     name
 }
 
-static GROUP_NAMES: std::sync::LazyLock<Mutex<HashMap<u32, String>>> =
+/// Cache of gid -> resolved name. A cached `None` records a *failed*
+/// resolution so repeated lookups of an unknown gid neither re-enter the
+/// libc NSS call nor re-spawn `getent`.
+static GROUP_NAMES: std::sync::LazyLock<Mutex<HashMap<u32, Option<String>>>> =
     std::sync::LazyLock::new(|| Mutex::new(HashMap::new()));
 
 /// Get group name from gid using thread-safe getgrgid_r.
@@ -232,7 +287,7 @@ pub fn get_group_name(gid: u32) -> Option<String> {
     {
         let cache = GROUP_NAMES.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(result) = cache.get(&gid) {
-            return Some(result.clone());
+            return result.clone();
         }
     }
 
@@ -268,10 +323,11 @@ pub fn get_group_name(gid: u32) -> Option<String> {
         break cname.to_str().ok().map(|s| s.to_string());
     };
 
-    // Re-acquire lock to insert into cache.
-    if let Some(ref n) = name {
+    // Re-acquire lock to cache the result -- including a failed (`None`)
+    // resolution, so an unknown gid is not looked up repeatedly.
+    {
         let mut cache = GROUP_NAMES.lock().unwrap_or_else(|e| e.into_inner());
-        cache.insert(gid, n.clone());
+        cache.insert(gid, name.clone());
     }
 
     name

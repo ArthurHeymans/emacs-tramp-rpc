@@ -56,7 +56,7 @@ running "file-exists" and "file-read" benchmarks with rpc
     --eval '(tramp-rpc-benchmark-run-subset (quote ("file-exists" "file-read")) (quote ("rpc")))'
 ```
 
-# After changing rust code
+# Before pushing Rust changes
 After any changes to the rust source code, ALWAYS run `cargo fmt` and `cargo clippy` on the project. Fix any clippy or build warnings.
 
 # Before pushing Elisp changes
