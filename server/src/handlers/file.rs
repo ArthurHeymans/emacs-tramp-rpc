@@ -133,11 +133,22 @@ fn get_file_type(metadata: &std::fs::Metadata) -> FileType {
     }
 }
 
+/// Selects whether to resolve a user (uid) or group (gid) name.
+#[derive(Clone, Copy)]
+enum NssKind {
+    User,
+    Group,
+}
+
 /// Cache of uid -> resolved name. A cached `None` records a *definitive*
 /// miss (the uid is absent from all NSS databases). Transient failures
 /// (timeout, backend unavailable) are not cached so a later lookup can
 /// succeed once the directory service recovers.
 static USER_NAMES: std::sync::LazyLock<Mutex<HashMap<u32, Option<String>>>> =
+    std::sync::LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// Cache of gid -> resolved name. Same caching semantics as `USER_NAMES`.
+static GROUP_NAMES: std::sync::LazyLock<Mutex<HashMap<u32, Option<String>>>> =
     std::sync::LazyLock::new(|| Mutex::new(HashMap::new()));
 
 /// Initial buffer size hint from sysconf, or a reasonable default.
@@ -146,9 +157,10 @@ fn sysconf_bufsize(name: libc::c_int, fallback: usize) -> usize {
     if ret > 0 { ret as usize } else { fallback }
 }
 
-/// Maximum buffer size we will attempt before giving up (1 MiB).
-/// Used for both getpwuid_r and getgrgid_r retry loops.
-const MAX_NSS_BUFSIZE: usize = 1024 * 1024;
+/// Maximum buffer size we will attempt before giving up (64 KiB).
+/// Even large LDAP group records with many members stay well below this;
+/// if a record genuinely exceeds 64 KiB the getent fallback will handle it.
+const MAX_NSS_BUFSIZE: usize = 64 * 1024;
 
 /// Maximum wall-clock time to wait for a `getent` fallback lookup before
 /// giving up. NSS backends (LDAP, SSSD) can hang indefinitely when the
@@ -232,42 +244,79 @@ fn getent_name(database: &str, id: u32) -> Result<Option<String>, ()> {
     }
 }
 
-/// Get user name from uid using thread-safe getpwuid_r.
+/// Shared NSS name resolution for both uid and gid.
 ///
-/// Uses `sysconf(_SC_GETPW_R_SIZE_MAX)` for the initial buffer size and
-/// retries with a doubled buffer on `ERANGE`, which can happen when user
-/// records are served by LDAP or other NSS backends that return large
-/// entries.
-///
-/// The mutex is only held for cache lookups/inserts, not during the
-/// (potentially slow) NSS syscall, to avoid blocking other threads
-/// when the directory backend is slow.
-pub fn get_user_name(uid: u32) -> Option<String> {
+/// Uses `getpwuid_r` or `getgrgid_r` (selected by `kind`) with a
+/// sysconf-hinted buffer that doubles on `ERANGE`, falls back to `getent`
+/// on libc errors, and caches only definitive results so transient failures
+/// (timeout, backend unavailable) can be retried on a later lookup.
+fn resolve_nss_name(
+    cache: &'static Mutex<HashMap<u32, Option<String>>>,
+    kind: NssKind,
+    id: u32,
+) -> Option<String> {
     // Fast path: check cache under lock, release immediately.
     {
-        let cache = USER_NAMES.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(result) = cache.get(&uid) {
+        let c = cache.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(result) = c.get(&id) {
             return result.clone();
         }
     }
 
-    // Slow path: perform the syscall without holding the lock.
-    let init_size = sysconf_bufsize(libc::_SC_GETPW_R_SIZE_MAX, 1024);
-    let mut bufsize = init_size;
+    let (bufsize_hint, database) = match kind {
+        NssKind::User => (libc::_SC_GETPW_R_SIZE_MAX, "passwd"),
+        NssKind::Group => (libc::_SC_GETGR_R_SIZE_MAX, "group"),
+    };
+
+    let mut bufsize = sysconf_bufsize(bufsize_hint, 1024);
 
     let name_result: Result<Option<String>, ()> = loop {
         let mut buf = vec![0u8; bufsize];
-        let mut pwd: libc::passwd = unsafe { std::mem::zeroed() };
-        let mut result_ptr: *mut libc::passwd = std::ptr::null_mut();
 
-        let ret = unsafe {
-            libc::getpwuid_r(
-                uid,
-                &mut pwd,
-                buf.as_mut_ptr() as *mut libc::c_char,
-                buf.len(),
-                &mut result_ptr,
-            )
+        // Perform the appropriate libc call and extract (ret, name_string).
+        // The name pointer is converted to an owned String within the match
+        // arm while `buf` is still in scope, so no raw pointer escapes.
+        let (ret, result_null, name_str) = match kind {
+            NssKind::User => {
+                let mut pwd: libc::passwd = unsafe { std::mem::zeroed() };
+                let mut result_ptr: *mut libc::passwd = std::ptr::null_mut();
+                let ret = unsafe {
+                    libc::getpwuid_r(
+                        id,
+                        &mut pwd,
+                        buf.as_mut_ptr() as *mut libc::c_char,
+                        buf.len(),
+                        &mut result_ptr,
+                    )
+                };
+                let name_str = if !result_ptr.is_null() {
+                    let cname = unsafe { std::ffi::CStr::from_ptr(pwd.pw_name) };
+                    cname.to_str().ok().map(|s| s.to_string())
+                } else {
+                    None
+                };
+                (ret, result_ptr.is_null(), name_str)
+            }
+            NssKind::Group => {
+                let mut grp: libc::group = unsafe { std::mem::zeroed() };
+                let mut result_ptr: *mut libc::group = std::ptr::null_mut();
+                let ret = unsafe {
+                    libc::getgrgid_r(
+                        id,
+                        &mut grp,
+                        buf.as_mut_ptr() as *mut libc::c_char,
+                        buf.len(),
+                        &mut result_ptr,
+                    )
+                };
+                let name_str = if !result_ptr.is_null() {
+                    let cname = unsafe { std::ffi::CStr::from_ptr(grp.gr_name) };
+                    cname.to_str().ok().map(|s| s.to_string())
+                } else {
+                    None
+                };
+                (ret, result_ptr.is_null(), name_str)
+            }
         };
 
         if ret == libc::ERANGE && bufsize < MAX_NSS_BUFSIZE {
@@ -275,107 +324,38 @@ pub fn get_user_name(uid: u32) -> Option<String> {
             continue;
         }
 
-        if ret == 0 && result_ptr.is_null() {
-            // Definitive miss: uid is absent from all NSS databases libc
+        if ret == 0 && result_null {
+            // Definitive miss: id is absent from all NSS databases libc
             // can reach. No need to try getent.
             break Ok(None);
         }
 
         if ret != 0 {
             // libc error (backend unavailable, etc.): try getent fallback.
-            break getent_name("passwd", uid);
+            break getent_name(database, id);
         }
 
-        let cname = unsafe { std::ffi::CStr::from_ptr(pwd.pw_name) };
-        break Ok(cname.to_str().ok().map(|s| s.to_string()));
+        break Ok(name_str);
     };
 
     // Cache only definitive results. Transient failures (Err) are not
     // cached so a later lookup can succeed once the service recovers.
     match name_result {
         Ok(name) => {
-            let mut cache = USER_NAMES.lock().unwrap_or_else(|e| e.into_inner());
-            cache.insert(uid, name.clone());
+            let mut c = cache.lock().unwrap_or_else(|e| e.into_inner());
+            c.insert(id, name.clone());
             name
         }
         Err(()) => None,
     }
 }
 
-/// Cache of gid -> resolved name. A cached `None` records a *definitive*
-/// miss (the gid is absent from all NSS databases). Transient failures
-/// (timeout, backend unavailable) are not cached so a later lookup can
-/// succeed once the directory service recovers.
-static GROUP_NAMES: std::sync::LazyLock<Mutex<HashMap<u32, Option<String>>>> =
-    std::sync::LazyLock::new(|| Mutex::new(HashMap::new()));
+pub fn get_user_name(uid: u32) -> Option<String> {
+    resolve_nss_name(&USER_NAMES, NssKind::User, uid)
+}
 
-/// Get group name from gid using thread-safe getgrgid_r.
-///
-/// Uses `sysconf(_SC_GETGR_R_SIZE_MAX)` for the initial buffer size and
-/// retries with a doubled buffer on `ERANGE`, which can happen when group
-/// records are served by LDAP or other NSS backends that return large
-/// entries (e.g. groups with many members).
-///
-/// The mutex is only held for cache lookups/inserts, not during the
-/// (potentially slow) NSS syscall.
 pub fn get_group_name(gid: u32) -> Option<String> {
-    // Fast path: check cache under lock, release immediately.
-    {
-        let cache = GROUP_NAMES.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(result) = cache.get(&gid) {
-            return result.clone();
-        }
-    }
-
-    // Slow path: perform the syscall without holding the lock.
-    let init_size = sysconf_bufsize(libc::_SC_GETGR_R_SIZE_MAX, 1024);
-    let mut bufsize = init_size;
-
-    let name_result: Result<Option<String>, ()> = loop {
-        let mut buf = vec![0u8; bufsize];
-        let mut grp: libc::group = unsafe { std::mem::zeroed() };
-        let mut result_ptr: *mut libc::group = std::ptr::null_mut();
-
-        let ret = unsafe {
-            libc::getgrgid_r(
-                gid,
-                &mut grp,
-                buf.as_mut_ptr() as *mut libc::c_char,
-                buf.len(),
-                &mut result_ptr,
-            )
-        };
-
-        if ret == libc::ERANGE && bufsize < MAX_NSS_BUFSIZE {
-            bufsize = bufsize.saturating_mul(2).min(MAX_NSS_BUFSIZE);
-            continue;
-        }
-
-        if ret == 0 && result_ptr.is_null() {
-            // Definitive miss: gid is absent from all NSS databases libc
-            // can reach. No need to try getent.
-            break Ok(None);
-        }
-
-        if ret != 0 {
-            // libc error (backend unavailable, etc.): try getent fallback.
-            break getent_name("group", gid);
-        }
-
-        let cname = unsafe { std::ffi::CStr::from_ptr(grp.gr_name) };
-        break Ok(cname.to_str().ok().map(|s| s.to_string()));
-    };
-
-    // Cache only definitive results. Transient failures (Err) are not
-    // cached so a later lookup can succeed once the service recovers.
-    match name_result {
-        Ok(name) => {
-            let mut cache = GROUP_NAMES.lock().unwrap_or_else(|e| e.into_inner());
-            cache.insert(gid, name.clone());
-            name
-        }
-        Err(()) => None,
-    }
+    resolve_nss_name(&GROUP_NAMES, NssKind::Group, gid)
 }
 
 pub fn map_io_error(err: std::io::Error, path: &str) -> RpcError {
