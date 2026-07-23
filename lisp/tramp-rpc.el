@@ -1015,33 +1015,25 @@ Results are cached per connection."
            (or found program)))))))
 
 (defun tramp-rpc--find-executable (vec program)
-  "Find PROGRAM in the remote PATH on VEC.
-Returns the absolute path or nil.
-Uses `command -v` via the user's login shell for lookup, so that
-executables in shell-specific PATH entries are found.
-Uses a unique marker to separate MOTD/banner text from actual output,
-following the pattern used by standard TRAMP."
+  "Find PROGRAM in the configured remote PATH on VEC.
+Returns the absolute path or nil."
   (condition-case err
-      (let* (;; Use a unique marker (MD5 hash) to delimit output from MOTD text
-             ;; This is the same approach used by tramp-sh.el
-             (marker (md5 (format "tramp-rpc-%s-%s" program (float-time))))
-             (shell (tramp-rpc--get-remote-login-shell vec))
-             (result (tramp-rpc--call vec "process.run"
-                                       `((cmd . ,shell)
-                                         (args . ["-l" "-c"
-                                                  ,(format "echo %s; command -v %s"
-                                                            marker (tramp-shell-quote-argument program))])
-                                         (cwd . "/"))))
+      (let* ((shell (tramp-rpc--get-remote-login-shell vec))
+             (result (tramp-rpc--call
+                      vec "process.run"
+                      `((cmd . ,shell)
+                        (args . ["-c" ,(format "command -v %s"
+                                               (tramp-shell-quote-argument program))])
+                        (cwd . "/")
+                        (env . ,(tramp-rpc--remote-path-environment vec)))))
              (exit-code (alist-get 'exit_code result))
              (stdout (tramp-rpc--decode-output
                       (alist-get 'stdout result)
-                      (alist-get 'stdout_encoding result))))
-        (when (and (eq exit-code 0) (> (length stdout) 0))
-          ;; Find the marker and extract the path after it
-          (when (string-match (concat (regexp-quote marker) "\n\\([^\n]+\\)") stdout)
-            (let ((path (string-trim (match-string 1 stdout))))
-              (when (string-prefix-p "/" path)
-                path)))))
+                      (alist-get 'stdout_encoding result)))
+             (path (string-trim stdout)))
+        (and (eq exit-code 0)
+             (string-prefix-p "/" path)
+             path))
     (error
      (tramp-rpc--debug "find-executable failed for %s: %S" program err)
      nil)))
