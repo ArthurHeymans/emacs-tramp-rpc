@@ -235,6 +235,7 @@ This is called from `tramp-multi-hop-p-hook'."
 ;; Silence byte-compiler warnings for functions defined in with-eval-after-load
 (declare-function tramp-add-external-operation "tramp")
 (declare-function tramp-remove-external-operation "tramp")
+(declare-function tramp-handle-insert-directory "tramp")
 (declare-function dired-compress-file "dired-aux")
 (declare-function tramp-rpc--sudo-file-name-p "tramp-rpc")
 (declare-function tramp-rpc-multi-hop-p "tramp-rpc")
@@ -2646,8 +2647,24 @@ so a single RPC can both validate and list the directory."
         (setq entries (seq-take entries count)))
       entries)))
 
+;; Declared in ls-lisp.el; dynamically rebound for rpc dired formatting.
+(defvar ls-lisp-format-time-list)
+(defvar ls-lisp-use-localized-time-format)
 ;; Declared in Tramp 2.8.1.3+; forward-declare so byte compiler treats it as dynamic.
 (defvar tramp-fnac-add-trailing-slash)
+
+(defun tramp-rpc-handle-insert-directory
+    (filename switches &optional wildcard full-directory-p)
+  "Like `insert-directory' for TRAMP-RPC files.
+Use `ls-lisp' via TRAMP, but force GNU ls-like date strings so rpc dired
+matches ssh dired output style."
+  ;; `ls-lisp-format-time-list' is honored only for the C/POSIX locale unless
+  ;; `ls-lisp-use-localized-time-format' is non-nil; force it so the GNU-style
+  ;; format applies regardless of the local locale.
+  (let ((ls-lisp-format-time-list '("%b %e %H:%M" "%b %e  %Y"))
+        (ls-lisp-use-localized-time-format t))
+    (tramp-handle-insert-directory
+     filename switches wildcard full-directory-p)))
 
 (defun tramp-rpc-handle-file-name-all-completions (filename directory)
   "Like `file-name-all-completions' for TRAMP-RPC files."
@@ -4858,7 +4875,7 @@ Also controls process exit detection latency."
     (make-directory . tramp-rpc-handle-make-directory)
     (delete-directory . tramp-rpc-handle-delete-directory)
     (dired-compress-file . tramp-rpc-handle-dired-compress-file)
-    (insert-directory . tramp-handle-insert-directory)
+    (insert-directory . tramp-rpc-handle-insert-directory)
     (copy-directory . tramp-rpc-handle-copy-directory)
 
     ;; =========================================================================

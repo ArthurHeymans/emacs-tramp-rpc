@@ -56,6 +56,9 @@ running "file-exists" and "file-read" benchmarks with rpc
     --eval '(tramp-rpc-benchmark-run-subset (quote ("file-exists" "file-read")) (quote ("rpc")))'
 ```
 
+# Before pushing Rust changes
+After any changes to the rust source code, ALWAYS run `cargo fmt` and `cargo clippy` on the project. Fix any clippy or build warnings.
+
 # Before pushing Elisp changes
 
 Always byte-compile all `.el` files before pushing to catch cross-module reference errors that CI will fail on. The project uses `byte-compile-error-on-warn`, so any missing `declare-function` for cross-module calls will fail the build.
