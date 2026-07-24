@@ -157,11 +157,6 @@ fn sysconf_bufsize(name: libc::c_int, fallback: usize) -> usize {
     if ret > 0 { ret as usize } else { fallback }
 }
 
-/// Maximum buffer size we will attempt before giving up (64 KiB).
-/// Even large LDAP group records with many members stay well below this;
-/// if a record genuinely exceeds 64 KiB the getent fallback will handle it.
-const MAX_NSS_BUFSIZE: usize = 64 * 1024;
-
 /// Maximum wall-clock time to wait for a `getent` fallback lookup before
 /// giving up. NSS backends (LDAP, SSSD) can hang indefinitely when the
 /// directory service is unreachable; without a bound this would stall
@@ -246,10 +241,10 @@ fn getent_name(database: &str, id: u32) -> Result<Option<String>, ()> {
 
 /// Shared NSS name resolution for both uid and gid.
 ///
-/// Uses `getpwuid_r` or `getgrgid_r` (selected by `kind`) with a
-/// sysconf-hinted buffer that doubles on `ERANGE`, falls back to `getent`
-/// on libc errors, and caches only definitive results so transient failures
-/// (timeout, backend unavailable) can be retried on a later lookup.
+/// Tries `getpwuid_r`/`getgrgid_r` once with a sysconf-hinted buffer.
+/// On `ERANGE` or any other libc error, falls back to `getent` — which
+/// reads stdout without a buffer limit and already handles the record.
+/// Caches only definitive results so transient failures can be retried.
 fn resolve_nss_name(
     cache: &'static Mutex<HashMap<u32, Option<String>>>,
     kind: NssKind,
@@ -268,74 +263,62 @@ fn resolve_nss_name(
         NssKind::Group => (libc::_SC_GETGR_R_SIZE_MAX, "group"),
     };
 
-    let mut bufsize = sysconf_bufsize(bufsize_hint, 1024);
+    let bufsize = sysconf_bufsize(bufsize_hint, 1024);
+    let mut buf = vec![0u8; bufsize];
 
-    let name_result: Result<Option<String>, ()> = loop {
-        let mut buf = vec![0u8; bufsize];
-
-        // Perform the appropriate libc call and extract (ret, name_string).
-        // The name pointer is converted to an owned String within the match
-        // arm while `buf` is still in scope, so no raw pointer escapes.
-        let (ret, result_null, name_str) = match kind {
-            NssKind::User => {
-                let mut pwd: libc::passwd = unsafe { std::mem::zeroed() };
-                let mut result_ptr: *mut libc::passwd = std::ptr::null_mut();
-                let ret = unsafe {
-                    libc::getpwuid_r(
-                        id,
-                        &mut pwd,
-                        buf.as_mut_ptr() as *mut libc::c_char,
-                        buf.len(),
-                        &mut result_ptr,
-                    )
-                };
-                let name_str = if !result_ptr.is_null() {
-                    let cname = unsafe { std::ffi::CStr::from_ptr(pwd.pw_name) };
-                    cname.to_str().ok().map(|s| s.to_string())
-                } else {
-                    None
-                };
-                (ret, result_ptr.is_null(), name_str)
-            }
-            NssKind::Group => {
-                let mut grp: libc::group = unsafe { std::mem::zeroed() };
-                let mut result_ptr: *mut libc::group = std::ptr::null_mut();
-                let ret = unsafe {
-                    libc::getgrgid_r(
-                        id,
-                        &mut grp,
-                        buf.as_mut_ptr() as *mut libc::c_char,
-                        buf.len(),
-                        &mut result_ptr,
-                    )
-                };
-                let name_str = if !result_ptr.is_null() {
-                    let cname = unsafe { std::ffi::CStr::from_ptr(grp.gr_name) };
-                    cname.to_str().ok().map(|s| s.to_string())
-                } else {
-                    None
-                };
-                (ret, result_ptr.is_null(), name_str)
-            }
-        };
-
-        if ret == libc::ERANGE && bufsize < MAX_NSS_BUFSIZE {
-            bufsize = bufsize.saturating_mul(2).min(MAX_NSS_BUFSIZE);
-            continue;
+    // Perform the appropriate libc call. The name pointer is converted to
+    // an owned String while `buf` is still in scope so no raw pointer escapes.
+    let (ret, result_null, name_str) = match kind {
+        NssKind::User => {
+            let mut pwd: libc::passwd = unsafe { std::mem::zeroed() };
+            let mut result_ptr: *mut libc::passwd = std::ptr::null_mut();
+            let ret = unsafe {
+                libc::getpwuid_r(
+                    id,
+                    &mut pwd,
+                    buf.as_mut_ptr() as *mut libc::c_char,
+                    buf.len(),
+                    &mut result_ptr,
+                )
+            };
+            let name_str = if !result_ptr.is_null() {
+                let cname = unsafe { std::ffi::CStr::from_ptr(pwd.pw_name) };
+                cname.to_str().ok().map(|s| s.to_string())
+            } else {
+                None
+            };
+            (ret, result_ptr.is_null(), name_str)
         }
-
-        if ret == 0 && result_null {
-            // Definitive miss: id is absent from all NSS databases libc
-            // can reach. No need to try getent.
-            break Ok(None);
+        NssKind::Group => {
+            let mut grp: libc::group = unsafe { std::mem::zeroed() };
+            let mut result_ptr: *mut libc::group = std::ptr::null_mut();
+            let ret = unsafe {
+                libc::getgrgid_r(
+                    id,
+                    &mut grp,
+                    buf.as_mut_ptr() as *mut libc::c_char,
+                    buf.len(),
+                    &mut result_ptr,
+                )
+            };
+            let name_str = if !result_ptr.is_null() {
+                let cname = unsafe { std::ffi::CStr::from_ptr(grp.gr_name) };
+                cname.to_str().ok().map(|s| s.to_string())
+            } else {
+                None
+            };
+            (ret, result_ptr.is_null(), name_str)
         }
+    };
 
-        if ret != 0 {
-            // libc error (backend unavailable, etc.): try getent fallback.
-            break getent_name(database, id);
-        }
-
-        break Ok(name_str);
+    let name_result: Result<Option<String>, ()> = if ret == 0 && result_null {
+        Ok(None) // definitive miss: id absent from all NSS databases libc can reach
+    } else if ret == 0 {
+        Ok(name_str)
+    } else {
+        // ERANGE (buffer too small) or any other libc error: getent reads
+        // stdout without a size limit so it handles oversized records too.
+        getent_name(database, id)
     };
 
     // Cache only definitive results. Transient failures (Err) are not
