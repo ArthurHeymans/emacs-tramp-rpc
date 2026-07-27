@@ -280,7 +280,7 @@ pub async fn read(params: Value) -> HandlerResult {
 
     // Check if process has exited.  Reacquire the map briefly; do not hold it
     // across any await points above.
-    let exit_status = {
+    let mut exit_status = {
         let mut processes = get_process_map().lock().await;
         let managed = processes
             .get_mut(&params.pid)
@@ -288,6 +288,27 @@ pub async fn read(params: Value) -> HandlerResult {
         poll_exit_status(managed)
             .map_err(|e| RpcError::process_error(format!("Failed to query process status: {e}")))?
     };
+
+    // When both pipes are at EOF the child has already closed all its file
+    // descriptors, which means it has exited (or is in the act of exiting).
+    // There is a tiny race on Linux between the child closing its fds and
+    // the kernel updating its wait table: try_wait() may return None for a
+    // brief window even though the pipes are done.  Yield to the runtime a
+    // few times so it can process the SIGCHLD notification, then retry.
+    if exit_status.is_none() && stdout_eof && stderr_eof {
+        for _ in 0..5 {
+            tokio::task::yield_now().await;
+            let mut processes = get_process_map().lock().await;
+            if let Some(managed) = processes.get_mut(&params.pid) {
+                exit_status = poll_exit_status(managed).map_err(|e| {
+                    RpcError::process_error(format!("Failed to query process status: {e}"))
+                })?;
+                if exit_status.is_some() {
+                    break;
+                }
+            }
+        }
+    }
 
     // Child exit and pipe EOF are separate events.  A child can exit after a
     // read returns data while additional bytes are still buffered in either
