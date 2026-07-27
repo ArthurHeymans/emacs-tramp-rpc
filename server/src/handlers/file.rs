@@ -171,6 +171,32 @@ const GETENT_TIMEOUT: Duration = Duration::from_secs(2);
 /// Poll interval while waiting for the child to exit.
 const GETENT_POLL_INTERVAL: Duration = Duration::from_millis(10);
 
+/// Maximum time to wait for the reader thread to finish after killing the child.
+/// Bounds `reader.join()` in case an orphaned process inherited the pipe write-end.
+const GETENT_READER_TIMEOUT: Duration = Duration::from_millis(500);
+
+/// Join the reader thread with a bounded timeout.
+///
+/// After `child.kill()` + `child.wait()` the direct child's write-end of the
+/// pipe is closed, but an orphaned subprocess that inherited the fd would keep
+/// `read_to_end` (and therefore `join`) blocked forever.  We poll
+/// `is_finished` for up to `GETENT_READER_TIMEOUT`; if it doesn't complete we
+/// leak the thread (it will eventually unblock once the orphan exits or the
+/// pipe is otherwise closed).
+fn bounded_join_reader(reader: std::thread::JoinHandle<Vec<u8>>) {
+    let deadline = Instant::now() + GETENT_READER_TIMEOUT;
+    loop {
+        if reader.is_finished() {
+            let _ = reader.join();
+            return;
+        }
+        if Instant::now() >= deadline {
+            return; // leak thread; unblocks once all pipe write-ends close
+        }
+        std::thread::sleep(GETENT_POLL_INTERVAL);
+    }
+}
+
 /// Resolve a uid/gid to a name via the `getent` command, used only as a
 /// fallback when the reentrant libc lookup fails.
 ///
@@ -212,7 +238,7 @@ fn getent_name(database: &str, id: u32) -> Result<Option<String>, ()> {
                     // Deadline expired: terminate the child and give up.
                     let _ = child.kill();
                     let _ = child.wait();
-                    let _ = reader.join();
+                    bounded_join_reader(reader);
                     return Err(()); // transient: timeout
                 }
                 std::thread::sleep(GETENT_POLL_INTERVAL);
@@ -220,7 +246,7 @@ fn getent_name(database: &str, id: u32) -> Result<Option<String>, ()> {
             Err(_) => {
                 let _ = child.kill();
                 let _ = child.wait();
-                let _ = reader.join();
+                bounded_join_reader(reader);
                 return Err(()); // transient: I/O error on try_wait
             }
         }
