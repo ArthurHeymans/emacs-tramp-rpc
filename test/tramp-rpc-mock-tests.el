@@ -867,6 +867,10 @@ This matches the behavior expected by `tramp-test28-process-file'."
 (declare-function tramp-rpc-magit--file-exists-in-ancestor-scan
                   "tramp-rpc-magit" (filename scan))
 (declare-function tramp-rpc-magit--get-cache-key "tramp-rpc-magit" (vec directory))
+(declare-function tramp-rpc-magit--prefetch-git-commands
+                  "tramp-rpc-magit" (directory &optional vec))
+(declare-function tramp-rpc-magit--git-command-entry
+                  "tramp-rpc-magit" (directory args &optional vec))
 (declare-function tramp-rpc-magit--process-cache-key "tramp-rpc-magit" (&rest args))
 (declare-function tramp-rpc-magit--process-cache-lookup "tramp-rpc-magit" (program args))
 (declare-function tramp-rpc-magit--process-cache-store "tramp-rpc-magit" (program args exit-code stdout))
@@ -3883,7 +3887,10 @@ discard it for being unreadable."
               ((symbol-function 'tramp-rpc--call)
                (lambda (_vec method params)
                  (should (equal method "process.run"))
-                 (should (equal (alist-get 'cmd params) "/bin/zsh"))
+                 ;; Lookup must not go through the user's login shell: a
+                 ;; non-POSIX shell has no `command -v', and zsh reads
+                 ;; .zshenv even for non-interactive -c invocations.
+                 (should (equal (alist-get 'cmd params) "/bin/sh"))
                  (should (equal (alist-get 'env params)
                                 '(("PATH" . "/tool/git/bin:/usr/bin"))))
                  (should (equal (alist-get 'args params)
@@ -3891,6 +3898,54 @@ discard it for being unreadable."
                  '((exit_code . 0)
                    (stdout . "/tool/git/bin/git\n")))))
       (should (equal (tramp-rpc--find-executable vec "git")
+                     "/tool/git/bin/git")))))
+
+(ert-deftest tramp-rpc-mock-test-find-executable-rejects-noisy-output ()
+  "Shell startup noise must not be mistaken for an executable path."
+  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
+  (let ((vec (make-tramp-file-name :method "rpc" :host "host" :user "user"
+                                   :localname "/")))
+    (dolist (stdout '("/etc/profile: some warning\n/tool/git/bin/git\n"
+                      "git: aliased to hub\n"
+                      "\n"))
+      (cl-letf (((symbol-function 'tramp-rpc--remote-path-environment)
+                 (lambda (_vec) '(("PATH" . "/tool/git/bin:/usr/bin"))))
+                ((symbol-function 'tramp-rpc--decode-output)
+                 (lambda (output _encoding) output))
+                ((symbol-function 'tramp-rpc--call)
+                 (lambda (_vec _method _params)
+                   `((exit_code . 0) (stdout . ,stdout)))))
+        (should-not (tramp-rpc--find-executable vec "git"))))))
+
+(ert-deftest tramp-rpc-mock-test-magit-prefetch-uses-resolved-git ()
+  "Magit prefetch must run the git found on the configured remote PATH.
+`commands.run_parallel' has no environment support, so the program name
+itself has to carry the resolution."
+  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
+  (skip-unless tramp-rpc-mock-test--tramp-rpc-magit-loaded)
+  (let ((vec (make-tramp-file-name :method "rpc" :host "host" :user "user"
+                                   :localname "/")))
+    (cl-letf (((symbol-function 'tramp-rpc--resolve-executable)
+               (lambda (_vec program)
+                 (should (equal program "git"))
+                 "/tool/git/bin/git")))
+      ;; Full status prefetch.
+      (let ((entries (append (tramp-rpc-magit--prefetch-git-commands
+                              "/home/user/repo/" vec)
+                             nil)))
+        (should entries)
+        (let ((git-entries (seq-filter
+                            (lambda (e)
+                              (not (string-prefix-p "state_file:"
+                                                    (alist-get 'key e))))
+                            entries)))
+          (should git-entries)
+          (dolist (entry git-entries)
+            (should (equal (alist-get 'cmd entry) "/tool/git/bin/git")))))
+      ;; Incremental entries (dynamic status, file sections).
+      (should (equal (alist-get 'cmd (tramp-rpc-magit--git-command-entry
+                                      "/home/user/repo/" '("rev-parse" "HEAD")
+                                      vec))
                      "/tool/git/bin/git")))))
 
 (ert-deftest tramp-rpc-mock-test-fetch-remote-exec-path-ignores-banner ()

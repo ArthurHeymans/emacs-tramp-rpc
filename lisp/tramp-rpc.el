@@ -1017,12 +1017,18 @@ Results are cached per connection."
 
 (defun tramp-rpc--find-executable (vec program)
   "Find PROGRAM in the configured remote PATH on VEC.
-Returns the absolute path or nil."
+Returns the absolute path or nil.
+
+Lookup runs `command -v' under \"/bin/sh\" rather than the user's login
+shell: the PATH to search is supplied explicitly via the environment, so
+the login shell adds nothing but risk.  Non-POSIX login shells (csh, tcsh,
+fish) do not implement `command -v' with these semantics, and shells such
+as zsh still read startup files (.zshenv) for non-interactive `-c'
+invocations, which could both rewrite PATH and print output."
   (condition-case err
-      (let* ((shell (tramp-rpc--get-remote-login-shell vec))
-             (result (tramp-rpc--call
+      (let* ((result (tramp-rpc--call
                       vec "process.run"
-                      `((cmd . ,shell)
+                      `((cmd . "/bin/sh")
                         (args . ["-c" ,(format "command -v %s"
                                                (tramp-shell-quote-argument program))])
                         (cwd . "/")
@@ -1031,8 +1037,14 @@ Returns the absolute path or nil."
              (stdout (tramp-rpc--decode-output
                       (alist-get 'stdout result)
                       (alist-get 'stdout_encoding result)))
-             (path (string-trim stdout)))
+             ;; Accept only a single absolute path: shell startup noise or a
+             ;; `command -v' result naming a builtin/alias must not be taken
+             ;; for an executable.
+             (lines (and (stringp stdout)
+                         (split-string (string-trim stdout) "\n" t "[ \t\r]+")))
+             (path (and (= (length lines) 1) (car lines))))
         (and (eq exit-code 0)
+             path
              (string-prefix-p "/" path)
              path))
     (error
