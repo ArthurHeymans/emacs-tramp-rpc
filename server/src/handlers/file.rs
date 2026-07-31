@@ -351,9 +351,9 @@ fn resolve_nss_name(
         }
 
         if ret == 0 && result_null {
-            // Definitive miss: id is absent from all NSS databases libc
-            // can reach. No need to try getent.
-            break Ok(None);
+            // Some NSS stacks can report a libc miss here while
+            // `getent` still resolves through another backend.
+            break getent_name(database, id);
         }
 
         if ret != 0 {
