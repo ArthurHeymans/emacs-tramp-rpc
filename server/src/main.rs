@@ -1080,6 +1080,51 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_commands_run_parallel_uses_batch_environment_for_lookup() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir().expect("temporary command directory");
+        let bin = temp.path().join("bin");
+        std::fs::create_dir(&bin).expect("create command directory");
+        let program = bin.join("path-probe");
+        std::fs::write(&program, "#!/bin/sh\nprintf selected").expect("write command");
+        let mut permissions = std::fs::metadata(&program)
+            .expect("command metadata")
+            .permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&program, permissions).expect("make command executable");
+
+        let command = Value::Map(vec![
+            (Value::String("key".into()), Value::String("probe".into())),
+            (
+                Value::String("cmd".into()),
+                Value::String("path-probe".into()),
+            ),
+        ]);
+        let result = handlers::commands::run_parallel(Value::Map(vec![
+            (
+                Value::String("commands".into()),
+                Value::Array(vec![command]),
+            ),
+            (
+                Value::String("env".into()),
+                Value::Map(vec![(
+                    Value::String("PATH".into()),
+                    Value::String(bin.to_string_lossy().into_owned().into()),
+                )]),
+            ),
+        ]))
+        .await
+        .unwrap();
+        let entry = map_get(&result, "probe").unwrap();
+        assert_eq!(
+            map_get(entry, "stdout"),
+            Some(&Value::Binary(b"selected".to_vec()))
+        );
+        assert_eq!(map_get(entry, "exit_code").and_then(Value::as_i64), Some(0));
+    }
+
+    #[tokio::test]
     async fn test_commands_run_parallel_stdin() {
         let command = Value::Map(vec![
             (Value::String("key".into()), Value::String("cat".into())),

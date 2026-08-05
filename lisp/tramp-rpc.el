@@ -974,27 +974,6 @@ Otherwise clear all entries."
     (clrhash tramp-rpc--direnv-cache)
     (clrhash tramp-rpc--direnv-available-cache)))
 
-(defvar tramp-rpc--executable-cache (make-hash-table :test 'equal)
-  "Cache of executable paths keyed by (connection-key . program).
-Value is the full path or :not-found.")
-
-(defun tramp-rpc--clear-executable-cache (&optional vec)
-  "Clear the executable cache.
-If VEC is provided, only clear entries for that connection.
-Otherwise clear all entries."
-  (if vec
-      (let ((conn-key (tramp-rpc--connection-key vec))
-            (keys-to-remove nil))
-        ;; Collect keys first (can't modify hash table during maphash)
-        (maphash (lambda (key _value)
-                   (when (equal (car key) conn-key)
-                     (push key keys-to-remove)))
-                 tramp-rpc--executable-cache)
-        ;; Now remove them
-        (dolist (key keys-to-remove)
-          (remhash key tramp-rpc--executable-cache)))
-    (clrhash tramp-rpc--executable-cache)))
-
 ;; Forward-declare caches used by tramp-rpc--remove-connection (defined
 ;; later in the exec-path section).  The byte-compiler needs to see
 ;; these defvars before their first reference.
@@ -1114,57 +1093,18 @@ by `with-environment-variables') are returned as an alist of
         (push (cons (match-string 1 elt) (match-string 2 elt)) env)))
     (nreverse env)))
 
-(defun tramp-rpc--resolve-executable (vec program)
-  "Resolve PROGRAM to its full path on VEC.
-Returns the full path if found, otherwise the original PROGRAM.
-Results are cached per connection."
-  (if (file-name-absolute-p program)
-      program
-    (let* ((cache-key (cons (tramp-rpc--connection-key vec) program))
-           (cached (gethash cache-key tramp-rpc--executable-cache)))
-      (cond
-       ((stringp cached) cached)  ; Cached full path
-       ((eq cached :not-found) program)  ; Known not found, use original
-       (t  ; Not cached, look it up
-        (let ((found (tramp-rpc--find-executable vec program)))
-          (puthash cache-key (or found :not-found) tramp-rpc--executable-cache)
-           (or found program)))))))
-
-(defun tramp-rpc--find-executable (vec program)
-  "Find PROGRAM in the configured remote PATH on VEC.
-Returns the absolute path or nil.
-
-Lookup runs `command -v' under \"/bin/sh\" rather than the user's login
-shell: the PATH to search is supplied explicitly via the environment, so
-the login shell adds nothing but risk.  Non-POSIX login shells (csh, tcsh,
-fish) do not implement `command -v' with these semantics, and shells such
-as zsh still read startup files (.zshenv) for non-interactive `-c'
-invocations, which could both rewrite PATH and print output."
-  (condition-case err
-      (let* ((result (tramp-rpc--call
-                      vec "process.run"
-                      `((cmd . "/bin/sh")
-                        (args . ["-c" ,(format "command -v %s"
-                                               (tramp-shell-quote-argument program))])
-                        (cwd . "/")
-                        (env . ,(tramp-rpc--remote-path-environment vec)))))
-             (exit-code (alist-get 'exit_code result))
-             (stdout (tramp-rpc--decode-output
-                      (alist-get 'stdout result)
-                      (alist-get 'stdout_encoding result)))
-             ;; Accept only a single absolute path: shell startup noise or a
-             ;; `command -v' result naming a builtin/alias must not be taken
-             ;; for an executable.
-             (lines (and (stringp stdout)
-                         (split-string (string-trim stdout) "\n" t "[ \t\r]+")))
-             (path (and (= (length lines) 1) (car lines))))
-        (and (eq exit-code 0)
-             path
-             (string-prefix-p "/" path)
-             path))
-    (error
-     (tramp-rpc--debug "find-executable failed for %s: %S" program err)
-     nil)))
+(defun tramp-rpc--process-environment (vec localname)
+  "Return the effective child environment for LOCALNAME on VEC.
+The configured remote PATH is the baseline.  Dynamic TRAMP environment,
+EMACSCLIENT_TRAMP, direnv, and caller overrides are merged in that order, so
+later and more specific values replace earlier ones."
+  (tramp-rpc--ensure-inside-emacs-env
+   (tramp-rpc--merge-environments
+    (tramp-rpc--remote-path-environment vec)
+    (tramp-rpc--tramp-remote-process-environment)
+    (tramp-rpc--emacsclient-tramp-environment vec)
+    (tramp-rpc--get-direnv-environment vec localname)
+    (tramp-rpc--caller-environment))))
 
 (defsubst tramp-rpc--port-to-string (port)
   "Normalize PORT to a string, or return nil.
@@ -1232,8 +1172,7 @@ Also clears the executable, exec-path, and login-shell caches."
         (tramp-rpc-protocol--clear-deferred-polls-for-target transport))
       (remhash key tramp-rpc--connections)
       (remhash key tramp-rpc--exec-path-cache)
-      (remhash key tramp-rpc--login-shell-cache)
-      (tramp-rpc--clear-executable-cache vec))))
+      (remhash key tramp-rpc--login-shell-cache))))
 
 (defun tramp-rpc--connection-error-response (vec event)
   "Return an RPC error response for a transport failure on VEC."
@@ -4280,13 +4219,7 @@ refresh), git commands are served from the prefetch cache when possible."
                ;; environment.  The PATH entry comes from `tramp-remote-path'
                ;; (or deprecated `tramp-rpc-remote-path'); direnv and dynamic
                ;; caller variables keep their previous roles and override it.
-               (env (tramp-rpc--ensure-inside-emacs-env
-                     (tramp-rpc--merge-environments
-                      (tramp-rpc--remote-path-environment v)
-                      (tramp-rpc--tramp-remote-process-environment)
-                      (tramp-rpc--emacsclient-tramp-environment v)
-                      (tramp-rpc--get-direnv-environment v localname)
-                      (tramp-rpc--caller-environment))))
+               (env (tramp-rpc--process-environment v localname))
                (stdin-content (when (and infile (not (eq infile t)))
                                  (with-temp-buffer
                                    (set-buffer-multibyte nil)
@@ -5520,7 +5453,6 @@ cleanup of all connections has run."
   (clrhash tramp-rpc--async-callbacks)
   (tramp-rpc-protocol--clear-deferred-polls)
   (clrhash tramp-rpc--async-callback-processes)
-  (clrhash tramp-rpc--executable-cache)
   (tramp-rpc--clear-direnv-cache)
   (tramp-rpc--clear-file-metadata-caches)
   ;; Note: recentf cleanup is handled by `tramp-recentf-cleanup-all'
