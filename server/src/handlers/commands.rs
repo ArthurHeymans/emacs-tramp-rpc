@@ -62,6 +62,12 @@ pub async fn run_parallel(params: Value) -> HandlerResult {
     #[derive(Deserialize)]
     struct Params {
         commands: Vec<CommandEntry>,
+        /// Environment variables applied to every command in the batch.
+        #[serde(default)]
+        env: Option<HashMap<String, String>>,
+        /// Clear the inherited server environment before applying `env`.
+        #[serde(default)]
+        clear_env: bool,
     }
 
     let params: Params = from_value(params).map_err(|e| RpcError::invalid_params(e.to_string()))?;
@@ -82,13 +88,22 @@ pub async fn run_parallel(params: Value) -> HandlerResult {
     // This budget is shared by every command in the batch, so one chatty
     // command cannot push the combined response over the frame limit.
     let remaining = Arc::new(Semaphore::new(crate::MAX_RESPONSE_OUTPUT_BYTES));
+    let env = params.env.map(Arc::new);
+    let clear_env = params.clear_env;
     let results = futures::future::join_all(params.commands.into_iter().map(|entry| {
         let remaining = Arc::clone(&remaining);
+        let env = env.clone();
         async move {
             let mut cmd = Command::new(&entry.cmd);
             cmd.args(&entry.args);
             if let Some(ref cwd) = entry.cwd {
                 cmd.current_dir(super::expand_tilde(cwd));
+            }
+            if clear_env {
+                cmd.env_clear();
+            }
+            if let Some(env) = env {
+                cmd.envs(env.iter());
             }
             cmd.stdin(if entry.stdin.is_some() {
                 Stdio::piped()

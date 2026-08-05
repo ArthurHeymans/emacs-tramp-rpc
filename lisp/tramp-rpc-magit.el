@@ -43,7 +43,7 @@
 (declare-function tramp-rpc--call-batch "tramp-rpc")
 (declare-function tramp-rpc--connection-key "tramp-rpc")
 (declare-function tramp-rpc--decode-output "tramp-rpc")
-(declare-function tramp-rpc--resolve-executable "tramp-rpc")
+(declare-function tramp-rpc--process-environment "tramp-rpc")
 (declare-function tramp-rpc--decode-string "tramp-rpc")
 (declare-function tramp-rpc--encode-path "tramp-rpc")
 (declare-function tramp-rpc--convert-file-attributes "tramp-rpc")
@@ -804,31 +804,18 @@ the gitdir) and the results are cached in `tramp-rpc--file-exists-cache'.")
       (cmd . "test")
       (args . ["-e" ,full-path]))))
 
-(defun tramp-rpc-magit--git-program (&optional vec)
-  "Return the git executable to use for prefetch commands on VEC.
-
-`commands.run_parallel' spawns commands directly on the server, which
-inherits the SSH session PATH and knows nothing about `tramp-remote-path'.
-Resolve git against the configured remote PATH (cached per connection) so
-prefetched output comes from the same git that `process-file' would use.
-Falls back to \"git\" when VEC is nil or lookup fails."
-  (if vec
-      (tramp-rpc--resolve-executable vec "git")
-    "git"))
-
-(defun tramp-rpc-magit--prefetch-git-commands (directory &optional vec)
+(defun tramp-rpc-magit--prefetch-git-commands (directory &optional _vec)
   "Build the list of git commands to prefetch for DIRECTORY.
 Returns a vector of command entries for commands.run_parallel.
 Each entry has key, cmd, args, and cwd fields.  Git command keys
 match what `tramp-rpc-magit--process-cache-lookup' will look up.
 State file checks use \"state_file:PATH\" keys.
-VEC resolves git against the configured remote PATH."
+The batch RPC supplies the same effective environment as `process-file'."
   (let ((cmds nil)
-        (git (tramp-rpc-magit--git-program vec))
         (gitdir (concat (file-name-as-directory directory) ".git")))
     (cl-flet ((add-git (&rest args)
                 (push `((key . ,(apply #'tramp-rpc-magit--process-cache-key args))
-                        (cmd . ,git)
+                        (cmd . "git")
                         (args . ,(vconcat (append tramp-rpc-magit--git-prefetch-prefix-args
                                                    args)))
                         (cwd . ,directory))
@@ -930,11 +917,10 @@ VEC resolves git against the configured remote PATH."
 
     (vconcat (nreverse cmds))))
 
-(defun tramp-rpc-magit--git-command-entry (directory args &optional vec)
-  "Return a commands.run_parallel entry for git ARGS in DIRECTORY.
-VEC resolves git against the configured remote PATH."
+(defun tramp-rpc-magit--git-command-entry (directory args &optional _vec)
+  "Return a commands.run_parallel entry for git ARGS in DIRECTORY."
   `((key . ,(apply #'tramp-rpc-magit--process-cache-key args))
-    (cmd . ,(tramp-rpc-magit--git-program vec))
+    (cmd . "git")
     (args . ,(vconcat (append tramp-rpc-magit--git-prefetch-prefix-args args)))
     (cwd . ,directory)))
 
@@ -972,6 +958,15 @@ existing one."
 The server currently rejects batches above 256; keep headroom so dynamic
 prefetch growth does not trip that hard limit.")
 
+(defun tramp-rpc-magit--run-parallel (vec directory commands)
+  "Run COMMANDS on VEC in DIRECTORY with the normal RPC process environment."
+  (let ((localname (or (file-remote-p (expand-file-name directory) 'localname)
+                       directory)))
+    (tramp-rpc--call
+     vec "commands.run_parallel"
+     `((commands . ,commands)
+       (env . ,(tramp-rpc--process-environment vec localname))))))
+
 (defun tramp-rpc-magit--run-command-entries (vec directory commands)
   "Run COMMANDS in chunks and merge their results into DIRECTORY's cache."
   (let ((remaining (append commands nil))
@@ -987,8 +982,8 @@ prefetch growth does not trip that hard limit.")
         (setq cache
               (tramp-rpc-magit--store-command-results
                vec directory
-               (tramp-rpc--call vec "commands.run_parallel"
-                                `((commands . ,(vconcat chunk))))))))
+               (tramp-rpc-magit--run-parallel
+                vec directory (vconcat chunk))))))
     cache))
 
 (defun tramp-rpc-magit--cached-git-stdout (cache &rest args)
@@ -1258,11 +1253,10 @@ when the status cache has expired but TAB is expanding a single file section."
                                       cache))
             (tramp-rpc-magit--store-command-results
              v directory
-             (tramp-rpc--call
-              v "commands.run_parallel"
-              `((commands . ,(vector
-                              (tramp-rpc-magit--git-command-entry
-                               root-local '("rev-parse" "HEAD") v)))))))
+             (tramp-rpc-magit--run-parallel
+              v directory
+              (vector (tramp-rpc-magit--git-command-entry
+                       root-local '("rev-parse" "HEAD") v)))))
           (setq cache (tramp-rpc-magit--get-process-cache))
           (let* ((head-entry (and cache
                                   (gethash (tramp-rpc-magit--process-cache-key
@@ -1289,8 +1283,8 @@ when the status cache has expired but TAB is expanding a single file section."
                 (add "cat-file" "-p" (format "%s:%s" head rel-file))))
             (tramp-rpc-magit--store-command-results
              v directory
-             (tramp-rpc--call v "commands.run_parallel"
-                              `((commands . ,(vconcat (nreverse commands))))))))))))
+             (tramp-rpc-magit--run-parallel
+              v directory (vconcat (nreverse commands))))))))))
 
 (defun tramp-rpc-magit--strip-git-prefix-args (args)
   "Strip cache-neutral Magit git prefix flags from ARGS.
@@ -1394,8 +1388,8 @@ as the process-file cache.  Also fetches ancestor markers."
         ;; Magit in the real refresh sequence, and `tramp-rpc-handle-process-file'
         ;; triggers this prefetch immediately after that command completes.
         (let* ((commands (tramp-rpc-magit--prefetch-git-commands localname v))
-               (results (tramp-rpc--call v "commands.run_parallel"
-                                         `((commands . ,commands)))))
+               (results (tramp-rpc-magit--run-parallel
+                         v directory commands)))
           (when results
             ;; Each result entry is (key . {exit_code, stdout, stderr}).  Git
             ;; command results are stored as (exit-code . decoded-stdout), while

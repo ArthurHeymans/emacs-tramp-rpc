@@ -47,18 +47,12 @@
 (declare-function tramp-rpc--call "tramp-rpc" (vec method params &optional connection))
 (declare-function tramp-rpc--call-fast "tramp-rpc")
 (declare-function tramp-rpc--call-async "tramp-rpc" (vec method params callback &optional connection))
-(declare-function tramp-rpc--get-direnv-environment "tramp-rpc")
 (declare-function tramp-rpc--get-remote-login-shell "tramp-rpc")
+(declare-function tramp-rpc--process-environment "tramp-rpc")
 (declare-function tramp-rpc--binary-bytes "tramp-rpc")
 (declare-function tramp-rpc--controlmaster-socket-path "tramp-rpc")
 (declare-function tramp-rpc--hops-to-proxyjump "tramp-rpc")
 (declare-function tramp-rpc--port-to-string "tramp-rpc")
-(declare-function tramp-rpc--ensure-inside-emacs-env "tramp-rpc")
-(declare-function tramp-rpc--merge-environments "tramp-rpc")
-(declare-function tramp-rpc--remote-path-environment "tramp-rpc")
-(declare-function tramp-rpc--tramp-remote-process-environment "tramp-rpc")
-(declare-function tramp-rpc--emacsclient-tramp-environment "tramp-rpc")
-(declare-function tramp-rpc--caller-environment "tramp-rpc")
 (declare-function tramp-rpc--ssh-detail-user "tramp-rpc")
 (declare-function tramp-rpc--sudo-rpc-hop-vec "tramp-rpc")
 (declare-function tramp-rpc-file-name-p "tramp-rpc")
@@ -843,16 +837,9 @@ Resolves program path and loads direnv environment from working directory."
                                     (cdr command))))))
         (when use-pty
           (setq command (tramp-rpc--maybe-login-shell-command v command)))
-        ;; Get the remote process environment: PATH from `tramp-remote-path'
-        ;; (or deprecated `tramp-rpc-remote-path'), direnv for this directory,
-        ;; INSIDE_EMACS, and caller-set env vars (e.g. GIT_INDEX_FILE from magit).
-        (let ((process-env (tramp-rpc--ensure-inside-emacs-env
-                            (tramp-rpc--merge-environments
-                             (tramp-rpc--remote-path-environment v)
-                             (tramp-rpc--tramp-remote-process-environment)
-                             (tramp-rpc--emacsclient-tramp-environment v)
-                             (tramp-rpc--get-direnv-environment v localname)
-                             (tramp-rpc--caller-environment)))))
+        ;; Use the same effective environment as synchronous and parallel RPC
+        ;; processes, including configured PATH, direnv, and caller overrides.
+        (let ((process-env (tramp-rpc--process-environment v localname)))
           (if use-pty
               ;; PTY mode - start async process with PTY.  Do not add -n or
               ;; pre-authenticate here; sudo owns the terminal prompt.
