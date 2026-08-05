@@ -6133,23 +6133,36 @@ itself has to carry the resolution."
                      '("PATH" . "/home/user/.cargo/bin:/usr/bin:/bin"))))))
 
 (ert-deftest tramp-rpc-mock-test-process-file-not-found-returns-127 ()
-  "Only a structured spawn ENOENT becomes process-file status 127."
+  "A structured spawn ENOENT becomes status 127 with captured stderr."
   (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
-  (let ((default-directory "/rpc:user@host:/work/"))
-    (cl-letf (((symbol-function 'tramp-rpc--cached-remote-path)
-               (lambda (_vec) '("/usr/bin")))
-              ((symbol-function 'tramp-rpc--get-direnv-environment)
-               (lambda (&rest _) nil))
-              ((symbol-function 'tramp-rpc--caller-environment)
-               (lambda () nil))
-              ((symbol-function 'tramp-rpc-magit--process-cache-lookup)
-               (lambda (&rest _) nil))
-               ((symbol-function 'tramp-rpc--call)
-                (lambda (&rest _)
-                  (tramp-rpc--signal-rpc-error
-                   "RPC" "missing executable" tramp-rpc-protocol-error-process 2
-                   nil '((spawn_not_found . t))))))
-       (should (= (tramp-rpc-handle-process-file "missing" nil nil nil) 127)))))
+  (let ((default-directory "/rpc:user@host:/work/")
+        (stderr-file (make-temp-file "tramp-rpc-process-stderr")))
+    (unwind-protect
+        (progn
+          ;; `process-file' output files need not exist before the call.
+          (delete-file stderr-file)
+          (cl-letf (((symbol-function 'tramp-rpc--cached-remote-path)
+                     (lambda (_vec) '("/usr/bin")))
+                    ((symbol-function 'tramp-rpc--get-direnv-environment)
+                     (lambda (&rest _) nil))
+                    ((symbol-function 'tramp-rpc--caller-environment)
+                     (lambda () nil))
+                    ((symbol-function 'tramp-rpc-magit--process-cache-lookup)
+                     (lambda (&rest _) nil))
+                    ((symbol-function 'tramp-rpc--call)
+                     (lambda (&rest _)
+                       (tramp-rpc--signal-rpc-error
+                        "RPC" "missing executable"
+                        tramp-rpc-protocol-error-process 2
+                        nil '((spawn_not_found . t))))))
+            (should (= (tramp-rpc-handle-process-file
+                        "missing" nil (list nil stderr-file) nil)
+                       127))
+            (should (file-exists-p stderr-file))
+            (with-temp-buffer
+              (insert-file-contents stderr-file)
+              (should (string-match-p "missing executable" (buffer-string))))))
+      (ignore-errors (delete-file stderr-file)))))
 
 (ert-deftest tramp-rpc-mock-test-process-file-preserves-other-rpc-errors ()
   "A process cwd ENOENT remains a remote-file-error, not status 127."

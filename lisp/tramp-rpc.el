@@ -4292,7 +4292,7 @@ refresh), git commands are served from the prefetch cache when possible."
                                    (set-buffer-multibyte nil)
                                    (insert-file-contents-literally infile)
                                    (buffer-string))))
-               (result (condition-case nil
+               (result (condition-case err
                            (tramp-rpc--call v "process.run"
                                             `((cmd . ,program)
                                               (args . ,(vconcat args))
@@ -4301,8 +4301,13 @@ refresh), git commands are served from the prefetch cache when possible."
                                               ,@(when stdin-content
                                                   `((stdin . ,stdin-content)))))
                          ;; The server marks confirmed spawn ENOENT as
-                         ;; `file-missing'; other RPC failures must propagate.
-                         (file-missing 127))))
+                         ;; `file-missing'.  Shell-based TRAMP returns status
+                         ;; 127 and leaves the diagnostic on stderr, so preserve
+                         ;; both parts of that contract for split destinations.
+                         (file-missing
+                          (tramp-rpc--route-process-file-output
+                           destination "" (concat (error-message-string err) "\n"))
+                          127))))
           (if (eq result 127)
               127
             (if result
