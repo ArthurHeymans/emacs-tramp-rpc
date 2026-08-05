@@ -4033,6 +4033,23 @@ This matches the behavior expected by `tramp-test28-process-file'."
       (tramp-rpc-handle-delete-file "/rpc:mock:/tmp/missing" nil)
       (should (equal invalidated "/rpc:mock:/tmp/missing")))))
 
+(ert-deftest tramp-rpc-mock-test-move-file-to-trash-fallback-bypasses-advice ()
+  "The trash fallback must not re-enter TRAMP's external operation advice."
+  :tags '(:delete)
+  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
+  (let* ((called nil)
+         (tramp-rpc--move-file-to-trash-function
+         (lambda (filename)
+           (setq called filename)
+           'fallback)))
+    (cl-letf (((symbol-function 'move-file-to-trash)
+               (lambda (&rest _args)
+                 (error "TRAMP external operation was re-entered"))))
+      (should (eq (tramp-rpc--fallback-move-file-to-trash
+                   "/rpc:mock:/tmp/file")
+                  'fallback))
+      (should (equal called "/rpc:mock:/tmp/file")))))
+
 (ert-deftest tramp-rpc-mock-test-move-file-to-trash-regular-file-local-trash ()
   "Test optimized `move-file-to-trash' copies a remote file to local trash."
   :tags '(:delete)

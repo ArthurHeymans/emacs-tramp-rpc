@@ -3862,12 +3862,16 @@ returns a destination when that branch resolves to a local directory."
             (setq new-fn (car (find-backup-file-name new-fn)))))
         new-fn))))
 
+(defvar tramp-rpc--move-file-to-trash-function
+  (symbol-function 'move-file-to-trash)
+  "Original `move-file-to-trash' function, captured before TRAMP advice.")
+
 (defun tramp-rpc--fallback-move-file-to-trash (filename)
-  "Run the real `move-file-to-trash' for FILENAME without this external op."
-  (let ((inhibit-file-name-handlers
-         (cons #'tramp-rpc-file-name-handler inhibit-file-name-handlers))
-        (inhibit-file-name-operation 'move-file-to-trash))
-    (move-file-to-trash filename)))
+  "Run the original `move-file-to-trash' implementation for FILENAME.
+Bypass only TRAMP's external-operation advice.  File operations performed by
+the original implementation must still dispatch through the TRAMP-RPC file
+name handler."
+  (funcall tramp-rpc--move-file-to-trash-function filename))
 
 (defun tramp-rpc--delete-local-trash-copy (filename)
   "Best-effort removal of a partial local trash copy at FILENAME."
