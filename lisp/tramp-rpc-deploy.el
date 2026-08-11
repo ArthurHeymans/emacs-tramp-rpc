@@ -604,7 +604,7 @@ Returns t on success, nil on failure."
                     (if (looking-at "HTTP/[0-9.]+ \\([0-9]+\\)")
                         (signal 'remote-file-error (list "HTTP error" (match-string 1)))
                       (signal 'remote-file-error (list "Invalid HTTP response"))))
-                  (unless (re-search-forward "^\\r?\\n" nil t)
+                  (unless (re-search-forward "\r?\n\r?\n" nil t)
                     (signal 'remote-file-error (list "Malformed HTTP response")))
                   (let ((coding-system-for-write 'binary))
                     (write-region (point) (point-max) dest nil 'silent))
