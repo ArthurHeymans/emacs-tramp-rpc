@@ -4689,6 +4689,42 @@ Each entry is (HOST ALLOW-PROMPT FORCE-OBTAIN AUTO-DEPLOY)."
       (format "%s  %s\n%s  other.tar.gz\n" digest asset digest) asset)
      :type 'remote-file-error)))
 
+(ert-deftest tramp-rpc-mock-test-deploy-download-parses-lf-only-response ()
+  "Test `tramp-rpc-deploy--download-file' parses LF-only HTTP responses.
+
+GitHub's release-assets server (release-assets.githubusercontent.com)
+returns headers terminated by bare LF (no CRLF).  The header/body
+separator must be located without relying on a `^'-anchored regexp,
+which fails to match an empty line in Emacs.  Regression test for
+issue #268 (0.13 fails to download prebuilt binary)."
+  :tags '(:deploy)
+  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
+  (let* ((body "310a9545a07d9848d1125fda930ddba9f219def7bec9d94ab5965d072a8caa0c  server.tar.gz\n")
+         (dest (make-temp-file "tramp-rpc-download"))
+         (resp-buf (generate-new-buffer " *tramp-rpc-mock-http*")))
+    (unwind-protect
+        (cl-letf (((symbol-function 'url-retrieve-synchronously)
+                   (lambda (&rest _args)
+                     (with-current-buffer resp-buf
+                       (erase-buffer)
+                       (set-buffer-multibyte nil)
+                       ;; LF-only headers, exactly as GitHub's release
+                       ;; assets server emits them.
+                       (insert "HTTP/1.1 200 OK\n"
+                               "Content-Length: 123\n"
+                               "Content-Type: application/octet-stream\n"
+                               "\n"
+                               body))
+                     resp-buf)))
+          (should (tramp-rpc-deploy--download-file
+                   "https://example.invalid/server.tar.gz.sha256" dest))
+          (should (equal (with-temp-buffer
+                           (insert-file-contents-literally dest)
+                           (buffer-string))
+                         body)))
+      (delete-file dest)
+      (when (buffer-live-p resp-buf) (kill-buffer resp-buf)))))
+
 (ert-deftest tramp-rpc-mock-test-deploy-download-requires-checksum ()
   "Test release artifacts are rejected when checksum retrieval fails."
   :tags '(:deploy)
