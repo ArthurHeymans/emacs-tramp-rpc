@@ -1066,6 +1066,8 @@ This matches the behavior expected by `tramp-test28-process-file'."
 (require 'tramp-rpc)
 (declare-function tramp-rpc--pty-handle-async-response
                   "tramp-rpc-process" (local-process response))
+(declare-function tramp-rpc-deploy--download-file
+                  "tramp-rpc-deploy" (url dest))
 (defconst tramp-rpc-mock-test--tramp-rpc-loaded t
   "The full TRAMP-RPC backend was loaded successfully.")
 
