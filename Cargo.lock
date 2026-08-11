@@ -618,7 +618,7 @@ dependencies = [
 
 [[package]]
 name = "tramp-rpc-server"
-version = "0.13.0"
+version = "0.13.1"
 dependencies = [
  "flate2",
  "futures",
