@@ -836,6 +836,9 @@ Keys include target method/user/host/port plus the effective route (explicit
 or hidden TRAMP ad-hoc proxy hops).  Values are plists with :process, :buffer,
 and optional :stderr-buffer.")
 
+(defvar tramp-rpc--connection-lifecycle-mutexes (make-hash-table :test 'equal)
+  "Mutexes serializing connection replacement and ControlMaster teardown.")
+
 ;; tramp-rpc--async-processes and tramp-rpc--pty-processes are defined in
 ;; tramp-rpc-process.el (loaded via require below)
 
@@ -1157,6 +1160,13 @@ hop."
   "Get the RPC connection for VEC, or nil if not connected."
   (gethash (tramp-rpc--connection-key vec) tramp-rpc--connections))
 
+(defun tramp-rpc--connection-lifecycle-mutex (vec)
+  "Return the connection lifecycle mutex for VEC."
+  (let ((key (tramp-rpc--connection-key vec)))
+    (or (gethash key tramp-rpc--connection-lifecycle-mutexes)
+        (puthash key (make-mutex "tramp-rpc connection lifecycle")
+                 tramp-rpc--connection-lifecycle-mutexes))))
+
 (defun tramp-rpc--set-connection (vec process buffer &optional stderr-buffer)
   "Store the RPC connection for VEC.
 Caches keyed only by the TRAMP connection spelling are invalidated before a
@@ -1232,12 +1242,12 @@ This is idempotent so it can run from every synchronous wait exit path."
          (progn ,@body)
        (tramp-rpc--release-pending-requests ,process ,buffer ,ids))))
 
-(defun tramp-rpc--cleanup-connection-generation
-    (process vec event reason &optional remote-cleanup)
-  "Clean up one PROCESS generation for VEC.
-REASON and EVENT are retained on PROCESS and used for both explicit disconnect
-and unexpected transport death.  REMOTE-CLEANUP requests termination before
-local relay deletion when PROCESS is still live."
+(defun tramp-rpc--claim-connection-generation (process vec event reason)
+  "Claim PROCESS as a dead generation and detach it from VEC's connection table.
+Sets cleanup bookkeeping on PROCESS and, when PROCESS is still the current
+connection for VEC, removes it so a replacement can take over.  Returns a plist
+capturing the connection state needed by the remaining cleanup, or nil when the
+generation was already claimed."
   (when (and (processp process)
              (not (process-get process :tramp-rpc-cleanup-started)))
     (process-put process :tramp-rpc-cleanup-started t)
@@ -1250,9 +1260,7 @@ local relay deletion when PROCESS is still live."
                      (and current-p current-connection)))
            (generation-buffer (or (process-get process :tramp-rpc-buffer)
                                   (and current-p conn
-                                       (plist-get conn :buffer))))
-           (error-response (tramp-rpc--connection-error-response vec event))
-           callbacks)
+                                       (plist-get conn :buffer)))))
       ;; Detach the generation before any relay sentinel can reenter connection
       ;; lookup.  Explicit cleanup retains CONN locally for its final kill RPCs.
       (when current-p
@@ -1260,49 +1268,78 @@ local relay deletion when PROCESS is still live."
         (tramp-rpc--clear-file-caches-for-connection vec)
         (tramp-rpc-magit--clear-cache-for-connection vec)
         (tramp-rpc--remove-connection vec process))
-      ;; Kill acknowledgements must still be accepted by the live transport.
-      ;; Mark it dead only after these captured-generation calls complete.
-      (when (and remote-cleanup conn (process-live-p process))
-        (tramp-rpc--terminate-async-processes vec process conn)
-        (tramp-rpc--terminate-pty-processes vec process conn))
-      (process-put process :tramp-rpc-transport-cleaned t)
-      (process-put process :tramp-rpc-transport-dead t)
-      ;; Wake synchronous callers after remote cleanup, before removing any
-      ;; remaining generation-local state.
-      (dolist (id (process-get process :tramp-rpc-pending-ids))
-        (when (buffer-live-p generation-buffer)
-          (puthash id error-response
-                   (tramp-rpc--get-pending-responses generation-buffer))))
-      ;; Detach callbacks before invoking them, so callback code cannot observe
-      ;; or recreate a callback belonging to this dead generation.
-      (maphash
-       (lambda (id callback-process)
-         (when (eq callback-process process)
-           (when-let* ((callback (gethash id tramp-rpc--async-callbacks)))
-             (push callback callbacks))
-           (remhash id tramp-rpc--async-callbacks)
-           (remhash id tramp-rpc--async-callback-processes)))
-       tramp-rpc--async-callback-processes)
-      ;; These functions keep local relays tracked through delete-process so
-      ;; their wrapped sentinels can preserve the user's sentinel.  Remote
-      ;; termination was completed above using the captured connection.
-      (tramp-rpc--cleanup-async-processes vec process nil)
-      (tramp-rpc--cleanup-pty-processes vec process nil)
-      (tramp-rpc--cleanup-watches-for-connection vec process)
-      (tramp-rpc--cleanup-file-notify-for-connection vec process)
+      (list :conn conn :generation-buffer generation-buffer))))
+
+(defun tramp-rpc--finish-connection-generation-cleanup
+    (process vec event claimed &optional remote-cleanup defer-callbacks)
+  "Complete cleanup of a claimed PROCESS generation for VEC.
+CLAIMED is the state plist returned by `tramp-rpc--claim-connection-generation'.
+REMOTE-CLEANUP requests termination before local relay deletion when PROCESS is
+still live.  When DEFER-CALLBACKS is non-nil, this returns
+\(ERROR-RESPONSE . CALLBACKS) instead of invoking the callbacks."
+  (let* ((conn (plist-get claimed :conn))
+         (generation-buffer (plist-get claimed :generation-buffer))
+         (error-response (tramp-rpc--connection-error-response vec event))
+         callbacks)
+    ;; Kill acknowledgements must still be accepted by the live transport.
+    ;; Mark it dead only after these captured-generation calls complete.
+    (when (and remote-cleanup conn (process-live-p process))
+      (tramp-rpc--terminate-async-processes vec process conn)
+      (tramp-rpc--terminate-pty-processes vec process conn))
+    (process-put process :tramp-rpc-transport-cleaned t)
+    (process-put process :tramp-rpc-transport-dead t)
+    ;; Wake synchronous callers after remote cleanup, before removing any
+    ;; remaining generation-local state.
+    (dolist (id (process-get process :tramp-rpc-pending-ids))
+      (when (buffer-live-p generation-buffer)
+        (puthash id error-response
+                 (tramp-rpc--get-pending-responses generation-buffer))))
+    ;; Detach callbacks before invoking them, so callback code cannot observe
+    ;; or recreate a callback belonging to this dead generation.
+    (maphash
+     (lambda (id callback-process)
+       (when (eq callback-process process)
+         (when-let* ((callback (gethash id tramp-rpc--async-callbacks)))
+           (push callback callbacks))
+         (remhash id tramp-rpc--async-callbacks)
+         (remhash id tramp-rpc--async-callback-processes)))
+     tramp-rpc--async-callback-processes)
+    ;; These functions keep local relays tracked through delete-process so
+    ;; their wrapped sentinels can preserve the user's sentinel.  Remote
+    ;; termination was completed above using the captured connection.
+    (tramp-rpc--cleanup-async-processes vec process nil)
+    (tramp-rpc--cleanup-pty-processes vec process nil)
+    (tramp-rpc--cleanup-watches-for-connection vec process)
+    (tramp-rpc--cleanup-file-notify-for-connection vec process)
+    (unless defer-callbacks
       (dolist (callback callbacks)
         (condition-case callback-error
             (funcall callback error-response)
           (error
            (tramp-rpc--debug "transport cleanup callback failed: %S"
-                             callback-error))))
-      ;; Keep injected errors and the request IDs until active waiters consume
-      ;; them.  Their unwind-protect cleanup removes the generation state.
-      (tramp-rpc--maybe-clear-pending-response-state process generation-buffer)
-      ;; Explicit disconnect owns transport deletion; unexpected death is
-      ;; already dispatched by Emacs and this is harmlessly idempotent.
-      (when (and remote-cleanup (process-live-p process))
-        (delete-process process)))))
+                             callback-error)))))
+    ;; Keep injected errors and the request IDs until active waiters consume
+    ;; them.  Their unwind-protect cleanup removes the generation state.
+    (tramp-rpc--maybe-clear-pending-response-state process generation-buffer)
+    ;; Explicit disconnect owns transport deletion; unexpected death is
+    ;; already dispatched by Emacs and this is harmlessly idempotent.
+    (when (and remote-cleanup (process-live-p process))
+      (delete-process process))
+    (when defer-callbacks
+      (cons error-response callbacks))))
+
+(defun tramp-rpc--cleanup-connection-generation
+    (process vec event reason &optional remote-cleanup defer-callbacks)
+  "Clean up one PROCESS generation for VEC.
+REASON and EVENT are retained on PROCESS and used for both explicit disconnect
+and unexpected transport death.  REMOTE-CLEANUP requests termination before
+local relay deletion when PROCESS is still live.  When DEFER-CALLBACKS is
+non-nil, callback invocation is left to the caller and this returns
+\(ERROR-RESPONSE . CALLBACKS)."
+  (let ((claimed (tramp-rpc--claim-connection-generation process vec event reason)))
+    (when claimed
+      (tramp-rpc--finish-connection-generation-cleanup
+       process vec event claimed remote-cleanup defer-callbacks))))
 
 (defun tramp-rpc--connection-transport-death (process vec event)
   "Clean up unexpected death of PROCESS generation for VEC."
@@ -1334,17 +1371,24 @@ completion) from blocking on unreachable hosts."
              (process-live-p (plist-get conn :process))
              (buffer-live-p (plist-get conn :buffer)))
         conn
-      ;; Stale connection - remove it before reconnecting
-      (when conn
-        (tramp-rpc--remove-connection vec))
-      ;; During non-essential operations, don't open new connections.
-      ;; This mirrors the (unless (tramp-connectable-p vec)
-      ;; (throw 'non-essential 'non-essential)) pattern used by every
-      ;; standard TRAMP backend in their maybe-open-connection functions.
-      (unless (tramp-connectable-p vec)
-        (throw 'non-essential 'non-essential))
-      ;; Need to establish connection
-      (tramp-rpc--connect vec))))
+      (with-mutex (tramp-rpc--connection-lifecycle-mutex vec)
+        ;; Another thread may have reconnected while this one waited.
+        (setq conn (tramp-rpc--get-connection vec))
+        (if (and conn
+                 (process-live-p (plist-get conn :process))
+                 (buffer-live-p (plist-get conn :buffer)))
+            conn
+          ;; Stale connection - remove it before reconnecting.
+          (when conn
+            (tramp-rpc--remove-connection vec))
+          ;; During non-essential operations, don't open new connections.
+          ;; This mirrors the (unless (tramp-connectable-p vec)
+          ;; (throw 'non-essential 'non-essential)) pattern used by every
+          ;; standard TRAMP backend in their maybe-open-connection functions.
+          (unless (tramp-connectable-p vec)
+            (throw 'non-essential 'non-essential))
+          ;; Need to establish connection.
+          (tramp-rpc--connect vec))))))
 
 (defun tramp-rpc--ensure-controlmaster-directory ()
   "Ensure the ControlMaster socket directory exists.
@@ -1787,10 +1831,29 @@ accidentally routing file operations through tramp-sh."
   (tramp-flush-directory-properties vec "/")
   (tramp-flush-connection-properties vec))
 
-(defun tramp-rpc--cleanup-controlmaster (vec)
-  "Clean up the ControlMaster process and socket for VEC.
-Sends an SSH -O exit command to gracefully close the ControlMaster
-socket, then kills the auth process and buffer."
+(defun tramp-rpc--controlmaster-socket-shared-p (vec &optional except-process)
+  "Return non-nil when another live connection shares VEC's ControlMaster socket.
+A connection other than EXCEPT-PROCESS is considered to share the socket when
+its process is live and its ControlMaster socket path equals VEC's.  Tearing
+down VEC's ControlMaster in that case would disrupt the still-live connection."
+  (let ((socket-path (tramp-rpc--controlmaster-socket-path vec)))
+    (catch 'shared
+      (maphash
+       (lambda (_key conn)
+         (let ((other-process (plist-get conn :process))
+               (other-vec (plist-get conn :vec)))
+           (when (and other-process
+                      other-vec
+                      (not (eq other-process except-process))
+                      (process-live-p other-process)
+                      (equal socket-path
+                             (tramp-rpc--controlmaster-socket-path other-vec)))
+             (throw 'shared t))))
+       tramp-rpc--connections)
+      nil)))
+
+(defun tramp-rpc--cleanup-controlmaster-unlocked (vec)
+  "Clean up VEC's ControlMaster while holding its lifecycle mutex."
   (when tramp-rpc-use-controlmaster
     (let* ((host (tramp-file-name-host vec))
            (user (tramp-rpc--ssh-detail-user vec))
@@ -1819,6 +1882,54 @@ socket, then kills the auth process and buffer."
       ;; Kill the auth buffer.
       (when (buffer-live-p auth-buffer)
         (kill-buffer auth-buffer)))))
+
+(defun tramp-rpc--cleanup-controlmaster (vec &optional expected-process)
+  "Clean up the ControlMaster process and socket for VEC.
+Sends an SSH -O exit command to gracefully close the ControlMaster socket, then
+kills the auth process and buffer.  Skip cleanup when EXPECTED-PROCESS is
+non-nil and a newer RPC connection has replaced that process, or when another
+live connection shares VEC's ControlMaster socket."
+  (with-mutex (tramp-rpc--connection-lifecycle-mutex vec)
+    (let ((current (tramp-rpc--get-connection vec)))
+      (when (and (or (null expected-process)
+                     (null current)
+                     (eq expected-process (plist-get current :process)))
+                 (not (tramp-rpc--controlmaster-socket-shared-p
+                       vec expected-process)))
+        (tramp-rpc--cleanup-controlmaster-unlocked vec)))))
+
+(defun tramp-rpc--invalidate-timed-out-connection (process vec event)
+  "Discard PROCESS and its ControlMaster after a timeout on VEC.
+EVENT describes the timed-out operation for transport diagnostics.  A timed-out
+stream cannot safely be reused because its response may still arrive later and
+the underlying SSH ControlMaster may be half-open after a network interruption."
+  (let ((claimed
+         (with-mutex (tramp-rpc--connection-lifecycle-mutex vec)
+           (prog1 (tramp-rpc--claim-connection-generation
+                   process vec event :timeout)
+             ;; Tear down the ControlMaster while holding the lifecycle mutex
+             ;; and only when no replacement connection is already current, so
+             ;; a reconnect cannot reuse the half-open socket between removal
+             ;; and teardown.
+             (let ((current (tramp-rpc--get-connection vec)))
+               (when (and (or (null current)
+                              (eq process (plist-get current :process)))
+                          (not (tramp-rpc--controlmaster-socket-shared-p
+                                vec process)))
+                 (tramp-rpc--cleanup-controlmaster-unlocked vec)))))))
+    (when claimed
+      (let ((deferred (tramp-rpc--finish-connection-generation-cleanup
+                       process vec event claimed nil t)))
+        (when (process-live-p process)
+          (delete-process process))
+        ;; Invoke the generation's callbacks only after the protected lifecycle
+        ;; transition has completed and the transport is fully detached.
+        (dolist (callback (cdr deferred))
+          (condition-case callback-error
+              (funcall callback (car deferred))
+            (error
+             (tramp-rpc--debug "transport cleanup callback failed: %S"
+                               callback-error))))))))
 
 ;; ============================================================================
 ;; RPC communication
@@ -2050,6 +2161,8 @@ Returns the result or signals an error."
                "TIMEOUT id=%s method=%s elapsed=%.1fs buffer-size=%d process-live=%s stderr-tail=%S"
                expected-id method elapsed (buffer-size) (process-live-p process)
                stderr-tail)
+              (tramp-rpc--invalidate-timed-out-connection
+               process vec (format "RPC timeout waiting for %s\n" method))
               (signal
                'remote-file-error
                (list (concat
@@ -2147,6 +2260,8 @@ Returns:
                "TIMEOUT-BATCH id=%s elapsed=%.1fs buffer-size=%d process-live=%s stderr-tail=%S"
                expected-id elapsed (buffer-size) (process-live-p process)
                stderr-tail)
+              (tramp-rpc--invalidate-timed-out-connection
+               process vec "Batch RPC timeout\n")
               (signal
                'remote-file-error
                (list (concat
@@ -2260,13 +2375,17 @@ captured connection generation to use."
               (keyboard-quit)))))
           (when remaining-ids
             (tramp-rpc--debug "RECV-PIPE missing ids: %S" remaining-ids)
-            (signal
-             'remote-file-error
-             (list (if (process-live-p process)
-                       (format "Timeout waiting for pipelined RPC responses from %s (missing ids: %S)"
-                               (tramp-file-name-host vec) remaining-ids)
-                     (format "RPC process died waiting for pipelined responses from %s (missing ids: %S)"
-                             (tramp-file-name-host vec) remaining-ids)))))
+            (let ((process-live (process-live-p process)))
+              (when process-live
+                (tramp-rpc--invalidate-timed-out-connection
+                 process vec "Pipelined RPC timeout\n"))
+              (signal
+               'remote-file-error
+               (list (if process-live
+                         (format "Timeout waiting for pipelined RPC responses from %s (missing ids: %S)"
+                                 (tramp-file-name-host vec) remaining-ids)
+                       (format "RPC process died waiting for pipelined responses from %s (missing ids: %S)"
+                               (tramp-file-name-host vec) remaining-ids))))))
           ;; Convert hash table to alist in original order
           (mapcar (lambda (id)
                     (cons id (gethash id responses)))
