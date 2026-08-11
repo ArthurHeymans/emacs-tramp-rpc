@@ -1090,6 +1090,47 @@ This matches the behavior expected by `tramp-test28-process-file'."
       (should-error (tramp-rpc--apply-directory-count entries count)
                     :type 'wrong-type-argument))))
 
+(ert-deftest tramp-rpc-mock-test-call-uses-configured-timeout ()
+  "Synchronous RPC calls honor `tramp-rpc-call-timeout'."
+  (let ((tramp-rpc-call-timeout 75))
+    (cl-letf (((symbol-function 'tramp-rpc--call-with-timeout)
+               (lambda (_vec _method _params timeout poll-interval
+                             &optional _connection)
+                 (should (= timeout 75))
+                 (should (= poll-interval 0.1))
+                 'result)))
+      (should (eq (tramp-rpc--call 'vec "test" nil) 'result)))))
+
+(ert-deftest tramp-rpc-mock-test-call-rejects-invalid-configured-timeout ()
+  "Synchronous RPC calls reject invalid configured timeouts before sending."
+  (dolist (timeout '(0 -1 invalid))
+    (let ((tramp-rpc-call-timeout timeout))
+      (cl-letf (((symbol-function 'tramp-rpc--call-with-timeout)
+                 (lambda (&rest _)
+                   (ert-fail "RPC call started with an invalid timeout"))))
+        (should-error (tramp-rpc--call 'vec "test" nil)
+                      :type 'user-error)))))
+
+(ert-deftest tramp-rpc-mock-test-pipelined-call-uses-configured-timeout ()
+  "Pipelined RPC calls pass `tramp-rpc-call-timeout' to their receiver."
+  (let ((tramp-rpc-call-timeout 75)
+        (connection '(:process test-process :buffer test-buffer)))
+    (cl-letf (((symbol-function 'tramp-rpc--ensure-connection)
+               (lambda (_vec) connection))
+              ((symbol-function 'tramp-rpc--send-requests)
+               (lambda (_vec _requests passed-connection)
+                 (should (eq passed-connection connection))
+                 '(1)))
+              ((symbol-function 'tramp-rpc--receive-responses)
+               (lambda (_vec ids timeout passed-connection)
+                 (should (equal ids '(1)))
+                 (should (= timeout 75))
+                 (should (eq passed-connection connection))
+                 (list (cons 1 '(:id 1 :result result))))))
+      (should (equal '(result)
+                     (tramp-rpc--call-pipelined
+                      'vec '(("test" . nil))))))))
+
 (ert-deftest tramp-rpc-mock-test-pipelined-timeout-signals-error ()
   "A live connection with no response reaches the pipeline timeout branch."
   (let* ((buffer (generate-new-buffer " *tramp-rpc-pipeline-test*"))
