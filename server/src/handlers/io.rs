@@ -47,7 +47,7 @@ pub async fn read(params: Value) -> HandlerResult {
         )));
     }
 
-    let path = bytes_to_path(&params.path);
+    let path = bytes_to_path(&params.path).await?;
     let path_str = path.to_string_lossy().into_owned();
 
     let mut file = File::open(&path)
@@ -162,7 +162,7 @@ pub async fn write(params: Value) -> HandlerResult {
 
     let params: Params = from_value(params).map_err(|e| RpcError::invalid_params(e.to_string()))?;
 
-    let path = bytes_to_path(&params.path);
+    let path = bytes_to_path(&params.path).await?;
     let path_str = path.to_string_lossy().into_owned();
 
     // Content is already binary, no decoding needed!
@@ -254,8 +254,8 @@ pub async fn copy(params: Value) -> HandlerResult {
         merge_existing_directories: params.merge_existing_directories,
     };
 
-    let src_path = bytes_to_path(&params.src);
-    let mut dest_path = bytes_to_path(&params.dest);
+    let src_path = bytes_to_path(&params.src).await?;
+    let mut dest_path = bytes_to_path(&params.dest).await?;
 
     // If destination is a directory, append the source filename
     if !params.exact_dest
@@ -561,8 +561,8 @@ pub async fn rename(params: Value) -> HandlerResult {
 
     let params: Params = from_value(params).map_err(|e| RpcError::invalid_params(e.to_string()))?;
 
-    let src = bytes_to_path(&params.src);
-    let dest = bytes_to_path(&params.dest);
+    let src = bytes_to_path(&params.src).await?;
+    let dest = bytes_to_path(&params.dest).await?;
     let dest_str = dest.to_string_lossy().into_owned();
     let src_str = src.to_string_lossy().into_owned();
 
@@ -598,7 +598,7 @@ pub async fn delete(params: Value) -> HandlerResult {
 
     let params: Params = from_value(params).map_err(|e| RpcError::invalid_params(e.to_string()))?;
 
-    let path = bytes_to_path(&params.path);
+    let path = bytes_to_path(&params.path).await?;
     let path_str = path.to_string_lossy().into_owned();
 
     match fs::remove_file(&path).await {
@@ -621,7 +621,7 @@ pub async fn set_modes(params: Value) -> HandlerResult {
 
     let params: Params = from_value(params).map_err(|e| RpcError::invalid_params(e.to_string()))?;
 
-    let path = bytes_to_path(&params.path);
+    let path = bytes_to_path(&params.path).await?;
     let path_str = path.to_string_lossy().into_owned();
 
     let perms = std::fs::Permissions::from_mode(params.mode);
@@ -650,7 +650,7 @@ pub async fn set_times(params: Value) -> HandlerResult {
 
     let params: Params = from_value(params).map_err(|e| RpcError::invalid_params(e.to_string()))?;
 
-    let path = bytes_to_path(&params.path);
+    let path = bytes_to_path(&params.path).await?;
     let path_str = path.to_string_lossy().into_owned();
     let atime = params.atime.unwrap_or(params.mtime);
     let mtime = params.mtime;
@@ -679,8 +679,8 @@ pub async fn make_symlink(params: Value) -> HandlerResult {
 
     let params: Params = from_value(params).map_err(|e| RpcError::invalid_params(e.to_string()))?;
 
-    let target = bytes_to_path(&params.target);
-    let link_path = bytes_to_path(&params.link_path);
+    let target = bytes_to_path(&params.target).await?;
+    let link_path = bytes_to_path(&params.link_path).await?;
     let link_path_str = link_path.to_string_lossy().into_owned();
 
     #[cfg(unix)]
@@ -718,8 +718,8 @@ pub async fn make_hardlink(params: Value) -> HandlerResult {
 
     let params: Params = from_value(params).map_err(|e| RpcError::invalid_params(e.to_string()))?;
 
-    let src = bytes_to_path(&params.src);
-    let dest = bytes_to_path(&params.dest);
+    let src = bytes_to_path(&params.src).await?;
+    let dest = bytes_to_path(&params.dest).await?;
     let dest_str = dest.to_string_lossy().into_owned();
 
     fs::hard_link(&src, &dest)
@@ -743,7 +743,7 @@ pub async fn chown(params: Value) -> HandlerResult {
 
     let params: Params = from_value(params).map_err(|e| RpcError::invalid_params(e.to_string()))?;
 
-    let path = bytes_to_path(&params.path);
+    let path = bytes_to_path(&params.path).await?;
     let uid = params.uid;
     let gid = params.gid;
 

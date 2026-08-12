@@ -1163,7 +1163,7 @@ pub async fn handle_add(params: Value) -> HandlerResult {
     let params: Params = from_value(params).map_err(|e| RpcError::invalid_params(e.to_string()))?;
 
     // `bytes_to_path` preserves the legacy ~ expansion used by watch paths.
-    let path = bytes_to_path(&params.path);
+    let path = bytes_to_path(&params.path).await?;
 
     let manager = get().ok_or_else(|| RpcError::internal_error("File watcher not available"))?;
 
@@ -1204,7 +1204,7 @@ pub async fn handle_remove(params: Value) -> HandlerResult {
     let params: Params = from_value(params).map_err(|e| RpcError::invalid_params(e.to_string()))?;
 
     // `bytes_to_path` preserves the legacy ~ expansion used by watch paths.
-    let path = bytes_to_path(&params.path);
+    let path = bytes_to_path(&params.path).await?;
 
     let manager = get().ok_or_else(|| RpcError::internal_error("File watcher not available"))?;
 

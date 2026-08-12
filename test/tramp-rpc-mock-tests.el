@@ -6016,8 +6016,24 @@ A rejected sudo password must not be reused on the next attempt, otherwise
           (delete-process proc))
         (tramp-rpc--remove-connection vec)))))
 
+(ert-deftest tramp-rpc-mock-test-sudo-auth-rejection-detection ()
+  "Recognize explicit sudo password rejection diagnostics only."
+  :tags '(:sudo)
+  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
+  (let ((buffer (generate-new-buffer " *tramp-rpc-sudo-stderr-test*")))
+    (unwind-protect
+        (progn
+          (with-current-buffer buffer
+            (insert "sudo: /missing/server: command not found"))
+          (should-not (tramp-rpc--sudo-auth-rejected-p buffer))
+          (with-current-buffer buffer
+            (erase-buffer)
+            (insert "Sorry, try again.\nsudo: 1 incorrect password attempt\n"))
+          (should (tramp-rpc--sudo-auth-rejected-p buffer)))
+      (kill-buffer buffer))))
+
 (ert-deftest tramp-rpc-mock-test-start-server-sudo-failure-clears-password ()
-  "A failed sudo server probe forgets its password before a retry."
+  "A rejected sudo password is forgotten and its transport is terminated."
   :tags '(:sudo)
   (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
   (let ((vec (tramp-dissect-file-name
@@ -6035,9 +6051,9 @@ A rejected sudo password must not be reused on the next attempt, otherwise
               ((symbol-function 'tramp-rpc--call)
                (lambda (_vec method _params)
                  (should (equal method "system.info"))
-                 ;; This is the normal rejected-password failure: sudo exits,
-                 ;; and the RPC probe reports a closed transport.
                  (signal 'remote-file-error '("RPC transport disconnected"))))
+              ((symbol-function 'tramp-rpc--sudo-auth-rejected-p)
+               (lambda (_stderr-buffer) t))
               ((symbol-function 'tramp-rpc--clear-sudo-password)
                (lambda (actual-vec)
                  (setq cleared actual-vec))))
@@ -6046,8 +6062,47 @@ A rejected sudo password must not be reused on the next attempt, otherwise
             (should-error
              (tramp-rpc--start-server-process
               vec "/tmp/tramp-rpc-server" "wrong-password")
+             :type 'tramp-rpc-sudo-auth-rejected)
+            (should (eq cleared vec))
+            (should-not (process-live-p proc))
+            (should-not (tramp-rpc--get-connection vec)))
+        (when (process-live-p proc)
+          (delete-process proc))
+        (tramp-rpc--remove-connection vec)))))
+
+(ert-deftest tramp-rpc-mock-test-start-server-generic-failure-keeps-sudo-password ()
+  "A non-authentication failure cleans up without discarding sudo credentials."
+  :tags '(:sudo)
+  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
+  (let ((vec (tramp-dissect-file-name
+              "/rpc:alice@server|sudo:root@server:/root/"))
+        (orig-make-process (symbol-function 'make-process))
+        cleared proc)
+    (cl-letf (((symbol-function 'make-process)
+               (lambda (&rest _)
+                 (setq proc (funcall orig-make-process
+                                     :name "tramp-rpc-mock-cat"
+                                     :buffer nil
+                                     :command '("cat")
+                                     :connection-type 'pipe
+                                     :noquery t))))
+              ((symbol-function 'tramp-rpc--call)
+               (lambda (_vec _method _params)
+                 (signal 'remote-file-error '("Remote binary not found"))))
+              ((symbol-function 'tramp-rpc--sudo-auth-rejected-p)
+               (lambda (_stderr-buffer) nil))
+              ((symbol-function 'tramp-rpc--clear-sudo-password)
+               (lambda (_actual-vec)
+                 (setq cleared t))))
+      (unwind-protect
+          (progn
+            (should-error
+             (tramp-rpc--start-server-process
+              vec "/tmp/missing-tramp-rpc-server" "valid-password")
              :type 'remote-file-error)
-            (should (eq cleared vec)))
+            (should-not cleared)
+            (should-not (process-live-p proc))
+            (should-not (tramp-rpc--get-connection vec)))
         (when (process-live-p proc)
           (delete-process proc))
         (tramp-rpc--remove-connection vec)))))
