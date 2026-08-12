@@ -8,12 +8,13 @@
 use crate::protocol::{DirEntry, FileAttributes, FileType, RpcError, from_value};
 use rmpv::Value;
 use serde::Deserialize;
+use std::os::fd::{FromRawFd, OwnedFd};
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use tokio::fs;
 
 use super::HandlerResult;
-use super::file::{bytes_to_path, file_type_from_metadata_ft, map_io_error};
+use super::file::{bytes_to_path, file_type_from_metadata_ft, map_io_error, path_cstring};
 
 use crate::protocol::path_or_bytes;
 
@@ -49,9 +50,9 @@ fn get_file_attributes_at(
 ) -> Option<FileAttributes> {
     let mut stat_buf: libc::stat = unsafe { std::mem::zeroed() };
 
-    // Create null-terminated name
-    let mut name_cstr = name.to_vec();
-    name_cstr.push(0);
+    let Ok(name_cstr) = path_cstring(name) else {
+        return None;
+    };
 
     let flags = if follow_symlinks {
         0
@@ -178,8 +179,12 @@ fn list_dir_sync(
 ) -> Result<Vec<DirEntry>, std::io::Error> {
     // Open directory fd for fstatat
     let dir_fd = if include_attrs {
-        let mut path_cstr = path.as_os_str().as_bytes().to_vec();
-        path_cstr.push(0);
+        let path_cstr = path_cstring(path.as_os_str().as_bytes()).map_err(|error| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("invalid path: {error}"),
+            )
+        })?;
         let fd = unsafe {
             libc::open(
                 path_cstr.as_ptr() as *const libc::c_char,
@@ -194,18 +199,11 @@ fn list_dir_sync(
         None
     };
 
-    // Ensure we close the fd on all exit paths
-    struct DirFdGuard(Option<libc::c_int>);
-    impl Drop for DirFdGuard {
-        fn drop(&mut self) {
-            if let Some(fd) = self.0 {
-                unsafe {
-                    libc::close(fd);
-                }
-            }
-        }
-    }
-    let _guard = DirFdGuard(dir_fd);
+    // Close the directory descriptor on all exit paths.
+    let _fd_guard = dir_fd.map(|fd| {
+        // SAFETY: `fd` is a fresh, uniquely-owned descriptor from `libc::open`.
+        unsafe { OwnedFd::from_raw_fd(fd) }
+    });
 
     let mut results: Vec<DirEntry> = Vec::new();
 
