@@ -21,3 +21,6 @@ result
 
 # config
 .config
+
+# entire.io local tool state
+.entire/

@@ -4,6 +4,9 @@
 (require 'cl-lib)
 (require 'tramp-rpc)
 
+(declare-function tramp-rpc--invalidate-timed-out-connection "tramp-rpc"
+                  (process vec event))
+
 (defun tramp-rpc-mock-test-request--connection ()
   "Return a live process and its buffer for request lifecycle tests."
   (let* ((buffer (generate-new-buffer " *tramp-rpc-mock-test-request*"))
@@ -43,15 +46,20 @@
   (tramp-rpc-mock-test-request--with-connection (process buffer)
     (let ((clock (tramp-rpc-mock-test-request--timeout-clock))
           (vec (tramp-rpc-mock-test-request--vec))
-          (tramp-rpc--connections (make-hash-table :test 'equal)))
+          (tramp-rpc--connections (make-hash-table :test 'equal))
+          invalidated)
       (cl-letf (((symbol-function 'tramp-rpc--ensure-connection)
                  (lambda (_vec) (list :process process :buffer buffer)))
                 ((symbol-function 'tramp-rpc-protocol-encode-request-with-id)
                  (lambda (&rest _) '(101 . "request")))
                 ((symbol-function 'process-send-string) (lambda (&rest _) nil))
+                ((symbol-function 'tramp-rpc--invalidate-timed-out-connection)
+                 (lambda (timed-out-process timed-out-vec _event)
+                   (setq invalidated (list timed-out-process timed-out-vec))))
                 ((symbol-function 'float-time) clock))
         (should-error (tramp-rpc--call-with-timeout vec "test" nil 0 0)
                       :type 'remote-file-error)
+        (should (equal (list process vec) invalidated))
         (should-not (process-get process :tramp-rpc-pending-ids))
         (let ((messages (list '(:id 101 :result late))))
           (cl-letf (((symbol-function 'tramp-rpc-protocol-try-read-message)
@@ -60,6 +68,126 @@
                        (pop messages))))
             (tramp-rpc--connection-filter process "late")))
         (should-not (gethash buffer tramp-rpc--pending-responses))))))
+
+(ert-deftest tramp-rpc-mock-test-request-timeout-invalidates-ssh-generation ()
+  "Timeout invalidation removes the transport and its ControlMaster."
+  (tramp-rpc-mock-test-request--with-connection (process buffer)
+    (let* ((vec (tramp-rpc-mock-test-request--vec))
+           (connection (list :process process :buffer buffer :vec vec))
+           (tramp-rpc--connections (make-hash-table :test 'equal))
+           controlmaster-cleaned)
+      (process-put process :tramp-rpc-buffer buffer)
+      (process-put process :tramp-rpc-connection connection)
+      (puthash (tramp-rpc--connection-key vec) connection tramp-rpc--connections)
+      (cl-letf (((symbol-function 'tramp-rpc--cleanup-async-processes) #'ignore)
+                ((symbol-function 'tramp-rpc--cleanup-pty-processes) #'ignore)
+                ((symbol-function 'tramp-rpc--cleanup-watches-for-connection) #'ignore)
+                ((symbol-function 'tramp-rpc--cleanup-file-notify-for-connection) #'ignore)
+                ((symbol-function 'tramp-rpc--clear-direnv-cache) #'ignore)
+                ((symbol-function 'tramp-rpc--clear-file-caches-for-connection) #'ignore)
+                ((symbol-function 'tramp-rpc-magit--clear-cache-for-connection) #'ignore)
+                ((symbol-function 'tramp-rpc--cleanup-controlmaster-unlocked)
+                 (lambda (cleaned-vec)
+                   (setq controlmaster-cleaned cleaned-vec))))
+        (tramp-rpc--invalidate-timed-out-connection
+         process vec "test timeout\n"))
+      (should-not (process-live-p process))
+      (should-not (tramp-rpc--get-connection vec))
+      (should (equal vec controlmaster-cleaned)))))
+
+(ert-deftest tramp-rpc-mock-test-request-timeout-preserves-replacement-controlmaster ()
+  "Timeout cleanup does not tear down a replacement connection."
+  (tramp-rpc-mock-test-request--with-connection (process buffer)
+    (let* ((vec (tramp-rpc-mock-test-request--vec))
+           (replacement-buffer (generate-new-buffer
+                                " *tramp-rpc-mock-test-replacement*"))
+           (replacement (make-pipe-process
+                         :name "tramp-rpc-mock-test-replacement"
+                         :buffer replacement-buffer :noquery t))
+           (old-connection (list :process process :buffer buffer :vec vec))
+           (replacement-connection
+            (list :process replacement :buffer replacement-buffer :vec vec))
+           (tramp-rpc--connections (make-hash-table :test 'equal))
+           cleanup-attempted)
+      (unwind-protect
+          (progn
+            (process-put process :tramp-rpc-buffer buffer)
+            (process-put process :tramp-rpc-connection old-connection)
+            (puthash (tramp-rpc--connection-key vec) replacement-connection
+                     tramp-rpc--connections)
+            (cl-letf (((symbol-function 'tramp-rpc--cleanup-async-processes)
+                       #'ignore)
+                      ((symbol-function 'tramp-rpc--cleanup-pty-processes)
+                       #'ignore)
+                      ((symbol-function 'tramp-rpc--cleanup-watches-for-connection)
+                       #'ignore)
+                      ((symbol-function 'tramp-rpc--cleanup-file-notify-for-connection)
+                       #'ignore)
+                      ((symbol-function 'tramp-rpc--controlmaster-socket-path)
+                       (lambda (_vec) (setq cleanup-attempted t))))
+              (tramp-rpc--invalidate-timed-out-connection
+               process vec "test timeout\n"))
+            (should-not (process-live-p process))
+            (should (process-live-p replacement))
+            (should (eq replacement-connection
+                        (tramp-rpc--get-connection vec)))
+            (should-not cleanup-attempted))
+        (when (process-live-p replacement)
+          (delete-process replacement))
+        (when (buffer-live-p replacement-buffer)
+          (kill-buffer replacement-buffer))))))
+
+(ert-deftest tramp-rpc-mock-test-request-timeout-preserves-shared-controlmaster ()
+  "Timeout cleanup does not tear down a ControlMaster shared with a live connection."
+  (tramp-rpc-mock-test-request--with-connection (process buffer)
+    (let* ((vec (tramp-rpc-mock-test-request--vec))
+           (other-buffer (generate-new-buffer " *tramp-rpc-mock-test-shared*"))
+           (other (make-pipe-process :name "tramp-rpc-mock-test-shared"
+                                     :buffer other-buffer :noquery t))
+           (other-vec (tramp-dissect-file-name "/rpc:shared-test:/tmp/"))
+           (old-connection (list :process process :buffer buffer :vec vec))
+           (other-connection (list :process other :buffer other-buffer
+                                   :vec other-vec))
+           (tramp-rpc--connections (make-hash-table :test 'equal))
+           cleanup-attempted)
+      (unwind-protect
+          (progn
+            (process-put process :tramp-rpc-buffer buffer)
+            (process-put process :tramp-rpc-connection old-connection)
+            (process-put other :tramp-rpc-buffer other-buffer)
+            (process-put other :tramp-rpc-connection other-connection)
+            (puthash (tramp-rpc--connection-key vec) old-connection
+                     tramp-rpc--connections)
+            (puthash (tramp-rpc--connection-key other-vec) other-connection
+                     tramp-rpc--connections)
+            (cl-letf (((symbol-function 'tramp-rpc--cleanup-async-processes)
+                       #'ignore)
+                      ((symbol-function 'tramp-rpc--cleanup-pty-processes)
+                       #'ignore)
+                      ((symbol-function 'tramp-rpc--cleanup-watches-for-connection)
+                       #'ignore)
+                      ((symbol-function 'tramp-rpc--cleanup-file-notify-for-connection)
+                       #'ignore)
+                      ((symbol-function 'tramp-rpc--clear-direnv-cache) #'ignore)
+                      ((symbol-function 'tramp-rpc--clear-file-caches-for-connection)
+                       #'ignore)
+                      ((symbol-function 'tramp-rpc-magit--clear-cache-for-connection)
+                       #'ignore)
+                      ((symbol-function 'tramp-rpc--controlmaster-socket-path)
+                       (lambda (_v) "/tmp/tramp-rpc-mock-shared-socket"))
+                      ((symbol-function 'tramp-rpc--cleanup-controlmaster-unlocked)
+                       (lambda (_v) (setq cleanup-attempted t))))
+              (tramp-rpc--invalidate-timed-out-connection
+               process vec "test timeout\n"))
+            (should-not (process-live-p process))
+            (should (process-live-p other))
+            (should (eq other-connection
+                        (tramp-rpc--get-connection other-vec)))
+            (should-not cleanup-attempted))
+        (when (process-live-p other)
+          (delete-process other))
+        (when (buffer-live-p other-buffer)
+          (kill-buffer other-buffer))))))
 
 (ert-deftest tramp-rpc-mock-test-request-callback-error-does-not-strand-next-frame ()
   "A failing async callback does not stop delivery of buffered responses."
@@ -86,15 +214,20 @@
   "A batch timeout releases its request ID and response table."
   (tramp-rpc-mock-test-request--with-connection (process buffer)
     (let ((vec (tramp-rpc-mock-test-request--vec))
-          (tramp-rpc--connections (make-hash-table :test 'equal)))
+          (tramp-rpc--connections (make-hash-table :test 'equal))
+          invalidated)
       (cl-letf (((symbol-function 'tramp-rpc--ensure-connection)
                  (lambda (_vec) (list :process process :buffer buffer)))
                 ((symbol-function 'tramp-rpc-protocol-encode-batch-request-with-id)
                  (lambda (&rest _) '(102 . "batch")))
                 ((symbol-function 'process-send-string) (lambda (&rest _) nil))
+                ((symbol-function 'tramp-rpc--invalidate-timed-out-connection)
+                 (lambda (timed-out-process timed-out-vec _event)
+                   (setq invalidated (list timed-out-process timed-out-vec))))
                 ((symbol-function 'float-time) (tramp-rpc-mock-test-request--timeout-clock)))
         (should-error (tramp-rpc--call-batch vec '(("test" . nil)))
                       :type 'remote-file-error)
+        (should (equal (list process vec) invalidated))
         (should-not (process-get process :tramp-rpc-pending-ids))
         (should-not (gethash buffer tramp-rpc--pending-responses))))))
 

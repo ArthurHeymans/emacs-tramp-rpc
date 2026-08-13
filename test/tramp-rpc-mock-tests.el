@@ -1131,8 +1131,8 @@ This matches the behavior expected by `tramp-test28-process-file'."
                      (tramp-rpc--call-pipelined
                       'vec '(("test" . nil))))))))
 
-(ert-deftest tramp-rpc-mock-test-pipelined-timeout-signals-error ()
-  "A live connection with no response reaches the pipeline timeout branch."
+(ert-deftest tramp-rpc-mock-test-pipelined-timeout-invalidates-connection ()
+  "A live connection with no response is discarded after pipeline timeout."
   (let* ((buffer (generate-new-buffer " *tramp-rpc-pipeline-test*"))
          (process (make-pipe-process :name "tramp-rpc-pipeline-test"
                                      :buffer buffer :noquery t))
@@ -1152,7 +1152,7 @@ This matches the behavior expected by `tramp-test28-process-file'."
                 (error "Expected pipelined response timeout"))
             (remote-file-error
              (should (string-match-p "Timeout" (error-message-string err)))))
-          (should (process-live-p process))
+          (should-not (process-live-p process))
           (should-not (process-get process :tramp-rpc-pending-ids))
           (should-not (gethash buffer tramp-rpc--pending-responses)))
       (when (process-live-p process) (delete-process process))
