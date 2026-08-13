@@ -5566,6 +5566,30 @@ as a hop in multi-hop chains."
     ;; gateway != server, so no sudo elevation
     (should-not (tramp-rpc--detect-sudo-elevation vec))))
 
+(ert-deftest tramp-rpc-mock-test-clear-sudo-password ()
+  "Clearing the sudo password cache removes the cached password.
+A rejected sudo password must not be reused on the next attempt, otherwise
+`tramp-revert-buffer-with-sudo' fails again without prompting (issue #274)."
+  :tags '(:multi-hop :sudo)
+  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
+  (let* ((vec (tramp-dissect-file-name
+               "/rpc:alice@server|sudo:root@server:/etc/shadow"))
+         (sudo-ssh-user (tramp-rpc--detect-sudo-elevation vec))
+         (host (tramp-file-name-host vec))
+         (port (tramp-rpc--port-to-string (tramp-rpc--ssh-detail-port vec)))
+         (pw-spec (list :max 1 :user sudo-ssh-user :host host :port port
+                        :method "sudo"
+                        :require (cons :secret (and sudo-ssh-user '(:user)))
+                        :create (and sudo-ssh-user t)))
+         (key (auth-source-format-cache-entry pw-spec)))
+    ;; Simulate the pw-spec that `tramp-read-passwd' stores on the vec, then
+    ;; cache a (wrong) password the way `password-read' would.
+    (tramp-set-connection-property vec " pw-spec" pw-spec)
+    (password-cache-add key "wrongpass")
+    (should (password-in-cache-p key))
+    (tramp-rpc--clear-sudo-password vec)
+    (should-not (password-in-cache-p key))))
+
 (ert-deftest tramp-rpc-mock-test-sudo-file-name-predicate ()
   "Test the sudo+rpc handler predicate."
   :tags '(:multi-hop :sudo)
@@ -5907,6 +5931,42 @@ as a hop in multi-hop chains."
             (should-not (member "" command))
             (should (equal sent "secret\n")))
         (when (processp proc)
+          (delete-process proc))
+        (tramp-rpc--remove-connection vec)))))
+
+(ert-deftest tramp-rpc-mock-test-start-server-sudo-failure-clears-password ()
+  "A failed sudo server probe forgets its password before a retry."
+  :tags '(:sudo)
+  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
+  (let ((vec (tramp-dissect-file-name
+              "/rpc:alice@server|sudo:root@server:/root/"))
+        (orig-make-process (symbol-function 'make-process))
+        cleared proc)
+    (cl-letf (((symbol-function 'make-process)
+               (lambda (&rest _)
+                 (setq proc (funcall orig-make-process
+                                     :name "tramp-rpc-mock-cat"
+                                     :buffer nil
+                                     :command '("cat")
+                                     :connection-type 'pipe
+                                     :noquery t))))
+              ((symbol-function 'tramp-rpc--call)
+               (lambda (_vec method _params)
+                 (should (equal method "system.info"))
+                 ;; This is the normal rejected-password failure: sudo exits,
+                 ;; and the RPC probe reports a closed transport.
+                 (signal 'remote-file-error '("RPC transport disconnected"))))
+              ((symbol-function 'tramp-rpc--clear-sudo-password)
+               (lambda (actual-vec)
+                 (setq cleared actual-vec))))
+      (unwind-protect
+          (progn
+            (should-error
+             (tramp-rpc--start-server-process
+              vec "/tmp/tramp-rpc-server" "wrong-password")
+             :type 'remote-file-error)
+            (should (eq cleared vec)))
+        (when (process-live-p proc)
           (delete-process proc))
         (tramp-rpc--remove-connection vec)))))
 

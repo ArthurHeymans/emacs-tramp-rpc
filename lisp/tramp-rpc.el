@@ -387,6 +387,7 @@ is VEC itself."
   (tramp-file-name-port (tramp-rpc--ssh-detail-vec vec)))
 
 (declare-function tramp-read-passwd "tramp")
+(declare-function tramp-clear-passwd "tramp" (vec))
 
 (defun tramp-rpc--sudo-auth-vec (vec)
   "Return the unprivileged rpc vector used to validate sudo for VEC."
@@ -454,6 +455,12 @@ shape before passing the value to `sudo -S'."
                     (if ssh-user (concat ssh-user "@") "") host))))
       (when (process-live-p process)
         (delete-process process)))))
+
+(defun tramp-rpc--clear-sudo-password (vec)
+  "Clear the cached sudo password for VEC.
+Called when a sudo-via-RPC server start fails so the next attempt prompts
+for a fresh password instead of silently reusing a rejected one."
+  (tramp-clear-passwd vec))
 
 (defun tramp-rpc--proxy-hop-string (vec)
   "Return VEC's hop string with its sudo rpc hop removed.
@@ -1710,11 +1717,23 @@ Returns the connection plist.  Signals `remote-file-error' on failure."
 
     ;; Wait for server to be ready by sending a ping, and seed the
     ;; connection-local system.info cache for later uid/gid/home/shell lookups.
-    (let ((response (tramp-rpc--cache-system-info
-                     vec (tramp-rpc--call vec "system.info" nil))))
-      (unless response
-        (tramp-rpc--remove-connection vec)
-        (signal 'remote-file-error (list "Failed to connect to RPC server on" host))))
+    ;; `tramp-rpc--call' signals on the usual failed-start paths (a closed
+    ;; transport or timeout), so clear a supplied sudo password in the error
+    ;; handler as well as for an unexpected empty response.
+    (condition-case err
+        (let ((response (tramp-rpc--cache-system-info
+                         vec (tramp-rpc--call vec "system.info" nil))))
+          (unless response
+            (signal 'remote-file-error
+                    (list "Failed to connect to RPC server on" host))))
+      (remote-file-error
+       (tramp-rpc--remove-connection vec)
+       ;; A sudo start that fails to respond likely had its password rejected
+       ;; by sudo.  Clear the cached password so the next attempt prompts again
+       ;; instead of silently reusing the rejected password.
+       (when sudo-password
+         (tramp-rpc--clear-sudo-password vec))
+       (signal (car err) (cdr err))))
 
     ;; Set connection-local variables in the connection buffer.
     ;; Every TRAMP backend must call this after establishing the connection
@@ -1819,6 +1838,13 @@ accidentally routing file operations through tramp-sh."
          ;; leaving it alive can cause vc/diff-hl sentinels to route
          ;; file operations through tramp-sh instead of tramp-rpc.
          (tramp-rpc--cleanup-bootstrap-connection vec)
+         ;; The first start may have failed because sudo rejected the password.
+         ;; `tramp-rpc--start-server-process' cleared the cached password, so
+         ;; re-read it here to give the retry a fresh prompt.
+         (when sudo-ssh-user
+           (setq sudo-password
+                 (when (tramp-rpc--sudo-password-required-p vec)
+                   (tramp-rpc--sudo-read-password vec sudo-ssh-user))))
          (tramp-rpc--start-server-process vec binary-path sudo-password)))))))
 
 (defun tramp-rpc--disconnect (vec)
