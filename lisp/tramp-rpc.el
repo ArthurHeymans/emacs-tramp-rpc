@@ -547,6 +547,19 @@ Used to skip cache invalidation in `tramp-rpc-handle-process-file'.")
   "TRAMP backend using RPC."
   :group 'tramp)
 
+(defcustom tramp-rpc-call-timeout 30
+  "Maximum seconds to wait for a synchronous RPC call to complete.
+The value must be a positive number."
+  :type 'number
+  :group 'tramp-rpc)
+
+(defun tramp-rpc--configured-call-timeout ()
+  "Return the validated synchronous RPC call timeout."
+  (unless (and (numberp tramp-rpc-call-timeout)
+               (> tramp-rpc-call-timeout 0))
+    (user-error "`tramp-rpc-call-timeout' must be a positive number"))
+  tramp-rpc-call-timeout)
+
 (defcustom tramp-rpc-use-controlmaster t
   "Whether to use SSH ControlMaster for connection sharing.
 When enabled, multiple connections to the same host share a single
@@ -1900,7 +1913,8 @@ Returns the request ID."
   "Call METHOD with PARAMS on the RPC server for VEC.
 CONNECTION, when non-nil, is the captured connection generation to use.
 Returns the result or signals an error."
-  (tramp-rpc--call-with-timeout vec method params 30 0.1 connection))
+  (tramp-rpc--call-with-timeout
+   vec method params (tramp-rpc--configured-call-timeout) 0.1 connection))
 
 (defun tramp-rpc--call-fast (vec method params)
   "Call METHOD with PARAMS with shorter timeout for low-latency ops.
@@ -2071,7 +2085,8 @@ Returns:
   (t                          ; file.exists result
    ((type . \"file\") ...)    ; file.stat result
    (:error -32001 :message \"...\"))  ; or error plist"
-  (let* ((conn (tramp-rpc--ensure-connection vec))
+  (let* ((timeout (tramp-rpc--configured-call-timeout))
+         (conn (tramp-rpc--ensure-connection vec))
          (process (plist-get conn :process))
          (buffer (plist-get conn :buffer))
          (id-and-request (let ((tramp-rpc-protocol--message-target process))
@@ -2090,7 +2105,7 @@ Returns:
       ;; Wait for response with matching ID using wall-clock deadline
     (with-current-buffer buffer
       (let ((start-time (float-time))
-            (deadline (+ (float-time) 30))
+            (deadline (+ (float-time) timeout))
             response)
         ;; A transport sentinel may have injected an error before the loop.
         (setq response (tramp-rpc--find-response-by-id expected-id process))
@@ -2186,12 +2201,14 @@ Returns a list of request IDs in the same order."
 (defun tramp-rpc--receive-responses (vec ids &optional timeout connection)
   "Receive responses for request IDS from the RPC server for VEC.
 Returns an alist mapping each ID to its response plist.
-TIMEOUT is the maximum time to wait in seconds (default 30).
-CONNECTION, when non-nil, is the captured connection generation to use."
-  (let* ((conn (or connection (tramp-rpc--ensure-connection vec)))
+TIMEOUT is the maximum time to wait in seconds.
+When nil, `tramp-rpc-call-timeout' is used.  CONNECTION, when non-nil, is the
+captured connection generation to use."
+  (let* ((timeout (or timeout (tramp-rpc--configured-call-timeout)))
+         (conn (or connection (tramp-rpc--ensure-connection vec)))
          (process (plist-get conn :process))
          (buffer (plist-get conn :buffer))
-         (deadline (+ (float-time) (or timeout 30)))
+         (deadline (+ (float-time) timeout))
          (remaining-ids (copy-sequence ids))
          (responses (make-hash-table :test 'eql)))
     (tramp-rpc--debug "RECV-PIPE waiting for %d responses: %S" (length ids) ids)
@@ -2265,9 +2282,11 @@ Each result is either the actual result or an error plist.
 Unlike `tramp-rpc--call-batch', this sends each request as a separate
 RPC call, allowing the server to process them concurrently.
 This is more efficient when the server has async support."
-  (let* ((connection (tramp-rpc--ensure-connection vec))
+  (let* ((timeout (tramp-rpc--configured-call-timeout))
+         (connection (tramp-rpc--ensure-connection vec))
          (ids (tramp-rpc--send-requests vec requests connection))
-         (responses (tramp-rpc--receive-responses vec ids nil connection)))
+         (responses (tramp-rpc--receive-responses
+                     vec ids timeout connection)))
     ;; Process responses in order and extract results
     (mapcar (lambda (id-response)
               (let ((response (cdr id-response)))

@@ -98,6 +98,32 @@
         (should-not (process-get process :tramp-rpc-pending-ids))
         (should-not (gethash buffer tramp-rpc--pending-responses))))))
 
+(ert-deftest tramp-rpc-mock-test-request-batch-uses-configured-timeout ()
+  "Batch RPC calls wait for the configured synchronous timeout."
+  (tramp-rpc-mock-test-request--with-connection (process buffer)
+    (let ((vec (tramp-rpc-mock-test-request--vec))
+          (tramp-rpc-call-timeout 75)
+          (tramp-rpc--connections (make-hash-table :test 'equal))
+          (clock-calls 0))
+      (cl-letf (((symbol-function 'tramp-rpc--ensure-connection)
+                 (lambda (_vec) (list :process process :buffer buffer)))
+                ((symbol-function 'tramp-rpc-protocol-encode-batch-request-with-id)
+                 (lambda (&rest _) '(103 . "batch")))
+                ((symbol-function 'process-send-string) (lambda (&rest _) nil))
+                ((symbol-function 'float-time)
+                 (lambda (&rest _)
+                   (setq clock-calls (1+ clock-calls))
+                   (if (<= clock-calls 2) 0 50)))
+                ((symbol-function 'accept-process-output)
+                 (lambda (&rest _)
+                   (puthash 103 '(:id 103 :result batch)
+                            (tramp-rpc--get-pending-responses buffer))
+                   t))
+                ((symbol-function 'tramp-rpc-protocol-decode-batch-response)
+                 (lambda (_response) 'batch-result)))
+        (should (eq 'batch-result
+                    (tramp-rpc--call-batch vec '(("test" . nil)))))))))
+
 (ert-deftest tramp-rpc-mock-test-request-pipeline-death-keeps-receive-on-old-generation ()
   "A pipeline receives its injected error from the generation that sent it."
   (tramp-rpc-mock-test-request--with-connection (process buffer)
