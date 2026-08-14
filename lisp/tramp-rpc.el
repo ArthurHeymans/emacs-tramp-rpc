@@ -2894,11 +2894,7 @@ that `locate-dominating-stop-dir-regexp' is expected to match."
 (defun tramp-rpc-handle-dir-locals--all-files (directory &optional base-el-only)
   "Like `dir-locals--all-files' for TRAMP-RPC files.
 Return readable dir-locals files in DIRECTORY in increasing priority order."
-  (with-parsed-tramp-file-name
-      (if (file-name-absolute-p directory)
-          directory
-        (file-name-concat default-directory directory))
-      nil
+  (with-parsed-tramp-file-name (expand-file-name directory) nil
     ;; Unquote file names (e.g. /: prefix) before sending to server.
     (let* ((quoted-localname localname)
            (localdir (directory-file-name (file-name-unquote localname)))
@@ -2921,11 +2917,7 @@ For string/list NAME, uses a high-level RPC call.  Predicate NAME falls back
 to the built-in implementation."
   (if (functionp name)
       (tramp-run-real-handler #'locate-dominating-file (list file name))
-    (with-parsed-tramp-file-name
-        (if (file-name-absolute-p file)
-            file
-          (file-name-concat default-directory file))
-        nil
+    (with-parsed-tramp-file-name (expand-file-name file) nil
       ;; Unquote file names (e.g. /: prefix) before sending to server.
       (let* ((quoted-localname localname)
              (localname (file-name-unquote localname))
@@ -2951,11 +2943,7 @@ to the built-in implementation."
 
 (defun tramp-rpc--dir-locals-cache-update (file cache)
   "Call RPC helper for `dir-locals-find-file' update using FILE and CACHE."
-  (with-parsed-tramp-file-name
-      (if (file-name-absolute-p file)
-          file
-        (file-name-concat default-directory file))
-      nil
+  (with-parsed-tramp-file-name (expand-file-name file) nil
     ;; Unquote file names (e.g. /: prefix) before sending to server.
     (let* ((localname (file-name-unquote localname))
            (file-connection (file-remote-p file))
@@ -2991,9 +2979,7 @@ This is a lexical path check: the directories can be remote or not yet exist."
 
 (defun tramp-rpc-handle-dir-locals-find-file (file)
   "Like `dir-locals-find-file' for TRAMP-RPC files."
-  (let* ((file (if (file-name-absolute-p file)
-                   file
-                 (file-name-concat default-directory file)))
+  (let* ((file (expand-file-name file))
          (file-connection (file-remote-p file))
          (cache-update (tramp-rpc--dir-locals-cache-update file dir-locals-directory-cache))
          (locals-dir-update (alist-get 'locals cache-update))

@@ -365,7 +365,7 @@ pub async fn highlevel_test_files_in_dir(params: Value) -> HandlerResult {
     let params: Params = from_value(params).map_err(|e| RpcError::invalid_params(e.to_string()))?;
 
     tokio::task::spawn_blocking(move || {
-        let dir = canonical_or_original(Path::new(&params.directory));
+        let dir = canonical_or_original(Path::new(&super::expand_tilde(&params.directory)));
         if !dir.is_dir() {
             return Ok(Value::Array(vec![]));
         }
@@ -396,7 +396,7 @@ pub async fn highlevel_locate_dominating_file_multi(params: Value) -> HandlerRes
     let params: Params = from_value(params).map_err(|e| RpcError::invalid_params(e.to_string()))?;
 
     tokio::task::spawn_blocking(move || {
-        let path = PathBuf::from(&params.file);
+        let path = PathBuf::from(super::expand_tilde(&params.file));
         // Preserve lexical path shape instead of canonicalizing symlinks.
         // TRAMP clients rely on this to compute repo-relative paths correctly.
         let Some(existing_start) = find_existing_start(&path) else {
@@ -433,7 +433,7 @@ pub async fn highlevel_dir_locals_find_file_cache_update(params: Value) -> Handl
     let params: Params = from_value(params).map_err(|e| RpcError::invalid_params(e.to_string()))?;
 
     tokio::task::spawn_blocking(move || {
-        let file_path = PathBuf::from(&params.file);
+        let file_path = PathBuf::from(super::expand_tilde(&params.file));
         // Keep lexical (non-canonical) path shape to match locate-dominating behavior.
         let lexical_file = file_path.clone();
         let file_value = lexical_file.to_string_lossy().to_string().into_value();

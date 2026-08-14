@@ -808,6 +808,36 @@ Returns the result or signals an error."
             (should (string-match-p "/highlevel-root/\\.git\\'" first)))))
     (tramp-rpc-mock-test--stop-server)))
 
+(ert-deftest tramp-rpc-mock-test-server-highlevel-locate-dominating-file-expands-tilde ()
+  "Test high-level locate-dominating-file RPC expands a leading tilde.
+A tilde is a shell convention rather than a directory, so walking it
+literally finds nothing."
+  :tags '(:server)
+  (skip-unless tramp-rpc-mock-test--msgpack-available)
+  (skip-unless (tramp-rpc-mock-test--find-server))
+  (let ((home (make-temp-file "tramp-rpc-home" t))
+        ;; Overriding HOME below also changes how Emacs expands a tilde, so
+        ;; resolve `default-directory' while the real one is still in effect;
+        ;; the server is started with it as its working directory.
+        (default-directory (expand-file-name default-directory)))
+    (unwind-protect
+        (let ((process-environment (cons (concat "HOME=" home) process-environment)))
+          (tramp-rpc-mock-test--start-server)
+          (let ((deep (expand-file-name "project/a/b" home)))
+            (make-directory deep t)
+            (make-directory (expand-file-name "project/.git" home) t)
+            (with-temp-file (expand-file-name "file.txt" deep) (insert "x"))
+            (let* ((result (tramp-rpc-mock-test--rpc-call
+                            "highlevel.locate_dominating_file_multi"
+                            `((file . ,(encode-coding-string
+                                        "~/project/a/b/file.txt" 'utf-8))
+                              (names . [".git"]))))
+                   (first (car result)))
+              (should (stringp first))
+              (should (string= first (expand-file-name "project/.git" home))))))
+      (tramp-rpc-mock-test--stop-server)
+      (delete-directory home t))))
+
 (ert-deftest tramp-rpc-mock-test-server-highlevel-locate-dominating-file-preserves-symlink-path ()
   "Test locate-dominating-file keeps lexical symlink path."
   :tags '(:server)
@@ -6083,6 +6113,28 @@ operations and re-quoted on the way back."
              (result (tramp-rpc-handle-locate-dominating-file "foo" ".git")))
         (should (equal captured-file "/tmp/tramp-rpc-root/subdir/foo"))
         (should (equal result "/rpc:host:/:/tmp/tramp-rpc-root/"))))))
+
+(ert-deftest tramp-rpc-mock-test-locate-dominating-file-expands-tilde ()
+  "Ensure the locate-dominating handler expands a tilde before the RPC call.
+`find-file' abbreviates the remote home directory, so buffer paths reach
+this handler in tilde form.  Expanding here also keeps the search path and
+the returned directory in the one form
+`tramp-rpc--locate-dominating-before-stop-p' compares."
+  :tags '(:dir-locals)
+  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
+  (let (captured-file)
+    (cl-letf (((symbol-function 'tramp-rpc--call)
+               (lambda (_vec method params)
+                 (should (string= method "highlevel.locate_dominating_file_multi"))
+                 (setq captured-file
+                       (decode-coding-string (alist-get 'file params) 'utf-8 t))
+                 (list (encode-coding-string "/home/user/project/.git" 'utf-8 t))))
+              ((symbol-function 'tramp-get-home-directory)
+               (lambda (&rest _) "/home/user")))
+      (let ((result (tramp-rpc-handle-locate-dominating-file
+                     "/rpc:host:~/project/src/" ".git")))
+        (should (equal captured-file "/home/user/project/src/"))
+        (should (equal result "/rpc:host:/home/user/project/"))))))
 
 (ert-deftest tramp-rpc-mock-test-locate-dominating-file-respects-stop-regexp ()
   "Ensure locate-dominating handler filters results above stop regexp."
