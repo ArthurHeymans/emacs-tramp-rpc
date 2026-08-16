@@ -1,4 +1,8 @@
-{ rustPlatform, lib }:
+{
+  buildPackages,
+  lib,
+  rustPlatform,
+}:
 rustPlatform.buildRustPackage {
   pname = "emacs-tramp-rpc";
   version = "dev";
@@ -6,4 +10,8 @@ rustPlatform.buildRustPackage {
   cargoDeps = rustPlatform.importCargoLock {
     lockFile = ./Cargo.lock;
   };
+  nativeCheckInputs = [
+    buildPackages.coreutils
+    buildPackages.python3
+  ];
 }

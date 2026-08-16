@@ -4070,10 +4070,7 @@ mod tests {
     async fn pty_read_errors_are_terminal_process_errors() {
         let _test_lock = test_process_map_lock().await;
         let start = start_pty(Value::Map(vec![
-            (
-                Value::String("cmd".into()),
-                Value::String("/bin/sleep".into()),
-            ),
+            (Value::String("cmd".into()), Value::String("sleep".into())),
             (
                 Value::String("args".into()),
                 Value::Array(vec![Value::String("30".into())]),
@@ -4338,10 +4335,7 @@ mod tests {
     async fn pty_write_completes_large_data_under_backpressure() {
         let _test_lock = test_process_map_lock().await;
         let start = start_pty(Value::Map(vec![
-            (
-                Value::String("cmd".into()),
-                Value::String("/bin/sleep".into()),
-            ),
+            (Value::String("cmd".into()), Value::String("sleep".into())),
             (
                 Value::String("args".into()),
                 Value::Array(vec![Value::String("30".into())]),
