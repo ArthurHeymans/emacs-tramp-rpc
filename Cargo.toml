@@ -5,6 +5,7 @@ members = ["server"]
 [workspace.package]
 version = "0.13.1"
 edition = "2024"
+rust-version = "1.88"
 license = "GPL-3.0-or-later"
 authors = ["Arthur Heymans <arthur@aheymans.xyz>"]
 

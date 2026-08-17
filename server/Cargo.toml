@@ -2,6 +2,7 @@
 name = "tramp-rpc-server"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 authors.workspace = true
 description = "RPC server for TRAMP remote file access"
