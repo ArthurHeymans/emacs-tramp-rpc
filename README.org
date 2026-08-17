@@ -415,6 +415,7 @@ Run ~M-x tramp-rpc-deploy-status~ to see:
 - Whether Rust/cargo is available
 - Cached binaries
 - Download URLs
+- The binary ID (in case you are manually installing the binary on the remote out of band)
 
 ** diff-hl issues in dired
 

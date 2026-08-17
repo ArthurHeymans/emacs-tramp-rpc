@@ -20,7 +20,7 @@ use crate::protocol::path_or_bytes;
 /// Extract time and mode fields from libc::stat in a cross-platform way
 /// Returns (atime, mtime, ctime, mode)
 /// - On Linux: st_mode is u32; time fields are i32 on 32-bit, i64 on 64-bit
-/// - On macOS: st_mode is u16, time fields are i64
+/// - On macOS and FreeBSD: st_mode is u16, time fields are i64
 #[inline]
 fn stat_time_to_i64<T: Into<i64>>(time: T) -> i64 {
     time.into()
@@ -28,9 +28,9 @@ fn stat_time_to_i64<T: Into<i64>>(time: T) -> i64 {
 
 #[inline]
 fn extract_stat_fields(stat_buf: &libc::stat) -> (i64, i64, i64, u32) {
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "freebsd"))]
     let mode = stat_buf.st_mode as u32;
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(not(any(target_os = "macos", target_os = "freebsd")))]
     let mode = stat_buf.st_mode;
 
     (
