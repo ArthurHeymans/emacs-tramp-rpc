@@ -438,14 +438,19 @@ preserve timestamps."
   (let ((root (tramp-rpc-deploy--source-root))
         (files (tramp-rpc-deploy--source-file-list)))
     (when (and root files)
-      (with-temp-buffer
-        (set-buffer-multibyte nil)
-        (dolist (file files)
-          (insert (file-relative-name file root) "\0")
-          (let ((coding-system-for-read 'binary))
-            (insert-file-contents-literally file))
-          (insert "\0"))
-        (secure-hash 'sha256 (current-buffer))))))
+      ;; Temporary buffers inherit `default-directory'.  During connection
+      ;; setup that can be a remote RPC directory; coding detection may then
+      ;; expand an empty file name against it and recursively reconnect while
+      ;; the deployment binary id is still being computed.
+      (let ((default-directory (file-name-as-directory root)))
+        (with-temp-buffer
+          (set-buffer-multibyte nil)
+          (dolist (file files)
+            (insert (file-relative-name file root) "\0")
+            (let ((coding-system-for-read 'binary))
+              (insert-file-contents-literally file))
+            (insert "\0"))
+          (secure-hash 'sha256 (current-buffer)))))))
 
 (defun tramp-rpc-deploy--git-revision ()
   "Return the short git revision for the source checkout, or nil."

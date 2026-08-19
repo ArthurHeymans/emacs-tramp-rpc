@@ -4935,6 +4935,26 @@ issue #268 (0.13 fails to download prebuilt binary)."
                   (should-not (equal id1 (tramp-rpc-deploy--binary-id))))))))
       (delete-directory dir t))))
 
+(ert-deftest tramp-rpc-mock-test-deploy-source-hash-ignores-remote-default-directory ()
+  "Source hashing must not reconnect through an inherited remote directory."
+  :tags '(:deploy)
+  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
+  (let ((dir (make-temp-file "tramp-rpc-source" t)))
+    (unwind-protect
+        (progn
+          (make-directory (expand-file-name "server/src" dir) t)
+          (with-temp-file (expand-file-name "Cargo.toml" dir)
+            (insert "[workspace]\nmembers = [\"server\"]\n"))
+          (with-temp-file (expand-file-name "server/src/main.rs" dir)
+            (insert "fn main() {}\n"))
+          (let ((tramp-rpc-deploy-source-directory dir)
+                (default-directory "/rpc:must-not-connect:~/workspace/"))
+            (cl-letf (((symbol-function 'tramp-rpc--ensure-connection)
+                       (lambda (&rest _args)
+                         (ert-fail "Source hashing attempted a remote connection"))))
+              (should (stringp (tramp-rpc-deploy--source-tree-hash))))))
+      (delete-directory dir t))))
+
 (ert-deftest tramp-rpc-mock-test-deploy-binary-id-release-policy ()
   "Test that release policy keeps version-keyed ids for git checkouts."
   :tags '(:deploy)
