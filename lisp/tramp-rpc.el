@@ -592,6 +592,30 @@ Set to \"yes\" to keep alive indefinitely."
                  (const :tag "Indefinitely" "yes"))
   :group 'tramp-rpc)
 
+(defcustom tramp-rpc-server-alive-interval 30
+  "SSH ServerAliveInterval in seconds for RPC connections, or nil to disable.
+The subscriber model keeps remote processes alive by having the server push
+output notifications, but when a remote process is idle the SSH connection
+carries no traffic.  Without keepalives, NAT routers and firewalls often
+drop idle TCP connections (typically after 30 minutes to 2 hours), causing
+the connection to silently die.
+
+This option adds SSH ServerAliveInterval to both the ControlMaster and
+server connections, keeping the TCP socket alive and ensuring dead
+connections are detected promptly.  Set to nil to disable and rely on
+your SSH config or system TCP keepalives instead."
+  :type '(choice (integer :tag "Interval (seconds)")
+                 (const :tag "Disabled" nil))
+  :group 'tramp-rpc)
+
+(defcustom tramp-rpc-server-alive-count-max 3
+  "SSH ServerAliveCountMax for RPC connections.
+Number of unanswered keepalives before the connection is considered dead.
+Used together with `tramp-rpc-server-alive-interval'.
+The connection is declared dead after interval * count-max seconds."
+  :type 'integer
+  :group 'tramp-rpc)
+
 (defcustom tramp-rpc-ssh-options nil
   "Additional SSH options to pass when connecting.
 This is a list of strings, each of which is passed as an SSH -o option.
@@ -1562,6 +1586,16 @@ Returns non-nil on success."
                           "-o" (format "ControlPath=%s" socket-path)
                           "-o" (format "ControlPersist=%s"
                                        tramp-rpc-controlmaster-persist))
+                    ;; SSH keepalives: the subscriber model generates no traffic
+                    ;; when remote processes are idle, so without keepalives NAT
+                    ;; and firewalls will drop the TCP connection overnight.
+                    ;; These keepalives are on the ControlMaster because it owns
+                    ;; the actual TCP socket used by all muxed connections.
+                    (when tramp-rpc-server-alive-interval
+                      (list "-o" (format "ServerAliveInterval=%d"
+                                         tramp-rpc-server-alive-interval)
+                            "-o" (format "ServerAliveCountMax=%d"
+                                         tramp-rpc-server-alive-count-max)))
                     ;; Connect and immediately exit, leaving ControlMaster running
                     (list "-N" host)))
          process)
@@ -1628,6 +1662,16 @@ Returns the connection plist.  Signals `remote-file-error' on failure."
                     ;; User-specified SSH options
                     (mapcan (lambda (opt) (list "-o" opt))
                             tramp-rpc-ssh-options)
+                    ;; SSH keepalives: when ControlMaster is not in use this
+                    ;; connection owns the TCP socket directly, so keepalives
+                    ;; must be set here.  When ControlMaster is in use the
+                    ;; ControlMaster already carries the keepalives, but setting
+                    ;; them here too is harmless and provides defence-in-depth.
+                    (when tramp-rpc-server-alive-interval
+                      (list "-o" (format "ServerAliveInterval=%d"
+                                         tramp-rpc-server-alive-interval)
+                            "-o" (format "ServerAliveCountMax=%d"
+                                         tramp-rpc-server-alive-count-max)))
                     ;; ControlMaster options for connection sharing
                     ;; Use the expanded socket path to match what establish-controlmaster created
                     (when tramp-rpc-use-controlmaster
