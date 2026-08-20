@@ -52,7 +52,8 @@
 (declare-function tramp-rpc--binary-bytes "tramp-rpc")
 (declare-function tramp-rpc--controlmaster-socket-path "tramp-rpc")
 (declare-function tramp-rpc--hops-to-proxyjump "tramp-rpc")
-(declare-function tramp-rpc--port-to-string "tramp-rpc")
+(declare-function tramp-rpc--port-to-string "tramp-rpc" (port))
+(declare-function tramp-rpc--ssh-identity-args "tramp-rpc" (user port proxyjump))
 (declare-function tramp-rpc--ssh-detail-user "tramp-rpc")
 (declare-function tramp-rpc--sudo-rpc-hop-vec "tramp-rpc")
 (declare-function tramp-rpc-file-name-p "tramp-rpc")
@@ -1042,8 +1043,6 @@ DIRENV-ENV is an optional alist of environment variables from direnv."
                     (list "ssh")
                     ;; Request PTY allocation
                     (list "-t" "-t")  ; Force PTY even without controlling terminal
-                    ;; Multi-hop via ProxyJump
-                    (when proxyjump (list "-J" proxyjump))
                     ;; Reuse ControlMaster if enabled
                     (when tramp-rpc-use-controlmaster
                       (list "-o" "ControlMaster=auto"
@@ -1064,8 +1063,7 @@ DIRENV-ENV is an optional alist of environment variables from direnv."
                     ;; Raw SSH arguments
                     tramp-rpc-ssh-args
                     ;; Connection parameters
-                    (when user (list "-l" user))
-                    (when port (list "-p" port))
+                    (tramp-rpc--ssh-identity-args user port proxyjump)
                     ;; Host and command
                     (list host remote-cmd)))
          ;; Normalize buffer

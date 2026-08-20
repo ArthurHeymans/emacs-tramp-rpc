@@ -13,7 +13,7 @@ use tokio::fs::{self, File, OpenOptions};
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 
 use super::HandlerResult;
-use super::file::{bytes_to_path, map_io_error};
+use super::file::{bytes_to_path, map_io_error, path_cstring};
 
 use crate::protocol::path_or_bytes;
 
@@ -764,9 +764,8 @@ pub async fn chown(params: Value) -> HandlerResult {
     // Use spawn_blocking for the libc syscall
     tokio::task::spawn_blocking(move || {
         use std::os::unix::ffi::OsStrExt;
-        let path_bytes = path.as_os_str().as_bytes();
-        let mut path_cstr = path_bytes.to_vec();
-        path_cstr.push(0);
+        let path_cstr = path_cstring(path.as_os_str().as_bytes())
+            .map_err(|error| RpcError::invalid_params(format!("invalid path: {error}")))?;
 
         let result = unsafe {
             libc::chown(
@@ -802,9 +801,12 @@ fn set_file_times_sync_path_io(
 ) -> std::io::Result<()> {
     use std::os::unix::ffi::OsStrExt;
 
-    let path_bytes = path.as_os_str().as_bytes();
-    let mut path_cstr = path_bytes.to_vec();
-    path_cstr.push(0); // Null terminate
+    let path_cstr = path_cstring(path.as_os_str().as_bytes()).map_err(|error| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("invalid path: {error}"),
+        )
+    })?;
 
     let times = [
         libc::timespec {

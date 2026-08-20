@@ -386,6 +386,17 @@ is VEC itself."
   "Return the SSH port for VEC, using sudo-via-RPC hop details."
   (tramp-file-name-port (tramp-rpc--ssh-detail-vec vec)))
 
+(defsubst tramp-rpc--port-to-string (port)
+  "Normalize PORT to a string, or return nil.
+PORT may be a number (from defaults), a string (from filename
+parsing via `tramp-dissect-file-name'), or nil (when unset).
+Upstream TRAMP always stores port as a string in the
+`tramp-file-name' struct, but defensive handling of numbers
+avoids breakage if callers supply numeric defaults."
+  (cond ((stringp port) port)
+        ((numberp port) (number-to-string port))
+        (t nil)))
+
 (declare-function tramp-read-passwd "tramp")
 (declare-function tramp-clear-passwd "tramp" (vec))
 
@@ -429,9 +440,7 @@ shape before passing the value to `sudo -S'."
 (defun tramp-rpc--sudo-read-password (vec ssh-user)
   "Read sudo password for SSH-USER on VEC using TRAMP auth machinery."
   (let* ((host (tramp-file-name-host vec))
-         (raw-port (tramp-rpc--ssh-detail-port vec))
-         (port (cond ((stringp raw-port) raw-port)
-                     ((numberp raw-port) (number-to-string raw-port))))
+         (port (tramp-rpc--port-to-string (tramp-rpc--ssh-detail-port vec)))
          (buffer (get-buffer-create " *tramp-rpc-sudo-password*"))
          (process (make-pipe-process
                    :name "tramp-rpc-sudo-password"
@@ -1129,17 +1138,6 @@ later and more specific values replace earlier ones."
     (tramp-rpc--get-direnv-environment vec localname)
     (tramp-rpc--caller-environment))))
 
-(defsubst tramp-rpc--port-to-string (port)
-  "Normalize PORT to a string, or return nil.
-PORT may be a number (from defaults), a string (from filename
-parsing via `tramp-dissect-file-name'), or nil (when unset).
-Upstream TRAMP always stores port as a string in the
-`tramp-file-name' struct, but defensive handling of numbers
-avoids breakage if callers supply numeric defaults."
-  (cond ((stringp port) port)
-        ((numberp port) (number-to-string port))
-        (t nil)))
-
 (defun tramp-rpc--connection-key-route-hop (hop-vec)
   "Return normalized route identity for HOP-VEC."
   (list (tramp-rpc--hop-component-string (tramp-file-name-method hop-vec))
@@ -1512,6 +1510,14 @@ hop so the socket is shared with the normal rpc connection."
                 path t t))
     (expand-file-name path)))
 
+(defun tramp-rpc--ssh-identity-args (user port proxyjump)
+  "Return SSH -l/-p/-J arguments for USER, PORT, and PROXYJUMP.
+Each of USER, PORT, and PROXYJUMP may be nil, in which case the
+corresponding argument is omitted."
+  (append (when user (list "-l" user))
+          (when port (list "-p" port))
+          (when proxyjump (list "-J" proxyjump))))
+
 (defun tramp-rpc--controlmaster-active-p (vec)
   "Return non-nil if a ControlMaster connection is active for VEC."
   (let* ((socket-path (tramp-rpc--controlmaster-socket-path vec))
@@ -1524,9 +1530,7 @@ hop so the socket is shared with the normal rpc connection."
          ;; Check if the socket is actually usable via ssh -O check
          (zerop (apply #'call-process "ssh" nil nil nil
                        (append
-                        (when user (list "-l" user))
-                        (when port (list "-p" port))
-                        (when proxyjump (list "-J" proxyjump))
+                        (tramp-rpc--ssh-identity-args user port proxyjump)
                         (list "-o" (format "ControlPath=%s" socket-path)
                               "-O" "check"
                               host)))))))
@@ -1553,10 +1557,7 @@ Returns non-nil on success."
          (ssh-args (append
                     (list "ssh")
                     tramp-rpc-ssh-args
-                    (when user (list "-l" user))
-                    (when port (list "-p" port))
-                    ;; Multi-hop via ProxyJump
-                    (when proxyjump (list "-J" proxyjump))
+                    (tramp-rpc--ssh-identity-args user port proxyjump)
                     ;; NO BatchMode - allow password prompts
                     (list "-o" "StrictHostKeyChecking=accept-new")
                     ;; ControlMaster options
@@ -1618,10 +1619,7 @@ Returns the connection plist.  Signals `remote-file-error' on failure."
                     (list "ssh")
                     ;; Raw SSH arguments (e.g., -v, -F config)
                     tramp-rpc-ssh-args
-                    (when user (list "-l" user))
-                    (when port (list "-p" port))
-                    ;; Multi-hop via ProxyJump
-                    (when proxyjump (list "-J" proxyjump))
+                    (tramp-rpc--ssh-identity-args user port proxyjump)
                     ;; Only use BatchMode=yes when ControlMaster handles auth;
                     ;; without it, BatchMode=yes prevents password prompts.
                     (when tramp-rpc-use-controlmaster
@@ -1897,9 +1895,7 @@ down VEC's ControlMaster in that case would disrupt the still-live connection."
         (ignore-errors
           (apply #'call-process "ssh" nil nil nil
                  (append
-                  (when user (list "-l" user))
-                  (when port (list "-p" port))
-                  (when proxyjump (list "-J" proxyjump))
+                  (tramp-rpc--ssh-identity-args user port proxyjump)
                   (list "-o" (format "ControlPath=%s" socket-path)
                         "-O" "exit" host)))))
       ;; Kill the auth process.
