@@ -140,6 +140,69 @@ async fn read_default_bounded(
     Ok(buf)
 }
 
+fn write_open_options(
+    append: bool,
+    offset: Option<u64>,
+    create_new: bool,
+    mode: Option<u32>,
+) -> OpenOptions {
+    let mut options = OpenOptions::new();
+    if append {
+        options.append(true);
+    } else {
+        options.write(true);
+        if offset.is_none() && !create_new {
+            options.truncate(true);
+        }
+    }
+    if create_new {
+        options.create_new(true);
+        if let Some(mode) = mode {
+            options.mode(mode);
+        }
+    }
+    options
+}
+
+async fn open_for_write(
+    path: &Path,
+    append: bool,
+    offset: Option<u64>,
+    mode: Option<u32>,
+) -> std::io::Result<(File, bool)> {
+    if mode.is_some() {
+        loop {
+            match write_open_options(append, offset, true, mode)
+                .open(path)
+                .await
+            {
+                Ok(file) => return Ok((file, true)),
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                    // Open the existing file without creating it.  If it was
+                    // unlinked after the probe, retry the probe so that a file
+                    // this operation creates is always reported as created and
+                    // receives its requested mode.
+                    match write_open_options(append, offset, false, None)
+                        .open(path)
+                        .await
+                    {
+                        Ok(file) => return Ok((file, false)),
+                        Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                        Err(error) => return Err(error),
+                    }
+                }
+                Err(error) => return Err(error),
+            }
+        }
+    }
+
+    write_open_options(append, offset, false, None)
+        .create(true)
+        .open(path)
+        .await
+        .map(|file| (file, false))
+}
+
 /// Write file contents
 pub async fn write(params: Value) -> HandlerResult {
     #[derive(Deserialize)]
@@ -168,21 +231,11 @@ pub async fn write(params: Value) -> HandlerResult {
     // Content is already binary, no decoding needed!
     let content = params.content;
 
-    // Open the file with appropriate options
-    let mut options = OpenOptions::new();
-
-    if params.append {
-        options.append(true).create(true);
-    } else if params.offset.is_some() {
-        // Seeking past EOF then writing is the sparse, zero-filled behavior
-        // Emacs expects for an integer `write-region' offset.
-        options.write(true).create(true);
-    } else {
-        options.write(true).create(true).truncate(true);
-    }
-
-    let mut file = options
-        .open(&path)
+    // A create-new probe makes the "mode only for new files" contract atomic:
+    // a metadata precheck would race another creator between stat and open.
+    // The requested mode is also supplied at creation so the inode is never
+    // briefly exposed with the default 0666 permissions.
+    let (mut file, created) = open_for_write(&path, params.append, params.offset, params.mode)
         .await
         .map_err(|e| map_io_error(e, &path_str))?;
 
@@ -200,10 +253,12 @@ pub async fn write(params: Value) -> HandlerResult {
     // Do not report success until Tokio has completed the pending file writes.
     file.flush().await.map_err(|e| map_io_error(e, &path_str))?;
 
-    // Set permissions if specified
-    if let Some(mode) = params.mode {
+    // Set permissions if specified.  Chmod the open file handle rather than
+    // the path so the mode always lands on the inode just written, even if
+    // the path was replaced concurrently.
+    if let Some(mode) = params.mode.filter(|_| created) {
         let perms = std::fs::Permissions::from_mode(mode);
-        fs::set_permissions(&path, perms)
+        file.set_permissions(perms)
             .await
             .map_err(|e| map_io_error(e, &path_str))?;
     }
@@ -879,6 +934,35 @@ mod tests {
         .expect("write at offset creates file");
 
         assert_eq!(fs::read(path).await.unwrap(), b"\0\0\0\0XY");
+    }
+
+    #[tokio::test]
+    async fn write_mode_is_applied_only_when_file_is_created() {
+        let tmp = tempfile::tempdir().expect("create tempdir");
+        let existing = tmp.path().join("existing");
+        fs::write(&existing, b"old").await.unwrap();
+        fs::set_permissions(&existing, std::fs::Permissions::from_mode(0o640))
+            .await
+            .unwrap();
+
+        write(msgpack_map! {
+            "path" => path_value(&existing),
+            "content" => Value::Binary(b"new".to_vec()),
+            "mode" => 0o600u32,
+        })
+        .await
+        .expect("overwrite existing file");
+        assert_eq!(fs::metadata(&existing).await.unwrap().mode() & 0o777, 0o640);
+
+        let created = tmp.path().join("created");
+        write(msgpack_map! {
+            "path" => path_value(&created),
+            "content" => Value::Binary(b"new".to_vec()),
+            "mode" => 0o600u32,
+        })
+        .await
+        .expect("create file");
+        assert_eq!(fs::metadata(created).await.unwrap().mode() & 0o777, 0o600);
     }
 
     #[tokio::test]
