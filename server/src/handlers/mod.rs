@@ -7,7 +7,7 @@ pub mod io;
 pub mod process;
 
 use crate::msgpack_map;
-use crate::protocol::{Request, RequestId, Response, RpcError, from_value};
+use crate::protocol::{Request, Response, RpcError, from_value};
 use futures::{StreamExt, TryStreamExt};
 use rmpv::Value;
 
@@ -336,21 +336,12 @@ async fn batch_execute(params: Value) -> HandlerResult {
     }
 
     let results = bounded_batch_futures(batch_params.requests.into_iter().map(|req| async move {
-        // Create a fake Request to reuse dispatch logic.
-        let fake_request = Request {
-            version: "2.0".to_string(),
-            id: RequestId::Number(0), // Dummy ID, not used in batch
-            method: req.method,
-            params: req.params,
-        };
-
-        // Get the result by calling the handler directly (not full dispatch).
-        let response = dispatch_inner(fake_request).await;
-
-        // Convert Response to a result object.
-        let result = match (response.result, response.error) {
-            (Some(result), None) => msgpack_map! { "result" => result },
-            (None, Some(error)) => {
+        // Batch subrequests have no request id of their own; route them
+        // directly to the handlers instead of round-tripping through a
+        // synthetic Request/Response pair.
+        let result = match route(req.method, req.params).await {
+            Ok(value) => msgpack_map! { "result" => value },
+            Err(error) => {
                 let mut error_fields = vec![
                     (
                         Value::String("code".into()),
@@ -368,7 +359,6 @@ async fn batch_execute(params: Value) -> HandlerResult {
                     "error" => Value::Map(error_fields)
                 }
             }
-            _ => msgpack_map! { "result" => Value::Nil },
         };
         Ok::<Value, RpcError>(result)
     }))
@@ -398,14 +388,22 @@ async fn batch_execute(params: Value) -> HandlerResult {
     Ok(msgpack_map! { "results" => Value::Array(results) })
 }
 
-/// Inner dispatch that handles the actual method routing
-/// Used by both single requests and batch requests
+/// Dispatch a single request to its handler and wrap the outcome in a
+/// response for its request id.
 async fn dispatch_inner(request: Request) -> Response {
     let Request {
         id, method, params, ..
     } = request;
+    match route(method, params).await {
+        Ok(value) => Response::success(id, value),
+        Err(error) => Response::error(Some(id), error),
+    }
+}
 
-    let result = match method.as_str() {
+/// Route a method to its handler.  Shared by single requests and batch
+/// subrequests.
+async fn route(method: String, params: Value) -> HandlerResult {
+    match method.as_str() {
         // File metadata operations
         "file.stat" => file::stat(params).await,
         "file.truename" => file::truename(params).await,
@@ -471,11 +469,6 @@ async fn dispatch_inner(request: Request) -> Response {
 
         // Note: "batch" is NOT allowed in batch (no recursion)
         _ => Err(RpcError::method_not_found(&method)),
-    };
-
-    match result {
-        Ok(value) => Response::success(id, value),
-        Err(error) => Response::error(Some(id), error),
     }
 }
 
@@ -680,7 +673,7 @@ mod tests {
         let result = msgpack_map! {
             "results" => Value::Array(vec![Value::Binary(vec![0; 64])]),
         };
-        let response = Response::success(RequestId::Number(99), result.clone());
+        let response = Response::success(crate::protocol::RequestId::Number(99), result.clone());
         let inner_size = rmp_serde::to_vec_named(&result).unwrap().len();
         let frame_size = rmp_serde::to_vec_named(&response).unwrap().len();
         assert!(frame_size > inner_size);

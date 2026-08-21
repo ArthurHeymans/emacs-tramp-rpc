@@ -5488,9 +5488,9 @@ issue #268 (0.13 fails to download prebuilt binary)."
     (with-temp-buffer
       (insert-file-contents
        (expand-file-name "server/src/handlers/mod.rs" tramp-rpc-mock-test--project-root))
-      (should (re-search-forward "async fn dispatch_inner" nil t))
+      (should (re-search-forward "async fn route" nil t))
       (let ((start (point))
-            (end (progn (should (re-search-forward "^ *match result {" nil t))
+            (end (progn (should (re-search-forward "_ => Err(RpcError::method_not_found" nil t))
                         (match-beginning 0))))
         (goto-char start)
         (while (re-search-forward "\\\"\\([[:alnum:]_.]+\\)\\\" =>" end t)
