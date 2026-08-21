@@ -696,10 +696,10 @@ impl WatchManager {
                     // still leave the path unwatched.  Restore a consistent
                     // non-recursive registration before surfacing the error,
                     // otherwise this map claims a live watch that is gone.
-                    if watcher
-                        .watch(&canonical, RecursiveMode::NonRecursive)
-                        .is_ok()
-                    {
+                    // rearm_existing_watch forces a backend re-registration;
+                    // watch_nonrecursive would return early because the
+                    // logical direct_watches entry still exists.
+                    if watcher.rearm_existing_watch(&canonical).is_ok() {
                         paths.insert(canonical.clone(), RecursiveMode::NonRecursive);
                     } else {
                         paths.remove(&canonical);
