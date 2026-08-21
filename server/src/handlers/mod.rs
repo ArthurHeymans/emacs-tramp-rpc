@@ -265,12 +265,14 @@ pub(crate) fn expand_tilde(path: &str) -> String {
 ///
 /// Returns None when the path contains no expandable tilde prefix.
 pub(crate) fn expand_tilde_bytes(path: &[u8]) -> Option<Vec<u8>> {
-    if let Ok(home) = std::env::var("HOME") {
+    // var_os keeps raw bytes: HOME need not be valid UTF-8.
+    if let Some(home) = std::env::var_os("HOME") {
+        let home = std::os::unix::ffi::OsStrExt::as_bytes(home.as_os_str());
         if path == b"~" {
-            return Some(home.into_bytes());
+            return Some(home.to_vec());
         }
         if let Some(rest) = path.strip_prefix(b"~/") {
-            let mut expanded = home.into_bytes();
+            let mut expanded = home.to_vec();
             expanded.push(b'/');
             expanded.extend_from_slice(rest);
             return Some(expanded);
@@ -287,7 +289,7 @@ pub(crate) fn expand_tilde_bytes(path: &[u8]) -> Option<Vec<u8>> {
         None => (rest, &b""[..]),
     };
     let user = std::str::from_utf8(user).ok()?;
-    let mut expanded = file::get_user_home_dir(user)?.into_bytes();
+    let mut expanded = file::get_user_home_dir(user)?;
     expanded.extend_from_slice(suffix);
     Some(expanded)
 }
@@ -504,6 +506,7 @@ mod tests {
         let Some(expected) = file::get_user_home_dir(name) else {
             return; // no root entry on this host; nothing to compare
         };
+        let expected = String::from_utf8_lossy(&expected).into_owned();
         assert_eq!(expand_tilde("~root"), expected);
         assert_eq!(expand_tilde("~root/foo"), format!("{expected}/foo"));
         assert!(!expand_tilde("~nonexistent-user-xyz").starts_with('/'));

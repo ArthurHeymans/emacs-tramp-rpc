@@ -418,7 +418,7 @@ pub(crate) fn get_user_login_shell(uid: u32) -> Option<String> {
 
 /// Cache of user name -> resolved home directory.  Same caching semantics as
 /// `USER_NAMES`: only definitive results are cached.
-static USER_HOMES: std::sync::LazyLock<Mutex<HashMap<String, Option<String>>>> =
+static USER_HOMES: std::sync::LazyLock<Mutex<HashMap<String, Option<Vec<u8>>>>> =
     std::sync::LazyLock::new(|| Mutex::new(HashMap::new()));
 
 /// Resolve the home directory for a user name via getpwnam_r.
@@ -426,7 +426,7 @@ static USER_HOMES: std::sync::LazyLock<Mutex<HashMap<String, Option<String>>>> =
 /// Used for `~user` tilde expansion.  Results are cached because the lookup
 /// can hit slow NSS backends; only definitive results are cached so a
 /// transient directory-service failure can be retried later.
-pub(crate) fn get_user_home_dir(user: &str) -> Option<String> {
+pub(crate) fn get_user_home_dir(user: &str) -> Option<Vec<u8>> {
     {
         let cache = USER_HOMES.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(result) = cache.get(user) {
@@ -442,7 +442,7 @@ pub(crate) fn get_user_home_dir(user: &str) -> Option<String> {
     resolved
 }
 
-fn getpwnam_home_dir_uncached(user: &str) -> Option<String> {
+fn getpwnam_home_dir_uncached(user: &str) -> Option<Vec<u8>> {
     let user_c = std::ffi::CString::new(user).ok()?;
     let mut bufsize = sysconf_bufsize(libc::_SC_GETPW_R_SIZE_MAX, 1024);
     loop {
@@ -466,9 +466,9 @@ fn getpwnam_home_dir_uncached(user: &str) -> Option<String> {
             return None;
         }
         // Extract owned data while `buf` is still alive: the passwd strings
-        // point into it.
+        // point into it.  Keep raw bytes: home directories need not be UTF-8.
         let dir = unsafe { std::ffi::CStr::from_ptr(pwd.pw_dir) };
-        return dir.to_str().ok().map(str::to_owned);
+        return Some(dir.to_bytes().to_vec());
     }
 }
 
