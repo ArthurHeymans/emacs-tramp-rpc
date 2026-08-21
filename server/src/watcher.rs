@@ -690,7 +690,22 @@ impl WatchManager {
             Some(existing) if existing == mode => return Ok(canonical),
             Some(RecursiveMode::Recursive) => return Ok(canonical),
             Some(RecursiveMode::NonRecursive) => {
-                watcher.unwatch(&canonical)?;
+                if let Err(err) = watcher.unwatch(&canonical) {
+                    // notify drops its own backend registration before the
+                    // unwatch syscall reports failure, so an error here can
+                    // still leave the path unwatched.  Restore a consistent
+                    // non-recursive registration before surfacing the error,
+                    // otherwise this map claims a live watch that is gone.
+                    if watcher
+                        .watch(&canonical, RecursiveMode::NonRecursive)
+                        .is_ok()
+                    {
+                        paths.insert(canonical.clone(), RecursiveMode::NonRecursive);
+                    } else {
+                        paths.remove(&canonical);
+                    }
+                    return Err(err);
+                }
                 if let Err(err) = watcher.watch(&canonical, RecursiveMode::Recursive) {
                     if watcher
                         .watch(&canonical, RecursiveMode::NonRecursive)
