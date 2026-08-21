@@ -2660,8 +2660,13 @@ which would otherwise perform another remote stat."
   "Like `file-symlink-p' for TRAMP-RPC files."
   (with-parsed-tramp-file-name (expand-file-name filename) nil
     (when-let* ((stat (tramp-rpc--call-file-stat v localname t))
-                ((equal (alist-get 'type stat) "symlink")))
-      (tramp-rpc--decode-string (alist-get 'link_target stat)))))
+                ((equal (alist-get 'type stat) "symlink"))
+                (result (tramp-rpc--decode-string
+                         (alist-get 'link_target stat))))
+      ;; Quote a symlink target which looks remote.
+      (if (tramp-tramp-file-p result)
+          (file-name-quote result 'top)
+        result))))
 
 (defun tramp-rpc-handle-access-file (filename string)
   "Like `access-file' for TRAMP-RPC files."
@@ -2797,6 +2802,9 @@ ID-FORMAT specifies whether to use numeric or string IDs."
          (mode (tramp-file-mode-from-int (alist-get 'mode stat)))
          (inode (alist-get 'inode stat))
          (dev (alist-get 'dev stat)))
+    ;; Quote a symlink target which looks remote.
+    (when (and (stringp type) (tramp-tramp-file-p type))
+      (setq type (file-name-quote type 'top)))
     ;; Return in file-attributes format
     (list type nlinks
           (if (eq id-format 'string) (or uname (number-to-string uid)) uid)
