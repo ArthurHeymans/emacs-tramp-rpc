@@ -952,8 +952,7 @@ See `tramp-rpc-direnv-essential-vars' for the list of variables."
                                          (cwd . "/"))))
              (exit-code (alist-get 'exit_code result))
              (stdout (tramp-rpc--decode-output
-                      (alist-get 'stdout result)
-                      (alist-get 'stdout_encoding result))))
+                      (alist-get 'stdout result))))
         (if (and (eq exit-code 0)
                  (> (length stdout) 0))
             ;; Parse JSON output into alist, filter to essential vars
@@ -2465,19 +2464,14 @@ text strings.  Returns nil if DATA is nil."
     (encode-coding-string data 'utf-8-unix))
    (t data)))
 
-(defun tramp-rpc--decode-output (data encoding)
-  "Decode binary process DATA using ENCODING.
+(defun tramp-rpc--decode-output (data)
+  "Decode binary process DATA as UTF-8.
 This helper is for synchronous command/file paths.  Async relays keep their
-bytes raw and let the relay process decoder handle incremental output."
+bytes raw and let the relay process decoder handle incremental output.
+The server never reports a process output encoding, so UTF-8 is assumed,
+matching `tramp-sh' behavior for command output."
   (if data
-      (let ((coding (cond
-                     ((null encoding) 'utf-8-unix)
-                     ((coding-system-p encoding) encoding)
-                     ((stringp encoding)
-                      (or (coding-system-from-name encoding)
-                          'utf-8-unix))
-                     (t 'utf-8-unix))))
-        (decode-coding-string (tramp-rpc--binary-bytes data) coding))
+      (decode-coding-string (tramp-rpc--binary-bytes data) 'utf-8-unix)
     ""))
 
 (defun tramp-rpc--decode-filename (entry)
@@ -3484,17 +3478,11 @@ copy options.  Fall back to the generic TRAMP handler for cross-remote copies."
                 (prog1
                     (tramp-rpc--call
                      v2 "file.make_symlink"
-                     (append
-                      `((target . ,(tramp-rpc--path-to-bin
-                                    (or source-symlink-target
-                                        (tramp-rpc--decode-string
-                                         (alist-get 'link_target source-lstat))))))
-                      (mapcar (lambda (param)
-                                (pcase (car param)
-                                  ('path (cons 'link_path (cdr param)))
-                                  ('path_encoding (cons 'link_path_encoding (cdr param)))
-                                  (_ param)))
-                              (tramp-rpc--encode-path symlink-dest-localname))))
+                     `((target . ,(tramp-rpc--path-to-bin
+                                   (or source-symlink-target
+                                       (tramp-rpc--decode-string
+                                        (alist-get 'link_target source-lstat)))))
+                       (link_path . ,(tramp-rpc--path-to-bin symlink-dest-localname))))
                   (tramp-rpc-clear-all-caches))
               (let* ((source-stat (tramp-rpc--batch-result-or-signal
                                     "file.stat" dirname source-stat-result))
@@ -4020,21 +4008,11 @@ implementation, which will use the normal TRAMP-RPC file handlers underneath."
   "Like `make-symbolic-link' for TRAMP-RPC files."
   (prog1
       (tramp-skeleton-make-symbolic-link target linkname ok-if-already-exists
-        (let* ((target-path (file-name-unquote target))
-               (link-path-params (tramp-rpc--encode-path localname))
-               ;; Rename 'path' to 'link_path' in the encoded params.
-               (params (mapcar (lambda (p)
-                                  (cond
-                                   ((eq (car p) 'path)
-                                    (cons 'link_path (cdr p)))
-                                   ((eq (car p) 'path_encoding)
-                                    (cons 'link_path_encoding (cdr p)))
-                                   (t p)))
-                                link-path-params)))
+        (let ((target-path (file-name-unquote target)))
           (tramp-rpc--call
            v "file.make_symlink"
-           (append `((target . ,(tramp-rpc--path-to-bin target-path)))
-                   params))))
+           `((target . ,(tramp-rpc--path-to-bin target-path))
+             (link_path . ,(tramp-rpc--path-to-bin localname))))))
 
     (tramp-rpc--invalidate-cache-for-path linkname)))
 
@@ -4140,8 +4118,7 @@ Returns the ACL string for FILENAME, or nil if ACLs are not supported."
                                        (cwd . "/")))))
         (when (zerop (alist-get 'exit_code result))
           (let ((output (tramp-rpc--decode-output
-                         (alist-get 'stdout result)
-                         (alist-get 'stdout_encoding result))))
+                         (alist-get 'stdout result))))
             ;; Return nil if output is empty or only whitespace
             (when (string-match-p "[^ \t\n]" output)
 	      ;; By convention, the result string has a trailing
@@ -4191,8 +4168,7 @@ Returns a list of (USER ROLE TYPE RANGE), or (nil nil nil nil) if not available.
                                          (cwd . "/")))))
           (when (zerop (alist-get 'exit_code result))
             (let ((output (tramp-rpc--decode-output
-                           (alist-get 'stdout result)
-                           (alist-get 'stdout_encoding result))))
+                           (alist-get 'stdout result))))
               ;; Parse SELinux context from ls -Z output
               ;; Format: user:role:type:range filename
               (when (string-match
@@ -4270,11 +4246,9 @@ because all commands are sent in a single network round-trip."
                           :stderr (or (plist-get result :message) "RPC error"))
                   (list :exit-code (alist-get 'exit_code result)
                         :stdout (tramp-rpc--decode-output
-                                 (alist-get 'stdout result)
-                                 (alist-get 'stdout_encoding result))
+                                 (alist-get 'stdout result))
                         :stderr (tramp-rpc--decode-output
-                                 (alist-get 'stderr result)
-                                 (alist-get 'stderr_encoding result)))))
+                                 (alist-get 'stderr result)))))
               results))))
 
 (defun tramp-rpc--route-process-file-output (destination stdout &optional stderr)
@@ -4324,8 +4298,7 @@ signal numbers to human-readable strings like \"Interrupt\" or
                                       (cwd . "/"))))
            (exit-code (alist-get 'exit_code result))
            (stdout (tramp-rpc--decode-output
-                    (alist-get 'stdout result)
-                    (alist-get 'stdout_encoding result)))
+                    (alist-get 'stdout result)))
            (raw-signals (when (and (eq exit-code 0) (> (length stdout) 0))
                           (split-string (string-trim stdout) nil 'omit)))
            ;; Prepend a placeholder 0 for signal 0 so that (nth 1 signals)
@@ -4404,11 +4377,9 @@ refresh), git commands are served from the prefetch cache when possible."
             (if result
               (let ((exit-code (alist-get 'exit_code result))
                     (stdout (tramp-rpc--decode-output
-                             (alist-get 'stdout result)
-                             (alist-get 'stdout_encoding result)))
+                             (alist-get 'stdout result)))
                     (stderr (tramp-rpc--decode-output
-                             (alist-get 'stderr result)
-                             (alist-get 'stderr_encoding result))))
+                             (alist-get 'stderr result))))
 
                 ;; Memoize uncached Magit git calls made during lazy remote
                 ;; status expansion, so repeated section washing queries don't
@@ -4526,8 +4497,7 @@ Connection-local values are honored, matching `tramp-get-remote-path'."
                                         (cwd . "/"))))
              (exit-code (alist-get 'exit_code result))
              (stdout (tramp-rpc--decode-output
-                      (alist-get 'stdout result)
-                      (alist-get 'stdout_encoding result))))
+                      (alist-get 'stdout result))))
         (if (and (eq exit-code 0) (> (length stdout) 0))
             (split-string (string-trim stdout) ":" t)
           '("/bin" "/usr/bin")))
@@ -4603,8 +4573,7 @@ Returns \"/bin/sh\" if the lookup fails."
                                          (cwd . "/"))))
              (exit-code (alist-get 'exit_code result))
              (stdout (tramp-rpc--decode-output
-                      (alist-get 'stdout result)
-                      (alist-get 'stdout_encoding result))))
+                      (alist-get 'stdout result))))
         (if (and (eq exit-code 0) (> (length stdout) 0))
             ;; getent passwd format: name:x:uid:gid:gecos:home:shell
             (let* ((fields (split-string (string-trim stdout) ":"))
@@ -4630,8 +4599,7 @@ actual PATH line, matching the robustness of upstream TRAMP."
                                          (cwd . "/"))))
              (exit-code (alist-get 'exit_code result))
              (stdout (tramp-rpc--decode-output
-                      (alist-get 'stdout result)
-                      (alist-get 'stdout_encoding result))))
+                      (alist-get 'stdout result))))
         (when (and (eq exit-code 0) (> (length stdout) 0)
                    (string-match
                     (concat (regexp-quote marker) "\r?\n\\([^\r\n]+\\)")
@@ -4750,8 +4718,7 @@ Signals an error rather than returning nil, so that
                                          (cwd . "/"))))
              (exit-code (alist-get 'exit_code result))
              (stdout (tramp-rpc--decode-output
-                      (alist-get 'stdout result)
-                      (alist-get 'stdout_encoding result))))
+                      (alist-get 'stdout result))))
         (when (and (eq exit-code 0) (> (length stdout) 0))
           ;; getent passwd format: name:x:uid:gid:gecos:home:shell
           (let ((fields (split-string (string-trim stdout) ":")))
