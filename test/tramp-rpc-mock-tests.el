@@ -428,6 +428,34 @@ The server sends the full st_mode value including file type bits."
       ;; Link count
       (should (= (file-attribute-link-number attrs) 1)))))
 
+(ert-deftest tramp-rpc-mock-test-quote-remote-looking-symlink-targets ()
+  "Remote-looking symlink targets are quoted before they reach TRAMP."
+  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
+  (let* ((target "/ssh:$SENSITIVE_DATA@remote-host:")
+         (encoded-target (encode-coding-string target 'utf-8-unix))
+         (stat-result `((type . "symlink")
+                        (link_target . ,encoded-target)
+                        (mode . ,(logior #o120000 #o777))
+                        (nlinks . 1)
+                        (uid . 1000)
+                        (gid . 1000)
+                        (atime . 1700000000)
+                        (mtime . 1700000001)
+                        (ctime . 1700000002)
+                        (inode . 12345)
+                        (dev . 1)))
+         (attribute-target
+          (file-attribute-type
+           (tramp-rpc--convert-file-attributes stat-result 'integer))))
+    (cl-letf (((symbol-function 'tramp-rpc--call-file-stat)
+               (lambda (_vec _localname &optional _lstat) stat-result)))
+      (let ((symlink-target
+             (tramp-rpc-handle-file-symlink-p "/rpc:mockhost:/tmp/link")))
+        (should (file-name-quoted-p symlink-target))
+        (should (equal (file-name-unquote symlink-target) target))))
+    (should (file-name-quoted-p attribute-target))
+    (should (equal (file-name-unquote attribute-target) target))))
+
 ;;; ============================================================================
 ;;; Local Server Tests (runs actual server)
 ;;; ============================================================================
