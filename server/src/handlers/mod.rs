@@ -248,18 +248,48 @@ fn get_group_name(gid: libc::gid_t) -> Option<String> {
     file::get_group_name(gid)
 }
 
-/// Expand ~ to home directory
+/// Expand ~ to home directory.
+///
+/// Handles `~`, `~/...`, and `~user/...` (resolved via the passwd database).
+/// Upstream tramp-sh relies on the remote shell to expand these at every
+/// operation; this server has no shell, so path resolution must do it.
 pub(crate) fn expand_tilde(path: &str) -> String {
-    if path.starts_with("~/") {
-        if let Ok(home) = std::env::var("HOME") {
-            return format!("{}{}", home, &path[1..]);
-        }
-    } else if path == "~"
-        && let Ok(home) = std::env::var("HOME")
-    {
-        return home;
+    match expand_tilde_bytes(path.as_bytes()) {
+        Some(expanded) => String::from_utf8_lossy(&expanded).into_owned(),
+        None => path.to_string(),
     }
-    path.to_string()
+}
+
+/// Byte-level tilde expansion used by `bytes_to_path`, so non-UTF-8 paths
+/// never pass through a lossy string conversion.
+///
+/// Returns None when the path contains no expandable tilde prefix.
+pub(crate) fn expand_tilde_bytes(path: &[u8]) -> Option<Vec<u8>> {
+    if let Ok(home) = std::env::var("HOME") {
+        if path == b"~" {
+            return Some(home.into_bytes());
+        }
+        if let Some(rest) = path.strip_prefix(b"~/") {
+            let mut expanded = home.into_bytes();
+            expanded.push(b'/');
+            expanded.extend_from_slice(rest);
+            return Some(expanded);
+        }
+    }
+
+    // `~user` or `~user/...`.  The user name must be valid UTF-8 to look up.
+    let rest = path.strip_prefix(b"~")?;
+    if rest.starts_with(b"/") || rest.is_empty() {
+        return None;
+    }
+    let (user, suffix) = match rest.iter().position(|&byte| byte == b'/') {
+        Some(slash) => (&rest[..slash], &rest[slash..]),
+        None => (rest, &b""[..]),
+    };
+    let user = std::str::from_utf8(user).ok()?;
+    let mut expanded = file::get_user_home_dir(user)?.into_bytes();
+    expanded.extend_from_slice(suffix);
+    Some(expanded)
 }
 
 fn validate_batch_response_size(
@@ -452,6 +482,39 @@ async fn dispatch_inner(request: Request) -> Response {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn tilde_expands_home_and_user() {
+        let home = std::env::var("HOME").unwrap();
+        assert_eq!(expand_tilde("~"), home);
+        assert_eq!(expand_tilde("~/foo/bar"), format!("{home}/foo/bar"));
+        assert_eq!(expand_tilde("/tmp"), "/tmp");
+        assert_eq!(expand_tilde("~/"), format!("{home}/"));
+    }
+
+    #[test]
+    fn tilde_bytes_expand_without_lossy_conversion() {
+        let home = std::env::var("HOME").unwrap();
+        // A non-UTF-8 component must survive expansion untouched.
+        let path = b"~/\xff";
+        let expanded = expand_tilde_bytes(path).expect("~ path should expand");
+        let mut expected = home.into_bytes();
+        expected.push(b'/');
+        expected.push(0xff);
+        assert_eq!(expanded, expected);
+        assert_eq!(expand_tilde_bytes(b"/tmp/\xff"), None);
+    }
+
+    #[test]
+    fn tilde_user_expands_via_passwd_database() {
+        let name = "root";
+        let Some(expected) = file::get_user_home_dir(name) else {
+            return; // no root entry on this host; nothing to compare
+        };
+        assert_eq!(expand_tilde("~root"), expected);
+        assert_eq!(expand_tilde("~root/foo"), format!("{expected}/foo"));
+        assert!(!expand_tilde("~nonexistent-user-xyz").starts_with('/'));
+    }
 
     #[test]
     fn groups_retry_after_erange() {
