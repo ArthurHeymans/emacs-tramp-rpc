@@ -1462,6 +1462,7 @@ mod tests {
             .block_on(manager.refresh_recursive_roots(roots));
     }
 
+    #[cfg(target_os = "linux")]
     fn refresh_and_rearm(
         manager: &WatchManager,
         roots: HashSet<PathBuf>,
