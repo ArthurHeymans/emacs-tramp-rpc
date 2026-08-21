@@ -454,8 +454,8 @@ async fn dispatch_inner(request: Request) -> Response {
         }
 
         // Filesystem watch operations (for cache invalidation)
-        "watch.add" => crate::watcher::handle_add(params),
-        "watch.remove" => crate::watcher::handle_remove(params),
+        "watch.add" => crate::watcher::handle_add(params).await,
+        "watch.remove" => crate::watcher::handle_remove(params).await,
         "watch.list" => crate::watcher::handle_list(params),
 
         // Note: "batch" is NOT allowed in batch (no recursion)
