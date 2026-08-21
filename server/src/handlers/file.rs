@@ -382,6 +382,40 @@ pub fn get_group_name(gid: u32) -> Option<String> {
     resolve_nss_name(&GROUP_NAMES, NssKind::Group, gid)
 }
 
+/// Resolve the login shell for `uid` via getpwuid_r.
+///
+/// Uses a sysconf-hinted buffer that doubles on `ERANGE`, so passwd records
+/// larger than the initial hint (large LDAP/SSSD entries) still resolve
+/// instead of being reported as absent.
+pub(crate) fn get_user_login_shell(uid: u32) -> Option<String> {
+    let mut bufsize = sysconf_bufsize(libc::_SC_GETPW_R_SIZE_MAX, 1024);
+    loop {
+        let mut buf = vec![0u8; bufsize];
+        let mut pwd: libc::passwd = unsafe { std::mem::zeroed() };
+        let mut result_ptr: *mut libc::passwd = std::ptr::null_mut();
+        let ret = unsafe {
+            libc::getpwuid_r(
+                uid,
+                &mut pwd,
+                buf.as_mut_ptr() as *mut libc::c_char,
+                buf.len(),
+                &mut result_ptr,
+            )
+        };
+        if ret == libc::ERANGE && bufsize < MAX_NSS_BUFSIZE {
+            bufsize = bufsize.saturating_mul(2).min(MAX_NSS_BUFSIZE);
+            continue;
+        }
+        if ret != 0 || result_ptr.is_null() {
+            return None;
+        }
+        // Extract owned data while `buf` is still alive: the passwd strings
+        // point into it.
+        let shell = unsafe { std::ffi::CStr::from_ptr(pwd.pw_shell) };
+        return shell.to_str().ok().map(str::to_owned);
+    }
+}
+
 pub fn map_io_error(err: std::io::Error, path: &str) -> RpcError {
     use std::io::ErrorKind;
 

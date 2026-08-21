@@ -72,30 +72,11 @@ fn watcher_kind() -> &'static str {
 }
 
 /// Look up the current user's login shell from the passwd database.
-/// Uses getpwuid_r (reentrant) for thread safety, matching the pattern
-/// in file.rs for get_user_name/get_group_name.
+/// Delegates to file.rs's shared getpwuid_r lookup, which retries with a
+/// growing buffer on ERANGE so large NSS records (LDAP, SSSD) still resolve.
 fn login_shell() -> Option<String> {
     let uid = unsafe { libc::getuid() };
-    let mut buf = vec![0u8; 1024];
-    let mut pwd: libc::passwd = unsafe { std::mem::zeroed() };
-    let mut result_ptr: *mut libc::passwd = std::ptr::null_mut();
-
-    let ret = unsafe {
-        libc::getpwuid_r(
-            uid,
-            &mut pwd,
-            buf.as_mut_ptr() as *mut libc::c_char,
-            buf.len(),
-            &mut result_ptr,
-        )
-    };
-
-    if ret != 0 || result_ptr.is_null() {
-        return None;
-    }
-
-    let shell = unsafe { std::ffi::CStr::from_ptr(pwd.pw_shell) };
-    shell.to_str().ok().map(|s| s.to_string())
+    file::get_user_login_shell(uid)
 }
 
 use crate::protocol::IntoValue;
