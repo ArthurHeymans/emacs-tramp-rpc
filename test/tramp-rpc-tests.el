@@ -1952,8 +1952,11 @@ This matches the upstream `tramp-test28-process-file' test."
           (tramp-rpc-test--wait-for
            (lambda () (equal output "é\n")) "complete UTF-8 output" p)
           (should (equal output "é\n"))
+          ;; decode-output always decodes as UTF-8: a valid UTF-8 payload
+          ;; round-trips to the same characters.
           (should (equal (tramp-rpc--decode-output
-                          (msgpack-bin-make (string-make-unibyte "\351")))
+                          (msgpack-bin-make
+                           (encode-coding-string "é" 'utf-8-unix)))
                          "é"))
           (should (equal (string-to-list
                           (tramp-rpc--encode-process-input

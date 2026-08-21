@@ -435,15 +435,34 @@ pub(crate) fn get_user_home_dir(user: &str) -> Option<Vec<u8>> {
     }
 
     let resolved = getpwnam_home_dir_uncached(user);
-    if let Some(home) = &resolved {
+    // Cache definitive results only: found homes and confirmed-absent users.
+    // Transient NSS failures stay uncached so a later lookup can succeed once
+    // the directory service recovers.  Caching misses also keeps repeated
+    // `~unknown-user` paths from re-running the lookup on every request.
+    if resolved.definitive {
         let mut cache = USER_HOMES.lock().unwrap_or_else(|e| e.into_inner());
-        cache.insert(user.to_owned(), Some(home.clone()));
+        cache.insert(user.to_owned(), resolved.home.clone());
     }
-    resolved
+    resolved.home
 }
 
-fn getpwnam_home_dir_uncached(user: &str) -> Option<Vec<u8>> {
-    let user_c = std::ffi::CString::new(user).ok()?;
+struct HomeLookup {
+    home: Option<Vec<u8>>,
+    /// True when the passwd database definitively answered, whether or not
+    /// the user exists.
+    definitive: bool,
+}
+
+fn getpwnam_home_dir_uncached(user: &str) -> HomeLookup {
+    let user_c = match std::ffi::CString::new(user) {
+        Ok(user_c) => user_c,
+        Err(_) => {
+            return HomeLookup {
+                home: None,
+                definitive: true,
+            };
+        }
+    };
     let mut bufsize = sysconf_bufsize(libc::_SC_GETPW_R_SIZE_MAX, 1024);
     loop {
         let mut buf = vec![0u8; bufsize];
@@ -462,13 +481,27 @@ fn getpwnam_home_dir_uncached(user: &str) -> Option<Vec<u8>> {
             bufsize = bufsize.saturating_mul(2).min(MAX_NSS_BUFSIZE);
             continue;
         }
-        if ret != 0 || result_ptr.is_null() {
-            return None;
+        if ret != 0 {
+            // Backend unavailable or transient error: do not cache.
+            return HomeLookup {
+                home: None,
+                definitive: false,
+            };
+        }
+        if result_ptr.is_null() {
+            // Confirmed absent from all NSS databases.
+            return HomeLookup {
+                home: None,
+                definitive: true,
+            };
         }
         // Extract owned data while `buf` is still alive: the passwd strings
         // point into it.  Keep raw bytes: home directories need not be UTF-8.
         let dir = unsafe { std::ffi::CStr::from_ptr(pwd.pw_dir) };
-        return Some(dir.to_bytes().to_vec());
+        return HomeLookup {
+            home: Some(dir.to_bytes().to_vec()),
+            definitive: true,
+        };
     }
 }
 

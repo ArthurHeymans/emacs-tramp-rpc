@@ -121,7 +121,7 @@ fn system_getenv(params: Value) -> HandlerResult {
 }
 
 /// Expand path with tilde and environment variables
-fn system_expand_path(params: Value) -> HandlerResult {
+async fn system_expand_path(params: Value) -> HandlerResult {
     #[derive(serde::Deserialize)]
     struct Params {
         path: String,
@@ -129,12 +129,16 @@ fn system_expand_path(params: Value) -> HandlerResult {
 
     let params: Params = from_value(params).map_err(|e| RpcError::invalid_params(e.to_string()))?;
 
-    let expanded = expand_tilde(&params.path);
+    // `~user` expansion consults the passwd database, which can block on
+    // slow NSS backends; keep it off the Tokio workers.
+    let expanded = tokio::task::spawn_blocking(move || expand_tilde(&params.path))
+        .await
+        .map_err(|e| RpcError::internal_error(format!("Task join error: {}", e)))?;
     Ok(expanded.into_value())
 }
 
 /// Get filesystem information (like df)
-fn system_statvfs(params: Value) -> HandlerResult {
+async fn system_statvfs(params: Value) -> HandlerResult {
     #[derive(serde::Deserialize)]
     struct Params {
         path: String,
@@ -142,8 +146,16 @@ fn system_statvfs(params: Value) -> HandlerResult {
 
     let params: Params = from_value(params).map_err(|e| RpcError::invalid_params(e.to_string()))?;
 
+    // Both `~user` expansion (passwd lookup) and the statvfs call block;
+    // run them off the Tokio workers.
+    tokio::task::spawn_blocking(move || statvfs_blocking(&params.path))
+        .await
+        .map_err(|e| RpcError::internal_error(format!("Task join error: {}", e)))?
+}
+
+fn statvfs_blocking(path: &str) -> HandlerResult {
     use std::ffi::CString;
-    let expanded = expand_tilde(&params.path);
+    let expanded = expand_tilde(path);
     let path_cstr =
         CString::new(expanded.as_str()).map_err(|_| RpcError::invalid_params("Invalid path"))?;
 
@@ -449,8 +461,8 @@ async fn route(method: String, params: Value) -> HandlerResult {
         // System info
         "system.info" => system_info(),
         "system.getenv" => system_getenv(params),
-        "system.expand_path" => system_expand_path(params),
-        "system.statvfs" => system_statvfs(params),
+        "system.expand_path" => system_expand_path(params).await,
+        "system.statvfs" => system_statvfs(params).await,
         "system.groups" => system_groups(),
 
         // Parallel command execution and ancestor scanning
