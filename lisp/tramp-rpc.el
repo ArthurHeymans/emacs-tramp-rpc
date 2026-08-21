@@ -1902,7 +1902,11 @@ down VEC's ControlMaster in that case would disrupt the still-live connection."
       nil)))
 
 (defun tramp-rpc--cleanup-controlmaster-unlocked (vec)
-  "Clean up VEC's ControlMaster while holding its lifecycle mutex."
+  "Clean up VEC's ControlMaster while holding its lifecycle mutex.
+Only tears down the ControlMaster when this Emacs process owns it —
+i.e. when the auth process it started is still tracked here.  Reusing
+a ControlMaster started by another Emacs process is safe, but sending
+ssh -O exit to a shared socket would disconnect that other session."
   (when tramp-rpc-use-controlmaster
     (let* ((host (tramp-file-name-host vec))
            (user (tramp-rpc--ssh-detail-user vec))
@@ -1913,10 +1917,18 @@ down VEC's ControlMaster in that case would disrupt the still-live connection."
            (auth-process-name (format "*tramp-rpc-auth %s*" host))
            (auth-buffer-name (format " *tramp-rpc-auth %s*" host))
            (auth-process (get-process auth-process-name))
-           (auth-buffer (get-buffer auth-buffer-name)))
+           (auth-buffer (get-buffer auth-buffer-name))
+           ;; We own the ControlMaster only when its auth process was
+           ;; started by this Emacs and is still registered here.
+           ;; If the ControlMaster was created by another Emacs process
+           ;; (batch test run, separate session, etc.), auth-process is
+           ;; nil here and we must not call ssh -O exit, which would kill
+           ;; the shared socket and disconnect that other session.
+           (owned (and auth-process (process-live-p auth-process))))
       ;; Close the ControlMaster socket gracefully via ssh -O exit.
       ;; This is a local control message (no network round-trip), so fast.
-      (when (file-exists-p socket-path)
+      ;; Only do this when we own the socket (see above).
+      (when (and owned (file-exists-p socket-path))
         (ignore-errors
           (apply #'call-process "ssh" nil nil nil
                  (append
@@ -2022,10 +2034,14 @@ Uses length-prefixed binary framing: <4-byte BE length><msgpack payload>."
             (goto-char (point-min))
             ;; Check for server-initiated notification (no id, has method)
             (if (plist-get response :notification)
-                (tramp-rpc--handle-notification
-                 process
-                 (plist-get response :method)
-                 (plist-get response :params))
+                (condition-case notify-err
+                    (tramp-rpc--handle-notification
+                     process
+                     (plist-get response :method)
+                     (plist-get response :params))
+                  (error
+                   (tramp-rpc--debug "notification handler error method=%s: %S"
+                                     (plist-get response :method) notify-err)))
               ;; A cleaned generation may still receive buffered output.  Its
               ;; injected transport-death errors belong to live waiters and
               ;; must not be overwritten by those late normal responses.
