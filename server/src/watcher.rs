@@ -690,7 +690,22 @@ impl WatchManager {
             Some(existing) if existing == mode => return Ok(canonical),
             Some(RecursiveMode::Recursive) => return Ok(canonical),
             Some(RecursiveMode::NonRecursive) => {
-                watcher.unwatch(&canonical)?;
+                if let Err(err) = watcher.unwatch(&canonical) {
+                    // notify drops its own backend registration before the
+                    // unwatch syscall reports failure, so an error here can
+                    // still leave the path unwatched.  Restore a consistent
+                    // non-recursive registration before surfacing the error,
+                    // otherwise this map claims a live watch that is gone.
+                    // rearm_existing_watch forces a backend re-registration;
+                    // watch_nonrecursive would return early because the
+                    // logical direct_watches entry still exists.
+                    if watcher.rearm_existing_watch(&canonical).is_ok() {
+                        paths.insert(canonical.clone(), RecursiveMode::NonRecursive);
+                    } else {
+                        paths.remove(&canonical);
+                    }
+                    return Err(err);
+                }
                 if let Err(err) = watcher.watch(&canonical, RecursiveMode::Recursive) {
                     if watcher
                         .watch(&canonical, RecursiveMode::NonRecursive)
@@ -783,21 +798,28 @@ impl WatchManager {
         roots_to_refresh
     }
 
-    fn refresh_recursive_roots(&self, roots_to_refresh: HashSet<PathBuf>) {
+    async fn refresh_recursive_roots(&self, roots_to_refresh: HashSet<PathBuf>) {
         if roots_to_refresh.is_empty() {
             return;
         }
 
-        let refreshed_roots: Vec<_> = roots_to_refresh
-            .into_iter()
-            .map(|root| {
-                let dirs = FilteredWatcher::collect_recursive_dirs(&root);
-                (root, dirs)
-            })
-            .collect();
+        // Tree scans can take a long time on large or slow filesystems; run
+        // them off the Tokio workers that drive request dispatch and response
+        // writes.
+        let scanned = tokio::task::spawn_blocking(move || {
+            roots_to_refresh
+                .into_iter()
+                .map(|root| {
+                    let dirs = FilteredWatcher::collect_recursive_dirs(&root);
+                    (root, dirs)
+                })
+                .collect::<Vec<_>>()
+        })
+        .await
+        .unwrap_or_default();
 
         let mut watcher = lock_or_recover(&self.watcher);
-        for (root, dirs) in refreshed_roots {
+        for (root, dirs) in scanned {
             let _ = watcher.apply_recursive_dirs(&root, dirs);
         }
     }
@@ -806,23 +828,22 @@ impl WatchManager {
     ///
     /// Must run after `refresh_recursive_roots`, so genuine deletes are already
     /// pruned and only path-identical replacements remain.
-    fn rearm_suspect_paths(&self, suspect_paths: HashSet<PathBuf>) {
-        let existing_roots: Vec<PathBuf> = suspect_paths
-            .into_iter()
-            .filter(|path| path.is_dir())
-            .collect();
-        if existing_roots.is_empty() {
-            return;
-        }
-
+    async fn rearm_suspect_paths(&self, suspect_paths: HashSet<PathBuf>) {
+        let suspects: Vec<PathBuf> = suspect_paths.into_iter().collect();
         let candidates = {
             let watcher = lock_or_recover(&self.watcher);
-            watcher.watched_paths_under(&existing_roots)
+            watcher.watched_paths_under(&suspects)
         };
-        let existing: Vec<PathBuf> = candidates
-            .into_iter()
-            .filter(|path| path.is_dir())
-            .collect();
+        // The liveness probes below stat every candidate path, which can be a
+        // storm on large watches; run them off the Tokio workers.
+        let existing = tokio::task::spawn_blocking(move || {
+            candidates
+                .into_iter()
+                .filter(|path| path.is_dir())
+                .collect::<Vec<_>>()
+        })
+        .await
+        .unwrap_or_default();
         if existing.is_empty() {
             return;
         }
@@ -1051,8 +1072,8 @@ async fn debounce_loop(
         }
 
         if let Some(manager) = manager.upgrade() {
-            manager.refresh_recursive_roots(roots_to_refresh);
-            manager.rearm_suspect_paths(suspect_paths);
+            manager.refresh_recursive_roots(roots_to_refresh).await;
+            manager.rearm_suspect_paths(suspect_paths).await;
         }
 
         // Phase 3: Send notification with all collected events
@@ -1125,7 +1146,7 @@ use crate::handlers::HandlerResult;
 ///
 /// Params: { "path": "/path/to/dir", "recursive": true|false,
 /// "nofollow": true|false }
-pub fn handle_add(params: Value) -> HandlerResult {
+pub async fn handle_add(params: Value) -> HandlerResult {
     #[derive(serde::Deserialize)]
     struct Params {
         #[serde(with = "path_or_bytes")]
@@ -1146,11 +1167,21 @@ pub fn handle_add(params: Value) -> HandlerResult {
 
     let manager = get().ok_or_else(|| RpcError::internal_error("File watcher not available"))?;
 
-    let canonical = if params.nofollow {
-        manager.watch_with_options(&path, params.recursive, true)
-    } else {
-        manager.watch(&path, params.recursive)
-    }
+    // A recursive watch walks the whole directory tree; keep that off the
+    // Tokio workers that drive request dispatch and response writes.
+    let manager = Arc::clone(manager);
+    let watch_path = path.clone();
+    let recursive = params.recursive;
+    let nofollow = params.nofollow;
+    let canonical = tokio::task::spawn_blocking(move || {
+        if nofollow {
+            manager.watch_with_options(&watch_path, recursive, true)
+        } else {
+            manager.watch(&watch_path, recursive)
+        }
+    })
+    .await
+    .map_err(|e| RpcError::internal_error(format!("Task join error: {}", e)))?
     .map_err(|e| RpcError::internal_error(format!("Failed to watch: {}", e)))?;
 
     Ok(msgpack_map! {
@@ -1163,7 +1194,7 @@ pub fn handle_add(params: Value) -> HandlerResult {
 /// Handle `watch.remove` - stop watching a directory.
 ///
 /// Params: { "path": "/path/to/dir" }
-pub fn handle_remove(params: Value) -> HandlerResult {
+pub async fn handle_remove(params: Value) -> HandlerResult {
     #[derive(serde::Deserialize)]
     struct Params {
         #[serde(with = "path_or_bytes")]
@@ -1177,8 +1208,10 @@ pub fn handle_remove(params: Value) -> HandlerResult {
 
     let manager = get().ok_or_else(|| RpcError::internal_error("File watcher not available"))?;
 
-    manager
-        .unwatch(&path)
+    let manager = Arc::clone(manager);
+    tokio::task::spawn_blocking(move || manager.unwatch(&path))
+        .await
+        .map_err(|e| RpcError::internal_error(format!("Task join error: {}", e)))?
         .map_err(|e| RpcError::internal_error(format!("Failed to unwatch: {}", e)))?;
 
     Ok(Value::Boolean(true))
@@ -1424,7 +1457,21 @@ mod tests {
 
     fn refresh_for_event(manager: &WatchManager, event: &Event) {
         let roots = manager.recursive_roots_for_event(event);
-        manager.refresh_recursive_roots(roots);
+        tokio::runtime::Runtime::new()
+            .unwrap()
+            .block_on(manager.refresh_recursive_roots(roots));
+    }
+
+    #[cfg(target_os = "linux")]
+    fn refresh_and_rearm(
+        manager: &WatchManager,
+        roots: HashSet<PathBuf>,
+        suspects: HashSet<PathBuf>,
+    ) {
+        tokio::runtime::Runtime::new().unwrap().block_on(async {
+            manager.refresh_recursive_roots(roots).await;
+            manager.rearm_suspect_paths(suspects).await;
+        });
     }
 
     #[test]
@@ -1911,8 +1958,7 @@ mod tests {
             roots.extend(manager.recursive_roots_for_event(event));
             suspects.extend(inode_replacing_paths(event));
         }
-        manager.refresh_recursive_roots(roots);
-        manager.rearm_suspect_paths(suspects);
+        refresh_and_rearm(&manager, roots, suspects);
 
         {
             let watcher = lock_or_recover(&manager.watcher);
@@ -1975,8 +2021,7 @@ mod tests {
         let mut suspects: HashSet<PathBuf> = HashSet::new();
         roots.extend(manager.recursive_roots_for_event(&rename_event));
         suspects.extend(inode_replacing_paths(&rename_event));
-        manager.refresh_recursive_roots(roots);
-        manager.rearm_suspect_paths(suspects);
+        refresh_and_rearm(&manager, roots, suspects);
 
         {
             let watcher = lock_or_recover(&manager.watcher);
