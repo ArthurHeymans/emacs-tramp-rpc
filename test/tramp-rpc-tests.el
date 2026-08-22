@@ -81,6 +81,7 @@
 
 (require 'tramp-rpc)
 
+(declare-function tramp-rpc--decode-output "tramp-rpc" (data))
 (declare-function tramp-rpc--handle-async-read-response "tramp-rpc-process")
 (declare-function tramp-rpc--pty-handle-async-response
                   "tramp-rpc-process" (local-process response))
