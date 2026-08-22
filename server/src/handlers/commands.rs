@@ -10,19 +10,39 @@ use rmpv::Value;
 use serde::Deserialize;
 use std::collections::HashMap;
 use std::fs::File;
+use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
-use std::sync::Arc;
-use std::time::UNIX_EPOCH;
+use std::sync::{Arc, LazyLock};
+use std::time::{Duration, UNIX_EPOCH};
 use tokio::io::AsyncWriteExt;
 use tokio::process::Command;
-use tokio::sync::Semaphore;
+use tokio::sync::{Semaphore, SemaphorePermit};
 
 use super::HandlerResult;
 
 /// Maximum number of commands that can be run in a single request.
 /// Prevents resource exhaustion from excessively large batches.
 const MAX_PARALLEL_COMMANDS: usize = 256;
+
+/// Global child budget for `commands.run_parallel` requests.  Request-level
+/// admission alone is insufficient because each admitted request can fan out
+/// into hundreds of operating-system processes.
+const MAX_CONCURRENT_PARALLEL_CHILDREN: usize = 64;
+const PARALLEL_CHILD_ADMISSION_WAIT: Duration = Duration::from_secs(25);
+static PARALLEL_CHILD_ADMISSIONS: LazyLock<Semaphore> =
+    LazyLock::new(|| Semaphore::new(MAX_CONCURRENT_PARALLEL_CHILDREN));
+
+async fn acquire_parallel_child_permit(
+    semaphore: &Semaphore,
+    wait: Duration,
+) -> Result<SemaphorePermit<'_>, &'static [u8]> {
+    match tokio::time::timeout(wait, semaphore.acquire()).await {
+        Ok(Ok(permit)) => Ok(permit),
+        Ok(Err(_)) => Err(b"Parallel child admission closed"),
+        Err(_) => Err(b"Parallel child admission timed out"),
+    }
+}
 
 /// Run multiple commands concurrently.
 ///
@@ -94,6 +114,25 @@ pub async fn run_parallel(params: Value) -> HandlerResult {
         let remaining = Arc::clone(&remaining);
         let env = env.clone();
         async move {
+            let _child_permit = match acquire_parallel_child_permit(
+                &PARALLEL_CHILD_ADMISSIONS,
+                PARALLEL_CHILD_ADMISSION_WAIT,
+            )
+            .await
+            {
+                Ok(permit) => permit,
+                Err(message) => {
+                    return (
+                        entry.key,
+                        msgpack_map! {
+                            "exit_code" => -1i32,
+                            "stdout" => Value::Binary(vec![]),
+                            "stderr" => Value::Binary(message.to_vec()),
+                            "not_admitted" => true
+                        },
+                    );
+                }
+            };
             let mut cmd = Command::new(&entry.cmd);
             cmd.args(&entry.args);
             if let Some(ref cwd) = entry.cwd {
@@ -206,7 +245,8 @@ pub async fn ancestors_scan(params: Value) -> HandlerResult {
     #[derive(Deserialize)]
     struct Params {
         /// Starting directory
-        directory: String,
+        #[serde(with = "crate::protocol::path_or_bytes")]
+        directory: Vec<u8>,
         /// Marker files/directories to look for
         markers: Vec<String>,
         /// Maximum depth to search (default: 10)
@@ -221,15 +261,17 @@ pub async fn ancestors_scan(params: Value) -> HandlerResult {
     let params: Params = from_value(params).map_err(|e| RpcError::invalid_params(e.to_string()))?;
 
     // Wrap in spawn_blocking since this does blocking filesystem I/O
-    let expanded_directory = super::expand_tilde(&params.directory);
+    let expanded_directory = super::file::bytes_to_path(&params.directory);
     tokio::task::spawn_blocking(move || {
-        let dir = Path::new(&expanded_directory);
+        let dir = expanded_directory.as_path();
         if !dir.exists() {
-            return Err(RpcError::file_not_found(&expanded_directory));
+            return Err(RpcError::file_not_found(
+                &expanded_directory.to_string_lossy(),
+            ));
         }
 
         // Initialize results with None for each marker
-        let mut results: HashMap<String, Option<String>> =
+        let mut results: HashMap<String, Option<Vec<u8>>> =
             params.markers.iter().map(|m| (m.clone(), None)).collect();
 
         // Walk up the directory tree
@@ -239,11 +281,13 @@ pub async fn ancestors_scan(params: Value) -> HandlerResult {
         while depth < params.max_depth {
             // Check each marker that hasn't been found yet
             for marker in &params.markers {
-                if results.get(marker).unwrap().is_none() {
+                if results.get(marker).is_some_and(Option::is_none) {
                     let marker_path = current.join(marker);
                     if marker_path.exists() {
-                        results
-                            .insert(marker.clone(), Some(current.to_string_lossy().into_owned()));
+                        results.insert(
+                            marker.clone(),
+                            Some(current.as_os_str().as_bytes().to_vec()),
+                        );
                     }
                 }
             }
@@ -266,7 +310,7 @@ pub async fn ancestors_scan(params: Value) -> HandlerResult {
         // Convert to Value
         let pairs: Vec<(Value, Value)> = results
             .into_iter()
-            .map(|(k, v)| (k.into_value(), v.into_value()))
+            .map(|(k, v)| (k.into_value(), v.map_or(Value::Nil, Value::Binary)))
             .collect();
 
         Ok(Value::Map(pairs))
@@ -529,4 +573,16 @@ pub async fn highlevel_dir_locals_find_file_cache_update(params: Value) -> Handl
     })
     .await
     .map_err(|e| RpcError::internal_error(format!("Task join error: {}", e)))?
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn parallel_child_admission_wait_is_bounded() {
+        let semaphore = Semaphore::new(0);
+        let result = acquire_parallel_child_permit(&semaphore, Duration::from_millis(10)).await;
+        assert_eq!(result.unwrap_err(), b"Parallel child admission timed out");
+    }
 }

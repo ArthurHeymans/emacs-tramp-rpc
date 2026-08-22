@@ -45,6 +45,9 @@
 (declare-function tramp-rpc--decode-output "tramp-rpc")
 (declare-function tramp-rpc--process-environment "tramp-rpc")
 (declare-function tramp-rpc--decode-string "tramp-rpc")
+(declare-function tramp-rpc--binary-bytes "tramp-rpc")
+(declare-function tramp-rpc--path-to-bytes "tramp-rpc")
+(declare-function tramp-rpc--path-to-bin "tramp-rpc")
 (declare-function tramp-rpc--encode-path "tramp-rpc")
 (declare-function tramp-rpc--convert-file-attributes "tramp-rpc")
 (declare-function tramp-rpc-file-name-p "tramp-rpc")
@@ -181,22 +184,20 @@ must still report symlink type for lstat."
           (remhash (caar entries) cache)
           (setq entries (cdr entries)))))))
 
-(defvar tramp-rpc-magit--ancestors-cache)
-(defvar tramp-rpc-magit--prefetch-directory)
-(defvar tramp-rpc-magit--ancestors-cache-timestamp)
 (defvar tramp-rpc-magit--ancestor-scan-caches)
+(defvar tramp-rpc-magit--prefetch-directories)
 
 (defun tramp-rpc-magit--clear-ancestor-caches ()
   "Clear cached ancestor marker scans."
   (when (boundp 'tramp-rpc-magit--ancestor-scan-caches)
     (clrhash tramp-rpc-magit--ancestor-scan-caches))
-  (setq tramp-rpc-magit--ancestors-cache nil
-        tramp-rpc-magit--ancestors-cache-timestamp nil))
+  (when (boundp 'tramp-rpc-magit--prefetch-directories)
+    (clrhash tramp-rpc-magit--prefetch-directories)))
 
 (defun tramp-rpc-magit--clear-ancestor-caches-for-connection (vec)
   "Clear ancestor caches belonging to the connection identified by VEC."
-  (let ((connection-key (format "%S" (tramp-rpc--connection-key vec)))
-        ancestor-keys)
+  (let ((connection-key (tramp-rpc--connection-key-string vec))
+        ancestor-keys prefetch-keys)
     (maphash
      (lambda (key _entry)
        (when (and (consp key) (equal (car key) connection-key))
@@ -204,12 +205,14 @@ must still report symlink type for lstat."
      tramp-rpc-magit--ancestor-scan-caches)
     (dolist (key ancestor-keys)
       (remhash key tramp-rpc-magit--ancestor-scan-caches))
-    (when tramp-rpc-magit--prefetch-directory
-      (with-parsed-tramp-file-name tramp-rpc-magit--prefetch-directory nil
-        (when (equal (format "%S" (tramp-rpc--connection-key v)) connection-key)
-          (setq tramp-rpc-magit--ancestors-cache nil
-                tramp-rpc-magit--ancestors-cache-timestamp nil
-                tramp-rpc-magit--prefetch-directory nil))))))
+    (maphash
+     (lambda (directory _timestamp)
+       (when (equal (tramp-rpc-magit--file-connection-key directory)
+                    connection-key)
+         (push directory prefetch-keys)))
+     tramp-rpc-magit--prefetch-directories)
+    (dolist (key prefetch-keys)
+      (remhash key tramp-rpc-magit--prefetch-directories))))
 
 (defun tramp-rpc--invalidate-cache-for-path (filename)
   "Invalidate cache entries for FILENAME."
@@ -667,13 +670,6 @@ using the current `tab-width' instead."
 The server rejects batches larger than 64 entries, so status prefetches for
 large worktrees must be split without losing item/result ordering.")
 
-(defvar tramp-rpc-magit--ancestors-cache nil
-  "Cached ancestor scan data from server-side RPC.
-This is populated by `tramp-rpc-magit--prefetch' for file existence checks.")
-
-(defvar tramp-rpc-magit--ancestors-cache-timestamp nil
-  "Creation time of `tramp-rpc-magit--ancestors-cache'.")
-
 (defconst tramp-rpc-magit--ancestor-marker-names
   '(".git" ".svn" ".hg" ".bzr" "_darcs"
     ".fslckout" "_FOSSIL_" ".pijul" ".sl" ".jj"
@@ -683,9 +679,10 @@ This is populated by `tramp-rpc-magit--prefetch' for file existence checks.")
 (defvar tramp-rpc-magit--ancestor-scan-caches (make-hash-table :test 'equal)
   "Cached ancestor scans keyed by remote search directory.")
 
-(defvar tramp-rpc-magit--prefetch-directory nil
-  "The directory that was prefetched.
-Used to answer file-exists-p queries for the directory itself.")
+(defvar tramp-rpc-magit--prefetch-directories (make-hash-table :test 'equal)
+  "Remote directories with active prefetch snapshots, keyed by directory.
+Values are creation timestamps so independent repositories cannot clobber
+one another's ancestor-discovery state.")
 
 (defvar tramp-rpc-magit--debug nil
   "When non-nil, log cache hits/misses for debugging.")
@@ -941,15 +938,19 @@ existing one."
                           (car entry)))
                (data (cdr entry))
                (exit-code (alist-get 'exit_code data)))
-          (if (string-prefix-p "state_file:" cmd-key)
-              (let* ((remote-path (substring cmd-key (length "state_file:")))
-                     (tramp-path (concat remote-prefix remote-path)))
-                (tramp-rpc--cache-put tramp-rpc--file-exists-cache
-                                      tramp-path
-                                      (= exit-code 0)))
-            (let* ((stdout-raw (alist-get 'stdout data))
-                   (stdout (tramp-rpc--decode-output stdout-raw nil)))
-              (puthash cmd-key (cons exit-code stdout) cache)))))
+          ;; Admission failures are transient server load, not git results.
+          ;; Returning them to the caller is useful, but caching them would
+          ;; turn one overloaded refresh into a failure for the whole TTL.
+          (unless (eq (alist-get 'not_admitted data) t)
+            (if (string-prefix-p "state_file:" cmd-key)
+                (let* ((remote-path (substring cmd-key (length "state_file:")))
+                       (tramp-path (concat remote-prefix remote-path)))
+                  (tramp-rpc--cache-put tramp-rpc--file-exists-cache
+                                        tramp-path
+                                        (= exit-code 0)))
+              (let* ((stdout-raw (alist-get 'stdout data))
+                     (stdout (tramp-rpc--decode-output stdout-raw nil)))
+                (puthash cmd-key (cons exit-code stdout) cache))))))
       (tramp-rpc-magit--set-process-cache vec directory cache)
       cache)))
 
@@ -1380,8 +1381,10 @@ as the process-file cache.  Also fetches ancestor markers."
     ;; we run on the server touch .git/index etc., triggering inotify events
     ;; that would clear the cache we're building.
     (let ((tramp-rpc--suppress-fs-notifications t))
-      ;; Remember the directory we prefetched for
-      (setq tramp-rpc-magit--prefetch-directory (expand-file-name directory))
+      ;; Remember every active repository independently.  Magit can refresh
+      ;; multiple repositories from different threads or nested callbacks.
+      (puthash (expand-file-name directory) (float-time)
+               tramp-rpc-magit--prefetch-directories)
       (with-parsed-tramp-file-name directory nil
         ;; Build command list and run in parallel on server.  `update-index
         ;; --refresh' is intentionally not part of this prefetch; it is run by
@@ -1410,11 +1413,15 @@ as the process-file cache.  Also fetches ancestor markers."
                                (string-trim (cdr toplevel-entry)))))
               (when toplevel
                 (tramp-rpc--auto-watch-git-worktree v toplevel)))))
-        ;; Fetch ancestor markers for project/VC detection
-        (setq tramp-rpc-magit--ancestors-cache
-              (tramp-rpc-ancestors-scan
-               directory tramp-rpc-magit--ancestor-marker-names)
-              tramp-rpc-magit--ancestors-cache-timestamp (float-time))
+        ;; Fetch ancestor markers for project/VC detection.  Normalize the
+        ;; directory so the stored key matches the one
+        ;; `tramp-rpc-magit--ancestor-scan-for-directory' looks up.
+        (let ((scan (tramp-rpc-ancestors-scan
+                     directory tramp-rpc-magit--ancestor-marker-names)))
+          (puthash (tramp-rpc-magit--ancestor-scan-cache-key
+                    (file-name-as-directory (expand-file-name directory)))
+                   (cons (float-time) scan)
+                   tramp-rpc-magit--ancestor-scan-caches))
         (when tramp-rpc-magit--debug
           (let ((cache (tramp-rpc-magit--get-process-cache)))
             (tramp-rpc--debug "tramp-rpc-magit: prefetched %d commands + ancestors for %s"
@@ -1457,16 +1464,17 @@ the server scans the entire tree in one operation."
              (tramp-rpc-file-name-p directory))
     (with-parsed-tramp-file-name directory nil
       (let ((result (tramp-rpc--call v "ancestors.scan"
-                                     `((directory . ,localname)
+                                     `((directory . ,(tramp-rpc--path-to-bin localname))
                                        (markers . ,(vconcat markers))
                                        (max_depth . ,(or max-depth 10))))))
-        ;; Convert result to alist with string keys and decoded paths
+        ;; Marker names are text, but paths must remain raw bytes so invalid
+        ;; UTF-8 can be compared with TRAMP localnames without replacement.
         (mapcar (lambda (pair)
                   (let ((key (car pair))
                         (val (cdr pair)))
                     (cons (if (symbolp key) (symbol-name key) key)
                           (when val
-                            (decode-coding-string val 'utf-8)))))
+                            (tramp-rpc--binary-bytes val)))))
                 result)))))
 
 (defun tramp-rpc-magit--ancestor-scan-cache-key (directory)
@@ -1503,9 +1511,11 @@ the server scans the entire tree in one operation."
     (if entry
         (if (cdr entry)
             (let ((found-dir (directory-file-name (cdr entry)))
-                  (candidate-dir (directory-file-name
-                                  (file-name-directory
-                                   (tramp-file-local-name expanded)))))
+                  (candidate-dir
+                   (directory-file-name
+                    (file-name-directory
+                     (tramp-rpc--path-to-bytes
+                      (tramp-file-local-name expanded))))))
               (cond
                ((string= found-dir candidate-dir) t)
                ;; The closest hit proves there is no matching marker below
@@ -1529,6 +1539,7 @@ Returns t, nil, or \\='not-cached if not in cache."
                     (directory-file-name
                      (or (file-name-directory (tramp-file-local-name expanded))
                          (tramp-file-local-name expanded)))))
+         (connection-key (tramp-rpc-magit--file-connection-key expanded))
          (answer 'not-cached))
     (when (member basename tramp-rpc-magit--ancestor-marker-names)
       ;; Reuse any dynamic scan whose root is below this candidate directory;
@@ -1537,48 +1548,41 @@ Returns t, nil, or \\='not-cached if not in cache."
        (lambda (key entry)
          (when (and (eq answer 'not-cached)
                     (tramp-rpc--cache-entry-valid-p (car entry))
-                    (equal (car key)
-                           (tramp-rpc-magit--file-connection-key expanded))
+                    (equal (car key) connection-key)
                     (tramp-rpc-magit--ancestor-cache-covers-p
                      (cdr key) file-dir))
            (setq answer
                  (tramp-rpc-magit--file-exists-in-ancestor-scan
                   expanded (cdr entry)))))
        tramp-rpc-magit--ancestor-scan-caches)
-      (when (and (eq answer 'not-cached)
-                 tramp-rpc-magit--ancestors-cache
-                 tramp-rpc-magit--ancestors-cache-timestamp
-                 (tramp-rpc--cache-entry-valid-p
-                  tramp-rpc-magit--ancestors-cache-timestamp)
-                 tramp-rpc-magit--prefetch-directory
-                 (equal (tramp-rpc-magit--file-connection-key expanded)
-                        (tramp-rpc-magit--file-connection-key
-                         tramp-rpc-magit--prefetch-directory))
-                 (tramp-rpc-magit--ancestor-cache-covers-p
-                  (tramp-file-local-name tramp-rpc-magit--prefetch-directory)
-                  file-dir))
-        (setq answer
-              (tramp-rpc-magit--file-exists-in-ancestor-scan
-               expanded tramp-rpc-magit--ancestors-cache)))
       ;; If this is a marker under the prefetched repository, one high-level
       ;; ancestor scan from the queried directory replaces dozens of serial
       ;; file.stat calls as project.el/Projectile walk upward.  Preserve nil as
       ;; a real cached answer, not as "try the next fallback".
-      (when (and (eq answer 'not-cached)
-                 tramp-rpc-magit--prefetch-directory
-                 (equal (tramp-rpc-magit--file-connection-key expanded)
-                        (tramp-rpc-magit--file-connection-key
-                         tramp-rpc-magit--prefetch-directory))
-                 (string-prefix-p
-                  (file-name-as-directory
-                   (directory-file-name
-                    (tramp-file-local-name tramp-rpc-magit--prefetch-directory)))
-                  (tramp-file-local-name expanded)))
-        (setq answer
-              (tramp-rpc-magit--file-exists-in-ancestor-scan
-               expanded
-               (tramp-rpc-magit--ancestor-scan-for-directory
-                (file-name-directory expanded))))))
+      (when (eq answer 'not-cached)
+        (let (covering-prefetch)
+          ;; Only select a cache entry here.  The scan below can dispatch
+          ;; fs.events and mutate this table, which is unsafe during `maphash'.
+          (maphash
+           (lambda (prefetch-directory timestamp)
+             (when (and (not covering-prefetch)
+                        (tramp-rpc--cache-entry-valid-p timestamp)
+                        (equal connection-key
+                               (tramp-rpc-magit--file-connection-key
+                                prefetch-directory))
+                        (string-prefix-p
+                         (file-name-as-directory
+                          (directory-file-name
+                           (tramp-file-local-name prefetch-directory)))
+                         (tramp-file-local-name expanded)))
+               (setq covering-prefetch prefetch-directory)))
+           tramp-rpc-magit--prefetch-directories)
+          (when covering-prefetch
+            (setq answer
+                  (tramp-rpc-magit--file-exists-in-ancestor-scan
+                   expanded
+                   (tramp-rpc-magit--ancestor-scan-for-directory
+                    (file-name-directory expanded))))))))
     answer))
 
 ;; ============================================================================
@@ -1616,8 +1620,7 @@ Returns t, nil, or \\='not-cached if not in cache."
 (defun tramp-rpc-magit--clear-cache ()
   "Clear all magit-related caches."
   (clrhash tramp-rpc-magit--process-caches)
-  (tramp-rpc-magit--clear-ancestor-caches)
-  (setq tramp-rpc-magit--prefetch-directory nil))
+  (tramp-rpc-magit--clear-ancestor-caches))
 
 ;; ============================================================================
 ;; Lazy Magit section expansion

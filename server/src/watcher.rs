@@ -1051,8 +1051,18 @@ async fn debounce_loop(
         }
 
         if let Some(manager) = manager.upgrade() {
-            manager.refresh_recursive_roots(roots_to_refresh);
-            manager.rearm_suspect_paths(suspect_paths);
+            // Recursive refreshes perform full synchronous directory walks.
+            // Keep them, along with replacement-path metadata probes, off the
+            // Tokio worker pool so control requests remain responsive.
+            let refresh_manager = Arc::clone(&manager);
+            // A panicked refresh degrades watch accuracy but must not kill
+            // the debounce loop; stderr is unavailable for reporting because
+            // SSH merges it into the protocol stream.
+            let _ = tokio::task::spawn_blocking(move || {
+                refresh_manager.refresh_recursive_roots(roots_to_refresh);
+                refresh_manager.rearm_suspect_paths(suspect_paths);
+            })
+            .await;
         }
 
         // Phase 3: Send notification with all collected events
@@ -1098,19 +1108,50 @@ fn fs_events_notification(events: &[WatchEvent]) -> Notification {
     )
 }
 
-/// Serialize and send an `fs.events` notification over the stdout writer.
-/// Returns an error if serialization or writing fails.
+fn encode_notification_frames(
+    events: &[WatchEvent],
+) -> Result<Vec<Vec<u8>>, Box<dyn std::error::Error>> {
+    encode_notification_frames_with_limit(events, crate::MAX_FRAME_SIZE)
+}
+
+fn encode_notification_frames_with_limit(
+    events: &[WatchEvent],
+    max_frame_size: usize,
+) -> Result<Vec<Vec<u8>>, Box<dyn std::error::Error>> {
+    if events.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let bytes = rmp_serde::to_vec_named(&fs_events_notification(events))?;
+    if bytes.len() <= max_frame_size {
+        return Ok(vec![bytes]);
+    }
+    if events.len() == 1 {
+        return Err("single fs.events entry exceeds maximum frame size".into());
+    }
+
+    let middle = events.len() / 2;
+    let mut frames = encode_notification_frames_with_limit(&events[..middle], max_frame_size)?;
+    frames.extend(encode_notification_frames_with_limit(
+        &events[middle..],
+        max_frame_size,
+    )?);
+    Ok(frames)
+}
+
+/// Serialize and send bounded `fs.events` notifications over the stdout writer.
+/// Oversized debounce batches are split while preserving event order.
 async fn send_notification(
     writer: &WriterHandle,
     events: &[WatchEvent],
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let notification = fs_events_notification(events);
-
-    let bytes = rmp_serde::to_vec_named(&notification)?;
+    let frames = encode_notification_frames(events)?;
     let mut w = writer.lock().await;
-    let len_bytes = (bytes.len() as u32).to_be_bytes();
-    w.write_all(&len_bytes).await?;
-    w.write_all(&bytes).await?;
+    for bytes in frames {
+        let len_bytes = (bytes.len() as u32).to_be_bytes();
+        w.write_all(&len_bytes).await?;
+        w.write_all(&bytes).await?;
+    }
     w.flush().await?;
     Ok(())
 }
@@ -1125,7 +1166,7 @@ use crate::handlers::HandlerResult;
 ///
 /// Params: { "path": "/path/to/dir", "recursive": true|false,
 /// "nofollow": true|false }
-pub fn handle_add(params: Value) -> HandlerResult {
+pub async fn handle_add(params: Value) -> HandlerResult {
     #[derive(serde::Deserialize)]
     struct Params {
         #[serde(with = "path_or_bytes")]
@@ -1144,19 +1185,25 @@ pub fn handle_add(params: Value) -> HandlerResult {
     // `bytes_to_path` preserves the legacy ~ expansion used by watch paths.
     let path = bytes_to_path(&params.path);
 
-    let manager = get().ok_or_else(|| RpcError::internal_error("File watcher not available"))?;
-
-    let canonical = if params.nofollow {
-        manager.watch_with_options(&path, params.recursive, true)
-    } else {
-        manager.watch(&path, params.recursive)
-    }
-    .map_err(|e| RpcError::internal_error(format!("Failed to watch: {}", e)))?;
+    let manager =
+        Arc::clone(get().ok_or_else(|| RpcError::internal_error("File watcher not available"))?);
+    let recursive = params.recursive;
+    let nofollow = params.nofollow;
+    let canonical = tokio::task::spawn_blocking(move || {
+        if nofollow {
+            manager.watch_with_options(&path, recursive, true)
+        } else {
+            manager.watch(&path, recursive)
+        }
+    })
+    .await
+    .map_err(|e| RpcError::internal_error(format!("Watch task join error: {e}")))?
+    .map_err(|e| RpcError::internal_error(format!("Failed to watch: {e}")))?;
 
     Ok(msgpack_map! {
         "path" => path_to_value(&canonical),
-        "recursive" => Value::Boolean(params.recursive),
-        "nofollow" => Value::Boolean(params.nofollow)
+        "recursive" => Value::Boolean(recursive),
+        "nofollow" => Value::Boolean(nofollow)
     })
 }
 
@@ -1231,6 +1278,30 @@ mod tests {
             }),
             _ => None,
         }
+    }
+
+    #[test]
+    fn test_notification_frames_split_oversized_batches() {
+        let events = vec![
+            WatchEvent::path(
+                "created",
+                PathBuf::from("/tmp/first-long-notification-path"),
+            ),
+            WatchEvent::path(
+                "deleted",
+                PathBuf::from("/tmp/second-long-notification-path"),
+            ),
+        ];
+        let first_size = rmp_serde::to_vec_named(&fs_events_notification(&events[..1]))
+            .unwrap()
+            .len();
+        let second_size = rmp_serde::to_vec_named(&fs_events_notification(&events[1..]))
+            .unwrap()
+            .len();
+        let limit = first_size.max(second_size);
+        let frames = encode_notification_frames_with_limit(&events, limit).unwrap();
+        assert_eq!(frames.len(), 2);
+        assert!(frames.iter().all(|frame| frame.len() <= limit));
     }
 
     #[test]

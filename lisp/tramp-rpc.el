@@ -482,6 +482,9 @@ proxy hops remain."
 
 (require 'tramp-rpc-deploy)
 
+(define-error 'tramp-rpc-server-unavailable
+  "TRAMP-RPC server binary is unavailable" 'remote-file-error)
+
 ;; Silence byte-compiler warnings for functions defined elsewhere
 ;; (vterm variables are declared in tramp-rpc-process.el)
 
@@ -1422,15 +1425,29 @@ Creates the directory from `tramp-rpc-controlmaster-path' if needed."
   "Dynamically bound socket path during ControlMaster establishment.
 Used by `tramp-rpc--action-controlmaster-established'.")
 
+(defvar tramp-rpc--controlmaster-socket-grace-retries 50
+  "Number of checks for a late ControlMaster socket after ssh exits.")
+
+(defvar tramp-rpc--controlmaster-socket-grace-delay 0.02
+  "Seconds between checks for a late ControlMaster socket.")
+
 (defun tramp-rpc--action-controlmaster-established (proc _vec)
   "Succeed when the ControlMaster socket file appears, fail on process death.
 The target socket path is read from the dynamic variable
-`tramp-rpc--controlmaster-socket-path'."
+`tramp-rpc--controlmaster-socket-path'.
+With ControlPersist, the ssh parent exits as soon as it forks the
+persistent master into the background, and the socket can become visible a
+few milliseconds after that exit.  Give a dead process a short grace period
+for the socket to appear before declaring the attempt dead."
   (cond
    ((file-exists-p tramp-rpc--controlmaster-socket-path)
     (throw 'tramp-action 'ok))
    ((not (process-live-p proc))
     (while (tramp-accept-process-output proc))
+    (dotimes (_ tramp-rpc--controlmaster-socket-grace-retries)
+      (when (file-exists-p tramp-rpc--controlmaster-socket-path)
+        (throw 'tramp-action 'ok))
+      (sleep-for tramp-rpc--controlmaster-socket-grace-delay))
     (throw 'tramp-action 'process-died))))
 
 (defconst tramp-rpc--controlmaster-actions
@@ -1575,26 +1592,59 @@ Returns non-nil on success."
       (ignore-errors (delete-file socket-path)))
     (with-current-buffer buffer
       (erase-buffer))
-    ;; Start SSH with PTY for interactive password prompt
-    (let ((process-connection-type t))  ; Use PTY for password prompts
-      (setq process (apply #'start-process process-name buffer ssh-args)))
-    (set-process-query-on-exit-flag process nil)
-    (set-process-sentinel process #'ignore)
-    ;; Set up process properties for tramp-process-actions / tramp-read-passwd.
-    ;; pw-vector tells auth-source where to look up credentials.
-    (process-put process 'tramp-vector vec)
-    (tramp-set-connection-property process "hop-vector" vec)
-    (tramp-set-connection-property
-     process "pw-vector"
-     (make-tramp-file-name :method "ssh" :user user :host host :port port))
-    ;; Use upstream tramp-process-actions for password/host-key handling.
-    ;; The custom action checks for the ControlMaster socket appearing.
-    (let ((tramp-rpc--controlmaster-socket-path socket-path))
-      (tramp-process-actions process vec nil
-                             tramp-rpc--controlmaster-actions 60))
-    ;; tramp-process-actions throws on failure; reaching here means success.
-    (sleep-for 0.1)
-    t))
+    (let (success)
+      (unwind-protect
+          (progn
+            ;; Start SSH with PTY for interactive password prompt.
+            (let ((process-connection-type t))
+              (setq process (apply #'start-process process-name buffer ssh-args)))
+            (set-process-query-on-exit-flag process nil)
+            (set-process-sentinel process #'ignore)
+            ;; Set up process properties for tramp-process-actions /
+            ;; tramp-read-passwd.  pw-vector tells auth-source where to look
+            ;; up credentials.
+            (process-put process 'tramp-vector vec)
+            (tramp-set-connection-property process "hop-vector" vec)
+            (tramp-set-connection-property
+             process "pw-vector"
+             (make-tramp-file-name
+              :method "ssh" :user user :host host :port port))
+            ;; Use upstream tramp-process-actions for password/host-key
+            ;; handling.  The custom action checks for the ControlMaster
+            ;; socket appearing.
+            (let ((tramp-rpc--controlmaster-socket-path socket-path))
+              (tramp-process-actions process vec nil
+                                     tramp-rpc--controlmaster-actions 60))
+            ;; tramp-process-actions throws on failure; reaching here means
+            ;; the persistent master owns PROCESS and BUFFER.
+            (sleep-for 0.1)
+            (setq success t))
+        (unless success
+          (when (and process (process-live-p process))
+            (delete-process process))
+          (when (buffer-live-p buffer)
+            (kill-buffer buffer))))
+      success)))
+
+(defun tramp-rpc--server-binary-unavailable-p (process stderr-buffer)
+  "Return non-nil when PROCESS failed because its remote binary was absent.
+OpenSSH exits with status 255 for its own failures (authentication,
+unreachable host, lost ControlMaster socket); a missing or non-executable
+remote binary is reported by the remote shell as 127 or 126, which ssh
+propagates.  STDERR-BUFFER must also point at the remote exec failing, so
+that an authentication failure (which prints \"Permission denied\") is not
+misclassified as a deployable missing binary."
+  (and (not (process-live-p process))
+       (let ((status (process-exit-status process)))
+         (and (not (eql status 255))
+              (or (memq status '(126 127))
+                  (and (buffer-live-p stderr-buffer)
+                       (with-current-buffer stderr-buffer
+                         (let ((case-fold-search t))
+                           (string-match-p
+                            (rx (or "no such file" "not found" "cannot execute"
+                                    "permission denied"))
+                            (buffer-string))))))))))
 
 (defun tramp-rpc--connection-sentinel (process _event)
   "Discard deferred protocol state when RPC connection PROCESS closes."
@@ -1715,56 +1765,74 @@ Returns the connection plist.  Signals `remote-file-error' on failure."
     (process-put process 'tramp-vector vec)
     (tramp-rpc--install-connection-sentinel process vec)
 
-    ;; Wait for server to be ready by sending a ping, and seed the
-    ;; connection-local system.info cache for later uid/gid/home/shell lookups.
-    ;; `tramp-rpc--call' signals on the usual failed-start paths (a closed
-    ;; transport or timeout), so clear a supplied sudo password in the error
-    ;; handler as well as for an unexpected empty response.
-    (condition-case err
-        (let ((response (tramp-rpc--cache-system-info
-                         vec (tramp-rpc--call vec "system.info" nil))))
-          (unless response
-            (signal 'remote-file-error
-                    (list "Failed to connect to RPC server on" host))))
-      (remote-file-error
-       (tramp-rpc--remove-connection vec)
-       ;; A sudo start that fails to respond likely had its password rejected
-       ;; by sudo.  Clear the cached password so the next attempt prompts again
-       ;; instead of silently reusing the rejected password.
-       (when sudo-password
-         (tramp-rpc--clear-sudo-password vec))
-       (signal (car err) (cdr err))))
+    (condition-case start-error
+        (progn
+          ;; Wait for server to be ready by sending a ping, and seed the
+          ;; connection-local system.info cache for later uid/gid/home/shell
+          ;; lookups.
+          (let ((response (tramp-rpc--cache-system-info
+                           vec (tramp-rpc--call vec "system.info" nil))))
+            (unless response
+              (signal 'remote-file-error
+                      (list "Failed to connect to RPC server on" host))))
 
-    ;; Set connection-local variables in the connection buffer.
-    ;; Every TRAMP backend must call this after establishing the connection
-    ;; so that connection-local variable profiles (registered via
-    ;; `connection-local-set-profiles') are applied.  This enables variables
-    ;; like `tramp-direct-async-process', `shell-file-name', `path-separator'
-    ;; etc. to take effect in the connection buffer.
-    (tramp-set-connection-local-variables vec)
+          ;; Set connection-local variables in the connection buffer.
+          ;; Every TRAMP backend must call this after establishing the
+          ;; connection so that connection-local variable profiles
+          ;; (registered via `connection-local-set-profiles') are applied.
+          ;; This enables variables like `tramp-direct-async-process',
+          ;; `shell-file-name', `path-separator' etc. to take effect in the
+          ;; connection buffer.
+          (tramp-set-connection-local-variables vec)
 
-    ;; Mark as connected for TRAMP's connectivity checks (used by projectile, etc.)
-    (tramp-set-connection-property process "connected" t)
+          ;; Mark as connected for TRAMP's connectivity checks (used by
+          ;; projectile, etc.)
+          (tramp-set-connection-property process "connected" t)
 
-    ;; Mark as connected on the vec so `tramp-list-connections' finds
-    ;; this connection and `tramp-cleanup-connection' can offer it
-    ;; interactively.  The value is the connection buffer, matching the
-    ;; convention in `tramp-get-buffer'.
-    ;; Emacs 30.x uses "process-buffer"; newer TRAMP (31+) uses " connected".
-    ;; Set both for compatibility.
-    (tramp-set-connection-property vec "process-buffer" buffer)
-    (tramp-set-connection-property vec " connected" buffer)
+          ;; Mark as connected on the vec so `tramp-list-connections' finds
+          ;; this connection and `tramp-cleanup-connection' can offer it
+          ;; interactively.  The value is the connection buffer, matching the
+          ;; convention in `tramp-get-buffer'.
+          ;; Emacs 30.x uses "process-buffer"; newer TRAMP (31+) uses
+          ;; " connected".  Set both for compatibility.
+          (tramp-set-connection-property vec "process-buffer" buffer)
+          (tramp-set-connection-property vec " connected" buffer)
 
-    (tramp-rpc--get-connection vec)))
+          (tramp-rpc--get-connection vec))
+      ((quit error)
+       (let ((binary-unavailable
+              (tramp-rpc--server-binary-unavailable-p process stderr-buffer)))
+         ;; A sudo start that fails to respond may have rejected the supplied
+         ;; password.  Do not silently reuse it on the next attempt.
+         (when sudo-password
+           (tramp-rpc--clear-sudo-password vec))
+         ;; The generation may already have detached itself after a timeout or
+         ;; protocol error, so clean up directly from the local handles.
+         (tramp-rpc--remove-connection vec process)
+         (when (process-live-p process)
+           (delete-process process))
+         (when (buffer-live-p buffer)
+           (kill-buffer buffer))
+         (when (buffer-live-p stderr-buffer)
+           (kill-buffer stderr-buffer))
+         (if binary-unavailable
+             (signal 'tramp-rpc-server-unavailable (cdr start-error))
+           (signal (car start-error) (cdr start-error))))))))
 
 (defun tramp-rpc--cleanup-failed-connection (vec)
   "Clean up a failed connection attempt for VEC.
 Kills the process if still alive and removes the connection entry."
   (let ((conn (tramp-rpc--get-connection vec)))
     (when conn
-      (let ((proc (plist-get conn :process)))
+      (let ((proc (plist-get conn :process))
+            (buffer (plist-get conn :buffer))
+            (stderr-buffer (plist-get conn :stderr-buffer)))
         (when (process-live-p proc)
-          (delete-process proc)))
+          (delete-process proc))
+        (when (buffer-live-p buffer)
+          (kill-buffer buffer))
+        (when (buffer-live-p stderr-buffer)
+          (kill-buffer stderr-buffer)))
       (tramp-rpc--remove-connection vec))))
 
 (defun tramp-rpc--cleanup-bootstrap-connection (vec)
@@ -1791,15 +1859,21 @@ accidentally routing file operations through tramp-sh."
       (remote-file-error
        ;; A stale ControlMaster socket can make OpenSSH exit immediately while
        ;; TRAMP reports only a generic connection failure.  Remove the socket
-       ;; and retry once before surfacing the error.
+       ;; and retry once before surfacing the error.  Retry likewise when no
+       ;; socket exists at all: the first attempt may have died transiently
+       ;; before creating one.  Only a socket that still answers ControlMaster
+       ;; checks must be left alone.
        (let ((socket-path (tramp-rpc--controlmaster-socket-path vec)))
-         (when (file-exists-p socket-path)
-           (ignore-errors (delete-file socket-path)))
-         (sleep-for 0.1)
-         (condition-case nil
-             (tramp-rpc--establish-controlmaster vec)
-           (remote-file-error
-            (signal (car err) (cdr err))))))))
+         (if (tramp-rpc--controlmaster-active-p vec)
+             ;; Do not tear down a socket that still answers ControlMaster
+             ;; checks merely because authentication failed for another reason.
+             (signal (car err) (cdr err))
+           (ignore-errors (delete-file socket-path))
+           (sleep-for 0.1)
+           (condition-case nil
+               (tramp-rpc--establish-controlmaster vec)
+             (remote-file-error
+              (signal (car err) (cdr err)))))))))
   (let* ((sudo-ssh-user (tramp-rpc--detect-sudo-elevation vec))
          ;; TRAMP's sudo method opens an elevated backend connection.  For the
          ;; RPC backend that means starting the server via sudo.  Prefer sudo
@@ -1830,7 +1904,7 @@ accidentally routing file operations through tramp-sh."
     (condition-case nil
         (tramp-rpc--start-server-process
          vec (tramp-rpc-deploy-expected-binary-localname) sudo-password)
-      (remote-file-error
+      (tramp-rpc-server-unavailable
        ;; Connection failed - binary likely missing.  Clean up and deploy.
        (tramp-rpc--cleanup-failed-connection vec)
        (let ((binary-path (tramp-rpc-deploy-ensure-binary vec)))
@@ -1966,7 +2040,7 @@ the underlying SSH ControlMaster may be half-open after a network interruption."
 Handles async responses by dispatching to registered callbacks.
 Uses length-prefixed binary framing: <4-byte BE length><msgpack payload>."
   (let ((buffer (process-buffer process))
-	response)
+        response)
     (when (buffer-live-p buffer)
       (with-current-buffer buffer
         ;; Append output to buffer
@@ -1977,43 +2051,65 @@ Uses length-prefixed binary framing: <4-byte BE length><msgpack payload>."
         ;; Process complete messages
         (goto-char (point-min))
         (let ((tramp-rpc-protocol--message-target process))
-          (while (setq response (tramp-rpc-protocol-try-read-message buffer))
-            ;; Replace buffer contents with remaining data
-            (delete-region (point-min) (mark-marker))
-            (goto-char (point-min))
-            ;; Check for server-initiated notification (no id, has method)
-            (if (plist-get response :notification)
-                (tramp-rpc--handle-notification
-                 process
-                 (plist-get response :method)
-                 (plist-get response :params))
-              ;; A cleaned generation may still receive buffered output.  Its
-              ;; injected transport-death errors belong to live waiters and
-              ;; must not be overwritten by those late normal responses.
-              (unless (or (process-get process :tramp-rpc-transport-cleaned)
-                          (process-get process :tramp-rpc-transport-dead))
-                (let* ((id (plist-get response :id))
-                       (callback (gethash id tramp-rpc--async-callbacks)))
-                  (if callback
-                      (progn
-                        (tramp-rpc--debug "FILTER dispatching async id=%s" id)
-                        (remhash id tramp-rpc--async-callbacks)
-                        (remhash id tramp-rpc--async-callback-processes)
-                        (condition-case callback-error
-                            (funcall callback response)
-                          (error
-                           ;; One client callback must not strand complete
-                           ;; responses already buffered behind its frame.
-                           (tramp-rpc--debug
-                            "async response callback failed for id=%s: %S"
-                            id callback-error))))
-                    ;; Store only responses for this transport's live waiters.
-                    ;; Late responses from an abandoned generation are discarded.
-                    (when (member id (process-get process :tramp-rpc-pending-ids))
-                      (tramp-rpc--debug "FILTER storing sync response id=%s" id)
-                      (puthash id response
-                               (tramp-rpc--get-pending-responses
-                                (process-buffer process))))))))))))))
+          (while
+              (condition-case protocol-error
+                  (setq response
+                        (tramp-rpc-protocol-try-read-message buffer))
+                (error
+                 ;; A malformed or incorrectly framed response makes stream
+                 ;; reuse unsafe.  Fail the generation immediately instead of
+                 ;; allowing an error in the process filter to strand pending
+                 ;; callers.
+                 (let* ((vec (process-get process :tramp-rpc-vec))
+                        (event (format "RPC protocol error: %s"
+                                       (error-message-string protocol-error))))
+                   (tramp-rpc--debug "%s" event)
+                   (when vec
+                     (tramp-rpc--cleanup-connection-generation
+                      process vec event :protocol-error nil))
+                   (when (process-live-p process)
+                     (delete-process process)))
+                 nil))
+                ;; Replace buffer contents with remaining data.
+                (delete-region (point-min) (mark-marker))
+                (goto-char (point-min))
+                ;; Check for server-initiated notification (no id, has method).
+                (if (plist-get response :notification)
+                    (tramp-rpc--handle-notification
+                     process
+                     (plist-get response :method)
+                     (plist-get response :params))
+                  ;; A cleaned generation may still receive buffered output.
+                  ;; Its injected transport-death errors belong to live waiters
+                  ;; and must not be overwritten by late normal responses.
+                  (unless (or (process-get process :tramp-rpc-transport-cleaned)
+                              (process-get process :tramp-rpc-transport-dead))
+                    (let* ((id (plist-get response :id))
+                           (callback (gethash id tramp-rpc--async-callbacks)))
+                      (if callback
+                          (progn
+                            (tramp-rpc--debug
+                             "FILTER dispatching async id=%s" id)
+                            (remhash id tramp-rpc--async-callbacks)
+                            (remhash id tramp-rpc--async-callback-processes)
+                            (condition-case callback-error
+                                (funcall callback response)
+                              (error
+                               ;; One client callback must not strand complete
+                               ;; responses already buffered behind its frame.
+                               (tramp-rpc--debug
+                                "async response callback failed for id=%s: %S"
+                                id callback-error))))
+                        ;; Store only responses for this transport's live
+                        ;; waiters.  Late responses from an abandoned
+                        ;; generation are discarded.
+                        (when (member
+                               id (process-get process :tramp-rpc-pending-ids))
+                          (tramp-rpc--debug
+                           "FILTER storing sync response id=%s" id)
+                          (puthash id response
+                                   (tramp-rpc--get-pending-responses
+                                    (process-buffer process))))))))))))))
 
 (defun tramp-rpc--call-async (vec method params callback &optional connection)
   "Call METHOD with PARAMS asynchronously on the RPC server for VEC.
@@ -3242,8 +3338,10 @@ network round-trip."
                       (buffer-substring-no-properties
                        (or start (point-min))
                        (or end (point-max)))))
-           ;; Encode using buffer's coding system or default to utf-8
-           (coding (or (and (not (stringp start))
+           ;; Match `write-region': a dynamic output override takes precedence
+           ;; over the visited buffer's coding system.
+           (coding (or coding-system-for-write
+                       (and (not (stringp start))
                             buffer-file-coding-system)
                        'utf-8-unix))
            (content-bytes (encode-coding-string content coding))
@@ -3689,8 +3787,10 @@ copy options.  Fall back to the generic TRAMP handler for cross-remote copies."
                                                 '((lstat . t))))
                        ("file.stat" . ,(append (tramp-rpc--encode-path v2-localname)
                                                 '((lstat . t)))))))
-             (source-stat (nth 0 stats))
-             (dest-stat (nth 1 stats))
+             (source-stat (tramp-rpc--batch-result-or-signal
+                           "file.stat" filename (nth 0 stats)))
+             (dest-stat (tramp-rpc--batch-result-or-signal
+                         "file.stat" newname (nth 1 stats)))
              (source-type (tramp-rpc--stat-type source-stat))
              (dest-type (tramp-rpc--stat-type dest-stat)))
         (when dest-stat
@@ -4117,17 +4217,29 @@ ID-FORMAT specifies whether to return integer GIDs or string names."
 ;; ACL Support
 ;; ============================================================================
 
+(defun tramp-rpc--cached-capability-probe (vec property command args)
+  "Return cached capability PROPERTY for VEC, probing COMMAND with ARGS.
+Successful probes cache both enabled and disabled results.  Transport and RPC
+errors return nil without caching so a later operation can retry."
+  (let* ((missing (make-symbol "missing"))
+         (cached (tramp-get-connection-property vec property missing)))
+    (if (not (eq cached missing))
+        cached
+      (condition-case nil
+          (let* ((result (tramp-rpc--call vec "process.run"
+                                          `((cmd . ,command)
+                                            (args . ,args)
+                                            (cwd . "/"))))
+                 (enabled (zerop (alist-get 'exit_code result))))
+            (tramp-set-connection-property vec property enabled)
+            enabled)
+        (error nil)))))
+
 (defun tramp-rpc--acl-enabled-p (vec)
   "Check if ACL is available on the remote host VEC.
-Caches the result for efficiency."
-  ;; Check if getfacl exists and works
-  (condition-case nil
-      (let ((result (tramp-rpc--call vec "process.run"
-                                     `((cmd . "getfacl")
-                                       (args . ["--version"])
-                                       (cwd . "/")))))
-        (zerop (alist-get 'exit_code result)))
-    (error nil)))
+Cache successful probe results for the connection lifetime."
+  (tramp-rpc--cached-capability-probe
+   vec "rpc-acl-enabled" "getfacl" ["--version"]))
 
 (defun tramp-rpc-handle-file-acl (filename)
   "Like `file-acl' for TRAMP-RPC files.
@@ -4170,14 +4282,10 @@ Returns t on success, nil on failure."
 ;; ============================================================================
 
 (defun tramp-rpc--selinux-enabled-p (vec)
-  "Check if SELinux is enabled on the remote host VEC."
-  (condition-case nil
-      (let ((result (tramp-rpc--call vec "process.run"
-                                     `((cmd . "selinuxenabled")
-                                       (args . [])
-                                       (cwd . "/")))))
-        (zerop (alist-get 'exit_code result)))
-    (error nil)))
+  "Check if SELinux is enabled on the remote host VEC.
+Cache successful probe results for the connection lifetime."
+  (tramp-rpc--cached-capability-probe
+   vec "rpc-selinux-enabled" "selinuxenabled" []))
 
 (defun tramp-rpc-handle-file-selinux-context (filename)
   "Like `file-selinux-context' for TRAMP-RPC files.
@@ -4439,9 +4547,14 @@ refresh), git commands are served from the prefetch cache when possible."
                 ;; and the directory isn't being watched (watched dirs get
                 ;; server-pushed invalidation)
                 (let ((program-name (file-name-nondirectory program)))
-                  (unless (or (member program-name tramp-rpc--readonly-programs)
-                              (tramp-rpc--directory-watched-p localname v))
-                    (tramp-rpc--invalidate-cache-for-path default-directory)))
+                  (unless (member program-name tramp-rpc--readonly-programs)
+                    ;; Arbitrary commands can mutate paths outside their cwd,
+                    ;; and invalidating the directory object does not evict
+                    ;; cached answers for children created below it.  Clear
+                    ;; the whole connection's file caches even when the
+                    ;; directory is watched: correctness for unwatched and
+                    ;; out-of-tree mutations over fewer re-stat round-trips.
+                    (tramp-rpc--clear-file-caches-for-connection v)))
 
                 ;; Handle signal strings: when
                 ;; `process-file-return-signal-string' is non-nil and exit

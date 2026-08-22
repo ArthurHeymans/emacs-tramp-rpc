@@ -38,9 +38,13 @@ pub async fn cleanup_managed_processes() -> Result<(), RpcError> {
 
 pub type HandlerResult = Result<Value, RpcError>;
 
-/// Get system information
-fn system_info() -> HandlerResult {
+/// Get system information without running NSS lookups on a Tokio worker.
+async fn system_info() -> HandlerResult {
     use std::env;
+
+    let shell = tokio::task::spawn_blocking(login_shell)
+        .await
+        .map_err(|e| RpcError::internal_error(format!("Login shell task join error: {e}")))?;
 
     Ok(msgpack_map! {
         "version" => env!("CARGO_PKG_VERSION"),
@@ -53,7 +57,7 @@ fn system_info() -> HandlerResult {
         "gid" => unsafe { libc::getgid() },
         "home" => env::var("HOME").ok().into_value(),
         "user" => env::var("USER").ok().into_value(),
-        "shell" => login_shell().into_value()
+        "shell" => shell.into_value()
     })
 }
 
@@ -153,7 +157,7 @@ fn system_expand_path(params: Value) -> HandlerResult {
 }
 
 /// Get filesystem information (like df)
-fn system_statvfs(params: Value) -> HandlerResult {
+async fn system_statvfs(params: Value) -> HandlerResult {
     #[derive(serde::Deserialize)]
     struct Params {
         path: String,
@@ -161,35 +165,38 @@ fn system_statvfs(params: Value) -> HandlerResult {
 
     let params: Params = from_value(params).map_err(|e| RpcError::invalid_params(e.to_string()))?;
 
-    use std::ffi::CString;
     let expanded = expand_tilde(&params.path);
-    let path_cstr =
-        CString::new(expanded.as_str()).map_err(|_| RpcError::invalid_params("Invalid path"))?;
+    tokio::task::spawn_blocking(move || {
+        use std::ffi::CString;
+        let path_cstr = CString::new(expanded.as_str())
+            .map_err(|_| RpcError::invalid_params("Invalid path"))?;
 
-    let mut stat: libc::statvfs = unsafe { std::mem::zeroed() };
-    let result = unsafe { libc::statvfs(path_cstr.as_ptr(), &mut stat) };
+        let mut stat: libc::statvfs = unsafe { std::mem::zeroed() };
+        let result = unsafe { libc::statvfs(path_cstr.as_ptr(), &mut stat) };
+        if result != 0 {
+            return Err(RpcError::io_error(std::io::Error::last_os_error()));
+        }
 
-    if result != 0 {
-        return Err(RpcError::io_error(std::io::Error::last_os_error()));
-    }
+        // Return values in bytes (multiply by block size).  Types differ
+        // between Linux and macOS.
+        #[allow(clippy::unnecessary_cast)]
+        let block_size = stat.f_frsize as u64;
+        #[allow(clippy::unnecessary_cast)]
+        let total = stat.f_blocks as u64 * block_size;
+        #[allow(clippy::unnecessary_cast)]
+        let free = stat.f_bfree as u64 * block_size;
+        #[allow(clippy::unnecessary_cast)]
+        let available = stat.f_bavail as u64 * block_size;
 
-    // Return values in bytes (multiply by block size)
-    // Allow unnecessary casts for cross-platform compatibility (types differ between Linux/macOS)
-    #[allow(clippy::unnecessary_cast)]
-    let block_size = stat.f_frsize as u64;
-    #[allow(clippy::unnecessary_cast)]
-    let total = stat.f_blocks as u64 * block_size;
-    #[allow(clippy::unnecessary_cast)]
-    let free = stat.f_bfree as u64 * block_size;
-    #[allow(clippy::unnecessary_cast)]
-    let available = stat.f_bavail as u64 * block_size;
-
-    Ok(msgpack_map! {
-        "total" => total,
-        "free" => free,
-        "available" => available,
-        "block_size" => block_size
+        Ok(msgpack_map! {
+            "total" => total,
+            "free" => free,
+            "available" => available,
+            "block_size" => block_size
+        })
     })
+    .await
+    .map_err(|e| RpcError::internal_error(format!("statvfs task join error: {e}")))?
 }
 
 fn supplementary_groups_with<F>(
@@ -244,22 +251,23 @@ fn supplementary_groups() -> std::io::Result<Vec<libc::gid_t>> {
 }
 
 /// Get groups for the current user
-fn system_groups() -> HandlerResult {
-    let groups = supplementary_groups().map_err(RpcError::io_error)?;
-
-    // Convert to group info with names
-    let group_info: Vec<Value> = groups
-        .iter()
-        .map(|&gid| {
-            let gname = get_group_name(gid);
-            msgpack_map! {
-                "gid" => gid,
-                "name" => gname.into_value()
-            }
-        })
-        .collect();
-
-    Ok(Value::Array(group_info))
+async fn system_groups() -> HandlerResult {
+    tokio::task::spawn_blocking(|| {
+        let groups = supplementary_groups().map_err(RpcError::io_error)?;
+        let group_info = groups
+            .into_iter()
+            .map(|gid| {
+                let gname = get_group_name(gid);
+                msgpack_map! {
+                    "gid" => gid,
+                    "name" => gname.into_value()
+                }
+            })
+            .collect();
+        Ok(Value::Array(group_info))
+    })
+    .await
+    .map_err(|e| RpcError::internal_error(format!("Group lookup task join error: {e}")))?
 }
 
 /// Get group name from gid (delegates to file.rs's mutex-protected, cached version)
@@ -436,11 +444,11 @@ async fn dispatch_inner(request: Request) -> Response {
         "process.list_pty" => process::list_pty(params).await,
 
         // System info
-        "system.info" => system_info(),
+        "system.info" => system_info().await,
         "system.getenv" => system_getenv(params),
         "system.expand_path" => system_expand_path(params),
-        "system.statvfs" => system_statvfs(params),
-        "system.groups" => system_groups(),
+        "system.statvfs" => system_statvfs(params).await,
+        "system.groups" => system_groups().await,
 
         // Parallel command execution and ancestor scanning
         "commands.run_parallel" => commands::run_parallel(params).await,
@@ -454,7 +462,7 @@ async fn dispatch_inner(request: Request) -> Response {
         }
 
         // Filesystem watch operations (for cache invalidation)
-        "watch.add" => crate::watcher::handle_add(params),
+        "watch.add" => crate::watcher::handle_add(params).await,
         "watch.remove" => crate::watcher::handle_remove(params),
         "watch.list" => crate::watcher::handle_list(params),
 

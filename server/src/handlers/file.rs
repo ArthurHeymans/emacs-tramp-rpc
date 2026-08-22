@@ -412,12 +412,17 @@ pub fn bytes_to_path(bytes: &[u8]) -> PathBuf {
     expand_tilde_path(&path)
 }
 
-/// Expand ~ to home directory in a PathBuf.
-/// Delegates to the canonical string-based `expand_tilde` in mod.rs.
+/// Expand ~ to home directory in a PathBuf without decoding path bytes.
 fn expand_tilde_path(path: &Path) -> PathBuf {
-    let s = path.to_string_lossy();
-    let expanded = super::expand_tilde(&s);
-    if expanded.as_str() != s.as_ref() {
+    let bytes = path.as_os_str().as_bytes();
+    if (bytes == b"~" || bytes.starts_with(b"~/"))
+        && let Some(home) = std::env::var_os("HOME")
+    {
+        // Concatenate bytes instead of PathBuf::push: a suffix with repeated
+        // separators ("~//foo") starts with "/" and would replace the HOME
+        // prefix instead of appending to it.
+        let mut expanded = home;
+        expanded.push(OsStr::from_bytes(&bytes[1..]));
         PathBuf::from(expanded)
     } else {
         path.to_path_buf()
@@ -497,6 +502,30 @@ mod tests {
     fn test_get_group_name_root() {
         let name = get_group_name(0);
         assert!(name.is_some(), "gid 0 should always have a group entry");
+    }
+
+    #[test]
+    fn test_expand_tilde_preserves_non_utf8_suffix() {
+        let Some(home) = std::env::var_os("HOME") else {
+            return;
+        };
+        let path = bytes_to_path(b"~/\xff");
+        let mut expected = PathBuf::from(home);
+        expected.push(OsStr::from_bytes(b"\xff"));
+        assert_eq!(path, expected);
+    }
+
+    /// Repeated separators after "~/" must survive: the suffix begins with
+    /// "/" and must not replace the HOME prefix.
+    #[test]
+    fn test_expand_tilde_preserves_repeated_separators() {
+        let Some(home) = std::env::var_os("HOME") else {
+            return;
+        };
+        let path = bytes_to_path(b"~//\xff");
+        let mut expected = home;
+        expected.push(OsStr::from_bytes(b"//\xff"));
+        assert_eq!(path, PathBuf::from(expected));
     }
 
     /// Repeated lookups should hit the cache and return the same value.
