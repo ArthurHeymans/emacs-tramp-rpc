@@ -66,6 +66,7 @@
 (defvar tramp-rpc-async-read-timeout-ms)
 (defvar tramp-rpc--delivering-output)
 (defvar tramp-rpc--closing-local-relay)
+(defvar tramp-rpc--process-timer-recorder)
 
 ;; ============================================================================
 ;; Process tracking state
@@ -108,6 +109,9 @@ the next read cannot discard output waiting for relay delivery."
                  (puthash process (plist-put current timer-key nil) table)
                  (apply function args)))))
       (puthash process (plist-put info timer-key timer) table)
+      (when tramp-rpc--process-timer-recorder
+        (funcall tramp-rpc--process-timer-recorder
+                 timer table process timer-key))
       timer)))
 
 (defun tramp-rpc--cancel-process-timers (table process)

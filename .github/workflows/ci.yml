@@ -249,6 +249,16 @@ jobs:
             -l test/tramp-rpc-mock-tests.el \
             --eval "(ert-run-tests-batch-and-exit \"^tramp-rpc-mock-test-protocol\")"
 
+      - name: Run request lifecycle tests
+        run: |
+          emacs -Q --batch \
+            --eval "(require 'package)" \
+            --eval "(add-to-list 'package-archives '(\"melpa\" . \"https://melpa.org/packages/\") t)" \
+            --eval "(package-initialize)" \
+            --eval "(setq debug-on-error t)" \
+            -l test/tramp-rpc-mock-tests.el \
+            --eval "(ert-run-tests-batch-and-exit \"^tramp-rpc-mock-test-request\")"
+
   test-multi-hop:
     name: Multi-Hop Tests (${{ matrix.emacs_label }})
     runs-on: ubuntu-latest

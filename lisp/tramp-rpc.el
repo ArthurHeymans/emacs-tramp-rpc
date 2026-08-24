@@ -855,6 +855,9 @@ and optional :stderr-buffer.")
 (defvar tramp-rpc--async-callback-processes (make-hash-table :test 'eql)
   "Hash table mapping async request IDs to their transport process.")
 
+(defvar tramp-rpc--process-timer-recorder nil
+  "Function called for process timers created during a suspended RPC wait.")
+
 (defvar tramp-rpc--pending-responses (make-hash-table :test 'eq)
   "Hash table mapping buffers to their pending response hash tables.
 Each buffer has its own hash table mapping request IDs to response plists.")
@@ -2100,6 +2103,30 @@ and blocking SSH or the remote server."
          (max (point-min) (- (point-max) (or max-bytes 1024)))
          (point-max))))))
 
+(defmacro tramp-rpc--with-suspended-timers-preserving-process-timers (&rest body)
+  "Run BODY with external timers suspended, preserving new process timers.
+Reactivation assumes no enclosing `with-tramp-suspended-timers' is still
+in effect when BODY exits, because the restored timers would land in that
+outer binding of `timer-list' and be discarded again.  The RPC wait loops
+satisfy this: they accept output with JUST-THIS-ONE, so no other
+connection's filter, and therefore no nested wait, can run inside BODY."
+  (declare (indent 0) (debug t))
+  (let ((recorded (make-symbol "recorded-process-timers")))
+    `(let (,recorded)
+       (unwind-protect
+           (let ((tramp-rpc--process-timer-recorder
+                  (lambda (&rest timer-state)
+                    (push timer-state ,recorded))))
+             (with-tramp-suspended-timers
+               ,@body))
+         (dolist (timer-state ,recorded)
+           (pcase-let ((`(,timer ,table ,process ,timer-key) timer-state))
+             (when (and (timerp timer)
+                        (not (memq timer timer-list))
+                        (when-let* ((info (gethash process table)))
+                          (eq timer (plist-get info timer-key))))
+               (timer-activate timer))))))))
+
 (defun tramp-rpc--call-with-timeout (vec method params total-timeout poll-interval
                                           &optional connection)
   "Call METHOD with PARAMS on the RPC server for VEC.
@@ -2157,12 +2184,14 @@ Returns the result or signals an error."
             ;; - JUST-THIS-ONE=t to only accept from this process (Bug#12145)
             ;; - with-local-quit to allow C-g, returns t on success
             ;; - Propagate quit if user pressed C-g
-            ;; - with-tramp-suspended-timers to prevent deferred process
-            ;;   sentinels (scheduled via run-at-time 0) from firing
-            ;;   inside accept-process-output and blocking this call.
-            ;;   The sentinels will run when control returns to the
-            ;;   command loop.  (Mirrors tramp-accept-process-output.)
-            (if (with-tramp-suspended-timers
+            ;; - suspended timers to prevent deferred process sentinels
+            ;;   (scheduled via run-at-time 0) from firing inside
+            ;;   accept-process-output and blocking this call.  The
+            ;;   sentinels will run when control returns to the command
+            ;;   loop.  (Mirrors tramp-accept-process-output.)  The
+            ;;   wrapper additionally keeps process timers this wait
+            ;;   scheduled, which the plain suspension would discard.
+            (if (tramp-rpc--with-suspended-timers-preserving-process-timers
                   (with-local-quit
                     (tramp-rpc--drain-connection-stderr conn)
                     (accept-process-output process poll-interval nil t)
@@ -2262,7 +2291,7 @@ Returns:
                 ;; Check if other thread already got our response
                 (setq response (tramp-rpc--find-response-by-id expected-id process)))
             ;; Process is accessible
-            (if (with-tramp-suspended-timers
+            (if (tramp-rpc--with-suspended-timers-preserving-process-timers
                   (with-local-quit
                     (tramp-rpc--drain-connection-stderr conn)
                     (accept-process-output process 0.1 nil t)
@@ -2381,7 +2410,7 @@ captured connection generation to use."
                     (puthash id response responses)
                     (setq remaining-ids (delete id remaining-ids))))))
           ;; Process is accessible
-          (if (with-tramp-suspended-timers
+          (if (tramp-rpc--with-suspended-timers-preserving-process-timers
                 (with-local-quit
                   (tramp-rpc--drain-connection-stderr conn)
                   (accept-process-output process 0.1 nil t)
