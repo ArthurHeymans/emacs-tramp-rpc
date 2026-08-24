@@ -5,7 +5,6 @@
 ;; Author: Arthur Heymans <arthur@aheymans.xyz>
 ;; Assisted-by: various LLMs
 ;; Keywords: comm, processes
-;; Package-Requires: ((emacs "30.1") (msgpack "0.1.1"))
 
 ;; This file is part of tramp-rpc.
 
@@ -368,7 +367,8 @@ The queue remains bound to OWNER-PROCESS's original connection generation."
              (signal (car err) (cdr err))))))))))
 
 (defun tramp-rpc--drain-write-queue (vec pid &optional owner-process)
-  "Wait for VEC and PID's exact captured write queue to complete."
+  "Wait for VEC and PID's exact captured write queue to complete.
+OWNER-PROCESS owns the request."
   (let* ((queue-key (tramp-rpc--process-write-queue-key-for-owner
                      vec pid owner-process))
          (deadline (+ (float-time) tramp-rpc-write-queue-drain-timeout)))
@@ -391,8 +391,7 @@ The queue remains bound to OWNER-PROCESS's original connection generation."
         (puthash queue-key queue tramp-rpc--process-write-queues))
        ((or (plist-get queue :writing) (plist-get queue :pending))
         (setq queue (tramp-rpc--process-write-queue-fail queue :timeout))
-        (puthash queue-key queue tramp-rpc--process-write-queues))
-       )
+        (puthash queue-key queue tramp-rpc--process-write-queues)))
       (tramp-rpc--signal-process-write-failure queue))))
 
 (defun tramp-rpc--process-error-kind (err)
@@ -402,7 +401,9 @@ The queue remains bound to OWNER-PROCESS's original connection generation."
       (and (listp data) (alist-get 'process_error data)))))
 
 (defun tramp-rpc--close-remote-stdin (vec pid &optional owner-process)
-  "Close stdin on OWNER-PROCESS's original RPC connection generation."
+  "Close stdin on OWNER-PROCESS's original RPC connection generation.
+VEC is the TRAMP connection vector.
+PID is the remote process ID."
   (let* ((queue-key (tramp-rpc--process-write-queue-key-for-owner
                      vec pid owner-process))
          (queue (gethash queue-key tramp-rpc--process-write-queues))
@@ -445,7 +446,7 @@ The queue remains bound to OWNER-PROCESS's original connection generation."
 (defun tramp-rpc--start-async-read (local-process)
   "Start an async read loop for LOCAL-PROCESS.
 Sends a blocking read request; when response arrives, delivers output
-and chains another read. This provides fast async I/O for LSP servers."
+and chains another read.  This provides fast async I/O for LSP servers."
   (when (and (processp local-process)
              (process-live-p local-process)
              (gethash local-process tramp-rpc--async-processes))
@@ -465,7 +466,7 @@ and chains another read. This provides fast async I/O for LSP servers."
 (defun tramp-rpc--deliver-process-output (local-process stdout stderr stderr-buffer)
   "Deliver STDOUT and STDERR to LOCAL-PROCESS.
 Writes to the local cat relay process, which triggers proper I/O events
-that satisfy accept-process-output.
+that satisfy function `accept-process-output'.
 STDERR-BUFFER is the separate stderr buffer, or nil to mix with stdout."
   (when (and (processp local-process) (process-live-p local-process))
     ;; Set flag to bypass our handler - we're writing TO the local process,
@@ -502,7 +503,11 @@ STDERR-BUFFER is the separate stderr buffer, or nil to mix with stdout."
         (apply #'tramp-rpc--deliver-process-output local-process chunk)))))
 
 (defun tramp-rpc--queue-process-output (local-process stdout stderr stderr-buffer)
-  "Queue one non-exit output chunk and schedule its exact delivery once."
+  "Queue one non-exit output chunk and schedule its exact delivery once.
+LOCAL-PROCESS is the local relay process.
+STDOUT is the process standard output.
+STDERR is the process standard error output.
+STDERR-BUFFER receives standard error output."
   (when-let* ((info (gethash local-process tramp-rpc--async-processes)))
     (setq info (plist-put info :pending-output
                           (append (plist-get info :pending-output)
@@ -523,7 +528,8 @@ STDERR-BUFFER is the separate stderr buffer, or nil to mix with stdout."
 (defun tramp-rpc--pipe-process-sentinel (proc event &optional user-sentinel)
   "Sentinel for pipe relay PROC, preserving USER-SENTINEL exactly once.
 The relay remains tracked while its sentinel runs; cleanup removes it after
-that chain has completed."
+that chain has completed.
+EVENT is the process event string."
   (when (and (memq (process-status proc) '(exit signal))
              (gethash proc tramp-rpc--async-processes))
     (let* ((info (gethash proc tramp-rpc--async-processes))
@@ -628,7 +634,8 @@ This design follows TRAMP's approach: let Emacs's process machinery
 handle sentinel dispatch rather than fighting it with `delete-process'
 + deferred `run-at-time' sentinel calls.  Doing `delete-process'
 before the cat relay drains its pipe causes a stale FD that makes
-`input-pending-p' return t permanently, starving keyboard input."
+`input-pending-p' return t permanently, starving keyboard input.
+EXIT-CODE is the process exit status."
   (let ((info (gethash local-process tramp-rpc--async-processes)))
     (when info
       (tramp-rpc--cancel-process-timers tramp-rpc--async-processes local-process)
@@ -718,7 +725,7 @@ update is still running."
 (defun tramp-rpc--coding-args (coding)
   "Return list of arguments for `set-process-coding-system' from CODING.
 CODING is a non-nil `make-process' :coding value: either a symbol
-(used for both decoding and encoding) or a cons cell (DECODING .
+\(used for both decoding and encoding) or a cons cell (DECODING .
 ENCODING).  When DECODING or ENCODING is nil inside a cons, it is
 replaced with the corresponding default from
 `default-process-coding-system', matching how native `make-process'
@@ -732,7 +739,7 @@ handles nil :coding elements."
   "Normalize a `make-process' :coding value for internal use.
 
 CODING may be nil, a coding-system symbol, or a cons cell
-(DECODING . ENCODING).  Nil sides in a cons are replaced with the
+\(DECODING . ENCODING).  Nil sides in a cons are replaced with the
 corresponding side of `default-process-coding-system', like native
 `make-process'.  When the resolved decoding and encoding coding systems
 are identical, return the single symbol form.  This preserves native
@@ -753,7 +760,8 @@ pair is a symbol."
 Non-shell commands, `shell -c ...', and script launches are left untouched.
 Login args are appended after the existing args: `M-x shell' passes bash
 `--noediting -i', and bash rejects the long `--noediting' option once a short
-option like `-l' precedes it (an invalid-option error)."
+option like `-l' precedes it (an invalid-option error).
+VEC is the TRAMP connection vector."
   (let* ((program (car command))
          (args (cdr command))
          (base (and (stringp program) (file-name-nondirectory program)))
@@ -987,7 +995,8 @@ interactive terminal use.  Otherwise, uses the RPC-based PTY implementation."
      vec name buffer command coding noquery filter sentinel localname direnv-env)))
 
 (defun tramp-rpc--direct-ssh-pty-sentinel (process event)
-  "Remove direct SSH PTY PROCESS and invoke its user sentinel once."
+  "Remove direct SSH PTY PROCESS and invoke its user sentinel once.
+EVENT is the process event string."
   (when (memq (process-status process) '(exit signal))
     (remhash process tramp-rpc--pty-processes)
     (tramp-rpc--call-user-sentinel-once
@@ -1218,7 +1227,9 @@ DIRENV-ENV is an optional alist of environment variables for the process."
     local-process))
 
 (defun tramp-rpc--pty-default-filter (process output)
-  "Default filter for PTY processes - insert output into process buffer."
+  "Default filter for PTY processes - insert output into process buffer.
+PROCESS is the process being handled.
+OUTPUT is the process output received."
   (when-let* ((buf (process-buffer process)))
     (when (buffer-live-p buf)
       (with-current-buffer buf
@@ -1308,7 +1319,8 @@ RESPONSE is the decoded RPC response plist."
        (tramp-rpc--handle-pty-exit local-process -1)))))
 
 (defun tramp-rpc--handle-pty-exit (local-process exit-code)
-  "Handle exit of PTY process associated with LOCAL-PROCESS."
+  "Handle exit of PTY process associated with LOCAL-PROCESS.
+EXIT-CODE is the process exit status."
   (when (gethash local-process tramp-rpc--pty-processes)
     (tramp-rpc--cancel-process-timers tramp-rpc--pty-processes local-process)
     ;; Close the remote PTY while the transport is still available.  Keep the
@@ -1332,7 +1344,8 @@ RESPONSE is the decoded RPC response plist."
         (ignore-errors (process-send-eof local-process))))))
 
 (defun tramp-rpc--pty-sentinel (process event)
-  "Sentinel for PTY relay PROCESS, preserving its user sentinel once."
+  "Sentinel for PTY relay PROCESS, preserving its user sentinel once.
+EVENT is the process event string."
   (when (memq (process-status process) '(exit signal))
     (when-let* ((info (gethash process tramp-rpc--pty-processes)))
       (tramp-rpc--cancel-process-timers tramp-rpc--pty-processes process)
@@ -1421,7 +1434,9 @@ Returns the final (width . height) cons, or nil if resize was not handled."
 (defun tramp-rpc-handle-vterm--window-adjust-process-window-size (process windows)
   "Handler for vterm's window adjust function to handle TRAMP-RPC PTY processes.
 For tramp-rpc processes, resize the remote PTY and update vterm's display.
-For direct SSH PTY, let the original function handle it (SSH handles resize)."
+For direct SSH PTY, let the original function handle it (SSH handles resize).
+PROCESS is the process being handled.
+WINDOWS is the list of windows displaying the process buffer."
   (cond
    ;; Direct SSH PTY - let original function handle it
    ((and (processp process)
@@ -1451,7 +1466,9 @@ For direct SSH PTY, let the original function handle it (SSH handles resize)."
 (defun tramp-rpc-handle-eat--adjust-process-window-size (process windows)
   "Handler for eat's window adjust function to handle TRAMP-RPC PTY processes.
 For tramp-rpc processes, resize the remote PTY and update eat's display.
-For direct SSH PTY, let the original function handle it (SSH handles resize)."
+For direct SSH PTY, let the original function handle it (SSH handles resize).
+PROCESS is the process being handled.
+WINDOWS is the list of windows displaying the process buffer."
   (cond
    ;; Direct SSH PTY - let original function handle it
    ((and (processp process)

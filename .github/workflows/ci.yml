@@ -141,7 +141,8 @@ jobs:
               --eval "(package-refresh-contents)" \
               --eval "(setq package-install-upgrade-built-in t)" \
               --eval "(package-install 'tramp)" \
-              --eval "(package-install 'msgpack)" && break
+              --eval "(package-install 'msgpack)" \
+              --eval "(package-install 'package-lint)" && break
             echo "Attempt $attempt failed, retrying in 10s..."
             sleep 10
           done
@@ -156,11 +157,36 @@ jobs:
             --eval "(push \"$(pwd)/lisp\" load-path)" \
             -f batch-byte-compile lisp/*.el
 
-      - name: Check package metadata
+      - name: Package lint
         run: |
           emacs -Q --batch \
             --eval "(require 'package)" \
-            --eval "(with-current-buffer (find-file-noselect \"lisp/tramp-rpc.el\") (package-buffer-info))"
+            --eval "(package-initialize)" \
+            --eval "(require 'package-lint)" \
+            --eval "(setq package-lint-main-file \"lisp/tramp-rpc.el\")" \
+            --eval "(advice-add 'package-lint--check-eval-after-load :override (lambda () nil))" \
+            -f package-lint-batch-and-exit \
+            lisp/tramp-rpc.el \
+            lisp/tramp-rpc-advice.el \
+            lisp/tramp-rpc-deploy.el \
+            lisp/tramp-rpc-magit.el \
+            lisp/tramp-rpc-process.el \
+            lisp/tramp-rpc-protocol.el
+
+      - name: Check documentation strings
+        run: |
+          for file in \
+            lisp/tramp-rpc.el \
+            lisp/tramp-rpc-advice.el \
+            lisp/tramp-rpc-deploy.el \
+            lisp/tramp-rpc-magit.el \
+            lisp/tramp-rpc-process.el \
+            lisp/tramp-rpc-protocol.el; do
+            emacs -Q --batch \
+              --eval "(require 'checkdoc)" \
+              --eval "(setq checkdoc-autofix-flag 'never)" \
+              --eval "(checkdoc-file \"$file\")"
+          done
 
   test-autoload:
     name: Autoload Tests (${{ matrix.emacs_label }})

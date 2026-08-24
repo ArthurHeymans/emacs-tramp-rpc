@@ -5,7 +5,6 @@
 ;; Author: Arthur Heymans <arthur@aheymans.xyz>
 ;; Assisted-by: various LLMs
 ;; Keywords: comm, processes, vc
-;; Package-Requires: ((emacs "30.1") (msgpack "0.1.1"))
 
 ;; This file is part of tramp-rpc.
 
@@ -79,11 +78,11 @@
   "Maximum number of entries per cache before eviction.")
 
 (defvar tramp-rpc--file-exists-cache (make-hash-table :test 'equal)
-  "Cache for file-exists-p results.
+  "Cache for `file-exists-p' results.
 Keys are expanded filenames, values are (TIMESTAMP . RESULT).")
 
 (defvar tramp-rpc--file-truename-cache (make-hash-table :test 'equal)
-  "Cache for file-truename results.
+  "Cache for `file-truename' results.
 Keys are expanded filenames, values are (TIMESTAMP . TRUENAME).")
 
 (defvar tramp-rpc--file-stat-cache (make-hash-table :test 'equal)
@@ -290,12 +289,12 @@ must still report symlink type for lstat."
       (drop-stat-prefix))))
 
 (defun tramp-rpc-clear-file-exists-cache ()
-  "Clear the file-exists-p cache."
+  "Clear the `file-exists-p' cache."
   (interactive)
   (clrhash tramp-rpc--file-exists-cache))
 
 (defun tramp-rpc-clear-file-truename-cache ()
-  "Clear the file-truename cache."
+  "Clear the `file-truename' cache."
   (interactive)
   (clrhash tramp-rpc--file-truename-cache))
 
@@ -326,7 +325,7 @@ must still report symlink type for lstat."
   (tramp-rpc--clear-file-metadata-caches))
 
 (defun tramp-rpc--clear-file-caches-for-connection (vec)
-  "Clear file-exists and file-truename cache entries for connection VEC.
+  "Clear file-exists and `file-truename' cache entries for connection VEC.
 Entries are keyed by expanded TRAMP filenames; this removes those
 matching the remote prefix of VEC."
   (tramp-rpc-magit--clear-ancestor-caches-for-connection vec)
@@ -631,9 +630,9 @@ magit-status on remote repositories."
   :group 'tramp-rpc)
 
 (defvar tramp-rpc-magit--process-caches (make-hash-table :test 'equal)
-  "Hash table mapping (conn-key . directory) to process-file cache entries.
+  "Hash table mapping (conn-key . directory) to `process-file' cache entries.
 Each value stores a timestamp and a hash table mapping git arg keys to
-(exit-code . stdout-string).  Keyed per connection and per directory to
+\(exit-code . stdout-string).  Keyed per connection and per directory to
 support multiple remotes and repos.")
 
 (defcustom tramp-rpc-magit-process-cache-ttl 120
@@ -686,7 +685,7 @@ This is populated by `tramp-rpc-magit--prefetch' for file existence checks.")
 
 (defvar tramp-rpc-magit--prefetch-directory nil
   "The directory that was prefetched.
-Used to answer file-exists-p queries for the directory itself.")
+Used to answer `file-exists-p' queries for the directory itself.")
 
 (defvar tramp-rpc-magit--debug nil
   "When non-nil, log cache hits/misses for debugging.")
@@ -734,7 +733,7 @@ Returns a cons cell (connection-key . directory) for hash table lookups."
      (t cache))))
 
 (defun tramp-rpc-magit--get-process-cache ()
-  "Get the process-file cache for the current `default-directory'.
+  "Get the `process-file' cache for the current `default-directory'.
 Returns the cache hash table, or nil if none."
   (when (file-remote-p default-directory)
     (with-parsed-tramp-file-name default-directory nil
@@ -742,7 +741,7 @@ Returns the cache hash table, or nil if none."
        (tramp-rpc-magit--get-cache-key v default-directory)))))
 
 (defun tramp-rpc-magit--set-process-cache (vec directory cache)
-  "Set the process-file CACHE for VEC and DIRECTORY."
+  "Set the `process-file' CACHE for VEC and DIRECTORY."
   (let ((key (tramp-rpc-magit--get-cache-key vec directory)))
     (puthash key (list :time (float-time) :cache cache)
              tramp-rpc-magit--process-caches)))
@@ -928,7 +927,8 @@ The batch RPC supplies the same effective environment as `process-file'."
 (defun tramp-rpc-magit--store-command-results (vec directory results &optional replace)
   "Merge commands.run_parallel RESULTS into DIRECTORY's process cache.
 When REPLACE is non-nil, build a fresh cache instead of merging into an
-existing one."
+existing one.
+VEC is the TRAMP connection vector."
   (when results
     (let* ((key (tramp-rpc-magit--get-cache-key vec directory))
            (cache (if replace
@@ -969,7 +969,8 @@ prefetch growth does not trip that hard limit.")
        (env . ,(tramp-rpc--process-environment vec localname))))))
 
 (defun tramp-rpc-magit--run-command-entries (vec directory commands)
-  "Run COMMANDS in chunks and merge their results into DIRECTORY's cache."
+  "Run COMMANDS in chunks and merge their results into DIRECTORY's cache.
+VEC is the TRAMP connection vector."
   (let ((remaining (append commands nil))
         cache)
     (while remaining
@@ -1027,7 +1028,8 @@ whitespace."
   (tramp-make-tramp-file-name vec localname))
 
 (defun tramp-rpc-magit--cache-file-stat (vec localname stat)
-  "Populate TRAMP/file-exists caches for LOCALNAME from STAT."
+  "Populate TRAMP/file-exists caches for LOCALNAME from STAT.
+VEC is the TRAMP connection vector."
   (let ((localnames (list localname)))
     ;; TRAMP distinguishes directory spellings with and without trailing slash
     ;; in its property keys.  Magit tends to ask for the slash spelling later,
@@ -1091,7 +1093,8 @@ whitespace."
       (delete-dups (append from-remotes from-refs)))))
 
 (defun tramp-rpc-magit--cache-file-truename (vec localname result)
-  "Populate `file-truename' cache for LOCALNAME from RESULT."
+  "Populate `file-truename' cache for LOCALNAME from RESULT.
+VEC is the TRAMP connection vector."
   (when result
     (let* ((truename-local (tramp-rpc--decode-string
                             (if (consp result)
@@ -1142,7 +1145,10 @@ whitespace."
 (defun tramp-rpc-magit--prefetch-dynamic-status (vec directory root-local)
   "Prefetch status data that depends on initial git output.
 This second-stage batch covers worktree-specific gitdirs, current branch and
-upstream names, and commands used to wash already-expanded file sections."
+upstream names, and commands used to wash already-expanded file sections.
+VEC is the TRAMP connection vector.
+DIRECTORY is the directory being handled.
+ROOT-LOCAL is the local form of the repository root."
   (when-let* ((cache (tramp-rpc-magit--get-process-cache)))
     (let ((commands nil)
           (expanded-files (list (directory-file-name root-local))))
@@ -1338,7 +1344,7 @@ our prefetch command/key."
         (setq safe nil)))))
 
 (defun tramp-rpc-magit--process-cache-lookup (program args)
-  "Look up PROGRAM ARGS in the process-file cache.
+  "Look up PROGRAM ARGS in the `process-file' cache.
 Returns (exit-code . stdout) if found, nil otherwise."
   (when-let* (((bound-and-true-p tramp-rpc-magit--allow-process-cache))
               ((tramp-rpc-magit--git-cache-safe-environment-p))
@@ -1374,7 +1380,7 @@ EXIT-CODE and STDOUT are the values returned by `process-file'."
   "Prefetch magit status and ancestor data for DIRECTORY.
 Sends all git commands magit will need via a single
 commands.run_parallel RPC call, then stores the results directly
-as the process-file cache.  Also fetches ancestor markers."
+as the `process-file' cache.  Also fetches ancestor markers."
   (when (and (file-remote-p directory)
              (tramp-rpc-file-name-p directory))
     ;; Suppress fs.events cache handling during prefetch.  The git commands
@@ -1647,7 +1653,9 @@ Returns t, nil, or \\='not-cached if not in cache."
         (tramp-rpc-magit--prefetch default-directory)))))
 
 (defun tramp-rpc-magit--section-show-advice (orig section)
-  "Advice around `magit-section-show' for lazy remote status sections."
+  "Advice around `magit-section-show' for lazy remote status sections.
+ORIG is the original advised function.
+SECTION is the Magit section being handled."
   (let ((tramp-rpc-magit--allow-process-cache t))
     (tramp-rpc-magit--maybe-prefetch-for-section section)
     (let ((magit-diff-adjust-tab-width
@@ -1668,7 +1676,8 @@ Returns t, nil, or \\='not-cached if not in cache."
   "Handler for `magit-status-setup-buffer' to prefetch data.
 Suppresses fs.events cache handling during refresh to prevent
 inotify events (from git commands touching .git/index etc.) from
-clearing caches mid-refresh."
+clearing caches mid-refresh.
+DIRECTORY is the directory being handled."
   (let* ((directory (or directory default-directory))
          (tramp-rpc--suppress-fs-notifications t)
          (tramp-rpc-magit--allow-process-cache t)
@@ -1776,13 +1785,15 @@ magit-status on remote repositories."
 `projectile-dir-files-alien' (via `projectile-get-ext-command') checks
 fd availability via `executable-find' on the LOCAL machine, but fd may
 not be available on the REMOTE.  Binding `projectile-git-use-fd' to nil
-forces git ls-files instead."
+forces git ls-files instead.
+DIRECTORY is the directory being handled."
   (let ((projectile-git-use-fd nil))
     (projectile-dir-files-alien directory)))
 
 (defun tramp-rpc-handle-projectile-project-files (project-root)
   "Handler to use alien indexing for remote project files.
-This bypasses the expensive `file-relative-name' calls in hybrid mode."
+This bypasses the expensive `file-relative-name' calls in hybrid mode.
+PROJECT-ROOT is the project root directory."
   ;; For remote RPC directories, use alien indexing directly
   (let ((files nil))
     ;; Check cache first (like projectile-project-files does)
