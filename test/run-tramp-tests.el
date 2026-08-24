@@ -1,6 +1,7 @@
 ;;; run-tramp-tests.el --- Run upstream tramp-tests.el with tramp-rpc  -*- lexical-binding: t -*-
 
 ;; Copyright (C) 2026 Arthur Heymans <arthur@aheymans.xyz>
+;; Assisted-by: various LLMs
 
 ;;; Commentary:
 
