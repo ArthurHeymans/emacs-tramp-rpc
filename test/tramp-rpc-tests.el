@@ -3,6 +3,7 @@
 ;; Copyright (C) 2026 Arthur Heymans <arthur@aheymans.xyz>
 
 ;; Author: Arthur Heymans <arthur@aheymans.xyz>
+;; Assisted-by: various LLMs
 
 ;; This file is part of tramp-rpc.
 

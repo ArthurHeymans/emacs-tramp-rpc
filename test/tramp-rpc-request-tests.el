@@ -1,4 +1,5 @@
 ;;; tramp-rpc-request-tests.el --- Request lifecycle tests -*- lexical-binding: t; -*-
+;; Assisted-by: various LLMs
 
 (require 'ert)
 (require 'cl-lib)

@@ -3,6 +3,7 @@
 ;; Copyright (C) 2026 Arthur Heymans <arthur@aheymans.xyz>
 
 ;; Author: Arthur Heymans <arthur@aheymans.xyz>
+;; Assisted-by: various LLMs
 ;; Keywords: comm, processes, vc
 ;; Package-Requires: ((emacs "30.1") (msgpack "0.1.1"))
 
