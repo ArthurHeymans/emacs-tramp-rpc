@@ -948,7 +948,7 @@ existing one."
                                       tramp-path
                                       (= exit-code 0)))
             (let* ((stdout-raw (alist-get 'stdout data))
-                   (stdout (tramp-rpc--decode-output stdout-raw nil)))
+                   (stdout (tramp-rpc--decode-output stdout-raw)))
               (puthash cmd-key (cons exit-code stdout) cache)))))
       (tramp-rpc-magit--set-process-cache vec directory cache)
       cache)))

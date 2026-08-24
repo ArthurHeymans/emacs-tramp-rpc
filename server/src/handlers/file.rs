@@ -382,6 +382,129 @@ pub fn get_group_name(gid: u32) -> Option<String> {
     resolve_nss_name(&GROUP_NAMES, NssKind::Group, gid)
 }
 
+/// Resolve the login shell for `uid` via getpwuid_r.
+///
+/// Uses a sysconf-hinted buffer that doubles on `ERANGE`, so passwd records
+/// larger than the initial hint (large LDAP/SSSD entries) still resolve
+/// instead of being reported as absent.
+pub(crate) fn get_user_login_shell(uid: u32) -> Option<String> {
+    let mut bufsize = sysconf_bufsize(libc::_SC_GETPW_R_SIZE_MAX, 1024);
+    loop {
+        let mut buf = vec![0u8; bufsize];
+        let mut pwd: libc::passwd = unsafe { std::mem::zeroed() };
+        let mut result_ptr: *mut libc::passwd = std::ptr::null_mut();
+        let ret = unsafe {
+            libc::getpwuid_r(
+                uid,
+                &mut pwd,
+                buf.as_mut_ptr() as *mut libc::c_char,
+                buf.len(),
+                &mut result_ptr,
+            )
+        };
+        if ret == libc::ERANGE && bufsize < MAX_NSS_BUFSIZE {
+            bufsize = bufsize.saturating_mul(2).min(MAX_NSS_BUFSIZE);
+            continue;
+        }
+        if ret != 0 || result_ptr.is_null() {
+            return None;
+        }
+        // Extract owned data while `buf` is still alive: the passwd strings
+        // point into it.
+        let shell = unsafe { std::ffi::CStr::from_ptr(pwd.pw_shell) };
+        return shell.to_str().ok().map(str::to_owned);
+    }
+}
+
+/// Cache of user name -> resolved home directory.  Same caching semantics as
+/// `USER_NAMES`: only definitive results are cached.
+static USER_HOMES: std::sync::LazyLock<Mutex<HashMap<String, Option<Vec<u8>>>>> =
+    std::sync::LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// Resolve the home directory for a user name via getpwnam_r.
+///
+/// Used for `~user` tilde expansion.  Results are cached because the lookup
+/// can hit slow NSS backends; only definitive results are cached so a
+/// transient directory-service failure can be retried later.
+pub(crate) fn get_user_home_dir(user: &str) -> Option<Vec<u8>> {
+    {
+        let cache = USER_HOMES.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(result) = cache.get(user) {
+            return result.clone();
+        }
+    }
+
+    let resolved = getpwnam_home_dir_uncached(user);
+    // Cache definitive results only: found homes and confirmed-absent users.
+    // Transient NSS failures stay uncached so a later lookup can succeed once
+    // the directory service recovers.  Caching misses also keeps repeated
+    // `~unknown-user` paths from re-running the lookup on every request.
+    if resolved.definitive {
+        let mut cache = USER_HOMES.lock().unwrap_or_else(|e| e.into_inner());
+        cache.insert(user.to_owned(), resolved.home.clone());
+    }
+    resolved.home
+}
+
+struct HomeLookup {
+    home: Option<Vec<u8>>,
+    /// True when the passwd database definitively answered, whether or not
+    /// the user exists.
+    definitive: bool,
+}
+
+fn getpwnam_home_dir_uncached(user: &str) -> HomeLookup {
+    let user_c = match std::ffi::CString::new(user) {
+        Ok(user_c) => user_c,
+        Err(_) => {
+            return HomeLookup {
+                home: None,
+                definitive: true,
+            };
+        }
+    };
+    let mut bufsize = sysconf_bufsize(libc::_SC_GETPW_R_SIZE_MAX, 1024);
+    loop {
+        let mut buf = vec![0u8; bufsize];
+        let mut pwd: libc::passwd = unsafe { std::mem::zeroed() };
+        let mut result_ptr: *mut libc::passwd = std::ptr::null_mut();
+        let ret = unsafe {
+            libc::getpwnam_r(
+                user_c.as_ptr(),
+                &mut pwd,
+                buf.as_mut_ptr() as *mut libc::c_char,
+                buf.len(),
+                &mut result_ptr,
+            )
+        };
+        if ret == libc::ERANGE && bufsize < MAX_NSS_BUFSIZE {
+            bufsize = bufsize.saturating_mul(2).min(MAX_NSS_BUFSIZE);
+            continue;
+        }
+        if ret != 0 {
+            // Backend unavailable or transient error: do not cache.
+            return HomeLookup {
+                home: None,
+                definitive: false,
+            };
+        }
+        if result_ptr.is_null() {
+            // Confirmed absent from all NSS databases.
+            return HomeLookup {
+                home: None,
+                definitive: true,
+            };
+        }
+        // Extract owned data while `buf` is still alive: the passwd strings
+        // point into it.  Keep raw bytes: home directories need not be UTF-8.
+        let dir = unsafe { std::ffi::CStr::from_ptr(pwd.pw_dir) };
+        return HomeLookup {
+            home: Some(dir.to_bytes().to_vec()),
+            definitive: true,
+        };
+    }
+}
+
 pub fn map_io_error(err: std::io::Error, path: &str) -> RpcError {
     use std::io::ErrorKind;
 
@@ -408,19 +531,11 @@ use std::path::PathBuf;
 
 /// Convert raw bytes to a PathBuf
 pub fn bytes_to_path(bytes: &[u8]) -> PathBuf {
-    let path = PathBuf::from(OsStr::from_bytes(bytes));
-    expand_tilde_path(&path)
-}
-
-/// Expand ~ to home directory in a PathBuf.
-/// Delegates to the canonical string-based `expand_tilde` in mod.rs.
-fn expand_tilde_path(path: &Path) -> PathBuf {
-    let s = path.to_string_lossy();
-    let expanded = super::expand_tilde(&s);
-    if expanded.as_str() != s.as_ref() {
-        PathBuf::from(expanded)
-    } else {
-        path.to_path_buf()
+    // Tilde expansion operates on the raw bytes so non-UTF-8 path components
+    // never pass through a lossy string conversion.
+    match super::expand_tilde_bytes(bytes) {
+        Some(expanded) => PathBuf::from(OsStr::from_bytes(&expanded)),
+        None => PathBuf::from(OsStr::from_bytes(bytes)),
     }
 }
 

@@ -7,7 +7,7 @@ pub mod io;
 pub mod process;
 
 use crate::msgpack_map;
-use crate::protocol::{Request, RequestId, Response, RpcError, from_value};
+use crate::protocol::{Request, Response, RpcError, from_value};
 use futures::{StreamExt, TryStreamExt};
 use rmpv::Value;
 
@@ -72,30 +72,11 @@ fn watcher_kind() -> &'static str {
 }
 
 /// Look up the current user's login shell from the passwd database.
-/// Uses getpwuid_r (reentrant) for thread safety, matching the pattern
-/// in file.rs for get_user_name/get_group_name.
+/// Delegates to file.rs's shared getpwuid_r lookup, which retries with a
+/// growing buffer on ERANGE so large NSS records (LDAP, SSSD) still resolve.
 fn login_shell() -> Option<String> {
     let uid = unsafe { libc::getuid() };
-    let mut buf = vec![0u8; 1024];
-    let mut pwd: libc::passwd = unsafe { std::mem::zeroed() };
-    let mut result_ptr: *mut libc::passwd = std::ptr::null_mut();
-
-    let ret = unsafe {
-        libc::getpwuid_r(
-            uid,
-            &mut pwd,
-            buf.as_mut_ptr() as *mut libc::c_char,
-            buf.len(),
-            &mut result_ptr,
-        )
-    };
-
-    if ret != 0 || result_ptr.is_null() {
-        return None;
-    }
-
-    let shell = unsafe { std::ffi::CStr::from_ptr(pwd.pw_shell) };
-    shell.to_str().ok().map(|s| s.to_string())
+    file::get_user_login_shell(uid)
 }
 
 use crate::protocol::IntoValue;
@@ -140,7 +121,7 @@ fn system_getenv(params: Value) -> HandlerResult {
 }
 
 /// Expand path with tilde and environment variables
-fn system_expand_path(params: Value) -> HandlerResult {
+async fn system_expand_path(params: Value) -> HandlerResult {
     #[derive(serde::Deserialize)]
     struct Params {
         path: String,
@@ -148,12 +129,16 @@ fn system_expand_path(params: Value) -> HandlerResult {
 
     let params: Params = from_value(params).map_err(|e| RpcError::invalid_params(e.to_string()))?;
 
-    let expanded = expand_tilde(&params.path);
+    // `~user` expansion consults the passwd database, which can block on
+    // slow NSS backends; keep it off the Tokio workers.
+    let expanded = tokio::task::spawn_blocking(move || expand_tilde(&params.path))
+        .await
+        .map_err(|e| RpcError::internal_error(format!("Task join error: {}", e)))?;
     Ok(expanded.into_value())
 }
 
 /// Get filesystem information (like df)
-fn system_statvfs(params: Value) -> HandlerResult {
+async fn system_statvfs(params: Value) -> HandlerResult {
     #[derive(serde::Deserialize)]
     struct Params {
         path: String,
@@ -161,8 +146,16 @@ fn system_statvfs(params: Value) -> HandlerResult {
 
     let params: Params = from_value(params).map_err(|e| RpcError::invalid_params(e.to_string()))?;
 
+    // Both `~user` expansion (passwd lookup) and the statvfs call block;
+    // run them off the Tokio workers.
+    tokio::task::spawn_blocking(move || statvfs_blocking(&params.path))
+        .await
+        .map_err(|e| RpcError::internal_error(format!("Task join error: {}", e)))?
+}
+
+fn statvfs_blocking(path: &str) -> HandlerResult {
     use std::ffi::CString;
-    let expanded = expand_tilde(&params.path);
+    let expanded = expand_tilde(path);
     let path_cstr =
         CString::new(expanded.as_str()).map_err(|_| RpcError::invalid_params("Invalid path"))?;
 
@@ -267,18 +260,50 @@ fn get_group_name(gid: libc::gid_t) -> Option<String> {
     file::get_group_name(gid)
 }
 
-/// Expand ~ to home directory
+/// Expand ~ to home directory.
+///
+/// Handles `~`, `~/...`, and `~user/...` (resolved via the passwd database).
+/// Upstream tramp-sh relies on the remote shell to expand these at every
+/// operation; this server has no shell, so path resolution must do it.
 pub(crate) fn expand_tilde(path: &str) -> String {
-    if path.starts_with("~/") {
-        if let Ok(home) = std::env::var("HOME") {
-            return format!("{}{}", home, &path[1..]);
-        }
-    } else if path == "~"
-        && let Ok(home) = std::env::var("HOME")
-    {
-        return home;
+    match expand_tilde_bytes(path.as_bytes()) {
+        Some(expanded) => String::from_utf8_lossy(&expanded).into_owned(),
+        None => path.to_string(),
     }
-    path.to_string()
+}
+
+/// Byte-level tilde expansion used by `bytes_to_path`, so non-UTF-8 paths
+/// never pass through a lossy string conversion.
+///
+/// Returns None when the path contains no expandable tilde prefix.
+pub(crate) fn expand_tilde_bytes(path: &[u8]) -> Option<Vec<u8>> {
+    // var_os keeps raw bytes: HOME need not be valid UTF-8.
+    if let Some(home) = std::env::var_os("HOME") {
+        let home = std::os::unix::ffi::OsStrExt::as_bytes(home.as_os_str());
+        if path == b"~" {
+            return Some(home.to_vec());
+        }
+        if let Some(rest) = path.strip_prefix(b"~/") {
+            let mut expanded = home.to_vec();
+            expanded.push(b'/');
+            expanded.extend_from_slice(rest);
+            return Some(expanded);
+        }
+    }
+
+    // `~user` or `~user/...`.  The user name must be valid UTF-8 to look up.
+    let rest = path.strip_prefix(b"~")?;
+    if rest.starts_with(b"/") || rest.is_empty() {
+        return None;
+    }
+    let (user, suffix) = match rest.iter().position(|&byte| byte == b'/') {
+        Some(slash) => (&rest[..slash], &rest[slash..]),
+        None => (rest, &b""[..]),
+    };
+    let user = std::str::from_utf8(user).ok()?;
+    let mut expanded = file::get_user_home_dir(user)?;
+    expanded.extend_from_slice(suffix);
+    Some(expanded)
 }
 
 fn validate_batch_response_size(
@@ -325,21 +350,12 @@ async fn batch_execute(params: Value) -> HandlerResult {
     }
 
     let results = bounded_batch_futures(batch_params.requests.into_iter().map(|req| async move {
-        // Create a fake Request to reuse dispatch logic.
-        let fake_request = Request {
-            version: "2.0".to_string(),
-            id: RequestId::Number(0), // Dummy ID, not used in batch
-            method: req.method,
-            params: req.params,
-        };
-
-        // Get the result by calling the handler directly (not full dispatch).
-        let response = dispatch_inner(fake_request).await;
-
-        // Convert Response to a result object.
-        let result = match (response.result, response.error) {
-            (Some(result), None) => msgpack_map! { "result" => result },
-            (None, Some(error)) => {
+        // Batch subrequests have no request id of their own; route them
+        // directly to the handlers instead of round-tripping through a
+        // synthetic Request/Response pair.
+        let result = match route(req.method, req.params).await {
+            Ok(value) => msgpack_map! { "result" => value },
+            Err(error) => {
                 let mut error_fields = vec![
                     (
                         Value::String("code".into()),
@@ -357,7 +373,6 @@ async fn batch_execute(params: Value) -> HandlerResult {
                     "error" => Value::Map(error_fields)
                 }
             }
-            _ => msgpack_map! { "result" => Value::Nil },
         };
         Ok::<Value, RpcError>(result)
     }))
@@ -387,14 +402,22 @@ async fn batch_execute(params: Value) -> HandlerResult {
     Ok(msgpack_map! { "results" => Value::Array(results) })
 }
 
-/// Inner dispatch that handles the actual method routing
-/// Used by both single requests and batch requests
+/// Dispatch a single request to its handler and wrap the outcome in a
+/// response for its request id.
 async fn dispatch_inner(request: Request) -> Response {
     let Request {
         id, method, params, ..
     } = request;
+    match route(method, params).await {
+        Ok(value) => Response::success(id, value),
+        Err(error) => Response::error(Some(id), error),
+    }
+}
 
-    let result = match method.as_str() {
+/// Route a method to its handler.  Shared by single requests and batch
+/// subrequests.
+async fn route(method: String, params: Value) -> HandlerResult {
+    match method.as_str() {
         // File metadata operations
         "file.stat" => file::stat(params).await,
         "file.truename" => file::truename(params).await,
@@ -438,8 +461,8 @@ async fn dispatch_inner(request: Request) -> Response {
         // System info
         "system.info" => system_info(),
         "system.getenv" => system_getenv(params),
-        "system.expand_path" => system_expand_path(params),
-        "system.statvfs" => system_statvfs(params),
+        "system.expand_path" => system_expand_path(params).await,
+        "system.statvfs" => system_statvfs(params).await,
         "system.groups" => system_groups(),
 
         // Parallel command execution and ancestor scanning
@@ -454,23 +477,52 @@ async fn dispatch_inner(request: Request) -> Response {
         }
 
         // Filesystem watch operations (for cache invalidation)
-        "watch.add" => crate::watcher::handle_add(params),
-        "watch.remove" => crate::watcher::handle_remove(params),
+        "watch.add" => crate::watcher::handle_add(params).await,
+        "watch.remove" => crate::watcher::handle_remove(params).await,
         "watch.list" => crate::watcher::handle_list(params),
 
         // Note: "batch" is NOT allowed in batch (no recursion)
         _ => Err(RpcError::method_not_found(&method)),
-    };
-
-    match result {
-        Ok(value) => Response::success(id, value),
-        Err(error) => Response::error(Some(id), error),
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn tilde_expands_home_and_user() {
+        let home = std::env::var("HOME").unwrap();
+        assert_eq!(expand_tilde("~"), home);
+        assert_eq!(expand_tilde("~/foo/bar"), format!("{home}/foo/bar"));
+        assert_eq!(expand_tilde("/tmp"), "/tmp");
+        assert_eq!(expand_tilde("~/"), format!("{home}/"));
+    }
+
+    #[test]
+    fn tilde_bytes_expand_without_lossy_conversion() {
+        let home = std::env::var("HOME").unwrap();
+        // A non-UTF-8 component must survive expansion untouched.
+        let path = b"~/\xff";
+        let expanded = expand_tilde_bytes(path).expect("~ path should expand");
+        let mut expected = home.into_bytes();
+        expected.push(b'/');
+        expected.push(0xff);
+        assert_eq!(expanded, expected);
+        assert_eq!(expand_tilde_bytes(b"/tmp/\xff"), None);
+    }
+
+    #[test]
+    fn tilde_user_expands_via_passwd_database() {
+        let name = "root";
+        let Some(expected) = file::get_user_home_dir(name) else {
+            return; // no root entry on this host; nothing to compare
+        };
+        let expected = String::from_utf8_lossy(&expected).into_owned();
+        assert_eq!(expand_tilde("~root"), expected);
+        assert_eq!(expand_tilde("~root/foo"), format!("{expected}/foo"));
+        assert!(!expand_tilde("~nonexistent-user-xyz").starts_with('/'));
+    }
 
     #[test]
     fn groups_retry_after_erange() {
@@ -636,7 +688,7 @@ mod tests {
         let result = msgpack_map! {
             "results" => Value::Array(vec![Value::Binary(vec![0; 64])]),
         };
-        let response = Response::success(RequestId::Number(99), result.clone());
+        let response = Response::success(crate::protocol::RequestId::Number(99), result.clone());
         let inner_size = rmp_serde::to_vec_named(&result).unwrap().len();
         let frame_size = rmp_serde::to_vec_named(&response).unwrap().len();
         assert!(frame_size > inner_size);
