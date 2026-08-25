@@ -508,32 +508,18 @@ async fn rename_no_overwrite_fallback(src: &Path, dest: &Path) -> std::io::Resul
 
 #[cfg(target_os = "linux")]
 async fn rename_no_overwrite(src: &Path, dest: &Path) -> std::io::Result<()> {
-    use std::ffi::CString;
-    use std::os::unix::ffi::OsStrExt;
+    use rustix::fs::{CWD, RenameFlags};
 
     let owned_src = src.to_owned();
     let owned_dest = dest.to_owned();
     let result = tokio::task::spawn_blocking(move || {
-        let src = CString::new(owned_src.as_os_str().as_bytes())?;
-        let dest = CString::new(owned_dest.as_os_str().as_bytes())?;
-        let result = unsafe {
-            libc::syscall(
-                libc::SYS_renameat2,
-                libc::AT_FDCWD,
-                src.as_ptr(),
-                libc::AT_FDCWD,
-                dest.as_ptr(),
-                libc::RENAME_NOREPLACE,
-            )
-        };
-        if result == 0 {
-            Ok(())
-        } else {
-            Err(std::io::Error::last_os_error())
-        }
+        rustix::fs::renameat_with(CWD, &owned_src, CWD, &owned_dest, RenameFlags::NOREPLACE)
     })
     .await
     .map_err(std::io::Error::other)?;
+
+    // Map rustix's Errno into a std io error so both match arms share one type.
+    let result = result.map_err(std::io::Error::from);
 
     match result {
         // Pre-3.15 kernels report ENOSYS, filesystems that do not implement
@@ -761,25 +747,13 @@ pub async fn chown(params: Value) -> HandlerResult {
     let uid = params.uid;
     let gid = params.gid;
 
-    // Use spawn_blocking for the libc syscall
+    // Use spawn_blocking for the chown syscall
     tokio::task::spawn_blocking(move || {
-        use std::os::unix::ffi::OsStrExt;
-        let path_bytes = path.as_os_str().as_bytes();
-        let mut path_cstr = path_bytes.to_vec();
-        path_cstr.push(0);
+        use nix::unistd::{Gid, Uid, chown};
 
-        let result = unsafe {
-            libc::chown(
-                path_cstr.as_ptr() as *const libc::c_char,
-                uid as libc::uid_t,
-                gid as libc::gid_t,
-            )
-        };
-
-        if result != 0 {
-            return Err(RpcError::io_error(std::io::Error::last_os_error()));
-        }
-        Ok(())
+        let owner = u32::try_from(uid).ok().map(Uid::from_raw);
+        let group = u32::try_from(gid).ok().map(Gid::from_raw);
+        chown(&path, owner, group).map_err(|error| RpcError::io_error(error.into()))
     })
     .await
     .map_err(|e| RpcError::internal_error(e.to_string()))??;
@@ -800,41 +774,24 @@ fn set_file_times_sync_path_io(
     mtime_nsec: i64,
     nofollow: bool,
 ) -> std::io::Result<()> {
-    use std::os::unix::ffi::OsStrExt;
+    use rustix::fs::{AtFlags, CWD, Timespec, Timestamps};
 
-    let path_bytes = path.as_os_str().as_bytes();
-    let mut path_cstr = path_bytes.to_vec();
-    path_cstr.push(0); // Null terminate
-
-    let times = [
-        libc::timespec {
-            tv_sec: atime as _,
-            tv_nsec: atime_nsec as _,
+    let times = Timestamps {
+        last_access: Timespec {
+            tv_sec: atime,
+            tv_nsec: atime_nsec,
         },
-        libc::timespec {
-            tv_sec: mtime as _,
-            tv_nsec: mtime_nsec as _,
+        last_modification: Timespec {
+            tv_sec: mtime,
+            tv_nsec: mtime_nsec,
         },
-    ];
-
-    let result = unsafe {
-        libc::utimensat(
-            libc::AT_FDCWD,
-            path_cstr.as_ptr() as *const libc::c_char,
-            times.as_ptr(),
-            if nofollow {
-                libc::AT_SYMLINK_NOFOLLOW
-            } else {
-                0
-            },
-        )
     };
-
-    if result != 0 {
-        return Err(std::io::Error::last_os_error());
-    }
-
-    Ok(())
+    let flags = if nofollow {
+        AtFlags::SYMLINK_NOFOLLOW
+    } else {
+        AtFlags::empty()
+    };
+    rustix::fs::utimensat(CWD, path, &times, flags).map_err(std::io::Error::from)
 }
 
 #[cfg(test)]

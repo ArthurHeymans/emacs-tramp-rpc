@@ -23,13 +23,16 @@ flate2 = "1.0"
 libc = "0.2"
 
 # For PTY support (term feature includes pty module)
-nix = { version = "0.31", features = ["term", "process", "signal", "fs"] }
+nix = { version = "0.31", features = ["term", "process", "signal", "fs", "user", "hostname"] }
 
 # For filesystem watching (inotify on Linux, kqueue on macOS)
 notify = "8.2"
 
 # For Git-aware recursive watch discovery.
 ignore = "0.4"
+
+# Safe syscall wrappers for renameat2/utimensat (no nix equivalents).
+rustix = { version = "1", features = ["std", "fs"] }
 
 [dev-dependencies]
 tempfile = "3"
