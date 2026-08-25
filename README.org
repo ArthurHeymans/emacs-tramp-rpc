@@ -143,6 +143,20 @@ On first connection, the server binary is automatically obtained and deployed:
 
 The binary is cached locally in =~/.emacs.d/tramp-rpc/= and deployed to =~/.cache/emacs/tramp-rpc/= on the remote host.
 
+** Multi-hop (~|~) file names
+
+TRAMP's ad-hoc multi-hop syntax works with the ~rpc~ method:
+
+- ~/rpc:user@host|sudo:root@host:/path~ stays RPC-accelerated: the RPC
+  server on =host= is started via sudo, so file operations run with
+  root privileges at full RPC speed.
+- Chains ending in shell-based methods such as ~su~ or ~docker~, e.g.
+  ~/rpc:host|su::/path~ or ~/rpc:host|docker:container:/path~, use
+  TRAMP's regular shell-based handler, which logs in through the rpc hop
+  as if it were ~ssh~.  The RPC server and its speedup are not used for
+  these chains.  RPC-to-RPC chains remain RPC-backed at the final target;
+  intermediate rpc hops provide SSH routing.
+
 ** Deployment Commands
 
 | Command                          | Description                    |

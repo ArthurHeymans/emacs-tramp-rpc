@@ -5557,9 +5557,10 @@ hop with \"Host name does not match\"."
     (should (member "%h" (flatten-tree login-args)))))
 
 (ert-deftest tramp-rpc-mock-test-compute-multi-hops-rpc-sudo-chain ()
-  "Test that `tramp-compute-multi-hops' accepts rpc as a proxy for sudo.
-The rpc method inherits all ssh connection parameters, so
-`tramp-maybe-open-connection' can process rpc hops using SSH."
+  "Test TRAMP's low-level multi-hop expansion for an rpc-to-sudo chain.
+Normal rpc-to-sudo paths are claimed by the tramp-rpc foreign handler.
+This test hides that handler to verify that rpc's inherited ssh parameters
+also satisfy `tramp-compute-multi-hops'."
   :tags '(:multi-hop)
   (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
   ;; Manually install the proxy entry that tramp-add-hops would create
