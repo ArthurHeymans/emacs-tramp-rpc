@@ -5,7 +5,6 @@
 ;; Author: Arthur Heymans <arthur@aheymans.xyz>
 ;; Assisted-by: various LLMs
 ;; Keywords: comm, processes
-;; Package-Requires: ((emacs "30.1"))
 
 ;; This file is part of tramp-rpc.
 
@@ -53,7 +52,7 @@ before deriving the project root."
 
 (defun tramp-rpc-deploy--default-source-directory ()
   "Return the default tramp-rpc source directory.
-This is usually the parent of the lisp directory.  Following source-file
+This is usually the parent of the Lisp directory.  Following source-file
 symlinks is important for straight.el/Doom builds: the loaded .elc lives in
 straight/build..., while the adjacent .el symlink points back to
 straight/repos..., which contains Cargo.toml and the Rust server sources."

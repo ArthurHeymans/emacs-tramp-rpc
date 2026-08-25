@@ -5,7 +5,6 @@
 ;; Author: Arthur Heymans <arthur@aheymans.xyz>
 ;; Assisted-by: various LLMs
 ;; Keywords: comm, processes
-;; Package-Requires: ((emacs "30.1") (msgpack "0.1.1"))
 
 ;; This file is part of tramp-rpc.
 
@@ -107,7 +106,8 @@ Returns a cons cell (ID . BYTES) for pipelining support."
     (cons id (tramp-rpc-protocol--length-prefix payload))))
 
 (defun tramp-rpc-protocol-decode-response (buffer start)
-  "Decode a MessagePack-RPC response or notification in BUFEER from START.
+  "Decode a MessagePack-RPC response or notification from BUFFER at START.
+START is the buffer position of the encoded object.
 Returns a plist with :id, :result, and :error keys for responses.
 For server-initiated notifications (no :id, has :method), returns a plist
 with :notification t, :method, and :params keys."

@@ -3,6 +3,7 @@
 ;; Copyright (C) 2026 Arthur Heymans <arthur@aheymans.xyz>
 
 ;; Author: Arthur Heymans <arthur@aheymans.xyz>
+;; URL: https://github.com/ArthurHeymans/tramp-rpc
 ;; Assisted-by: various LLMs
 ;; Version: 0.13.1
 ;; Keywords: comm, processes, files
@@ -37,7 +38,7 @@
 ;; Process filters, sentinels, and signals all work as expected.
 ;;
 ;; OPTIONAL CONFIGURATION:
-;; If you experience issues with diff-hl in dired, you can disable it:
+;; If you experience issues with diff-hl in Dired, you can disable it:
 ;;   (setq diff-hl-disable-on-remote t)
 ;;
 ;; AUTHENTICATION:
@@ -219,7 +220,7 @@ This is called from `tramp-multi-hop-p-hook'."
 ;; (tramp "2.8.1.4") but that is only enforced by package.el at install
 ;; time.  Guard at load time so that manual installations fail clearly.
 (when (version< tramp-version "2.8.1.4")
-  (error "tramp-rpc requires Tramp >= 2.8.1.4, but %s is loaded"
+  (error "Tramp RPC requires Tramp >= 2.8.1.4, but %s is loaded"
          tramp-version))
 
 ;; Give the rpc method all ssh connection parameters so it can serve
@@ -380,7 +381,8 @@ is VEC itself."
   (or (tramp-rpc--sudo-rpc-hop-vec vec) vec))
 
 (defun tramp-rpc--ssh-detail-user (vec &optional default)
-  "Return the SSH user for VEC, using sudo-via-RPC hop details."
+  "Return the SSH user for VEC, using sudo-via-RPC hop details.
+DEFAULT is the fallback value."
   (or (tramp-file-name-user (tramp-rpc--ssh-detail-vec vec)) default))
 
 (defun tramp-rpc--ssh-detail-port (vec)
@@ -424,7 +426,7 @@ shape before passing the value to `sudo -S'."
     (while (and (listp password) (plist-member password :secret))
       (setq password (plist-get password :secret))))
   (unless (stringp password)
-    (error "sudo password is not a string: %S" password))
+    (error "Sudo password is not a string: %S" password))
   password)
 
 (defun tramp-rpc--sudo-read-password (vec ssh-user)
@@ -824,7 +826,7 @@ FORCE-UNCOMPRESSED is passed to `tramp-rpc--file-read-params'."
                    ;; in this batch; `done' also prevents later batches.
                    (unless done
                      (when (tramp-rpc--batch-error-p result)
-                       (tramp-rpc--signal-batch-error
+                       (tramp-rpc--signal-batch-failure
                         "file.read" localname result))
                      (let ((content (tramp-rpc--extract-file-read-content result)))
                        (push content pieces)
@@ -885,7 +887,7 @@ Value is :available, :unavailable, or nil (unknown).")
 (defcustom tramp-rpc-use-direnv t
   "Whether to load direnv environment for remote processes.
 When enabled, runs `direnv export json` to get project-specific
-environment variables. Set to nil to disable for better performance."
+environment variables.  Set to nil to disable for better performance."
   :type 'boolean
   :group 'tramp-rpc)
 
@@ -1004,7 +1006,7 @@ Otherwise clear all entries."
 ;; later in the exec-path section).  The byte-compiler needs to see
 ;; these defvars before their first reference.
 (defvar tramp-rpc--exec-path-cache (make-hash-table :test 'equal)
-  "Cache of remote exec-path keyed by connection-key.")
+  "Cache of remote variable `exec-path' keyed by connection-key.")
 
 (defvar tramp-rpc--login-shell-cache (make-hash-table :test 'equal)
   "Cache of remote login shell keyed by connection-key.")
@@ -1180,7 +1182,10 @@ hop."
 (defun tramp-rpc--set-connection (vec process buffer &optional stderr-buffer)
   "Store the RPC connection for VEC.
 Caches keyed only by the TRAMP connection spelling are invalidated before a
-new generation is made visible."
+new generation is made visible.
+PROCESS is the RPC transport process.
+BUFFER receives the RPC response stream.
+STDERR-BUFFER receives the transport's standard error output."
   (tramp-rpc--clear-direnv-cache vec)
   (tramp-rpc--clear-file-caches-for-connection vec)
   (tramp-rpc-magit--clear-cache-for-connection vec)
@@ -1196,7 +1201,7 @@ new generation is made visible."
 
 (defun tramp-rpc--remove-connection (vec &optional process)
   "Remove VEC's connection, optionally only when PROCESS is current.
-Also clears the executable, exec-path, and login-shell caches."
+Also clears the executable, variable `exec-path', and login-shell caches."
   (let* ((key (tramp-rpc--connection-key vec))
          (current (gethash key tramp-rpc--connections)))
     (when (and current
@@ -1208,7 +1213,8 @@ Also clears the executable, exec-path, and login-shell caches."
       (remhash key tramp-rpc--login-shell-cache))))
 
 (defun tramp-rpc--connection-error-response (vec event)
-  "Return an RPC error response for a transport failure on VEC."
+  "Return an RPC error response for a transport failure on VEC.
+EVENT is the process event string."
   (list :error
         (list :code -32098
               :type 'remote-file-error
@@ -1243,7 +1249,8 @@ This is idempotent so it can run from every synchronous wait exit path."
   (tramp-rpc--maybe-clear-pending-response-state process buffer))
 
 (defmacro tramp-rpc--with-pending-requests (spec &rest body)
-  "Run BODY, releasing unresolved request IDS on every exit."
+  "Run BODY, releasing unresolved request IDS on every exit.
+SPEC is the connection specification."
   (declare (indent 1) (debug t))
   (let ((process (nth 0 spec))
         (buffer (nth 1 spec))
@@ -1257,7 +1264,9 @@ This is idempotent so it can run from every synchronous wait exit path."
 Sets cleanup bookkeeping on PROCESS and, when PROCESS is still the current
 connection for VEC, removes it so a replacement can take over.  Returns a plist
 capturing the connection state needed by the remaining cleanup, or nil when the
-generation was already claimed."
+generation was already claimed.
+EVENT is the process event string.
+REASON describes why the process ended."
   (when (and (processp process)
              (not (process-get process :tramp-rpc-cleanup-started)))
     (process-put process :tramp-rpc-cleanup-started t)
@@ -1286,7 +1295,8 @@ generation was already claimed."
 CLAIMED is the state plist returned by `tramp-rpc--claim-connection-generation'.
 REMOTE-CLEANUP requests termination before local relay deletion when PROCESS is
 still live.  When DEFER-CALLBACKS is non-nil, this returns
-\(ERROR-RESPONSE . CALLBACKS) instead of invoking the callbacks."
+\(ERROR-RESPONSE . CALLBACKS) instead of invoking the callbacks.
+EVENT is the process event string."
   (let* ((conn (plist-get claimed :conn))
          (generation-buffer (plist-get claimed :generation-buffer))
          (error-response (tramp-rpc--connection-error-response vec event))
@@ -1352,7 +1362,8 @@ non-nil, callback invocation is left to the caller and this returns
        process vec event claimed remote-cleanup defer-callbacks))))
 
 (defun tramp-rpc--connection-transport-death (process vec event)
-  "Clean up unexpected death of PROCESS generation for VEC."
+  "Clean up unexpected death of PROCESS generation for VEC.
+EVENT is the process event string."
   (tramp-rpc--cleanup-connection-generation
    process vec event :transport-death nil))
 
@@ -1428,7 +1439,8 @@ Used by `tramp-rpc--action-controlmaster-established'.")
 (defun tramp-rpc--action-controlmaster-established (proc _vec)
   "Succeed when the ControlMaster socket file appears, fail on process death.
 The target socket path is read from the dynamic variable
-`tramp-rpc--controlmaster-socket-path'."
+`tramp-rpc--controlmaster-socket-path'.
+PROC is the process being handled."
   (cond
    ((file-exists-p tramp-rpc--controlmaster-socket-path)
     (throw 'tramp-action 'ok))
@@ -2059,7 +2071,8 @@ Returns the result or signals an error."
 (defun tramp-rpc--call-fast (vec method params)
   "Call METHOD with PARAMS with shorter timeout for low-latency ops.
 Returns the result or signals an error.
-Uses 5s total timeout with 10ms polling."
+Uses 5s total timeout with 10ms polling.
+VEC is the TRAMP connection vector."
   (tramp-rpc--call-with-timeout vec method params 5 0.01))
 
 (defun tramp-rpc--find-response-by-id (expected-id &optional process)
@@ -2095,7 +2108,8 @@ and blocking SSH or the remote server."
     (while (accept-process-output stderr-process 0 nil t))))
 
 (defun tramp-rpc--connection-stderr-tail (conn &optional max-bytes)
-  "Return a diagnostic tail from CONN's stderr buffer, or nil."
+  "Return a diagnostic tail from CONN's stderr buffer, or nil.
+MAX-BYTES limits the number of bytes returned."
   (when-let* ((stderr-buffer (plist-get conn :stderr-buffer))
               ((buffer-live-p stderr-buffer)))
     (with-current-buffer stderr-buffer
@@ -2132,7 +2146,7 @@ connection's filter, and therefore no nested wait, can run inside BODY."
                                           &optional connection)
   "Call METHOD with PARAMS on the RPC server for VEC.
 TOTAL-TIMEOUT is maximum seconds to wait.
-POLL-INTERVAL is seconds between accept-process-output checks.
+POLL-INTERVAL is seconds between `accept-process-output' checks.
 CONNECTION, when non-nil, is the captured connection generation to use.
 Returns the result or signals an error."
   (let* ((conn (or connection (tramp-rpc--ensure-connection vec)))
@@ -2540,7 +2554,9 @@ Returns an alist with PATH as an explicit MessagePack bin value."
 ;; ============================================================================
 
 (defun tramp-rpc--mode-executable-p (mode-string remote-uid remote-gid attrs groups)
-  "Return non-nil when MODE-STRING permits the remote user to execute ATTRS."
+  "Return non-nil when MODE-STRING permits the remote user to execute ATTRS.
+REMOTE-UID is the remote user ID.
+REMOTE-GID is the remote group ID."
   (if (equal remote-uid tramp-root-id-integer)
       ;; Root may execute only when some execute bit is set.
       (or (memq (aref mode-string 3) '(?x ?s))
@@ -2562,7 +2578,8 @@ Returns an alist with PATH as an explicit MessagePack bin value."
 Checks execute permission from `file-attributes' mode string and
 the remote uid/gid.  No dedicated RPC call needed.
 For symlinks, follows through to the target (like
-`tramp-handle-file-readable-p' does)."
+`tramp-handle-file-readable-p' does).
+FILENAME is the file name being handled."
   (with-parsed-tramp-file-name (expand-file-name filename) nil
     (with-tramp-file-property v localname "file-executable-p"
       (when-let* ((attrs (file-attributes filename 'integer)))
@@ -2633,7 +2650,8 @@ Unlike `tramp-rpc--cache-get', this preserves cached nil values."
   "Like `file-exists-p' for TRAMP-RPC files.
 Uses TRAMP-RPC caches and Magit ancestor scan data before falling back to a
 single `file.stat' RPC.  This avoids latency-amplified marker scans from
-Projectile, project.el, and editorconfig during Magit section expansion."
+Projectile, project.el, and editorconfig during Magit section expansion.
+FILENAME is the file name being handled."
   (or
    ;; Preserve TRAMP's completion/root and non-essential fast paths, but avoid
    ;; `tramp-skeleton-file-exists-p' here: its generic symlink preflight adds a
@@ -2668,20 +2686,23 @@ Projectile, project.el, and editorconfig during Magit section expansion."
 (defun tramp-rpc-handle-file-readable-p (filename)
   "Like `file-readable-p' for TRAMP-RPC files.
 For cached-missing marker files, avoid delegating to TRAMP's generic handler,
-which would otherwise perform another remote stat."
+which would otherwise perform another remote stat.
+FILENAME is the file name being handled."
   (pcase (tramp-rpc-magit--file-exists-p filename)
     ('nil nil)
     (_ (tramp-handle-file-readable-p filename))))
 
 (defun tramp-rpc-handle-file-regular-p (filename)
-  "Like `file-regular-p' for TRAMP-RPC files."
+  "Like `file-regular-p' for TRAMP-RPC files.
+FILENAME is the file name being handled."
   (with-parsed-tramp-file-name (expand-file-name filename) nil
     (with-tramp-file-property v localname "file-regular-p"
       (when-let* ((stat (tramp-rpc--call-file-stat v localname)))
         (equal (alist-get 'type stat) "file")))))
 
 (defun tramp-rpc-handle-file-symlink-p (filename)
-  "Like `file-symlink-p' for TRAMP-RPC files."
+  "Like `file-symlink-p' for TRAMP-RPC files.
+FILENAME is the file name being handled."
   (with-parsed-tramp-file-name (expand-file-name filename) nil
     (when-let* ((stat (tramp-rpc--call-file-stat v localname t))
                 ((equal (alist-get 'type stat) "symlink"))
@@ -2693,7 +2714,9 @@ which would otherwise perform another remote stat."
         result))))
 
 (defun tramp-rpc-handle-access-file (filename string)
-  "Like `access-file' for TRAMP-RPC files."
+  "Like `access-file' for TRAMP-RPC files.
+FILENAME is the file name being checked.
+STRING is prepended to any resulting error message."
   (condition-case err
       (tramp-handle-access-file filename string)
     (file-error
@@ -2715,7 +2738,8 @@ which would otherwise perform another remote stat."
 (defun tramp-rpc-handle-file-truename (filename)
   "Like `file-truename' for TRAMP-RPC files.
 Resolves symlinks in the path.  For non-existing files, returns the
-path unchanged (after resolving any symlinks in parent directories)."
+path unchanged (after resolving any symlinks in parent directories).
+FILENAME is the file name being handled."
   (let* ((expanded (expand-file-name filename))
          (cached (and (not (eq remote-file-name-inhibit-cache t))
                       (tramp-rpc--cache-get tramp-rpc--file-truename-cache
@@ -2767,7 +2791,9 @@ path unchanged (after resolving any symlinks in parent directories)."
 
 
 (defun tramp-rpc-handle-file-attributes (filename &optional id-format)
-  "Like `file-attributes' for TRAMP-RPC files."
+  "Like `file-attributes' for TRAMP-RPC files.
+FILENAME is the file name being handled.
+ID-FORMAT controls how user and group IDs are represented."
   (with-parsed-tramp-file-name filename nil
     (with-tramp-file-property
         v localname (format "file-attributes-%s" id-format)
@@ -2795,7 +2821,8 @@ path unchanged (after resolving any symlinks in parent directories)."
 (defun tramp-rpc-handle-file-directory-p (filename)
   "Like `file-directory-p' for TRAMP-RPC files.
 Uses a single `file.stat' call instead of the generic TRAMP path
-which resolves truename and then stats."
+which resolves truename and then stats.
+FILENAME is the file name being handled."
   (or
    ;; Preserve TRAMP's completion-time fast path semantics.
    (tramp-string-empty-or-nil-p (tramp-file-local-name filename))
@@ -2806,7 +2833,7 @@ which resolves truename and then stats."
          (and stat (equal (alist-get 'type stat) "directory")))))))
 
 (defun tramp-rpc--convert-file-attributes (stat id-format)
-  "Convert STAT result to Emacs file-attributes format.
+  "Convert STAT result to Emacs `file-attributes' format.
 ID-FORMAT specifies whether to use numeric or string IDs."
   (let* ((type-str (alist-get 'type stat))
          (type (pcase type-str
@@ -2868,14 +2895,19 @@ errors instead of probing first."
                (signal (car err) (cdr err)))))))
 
 (defun tramp-rpc-handle-set-file-modes (filename mode &optional _flag)
-  "Like `set-file-modes' for TRAMP-RPC files."
+  "Like `set-file-modes' for TRAMP-RPC files.
+FILENAME is the file name being handled.
+MODE is the requested file mode."
   (tramp-rpc--with-set-file-attributes-rpc filename
     (tramp-rpc--call v "file.set_modes"
                      (append (tramp-rpc--encode-path localname)
                              `((mode . ,mode))))))
 
 (defun tramp-rpc-handle-set-file-times (filename &optional timestamp flag)
-  "Like `set-file-times' for TRAMP-RPC files."
+  "Like `set-file-times' for TRAMP-RPC files.
+FILENAME is the file name being handled.
+TIMESTAMP is the requested access and modification time, or nil for now.
+FLAG equal to `nofollow' prevents following a symbolic link."
   (tramp-rpc--with-set-file-attributes-rpc filename
     (let* ((mtime (floor (float-time (or timestamp (current-time)))))
            (tramp-name (tramp-make-tramp-file-name v localname))
@@ -2951,7 +2983,8 @@ that `locate-dominating-stop-dir-regexp' is expected to match."
 
 (defun tramp-rpc-handle-dir-locals--all-files (directory &optional base-el-only)
   "Like `dir-locals--all-files' for TRAMP-RPC files.
-Return readable dir-locals files in DIRECTORY in increasing priority order."
+Return readable dir-locals files in DIRECTORY in increasing priority order.
+BASE-EL-ONLY non-nil excludes the secondary `-2.el' file."
   (with-parsed-tramp-file-name (expand-file-name directory) nil
     ;; Unquote file names (e.g. /: prefix) before sending to server.
     (let* ((quoted-localname localname)
@@ -2972,7 +3005,8 @@ Return readable dir-locals files in DIRECTORY in increasing priority order."
 (defun tramp-rpc-handle-locate-dominating-file (file name)
   "Like `locate-dominating-file' for TRAMP-RPC files.
 For string/list NAME, uses a high-level RPC call.  Predicate NAME falls back
-to the built-in implementation."
+to the built-in implementation.
+FILE is the file name being handled."
   (if (functionp name)
       (tramp-run-real-handler #'locate-dominating-file (list file name))
     (with-parsed-tramp-file-name (expand-file-name file) nil
@@ -3036,7 +3070,8 @@ This is a lexical path check: the directories can be remote or not yet exist."
         (string-prefix-p locals cache))))
 
 (defun tramp-rpc-handle-dir-locals-find-file (file)
-  "Like `dir-locals-find-file' for TRAMP-RPC files."
+  "Like `dir-locals-find-file' for TRAMP-RPC files.
+FILE is the file name being handled."
   (let* ((file (expand-file-name file))
          (file-connection (file-remote-p file))
          (cache-update (tramp-rpc--dir-locals-cache-update file dir-locals-directory-cache))
@@ -3093,7 +3128,12 @@ Use the server's `dir.list' result directly instead of the generic
 TRAMP skeleton.  The skeleton first checks `file-exists-p' and
 `file-directory-p', which costs extra network round-trips on high-latency
 links.  `dir.list' already reports missing or non-directory paths as errors,
-so a single RPC can both validate and list the directory."
+so a single RPC can both validate and list the directory.
+DIRECTORY is the directory being handled.
+FULL non-nil returns names prefixed with DIRECTORY.
+MATCH, when non-nil, is a regexp matched against each relative file name.
+NOSORT non-nil preserves the server's directory order.
+COUNT limits the number of returned entries."
   (let* ((directory (file-name-as-directory (expand-file-name directory)))
          result)
     (with-parsed-tramp-file-name directory nil
@@ -3117,7 +3157,13 @@ so a single RPC can both validate and list the directory."
 
 (defun tramp-rpc-handle-directory-files-and-attributes
     (directory &optional full match nosort id-format count)
-  "Like `directory-files-and-attributes' for TRAMP-RPC files."
+  "Like `directory-files-and-attributes' for TRAMP-RPC files.
+DIRECTORY is the directory being handled.
+FULL non-nil returns names prefixed with DIRECTORY.
+MATCH, when non-nil, is a regexp matched against each relative file name.
+NOSORT non-nil preserves the server's directory order.
+ID-FORMAT controls how user and group IDs are represented.
+COUNT limits the number of returned entries."
   (with-parsed-tramp-file-name (expand-file-name directory) nil
     (let* ((result (tramp-rpc--call v "dir.list"
                                     (append (tramp-rpc--encode-path localname)
@@ -3145,7 +3191,7 @@ so a single RPC can both validate and list the directory."
         (setq entries (sort entries (lambda (a b) (string< (car a) (car b))))))
       (tramp-rpc--apply-directory-count entries count))))
 
-;; Declared in ls-lisp.el; dynamically rebound for rpc dired formatting.
+;; Declared in ls-lisp.el; dynamically rebound for RPC Dired formatting.
 (defvar ls-lisp-format-time-list)
 (defvar ls-lisp-use-localized-time-format)
 ;; Declared in Tramp 2.8.1.3+; forward-declare so byte compiler treats it as dynamic.
@@ -3154,8 +3200,12 @@ so a single RPC can both validate and list the directory."
 (defun tramp-rpc-handle-insert-directory
     (filename switches &optional wildcard full-directory-p)
   "Like `insert-directory' for TRAMP-RPC files.
-Use `ls-lisp' via TRAMP, but force GNU ls-like date strings so rpc dired
-matches ssh dired output style."
+Use `ls-lisp' via TRAMP, but force GNU ls-like date strings so RPC Dired
+matches SSH Dired output style.
+FILENAME is the file name being handled.
+SWITCHES contains the Dired listing switches.
+WILDCARD non-nil means to treat FILENAME as a shell wildcard.
+FULL-DIRECTORY-P non-nil requests a full listing of FILENAME as a directory."
   ;; `ls-lisp-format-time-list' is honored only for the C/POSIX locale unless
   ;; `ls-lisp-use-localized-time-format' is non-nil; force it so the GNU-style
   ;; format applies regardless of the local locale.
@@ -3165,7 +3215,9 @@ matches ssh dired output style."
      filename switches wildcard full-directory-p)))
 
 (defun tramp-rpc-handle-file-name-all-completions (filename directory)
-  "Like `file-name-all-completions' for TRAMP-RPC files."
+  "Like `file-name-all-completions' for TRAMP-RPC files.
+FILENAME is the file name being handled.
+DIRECTORY is the directory being handled."
   ;; Suppress check for trailing slash in `tramp-skeleton-file-name-all-completions'.
   (let (tramp-fnac-add-trailing-slash)
     (tramp-skeleton-file-name-all-completions filename directory
@@ -3224,7 +3276,9 @@ Delegate parent creation to the server instead of using
 `tramp-skeleton-make-directory'.  The generic skeleton probes each path
 component with separate `file-exists-p' / `file-directory-p' calls before the
 actual mkdir.  Server-side `create_dir_all' performs the same validation in one
-network round-trip."
+network round-trip.
+DIR is the directory being handled.
+PARENTS non-nil creates missing parent directories."
   (let ((dir (directory-file-name (expand-file-name dir))))
     (with-parsed-tramp-file-name dir nil
       (let ((created
@@ -3238,7 +3292,10 @@ network round-trip."
         (and parents (not created))))))
 
 (defun tramp-rpc-handle-delete-directory (directory &optional recursive trash)
-  "Like `delete-directory' for TRAMP-RPC files."
+  "Like `delete-directory' for TRAMP-RPC files.
+DIRECTORY is the directory being handled.
+RECURSIVE non-nil removes directory contents recursively.
+TRASH non-nil requests moving the directory to the trash."
   ;; Follow TRAMP's skeleton semantics for TRASH.  Callers that want
   ;; direct deletion can bind
   ;; `remote-file-name-inhibit-delete-by-moving-to-trash'.
@@ -3256,7 +3313,16 @@ network round-trip."
 
 (defun tramp-rpc-handle-write-region
     (start end filename &optional append visit lockname mustbenew)
-  "Like `write-region' for TRAMP-RPC files."
+  "Like `write-region' for TRAMP-RPC files.
+START and END normally delimit the buffer region to write.  A nil START
+means the whole buffer, while a string START is written directly; END is
+ignored in both cases.
+FILENAME is the destination file name.
+APPEND non-nil appends; an integer APPEND writes at that file offset.
+VISIT t marks the buffer as visiting FILENAME, while a string marks it as
+visiting that file; other non-nil values suppress the \"Wrote file\" message.
+LOCKNAME overrides the file name used for locking.
+MUSTBENEW requests an overwrite check; `excl' rejects an existing file."
   (tramp-skeleton-write-region
       start end filename append visit lockname mustbenew
     ;; If START is a string, write it directly; otherwise extract from buffer.
@@ -3320,7 +3386,8 @@ network round-trip."
 
 (defun tramp-rpc--signal-rpc-error
     (operation message code os-errno &optional filename data)
-  "Signal RPC error CODE/OS-ERRNO and optional structured DATA for OPERATION."
+  "Signal RPC error CODE/OS-ERRNO and optional structured DATA for OPERATION.
+MESSAGE describes the error."
   (cond
    ((= code tramp-rpc-protocol-error-file-not-found)
     (signal 'file-missing
@@ -3361,7 +3428,7 @@ network round-trip."
     (signal 'remote-file-error
             (tramp-rpc--error-args operation nil message filename data)))))
 
-(defun tramp-rpc--signal-batch-error (operation filename error)
+(defun tramp-rpc--signal-batch-failure (operation filename error)
   "Signal ERROR returned by a batched RPC for OPERATION on FILENAME."
   (tramp-rpc--signal-rpc-error
    operation
@@ -3372,14 +3439,18 @@ network round-trip."
    (plist-get error :data)))
 
 (defun tramp-rpc--batch-result-or-signal (operation filename result)
-  "Return batched RESULT, or signal its embedded error for FILENAME."
+  "Return batched RESULT, or signal its embedded error for FILENAME.
+OPERATION names the attempted operation."
   (if (tramp-rpc--batch-error-p result)
-      (tramp-rpc--signal-batch-error operation filename result)
+      (tramp-rpc--signal-batch-failure operation filename result)
     result))
 
 (cl-defun tramp-rpc--copy-file-same-remote
     (filename newname ok-if-already-exists keep-time preserve-permissions)
-  "Copy FILENAME to NEWNAME on one TRAMP-RPC remote with fewer round-trips."
+  "Copy FILENAME to NEWNAME on one TRAMP-RPC remote with fewer round-trips.
+OK-IF-ALREADY-EXISTS controls existing-destination handling.
+KEEP-TIME non-nil preserves timestamps.
+PRESERVE-PERMISSIONS non-nil preserves file permissions."
   (with-parsed-tramp-file-name filename v1
     (with-parsed-tramp-file-name newname v2
       (let* ((stats (tramp-rpc--call-batch
@@ -3439,7 +3510,12 @@ For same-remote directory copies, use the server-side recursive `file.copy'
 operation.  That keeps the number of RPC round-trips constant instead of
 walking the tree from Emacs and issuing one RPC per entry.  Lisp computes the
 Emacs/TRAMP destination and policy details; the server only receives primitive
-copy options.  Fall back to the generic TRAMP handler for cross-remote copies."
+copy options.  Fall back to the generic TRAMP handler for cross-remote copies.
+DIRNAME is the directory name being handled.
+NEWNAME is the destination file name.
+KEEP-DATE non-nil preserves timestamps.
+PARENTS non-nil creates missing parent directories.
+COPY-CONTENTS non-nil copies directory contents."
   (setq dirname (expand-file-name dirname)
         newname (expand-file-name newname))
   (if (and (not keep-date)
@@ -3594,7 +3670,13 @@ copy options.  Fall back to the generic TRAMP handler for cross-remote copies."
 (cl-defun tramp-rpc-handle-copy-file
     (filename newname &optional ok-if-already-exists keep-time
               preserve-uid-gid preserve-permissions)
-  "Like `copy-file' for TRAMP-RPC files."
+  "Like `copy-file' for TRAMP-RPC files.
+FILENAME is the file name being handled.
+NEWNAME is the destination file name.
+OK-IF-ALREADY-EXISTS controls existing-destination handling.
+KEEP-TIME non-nil preserves timestamps.
+PRESERVE-UID-GID requests ownership preservation on generic fallback paths.
+PRESERVE-PERMISSIONS non-nil preserves file permissions."
   (setq filename (expand-file-name filename)
         newname (expand-file-name newname))
   ;; Fast path for same-remote copies: batch source/destination stats, then do
@@ -3698,7 +3780,8 @@ copy options.  Fall back to the generic TRAMP handler for cross-remote copies."
 
 (cl-defun tramp-rpc--rename-file-same-remote
     (filename newname ok-if-already-exists)
-  "Rename FILENAME to NEWNAME on one TRAMP-RPC remote with fewer round-trips."
+  "Rename FILENAME to NEWNAME on one TRAMP-RPC remote with fewer round-trips.
+OK-IF-ALREADY-EXISTS controls existing-destination handling."
   (with-parsed-tramp-file-name filename v1
     (with-parsed-tramp-file-name newname v2
       (let* ((stats (tramp-rpc--call-batch
@@ -3707,8 +3790,10 @@ copy options.  Fall back to the generic TRAMP handler for cross-remote copies."
                                                 '((lstat . t))))
                        ("file.stat" . ,(append (tramp-rpc--encode-path v2-localname)
                                                 '((lstat . t)))))))
-             (source-stat (nth 0 stats))
-             (dest-stat (nth 1 stats))
+             (source-stat (tramp-rpc--batch-result-or-signal
+                           "file.stat" filename (nth 0 stats)))
+             (dest-stat (tramp-rpc--batch-result-or-signal
+                         "file.stat" newname (nth 1 stats)))
              (source-type (tramp-rpc--stat-type source-stat))
              (dest-type (tramp-rpc--stat-type dest-stat)))
         (when dest-stat
@@ -3743,7 +3828,10 @@ copy options.  Fall back to the generic TRAMP handler for cross-remote copies."
           (tramp-rpc--invalidate-cache-for-path newname))))))
 
 (cl-defun tramp-rpc-handle-rename-file (filename newname &optional ok-if-already-exists)
-  "Like `rename-file' for TRAMP-RPC files."
+  "Like `rename-file' for TRAMP-RPC files.
+FILENAME is the file name being handled.
+NEWNAME is the destination file name.
+OK-IF-ALREADY-EXISTS controls existing-destination handling."
   (setq filename (expand-file-name filename)
         newname (expand-file-name newname))
   ;; Fast path for same-remote renames: one batched preflight plus the rename.
@@ -3807,7 +3895,9 @@ copy options.  Fall back to the generic TRAMP handler for cross-remote copies."
 (defun tramp-rpc-handle-delete-file (filename &optional trash)
   "Like `delete-file' for TRAMP-RPC files.
 Calls `file.delete' directly.  Current Emacs `delete-file' treats missing files
-as a no-op, so ignore the server's ENOENT mapping as well."
+as a no-op, so ignore the server's ENOENT mapping as well.
+FILENAME is the file name being handled.
+TRASH non-nil requests moving the file to the trash."
   (tramp-skeleton-delete-file filename trash
     (condition-case err
         (tramp-rpc--call v "file.delete" (tramp-rpc--encode-path localname))
@@ -3927,7 +4017,7 @@ as a no-op, so ignore the server's ENOENT mapping as well."
                                ;; limit since dir.list supplied its size.
                                (tramp-rpc--read-file-bytes vec path nil nil t)
                              (when (tramp-rpc--batch-error-p result)
-                               (tramp-rpc--signal-batch-error
+                               (tramp-rpc--signal-batch-failure
                                 "file.read" path result))
                              (tramp-rpc--extract-file-read-content result))))
                      (tramp-rpc--write-local-trash-file
@@ -4001,7 +4091,8 @@ name handler."
   "Like `move-file-to-trash' for TRAMP-RPC files.
 Optimize the common `trash-directory' case where a remote file is moved to a
 local trash directory.  Unsupported trash modes fall back to Emacs' real
-implementation, which will use the normal TRAMP-RPC file handlers underneath."
+implementation, which will use the normal TRAMP-RPC file handlers underneath.
+FILENAME is the file name being handled."
   (if-let* ((dest (tramp-rpc--local-trash-destination filename)))
       (with-parsed-tramp-file-name (directory-file-name (expand-file-name filename)) nil
         (let ((stat (tramp-rpc--call-file-stat v localname t)))
@@ -4035,7 +4126,10 @@ implementation, which will use the normal TRAMP-RPC file handlers underneath."
 
 (defun tramp-rpc-handle-make-symbolic-link
     (target linkname &optional ok-if-already-exists)
-  "Like `make-symbolic-link' for TRAMP-RPC files."
+  "Like `make-symbolic-link' for TRAMP-RPC files.
+TARGET is the link target.
+LINKNAME is the name of the link to create.
+OK-IF-ALREADY-EXISTS non-nil permits an existing destination."
   (prog1
       (tramp-skeleton-make-symbolic-link target linkname ok-if-already-exists
         (let ((target-path (file-name-unquote target)))
@@ -4110,7 +4204,8 @@ containing FILENAME."
 
 (defun tramp-rpc-handle-get-remote-groups (vec id-format)
   "Return remote groups using RPC.
-ID-FORMAT specifies whether to return integer GIDs or string names."
+ID-FORMAT specifies whether to return integer GIDs or string names.
+VEC is the TRAMP connection vector."
   (condition-case nil
       (let ((result (tramp-rpc--call vec "system.groups" nil)))
         (mapcar (lambda (g)
@@ -4188,7 +4283,8 @@ Returns t on success, nil on failure."
 
 (defun tramp-rpc-handle-file-selinux-context (filename)
   "Like `file-selinux-context' for TRAMP-RPC files.
-Returns a list of (USER ROLE TYPE RANGE), or (nil nil nil nil) if not available."
+Returns a list of (USER ROLE TYPE RANGE), or (nil nil nil nil) if not available.
+FILENAME is the file name being handled."
   (with-parsed-tramp-file-name (expand-file-name (file-name-unquote filename)) nil
     (let ((context '(nil nil nil nil)))
       (when (tramp-rpc--selinux-enabled-p v)
@@ -4239,7 +4335,8 @@ Returns t on success, nil on failure."
 ;; ============================================================================
 
 (defun tramp-rpc-handle-dired-compress-file (file)
-  "Like `dired-compress-file' for TRAMP-RPC files."
+  "Like `dired-compress-file' for TRAMP-RPC files.
+FILE is the file name being handled."
   (tramp-run-real-handler #'dired-compress-file (list file)))
 
 ;; ============================================================================
@@ -4282,7 +4379,7 @@ because all commands are sent in a single network round-trip."
               results))))
 
 (defun tramp-rpc--route-process-file-output (destination stdout &optional stderr)
-  "Route process-file STDOUT and STDERR according to DESTINATION.
+  "Route `process-file' STDOUT and STDERR according to DESTINATION.
 DESTINATION follows the `process-file' convention:
   nil       - discard
   t         - insert into current buffer
@@ -4360,7 +4457,11 @@ signal numbers to human-readable strings like \"Interrupt\" or
   "Like `process-file' for TRAMP-RPC files.
 Resolves PROGRAM path and loads direnv environment from working directory.
 When `tramp-rpc-magit--process-caches' is populated (during magit
-refresh), git commands are served from the prefetch cache when possible."
+refresh), git commands are served from the prefetch cache when possible.
+INFILE is the input file name.
+DESTINATION controls where standard output and error are sent, as for
+`process-file'.
+ARGS contains the original function arguments."
   (with-parsed-tramp-file-name default-directory nil
     ;; Unquote localname in case of file-name-quoted paths (e.g. /: prefix).
     (setq localname (file-name-unquote localname))
@@ -4461,7 +4562,8 @@ Since tramp-rpc supports `process-file', VC backends can run their
 commands (git, svn, hg) directly via RPC.
 
 We set `default-directory' to the file's directory to ensure that
-process-file calls from VC backends are routed through our tramp handler."
+`process-file' calls from VC backends are routed through our tramp handler.
+FILE is the file name being handled."
   (when vc-handled-backends
     (with-parsed-tramp-file-name file nil
       ;; Set default-directory to the file's remote directory so that
@@ -4475,7 +4577,7 @@ process-file calls from VC backends are routed through our tramp handler."
 ;; ============================================================================
 
 (defun tramp-rpc-handle-exec-path ()
-  "Return remote exec-path using RPC.
+  "Return remote variable `exec-path' using RPC.
 Uses `tramp-remote-path' by default, including its standard placeholders
 `tramp-default-remote-path' and `tramp-own-remote-path'.  A non-nil
 `tramp-rpc-remote-path' overrides it for backward compatibility.
@@ -4534,7 +4636,7 @@ Connection-local values are honored, matching `tramp-get-remote-path'."
     (error '("/bin" "/usr/bin"))))
 
 (defun tramp-rpc--compute-remote-path (vec)
-  "Compute remote exec-path for VEC from `tramp-remote-path'.
+  "Compute remote variable `exec-path' for VEC from `tramp-remote-path'.
 A non-nil deprecated `tramp-rpc-remote-path' overrides
 `tramp-remote-path'.  Supports the standard TRAMP placeholders
 `tramp-default-remote-path' and `tramp-own-remote-path'.  The old
@@ -4642,7 +4744,11 @@ actual PATH line, matching the robustness of upstream TRAMP."
   "Like `insert-file-contents' for TRAMP-RPC files.
 Reads directly through `file.read' instead of going through
 `file-local-copy', avoiding the generic TRAMP temp-file path and its extra
-round-trips for the common non-VISIT case."
+round-trips for the common non-VISIT case.
+FILENAME is the file name being handled.
+VISIT controls whether Emacs visits the destination.
+BEG and END are source-file byte offsets delimiting the data to insert.
+REPLACE non-nil replaces the accessible buffer contents."
   (barf-if-buffer-read-only)
   (setq filename (expand-file-name filename))
   (if (or visit replace)
@@ -4756,7 +4862,9 @@ Signals an error rather than returning nil, so that
               (nth 5 fields))))))))
 
 (defun tramp-rpc-handle-get-remote-uid (vec id-format)
-  "Return remote UID using RPC."
+  "Return remote UID using RPC.
+VEC is the TRAMP connection vector.
+ID-FORMAT controls whether the UID is returned as an integer or string."
   (let* ((result (tramp-rpc--system-info vec))
          (uid (alist-get 'uid result)))
     (if (eq id-format 'integer)
@@ -4764,7 +4872,9 @@ Signals an error rather than returning nil, so that
       (number-to-string uid))))
 
 (defun tramp-rpc-handle-get-remote-gid (vec id-format)
-  "Return remote GID using RPC."
+  "Return remote GID using RPC.
+VEC is the TRAMP connection vector.
+ID-FORMAT controls whether the GID is returned as an integer or string."
   (let* ((result (tramp-rpc--system-info vec))
          (gid (alist-get 'gid result)))
     (if (eq id-format 'integer)
@@ -4804,7 +4914,9 @@ so the path is returned with the tilde unexpanded rather than
 signalling an error.
 `tramp-verbose' is suppressed during the first attempt because
 `tramp-error' logs a level-1 message before signalling, which
-would otherwise flood the echo area with \"Cannot expand tilde\"."
+would otherwise flood the echo area with \"Cannot expand tilde\".
+NAME identifies the connection.
+DIR is the directory being handled."
   ;; The generic `tramp-handle-expand-file-name' defaults non-absolute
   ;; localnames to "/" (root), but the ssh handler
   ;; (`tramp-sh-handle-expand-file-name') defaults to "~/" instead.
@@ -4883,7 +4995,9 @@ Keys are the same connection/path keys as `tramp-rpc--watched-directories'.")
       (file-notify-rm-watch descriptor))))
 
 (defun tramp-rpc--make-file-notify-descriptor (vec _directory localname)
-  "Create a TRAMP-style process descriptor for a file notification watch."
+  "Create a TRAMP-style process descriptor for a file notification watch.
+VEC is the TRAMP connection vector.
+LOCALNAME is the local file name."
   (let* (;; Emacs' remote file notification tests use the process name to
          ;; identify the remote library.  The concrete backend is exposed via
          ;; the "file-monitor" connection property below.
@@ -5102,7 +5216,8 @@ watch directory stored in `file-notify-descriptors'.  Passing an
 already expanded TRAMP name can therefore produce doubled remote
 prefixes on some TRAMP versions.  Prefer the name relative to the
 original watched directory, falling back to the original spelling when
-we cannot derive one."
+we cannot derive one.
+DATA is the payload to send."
   (let* ((display-file-name
           (tramp-rpc--file-notify-original-spelling data file-name))
          (directory (plist-get data :directory))
@@ -5188,7 +5303,8 @@ FILE-NAME1 is the destination for `renamed' events.  COOKIE pairs
 
 (defun tramp-rpc-handle-file-notify-add-watch (directory flags _callback)
   "Like `file-notify-add-watch' for TRAMP-RPC files.
-DIRECTORY is the remote directory passed by `file-notify-add-watch'."
+DIRECTORY is the remote directory passed by `file-notify-add-watch'.
+FLAGS controls the requested operation."
   ;; `file-notify-add-watch' validates FLAGS and CALLBACK before invoking file
   ;; name handlers, and stores the callback in `file-notify-descriptors' after
   ;; this handler returns.  We only need to create a distinct descriptor and
@@ -5548,7 +5664,7 @@ connection buffer killed, TRAMP caches flushed).
 Handles RPC-specific state: the connection hash table, async/PTY
 processes, file watches, ControlMaster process/socket, pending RPC
 responses, and RPC-specific caches (direnv, executable, file-exists,
-file-truename)."
+`file-truename')."
   (when (tramp-rpc--managed-file-name-p vec)
     ;; Save buffer reference before disconnect removes the connection
     ;; entry.  The buffer is already killed by TRAMP's generic cleanup,
