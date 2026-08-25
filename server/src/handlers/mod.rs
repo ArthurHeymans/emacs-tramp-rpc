@@ -173,19 +173,84 @@ fn statvfs_blocking(path: &str) -> HandlerResult {
     })
 }
 
+/// Apple targets where nix does not expose `getgroups` (membership lives in
+/// opendirectoryd, so nix declines to wrap the raw call there).
+#[cfg(any(
+    target_os = "macos",
+    target_os = "ios",
+    target_os = "tvos",
+    target_os = "watchos",
+    target_os = "visionos"
+))]
+fn current_groups() -> std::io::Result<Vec<libc::gid_t>> {
+    let count = unsafe { libc::getgroups(0, std::ptr::null_mut()) };
+    if count < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+
+    // Group membership can change after the sizing call; retry with a larger
+    // buffer instead of relying on a fixed supplementary limit.
+    let mut count = count as usize;
+    loop {
+        let mut groups = vec![0; count];
+        let actual_count =
+            unsafe { libc::getgroups(groups.len() as libc::c_int, groups.as_mut_ptr()) };
+        if actual_count < 0 {
+            let error = std::io::Error::last_os_error();
+            if matches!(
+                error.raw_os_error(),
+                Some(libc::EINVAL) | Some(libc::ERANGE)
+            ) {
+                count = count.saturating_mul(2).max(1);
+                continue;
+            }
+            return Err(error);
+        }
+        groups.truncate(actual_count as usize);
+        return Ok(groups);
+    }
+}
+
 /// Get groups for the current user
 fn system_groups() -> HandlerResult {
+    #[cfg(not(any(
+        target_os = "macos",
+        target_os = "ios",
+        target_os = "tvos",
+        target_os = "watchos",
+        target_os = "visionos"
+    )))]
     use nix::unistd::{Gid, getgroups};
 
+    #[cfg(any(
+        target_os = "macos",
+        target_os = "ios",
+        target_os = "tvos",
+        target_os = "watchos",
+        target_os = "visionos"
+    ))]
+    // Raw libc fallback: nix does not expose `getgroups` on Apple platforms.
+    let gids = current_groups().map_err(RpcError::io_error)?;
+
+    #[cfg(not(any(
+        target_os = "macos",
+        target_os = "ios",
+        target_os = "tvos",
+        target_os = "watchos",
+        target_os = "visionos"
+    )))]
     // nix sizes the buffer internally and retries when group membership
     // changes between the sizing and retrieval calls.
-    let groups = getgroups().map_err(|error| RpcError::io_error(error.into()))?;
+    let gids: Vec<_> = getgroups()
+        .map_err(|error| RpcError::io_error(error.into()))?
+        .iter()
+        .map(|&gid| Gid::as_raw(gid))
+        .collect();
 
     // Convert to group info with names
-    let group_info: Vec<Value> = groups
+    let group_info: Vec<Value> = gids
         .iter()
         .map(|&gid| {
-            let gid = Gid::as_raw(gid);
             let gname = get_group_name(gid);
             msgpack_map! {
                 "gid" => gid,
