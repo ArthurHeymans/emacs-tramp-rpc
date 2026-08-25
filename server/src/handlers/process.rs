@@ -934,8 +934,82 @@ fn signal_pty_process_group(pid: u32, signal: i32, action: &str) -> Result<(), R
     }
 }
 
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum SignalCode {
+    Number(i32),
+    Name(String),
+}
+
+impl SignalCode {
+    fn resolve(self) -> Result<i32, RpcError> {
+        match self {
+            Self::Number(signal) => {
+                validate_signal(signal)?;
+                Ok(signal)
+            }
+            Self::Name(name) => {
+                let name = name.to_ascii_uppercase();
+                let name = if name.starts_with("SIG") {
+                    name
+                } else {
+                    format!("SIG{name}")
+                };
+                let canonical_name = match name.as_str() {
+                    "SIGCLD" => "SIGCHLD",
+                    "SIGIOT" => "SIGABRT",
+                    "SIGPOLL" => "SIGIO",
+                    "SIGUNUSED" => "SIGSYS",
+                    _ => name.as_str(),
+                };
+                if canonical_name.starts_with("SIGRTMIN") || canonical_name.starts_with("SIGRTMAX")
+                {
+                    parse_realtime_signal(canonical_name)
+                        .ok_or_else(|| RpcError::invalid_params(format!("Invalid signal: {name}")))
+                } else {
+                    canonical_name
+                        .parse::<Signal>()
+                        .map(|signal| signal as i32)
+                        .map_err(|_| RpcError::invalid_params(format!("Invalid signal: {name}")))
+                }
+            }
+        }
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn realtime_signal_bounds() -> Option<(i32, i32)> {
+    Some((libc::SIGRTMIN(), libc::SIGRTMAX()))
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "android")))]
+fn realtime_signal_bounds() -> Option<(i32, i32)> {
+    None
+}
+
+fn parse_realtime_signal(name: &str) -> Option<i32> {
+    let (minimum, maximum) = realtime_signal_bounds()?;
+    let (base, suffix, minimum_based) = if let Some(suffix) = name.strip_prefix("SIGRTMIN") {
+        (minimum, suffix, true)
+    } else {
+        (maximum, name.strip_prefix("SIGRTMAX")?, false)
+    };
+    let offset = if suffix.is_empty() {
+        0
+    } else {
+        let expected_operator = if minimum_based { '+' } else { '-' };
+        suffix
+            .starts_with(expected_operator)
+            .then(|| suffix.parse::<i32>().ok())??
+    };
+    let signal = base.checked_add(offset)?;
+    (minimum..=maximum).contains(&signal).then_some(signal)
+}
+
 fn validate_signal(signal: i32) -> Result<(), RpcError> {
-    if signal == 0 || Signal::try_from(signal).is_ok() {
+    let realtime = realtime_signal_bounds()
+        .is_some_and(|(minimum, maximum)| (minimum..=maximum).contains(&signal));
+    if signal == 0 || Signal::try_from(signal).is_ok() || realtime {
         Ok(())
     } else {
         Err(RpcError::invalid_params(format!(
@@ -1123,15 +1197,15 @@ pub async fn kill(params: Value) -> HandlerResult {
         pid: u32,
         /// Signal to send (default: SIGTERM)
         #[serde(default = "default_signal")]
-        signal: i32,
+        signal: SignalCode,
     }
 
-    fn default_signal() -> i32 {
-        libc::SIGTERM
+    fn default_signal() -> SignalCode {
+        SignalCode::Number(libc::SIGTERM)
     }
 
     let params: Params = from_value(params).map_err(|e| RpcError::invalid_params(e.to_string()))?;
-    validate_signal(params.signal)?;
+    let signal = params.signal.resolve()?;
     // Signaling an unknown pid is an error; internal cleanup paths call
     // terminate_pipe_process directly and tolerate vanished entries.
     if !get_process_map().lock().await.contains_key(&params.pid) {
@@ -1140,7 +1214,7 @@ pub async fn kill(params: Value) -> HandlerResult {
             params.pid
         )));
     }
-    terminate_pipe_process(params.pid, params.signal, false).await?;
+    terminate_pipe_process(params.pid, signal, false).await?;
     Ok(Value::Boolean(true))
 }
 
@@ -2189,15 +2263,15 @@ pub async fn kill_pty(params: Value) -> HandlerResult {
     struct Params {
         pid: u32,
         #[serde(default = "default_pty_signal")]
-        signal: i32,
+        signal: SignalCode,
     }
 
-    fn default_pty_signal() -> i32 {
-        libc::SIGTERM
+    fn default_pty_signal() -> SignalCode {
+        SignalCode::Number(libc::SIGTERM)
     }
 
     let params: Params = from_value(params).map_err(|e| RpcError::invalid_params(e.to_string()))?;
-    validate_signal(params.signal)?;
+    let signal = params.signal.resolve()?;
     // Signaling an unknown pid is an error; close_pty stays idempotent by
     // calling terminate_pty_process directly.
     if !get_pty_process_map().lock().await.contains_key(&params.pid) {
@@ -2212,10 +2286,10 @@ pub async fn kill_pty(params: Value) -> HandlerResult {
     // Explicit SIGKILL also opts out of output draining.
     terminate_pty_process(
         params.pid,
-        params.signal,
+        signal,
         false,
-        params.signal == libc::SIGKILL,
-        params.signal == libc::SIGKILL,
+        signal == libc::SIGKILL,
+        signal == libc::SIGKILL,
     )
     .await?;
     Ok(Value::Boolean(true))
@@ -2331,6 +2405,67 @@ pub async fn cleanup_managed_processes() -> Result<(), RpcError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn signal_code_accepts_emacs_signal_names() {
+        assert_eq!(
+            SignalCode::Name("SIGINT".into()).resolve().unwrap(),
+            libc::SIGINT
+        );
+        assert_eq!(
+            SignalCode::Name("term".into()).resolve().unwrap(),
+            libc::SIGTERM
+        );
+        assert_eq!(
+            SignalCode::Name("SIGCLD".into()).resolve().unwrap(),
+            libc::SIGCHLD
+        );
+        assert_eq!(
+            SignalCode::Name("SIGIOT".into()).resolve().unwrap(),
+            libc::SIGABRT
+        );
+        assert_eq!(
+            SignalCode::Name("poll".into()).resolve().unwrap(),
+            libc::SIGIO
+        );
+        assert_eq!(
+            SignalCode::Name("SIGUNUSED".into()).resolve().unwrap(),
+            libc::SIGSYS
+        );
+        assert_eq!(SignalCode::Number(0).resolve().unwrap(), 0);
+        assert_eq!(
+            SignalCode::Name("not-a-signal".into())
+                .resolve()
+                .expect_err("invalid signal name")
+                .code,
+            RpcError::INVALID_PARAMS
+        );
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[test]
+    fn signal_code_accepts_emacs_realtime_signal_names() {
+        let minimum = libc::SIGRTMIN();
+        let maximum = libc::SIGRTMAX();
+        assert_eq!(
+            SignalCode::Name("SIGRTMIN".into()).resolve().unwrap(),
+            minimum
+        );
+        assert_eq!(
+            SignalCode::Name("rtmin+1".into()).resolve().unwrap(),
+            minimum + 1
+        );
+        assert_eq!(
+            SignalCode::Name("SIGRTMAX-1".into()).resolve().unwrap(),
+            maximum - 1
+        );
+        assert_eq!(SignalCode::Number(maximum).resolve().unwrap(), maximum);
+        assert!(SignalCode::Name("SIGRTMIN-1".into()).resolve().is_err());
+        assert!(SignalCode::Name("SIGRTMAX+1".into()).resolve().is_err());
+        assert!(SignalCode::Name("SIGRTMIN+999".into()).resolve().is_err());
+        assert!(SignalCode::Name("SIGRTMIN1".into()).resolve().is_err());
+        assert!(SignalCode::Name("SIGRTMAX1".into()).resolve().is_err());
+    }
 
     #[test]
     fn process_group_signal_reports_eperm_instead_of_treating_cleanup_as_success() {
@@ -3273,17 +3408,14 @@ mod tests {
             (Value::String("pid".into()), Value::Integer(pipe_pid.into())),
             (
                 Value::String("signal".into()),
-                Value::Integer((libc::SIGKILL as i64).into()),
+                Value::String("SIGKILL".into()),
             ),
         ]))
         .await
-        .expect("cleanup pipe");
+        .expect("cleanup pipe with named signal");
         kill_pty(Value::Map(vec![
             (Value::String("pid".into()), Value::Integer(pty_pid.into())),
-            (
-                Value::String("signal".into()),
-                Value::Integer((libc::SIGKILL as i64).into()),
-            ),
+            (Value::String("signal".into()), Value::String("KILL".into())),
         ]))
         .await
         .expect("cleanup PTY");

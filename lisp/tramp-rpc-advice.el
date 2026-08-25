@@ -37,6 +37,7 @@
 ;; Functions from tramp.el
 (declare-function tramp-add-external-operation "tramp")
 (declare-function tramp-remove-external-operation "tramp")
+(declare-function tramp-dissect-file-name "tramp" (name &optional nodefault))
 
 ;; Functions from tramp-rpc-process.el
 (declare-function tramp-rpc--write-remote-process "tramp-rpc-process"
@@ -53,6 +54,7 @@
 (declare-function tramp-rpc--debug "tramp-rpc")
 (declare-function tramp-rpc--call "tramp-rpc")
 (declare-function tramp-rpc-file-name-p "tramp-rpc")
+(declare-function tramp-rpc--managed-file-name-p "tramp-rpc")
 
 ;; Variables from tramp-rpc.el / tramp-rpc-process.el
 (defvar tramp-rpc--delivering-output)
@@ -242,25 +244,45 @@ PROCESS is the process being handled."
        ;; Not a tramp-rpc process
        (t (tramp-run-real-handler #'process-send-eof (and process (list process))))))))
 
-(defun tramp-rpc-handle-signal-process (process sigcode &optional _remote)
+(defun tramp-rpc-handle-signal-process (process sigcode &optional remote)
   "Handler for `signal-process' of TRAMP-RPC processes.
 It will be added to `signal-process-functions'.
-PROCESS is the process being handled.
-SIGCODE identifies the signal to send."
-  (when-let* ((pid (and (processp process)
-			(process-get process :tramp-rpc-pid)))
-	      (vec (process-get process :tramp-rpc-vec)))
-    (condition-case err
-        (progn
-          ;; Use PTY kill for PTY processes, regular kill for pipe processes
-          (if (process-get process :tramp-rpc-pty)
-              (tramp-rpc--call vec "process.kill_pty"
-                               `((pid . ,pid) (signal . ,sigcode)))
-            (tramp-rpc--kill-remote-process vec pid sigcode))
-          0) ; Return 0 for success
-      (error
-       (message "tramp-rpc: Error signaling process: %s" err)
-       -1))))
+PROCESS is the process object or remote PID being handled.
+SIGCODE identifies the signal to send.  REMOTE identifies the host when
+PROCESS is a PID."
+  (when (stringp process)
+    (setq process
+          (or (get-process process)
+              (and (string-match-p (rx bol (+ digit) eol) process)
+                   (string-to-number process)))))
+  (let (pid vec rpc-process)
+    (cond
+     ((processp process)
+      (setq pid (process-get process :tramp-rpc-pid)
+            vec (process-get process :tramp-rpc-vec)
+            rpc-process process))
+     ((and (numberp process)
+           (stringp remote)
+           (tramp-rpc--managed-file-name-p remote))
+      (setq pid process
+            vec (tramp-dissect-file-name remote))))
+    (when (and pid vec)
+      (let ((connection (and rpc-process
+                             (process-get rpc-process :tramp-rpc-connection))))
+        (condition-case err
+            (progn
+              ;; Use PTY kill for PTY processes, regular kill for pipe processes.
+              (if (and rpc-process
+                       (process-get rpc-process :tramp-rpc-pty))
+                  (tramp-rpc--call vec "process.kill_pty"
+                                   `((pid . ,pid) (signal . ,sigcode))
+                                   connection)
+                (tramp-rpc--kill-remote-process
+                 vec pid sigcode connection))
+              0) ; Return 0 for success.
+          (error
+           (message "tramp-rpc: Error signaling process: %s" err)
+           -1))))))
 
 ;; ============================================================================
 ;; Process metadata handlers
