@@ -550,7 +550,7 @@ mod tests {
     /// a passwd entry (local or NSS/LDAP).
     #[test]
     fn test_get_user_name_current_uid() {
-        let uid = unsafe { libc::getuid() };
+        let uid = nix::unistd::getuid().as_raw();
         let name = get_user_name(uid);
         assert!(
             name.is_some(),
@@ -565,7 +565,7 @@ mod tests {
     /// Verify get_group_name resolves the current process gid.
     #[test]
     fn test_get_group_name_current_gid() {
-        let gid = unsafe { libc::getgid() };
+        let gid = nix::unistd::getgid().as_raw();
         let name = get_group_name(gid);
         assert!(
             name.is_some(),
@@ -617,7 +617,7 @@ mod tests {
     /// Repeated lookups should hit the cache and return the same value.
     #[test]
     fn test_user_name_caching() {
-        let uid = unsafe { libc::getuid() };
+        let uid = nix::unistd::getuid().as_raw();
         let first = get_user_name(uid);
         let second = get_user_name(uid);
         assert_eq!(first, second, "cached lookup should match initial lookup");
@@ -626,7 +626,7 @@ mod tests {
     /// Repeated group lookups should hit the cache.
     #[test]
     fn test_group_name_caching() {
-        let gid = unsafe { libc::getgid() };
+        let gid = nix::unistd::getgid().as_raw();
         let first = get_group_name(gid);
         let second = get_group_name(gid);
         assert_eq!(first, second, "cached lookup should match initial lookup");
@@ -679,7 +679,7 @@ mod tests {
             attrs.gid
         );
 
-        let expected_uid = unsafe { libc::getuid() };
+        let expected_uid = nix::unistd::getuid().as_raw();
         assert_eq!(attrs.uid, expected_uid);
         assert_eq!(
             attrs.uname.as_deref(),

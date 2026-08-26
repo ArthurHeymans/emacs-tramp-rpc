@@ -40,6 +40,7 @@ pub type HandlerResult = Result<Value, RpcError>;
 
 /// Get system information
 fn system_info() -> HandlerResult {
+    use nix::unistd::{getgid, getuid};
     use std::env;
 
     Ok(msgpack_map! {
@@ -49,8 +50,8 @@ fn system_info() -> HandlerResult {
         "watcher" => watcher_kind(),
         "max_read_chunk_bytes" => io::MAX_FILE_READ_CHUNK_BYTES as u64,
         "hostname" => hostname(),
-        "uid" => unsafe { libc::getuid() },
-        "gid" => unsafe { libc::getgid() },
+        "uid" => getuid().as_raw(),
+        "gid" => getgid().as_raw(),
         "home" => env::var("HOME").ok().into_value(),
         "user" => env::var("USER").ok().into_value(),
         "shell" => login_shell().into_value()
@@ -75,7 +76,7 @@ fn watcher_kind() -> &'static str {
 /// Delegates to file.rs's shared getpwuid_r lookup, which retries with a
 /// growing buffer on ERANGE so large NSS records (LDAP, SSSD) still resolve.
 fn login_shell() -> Option<String> {
-    let uid = unsafe { libc::getuid() };
+    let uid = nix::unistd::getuid().as_raw();
     file::get_user_login_shell(uid)
 }
 
@@ -97,17 +98,13 @@ where
 }
 
 fn hostname() -> String {
-    let mut buf = [0u8; 256];
-    unsafe {
-        if libc::gethostname(buf.as_mut_ptr() as *mut libc::c_char, buf.len()) == 0 {
-            let len = buf.iter().position(|&c| c == 0).unwrap_or(buf.len());
-            String::from_utf8_lossy(&buf[..len]).into_owned()
-        } else {
-            "unknown".to_string()
-        }
-    }
-}
+    use nix::unistd::gethostname;
 
+    gethostname()
+        .ok()
+        .and_then(|name| name.into_string().ok())
+        .unwrap_or_else(|| "unknown".to_string())
+}
 /// Get environment variable
 fn system_getenv(params: Value) -> HandlerResult {
     #[derive(serde::Deserialize)]
@@ -154,28 +151,19 @@ async fn system_statvfs(params: Value) -> HandlerResult {
 }
 
 fn statvfs_blocking(path: &str) -> HandlerResult {
-    use std::ffi::CString;
+    use nix::sys::statvfs;
+
     let expanded = expand_tilde(path);
-    let path_cstr =
-        CString::new(expanded.as_str()).map_err(|_| RpcError::invalid_params("Invalid path"))?;
-
-    let mut stat: libc::statvfs = unsafe { std::mem::zeroed() };
-    let result = unsafe { libc::statvfs(path_cstr.as_ptr(), &mut stat) };
-
-    if result != 0 {
-        return Err(RpcError::io_error(std::io::Error::last_os_error()));
-    }
+    // NixPath accepts raw OsStr bytes, so non-UTF-8 paths still resolve.
+    let stats = statvfs::statvfs(std::path::Path::new(&expanded))
+        .map_err(|error| RpcError::io_error(std::io::Error::from(error)))?;
 
     // Return values in bytes (multiply by block size)
-    // Allow unnecessary casts for cross-platform compatibility (types differ between Linux/macOS)
     #[allow(clippy::unnecessary_cast)]
-    let block_size = stat.f_frsize as u64;
-    #[allow(clippy::unnecessary_cast)]
-    let total = stat.f_blocks as u64 * block_size;
-    #[allow(clippy::unnecessary_cast)]
-    let free = stat.f_bfree as u64 * block_size;
-    #[allow(clippy::unnecessary_cast)]
-    let available = stat.f_bavail as u64 * block_size;
+    let block_size = stats.fragment_size() as u64;
+    let total = stats.blocks() as u64 * block_size;
+    let free = stats.blocks_free() as u64 * block_size;
+    let available = stats.blocks_available() as u64 * block_size;
 
     Ok(msgpack_map! {
         "total" => total,
@@ -185,63 +173,82 @@ fn statvfs_blocking(path: &str) -> HandlerResult {
     })
 }
 
-fn supplementary_groups_with<F>(
-    initial_count: usize,
-    mut getgroups: F,
-) -> std::io::Result<Vec<libc::gid_t>>
-where
-    F: FnMut(&mut [libc::gid_t]) -> std::io::Result<usize>,
-{
-    let mut count = initial_count;
-    loop {
-        let mut groups = vec![0; count];
-        match getgroups(&mut groups) {
-            Ok(actual_count) => {
-                if actual_count > groups.len() {
-                    count = actual_count;
-                    continue;
-                }
-                groups.truncate(actual_count);
-                return Ok(groups);
-            }
-            // Group membership can change after the sizing call.  Retry with a
-            // larger buffer instead of relying on a fixed supplementary limit.
-            Err(error)
-                if matches!(
-                    error.raw_os_error(),
-                    Some(libc::EINVAL) | Some(libc::ERANGE)
-                ) =>
-            {
-                count = count.saturating_mul(2).max(1);
-            }
-            Err(error) => return Err(error),
-        }
-    }
-}
-
-fn supplementary_groups() -> std::io::Result<Vec<libc::gid_t>> {
+/// Apple targets where nix does not expose `getgroups` (membership lives in
+/// opendirectoryd, so nix declines to wrap the raw call there).
+#[cfg(any(
+    target_os = "macos",
+    target_os = "ios",
+    target_os = "tvos",
+    target_os = "watchos",
+    target_os = "visionos"
+))]
+fn current_groups() -> std::io::Result<Vec<libc::gid_t>> {
     let count = unsafe { libc::getgroups(0, std::ptr::null_mut()) };
     if count < 0 {
         return Err(std::io::Error::last_os_error());
     }
 
-    supplementary_groups_with(count as usize, |groups| {
+    // Group membership can change after the sizing call; retry with a larger
+    // buffer instead of relying on a fixed supplementary limit.
+    let mut count = count as usize;
+    loop {
+        let mut groups = vec![0; count];
         let actual_count =
             unsafe { libc::getgroups(groups.len() as libc::c_int, groups.as_mut_ptr()) };
         if actual_count < 0 {
-            Err(std::io::Error::last_os_error())
-        } else {
-            Ok(actual_count as usize)
+            let error = std::io::Error::last_os_error();
+            if matches!(
+                error.raw_os_error(),
+                Some(libc::EINVAL) | Some(libc::ERANGE)
+            ) {
+                count = count.saturating_mul(2).max(1);
+                continue;
+            }
+            return Err(error);
         }
-    })
+        groups.truncate(actual_count as usize);
+        return Ok(groups);
+    }
 }
 
 /// Get groups for the current user
 fn system_groups() -> HandlerResult {
-    let groups = supplementary_groups().map_err(RpcError::io_error)?;
+    #[cfg(not(any(
+        target_os = "macos",
+        target_os = "ios",
+        target_os = "tvos",
+        target_os = "watchos",
+        target_os = "visionos"
+    )))]
+    use nix::unistd::{Gid, getgroups};
+
+    #[cfg(any(
+        target_os = "macos",
+        target_os = "ios",
+        target_os = "tvos",
+        target_os = "watchos",
+        target_os = "visionos"
+    ))]
+    // Raw libc fallback: nix does not expose `getgroups` on Apple platforms.
+    let gids = current_groups().map_err(RpcError::io_error)?;
+
+    #[cfg(not(any(
+        target_os = "macos",
+        target_os = "ios",
+        target_os = "tvos",
+        target_os = "watchos",
+        target_os = "visionos"
+    )))]
+    // nix sizes the buffer internally and retries when group membership
+    // changes between the sizing and retrieval calls.
+    let gids: Vec<_> = getgroups()
+        .map_err(|error| RpcError::io_error(error.into()))?
+        .iter()
+        .map(|&gid| Gid::as_raw(gid))
+        .collect();
 
     // Convert to group info with names
-    let group_info: Vec<Value> = groups
+    let group_info: Vec<Value> = gids
         .iter()
         .map(|&gid| {
             let gname = get_group_name(gid);
@@ -522,41 +529,6 @@ mod tests {
         assert_eq!(expand_tilde("~root"), expected);
         assert_eq!(expand_tilde("~root/foo"), format!("{expected}/foo"));
         assert!(!expand_tilde("~nonexistent-user-xyz").starts_with('/'));
-    }
-
-    #[test]
-    fn groups_retry_after_erange() {
-        let mut calls = 0;
-        let groups = supplementary_groups_with(1, |buffer| {
-            calls += 1;
-            if calls == 1 {
-                return Err(std::io::Error::from_raw_os_error(libc::ERANGE));
-            }
-            assert!(buffer.len() >= 2);
-            buffer[..2].copy_from_slice(&[10, 20]);
-            Ok(2)
-        })
-        .expect("retry getgroups after ERANGE");
-
-        assert_eq!(groups, vec![10, 20]);
-        assert_eq!(calls, 2);
-    }
-
-    #[test]
-    fn groups_retry_after_zero_length_sizing_call() {
-        let mut calls = 0;
-        let groups = supplementary_groups_with(0, |buffer| {
-            calls += 1;
-            if buffer.is_empty() {
-                return Ok(2);
-            }
-            buffer.copy_from_slice(&[10, 20]);
-            Ok(2)
-        })
-        .expect("retry getgroups after sizing call");
-
-        assert_eq!(groups, vec![10, 20]);
-        assert_eq!(calls, 2);
     }
 
     use crate::msgpack_map;

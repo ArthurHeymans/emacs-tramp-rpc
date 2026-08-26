@@ -628,6 +628,7 @@ dependencies = [
  "notify",
  "rmp-serde",
  "rmpv",
+ "rustix",
  "serde",
  "serde_bytes",
  "tempfile",

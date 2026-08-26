@@ -1343,31 +1343,20 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     fn set_symlink_mtime(path: &Path, seconds: libc::time_t) {
-        let c_path = path_to_cstring(path).unwrap();
-        let times = [
-            libc::timespec {
+        use rustix::fs::{AtFlags, CWD, Timespec, Timestamps};
+
+        let times = Timestamps {
+            last_access: Timespec {
                 tv_sec: seconds,
                 tv_nsec: 0,
             },
-            libc::timespec {
+            last_modification: Timespec {
                 tv_sec: seconds,
                 tv_nsec: 0,
             },
-        ];
-        let ret = unsafe {
-            libc::utimensat(
-                libc::AT_FDCWD,
-                c_path.as_ptr(),
-                times.as_ptr(),
-                libc::AT_SYMLINK_NOFOLLOW,
-            )
         };
-        assert_eq!(
-            ret,
-            0,
-            "utimensat failed: {}",
-            std::io::Error::last_os_error()
-        );
+        rustix::fs::utimensat(CWD, path, &times, AtFlags::SYMLINK_NOFOLLOW)
+            .expect("utimensat should succeed");
     }
 
     #[test]
