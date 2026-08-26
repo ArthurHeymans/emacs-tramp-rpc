@@ -138,7 +138,7 @@ Access remote files using the ~rpc~ method:
 
 On first connection, the server binary is automatically obtained and deployed:
 
-1. *Release/package installs*: download from GitHub Releases first (fastest, ~850KB download), then build from source if Rust is installed and download fails.
+1. *Release/package installs*: download from GitHub Releases first (fastest, ~850KB download), then build from source if Rust 1.88 or later is installed and download fails.
 2. *Git checkout installs*: reuse a fresh source build or source-tree keyed cache.  Automatic file operations do not prompt when a binary is missing; run ~M-x tramp-rpc-deploy-install-binary~ to choose whether to download a checksum-verified release binary, build the checkout with Cargo, or skip.  A downloaded fallback remains keyed to that source tree, while strict ~build~ policy uses a separate identity.
 
 The binary is cached locally in =~/.emacs.d/tramp-rpc/= and deployed to =~/.cache/emacs/tramp-rpc/= on the remote host.
@@ -451,7 +451,7 @@ ssh -o BatchMode=yes user@host echo success
 
 If GitHub downloads fail (corporate firewall, etc.), you can:
 
-1. Install Rust and let tramp-rpc build locally:
+1. Install Rust 1.88 or later and let tramp-rpc build locally:
    #+begin_src bash
    curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
    #+end_src

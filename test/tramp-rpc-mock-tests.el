@@ -1129,6 +1129,8 @@ This matches the behavior expected by `tramp-test28-process-file'."
                   "tramp-rpc-advice" (process sigcode &optional remote))
 (declare-function tramp-rpc-deploy--download-file
                   "tramp-rpc-deploy" (url dest))
+(declare-function tramp-rpc-deploy--default-source-directory
+                  "tramp-rpc-deploy" ())
 (defconst tramp-rpc-mock-test--tramp-rpc-loaded t
   "The full TRAMP-RPC backend was loaded successfully.")
 
@@ -4583,6 +4585,24 @@ This matches the behavior expected by `tramp-test28-process-file'."
             (should (equal (file-name-as-directory
                             (tramp-rpc-deploy--default-source-directory))
                            (file-name-as-directory repo)))))
+      (delete-directory dir t))))
+
+(ert-deftest tramp-rpc-mock-test-deploy-default-source-finds-flat-package ()
+  "Test default source directory finds Rust sources in a flat package."
+  :tags '(:deploy)
+  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
+  (let* ((dir (make-temp-file "tramp-rpc-package" t))
+         (source (expand-file-name "tramp-rpc-deploy.el" dir)))
+    (unwind-protect
+        (progn
+          (make-directory (expand-file-name "server" dir))
+          (with-temp-file (expand-file-name "Cargo.toml" dir))
+          (with-temp-file source
+            (insert ";; source\n"))
+          (let ((load-file-name source))
+            (should (equal (file-name-as-directory
+                            (tramp-rpc-deploy--default-source-directory))
+                           (file-name-as-directory dir)))))
       (delete-directory dir t))))
 
 (ert-deftest tramp-rpc-mock-test-deploy-git-install-ask-without-cargo ()

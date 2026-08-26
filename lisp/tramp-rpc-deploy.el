@@ -52,12 +52,17 @@ before deriving the project root."
 
 (defun tramp-rpc-deploy--default-source-directory ()
   "Return the default tramp-rpc source directory.
-This is usually the parent of the Lisp directory.  Following source-file
+MELPA flattens Lisp files into the package root alongside the Rust sources,
+while source checkouts keep them in a Lisp subdirectory.  Following source-file
 symlinks is important for straight.el/Doom builds: the loaded .elc lives in
 straight/build..., while the adjacent .el symlink points back to
-straight/repos..., which contains Cargo.toml and the Rust server sources."
-  (when-let* ((file (tramp-rpc-deploy--load-source-file-name)))
-    (expand-file-name ".." (file-name-directory file))))
+straight/repos...."
+  (when-let* ((file (tramp-rpc-deploy--load-source-file-name))
+              (directory (file-name-directory file)))
+    (if (and (file-exists-p (expand-file-name "Cargo.toml" directory))
+             (file-directory-p (expand-file-name "server" directory)))
+        directory
+      (expand-file-name ".." directory))))
 
 (defgroup tramp-rpc-deploy nil
   "Deployment settings for TRAMP-RPC."
