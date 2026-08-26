@@ -178,7 +178,10 @@ Return raw unibyte bytes suitable for MessagePack bin payloads."
 If relay construction fails, delete any relay already created and call CLEANUP
 before propagating the original error.
 Return (STDOUT-PROCESS . STDERR-PROCESS)."
-  (let (stdout-process stderr-process complete)
+  (let ((default-directory (default-toplevel-value 'temporary-file-directory))
+        (exec-path (default-toplevel-value 'exec-path))
+        (process-environment (default-toplevel-value 'process-environment))
+        stdout-process stderr-process complete)
     (unwind-protect
         (prog1
             (progn

@@ -84,6 +84,8 @@
 
 (declare-function tramp-rpc--decode-output "tramp-rpc" (data))
 (declare-function tramp-rpc--handle-async-read-response "tramp-rpc-process")
+(declare-function tramp-rpc--start-cat-relays
+                  "tramp-rpc-process" (name buffer stderr-buffer cleanup))
 (declare-function tramp-rpc--pty-handle-async-response
                   "tramp-rpc-process" (local-process response))
 
@@ -1874,6 +1876,28 @@ This matches the upstream `tramp-test28-process-file' test."
     ;; Cons pair with nil encoding: nil replaced with default
     (should (equal (list 'utf-8-unix default-enc)
                    (tramp-rpc--coding-args '(utf-8-unix . nil))))))
+
+(ert-deftest tramp-rpc-test13a-cat-relay-uses-local-process-context ()
+  "Local relay creation must not inherit a remote process context."
+  (let ((original-start-process (symbol-function 'start-process))
+        (local-directory (default-toplevel-value 'temporary-file-directory))
+        (local-exec-path (default-toplevel-value 'exec-path))
+        (local-environment (default-toplevel-value 'process-environment))
+        (default-directory "/rpc:mock:/tmp/")
+        (exec-path '("/remote/bin"))
+        (process-environment '("REMOTE=1"))
+        captured process)
+    (unwind-protect
+        (cl-letf (((symbol-function 'start-process)
+                   (lambda (&rest args)
+                     (setq captured
+                           (list default-directory exec-path process-environment))
+                     (setq process (apply original-start-process args)))))
+          (tramp-rpc--start-cat-relays "tramp-rpc-local-relay" nil nil #'ignore)
+          (should (equal captured
+                         (list local-directory local-exec-path local-environment))))
+      (when (processp process)
+        (ignore-errors (delete-process process))))))
 
 (ert-deftest tramp-rpc-test13b-cat-relay-construction-cleans-partial-state ()
   "A failed stderr relay removes the stdout relay and remote child."

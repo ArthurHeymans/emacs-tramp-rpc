@@ -1125,6 +1125,8 @@ This matches the behavior expected by `tramp-test28-process-file'."
 (require 'tramp-rpc)
 (declare-function tramp-rpc--pty-handle-async-response
                   "tramp-rpc-process" (local-process response))
+(declare-function tramp-rpc-handle-signal-process
+                  "tramp-rpc-advice" (process sigcode &optional remote))
 (declare-function tramp-rpc-deploy--download-file
                   "tramp-rpc-deploy" (url dest))
 (defconst tramp-rpc-mock-test--tramp-rpc-loaded t
@@ -6546,6 +6548,51 @@ discard it for being unreadable."
        (setq body-env tramp-remote-process-environment)))
     (should (equal body-env
                    '("TERM=dumb" "PYTHONUNBUFFERED=1" "EXISTING=yes")))))
+
+(ert-deftest tramp-rpc-mock-test-signal-process-routes-remote-pid ()
+  "Remote PID signals use RPC and relays retain their owning connection."
+  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
+  (let ((vec (tramp-dissect-file-name "/rpc:user@host:/"))
+        (old-connection 'old-connection)
+        (replacement-connection 'replacement-connection)
+        process captured)
+    (unwind-protect
+        (cl-letf (((symbol-function 'tramp-rpc--get-connection)
+                   (lambda (_vec) replacement-connection))
+                  ((symbol-function 'tramp-rpc--kill-remote-process)
+                   (lambda (vec pid signal &optional connection)
+                     (setq captured (list 'pipe vec pid signal connection))))
+                  ((symbol-function 'tramp-rpc--call)
+                   (lambda (vec method params &optional connection)
+                     (setq captured (list 'pty vec method params connection)))))
+          (should (= 0 (tramp-rpc-handle-signal-process
+                        12345 'SIGINT "/rpc:user@host:/")))
+          (should (equal (list (car captured) (nth 2 captured)
+                               (nth 3 captured) (nth 4 captured))
+                         '(pipe 12345 SIGINT nil)))
+          (should (string= (tramp-file-name-method (nth 1 captured)) "rpc"))
+          (should-not (tramp-rpc-handle-signal-process
+                       12345 2 "/ssh:user@host:/"))
+
+          (setq process (start-process "tramp-rpc-signal-owner" nil "cat"))
+          (process-put process :tramp-rpc-vec vec)
+          (process-put process :tramp-rpc-pid 54321)
+          (process-put process :tramp-rpc-connection old-connection)
+          (should (= 0 (tramp-rpc-handle-signal-process process 15)))
+          (should (equal (list (car captured) (nth 2 captured)
+                               (nth 3 captured) (nth 4 captured))
+                         `(pipe 54321 15 ,old-connection)))
+
+          (process-put process :tramp-rpc-pty t)
+          (should (= 0 (tramp-rpc-handle-signal-process process 'SIGINT)))
+          (should (equal (list (car captured) (nth 2 captured)
+                               (alist-get 'pid (nth 3 captured))
+                               (alist-get 'signal (nth 3 captured))
+                               (nth 4 captured))
+                         `(pty "process.kill_pty" 54321 SIGINT
+                               ,old-connection))))
+      (when (processp process)
+        (ignore-errors (delete-process process))))))
 
 (ert-deftest tramp-rpc-mock-test-process-file-passes-path-and-unresolved-command ()
   "Test `process-file' searches commands with `tramp-remote-path' PATH."
