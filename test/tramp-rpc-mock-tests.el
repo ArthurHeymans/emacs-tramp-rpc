@@ -6584,12 +6584,14 @@ discard it for being unreadable."
                      (setq captured (list 'pipe vec pid signal connection))))
                   ((symbol-function 'tramp-rpc--call)
                    (lambda (vec method params &optional connection)
-                     (setq captured (list 'pty vec method params connection)))))
+                     (setq captured (list 'rpc vec method params connection)))))
           (should (= 0 (tramp-rpc-handle-signal-process
                         12345 'SIGINT "/rpc:user@host:/")))
           (should (equal (list (car captured) (nth 2 captured)
-                               (nth 3 captured) (nth 4 captured))
-                         '(pipe 12345 SIGINT nil)))
+                               (alist-get 'pid (nth 3 captured))
+                               (alist-get 'signal (nth 3 captured))
+                               (nth 4 captured))
+                         '(rpc "process.signal" 12345 SIGINT nil)))
           (should (string= (tramp-file-name-method (nth 1 captured)) "rpc"))
           (should-not (tramp-rpc-handle-signal-process
                        12345 2 "/ssh:user@host:/"))
@@ -6609,7 +6611,7 @@ discard it for being unreadable."
                                (alist-get 'pid (nth 3 captured))
                                (alist-get 'signal (nth 3 captured))
                                (nth 4 captured))
-                         `(pty "process.kill_pty" 54321 SIGINT
+                         `(rpc "process.kill_pty" 54321 SIGINT
                                ,old-connection))))
       (when (processp process)
         (ignore-errors (delete-process process))))))

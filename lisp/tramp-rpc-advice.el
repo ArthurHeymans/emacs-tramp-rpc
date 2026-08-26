@@ -271,14 +271,20 @@ PROCESS is a PID."
                              (process-get rpc-process :tramp-rpc-connection))))
         (condition-case err
             (progn
-              ;; Use PTY kill for PTY processes, regular kill for pipe processes.
-              (if (and rpc-process
-                       (process-get rpc-process :tramp-rpc-pty))
-                  (tramp-rpc--call vec "process.kill_pty"
-                                   `((pid . ,pid) (signal . ,sigcode))
-                                   connection)
+              (cond
+               ;; A numeric PID names an arbitrary remote OS process, not an
+               ;; entry in the RPC server's managed-process registry.
+               ((not rpc-process)
+                (tramp-rpc--call vec "process.signal"
+                                 `((pid . ,pid) (signal . ,sigcode))))
+               ;; Use PTY kill for PTY processes, regular kill for pipes.
+               ((process-get rpc-process :tramp-rpc-pty)
+                (tramp-rpc--call vec "process.kill_pty"
+                                 `((pid . ,pid) (signal . ,sigcode))
+                                 connection))
+               (t
                 (tramp-rpc--kill-remote-process
-                 vec pid sigcode connection))
+                 vec pid sigcode connection)))
               0) ; Return 0 for success.
           (error
            (message "tramp-rpc: Error signaling process: %s" err)

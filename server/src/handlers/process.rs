@@ -8,6 +8,9 @@ use nix::sys::termios::{LocalFlags, OutputFlags, SetArg, tcgetattr, tcsetattr};
 use nix::sys::wait::{WaitPidFlag, WaitStatus, waitpid};
 use nix::unistd::{Pid, tcgetpgrp};
 use rmpv::Value;
+use rustix::process::{Pid as RustixPid, Signal as RustixSignal};
+#[cfg(any(target_os = "linux", target_os = "android"))]
+use rustix_libc_wrappers::process::SignalExt;
 use serde::Deserialize;
 use std::collections::HashMap;
 use std::io::ErrorKind;
@@ -908,13 +911,29 @@ fn signal_process_group(pid: u32, signal: i32) -> std::io::Result<()> {
     }
 }
 
-#[cfg(target_os = "macos")]
+fn rustix_signal(signal: i32) -> Option<RustixSignal> {
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    {
+        RustixSignal::from_raw(signal)
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
+    {
+        RustixSignal::from_named_raw(signal)
+    }
+}
+
 fn signal_process(pid: u32, signal: i32) -> std::io::Result<()> {
-    let result = unsafe { libc::kill(pid as libc::pid_t, signal) };
-    if result == 0 {
-        Ok(())
+    let pid = i32::try_from(pid)
+        .ok()
+        .and_then(RustixPid::from_raw)
+        .ok_or_else(|| std::io::Error::new(ErrorKind::InvalidInput, "PID is out of range"))?;
+    if signal == 0 {
+        rustix::process::test_kill_process(pid).map_err(std::io::Error::from)
     } else {
-        Err(std::io::Error::last_os_error())
+        let signal = rustix_signal(signal).ok_or_else(|| {
+            std::io::Error::new(ErrorKind::InvalidInput, "Signal is out of range")
+        })?;
+        rustix::process::kill_process(pid, signal).map_err(std::io::Error::from)
     }
 }
 
@@ -1215,6 +1234,24 @@ pub async fn kill(params: Value) -> HandlerResult {
         )));
     }
     terminate_pipe_process(params.pid, signal, false).await?;
+    Ok(Value::Boolean(true))
+}
+
+/// Signal an arbitrary operating-system process by PID.
+pub async fn signal_pid(params: Value) -> HandlerResult {
+    #[derive(Deserialize)]
+    struct Params {
+        pid: u32,
+        signal: SignalCode,
+    }
+
+    let params: Params = from_value(params).map_err(|e| RpcError::invalid_params(e.to_string()))?;
+    if params.pid == 0 {
+        return Err(RpcError::invalid_params("PID must be greater than zero"));
+    }
+    let signal = params.signal.resolve()?;
+    signal_process(params.pid, signal)
+        .map_err(|error| RpcError::process_error(format!("Failed to signal process: {error}")))?;
     Ok(Value::Boolean(true))
 }
 
@@ -2484,6 +2521,69 @@ mod tests {
             )
             .is_ok()
         );
+    }
+
+    #[tokio::test]
+    async fn signal_pid_signals_unmanaged_os_process() {
+        let mut child = StdCommand::new("sleep")
+            .arg("30")
+            .spawn()
+            .expect("start unmanaged child");
+        let pid = child.id();
+
+        let signal_result = signal_pid(Value::Map(vec![
+            (Value::String("pid".into()), Value::Integer(pid.into())),
+            (
+                Value::String("signal".into()),
+                Value::String("SIGKILL".into()),
+            ),
+        ]))
+        .await;
+        if let Err(error) = signal_result {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("failed to signal unmanaged process: {error:?}");
+        }
+
+        let status = match tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                if let Some(status) = child.try_wait()? {
+                    return Ok::<_, std::io::Error>(status);
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        {
+            Ok(Ok(status)) => status,
+            Ok(Err(error)) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!("failed to query unmanaged child: {error}");
+            }
+            Err(_) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!("timed out waiting for unmanaged child to exit");
+            }
+        };
+        assert_eq!(status.signal(), Some(libc::SIGKILL));
+
+        let zero_pid = signal_pid(Value::Map(vec![
+            (Value::String("pid".into()), Value::Integer(0.into())),
+            (Value::String("signal".into()), Value::Integer(0.into())),
+        ]))
+        .await
+        .expect_err("PID zero must not signal the server process group");
+        assert_eq!(zero_pid.code, RpcError::INVALID_PARAMS);
+
+        let oversized_pid = signal_pid(Value::Map(vec![
+            (Value::String("pid".into()), Value::Integer(u32::MAX.into())),
+            (Value::String("signal".into()), Value::Integer(0.into())),
+        ]))
+        .await
+        .expect_err("oversized PID must not become a negative kill target");
+        assert_eq!(oversized_pid.code, RpcError::PROCESS_ERROR);
     }
 
     #[tokio::test]

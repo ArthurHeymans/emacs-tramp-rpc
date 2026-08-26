@@ -254,6 +254,7 @@ The dispatcher exposes these public methods:
 | Process | ~process.status~ | Return managed process status. |
 | Process | ~process.close_stdin~ | Close managed process stdin. |
 | Process | ~process.kill~ | Signal a managed process. |
+| Process | ~process.signal~ | Signal a positive OS PID permitted by the server's credentials. |
 | Process | ~process.list~ | List managed processes. |
 | PTY | ~process.start_pty~ | Start a pseudo-terminal process. |
 | PTY | ~process.read_pty~ | Read pseudo-terminal output. |
