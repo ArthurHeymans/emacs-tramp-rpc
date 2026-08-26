@@ -75,25 +75,27 @@
   ;; Register the method
   (add-to-list 'tramp-methods
                `(,tramp-rpc-method
-                 ;; Declare that the rpc method uses the host name.
-                 ;; tramp-compute-multi-hops validates that methods without
-                 ;; "%h" in tramp-login-args use a host matching the previous
-                 ;; hop.  Since rpc IS host-directed (it SSH-connects to the
-                 ;; specified host), advertising "%h" here lets rpc appear
-                 ;; as a proxy hop in chains like /rpc:server|sudo:root@server:/path
-                 ;; without triggering the "host does not match" error.
-                 ;; The actual tramp-login-args value is never used for login
-                 ;; because rpc is a foreign (non-tramp-sh) file handler.
-                 (tramp-login-args (("%h")))
-                 ;; Match TRAMP's remote-shell convention so PTY login shells
-                 ;; can honor method/connection-local overrides.
-                 (tramp-remote-shell-login ("-l"))
-                 ;; Direct async process support: tramp-rpc uses direct SSH
-                 ;; PTY connections for async processes, which means stderr
-                 ;; is mixed with stdout (normal PTY behavior).  Setting
-                 ;; tramp-direct-async lets upstream tests know to skip
-                 ;; stderr-separation assertions for async shell-command.
-                 (tramp-direct-async t)))
+                 ;; Placeholder; replaced with ssh's parameters below.
+                 (tramp-login-args (("%h")))))
+
+  ;; Give the rpc method all ssh connection parameters so it can serve
+  ;; as a hop in tramp-sh multi-hop chains.  This matters in two ways:
+  ;; - /rpc:host|sudo:root@host:/path is claimed by the tramp-rpc
+  ;;   foreign handler (see `tramp-rpc--sudo-file-name-p'), which never
+  ;;   uses these parameters for login.
+  ;; - Chains ending in shell-based methods such as su or docker, e.g.
+  ;;   /rpc:host|su::/path or /rpc:host|docker:container:/path, are
+  ;;   handled by tramp-sh, which logs in through the rpc hop as if it
+  ;;   were ssh (issue #99).  That happens without ever loading
+  ;;   tramp-rpc.el, so the full parameter set must be installed here at
+  ;;   autoload time, not when the main file is loaded.  RPC-to-RPC
+  ;;   chains remain RPC-backed.
+  ;; This is future-proof: if ssh's parameters change in future TRAMP
+  ;; versions, rpc automatically inherits the updates.
+  ;; Suggested by Michael Albinus.
+  (when-let* ((ssh-params (alist-get "ssh" tramp-methods nil nil #'equal))
+              (rpc-entry (assoc tramp-rpc-method tramp-methods)))
+    (setcdr rpc-entry ssh-params))
 
   ;; Enable direct-async-process for the rpc method.
   ;; This tells upstream tramp that our async processes are "direct"
@@ -222,17 +224,6 @@ This is called from `tramp-multi-hop-p-hook'."
 (when (version< tramp-version "2.8.1.4")
   (error "Tramp RPC requires Tramp >= 2.8.1.4, but %s is loaded"
          tramp-version))
-
-;; Give the rpc method all ssh connection parameters so it can serve
-;; as a hop in tramp-sh multi-hop chains (e.g.
-;; /rpc:host|sudo:root@host:/path).  For single-hop rpc, the foreign
-;; handler takes over and these parameters are never used.  This is
-;; future-proof: if ssh's parameters change in future TRAMP versions,
-;; rpc automatically inherits the updates.
-;; Suggested by Michael Albinus.
-(when-let* ((ssh-params (alist-get "ssh" tramp-methods nil nil #'equal))
-            (rpc-entry (assoc tramp-rpc-method tramp-methods)))
-  (setcdr rpc-entry ssh-params))
 
 ;; Silence byte-compiler warnings for functions defined in with-eval-after-load
 (declare-function tramp-add-external-operation "tramp")

@@ -44,6 +44,9 @@
 (declare-function tramp-rpc--sudo-file-name-p "tramp-rpc")
 (declare-function make-tramp-file-name "tramp")
 (declare-function tramp-dissect-file-name "tramp")
+(declare-function tramp-compute-multi-hops "tramp")
+(declare-function tramp-file-name-method "tramp")
+(declare-function tramp-file-name-hop "tramp")
 (declare-function tramp-find-foreign-file-name-handler "tramp")
 (declare-function tramp-get-method-parameter "tramp")
 (declare-function loaddefs-generate "autoload")
@@ -160,7 +163,7 @@ This allows testing autoload behavior in a clean state."
   (should-not (fboundp 'tramp-rpc-file-name-p)))
 
 (ert-deftest tramp-rpc-autoload-test-method-registration ()
-  "Test that method is registered when tramp loads."
+  "Test that the method inherits ssh parameters when tramp loads."
   (tramp-rpc-autoload-test--clean-environment)
   (tramp-rpc-autoload-test--generate-autoloads)
   (load tramp-rpc-autoload-test--autoloads-file nil t)
@@ -168,8 +171,31 @@ This allows testing autoload behavior in a clean state."
   ;; (tramp-methods may not even exist yet)
   ;; Load tramp
   (require 'tramp)
-  ;; Now method should be registered
-  (should (assoc "rpc" tramp-methods)))
+  ;; Shell-based chains through an rpc hop are handled by tramp-sh without
+  ;; loading tramp-rpc.el, so the autoloaded method must be usable as ssh.
+  (should (assoc "rpc" tramp-methods))
+  (let ((rpc-vec (make-tramp-file-name :method "rpc" :host "host"))
+        (ssh-vec (make-tramp-file-name :method "ssh" :host "host")))
+    (dolist (parameter '(tramp-login-program
+                         tramp-login-args
+                         tramp-remote-shell-login))
+      (should (equal (tramp-get-method-parameter rpc-vec parameter)
+                     (tramp-get-method-parameter ssh-vec parameter))))))
+
+(ert-deftest tramp-rpc-autoload-test-shell-chain-dispatch ()
+  "Test that an rpc-to-su chain dispatches without loading tramp-rpc.el."
+  (tramp-rpc-autoload-test--clean-environment)
+  (tramp-rpc-autoload-test--generate-autoloads)
+  (load tramp-rpc-autoload-test--autoloads-file nil t)
+  (require 'tramp)
+  (let* ((vec (tramp-dissect-file-name "/rpc:host|su::/path"))
+         (chain (tramp-compute-multi-hops vec)))
+    (should (equal (tramp-file-name-method vec) "su"))
+    (should (equal (tramp-file-name-hop vec) "rpc:host|"))
+    (should (equal (mapcar #'tramp-file-name-method chain) '("rpc" "su")))
+    (should (eq (tramp-find-foreign-file-name-handler vec)
+                'tramp-sh-file-name-handler))
+    (should-not (featurep 'tramp-rpc))))
 
 (ert-deftest tramp-rpc-autoload-test-predicate-available-after-tramp ()
   "Test that predicate is available after tramp loads (no autoload needed)."
