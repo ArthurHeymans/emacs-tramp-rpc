@@ -454,6 +454,7 @@ async fn route(method: String, params: Value) -> HandlerResult {
         "process.status" => process::status(params).await,
         "process.close_stdin" => process::close_stdin(params).await,
         "process.kill" => process::kill(params).await,
+        "process.signal" => process::signal_pid(params).await,
         "process.list" => process::list(params).await,
 
         // PTY (pseudo-terminal) process operations

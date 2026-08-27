@@ -149,12 +149,14 @@ impl Default for Admissions {
 }
 
 fn task_class(method: &str) -> TaskClass {
-    // These operations only signal/close an already managed process.  Keep
-    // them available while long-running general requests consume their slots.
+    // These operations only signal or close a process.  Keep them available
+    // while long-running general requests consume their slots.
     match method {
-        "process.kill" | "process.close_stdin" | "process.kill_pty" | "process.close_pty" => {
-            TaskClass::Control
-        }
+        "process.kill"
+        | "process.signal"
+        | "process.close_stdin"
+        | "process.kill_pty"
+        | "process.close_pty" => TaskClass::Control,
         // PTY writes can remain blocked until the remote program reads input.
         // Isolate them so they cannot consume every general request permit;
         // lifecycle operations retain their separately reserved control slots.
@@ -779,6 +781,7 @@ mod tests {
             .expect("reserve every general permit");
 
         assert_eq!(task_class("process.write_pty"), TaskClass::PtyWrite);
+        assert_eq!(task_class("process.signal"), TaskClass::Control);
         assert!(admissions.try_acquire(TaskClass::PtyWrite).is_some());
         assert!(admissions.try_acquire(TaskClass::Control).is_some());
     }

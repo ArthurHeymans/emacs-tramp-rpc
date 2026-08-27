@@ -32,8 +32,12 @@ notify = "8.2"
 # For Git-aware recursive watch discovery.
 ignore = "0.4"
 
-# Safe syscall wrappers for renameat2/utimensat (no nix equivalents).
-rustix = { version = "1", features = ["std", "fs"] }
+# Safe syscall wrappers.
+rustix = { version = "1", features = ["std", "fs", "process"] }
+
+# Linux real-time signal bounds are provided by libc at runtime.
+[target.'cfg(any(target_os = "linux", target_os = "android"))'.dependencies]
+rustix-libc-wrappers = { version = "0.1", features = ["process"] }
 
 [dev-dependencies]
 tempfile = "3"
