@@ -1253,13 +1253,22 @@ This is idempotent so it can run from every synchronous wait exit path."
 
 (defmacro tramp-rpc--with-pending-requests (spec &rest body)
   "Run BODY, releasing unresolved request IDS on every exit.
-SPEC is the connection specification."
+SPEC is the connection specification.  When it includes VEC and EVENT,
+retire the captured generation on user quit."
   (declare (indent 1) (debug t))
   (let ((process (nth 0 spec))
         (buffer (nth 1 spec))
-        (ids (nth 2 spec)))
+        (ids (nth 2 spec))
+        (vec (nth 3 spec))
+        (event (nth 4 spec)))
     `(unwind-protect
-         (progn ,@body)
+         (condition-case interrupted
+             (progn ,@body)
+           (quit
+            ,(when vec
+               `(tramp-rpc--invalidate-interrupted-connection
+                 ,process ,vec ,event))
+            (signal (car interrupted) (cdr interrupted))))
        (tramp-rpc--release-pending-requests ,process ,buffer ,ids))))
 
 (defun tramp-rpc--claim-connection-generation (process vec event reason)
@@ -1977,6 +1986,16 @@ the underlying SSH ControlMaster may be half-open after a network interruption."
              (tramp-rpc--debug "transport cleanup callback failed: %S"
                                callback-error))))))))
 
+(defun tramp-rpc--invalidate-interrupted-connection (process vec event)
+  "Retire PROCESS after an interrupted synchronous request on VEC.
+EVENT describes the interrupted operation.  Cleanup errors are logged so the
+original user quit is always re-signalled."
+  (condition-case cleanup-error
+      (tramp-rpc--invalidate-timed-out-connection process vec event)
+    (error
+     (tramp-rpc--debug "interrupted transport cleanup failed: %S"
+                       cleanup-error))))
+
 ;; ============================================================================
 ;; RPC communication
 ;; ============================================================================
@@ -2188,7 +2207,9 @@ Returns the result or signals an error."
     (tramp-rpc--debug "SEND id=%s method=%s" expected-id method)
     (tramp-rpc--track-pending-request process expected-id)
 
-    (tramp-rpc--with-pending-requests (process buffer (list expected-id))
+    (tramp-rpc--with-pending-requests
+        (process buffer (list expected-id) vec
+                 (format "RPC interrupted while waiting for %s\n" method))
       ;; Send request (binary data with length prefix, no newline)
       (process-send-string process request)
 
@@ -2307,7 +2328,8 @@ Returns:
     (tramp-rpc--debug "SEND-BATCH id=%s count=%d" expected-id (length requests))
     (tramp-rpc--track-pending-request process expected-id)
 
-    (tramp-rpc--with-pending-requests (process buffer (list expected-id))
+    (tramp-rpc--with-pending-requests
+        (process buffer (list expected-id) vec "Batch RPC interrupted\n")
       ;; Send batch request (binary data with length prefix, no newline)
       (process-send-string process request)
 
@@ -2390,22 +2412,31 @@ Returns a list of request IDs in the same order."
   (let* ((conn (or connection (tramp-rpc--ensure-connection vec)))
          (process (plist-get conn :process))
          (buffer (plist-get conn :buffer))
-         ids completed)
+         ids completed dispatch-attempted)
     (unwind-protect
-        (progn
-          (dolist (req requests)
-            (let* ((id-and-bytes (let ((tramp-rpc-protocol--message-target process))
-                                   (tramp-rpc-protocol-encode-request-with-id
-                                    (car req) (cdr req))))
-                   (id (car id-and-bytes))
-                   (bytes (cdr id-and-bytes)))
-              (tramp-rpc--debug "SEND-PIPE id=%s method=%s" id (car req))
-              (push id ids)
-              (tramp-rpc--track-pending-request process id)
-              ;; Send binary data with length prefix, no newline
-              (process-send-string process bytes)))
-          (setq completed t)
-          (nreverse ids))
+        (condition-case interrupted
+            (progn
+              (dolist (req requests)
+                (let* ((id-and-bytes
+                        (let ((tramp-rpc-protocol--message-target process))
+                          (tramp-rpc-protocol-encode-request-with-id
+                           (car req) (cdr req))))
+                       (id (car id-and-bytes))
+                       (bytes (cdr id-and-bytes)))
+                  (tramp-rpc--debug "SEND-PIPE id=%s method=%s" id (car req))
+                  (push id ids)
+                  (tramp-rpc--track-pending-request process id)
+                  ;; Once a transport write is attempted, a quit leaves frame
+                  ;; delivery ambiguous and this generation cannot be reused.
+                  (setq dispatch-attempted t)
+                  (process-send-string process bytes)))
+              (setq completed t)
+              (nreverse ids))
+          (quit
+           (when dispatch-attempted
+             (tramp-rpc--invalidate-interrupted-connection
+              process vec "Pipelined RPC interrupted while sending\n"))
+           (signal (car interrupted) (cdr interrupted))))
       (unless completed
         (tramp-rpc--release-pending-requests process buffer ids)))))
 
@@ -2423,8 +2454,9 @@ captured connection generation to use."
          (remaining-ids (copy-sequence ids))
          (responses (make-hash-table :test 'eql)))
     (tramp-rpc--debug "RECV-PIPE waiting for %d responses: %S" (length ids) ids)
-    (unwind-protect
-        (progn
+    (tramp-rpc--with-pending-requests
+        (process buffer ids vec "Pipelined RPC interrupted\n")
+      (progn
           (with-current-buffer buffer
             ;; Consume transport-death errors before checking process status.
             (dolist (id remaining-ids)
@@ -2468,7 +2500,7 @@ captured connection generation to use."
                     ;; Remove from remaining
                     (setq remaining-ids (delete id remaining-ids)))))
             (tramp-rpc--debug "RECV-PIPE quit (user interrupted)")
-              (keyboard-quit)))))
+            (keyboard-quit)))))
           (when remaining-ids
             (tramp-rpc--debug "RECV-PIPE missing ids: %S" remaining-ids)
             (let ((process-live (process-live-p process)))
@@ -2485,8 +2517,7 @@ captured connection generation to use."
           ;; Convert hash table to alist in original order
           (mapcar (lambda (id)
                     (cons id (gethash id responses)))
-                  ids))
-      (tramp-rpc--release-pending-requests process buffer ids))))
+                  ids)))))
 
 (defun tramp-rpc--call-pipelined (vec requests)
   "Execute multiple REQUESTS in a pipelined fashion for VEC.
