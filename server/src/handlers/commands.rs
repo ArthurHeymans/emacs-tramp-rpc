@@ -1,7 +1,7 @@
 //! Command execution and ancestor scanning for TRAMP-RPC
 //!
 //! This module provides:
-//! - `commands.run_parallel`: Run multiple commands in parallel using OS threads
+//! - `commands.run_parallel`: Run multiple Tokio-managed child processes
 //! - `ancestors.scan`: Scan ancestor directories for marker files
 
 use crate::msgpack_map;
@@ -13,7 +13,7 @@ use std::fs::File;
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 use std::time::UNIX_EPOCH;
 use tokio::io::AsyncWriteExt;
 use tokio::process::Command;
@@ -24,6 +24,13 @@ use super::HandlerResult;
 /// Maximum number of commands that can be run in a single request.
 /// Prevents resource exhaustion from excessively large batches.
 const MAX_PARALLEL_COMMANDS: usize = 256;
+
+/// Global child budget for `commands.run_parallel` requests.  Request-level
+/// admission alone is insufficient because each admitted request can fan out
+/// into hundreds of operating-system processes.
+const MAX_CONCURRENT_PARALLEL_CHILDREN: usize = 64;
+static PARALLEL_CHILD_ADMISSIONS: LazyLock<Semaphore> =
+    LazyLock::new(|| Semaphore::new(MAX_CONCURRENT_PARALLEL_CHILDREN));
 
 /// Run multiple commands concurrently.
 ///
@@ -95,6 +102,12 @@ pub async fn run_parallel(params: Value) -> HandlerResult {
         let remaining = Arc::clone(&remaining);
         let env = env.clone();
         async move {
+            // Valid batch entries queue behind earlier entries.  Dropping the
+            // request future on transport cancellation cancels this wait.
+            let _child_permit = PARALLEL_CHILD_ADMISSIONS
+                .acquire()
+                .await
+                .expect("parallel child admission semaphore is never closed");
             let mut cmd = Command::new(&entry.cmd);
             cmd.args(&entry.args);
             if let Some(ref cwd) = entry.cwd {
@@ -561,5 +574,23 @@ mod tests {
             ancestor_path_value(b"/tmp/\xff".to_vec()),
             Value::Binary(b"/tmp/\xff".to_vec())
         );
+    }
+
+    #[tokio::test]
+    async fn parallel_child_admission_queues_until_release() {
+        let semaphore = Semaphore::new(1);
+        let first = semaphore.acquire().await.unwrap();
+        let queued = semaphore.acquire();
+        tokio::pin!(queued);
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(10), queued.as_mut())
+                .await
+                .is_err()
+        );
+        drop(first);
+        let _permit = tokio::time::timeout(std::time::Duration::from_secs(1), queued)
+            .await
+            .expect("queued entry should proceed after release")
+            .expect("test semaphore remains open");
     }
 }

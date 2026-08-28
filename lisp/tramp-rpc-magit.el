@@ -631,7 +631,8 @@ When RECURSIVE is non-nil, watch subdirectories too."
 
 ;; The prefetch sends all git commands magit will need via a single
 ;; commands.run_parallel RPC call.  The server runs them in parallel
-;; using OS threads and returns {key: {exit_code, stdout, stderr}}.
+;; using Tokio-managed child processes and returns
+;; {key: {exit_code, stdout, stderr}}.
 ;; The results are stored directly as the process-file cache --
 ;; no reconstruction or key normalization needed.
 
@@ -961,15 +962,19 @@ VEC is the TRAMP connection vector."
                           (car entry)))
                (data (cdr entry))
                (exit-code (alist-get 'exit_code data)))
-          (if (string-prefix-p "state_file:" cmd-key)
-              (let* ((remote-path (substring cmd-key (length "state_file:")))
-                     (tramp-path (concat remote-prefix remote-path)))
-                (tramp-rpc--cache-put tramp-rpc--file-exists-cache
-                                      tramp-path
-                                      (= exit-code 0)))
-            (let* ((stdout-raw (alist-get 'stdout data))
-                   (stdout (tramp-rpc--decode-output stdout-raw)))
-              (puthash cmd-key (cons exit-code stdout) cache)))))
+          ;; Older bounded-admission servers reported transient load this way.
+          ;; Keep accepting those responses, but never cache them as git results
+          ;; for the whole TTL.
+          (unless (eq (alist-get 'not_admitted data) t)
+            (if (string-prefix-p "state_file:" cmd-key)
+                (let* ((remote-path (substring cmd-key (length "state_file:")))
+                       (tramp-path (concat remote-prefix remote-path)))
+                  (tramp-rpc--cache-put tramp-rpc--file-exists-cache
+                                        tramp-path
+                                        (= exit-code 0)))
+              (let* ((stdout-raw (alist-get 'stdout data))
+                     (stdout (tramp-rpc--decode-output stdout-raw)))
+                (puthash cmd-key (cons exit-code stdout) cache))))))
       (tramp-rpc-magit--set-process-cache vec directory cache)
       cache)))
 

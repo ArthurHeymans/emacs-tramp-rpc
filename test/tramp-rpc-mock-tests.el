@@ -1306,6 +1306,8 @@ This matches the behavior expected by `tramp-test28-process-file'."
                   "tramp-rpc-magit" (directory args &optional vec))
 (declare-function tramp-rpc-magit--run-parallel
                   "tramp-rpc-magit" (vec directory commands))
+(declare-function tramp-rpc-magit--store-command-results
+                  "tramp-rpc-magit" (vec directory results &optional replace))
 (declare-function tramp-rpc-magit--process-cache-key "tramp-rpc-magit" (&rest args))
 (declare-function tramp-rpc-magit--process-cache-lookup "tramp-rpc-magit" (program args))
 (declare-function tramp-rpc-magit--process-cache-store "tramp-rpc-magit" (program args exit-code stdout))
@@ -2658,6 +2660,19 @@ This matches the behavior expected by `tramp-test28-process-file'."
                 (list :time (float-time) :cache cache)
                 tramp-rpc-magit--process-caches)
        ,@body)))
+
+(ert-deftest tramp-rpc-mock-test-git-process-cache-skips-admission-failures ()
+  "Transient parallel admission failures are not stored as git results."
+  (skip-unless tramp-rpc-mock-test--tramp-rpc-magit-loaded)
+  (tramp-rpc-mock-test--with-git-process-cache
+    (let* ((cmd-key (tramp-rpc-magit--process-cache-key "status"))
+           (results `((,cmd-key . ((exit_code . -1)
+                                   (stdout . "")
+                                   (stderr . "Parallel child admission timed out")
+                                   (not_admitted . t))))))
+      (tramp-rpc-magit--store-command-results
+       vec default-directory results)
+      (should-not (gethash cmd-key cache)))))
 
 (ert-deftest tramp-rpc-mock-test-git-process-cache-requires-opt-in ()
   "Prefetched git output is ignored outside Magit's cache window."
