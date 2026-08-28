@@ -38,10 +38,14 @@ pub async fn cleanup_managed_processes() -> Result<(), RpcError> {
 
 pub type HandlerResult = Result<Value, RpcError>;
 
-/// Get system information
-fn system_info() -> HandlerResult {
+/// Get system information without running NSS lookups on a Tokio worker.
+async fn system_info() -> HandlerResult {
     use nix::unistd::{getgid, getuid};
     use std::env;
+
+    let shell = tokio::task::spawn_blocking(login_shell)
+        .await
+        .map_err(|e| RpcError::internal_error(format!("Login shell task join error: {e}")))?;
 
     Ok(msgpack_map! {
         "version" => env!("CARGO_PKG_VERSION"),
@@ -54,7 +58,7 @@ fn system_info() -> HandlerResult {
         "gid" => getgid().as_raw(),
         "home" => env::var("HOME").ok().into_value(),
         "user" => env::var("USER").ok().into_value(),
-        "shell" => login_shell().into_value()
+        "shell" => shell.into_value()
     })
 }
 
@@ -147,7 +151,7 @@ async fn system_statvfs(params: Value) -> HandlerResult {
     // run them off the Tokio workers.
     tokio::task::spawn_blocking(move || statvfs_blocking(&params.path))
         .await
-        .map_err(|e| RpcError::internal_error(format!("Task join error: {}", e)))?
+        .map_err(|e| RpcError::internal_error(format!("Task join error: {e}")))?
 }
 
 fn statvfs_blocking(path: &str) -> HandlerResult {
@@ -212,54 +216,59 @@ fn current_groups() -> std::io::Result<Vec<libc::gid_t>> {
 }
 
 /// Get groups for the current user
-fn system_groups() -> HandlerResult {
-    #[cfg(not(any(
-        target_os = "macos",
-        target_os = "ios",
-        target_os = "tvos",
-        target_os = "watchos",
-        target_os = "visionos"
-    )))]
-    use nix::unistd::{Gid, getgroups};
+/// Get groups for the current user without NSS lookups on a Tokio worker.
+async fn system_groups() -> HandlerResult {
+    tokio::task::spawn_blocking(|| {
+        #[cfg(not(any(
+            target_os = "macos",
+            target_os = "ios",
+            target_os = "tvos",
+            target_os = "watchos",
+            target_os = "visionos"
+        )))]
+        use nix::unistd::{Gid, getgroups};
 
-    #[cfg(any(
-        target_os = "macos",
-        target_os = "ios",
-        target_os = "tvos",
-        target_os = "watchos",
-        target_os = "visionos"
-    ))]
-    // Raw libc fallback: nix does not expose `getgroups` on Apple platforms.
-    let gids = current_groups().map_err(RpcError::io_error)?;
+        #[cfg(any(
+            target_os = "macos",
+            target_os = "ios",
+            target_os = "tvos",
+            target_os = "watchos",
+            target_os = "visionos"
+        ))]
+        // Raw libc fallback: nix does not expose `getgroups` on Apple platforms.
+        let gids = current_groups().map_err(RpcError::io_error)?;
 
-    #[cfg(not(any(
-        target_os = "macos",
-        target_os = "ios",
-        target_os = "tvos",
-        target_os = "watchos",
-        target_os = "visionos"
-    )))]
-    // nix sizes the buffer internally and retries when group membership
-    // changes between the sizing and retrieval calls.
-    let gids: Vec<_> = getgroups()
-        .map_err(|error| RpcError::io_error(error.into()))?
-        .iter()
-        .map(|&gid| Gid::as_raw(gid))
-        .collect();
+        #[cfg(not(any(
+            target_os = "macos",
+            target_os = "ios",
+            target_os = "tvos",
+            target_os = "watchos",
+            target_os = "visionos"
+        )))]
+        // nix sizes the buffer internally and retries when group membership
+        // changes between the sizing and retrieval calls.
+        let gids: Vec<_> = getgroups()
+            .map_err(|error| RpcError::io_error(error.into()))?
+            .iter()
+            .map(|&gid| Gid::as_raw(gid))
+            .collect();
 
-    // Convert to group info with names
-    let group_info: Vec<Value> = gids
-        .iter()
-        .map(|&gid| {
-            let gname = get_group_name(gid);
-            msgpack_map! {
-                "gid" => gid,
-                "name" => gname.into_value()
-            }
-        })
-        .collect();
+        // Convert to group info with names
+        let group_info: Vec<Value> = gids
+            .iter()
+            .map(|&gid| {
+                let gname = get_group_name(gid);
+                msgpack_map! {
+                    "gid" => gid,
+                    "name" => gname.into_value()
+                }
+            })
+            .collect();
 
-    Ok(Value::Array(group_info))
+        Ok(Value::Array(group_info))
+    })
+    .await
+    .map_err(|e| RpcError::internal_error(format!("Group lookup task join error: {e}")))?
 }
 
 /// Get group name from gid (delegates to file.rs's mutex-protected, cached version)
@@ -467,11 +476,11 @@ async fn route(method: String, params: Value) -> HandlerResult {
         "process.list_pty" => process::list_pty(params).await,
 
         // System info
-        "system.info" => system_info(),
+        "system.info" => system_info().await,
         "system.getenv" => system_getenv(params),
         "system.expand_path" => system_expand_path(params).await,
         "system.statvfs" => system_statvfs(params).await,
-        "system.groups" => system_groups(),
+        "system.groups" => system_groups().await,
 
         // Parallel command execution and ancestor scanning
         "commands.run_parallel" => commands::run_parallel(params).await,
