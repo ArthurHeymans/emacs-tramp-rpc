@@ -380,6 +380,17 @@ DEFAULT is the fallback value."
   "Return the SSH port for VEC, using sudo-via-RPC hop details."
   (tramp-file-name-port (tramp-rpc--ssh-detail-vec vec)))
 
+(defsubst tramp-rpc--port-to-string (port)
+  "Normalize PORT to a string, or return nil.
+PORT may be a number (from defaults), a string (from filename
+parsing via `tramp-dissect-file-name'), or nil (when unset).
+Upstream TRAMP always stores port as a string in the
+`tramp-file-name' struct, but defensive handling of numbers
+avoids breakage if callers supply numeric defaults."
+  (cond ((stringp port) port)
+        ((numberp port) (number-to-string port))
+        (t nil)))
+
 (declare-function tramp-read-passwd "tramp")
 (declare-function tramp-clear-passwd "tramp" (vec))
 
@@ -423,9 +434,7 @@ shape before passing the value to `sudo -S'."
 (defun tramp-rpc--sudo-read-password (vec ssh-user)
   "Read sudo password for SSH-USER on VEC using TRAMP auth machinery."
   (let* ((host (tramp-file-name-host vec))
-         (raw-port (tramp-rpc--ssh-detail-port vec))
-         (port (cond ((stringp raw-port) raw-port)
-                     ((numberp raw-port) (number-to-string raw-port))))
+         (port (tramp-rpc--port-to-string (tramp-rpc--ssh-detail-port vec)))
          (buffer (get-buffer-create " *tramp-rpc-sudo-password*"))
          (process (make-pipe-process
                    :name "tramp-rpc-sudo-password"
@@ -450,10 +459,24 @@ shape before passing the value to `sudo -S'."
       (when (process-live-p process)
         (delete-process process)))))
 
+(define-error 'tramp-rpc-sudo-auth-rejected
+  "Sudo authentication was rejected" 'remote-file-error)
+
+(defun tramp-rpc--sudo-auth-rejected-p (stderr-buffer)
+  "Return non-nil when STDERR-BUFFER confirms sudo authentication rejection."
+  (when (buffer-live-p stderr-buffer)
+    (with-current-buffer stderr-buffer
+      (let ((case-fold-search t))
+        (string-match-p
+         (rx (or "sorry, try again"
+                 (seq (+ digit) " incorrect password attempt")
+                 "authentication failure"))
+         (buffer-substring-no-properties (point-min) (point-max)))))))
+
 (defun tramp-rpc--clear-sudo-password (vec)
   "Clear the cached sudo password for VEC.
-Called when a sudo-via-RPC server start fails so the next attempt prompts
-for a fresh password instead of silently reusing a rejected one."
+Called when sudo explicitly rejects a password so the next attempt prompts
+for a fresh password instead of silently reusing the rejected one."
   (tramp-clear-passwd vec))
 
 (defun tramp-rpc--proxy-hop-string (vec)
@@ -1125,17 +1148,6 @@ later and more specific values replace earlier ones."
     (tramp-rpc--get-direnv-environment vec localname)
     (tramp-rpc--caller-environment))))
 
-(defsubst tramp-rpc--port-to-string (port)
-  "Normalize PORT to a string, or return nil.
-PORT may be a number (from defaults), a string (from filename
-parsing via `tramp-dissect-file-name'), or nil (when unset).
-Upstream TRAMP always stores port as a string in the
-`tramp-file-name' struct, but defensive handling of numbers
-avoids breakage if callers supply numeric defaults."
-  (cond ((stringp port) port)
-        ((numberp port) (number-to-string port))
-        (t nil)))
-
 (defun tramp-rpc--connection-key-route-hop (hop-vec)
   "Return normalized route identity for HOP-VEC."
   (list (tramp-rpc--hop-component-string (tramp-file-name-method hop-vec))
@@ -1518,6 +1530,14 @@ hop so the socket is shared with the normal rpc connection."
                 path t t))
     (expand-file-name path)))
 
+(defun tramp-rpc--ssh-identity-args (user port proxyjump)
+  "Return SSH -l/-p/-J arguments for USER, PORT, and PROXYJUMP.
+Each of USER, PORT, and PROXYJUMP may be nil, in which case the
+corresponding argument is omitted."
+  (append (when user (list "-l" user))
+          (when port (list "-p" port))
+          (when proxyjump (list "-J" proxyjump))))
+
 (defun tramp-rpc--controlmaster-active-p (vec)
   "Return non-nil if a ControlMaster connection is active for VEC."
   (let* ((socket-path (tramp-rpc--controlmaster-socket-path vec))
@@ -1530,9 +1550,7 @@ hop so the socket is shared with the normal rpc connection."
          ;; Check if the socket is actually usable via ssh -O check
          (zerop (apply #'call-process "ssh" nil nil nil
                        (append
-                        (when user (list "-l" user))
-                        (when port (list "-p" port))
-                        (when proxyjump (list "-J" proxyjump))
+                        (tramp-rpc--ssh-identity-args user port proxyjump)
                         (list "-o" (format "ControlPath=%s" socket-path)
                               "-O" "check"
                               host)))))))
@@ -1559,10 +1577,7 @@ Returns non-nil on success."
          (ssh-args (append
                     (list "ssh")
                     tramp-rpc-ssh-args
-                    (when user (list "-l" user))
-                    (when port (list "-p" port))
-                    ;; Multi-hop via ProxyJump
-                    (when proxyjump (list "-J" proxyjump))
+                    (tramp-rpc--ssh-identity-args user port proxyjump)
                     ;; NO BatchMode - allow password prompts
                     (list "-o" "StrictHostKeyChecking=accept-new")
                     ;; ControlMaster options
@@ -1624,10 +1639,7 @@ Returns the connection plist.  Signals `remote-file-error' on failure."
                     (list "ssh")
                     ;; Raw SSH arguments (e.g., -v, -F config)
                     tramp-rpc-ssh-args
-                    (when user (list "-l" user))
-                    (when port (list "-p" port))
-                    ;; Multi-hop via ProxyJump
-                    (when proxyjump (list "-J" proxyjump))
+                    (tramp-rpc--ssh-identity-args user port proxyjump)
                     ;; Only use BatchMode=yes when ControlMaster handles auth;
                     ;; without it, BatchMode=yes prevents password prompts.
                     (when tramp-rpc-use-controlmaster
@@ -1724,8 +1736,7 @@ Returns the connection plist.  Signals `remote-file-error' on failure."
     ;; Wait for server to be ready by sending a ping, and seed the
     ;; connection-local system.info cache for later uid/gid/home/shell lookups.
     ;; `tramp-rpc--call' signals on the usual failed-start paths (a closed
-    ;; transport or timeout), so clear a supplied sudo password in the error
-    ;; handler as well as for an unexpected empty response.
+    ;; transport or timeout).  Tear down that failed transport before retrying.
     (condition-case err
         (let ((response (tramp-rpc--cache-system-info
                          vec (tramp-rpc--call vec "system.info" nil))))
@@ -1733,13 +1744,18 @@ Returns the connection plist.  Signals `remote-file-error' on failure."
             (signal 'remote-file-error
                     (list "Failed to connect to RPC server on" host))))
       (remote-file-error
-       (tramp-rpc--remove-connection vec)
-       ;; A sudo start that fails to respond likely had its password rejected
-       ;; by sudo.  Clear the cached password so the next attempt prompts again
-       ;; instead of silently reusing the rejected password.
-       (when sudo-password
-         (tramp-rpc--clear-sudo-password vec))
-       (signal (car err) (cdr err))))
+       (let ((sudo-auth-rejected
+              (and sudo-password
+                   (tramp-rpc--sudo-auth-rejected-p stderr-buffer))))
+         (tramp-rpc--cleanup-failed-connection vec)
+         ;; Missing binaries and other transport failures also reach this
+         ;; handler.  Forget the password only when sudo explicitly rejected it.
+         (when sudo-auth-rejected
+           (tramp-rpc--clear-sudo-password vec))
+         (signal (if sudo-auth-rejected
+                     'tramp-rpc-sudo-auth-rejected
+                   (car err))
+                 (cdr err)))))
 
     ;; Set connection-local variables in the connection buffer.
     ;; Every TRAMP backend must call this after establishing the connection
@@ -1833,7 +1849,7 @@ accidentally routing file operations through tramp-sh."
     ;; this connects directly.  If it doesn't exist (first time or after
     ;; version bump), SSH exits immediately, we catch the error, deploy
     ;; via scpx, and retry.
-    (condition-case nil
+    (condition-case err
         (tramp-rpc--start-server-process
          vec (tramp-rpc-deploy-expected-binary-localname) sudo-password)
       (remote-file-error
@@ -1844,10 +1860,10 @@ accidentally routing file operations through tramp-sh."
          ;; leaving it alive can cause vc/diff-hl sentinels to route
          ;; file operations through tramp-sh instead of tramp-rpc.
          (tramp-rpc--cleanup-bootstrap-connection vec)
-         ;; The first start may have failed because sudo rejected the password.
-         ;; `tramp-rpc--start-server-process' cleared the cached password, so
-         ;; re-read it here to give the retry a fresh prompt.
-         (when sudo-ssh-user
+         ;; Re-prompt only when sudo explicitly rejected the supplied password.
+         ;; Missing-binary fallback keeps using the still-valid credential.
+         (when (and sudo-ssh-user
+                    (eq (car err) 'tramp-rpc-sudo-auth-rejected))
            (setq sudo-password
                  (when (tramp-rpc--sudo-password-required-p vec)
                    (tramp-rpc--sudo-read-password vec sudo-ssh-user))))
@@ -1903,9 +1919,7 @@ down VEC's ControlMaster in that case would disrupt the still-live connection."
         (ignore-errors
           (apply #'call-process "ssh" nil nil nil
                  (append
-                  (when user (list "-l" user))
-                  (when port (list "-p" port))
-                  (when proxyjump (list "-J" proxyjump))
+                  (tramp-rpc--ssh-identity-args user port proxyjump)
                   (list "-o" (format "ControlPath=%s" socket-path)
                         "-O" "exit" host)))))
       ;; Kill the auth process.

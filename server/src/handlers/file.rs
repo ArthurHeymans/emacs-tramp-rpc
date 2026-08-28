@@ -28,7 +28,7 @@ pub async fn stat(params: Value) -> HandlerResult {
 
     let params: Params = from_value(params).map_err(|e| RpcError::invalid_params(e.to_string()))?;
 
-    let path = bytes_to_path(&params.path);
+    let path = bytes_to_path(&params.path).await?;
     match get_file_attributes(path.as_path(), params.lstat).await {
         Ok(attrs) => Ok(attrs.to_value()),
         Err(e) if e.code == RpcError::FILE_NOT_FOUND => Ok(Value::Nil),
@@ -46,7 +46,7 @@ pub async fn truename(params: Value) -> HandlerResult {
 
     let params: Params = from_value(params).map_err(|e| RpcError::invalid_params(e.to_string()))?;
 
-    let path = bytes_to_path(&params.path);
+    let path = bytes_to_path(&params.path).await?;
     let path_str = path.to_string_lossy().into_owned();
 
     // Use tokio's async canonicalize
@@ -268,6 +268,21 @@ fn getent_name(database: &str, id: u32) -> Result<Option<String>, ()> {
     }
 }
 
+/// Extract an owned name from a successful `getpwuid_r`/`getgrgid_r` result.
+///
+/// `ptr` is the struct's name field (`pw_name`/`gr_name`), valid only when the
+/// reentrant lookup succeeded.  Returns `None` for a null pointer or when the
+/// name is not valid UTF-8.
+fn nss_name_from_ptr(ptr: *const libc::c_char) -> Option<String> {
+    if ptr.is_null() {
+        return None;
+    }
+    // SAFETY: `ptr` is a valid NUL-terminated string owned by the `passwd` or
+    // `group` struct populated by a successful getpwuid_r/getgrgid_r call.
+    let name = unsafe { std::ffi::CStr::from_ptr(ptr) };
+    name.to_str().ok().map(str::to_string)
+}
+
 /// Shared NSS name resolution for both uid and gid.
 ///
 /// Uses `getpwuid_r` or `getgrgid_r` (selected by `kind`) with a
@@ -313,9 +328,8 @@ fn resolve_nss_name(
                         &mut result_ptr,
                     )
                 };
-                let name_str = if !result_ptr.is_null() {
-                    let cname = unsafe { std::ffi::CStr::from_ptr(pwd.pw_name) };
-                    cname.to_str().ok().map(|s| s.to_string())
+                let name_str = if ret == 0 && !result_ptr.is_null() {
+                    nss_name_from_ptr(pwd.pw_name)
                 } else {
                     None
                 };
@@ -333,9 +347,8 @@ fn resolve_nss_name(
                         &mut result_ptr,
                     )
                 };
-                let name_str = if !result_ptr.is_null() {
-                    let cname = unsafe { std::ffi::CStr::from_ptr(grp.gr_name) };
-                    cname.to_str().ok().map(|s| s.to_string())
+                let name_str = if ret == 0 && !result_ptr.is_null() {
+                    nss_name_from_ptr(grp.gr_name)
                 } else {
                     None
                 };
@@ -416,53 +429,37 @@ pub(crate) fn get_user_login_shell(uid: u32) -> Option<String> {
     }
 }
 
-/// Cache of user name -> resolved home directory.  Same caching semantics as
-/// `USER_NAMES`: only definitive results are cached.
-static USER_HOMES: std::sync::LazyLock<Mutex<HashMap<String, Option<Vec<u8>>>>> =
+/// Cache of user name -> resolved home directory.
+///
+/// Only successful lookups are cached.  In particular, arbitrary nonexistent
+/// user names must not grow this process-lifetime map without bound.
+static USER_HOMES: std::sync::LazyLock<Mutex<HashMap<String, Vec<u8>>>> =
     std::sync::LazyLock::new(|| Mutex::new(HashMap::new()));
 
 /// Resolve the home directory for a user name via getpwnam_r.
 ///
 /// Used for `~user` tilde expansion.  Results are cached because the lookup
-/// can hit slow NSS backends; only definitive results are cached so a
-/// transient directory-service failure can be retried later.
+/// can hit slow NSS backends.  Failed lookups stay uncached so transient
+/// directory-service failures can be retried without retaining arbitrary
+/// nonexistent user names forever.
 pub(crate) fn get_user_home_dir(user: &str) -> Option<Vec<u8>> {
     {
         let cache = USER_HOMES.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(result) = cache.get(user) {
-            return result.clone();
+        if let Some(home) = cache.get(user) {
+            return Some(home.clone());
         }
     }
 
     let resolved = getpwnam_home_dir_uncached(user);
-    // Cache definitive results only: found homes and confirmed-absent users.
-    // Transient NSS failures stay uncached so a later lookup can succeed once
-    // the directory service recovers.  Caching misses also keeps repeated
-    // `~unknown-user` paths from re-running the lookup on every request.
-    if resolved.definitive {
+    if let Some(home) = resolved.as_ref() {
         let mut cache = USER_HOMES.lock().unwrap_or_else(|e| e.into_inner());
-        cache.insert(user.to_owned(), resolved.home.clone());
+        cache.insert(user.to_owned(), home.clone());
     }
-    resolved.home
+    resolved
 }
 
-struct HomeLookup {
-    home: Option<Vec<u8>>,
-    /// True when the passwd database definitively answered, whether or not
-    /// the user exists.
-    definitive: bool,
-}
-
-fn getpwnam_home_dir_uncached(user: &str) -> HomeLookup {
-    let user_c = match std::ffi::CString::new(user) {
-        Ok(user_c) => user_c,
-        Err(_) => {
-            return HomeLookup {
-                home: None,
-                definitive: true,
-            };
-        }
-    };
+fn getpwnam_home_dir_uncached(user: &str) -> Option<Vec<u8>> {
+    let user_c = std::ffi::CString::new(user).ok()?;
     let mut bufsize = sysconf_bufsize(libc::_SC_GETPW_R_SIZE_MAX, 1024);
     loop {
         let mut buf = vec![0u8; bufsize];
@@ -481,27 +478,13 @@ fn getpwnam_home_dir_uncached(user: &str) -> HomeLookup {
             bufsize = bufsize.saturating_mul(2).min(MAX_NSS_BUFSIZE);
             continue;
         }
-        if ret != 0 {
-            // Backend unavailable or transient error: do not cache.
-            return HomeLookup {
-                home: None,
-                definitive: false,
-            };
-        }
-        if result_ptr.is_null() {
-            // Confirmed absent from all NSS databases.
-            return HomeLookup {
-                home: None,
-                definitive: true,
-            };
+        if ret != 0 || result_ptr.is_null() {
+            return None;
         }
         // Extract owned data while `buf` is still alive: the passwd strings
         // point into it.  Keep raw bytes: home directories need not be UTF-8.
         let dir = unsafe { std::ffi::CStr::from_ptr(pwd.pw_dir) };
-        return HomeLookup {
-            home: Some(dir.to_bytes().to_vec()),
-            definitive: true,
-        };
+        return Some(dir.to_bytes().to_vec());
     }
 }
 
@@ -529,14 +512,29 @@ use std::ffi::OsStr;
 use std::os::unix::ffi::OsStrExt;
 use std::path::PathBuf;
 
-/// Convert raw bytes to a PathBuf
-pub fn bytes_to_path(bytes: &[u8]) -> PathBuf {
+/// Convert raw bytes to a PathBuf without blocking a Tokio worker on NSS.
+pub async fn bytes_to_path(bytes: &[u8]) -> Result<PathBuf, RpcError> {
     // Tilde expansion operates on the raw bytes so non-UTF-8 path components
-    // never pass through a lossy string conversion.
-    match super::expand_tilde_bytes(bytes) {
+    // never pass through a lossy string conversion.  Only `~user` expansion
+    // can reach NSS, so ordinary paths and `$HOME` expansion remain immediate.
+    let expanded = if bytes
+        .strip_prefix(b"~")
+        .is_some_and(|rest| !rest.is_empty() && !rest.starts_with(b"/"))
+    {
+        let bytes = bytes.to_vec();
+        tokio::task::spawn_blocking(move || super::expand_tilde_bytes(&bytes))
+            .await
+            .map_err(|error| {
+                RpcError::internal_error(format!("Tilde expansion task join error: {error}"))
+            })?
+    } else {
+        super::expand_tilde_bytes(bytes)
+    };
+
+    Ok(match expanded {
         Some(expanded) => PathBuf::from(OsStr::from_bytes(&expanded)),
         None => PathBuf::from(OsStr::from_bytes(bytes)),
-    }
+    })
 }
 
 use crate::protocol::path_or_bytes;
@@ -630,6 +628,15 @@ mod tests {
         let first = get_group_name(gid);
         let second = get_group_name(gid);
         assert_eq!(first, second, "cached lookup should match initial lookup");
+    }
+
+    /// Failed user-home lookups must not grow the process-lifetime cache.
+    #[test]
+    fn test_user_home_misses_are_not_cached() {
+        let user = format!("tramp-rpc-missing-user-{}", std::process::id());
+        assert_eq!(get_user_home_dir(&user), None);
+        let cache = USER_HOMES.lock().unwrap_or_else(|e| e.into_inner());
+        assert!(!cache.contains_key(&user));
     }
 
     /// sysconf_bufsize should return a positive value for _SC_GETPW_R_SIZE_MAX.
