@@ -149,7 +149,7 @@ pub async fn write(params: Value) -> HandlerResult {
         /// Content to write as binary
         #[serde(with = "serde_bytes")]
         content: Vec<u8>,
-        /// File mode (permissions) - only applied to new files
+        /// File mode (permissions) applied after writing, including existing files
         #[serde(default)]
         mode: Option<u32>,
         /// Append to file instead of overwriting
@@ -168,9 +168,7 @@ pub async fn write(params: Value) -> HandlerResult {
     // Content is already binary, no decoding needed!
     let content = params.content;
 
-    // Open the file with appropriate options
     let mut options = OpenOptions::new();
-
     if params.append {
         options.append(true).create(true);
     } else if params.offset.is_some() {
@@ -200,10 +198,12 @@ pub async fn write(params: Value) -> HandlerResult {
     // Do not report success until Tokio has completed the pending file writes.
     file.flush().await.map_err(|e| map_io_error(e, &path_str))?;
 
-    // Set permissions if specified
+    // Preserve the existing file.write contract for external clients.  The
+    // Emacs client does not pass MODE; callers that do request it explicitly
+    // receive a post-write chmod.
     if let Some(mode) = params.mode {
         let perms = std::fs::Permissions::from_mode(mode);
-        fs::set_permissions(&path, perms)
+        file.set_permissions(perms)
             .await
             .map_err(|e| map_io_error(e, &path_str))?;
     }
@@ -744,15 +744,15 @@ pub async fn chown(params: Value) -> HandlerResult {
     let params: Params = from_value(params).map_err(|e| RpcError::invalid_params(e.to_string()))?;
 
     let path = bytes_to_path(&params.path).await?;
-    let uid = params.uid;
-    let gid = params.gid;
+    let uid = chown_id(params.uid, "uid")?;
+    let gid = chown_id(params.gid, "gid")?;
 
     // Use spawn_blocking for the chown syscall
     tokio::task::spawn_blocking(move || {
         use nix::unistd::{Gid, Uid, chown};
 
-        let owner = u32::try_from(uid).ok().map(Uid::from_raw);
-        let group = u32::try_from(gid).ok().map(Gid::from_raw);
+        let owner = uid.map(Uid::from_raw);
+        let group = gid.map(Gid::from_raw);
         chown(&path, owner, group).map_err(|error| RpcError::io_error(error.into()))
     })
     .await
@@ -764,6 +764,16 @@ pub async fn chown(params: Value) -> HandlerResult {
 // ============================================================================
 // Helper functions
 // ============================================================================
+
+fn chown_id(id: i32, name: &str) -> Result<Option<u32>, RpcError> {
+    match id {
+        -1 => Ok(None),
+        0.. => Ok(Some(id as u32)),
+        _ => Err(RpcError::invalid_params(format!(
+            "{name} must be -1 or non-negative"
+        ))),
+    }
+}
 
 #[cfg(unix)]
 fn set_file_times_sync_path_io(
@@ -805,6 +815,17 @@ mod tests {
         Value::Binary(path.as_os_str().as_bytes().to_vec())
     }
 
+    #[test]
+    fn chown_id_accepts_only_minus_one_or_non_negative_values() {
+        assert_eq!(chown_id(-1, "uid").unwrap(), None);
+        assert_eq!(chown_id(0, "uid").unwrap(), Some(0));
+        assert_eq!(chown_id(i32::MAX, "gid").unwrap(), Some(i32::MAX as u32));
+        assert_eq!(
+            chown_id(-2, "uid").unwrap_err().code,
+            RpcError::INVALID_PARAMS
+        );
+    }
+
     #[tokio::test]
     async fn write_offset_preserves_suffix() {
         let tmp = tempfile::tempdir().expect("create tempdir");
@@ -836,6 +857,26 @@ mod tests {
         .expect("write at offset creates file");
 
         assert_eq!(fs::read(path).await.unwrap(), b"\0\0\0\0XY");
+    }
+
+    #[tokio::test]
+    async fn write_mode_updates_existing_file_permissions() {
+        let tmp = tempfile::tempdir().expect("create tempdir");
+        let path = tmp.path().join("existing");
+        fs::write(&path, b"old").await.unwrap();
+        fs::set_permissions(&path, std::fs::Permissions::from_mode(0o640))
+            .await
+            .unwrap();
+
+        write(msgpack_map! {
+            "path" => path_value(&path),
+            "content" => Value::Binary(b"new".to_vec()),
+            "mode" => 0o600u32,
+        })
+        .await
+        .expect("overwrite existing file with explicit mode");
+
+        assert_eq!(fs::metadata(path).await.unwrap().mode() & 0o777, 0o600);
     }
 
     #[tokio::test]

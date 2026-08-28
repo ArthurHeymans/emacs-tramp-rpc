@@ -1,7 +1,7 @@
 //! Command execution and ancestor scanning for TRAMP-RPC
 //!
 //! This module provides:
-//! - `commands.run_parallel`: Run multiple commands in parallel using OS threads
+//! - `commands.run_parallel`: Run multiple Tokio-managed child processes
 //! - `ancestors.scan`: Scan ancestor directories for marker files
 
 use crate::msgpack_map;
@@ -10,9 +10,10 @@ use rmpv::Value;
 use serde::Deserialize;
 use std::collections::HashMap;
 use std::fs::File;
+use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 use std::time::UNIX_EPOCH;
 use tokio::io::AsyncWriteExt;
 use tokio::process::Command;
@@ -23,6 +24,13 @@ use super::HandlerResult;
 /// Maximum number of commands that can be run in a single request.
 /// Prevents resource exhaustion from excessively large batches.
 const MAX_PARALLEL_COMMANDS: usize = 256;
+
+/// Global child budget for `commands.run_parallel` requests.  Request-level
+/// admission alone is insufficient because each admitted request can fan out
+/// into hundreds of operating-system processes.
+const MAX_CONCURRENT_PARALLEL_CHILDREN: usize = 64;
+static PARALLEL_CHILD_ADMISSIONS: LazyLock<Semaphore> =
+    LazyLock::new(|| Semaphore::new(MAX_CONCURRENT_PARALLEL_CHILDREN));
 
 /// Run multiple commands concurrently.
 ///
@@ -94,6 +102,12 @@ pub async fn run_parallel(params: Value) -> HandlerResult {
         let remaining = Arc::clone(&remaining);
         let env = env.clone();
         async move {
+            // Valid batch entries queue behind earlier entries.  Dropping the
+            // request future on transport cancellation cancels this wait.
+            let _child_permit = PARALLEL_CHILD_ADMISSIONS
+                .acquire()
+                .await
+                .expect("parallel child admission semaphore is never closed");
             let mut cmd = Command::new(&entry.cmd);
             cmd.args(&entry.args);
             if let Some(ref cwd) = entry.cwd {
@@ -198,6 +212,13 @@ pub async fn run_parallel(params: Value) -> HandlerResult {
     ))
 }
 
+fn ancestor_path_value(bytes: Vec<u8>) -> Value {
+    match String::from_utf8(bytes) {
+        Ok(path) => Value::String(path.into()),
+        Err(error) => Value::Binary(error.into_bytes()),
+    }
+}
+
 /// Scan ancestor directories for marker files
 ///
 /// This is useful for project detection, VCS detection, etc.
@@ -206,7 +227,8 @@ pub async fn ancestors_scan(params: Value) -> HandlerResult {
     #[derive(Deserialize)]
     struct Params {
         /// Starting directory
-        directory: String,
+        #[serde(with = "crate::protocol::path_or_bytes")]
+        directory: Vec<u8>,
         /// Marker files/directories to look for
         markers: Vec<String>,
         /// Maximum depth to search (default: 10)
@@ -221,15 +243,17 @@ pub async fn ancestors_scan(params: Value) -> HandlerResult {
     let params: Params = from_value(params).map_err(|e| RpcError::invalid_params(e.to_string()))?;
 
     // Wrap in spawn_blocking since this does blocking filesystem I/O
-    let expanded_directory = super::expand_tilde(&params.directory);
+    let expanded_directory = super::file::bytes_to_path(&params.directory).await?;
     tokio::task::spawn_blocking(move || {
-        let dir = Path::new(&expanded_directory);
+        let dir = expanded_directory.as_path();
         if !dir.exists() {
-            return Err(RpcError::file_not_found(&expanded_directory));
+            return Err(RpcError::file_not_found(
+                &expanded_directory.to_string_lossy(),
+            ));
         }
 
         // Initialize results with None for each marker
-        let mut results: HashMap<String, Option<String>> =
+        let mut results: HashMap<String, Option<Vec<u8>>> =
             params.markers.iter().map(|m| (m.clone(), None)).collect();
 
         // Walk up the directory tree
@@ -239,11 +263,13 @@ pub async fn ancestors_scan(params: Value) -> HandlerResult {
         while depth < params.max_depth {
             // Check each marker that hasn't been found yet
             for marker in &params.markers {
-                if results.get(marker).unwrap().is_none() {
+                if results.get(marker).is_some_and(Option::is_none) {
                     let marker_path = current.join(marker);
                     if marker_path.exists() {
-                        results
-                            .insert(marker.clone(), Some(current.to_string_lossy().into_owned()));
+                        results.insert(
+                            marker.clone(),
+                            Some(current.as_os_str().as_bytes().to_vec()),
+                        );
                     }
                 }
             }
@@ -266,7 +292,10 @@ pub async fn ancestors_scan(params: Value) -> HandlerResult {
         // Convert to Value
         let pairs: Vec<(Value, Value)> = results
             .into_iter()
-            .map(|(k, v)| (k.into_value(), v.into_value()))
+            .map(|(key, path)| {
+                let path = path.map_or(Value::Nil, ancestor_path_value);
+                (key.into_value(), path)
+            })
             .collect();
 
         Ok(Value::Map(pairs))
@@ -529,4 +558,39 @@ pub async fn highlevel_dir_locals_find_file_cache_update(params: Value) -> Handl
     })
     .await
     .map_err(|e| RpcError::internal_error(format!("Task join error: {}", e)))?
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ancestor_paths_use_text_when_compatible_and_binary_when_required() {
+        assert_eq!(
+            ancestor_path_value(b"/tmp/project".to_vec()),
+            Value::String("/tmp/project".into())
+        );
+        assert_eq!(
+            ancestor_path_value(b"/tmp/\xff".to_vec()),
+            Value::Binary(b"/tmp/\xff".to_vec())
+        );
+    }
+
+    #[tokio::test]
+    async fn parallel_child_admission_queues_until_release() {
+        let semaphore = Semaphore::new(1);
+        let first = semaphore.acquire().await.unwrap();
+        let queued = semaphore.acquire();
+        tokio::pin!(queued);
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(10), queued.as_mut())
+                .await
+                .is_err()
+        );
+        drop(first);
+        let _permit = tokio::time::timeout(std::time::Duration::from_secs(1), queued)
+            .await
+            .expect("queued entry should proceed after release")
+            .expect("test semaphore remains open");
+    }
 }

@@ -732,6 +732,23 @@ The directory is deleted after BODY completes."
             (should (equal content read-content))))
       (ignore-errors (delete-file file)))))
 
+(ert-deftest tramp-rpc-test05-write-region-respects-coding-system-for-write ()
+  "Dynamic binary output coding must preserve string bytes exactly."
+  (skip-unless (tramp-rpc-test-enabled))
+
+  (let ((file (tramp-rpc-test--make-temp-name))
+        (content (unibyte-string 0 127 128 255)))
+    (unwind-protect
+        (progn
+          (let ((coding-system-for-write 'binary))
+            (write-region content nil file))
+          (let ((read-content (with-temp-buffer
+                                (set-buffer-multibyte nil)
+                                (insert-file-contents file)
+                                (buffer-string))))
+            (should (equal content read-content))))
+      (ignore-errors (delete-file file)))))
+
 (ert-deftest tramp-rpc-test05-write-region-utf8 ()
   "Test `write-region' with UTF-8 content."
   (skip-unless (tramp-rpc-test-enabled))
