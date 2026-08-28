@@ -1451,16 +1451,30 @@ Creates the directory from `tramp-rpc-controlmaster-path' if needed."
   "Dynamically bound socket path during ControlMaster establishment.
 Used by `tramp-rpc--action-controlmaster-established'.")
 
+(defvar tramp-rpc--controlmaster-socket-grace-retries 50
+  "Number of checks for a late ControlMaster socket after ssh exits.")
+
+(defvar tramp-rpc--controlmaster-socket-grace-delay 0.02
+  "Seconds between checks for a late ControlMaster socket.")
+
 (defun tramp-rpc--action-controlmaster-established (proc _vec)
   "Succeed when the ControlMaster socket file appears, fail on process death.
 The target socket path is read from the dynamic variable
 `tramp-rpc--controlmaster-socket-path'.
-PROC is the process being handled."
+PROC is the process being handled.
+With ControlPersist, the ssh parent exits as soon as it forks the
+persistent master into the background, and the socket can become visible a
+few milliseconds after that exit.  Give a dead process a short grace period
+for the socket to appear before declaring the attempt dead."
   (cond
    ((file-exists-p tramp-rpc--controlmaster-socket-path)
     (throw 'tramp-action 'ok))
    ((not (process-live-p proc))
     (while (tramp-accept-process-output proc))
+    (dotimes (_ tramp-rpc--controlmaster-socket-grace-retries)
+      (when (file-exists-p tramp-rpc--controlmaster-socket-path)
+        (throw 'tramp-action 'ok))
+      (sleep-for tramp-rpc--controlmaster-socket-grace-delay))
     (throw 'tramp-action 'process-died))))
 
 (defconst tramp-rpc--controlmaster-actions
@@ -1867,15 +1881,21 @@ accidentally routing file operations through tramp-sh."
       (remote-file-error
        ;; A stale ControlMaster socket can make OpenSSH exit immediately while
        ;; TRAMP reports only a generic connection failure.  Remove the socket
-       ;; and retry once before surfacing the error.
+       ;; and retry once before surfacing the error.  Retry likewise when no
+       ;; socket exists at all: the first attempt may have died transiently
+       ;; before creating one.  Only a socket that still answers ControlMaster
+       ;; checks must be left alone.
        (let ((socket-path (tramp-rpc--controlmaster-socket-path vec)))
-         (when (file-exists-p socket-path)
-           (ignore-errors (delete-file socket-path)))
-         (sleep-for 0.1)
-         (condition-case nil
-             (tramp-rpc--establish-controlmaster vec)
-           (remote-file-error
-            (signal (car err) (cdr err))))))))
+         (if (tramp-rpc--controlmaster-active-p vec)
+             ;; Do not tear down a socket that still answers ControlMaster
+             ;; checks merely because authentication failed for another reason.
+             (signal (car err) (cdr err))
+           (ignore-errors (delete-file socket-path))
+           (sleep-for 0.1)
+           (condition-case nil
+               (tramp-rpc--establish-controlmaster vec)
+             (remote-file-error
+              (signal (car err) (cdr err)))))))))
   (let* ((sudo-ssh-user (tramp-rpc--detect-sudo-elevation vec))
          ;; TRAMP's sudo method opens an elevated backend connection.  For the
          ;; RPC backend that means starting the server via sudo.  Prefer sudo

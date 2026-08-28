@@ -6376,6 +6376,121 @@ A rejected sudo password must not be reused on the next attempt, otherwise
     (should-not (funcall run-case 255
                          "Control socket connect: No such file or directory\r\n"))))
 
+(ert-deftest tramp-rpc-mock-test-connect-retries-establish-without-active-master ()
+  "A failed ControlMaster establish is retried when no live master remains.
+The first ssh attempt can die transiently before creating a socket; the
+retry must still happen in that case."
+  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
+  (let* ((vec (tramp-dissect-file-name "/rpc:mock:/"))
+         (controlmaster-dir (make-temp-file "tramp-rpc-controlmaster" t))
+         (tramp-rpc-controlmaster-path
+          (expand-file-name "%C" controlmaster-dir))
+         (establish-calls 0))
+    (unwind-protect
+        (cl-letf (((symbol-function 'tramp-rpc--establish-controlmaster)
+                   (lambda (_vec)
+                     (setq establish-calls (1+ establish-calls))
+                     (when (= establish-calls 1)
+                       (signal 'remote-file-error '("process died")))
+                     t))
+                  ((symbol-function 'tramp-rpc--controlmaster-active-p)
+                   (lambda (_vec) nil))
+                  ((symbol-function 'tramp-rpc--controlmaster-socket-path)
+                   (lambda (_vec) "/nonexistent/tramp-rpc-test-socket"))
+                  ((symbol-function 'sleep-for) #'ignore)
+                  ((symbol-function 'tramp-rpc--detect-sudo-elevation)
+                   (lambda (_vec) nil))
+                  ((symbol-function 'tramp-rpc-deploy-expected-binary-localname)
+                   (lambda () "/tmp/tramp-rpc-server"))
+                  ((symbol-function 'tramp-rpc--start-server-process)
+                   (lambda (&rest _) t)))
+          (should (tramp-rpc--connect vec))
+          (should (= establish-calls 2)))
+      (delete-directory controlmaster-dir t))))
+
+(ert-deftest tramp-rpc-mock-test-controlmaster-action-tolerates-late-socket ()
+  "A dead establish process still succeeds when its socket appears late.
+With ControlPersist the ssh parent exits as soon as the master forks to the
+background, which can precede the socket becoming visible."
+  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
+  (let* ((dir (make-temp-file "tramp-rpc-sock" t))
+         (sock (expand-file-name "sock" dir))
+         (proc-buf (generate-new-buffer " *tramp-rpc-mock-dead*"))
+         (proc (make-process :name "tramp-rpc-mock-dead"
+                             :buffer proc-buf
+                             :command '("true")
+                             :connection-type 'pipe
+                             :noquery t))
+         (tramp-rpc--controlmaster-socket-path sock)
+         (tramp-rpc--controlmaster-socket-grace-retries 2)
+         (tramp-rpc--controlmaster-socket-grace-delay 0))
+    (unwind-protect
+        (progn
+          (while (process-live-p proc)
+            (accept-process-output proc 0.1))
+          ;; Create the socket between the two deterministic grace checks.
+          (cl-letf (((symbol-function 'sleep-for)
+                     (lambda (&rest _)
+                       (write-region "" nil sock nil 'silent))))
+            (should (eq (catch 'tramp-action
+                          (tramp-rpc--action-controlmaster-established proc nil))
+                        'ok))))
+      (ignore-errors (delete-process proc))
+      (when (buffer-live-p proc-buf)
+        (kill-buffer proc-buf))
+      (ignore-errors (delete-directory dir t)))))
+
+(ert-deftest tramp-rpc-mock-test-controlmaster-action-dead-without-socket ()
+  "A dead establish process without a socket reports process-died."
+  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
+  (let* ((dir (make-temp-file "tramp-rpc-sock" t))
+         (sock (expand-file-name "sock" dir))
+         (proc-buf (generate-new-buffer " *tramp-rpc-mock-dead*"))
+         (proc (make-process :name "tramp-rpc-mock-dead"
+                             :buffer proc-buf
+                             :command '("true")
+                             :connection-type 'pipe
+                             :noquery t))
+         (tramp-rpc--controlmaster-socket-path sock)
+         (tramp-rpc--controlmaster-socket-grace-retries 1)
+         (tramp-rpc--controlmaster-socket-grace-delay 0))
+    (unwind-protect
+        (progn
+          (while (process-live-p proc)
+            (accept-process-output proc 0.1))
+          (cl-letf (((symbol-function 'sleep-for) #'ignore))
+            (should (eq (catch 'tramp-action
+                          (tramp-rpc--action-controlmaster-established proc nil))
+                        'process-died))))
+      (ignore-errors (delete-process proc))
+      (when (buffer-live-p proc-buf)
+        (kill-buffer proc-buf))
+      (ignore-errors (delete-directory dir t)))))
+
+(ert-deftest tramp-rpc-mock-test-connect-keeps-active-master-on-establish-failure ()
+  "A failed establish must not retry over a still-active ControlMaster."
+  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
+  (let* ((vec (tramp-dissect-file-name "/rpc:mock:/"))
+         (controlmaster-dir (make-temp-file "tramp-rpc-controlmaster" t))
+         (tramp-rpc-controlmaster-path
+          (expand-file-name "%C" controlmaster-dir))
+         (establish-calls 0))
+    (unwind-protect
+        (cl-letf (((symbol-function 'tramp-rpc--establish-controlmaster)
+                   (lambda (_vec)
+                     (setq establish-calls (1+ establish-calls))
+                     (signal 'remote-file-error '("process died"))))
+                  ((symbol-function 'tramp-rpc--controlmaster-active-p)
+                   (lambda (_vec) t))
+                  ((symbol-function 'tramp-rpc--controlmaster-socket-path)
+                   (lambda (_vec) "/nonexistent/tramp-rpc-test-socket"))
+                  ((symbol-function 'sleep-for) #'ignore)
+                  ((symbol-function 'tramp-rpc--detect-sudo-elevation)
+                   (lambda (_vec) nil)))
+          (should-error (tramp-rpc--connect vec) :type 'remote-file-error)
+          (should (= establish-calls 1)))
+      (delete-directory controlmaster-dir t))))
+
 
 
 (ert-deftest tramp-rpc-mock-test-password-string-unwraps-auth-source-entry ()
