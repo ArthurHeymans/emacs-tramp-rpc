@@ -10,6 +10,7 @@ use rmpv::Value;
 use serde::Deserialize;
 use std::collections::HashMap;
 use std::fs::File;
+use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::Arc;
@@ -198,6 +199,13 @@ pub async fn run_parallel(params: Value) -> HandlerResult {
     ))
 }
 
+fn ancestor_path_value(bytes: Vec<u8>) -> Value {
+    match String::from_utf8(bytes) {
+        Ok(path) => Value::String(path.into()),
+        Err(error) => Value::Binary(error.into_bytes()),
+    }
+}
+
 /// Scan ancestor directories for marker files
 ///
 /// This is useful for project detection, VCS detection, etc.
@@ -206,7 +214,8 @@ pub async fn ancestors_scan(params: Value) -> HandlerResult {
     #[derive(Deserialize)]
     struct Params {
         /// Starting directory
-        directory: String,
+        #[serde(with = "crate::protocol::path_or_bytes")]
+        directory: Vec<u8>,
         /// Marker files/directories to look for
         markers: Vec<String>,
         /// Maximum depth to search (default: 10)
@@ -221,15 +230,17 @@ pub async fn ancestors_scan(params: Value) -> HandlerResult {
     let params: Params = from_value(params).map_err(|e| RpcError::invalid_params(e.to_string()))?;
 
     // Wrap in spawn_blocking since this does blocking filesystem I/O
-    let expanded_directory = super::expand_tilde(&params.directory);
+    let expanded_directory = super::file::bytes_to_path(&params.directory).await?;
     tokio::task::spawn_blocking(move || {
-        let dir = Path::new(&expanded_directory);
+        let dir = expanded_directory.as_path();
         if !dir.exists() {
-            return Err(RpcError::file_not_found(&expanded_directory));
+            return Err(RpcError::file_not_found(
+                &expanded_directory.to_string_lossy(),
+            ));
         }
 
         // Initialize results with None for each marker
-        let mut results: HashMap<String, Option<String>> =
+        let mut results: HashMap<String, Option<Vec<u8>>> =
             params.markers.iter().map(|m| (m.clone(), None)).collect();
 
         // Walk up the directory tree
@@ -239,11 +250,13 @@ pub async fn ancestors_scan(params: Value) -> HandlerResult {
         while depth < params.max_depth {
             // Check each marker that hasn't been found yet
             for marker in &params.markers {
-                if results.get(marker).unwrap().is_none() {
+                if results.get(marker).is_some_and(Option::is_none) {
                     let marker_path = current.join(marker);
                     if marker_path.exists() {
-                        results
-                            .insert(marker.clone(), Some(current.to_string_lossy().into_owned()));
+                        results.insert(
+                            marker.clone(),
+                            Some(current.as_os_str().as_bytes().to_vec()),
+                        );
                     }
                 }
             }
@@ -266,7 +279,10 @@ pub async fn ancestors_scan(params: Value) -> HandlerResult {
         // Convert to Value
         let pairs: Vec<(Value, Value)> = results
             .into_iter()
-            .map(|(k, v)| (k.into_value(), v.into_value()))
+            .map(|(key, path)| {
+                let path = path.map_or(Value::Nil, ancestor_path_value);
+                (key.into_value(), path)
+            })
             .collect();
 
         Ok(Value::Map(pairs))
@@ -529,4 +545,21 @@ pub async fn highlevel_dir_locals_find_file_cache_update(params: Value) -> Handl
     })
     .await
     .map_err(|e| RpcError::internal_error(format!("Task join error: {}", e)))?
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ancestor_paths_use_text_when_compatible_and_binary_when_required() {
+        assert_eq!(
+            ancestor_path_value(b"/tmp/project".to_vec()),
+            Value::String("/tmp/project".into())
+        );
+        assert_eq!(
+            ancestor_path_value(b"/tmp/\xff".to_vec()),
+            Value::Binary(b"/tmp/\xff".to_vec())
+        );
+    }
 }

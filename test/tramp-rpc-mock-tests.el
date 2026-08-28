@@ -2528,6 +2528,19 @@ This matches the behavior expected by `tramp-test28-process-file'."
       (should (equal calls
                      '((dired-compress-file ("/rpc:mock:/tmp/file"))))))))
 
+(ert-deftest tramp-rpc-mock-test-compatible-path-value-prefers-text ()
+  "Valid UTF-8 paths remain compatible with pre-binary-path servers."
+  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
+  (let ((text (tramp-rpc--path-to-compatible-value "/tmp/project"))
+        (binary (tramp-rpc--path-to-compatible-value
+                 (concat "/tmp/" (unibyte-string #xff)))))
+    (should (stringp text))
+    (should (multibyte-string-p text))
+    (should (equal text "/tmp/project"))
+    (should (msgpack-bin-p binary))
+    (should (equal (msgpack-bin-string binary)
+                   (concat "/tmp/" (unibyte-string #xff))))))
+
 (ert-deftest tramp-rpc-mock-test-ancestor-scan-honors-cache-inhibition ()
   "Ancestor marker scans honor numeric and timestamp invalidation."
   (let* ((tramp-rpc-magit--ancestor-scan-caches
@@ -2621,6 +2634,15 @@ This matches the behavior expected by `tramp-test28-process-file'."
     (should (eq (tramp-rpc-magit--file-exists-in-ancestor-scan
                  "/ssh:mock:/repo/.editorconfig" scan)
                 'not-cached))))
+
+(ert-deftest tramp-rpc-mock-test-ancestor-scan-compares-raw-path-bytes ()
+  "Ancestor marker hits preserve non-UTF-8 localname bytes."
+  (skip-unless tramp-rpc-mock-test--tramp-rpc-magit-loaded)
+  (let* ((directory (concat "/repo/" (unibyte-string 255)))
+         (filename (concat "/ssh:mock:" directory "/.git"))
+         (scan (list (cons ".git" directory))))
+    (should (eq (tramp-rpc-magit--file-exists-in-ancestor-scan filename scan)
+                t))))
 
 (defmacro tramp-rpc-mock-test--with-git-process-cache (&rest body)
   "Run BODY with an isolated Magit process cache."

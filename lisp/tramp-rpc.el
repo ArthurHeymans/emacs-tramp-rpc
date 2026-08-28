@@ -2657,6 +2657,19 @@ the server, since the remote side does not understand it."
   "Return PATH as an explicit MessagePack bin value."
   (msgpack-bin-make (tramp-rpc--path-to-bytes path)))
 
+(defun tramp-rpc--path-to-compatible-value (path)
+  "Return PATH as text when UTF-8-compatible, otherwise MessagePack binary.
+Using text for ordinary paths preserves compatibility with older servers whose
+path parameters predate binary-path support."
+  (let* ((bytes (tramp-rpc--path-to-bytes path))
+         (decoded (decode-coding-string bytes 'utf-8-unix)))
+    (if (and (cl-every (lambda (char)
+                         (not (eq (char-charset char) 'eight-bit)))
+                       decoded)
+             (equal bytes (encode-coding-string decoded 'utf-8-unix)))
+        decoded
+      (msgpack-bin-make bytes))))
+
 (defun tramp-rpc--encode-path (path)
   "Encode PATH for transmission to path-or-bytes server parameters.
 Returns an alist with PATH as an explicit MessagePack bin value."

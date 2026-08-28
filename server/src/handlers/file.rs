@@ -612,6 +612,30 @@ mod tests {
         assert!(name.is_some(), "gid 0 should always have a group entry");
     }
 
+    #[tokio::test]
+    async fn test_expand_tilde_preserves_non_utf8_suffix() {
+        let Some(home) = std::env::var_os("HOME") else {
+            return;
+        };
+        let path = bytes_to_path(b"~/\xff").await.unwrap();
+        let mut expected = PathBuf::from(home);
+        expected.push(OsStr::from_bytes(b"\xff"));
+        assert_eq!(path, expected);
+    }
+
+    /// Repeated separators after "~/" must survive: the suffix begins with
+    /// "/" and must not replace the HOME prefix.
+    #[tokio::test]
+    async fn test_expand_tilde_preserves_repeated_separators() {
+        let Some(home) = std::env::var_os("HOME") else {
+            return;
+        };
+        let path = bytes_to_path(b"~//\xff").await.unwrap();
+        let mut expected = home;
+        expected.push(OsStr::from_bytes(b"//\xff"));
+        assert_eq!(path, PathBuf::from(expected));
+    }
+
     /// Repeated lookups should hit the cache and return the same value.
     #[test]
     fn test_user_name_caching() {

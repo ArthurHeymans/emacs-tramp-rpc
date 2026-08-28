@@ -45,6 +45,9 @@
 (declare-function tramp-rpc--decode-output "tramp-rpc")
 (declare-function tramp-rpc--process-environment "tramp-rpc")
 (declare-function tramp-rpc--decode-string "tramp-rpc")
+(declare-function tramp-rpc--binary-bytes "tramp-rpc")
+(declare-function tramp-rpc--path-to-bytes "tramp-rpc")
+(declare-function tramp-rpc--path-to-compatible-value "tramp-rpc")
 (declare-function tramp-rpc--encode-path "tramp-rpc")
 (declare-function tramp-rpc--convert-file-attributes "tramp-rpc")
 (declare-function tramp-rpc-file-name-p "tramp-rpc")
@@ -1487,16 +1490,18 @@ the server scans the entire tree in one operation."
              (tramp-rpc-file-name-p directory))
     (with-parsed-tramp-file-name directory nil
       (let ((result (tramp-rpc--call v "ancestors.scan"
-                                     `((directory . ,localname)
+                                     `((directory . ,(tramp-rpc--path-to-compatible-value
+                                                      localname))
                                        (markers . ,(vconcat markers))
                                        (max_depth . ,(or max-depth 10))))))
-        ;; Convert result to alist with string keys and decoded paths
+        ;; Marker names are text, but paths must remain raw bytes so invalid
+        ;; UTF-8 can be compared with TRAMP localnames without replacement.
         (mapcar (lambda (pair)
                   (let ((key (car pair))
                         (val (cdr pair)))
                     (cons (if (symbolp key) (symbol-name key) key)
                           (when val
-                            (decode-coding-string val 'utf-8)))))
+                            (tramp-rpc--binary-bytes val)))))
                 result)))))
 
 (defun tramp-rpc-magit--ancestor-scan-cache-key (directory)
@@ -1533,9 +1538,11 @@ the server scans the entire tree in one operation."
     (if entry
         (if (cdr entry)
             (let ((found-dir (directory-file-name (cdr entry)))
-                  (candidate-dir (directory-file-name
-                                  (file-name-directory
-                                   (tramp-file-local-name expanded)))))
+                  (candidate-dir
+                   (directory-file-name
+                    (file-name-directory
+                     (tramp-rpc--path-to-bytes
+                      (tramp-file-local-name expanded))))))
               (cond
                ((string= found-dir candidate-dir) t)
                ;; The closest hit proves there is no matching marker below
