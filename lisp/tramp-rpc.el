@@ -560,16 +560,6 @@ proxy hops remain."
 (defvar tramp-rpc-magit--debug)
 (defvar tramp-rpc-magit--process-caches)
 
-(defvar tramp-rpc--readonly-programs
-  '("git" "ls" "cat" "find" "grep" "rg" "test" "stat" "head" "tail"
-    "wc" "sort" "uniq" "diff" "comm" "file" "readlink" "realpath"
-    "which" "whereis" "id" "whoami" "hostname" "uname" "env" "printenv"
-    "date" "du" "df" "free" "uptime" "ps" "top" "awk" "sed" "tr"
-    "cut" "paste" "join" "tee" "xargs" "basename" "dirname" "sha256sum"
-    "md5sum" "true" "false" "echo" "printf")
-  "Programs known to not modify the filesystem.
-Used to skip cache invalidation in `tramp-rpc-handle-process-file'.")
-
 (defgroup tramp-rpc nil
   "TRAMP backend using RPC."
   :group 'tramp)
@@ -4612,14 +4602,24 @@ ARGS contains the original function arguments."
                                    (set-buffer-multibyte nil)
                                    (insert-file-contents-literally infile)
                                    (buffer-string))))
-               (result (condition-case err
-                           (tramp-rpc--call v "process.run"
-                                            `((cmd . ,program)
-                                              (args . ,(vconcat args))
-                                              (cwd . ,localname)
-                                              (env . ,env)
-                                              ,@(when stdin-content
-                                                  `((stdin . ,stdin-content)))))
+               dispatched)
+          ;; Once dispatch is attempted, clear after every exit when Emacs says
+          ;; the command may have side effects.  This includes decoding,
+          ;; prefetch, and output-routing failures, and prevents metadata cached
+          ;; while the command ran from surviving it.
+          (unwind-protect
+              (progn
+                (setq dispatched t)
+                (let ((result
+                       (condition-case err
+                           (tramp-rpc--call
+                            v "process.run"
+                            `((cmd . ,program)
+                              (args . ,(vconcat args))
+                              (cwd . ,localname)
+                              (env . ,env)
+                              ,@(when stdin-content
+                                  `((stdin . ,stdin-content)))))
                          ;; The server marks confirmed spawn ENOENT as
                          ;; `file-missing'.  Shell-based TRAMP returns status
                          ;; 127 and leaves the diagnostic on stderr, so preserve
@@ -4628,58 +4628,55 @@ ARGS contains the original function arguments."
                           (tramp-rpc--route-process-file-output
                            destination "" (concat (error-message-string err) "\n"))
                           127))))
-          (if (eq result 127)
-              127
-            (if result
-              (let ((exit-code (alist-get 'exit_code result))
-                    (stdout (tramp-rpc--decode-output
-                             (alist-get 'stdout result)))
-                    (stderr (tramp-rpc--decode-output
-                             (alist-get 'stderr result))))
+                  (if (eq result 127)
+                      127
+                    (if result
+                        (let ((exit-code (alist-get 'exit_code result))
+                              (stdout (tramp-rpc--decode-output
+                                       (alist-get 'stdout result)))
+                              (stderr (tramp-rpc--decode-output
+                                       (alist-get 'stderr result))))
 
-                ;; Memoize uncached Magit git calls made during lazy remote
-                ;; status expansion, so repeated section washing queries don't
-                ;; pay another round-trip.
-                (when (null infile)
-                  (tramp-rpc-magit--process-cache-store
-                   program args exit-code stdout))
+                          ;; Memoize uncached Magit git calls made during lazy
+                          ;; remote status expansion.
+                          (when (null infile)
+                            (tramp-rpc-magit--process-cache-store
+                             program args exit-code stdout))
 
-                ;; Preserve Magit's ordering for status refresh: let the real
-                ;; `update-index --refresh' run, then build the read snapshot
-                ;; that subsequent status/diff/log commands may reuse.
-                (when (and (null infile)
-                           (bound-and-true-p tramp-rpc-magit--allow-process-cache)
-                           (or (string-suffix-p "/git" program)
-                               (string= "git" program))
-                           (= exit-code 0)
-                           (tramp-rpc-magit--git-cache-safe-environment-p))
-                  (let ((core-args (tramp-rpc-magit--strip-git-prefix-args args)))
-                    (when (and (equal (car core-args) "update-index")
-                               (member "--refresh" core-args))
-                      (tramp-rpc-magit--clear-status-cache-for-connection v)
-                      (tramp-rpc-magit--prefetch default-directory))))
+                          ;; Let the real `update-index --refresh' run, then
+                          ;; build the read snapshot used by later Magit calls.
+                          (when (and
+                                 (null infile)
+                                 (bound-and-true-p
+                                  tramp-rpc-magit--allow-process-cache)
+                                 (or (string-suffix-p "/git" program)
+                                     (string= "git" program))
+                                 (= exit-code 0)
+                                 (tramp-rpc-magit--git-cache-safe-environment-p))
+                            (let ((core-args
+                                   (tramp-rpc-magit--strip-git-prefix-args args)))
+                              (when (and
+                                     (equal (car core-args) "update-index")
+                                     (member "--refresh" core-args))
+                                (tramp-rpc-magit--clear-status-cache-for-connection v)
+                                (tramp-rpc-magit--prefetch default-directory))))
 
-                ;; Handle destination
-                (tramp-rpc--route-process-file-output destination stdout stderr)
+                          (tramp-rpc--route-process-file-output
+                           destination stdout stderr)
 
-                ;; Invalidate caches if the program might modify the filesystem
-                ;; and the directory isn't being watched (watched dirs get
-                ;; server-pushed invalidation)
-                (let ((program-name (file-name-nondirectory program)))
-                  (unless (or (member program-name tramp-rpc--readonly-programs)
-                              (tramp-rpc--directory-watched-p localname v))
-                    (tramp-rpc--invalidate-cache-for-path default-directory)))
-
-                ;; Handle signal strings: when
-                ;; `process-file-return-signal-string' is non-nil and exit
-                ;; code >= 128, return the signal name string instead.
-                (if (and (bound-and-true-p process-file-return-signal-string)
-                         (natnump exit-code) (>= exit-code 128))
-                    (let ((strings (tramp-rpc--get-signal-strings v)))
-                      (aref strings (- exit-code 128)))
-                  exit-code))
-            ;; A successful RPC result is always non-nil.
-            (signal 'remote-file-error (list "Empty process.run response")))))))))
+                          ;; Handle signal strings when requested by Emacs.
+                          (if (and
+                               (bound-and-true-p
+                                process-file-return-signal-string)
+                               (natnump exit-code) (>= exit-code 128))
+                              (let ((strings (tramp-rpc--get-signal-strings v)))
+                                (aref strings (- exit-code 128)))
+                            exit-code))
+                      ;; A successful RPC result is always non-nil.
+                      (signal 'remote-file-error
+                              (list "Empty process.run response"))))))
+            (when (and dispatched process-file-side-effects)
+              (tramp-rpc--clear-file-caches-for-connection v))))))))
 
 (defun tramp-rpc-handle-vc-registered (file)
   "Like `vc-registered' for TRAMP-RPC files.

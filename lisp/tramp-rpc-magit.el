@@ -1668,7 +1668,8 @@ Returns t, nil, or \\='not-cached if not in cache."
   "Advice around `magit-section-show' for lazy remote status sections.
 ORIG is the original advised function.
 SECTION is the Magit section being handled."
-  (let ((tramp-rpc-magit--allow-process-cache t))
+  (let ((tramp-rpc-magit--allow-process-cache t)
+        (process-file-side-effects nil))
     (tramp-rpc-magit--maybe-prefetch-for-section section)
     (let ((magit-diff-adjust-tab-width
            (if (and tramp-rpc-magit-disable-remote-diff-tab-width-detection
@@ -1693,6 +1694,7 @@ DIRECTORY is the directory being handled."
   (let* ((directory (or directory default-directory))
          (tramp-rpc--suppress-fs-notifications t)
          (tramp-rpc-magit--allow-process-cache t)
+         (process-file-side-effects nil)
          (tramp-rpc-magit--status-setup-prefetch-active t)
          (magit-diff-adjust-tab-width
           (if (and tramp-rpc-magit-disable-remote-diff-tab-width-detection
@@ -1718,6 +1720,7 @@ inotify events from clearing caches mid-refresh."
     (tramp-rpc-magit--clear-caches-for-directory default-directory))
   (let ((tramp-rpc--suppress-fs-notifications t)
         (tramp-rpc-magit--allow-process-cache t)
+        (process-file-side-effects nil)
         (magit-diff-adjust-tab-width
          (if (and tramp-rpc-magit-disable-remote-diff-tab-width-detection
                   (file-remote-p default-directory)
