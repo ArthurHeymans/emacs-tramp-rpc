@@ -26,6 +26,7 @@ TRAMP_TEST_SOURCE_ENV_SET="${TRAMP_TEST_SOURCE+x}"
 TRAMP_RPC_TEST_HOST_ENV="${TRAMP_RPC_TEST_HOST-}"
 TRAMP_RPC_TEST_HOST_ENV_SET="${TRAMP_RPC_TEST_HOST+x}"
 if [[ -f "$PROJECT_DIR/.config.local" ]]; then
+    # shellcheck source=/dev/null
     source "$PROJECT_DIR/.config.local"
 fi
 if [[ -n "$TRAMP_SOURCE_ENV_SET" ]]; then TRAMP_SOURCE="$TRAMP_SOURCE_ENV"; fi
@@ -34,8 +35,8 @@ if [[ -n "$TRAMP_RPC_TEST_HOST_ENV_SET" ]]; then TRAMP_RPC_TEST_HOST="$TRAMP_RPC
 
 expand_home() {
     case "$1" in
-        "~") printf '%s' "$HOME" ;;
-        "~/"*) printf '%s/%s' "$HOME" "${1#\~/}" ;;
+        \~) printf '%s' "$HOME" ;;
+        \~/*) printf '%s/%s' "$HOME" "${1#\~/}" ;;
         *) printf '%s' "$1" ;;
     esac
 }
