@@ -1291,6 +1291,10 @@ This matches the behavior expected by `tramp-test28-process-file'."
       (when (process-live-p process) (delete-process process))
       (kill-buffer buffer))))
 
+(declare-function tramp-rpc-magit--ancestor-scan-cache-key
+                  "tramp-rpc-magit" (directory))
+(declare-function tramp-rpc-magit--prune-prefetch-directories
+                  "tramp-rpc-magit" ())
 (declare-function tramp-rpc-magit--file-exists-in-ancestor-scan
                   "tramp-rpc-magit" (filename scan))
 (declare-function tramp-rpc-magit--file-exists-p
@@ -1322,11 +1326,9 @@ This matches the behavior expected by `tramp-test28-process-file'."
                   "tramp-rpc-magit" (vec))
 (defvar tramp-rpc-magit-disable-remote-diff-tab-width-detection)
 (defvar tramp-rpc-magit--allow-process-cache)
-(defvar tramp-rpc-magit--prefetch-directory)
 (defvar tramp-rpc-magit--process-caches)
-(defvar tramp-rpc-magit--ancestors-cache)
-(defvar tramp-rpc-magit--ancestors-cache-timestamp)
 (defvar tramp-rpc-magit--ancestor-scan-caches)
+(defvar tramp-rpc-magit--prefetch-directories)
 
 (defconst tramp-rpc-mock-test--tramp-rpc-magit-loaded
   (progn (require 'tramp-rpc-magit) t)
@@ -1353,11 +1355,9 @@ This matches the behavior expected by `tramp-test28-process-file'."
    'tramp-rpc--exec-path-cache
    'tramp-rpc--login-shell-cache
    'tramp-rpc-magit--process-caches
-   'tramp-rpc-magit--ancestor-scan-caches)
-  (setq tramp-rpc-magit--ancestors-cache nil
-        tramp-rpc-magit--ancestors-cache-timestamp nil
-        tramp-rpc-magit--prefetch-directory nil
-        tramp-rpc-magit--allow-process-cache nil))
+   'tramp-rpc-magit--ancestor-scan-caches
+   'tramp-rpc-magit--prefetch-directories)
+  (setq tramp-rpc-magit--allow-process-cache nil))
 
 (ert-deftest tramp-rpc-mock-test-process-write-queues-isolate-connections ()
   "Queues with the same remote PID remain isolated by RPC connection." 
@@ -2274,16 +2274,15 @@ This matches the behavior expected by `tramp-test28-process-file'."
          (tramp-rpc--connections (make-hash-table :test 'equal))
          (tramp-rpc-magit--process-caches (make-hash-table :test 'equal))
          (tramp-rpc-magit--ancestor-scan-caches (make-hash-table :test 'equal))
-         (tramp-rpc-magit--prefetch-directory
-          (tramp-make-tramp-file-name vec-b "/repo-b/"))
-         (tramp-rpc-magit--ancestors-cache '((".git" . "/repo-b")))
-         (tramp-rpc-magit--ancestors-cache-timestamp (float-time)))
+         (prefetch-b (tramp-make-tramp-file-name vec-b "/repo-b/"))
+         (tramp-rpc-magit--prefetch-directories (make-hash-table :test 'equal)))
     (unwind-protect
         (progn
           (puthash key-a 'cache-a tramp-rpc-magit--process-caches)
           (puthash key-b 'cache-b tramp-rpc-magit--process-caches)
           (puthash ancestor-a 'scan-a tramp-rpc-magit--ancestor-scan-caches)
           (puthash ancestor-b 'scan-b tramp-rpc-magit--ancestor-scan-caches)
+          (puthash prefetch-b (float-time) tramp-rpc-magit--prefetch-directories)
           (cl-letf (((symbol-function 'tramp-rpc--clear-direnv-cache) #'ignore)
                     ((symbol-function 'tramp-rpc--clear-file-caches-for-connection)
                      #'ignore))
@@ -2296,9 +2295,7 @@ This matches the behavior expected by `tramp-test28-process-file'."
           (should (eq (gethash key-b tramp-rpc-magit--process-caches) 'cache-b))
           (should (eq (gethash ancestor-b tramp-rpc-magit--ancestor-scan-caches)
                       'scan-b))
-          (should tramp-rpc-magit--ancestors-cache)
-          (should (equal tramp-rpc-magit--prefetch-directory
-                         (tramp-make-tramp-file-name vec-b "/repo-b/"))))
+          (should (gethash prefetch-b tramp-rpc-magit--prefetch-directories)))
       (when (process-live-p process) (delete-process process))
       (when (buffer-live-p buffer) (kill-buffer buffer)))))
 
@@ -2535,8 +2532,8 @@ This matches the behavior expected by `tramp-test28-process-file'."
   "Ancestor marker scans honor numeric and timestamp invalidation."
   (let* ((tramp-rpc-magit--ancestor-scan-caches
           (make-hash-table :test 'equal))
-         (tramp-rpc-magit--ancestors-cache nil)
-         (tramp-rpc-magit--prefetch-directory nil)
+         (tramp-rpc-magit--prefetch-directories
+          (make-hash-table :test 'equal))
          (tramp-rpc--cache-ttl 300)
          (vec (tramp-dissect-file-name "/rpc:mock:/repo/sub/"))
          (key (cons (tramp-rpc--connection-key-string vec) "/repo/sub/"))
@@ -2551,16 +2548,61 @@ This matches the behavior expected by `tramp-test28-process-file'."
                     'not-cached))))))
 
 (ert-deftest tramp-rpc-mock-test-prefetch-ancestor-cache-isolates-connections ()
-  "A global prefetch scan must not answer for another connection."
+  "A prefetch scan must not answer for another connection."
   (let* ((tramp-rpc-magit--ancestor-scan-caches
           (make-hash-table :test 'equal))
-         (tramp-rpc-magit--ancestors-cache '((".git" . "/repo")))
-         (tramp-rpc-magit--ancestors-cache-timestamp (float-time))
-         (tramp-rpc-magit--prefetch-directory "/rpc:host-a:/repo/sub/")
-         (tramp-rpc--cache-ttl 300))
-    (should (tramp-rpc-magit--file-exists-p "/rpc:host-a:/repo/.git"))
+         (tramp-rpc-magit--prefetch-directories
+          (make-hash-table :test 'equal))
+         (tramp-rpc--cache-ttl 300)
+         (key-a (tramp-rpc-magit--ancestor-scan-cache-key
+                 "/rpc:host-a:/repo/sub/")))
+    (puthash key-a (cons (float-time) '((".git" . "/repo")))
+             tramp-rpc-magit--ancestor-scan-caches)
+    ;; A registered prefetch directory exercises the connection scoping in
+    ;; the prefetch fallback branch as well.
+    (puthash "/rpc:host-a:/repo/" (float-time)
+             tramp-rpc-magit--prefetch-directories)
+    (should (eq (tramp-rpc-magit--file-exists-p "/rpc:host-a:/repo/.git")
+                t))
     (should (eq (tramp-rpc-magit--file-exists-p "/rpc:host-b:/repo/.git")
                 'not-cached))))
+
+(ert-deftest tramp-rpc-mock-test-prefetch-directories-prunes-expired-entries ()
+  "Expired repository registrations do not accumulate indefinitely."
+  (skip-unless tramp-rpc-mock-test--tramp-rpc-magit-loaded)
+  (let ((tramp-rpc-magit--prefetch-directories
+         (make-hash-table :test 'equal))
+        (tramp-rpc--cache-ttl 10))
+    (puthash "/rpc:mock:/stale/" (- (float-time) 20)
+             tramp-rpc-magit--prefetch-directories)
+    (puthash "/rpc:mock:/fresh/" (float-time)
+             tramp-rpc-magit--prefetch-directories)
+    (tramp-rpc-magit--prune-prefetch-directories)
+    (should-not (gethash "/rpc:mock:/stale/"
+                         tramp-rpc-magit--prefetch-directories))
+    (should (gethash "/rpc:mock:/fresh/"
+                     tramp-rpc-magit--prefetch-directories))))
+
+(ert-deftest tramp-rpc-mock-test-prefetch-scan-may-invalidate-prefetch-table ()
+  "A synchronous ancestor scan runs after prefetch-table iteration."
+  (skip-unless tramp-rpc-mock-test--tramp-rpc-magit-loaded)
+  (let ((tramp-rpc-magit--ancestor-scan-caches
+         (make-hash-table :test 'equal))
+        (tramp-rpc-magit--prefetch-directories
+         (make-hash-table :test 'equal))
+        (tramp-rpc--cache-ttl 300))
+    (puthash "/rpc:mock:/repo/" (float-time)
+             tramp-rpc-magit--prefetch-directories)
+    (cl-letf (((symbol-function
+                'tramp-rpc-magit--ancestor-scan-for-directory)
+               (lambda (_directory)
+                 ;; Model fs.events invalidation dispatched by the RPC filter.
+                 (clrhash tramp-rpc-magit--prefetch-directories)
+                 '((".git" . "/repo")))))
+      (should (eq (tramp-rpc-magit--file-exists-p "/rpc:mock:/repo/.git") t))
+      (should (= (hash-table-count
+                  tramp-rpc-magit--prefetch-directories)
+                 0)))))
 
 (ert-deftest tramp-rpc-mock-test-ancestor-scan-parent-falls-through ()
   "Closest-only ancestor scan must not cache false negatives above the hit."
@@ -2587,7 +2629,6 @@ This matches the behavior expected by `tramp-test28-process-file'."
           (vec (tramp-dissect-file-name default-directory))
           (cache (make-hash-table :test 'equal))
           (tramp-rpc-magit--process-caches (make-hash-table :test 'equal))
-          (tramp-rpc-magit--prefetch-directory default-directory)
           (process-environment (default-toplevel-value 'process-environment)))
      (cl-letf (((symbol-function 'tramp-rpc--connection-key)
                 (lambda (_vec) '("rpc" nil "mock" nil))))
@@ -2698,20 +2739,22 @@ This matches the behavior expected by `tramp-test28-process-file'."
          (other-vec (tramp-dissect-file-name "/ssh:other:/repo/"))
          (key (cons (tramp-rpc--connection-key-string vec) "/repo/"))
          (other-key (cons (tramp-rpc--connection-key-string other-vec) "/repo/"))
-         (tramp-rpc-magit--ancestors-cache '((".git" . "/repo")))
-         (tramp-rpc-magit--ancestors-cache-timestamp (float-time))
-         (tramp-rpc-magit--prefetch-directory
-          (tramp-make-tramp-file-name vec "/repo/"))
-         (tramp-rpc-magit--ancestor-scan-caches (make-hash-table :test 'equal)))
+         (directory (tramp-make-tramp-file-name vec "/repo/"))
+         (other-directory (tramp-make-tramp-file-name other-vec "/repo/"))
+         (tramp-rpc-magit--ancestor-scan-caches (make-hash-table :test 'equal))
+         (tramp-rpc-magit--prefetch-directories (make-hash-table :test 'equal)))
     (puthash key '((".git" . "/repo"))
              tramp-rpc-magit--ancestor-scan-caches)
     (puthash other-key '((".git" . "/repo"))
              tramp-rpc-magit--ancestor-scan-caches)
+    (puthash directory (float-time) tramp-rpc-magit--prefetch-directories)
+    (puthash other-directory (float-time) tramp-rpc-magit--prefetch-directories)
     (cl-letf (((symbol-function 'tramp-flush-directory-properties) #'ignore))
       (tramp-rpc--clear-file-caches-for-connection vec))
-    (should-not tramp-rpc-magit--ancestors-cache)
     (should-not (gethash key tramp-rpc-magit--ancestor-scan-caches))
-    (should (gethash other-key tramp-rpc-magit--ancestor-scan-caches))))
+    (should (gethash other-key tramp-rpc-magit--ancestor-scan-caches))
+    (should-not (gethash directory tramp-rpc-magit--prefetch-directories))
+    (should (gethash other-directory tramp-rpc-magit--prefetch-directories))))
 
 (ert-deftest tramp-rpc-mock-test-subtree-invalidation-flushes-tramp-properties ()
   "Subtree invalidation flushes descendant TRAMP file properties."
@@ -3115,9 +3158,7 @@ This matches the behavior expected by `tramp-test28-process-file'."
                              :noquery t))
          (tramp-rpc-magit--process-caches (make-hash-table :test 'equal))
          (tramp-rpc-magit--ancestor-scan-caches (make-hash-table :test 'equal))
-         (tramp-rpc-magit--ancestors-cache '((".git" . "/repo-b")))
-         (tramp-rpc-magit--ancestors-cache-timestamp (float-time))
-         (tramp-rpc-magit--prefetch-directory "/rpc:cache-b:/repo-b/")
+         (tramp-rpc-magit--prefetch-directories (make-hash-table :test 'equal))
          (tramp-rpc--file-exists-cache (make-hash-table :test 'equal))
          (tramp-rpc--file-truename-cache (make-hash-table :test 'equal))
          (tramp-rpc--file-stat-cache (make-hash-table :test 'equal))
@@ -3131,6 +3172,10 @@ This matches the behavior expected by `tramp-test28-process-file'."
           (puthash process-key-b 'process-b tramp-rpc-magit--process-caches)
           (puthash ancestor-key-a 'ancestor-a tramp-rpc-magit--ancestor-scan-caches)
           (puthash ancestor-key-b 'ancestor-b tramp-rpc-magit--ancestor-scan-caches)
+          (puthash "/rpc:cache-a:/repo-a/" (float-time)
+                   tramp-rpc-magit--prefetch-directories)
+          (puthash "/rpc:cache-b:/repo-b/" (float-time)
+                   tramp-rpc-magit--prefetch-directories)
           (process-put proc :tramp-rpc-vec vec-a)
           (puthash (tramp-rpc--connection-key vec-a) (list :process proc)
                    tramp-rpc--connections)
@@ -3147,7 +3192,10 @@ This matches the behavior expected by `tramp-test28-process-file'."
                         'process-b))
             (should (eq (gethash ancestor-key-b tramp-rpc-magit--ancestor-scan-caches)
                         'ancestor-b))
-            (should tramp-rpc-magit--ancestors-cache)
+            (should-not (gethash "/rpc:cache-a:/repo-a/"
+                                 tramp-rpc-magit--prefetch-directories))
+            (should (gethash "/rpc:cache-b:/repo-b/"
+                             tramp-rpc-magit--prefetch-directories))
 
             ;; Ordinary mutation invalidation uses the same connection scope.
             (puthash ancestor-key-a 'ancestor-a tramp-rpc-magit--ancestor-scan-caches)
@@ -6530,8 +6578,6 @@ background, which can precede the socket becoming visible."
           (should-error (tramp-rpc--connect vec) :type 'remote-file-error)
           (should (= establish-calls 1)))
       (delete-directory controlmaster-dir t))))
-
-
 
 (ert-deftest tramp-rpc-mock-test-password-string-unwraps-auth-source-entry ()
   "Normalize auth-source plist secrets before sending them to sudo -S."
