@@ -365,6 +365,76 @@
       (set-marker (mark-marker) (point-min))
       (should-not (tramp-rpc-protocol-try-read-message (current-buffer))))))
 
+(ert-deftest tramp-rpc-mock-test-protocol-rejects-trailing-frame-data ()
+  "A declared frame must contain exactly one MessagePack object."
+  (skip-unless tramp-rpc-mock-test--msgpack-available)
+  (let* ((response '((version . "2.0") (id . 1) (result . t)))
+         (payload (concat (msgpack-encode response) (unibyte-string 0)))
+         (framed (tramp-rpc-protocol--length-prefix payload)))
+    (with-temp-buffer
+      (set-buffer-multibyte nil)
+      (insert framed)
+      (set-marker (mark-marker) (point-min))
+      (should-error
+       (tramp-rpc-protocol-try-read-message (current-buffer)))
+      (should (= (mark-marker) (point-min))))))
+
+(ert-deftest tramp-rpc-mock-test-protocol-rejects-oversized-frame ()
+  "Reject oversized declared frames before buffering their payload."
+  (skip-unless tramp-rpc-mock-test--msgpack-available)
+  (with-temp-buffer
+    (set-buffer-multibyte nil)
+    (insert (msgpack-unsigned-to-bytes
+             (1+ tramp-rpc-protocol-max-frame-size) 4))
+    (set-marker (mark-marker) (point-min))
+    (should-error
+     (tramp-rpc-protocol-try-read-message (current-buffer)))))
+
+(ert-deftest tramp-rpc-mock-test-protocol-rejects-oversized-request ()
+  "Reject an oversized request before it reaches the transport."
+  (skip-unless tramp-rpc-mock-test--msgpack-available)
+  (let ((tramp-rpc-protocol-max-frame-size 32)
+        (tramp-rpc-protocol--request-id 0)
+        (tramp-rpc-protocol--deferred-poll-messages
+         (make-hash-table :test 'eql)))
+    (should-error
+     (tramp-rpc-protocol-encode-request-with-id
+      "process.read" `((padding . ,(make-string 64 ?x))))
+     :type 'tramp-rpc-protocol-frame-too-large)
+    (should-not (gethash 1 tramp-rpc-protocol--deferred-poll-messages))))
+
+(ert-deftest tramp-rpc-mock-test-protocol-filter-fails-malformed-connection ()
+  "Malformed input is contained by the filter and retires the transport."
+  (skip-unless tramp-rpc-mock-test--msgpack-available)
+  (let* ((buffer (generate-new-buffer " *tramp-rpc-malformed-filter*"))
+         (process (make-process :name "tramp-rpc-malformed-filter"
+                                :buffer buffer
+                                :command '("cat")
+                                :connection-type 'pipe
+                                :coding 'binary
+                                :noquery t))
+         (vec (tramp-dissect-file-name "/rpc:mock:/"))
+         cleaned)
+    (unwind-protect
+        (progn
+          (with-current-buffer buffer
+            (set-buffer-multibyte nil)
+            (set-marker (mark-marker) (point-min)))
+          (process-put process :tramp-rpc-vec vec)
+          (cl-letf (((symbol-function 'tramp-rpc--cleanup-connection-generation)
+                     (lambda (clean-process clean-vec event reason &rest _)
+                       (setq cleaned (list clean-process clean-vec event reason)))))
+            (tramp-rpc--connection-filter
+             process
+             (msgpack-unsigned-to-bytes
+              (1+ tramp-rpc-protocol-max-frame-size) 4)))
+          (should (eq (nth 0 cleaned) process))
+          (should (equal (nth 1 cleaned) vec))
+          (should (eq (nth 3 cleaned) :protocol-error))
+          (should-not (process-live-p process)))
+      (when (process-live-p process) (delete-process process))
+      (when (buffer-live-p buffer) (kill-buffer buffer)))))
+
 ;;; ============================================================================
 ;;; MessagePack-RPC ID Generation Tests
 ;;; ============================================================================
@@ -380,8 +450,8 @@
         (puthash id t ids)))))
 
 (ert-deftest tramp-rpc-mock-test-runner-protocol-selector ()
-  "The protocol runner selector covers the nine protocol regressions."
-  (should (= (length (ert-select-tests "^tramp-rpc-mock-test-protocol" t)) 9)))
+  "The protocol runner selector covers the protocol regressions."
+  (should (= (length (ert-select-tests "^tramp-rpc-mock-test-protocol" t)) 13)))
 
 ;;; ============================================================================
 ;;; Mode String Conversion Tests
@@ -2395,7 +2465,7 @@ This matches the behavior expected by `tramp-test28-process-file'."
           (set-file-modes wrapper #o755)
           (with-temp-file skipped
             (insert "(require 'ert)\n"
-                    "(dotimes (n 9)\n"
+                    "(dotimes (n 13)\n"
                     "  (eval `(ert-deftest ,(intern (format \"tramp-rpc-mock-test-protocol-skip-%d\" n)) () (ert-skip \"simulated\"))))\n"))
           (with-temp-file empty (insert "(require 'ert)\n"))
           (make-directory (expand-file-name "lisp" unsupported) t)
@@ -2422,7 +2492,7 @@ This matches the behavior expected by `tramp-test28-process-file'."
             (pcase-let ((`(,status ,output) (run skipped supported-source)))
               (should (/= status 0))
               (should (string-match-p
-                       "ERT counts: selected=9 executed=0 skipped=9" output)))
+                       "ERT counts: selected=13 executed=0 skipped=13" output)))
             (pcase-let ((`(,status ,output) (run empty supported-source)))
               (should (/= status 0))
               (should (string-match-p "selected zero tests" output)))

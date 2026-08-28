@@ -33,6 +33,12 @@
 (defvar tramp-rpc-protocol--message-target nil
   "TRAMP vector or process used for level-6 protocol debug messages.")
 
+(defconst tramp-rpc-protocol-max-frame-size (* 100 1024 1024)
+  "Largest MessagePack frame accepted from or sent to the RPC server.")
+
+(define-error 'tramp-rpc-protocol-frame-too-large
+  "TRAMP-RPC MessagePack frame exceeds the configured limit")
+
 (defvar tramp-rpc-protocol--deferred-poll-messages (make-hash-table :test 'eql)
   "Idle polling requests awaiting a response, keyed by request ID.
 Each value is a cons cell containing the target connection and request.")
@@ -95,7 +101,13 @@ Returns a cons cell (ID . BYTES) for pipelining support."
                     (id . ,id)
                     (method . ,method)
                     (params . ,params)))
-         (payload (msgpack-encode request)))
+         (payload (msgpack-encode request))
+         (payload-size (length payload)))
+    (when (> payload-size tramp-rpc-protocol-max-frame-size)
+      (signal 'tramp-rpc-protocol-frame-too-large
+              (list (format "RPC request %s is %d bytes; maximum is %d"
+                            method payload-size
+                            tramp-rpc-protocol-max-frame-size))))
     ;; Idle process reads are continuous long polls.  Defer their request log
     ;; until the response is known so empty polls produce no debug noise while
     ;; output, exits, and errors still retain the complete request/response pair.
@@ -105,19 +117,27 @@ Returns a cons cell (ID . BYTES) for pipelining support."
       (tramp-rpc-protocol--message request))
     (cons id (tramp-rpc-protocol--length-prefix payload))))
 
-(defun tramp-rpc-protocol-decode-response (buffer start)
-  "Decode a MessagePack-RPC response or notification from BUFFER at START.
+(defun tramp-rpc-protocol-decode-response (buffer start &optional end)
+  "Decode a MessagePack-RPC response or notification in BUFFER from START.
 START is the buffer position of the encoded object.
+When END is non-nil, require the MessagePack object to consume exactly the
+bounded frame ending there.
 Returns a plist with :id, :result, and :error keys for responses.
 For server-initiated notifications (no :id, has :method), returns a plist
 with :notification t, :method, and :params keys."
   (let* ((response
 	  (with-current-buffer buffer
-	    (goto-char start)
-	    (msgpack-read :map-type 'alist
-                          :key-type 'symbol
-                          :array-type 'list
-                          :bin-type 'msgpack-bin)))
+	    (save-restriction
+	      (when end
+		(narrow-to-region start end))
+	      (goto-char start)
+	      (prog1
+		  (msgpack-read :map-type 'alist
+                                :key-type 'symbol
+                                :array-type 'list
+                                :bin-type 'msgpack-bin)
+		(when (and end (/= (point) (point-max)))
+		  (error "Trailing data in MessagePack frame"))))))
          (id (alist-get 'id response))
          (method (alist-get 'method response))
          (result
@@ -197,10 +217,15 @@ MESSAGE if a complete message is available, where MESSAGE is the decoded
 response plist.  Returns nil if no complete message yet."
   (with-current-buffer buffer
     (when-let* ((start (+ (mark-marker) 4))
-		(len (tramp-rpc-protocol-read-length buffer))
-		((>= (point-max) (+ start len))))
-      (set-marker (mark-marker) (+ start len))
-      (tramp-rpc-protocol-decode-response buffer start))))
+		(len (tramp-rpc-protocol-read-length buffer)))
+      (when (> len tramp-rpc-protocol-max-frame-size)
+	(error "RPC frame length %d exceeds maximum %d"
+	       len tramp-rpc-protocol-max-frame-size))
+      (let ((end (+ start len)))
+	(when (>= (point-max) end)
+	  (prog1 (tramp-rpc-protocol-decode-response buffer start end)
+	    ;; Commit the framing cursor only after successful exact decoding.
+	    (set-marker (mark-marker) end)))))))
 
 ;; ============================================================================
 ;; Batch request support

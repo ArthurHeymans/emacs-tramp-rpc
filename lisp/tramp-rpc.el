@@ -1986,7 +1986,7 @@ the underlying SSH ControlMaster may be half-open after a network interruption."
 Handles async responses by dispatching to registered callbacks.
 Uses length-prefixed binary framing: <4-byte BE length><msgpack payload>."
   (let ((buffer (process-buffer process))
-	response)
+        response)
     (when (buffer-live-p buffer)
       (with-current-buffer buffer
         ;; Append output to buffer
@@ -1997,43 +1997,65 @@ Uses length-prefixed binary framing: <4-byte BE length><msgpack payload>."
         ;; Process complete messages
         (goto-char (point-min))
         (let ((tramp-rpc-protocol--message-target process))
-          (while (setq response (tramp-rpc-protocol-try-read-message buffer))
-            ;; Replace buffer contents with remaining data
-            (delete-region (point-min) (mark-marker))
-            (goto-char (point-min))
-            ;; Check for server-initiated notification (no id, has method)
-            (if (plist-get response :notification)
-                (tramp-rpc--handle-notification
-                 process
-                 (plist-get response :method)
-                 (plist-get response :params))
-              ;; A cleaned generation may still receive buffered output.  Its
-              ;; injected transport-death errors belong to live waiters and
-              ;; must not be overwritten by those late normal responses.
-              (unless (or (process-get process :tramp-rpc-transport-cleaned)
-                          (process-get process :tramp-rpc-transport-dead))
-                (let* ((id (plist-get response :id))
-                       (callback (gethash id tramp-rpc--async-callbacks)))
-                  (if callback
-                      (progn
-                        (tramp-rpc--debug "FILTER dispatching async id=%s" id)
-                        (remhash id tramp-rpc--async-callbacks)
-                        (remhash id tramp-rpc--async-callback-processes)
-                        (condition-case callback-error
-                            (funcall callback response)
-                          (error
-                           ;; One client callback must not strand complete
-                           ;; responses already buffered behind its frame.
-                           (tramp-rpc--debug
-                            "async response callback failed for id=%s: %S"
-                            id callback-error))))
-                    ;; Store only responses for this transport's live waiters.
-                    ;; Late responses from an abandoned generation are discarded.
-                    (when (member id (process-get process :tramp-rpc-pending-ids))
-                      (tramp-rpc--debug "FILTER storing sync response id=%s" id)
-                      (puthash id response
-                               (tramp-rpc--get-pending-responses
-                                (process-buffer process))))))))))))))
+          (while
+              (condition-case protocol-error
+                  (setq response
+                        (tramp-rpc-protocol-try-read-message buffer))
+                (error
+                 ;; A malformed or incorrectly framed response makes stream
+                 ;; reuse unsafe.  Fail the generation immediately instead of
+                 ;; allowing an error in the process filter to strand pending
+                 ;; callers.
+                 (let* ((vec (process-get process :tramp-rpc-vec))
+                        (event (format "RPC protocol error: %s"
+                                       (error-message-string protocol-error))))
+                   (tramp-rpc--debug "%s" event)
+                   (when vec
+                     (tramp-rpc--cleanup-connection-generation
+                      process vec event :protocol-error nil))
+                   (when (process-live-p process)
+                     (delete-process process)))
+                 nil))
+                ;; Replace buffer contents with remaining data.
+                (delete-region (point-min) (mark-marker))
+                (goto-char (point-min))
+                ;; Check for server-initiated notification (no id, has method).
+                (if (plist-get response :notification)
+                    (tramp-rpc--handle-notification
+                     process
+                     (plist-get response :method)
+                     (plist-get response :params))
+                  ;; A cleaned generation may still receive buffered output.
+                  ;; Its injected transport-death errors belong to live waiters
+                  ;; and must not be overwritten by late normal responses.
+                  (unless (or (process-get process :tramp-rpc-transport-cleaned)
+                              (process-get process :tramp-rpc-transport-dead))
+                    (let* ((id (plist-get response :id))
+                           (callback (gethash id tramp-rpc--async-callbacks)))
+                      (if callback
+                          (progn
+                            (tramp-rpc--debug
+                             "FILTER dispatching async id=%s" id)
+                            (remhash id tramp-rpc--async-callbacks)
+                            (remhash id tramp-rpc--async-callback-processes)
+                            (condition-case callback-error
+                                (funcall callback response)
+                              (error
+                               ;; One client callback must not strand complete
+                               ;; responses already buffered behind its frame.
+                               (tramp-rpc--debug
+                                "async response callback failed for id=%s: %S"
+                                id callback-error))))
+                        ;; Store only responses for this transport's live
+                        ;; waiters.  Late responses from an abandoned
+                        ;; generation are discarded.
+                        (when (member
+                               id (process-get process :tramp-rpc-pending-ids))
+                          (tramp-rpc--debug
+                           "FILTER storing sync response id=%s" id)
+                          (puthash id response
+                                   (tramp-rpc--get-pending-responses
+                                    (process-buffer process))))))))))))))
 
 (defun tramp-rpc--call-async (vec method params callback &optional connection)
   "Call METHOD with PARAMS asynchronously on the RPC server for VEC.
