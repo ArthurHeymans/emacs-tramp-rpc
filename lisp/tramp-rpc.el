@@ -4335,17 +4335,30 @@ VEC is the TRAMP connection vector."
 ;; ACL Support
 ;; ============================================================================
 
+(defun tramp-rpc--cached-capability-probe (vec property command args)
+  "Return cached capability PROPERTY for VEC, probing COMMAND with ARGS.
+PROPERTY must start with a space so TRAMP keeps it ephemeral.  Successful
+probes cache both enabled and disabled results.  Transport and RPC errors
+return nil without caching so a later operation can retry."
+  (let* ((missing (make-symbol "missing"))
+         (cached (tramp-get-connection-property vec property missing)))
+    (if (not (eq cached missing))
+        cached
+      (condition-case nil
+          (let* ((result (tramp-rpc--call vec "process.run"
+                                          `((cmd . ,command)
+                                            (args . ,args)
+                                            (cwd . "/"))))
+                 (enabled (zerop (alist-get 'exit_code result))))
+            (tramp-set-connection-property vec property enabled)
+            enabled)
+        (error nil)))))
+
 (defun tramp-rpc--acl-enabled-p (vec)
   "Check if ACL is available on the remote host VEC.
-Caches the result for efficiency."
-  ;; Check if getfacl exists and works
-  (condition-case nil
-      (let ((result (tramp-rpc--call vec "process.run"
-                                     `((cmd . "getfacl")
-                                       (args . ["--version"])
-                                       (cwd . "/")))))
-        (zerop (alist-get 'exit_code result)))
-    (error nil)))
+Cache successful probe results for the connection lifetime."
+  (tramp-rpc--cached-capability-probe
+   vec " rpc-acl-enabled" "getfacl" ["--version"]))
 
 (defun tramp-rpc-handle-file-acl (filename)
   "Like `file-acl' for TRAMP-RPC files.
@@ -4387,14 +4400,10 @@ Returns t on success, nil on failure."
 ;; ============================================================================
 
 (defun tramp-rpc--selinux-enabled-p (vec)
-  "Check if SELinux is enabled on the remote host VEC."
-  (condition-case nil
-      (let ((result (tramp-rpc--call vec "process.run"
-                                     `((cmd . "selinuxenabled")
-                                       (args . [])
-                                       (cwd . "/")))))
-        (zerop (alist-get 'exit_code result)))
-    (error nil)))
+  "Check if SELinux is enabled on the remote host VEC.
+Cache successful probe results for the connection lifetime."
+  (tramp-rpc--cached-capability-probe
+   vec " rpc-selinux-enabled" "selinuxenabled" []))
 
 (defun tramp-rpc-handle-file-selinux-context (filename)
   "Like `file-selinux-context' for TRAMP-RPC files.

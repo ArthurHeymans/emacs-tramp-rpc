@@ -6579,6 +6579,44 @@ background, which can precede the socket becoming visible."
           (should (= establish-calls 1)))
       (delete-directory controlmaster-dir t))))
 
+(ert-deftest tramp-rpc-mock-test-capability-probes-retry-only-transient-errors ()
+  "Capability probes retry RPC errors but cache successful negative results."
+  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
+  (let ((vec (tramp-dissect-file-name "/rpc:capabilities:/"))
+        (acl-calls 0)
+        (selinux-calls 0))
+    (unwind-protect
+        (cl-letf (((symbol-function 'tramp-rpc--call)
+                   (lambda (_vec method params)
+                     (should (equal method "process.run"))
+                     (pcase (alist-get 'cmd params)
+                       ("getfacl"
+                        (setq acl-calls (1+ acl-calls))
+                        (if (= acl-calls 1)
+                            (signal 'remote-file-error '("temporary failure"))
+                          '((exit_code . 0))))
+                       ("selinuxenabled"
+                        (setq selinux-calls (1+ selinux-calls))
+                        '((exit_code . 1)))
+                       (command
+                        (ert-fail (format "Unexpected capability probe: %S"
+                                          command)))))))
+          (should-not (tramp-rpc--acl-enabled-p vec))
+          (should (tramp-rpc--acl-enabled-p vec))
+          (should (tramp-rpc--acl-enabled-p vec))
+          (should (= acl-calls 2))
+          (should (tramp-get-connection-property
+                   vec " rpc-acl-enabled" nil))
+          (should-not (tramp-get-connection-property
+                       vec "rpc-acl-enabled" nil))
+          (should-not (tramp-rpc--selinux-enabled-p vec))
+          (should-not (tramp-rpc--selinux-enabled-p vec))
+          (should (= selinux-calls 1))
+          (should (eq (tramp-get-connection-property
+                       vec " rpc-selinux-enabled" t)
+                      nil)))
+      (tramp-flush-connection-properties vec))))
+
 (ert-deftest tramp-rpc-mock-test-password-string-unwraps-auth-source-entry ()
   "Normalize auth-source plist secrets before sending them to sudo -S."
   :tags '(:sudo)
