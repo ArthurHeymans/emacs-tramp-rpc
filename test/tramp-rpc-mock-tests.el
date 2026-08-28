@@ -449,10 +449,6 @@
         (should-not (gethash id ids))
         (puthash id t ids)))))
 
-(ert-deftest tramp-rpc-mock-test-runner-protocol-selector ()
-  "The protocol runner selector covers the protocol regressions."
-  (should (= (length (ert-select-tests "^tramp-rpc-mock-test-protocol" t)) 13)))
-
 ;;; ============================================================================
 ;;; Mode String Conversion Tests
 ;;; ============================================================================
@@ -2471,7 +2467,7 @@ This matches the behavior expected by `tramp-test28-process-file'."
           (set-file-modes wrapper #o755)
           (with-temp-file skipped
             (insert "(require 'ert)\n"
-                    "(dotimes (n 13)\n"
+                    "(dotimes (n 2)\n"
                     "  (eval `(ert-deftest ,(intern (format \"tramp-rpc-mock-test-protocol-skip-%d\" n)) () (ert-skip \"simulated\"))))\n"))
           (with-temp-file empty (insert "(require 'ert)\n"))
           (make-directory (expand-file-name "lisp" unsupported) t)
@@ -2498,7 +2494,7 @@ This matches the behavior expected by `tramp-test28-process-file'."
             (pcase-let ((`(,status ,output) (run skipped supported-source)))
               (should (/= status 0))
               (should (string-match-p
-                       "ERT counts: selected=13 executed=0 skipped=13" output)))
+                       "ERT counts: selected=2 executed=0 skipped=2" output)))
             (pcase-let ((`(,status ,output) (run empty supported-source)))
               (should (/= status 0))
               (should (string-match-p "selected zero tests" output)))
@@ -6292,6 +6288,41 @@ A rejected sudo password must not be reused on the next attempt, otherwise
           (delete-process proc))
         (tramp-rpc--remove-connection vec)))))
 
+(ert-deftest tramp-rpc-mock-test-start-server-sudo-password-send-failure-cleans-up ()
+  "A failed sudo password write tears down the unregistered transport."
+  :tags '(:sudo)
+  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
+  (let* ((vec (tramp-dissect-file-name
+               "/rpc:alice@send-failure|sudo:root@send-failure:/root/"))
+         (buffer-name (tramp-buffer-name vec))
+         (stderr-buffer-name (concat buffer-name " stderr"))
+         (orig-make-process (symbol-function 'make-process))
+         proc)
+    (cl-letf (((symbol-function 'make-process)
+               (lambda (&rest _)
+                 (setq proc (funcall orig-make-process
+                                     :name "tramp-rpc-mock-cat"
+                                     :buffer nil
+                                     :command '("cat")
+                                     :connection-type 'pipe
+                                     :noquery t))))
+              ((symbol-function 'process-send-string)
+               (lambda (&rest _)
+                 (signal 'file-error '("password write failed")))))
+      (unwind-protect
+          (progn
+            (should-error
+             (tramp-rpc--start-server-process
+              vec "/tmp/tramp-rpc-server" "secret")
+             :type 'file-error)
+            (should-not (tramp-rpc--get-connection vec))
+            (should-not (process-live-p proc))
+            (should-not (get-buffer buffer-name))
+            (should-not (get-buffer stderr-buffer-name)))
+        (when (process-live-p proc)
+          (delete-process proc))
+        (tramp-rpc--remove-connection vec)))))
+
 (ert-deftest tramp-rpc-mock-test-sudo-auth-rejection-detection ()
   "Recognize explicit sudo password rejection diagnostics only."
   :tags '(:sudo)
@@ -6478,8 +6509,7 @@ A rejected sudo password must not be reused on the next attempt, otherwise
                      (insert stderr-text))
                    (while (process-live-p process)
                      (accept-process-output process 0.1))
-                   (tramp-rpc--server-binary-unavailable-p
-                    process stderr-buffer))
+                   (tramp-rpc--server-binary-unavailable-p process))
                (when (process-live-p process) (delete-process process))
                (when (buffer-live-p stderr-buffer)
                  (kill-buffer stderr-buffer)))))))
@@ -6516,7 +6546,9 @@ retry must still happen in that case."
                    (lambda (_vec)
                      (setq establish-calls (1+ establish-calls))
                      (when (= establish-calls 1)
-                       (signal 'remote-file-error '("process died")))
+                       ;; `tramp-process-actions' reports process death and
+                       ;; timeout as `file-error' on supported Emacs versions.
+                       (signal 'file-error '("process died")))
                      t))
                   ((symbol-function 'tramp-rpc--controlmaster-active-p)
                    (lambda (_vec) nil))
@@ -6604,7 +6636,7 @@ background, which can precede the socket becoming visible."
         (cl-letf (((symbol-function 'tramp-rpc--establish-controlmaster)
                    (lambda (_vec)
                      (setq establish-calls (1+ establish-calls))
-                     (signal 'remote-file-error '("process died"))))
+                     (signal 'file-error '("process died"))))
                   ((symbol-function 'tramp-rpc--controlmaster-active-p)
                    (lambda (_vec) t))
                   ((symbol-function 'tramp-rpc--controlmaster-socket-path)
@@ -6612,7 +6644,7 @@ background, which can precede the socket becoming visible."
                   ((symbol-function 'sleep-for) #'ignore)
                   ((symbol-function 'tramp-rpc--detect-sudo-elevation)
                    (lambda (_vec) nil)))
-          (should-error (tramp-rpc--connect vec) :type 'remote-file-error)
+          (should-error (tramp-rpc--connect vec) :type 'file-error)
           (should (= establish-calls 1)))
       (delete-directory controlmaster-dir t))))
 

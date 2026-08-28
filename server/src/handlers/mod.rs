@@ -215,7 +215,6 @@ fn current_groups() -> std::io::Result<Vec<libc::gid_t>> {
     }
 }
 
-/// Get groups for the current user
 /// Get groups for the current user without NSS lookups on a Tokio worker.
 async fn system_groups() -> HandlerResult {
     tokio::task::spawn_blocking(|| {

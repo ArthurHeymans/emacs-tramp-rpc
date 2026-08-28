@@ -1646,7 +1646,7 @@ Returns non-nil on success."
             (kill-buffer buffer))))
       success)))
 
-(defun tramp-rpc--server-binary-unavailable-p (process _stderr-buffer)
+(defun tramp-rpc--server-binary-unavailable-p (process)
   "Return non-nil when PROCESS reports a remote exec failure.
 A missing or non-executable remote binary is reported by the remote shell as
 127 or 126, which ssh propagates.  Do not infer this from free-form stderr:
@@ -1754,24 +1754,26 @@ Returns the connection plist.  Signals `remote-file-error' on failure."
            :filter #'tramp-rpc--connection-filter
            :sentinel #'tramp-rpc--connection-sentinel))
 
-    ;; If sudo is reading the password from stdin, send it before the RPC
-    ;; server starts.  sudo consumes this line; after exec, the same pipe
-    ;; carries MessagePack-RPC frames to the server.
-    (when sudo-password
-      (process-send-string process (concat sudo-password "\n")))
-
-    ;; Store connection
-    (tramp-rpc--set-connection vec process buffer stderr-buffer)
-
-    ;; Store vec on the process so notifications can identify the connection
-    ;; and install the generation sentinel before the first RPC can be sent.
-    (process-put process :tramp-rpc-vec vec)
-    (process-put process :tramp-rpc-buffer buffer)
-    (process-put process 'tramp-vector vec)
-    (tramp-rpc--install-connection-sentinel process vec)
-
     (condition-case start-error
         (progn
+          ;; If sudo is reading the password from stdin, send it before the RPC
+          ;; server starts.  sudo consumes this line; after exec, the same pipe
+          ;; carries MessagePack-RPC frames to the server.  Keep this inside the
+          ;; startup cleanup region because the transport can exit before the
+          ;; password write is accepted.
+          (when sudo-password
+            (process-send-string process (concat sudo-password "\n")))
+
+          ;; Store connection.
+          (tramp-rpc--set-connection vec process buffer stderr-buffer)
+
+          ;; Store vec on the process so notifications can identify the connection
+          ;; and install the generation sentinel before the first RPC can be sent.
+          (process-put process :tramp-rpc-vec vec)
+          (process-put process :tramp-rpc-buffer buffer)
+          (process-put process 'tramp-vector vec)
+          (tramp-rpc--install-connection-sentinel process vec)
+
           ;; Wait for server to be ready by sending a ping, and seed the
           ;; connection-local system.info cache for later uid/gid/home/shell
           ;; lookups.  Tear down a failed transport before retrying.
@@ -1806,7 +1808,7 @@ Returns the connection plist.  Signals `remote-file-error' on failure."
           (tramp-rpc--get-connection vec))
       ((quit error)
        (let ((binary-unavailable
-              (tramp-rpc--server-binary-unavailable-p process stderr-buffer))
+              (tramp-rpc--server-binary-unavailable-p process))
              (sudo-auth-rejected
               (and sudo-password
                    (tramp-rpc--sudo-auth-rejected-p stderr-buffer))))
@@ -1868,7 +1870,7 @@ accidentally routing file operations through tramp-sh."
   (when tramp-rpc-use-controlmaster
     (condition-case err
         (tramp-rpc--establish-controlmaster vec)
-      (remote-file-error
+      ((file-error remote-file-error)
        ;; A stale ControlMaster socket can make OpenSSH exit immediately while
        ;; TRAMP reports only a generic connection failure.  Remove the socket
        ;; and retry once before surfacing the error.  Retry likewise when no
@@ -1884,7 +1886,7 @@ accidentally routing file operations through tramp-sh."
            (sleep-for 0.1)
            (condition-case nil
                (tramp-rpc--establish-controlmaster vec)
-             (remote-file-error
+             ((file-error remote-file-error)
               (signal (car err) (cdr err)))))))))
   (let* ((sudo-ssh-user (tramp-rpc--detect-sudo-elevation vec))
          ;; TRAMP's sudo method opens an elevated backend connection.  For the
@@ -4697,6 +4699,10 @@ ARGS contains the original function arguments."
                       ;; A successful RPC result is always non-nil.
                       (signal 'remote-file-error
                               (list "Empty process.run response"))))))
+            ;; Any external command may mutate the filesystem, and watcher
+            ;; delivery is asynchronous.  Honor Emacs' conservative default;
+            ;; callers with a proven read-only scope can bind
+            ;; `process-file-side-effects' to nil.
             (when (and dispatched process-file-side-effects)
               (tramp-rpc--clear-file-caches-for-connection v))))))))
 
