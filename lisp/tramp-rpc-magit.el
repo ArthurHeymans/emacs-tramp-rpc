@@ -51,6 +51,7 @@
 (declare-function tramp-rpc--canonical-watch-active-p "tramp-rpc")
 (declare-function tramp-rpc--file-notify-alias-paths "tramp-rpc")
 (declare-function tramp-rpc--file-notify-dispatch "tramp-rpc")
+(declare-function tramp-rpc--file-notify-dispatch-rescan "tramp-rpc")
 (declare-function tramp-rpc--watch-entry-canonical-directory "tramp-rpc")
 
 ;; Functions from tramp-cache.el.
@@ -454,8 +455,13 @@ DIRECTORY itself returns the empty string.  Descendants can contain slashes."
       (when-let* ((vec (process-get process :tramp-rpc-vec))
                   (connection (tramp-rpc--get-connection vec))
                   ((eq process (plist-get connection :process))))
-        (unless tramp-rpc--suppress-fs-notifications
+        (when (or (not tramp-rpc--suppress-fs-notifications)
+                  (cl-some (lambda (event)
+                             (equal (alist-get 'action event) "rescan"))
+                           events))
           ;; Git state changed on this transport, not every remote connection.
+          ;; A rescan means concrete events were lost, so it must invalidate
+          ;; status state even while ordinary notification handling is suppressed.
           (tramp-rpc-magit--clear-status-cache-for-connection vec))
         (let (renamed-pairs)
           ;; Linux/inotify can report the same rename as both a combined pair
@@ -484,8 +490,14 @@ DIRECTORY itself returns the empty string.  Descendants can contain slashes."
                           renamed-pairs))))
               (when (and (stringp action) (not duplicate-tracked-rename))
                 (if (string= action "rescan")
-                    (unless tramp-rpc--suppress-fs-notifications
-                      (tramp-rpc--clear-file-caches-for-connection vec))
+                    (progn
+                      ;; A rescan means concrete paths were dropped, including
+                      ;; potentially unrelated changes that the suppressed
+                      ;; operation will not invalidate itself.
+                      (tramp-rpc--clear-file-caches-for-connection vec)
+                      ;; Public file-notify consumers still need a conservative
+                      ;; event for the dropped paths.
+                      (tramp-rpc--file-notify-dispatch-rescan process))
                   (when path
                     ;; File notifications are deliberately not suppressed by
                     ;; `tramp-rpc--suppress-fs-notifications': that variable only

@@ -1308,6 +1308,10 @@ This matches the behavior expected by `tramp-test28-process-file'."
 (declare-function tramp-rpc-magit--cache-file-truename "tramp-rpc-magit" (vec localname result))
 (declare-function tramp-rpc-handle-magit-status-setup-buffer "tramp-rpc-magit" (&optional directory))
 (declare-function tramp-rpc-handle-dired-compress-file "tramp-rpc" (file))
+(declare-function tramp-rpc--file-notify-dispatch-rescan
+                  "tramp-rpc" (connection-process))
+(declare-function tramp-rpc--acl-enabled-p "tramp-rpc" (vec))
+(declare-function tramp-rpc--selinux-enabled-p "tramp-rpc" (vec))
 (declare-function tramp-rpc-handle-file-regular-p "tramp-rpc" (filename))
 (declare-function tramp-rpc--clear-file-caches-for-connection "tramp-rpc-magit" (vec))
 (declare-function tramp-rpc--invalidate-cache-for-subtree "tramp-rpc-magit" (directory))
@@ -2881,7 +2885,7 @@ This matches the behavior expected by `tramp-test28-process-file'."
         (tramp-rpc--delete-file-notify-descriptor-process descriptor)))))
 
 (ert-deftest tramp-rpc-mock-test-file-notify-suppression-still-dispatches ()
-  "fs.events suppression skips cache work but still dispatches file notifications."
+  "Suppression skips concrete cache work, but rescans invalidate all state."
   (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
   (let* ((vec (tramp-dissect-file-name "/rpc:mock:/tmp/"))
          (proc (make-process :name "tramp-rpc-fs-events-test"
@@ -2891,7 +2895,9 @@ This matches the behavior expected by `tramp-test28-process-file'."
                              :noquery t))
          (status-clears 0)
          (invalidations nil)
+         (connection-clears nil)
          (dispatches nil)
+         (rescans nil)
          (tramp-rpc--suppress-fs-notifications t))
     (unwind-protect
         (progn
@@ -2902,15 +2908,22 @@ This matches the behavior expected by `tramp-test28-process-file'."
                      (lambda (_vec) (cl-incf status-clears)))
                     ((symbol-function 'tramp-rpc--invalidate-cache-for-path)
                      (lambda (path) (push path invalidations)))
+                    ((symbol-function 'tramp-rpc--clear-file-caches-for-connection)
+                     (lambda (clear-vec) (push clear-vec connection-clears)))
                     ((symbol-function 'tramp-rpc--file-notify-dispatch)
                      (lambda (action path &optional path1 cookie)
-                       (push (list action path path1 cookie) dispatches))))
+                       (push (list action path path1 cookie) dispatches)))
+                    ((symbol-function 'tramp-rpc--file-notify-dispatch-rescan)
+                     (lambda (rescan-process) (push rescan-process rescans))))
             (tramp-rpc--handle-notification
              proc "fs.events"
              '((events . (((action . "changed")
-                            (path . "/tmp/changed"))))))
-            (should (= status-clears 0))
+                            (path . "/tmp/changed"))
+                           ((action . "rescan"))))))
+            (should (= status-clears 1))
             (should-not invalidations)
+            (should (equal connection-clears (list vec)))
+            (should (equal rescans (list proc)))
             (should (equal dispatches
                            '(("changed" "/rpc:mock:/tmp/changed" nil nil))))))
       (when (process-live-p proc)
@@ -2929,6 +2942,7 @@ This matches the behavior expected by `tramp-test28-process-file'."
          (invalidations nil)
          (connection-clears nil)
          (dispatches nil)
+         (rescans nil)
          (tramp-rpc--suppress-fs-notifications nil))
     (unwind-protect
         (progn
@@ -2943,7 +2957,9 @@ This matches the behavior expected by `tramp-test28-process-file'."
                      (lambda (clear-vec) (push clear-vec connection-clears)))
                     ((symbol-function 'tramp-rpc--file-notify-dispatch)
                      (lambda (action path &optional path1 cookie)
-                       (push (list action path path1 cookie) dispatches))))
+                       (push (list action path path1 cookie) dispatches)))
+                    ((symbol-function 'tramp-rpc--file-notify-dispatch-rescan)
+                     (lambda (rescan-process) (push rescan-process rescans))))
             (tramp-rpc--handle-notification
              proc "fs.events"
              '((events . (((action . "changed")
@@ -2957,11 +2973,60 @@ This matches the behavior expected by `tramp-test28-process-file'."
             (should (member "/rpc:mock:/tmp/old" invalidations))
             (should (member "/rpc:mock:/tmp/new" invalidations))
             (should (equal connection-clears (list vec)))
+            (should (equal rescans (list proc)))
             (should (equal (nreverse dispatches)
                            '(("changed" "/rpc:mock:/tmp/changed" nil nil)
                              ("renamed" "/rpc:mock:/tmp/old" "/rpc:mock:/tmp/new" nil))))))
       (when (process-live-p proc)
         (delete-process proc)))))
+
+(ert-deftest tramp-rpc-mock-test-file-notify-rescan-dispatches-live-generation-only ()
+  "Rescan events target only selected live descriptors on their generation."
+  (let* ((connection (make-pipe-process :name "tramp-rpc-rescan-connection"
+                                        :noquery t))
+         (other (make-pipe-process :name "tramp-rpc-rescan-other" :noquery t))
+         (descriptor-change
+          (make-pipe-process :name "tramp-rpc-rescan-change" :noquery t))
+         (descriptor-attribute
+          (make-pipe-process :name "tramp-rpc-rescan-attribute" :noquery t))
+         (descriptor-other
+          (make-pipe-process :name "tramp-rpc-rescan-other-descriptor" :noquery t))
+         (descriptor-dead
+          (make-pipe-process :name "tramp-rpc-rescan-dead" :noquery t))
+         (directory "/rpc:mock:/repo/")
+         (tramp-rpc--file-notify-descriptors (make-hash-table :test 'eq))
+         events)
+    (unwind-protect
+        (progn
+          (dolist (entry `((,descriptor-change (change) ,connection)
+                           (,descriptor-attribute (attribute-change) ,connection)
+                           (,descriptor-other (change) ,other)
+                           (,descriptor-dead (change) ,connection)))
+            (puthash (nth 0 entry)
+                     (list :directory directory :flags (nth 1 entry)
+                           :connection-process (nth 2 entry))
+                     tramp-rpc--file-notify-descriptors))
+          (delete-process descriptor-dead)
+          ;; Exercise the real descriptor routing and event construction.  Only
+          ;; capture the final special-event insertion boundary.
+          (cl-letf (((symbol-function 'insert-special-event)
+                     (lambda (event) (push event events))))
+            (tramp-rpc--file-notify-dispatch-rescan connection))
+          (should (= (length events) 2))
+          (should
+           (equal
+            (sort
+             (mapcar (lambda (event)
+                       (let ((data (nth 1 event)))
+                         (list (process-name (nth 0 data))
+                               (nth 1 data) (nth 2 data))))
+                     events)
+             (lambda (left right) (string< (car left) (car right))))
+            '(("tramp-rpc-rescan-attribute" (attribute-changed) ".")
+              ("tramp-rpc-rescan-change" (changed) ".")))))
+      (dolist (process (list connection other descriptor-change
+                             descriptor-attribute descriptor-other descriptor-dead))
+        (when (process-live-p process) (delete-process process))))))
 
 (ert-deftest tramp-rpc-mock-test-retired-process-fs-events-are-ignored ()
   "Notifications from a replaced transport cannot invalidate current state."

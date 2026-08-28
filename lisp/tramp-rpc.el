@@ -5289,6 +5289,51 @@ DATA is the payload to send."
        tramp-rpc--file-notify-descriptors))
     matched))
 
+(defun tramp-rpc--file-notify-dispatch-descriptor
+    (descriptor data action file-name &optional file-name1 cookie)
+  "Dispatch ACTION for one selected DESCRIPTOR using its watch DATA.
+FILE-NAME1 is the destination for rename events.  COOKIE pairs tracked renames."
+  (when-let* ((callback-action (tramp-rpc--file-notify-callback-action action)))
+    ;; `file-notify-callback' and the special-event handler live in
+    ;; filenotify.el.  It is normally loaded before watches are registered.
+    (require 'filenotify)
+    (let* ((display-file-name
+            (tramp-rpc--file-notify-callback-name data file-name))
+           (display-file-name1
+            (and file-name1
+                 (tramp-rpc--file-notify-callback-name data file-name1)))
+           (event-data (append (list descriptor (list callback-action)
+                                     display-file-name)
+                               (cond
+                                (display-file-name1 (list display-file-name1))
+                                (cookie (list cookie)))))
+           (event `(file-notify ,event-data file-notify-callback)))
+      (if (fboundp 'insert-special-event)
+          (insert-special-event event)
+        (funcall (lookup-key special-event-map [file-notify]) event)))))
+
+(defun tramp-rpc--file-notify-dispatch-rescan (connection-process)
+  "Dispatch conservative events for live watches on CONNECTION-PROCESS."
+  (let (dispatches)
+    ;; Select concrete descriptors before dispatch.  Feeding their directories
+    ;; through the path router would also reach dead or replacement-generation
+    ;; descriptors that happen to watch the same spelling.
+    (maphash
+     (lambda (descriptor data)
+       (when (and (process-live-p descriptor)
+                  (eq connection-process
+                      (plist-get data :connection-process)))
+         (let ((directory (plist-get data :directory))
+               (flags (plist-get data :flags)))
+           (when (memq 'change flags)
+             (push (list descriptor data "changed" directory) dispatches))
+           (when (memq 'attribute-change flags)
+             (push (list descriptor data "attribute-changed" directory)
+                   dispatches)))))
+     tramp-rpc--file-notify-descriptors)
+    (dolist (dispatch dispatches)
+      (apply #'tramp-rpc--file-notify-dispatch-descriptor dispatch))))
+
 (defun tramp-rpc--file-notify-dispatch (action file-name &optional file-name1 cookie)
   "Dispatch a `file-notify' ACTION for TRAMP FILE-NAME.
 FILE-NAME1 is the destination for `renamed' events.  COOKIE pairs
@@ -5296,12 +5341,7 @@ FILE-NAME1 is the destination for `renamed' events.  COOKIE pairs
   (when (and (hash-table-p tramp-rpc--file-notify-descriptors)
              (> (hash-table-count tramp-rpc--file-notify-descriptors) 0)
              (tramp-rpc--file-notify-callback-action action))
-    ;; `file-notify-callback' and the special-event handler live in
-    ;; filenotify.el.  It is normally loaded before file notifications are
-    ;; registered, but require it defensively before constructing events.
-    (require 'filenotify)
-    (let ((descriptors nil)
-          (callback-action (tramp-rpc--file-notify-callback-action action)))
+    (let (descriptors)
       (maphash
        (lambda (descriptor data)
          (when (and (tramp-rpc--file-notify-action-enabled-p
@@ -5310,25 +5350,12 @@ FILE-NAME1 is the destination for `renamed' events.  COOKIE pairs
                         (and file-name1
                              (tramp-rpc--file-notify-path-matches-p
                               data file-name1))))
-             (push (cons descriptor data) descriptors)))
+           (push (cons descriptor data) descriptors)))
        tramp-rpc--file-notify-descriptors)
       (dolist (descriptor-data descriptors)
-        (let* ((descriptor (car descriptor-data))
-               (data (cdr descriptor-data))
-               (display-file-name
-                (tramp-rpc--file-notify-callback-name data file-name))
-               (display-file-name1
-                (and file-name1
-                     (tramp-rpc--file-notify-callback-name data file-name1)))
-               (event-data (append (list descriptor (list callback-action)
-                                         display-file-name)
-                                   (cond
-                                    (display-file-name1 (list display-file-name1))
-                                    (cookie (list cookie)))))
-               (event `(file-notify ,event-data file-notify-callback)))
-          (if (fboundp 'insert-special-event)
-              (insert-special-event event)
-            (funcall (lookup-key special-event-map [file-notify]) event)))))))
+        (tramp-rpc--file-notify-dispatch-descriptor
+         (car descriptor-data) (cdr descriptor-data)
+         action file-name file-name1 cookie)))))
 
 (defun tramp-rpc-handle-file-notify-add-watch (directory flags _callback)
   "Like `file-notify-add-watch' for TRAMP-RPC files.

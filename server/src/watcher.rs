@@ -11,9 +11,10 @@ use notify::{Config, Event, EventKind, RecommendedWatcher, RecursiveMode, Watche
 use rmpv::Value;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
 use tokio::io::AsyncWriteExt;
-use tokio::sync::mpsc;
+use tokio::sync::{Notify, mpsc};
 use tokio::time::{self, Duration};
 
 use crate::handlers::file::bytes_to_path;
@@ -23,6 +24,13 @@ use crate::protocol::{from_value, path_or_bytes};
 /// During bulk operations (e.g. git checkout), many events fire in rapid
 /// succession. We collect them all and send a single notification.
 const DEBOUNCE_DURATION: Duration = Duration::from_millis(200);
+
+/// Bound callback-to-debounce buffering during filesystem event storms.
+const WATCH_INPUT_CAPACITY: usize = 4096;
+
+/// Bound one public notification batch.  Overflow is represented by a single
+/// rescan event, which tells the client to discard connection-local caches.
+const MAX_DEBOUNCE_EVENTS: usize = 8192;
 
 /// Global WatchManager instance, initialized in main().
 static WATCH_MANAGER: OnceLock<Arc<WatchManager>> = OnceLock::new();
@@ -349,6 +357,28 @@ enum WatchInput {
     Direct(Vec<WatchEvent>),
 }
 
+#[derive(Clone)]
+struct WatchInputSender {
+    tx: mpsc::Sender<WatchInput>,
+    overflowed: Arc<AtomicBool>,
+    overflow_notify: Arc<Notify>,
+}
+
+impl WatchInputSender {
+    fn send(&self, input: WatchInput) {
+        match self.tx.try_send(input) {
+            Ok(()) | Err(mpsc::error::TrySendError::Closed(_)) => {}
+            Err(mpsc::error::TrySendError::Full(_)) => {
+                self.overflowed.store(true, Ordering::Release);
+                // A dropped input cannot wake the receiver through the full
+                // channel.  Notify independently so a storm that ends at this
+                // exact point still produces a rescan.
+                self.overflow_notify.notify_one();
+            }
+        }
+    }
+}
+
 fn path_to_value(path: &Path) -> Value {
     use std::os::unix::ffi::OsStrExt;
 
@@ -374,7 +404,7 @@ struct SymlinkWatchEntry {
 
 #[cfg(any(target_os = "linux", target_os = "android"))]
 impl NofollowSymlinkWatcher {
-    fn new(tx: mpsc::UnboundedSender<WatchInput>) -> Result<Self, notify::Error> {
+    fn new(tx: WatchInputSender) -> Result<Self, notify::Error> {
         let fd = unsafe { libc::inotify_init1(libc::IN_NONBLOCK | libc::IN_CLOEXEC) };
         if fd < 0 {
             return Err(notify::Error::io(std::io::Error::last_os_error()));
@@ -511,7 +541,7 @@ fn spawn_nofollow_reader(
     wd_to_path: Arc<Mutex<HashMap<libc::c_int, PathBuf>>>,
     ignored_wds: Arc<Mutex<HashSet<libc::c_int>>>,
     running: Arc<std::sync::atomic::AtomicBool>,
-    tx: mpsc::UnboundedSender<WatchInput>,
+    tx: WatchInputSender,
 ) -> std::thread::JoinHandle<()> {
     std::thread::spawn(move || {
         let mut buf = vec![0_u8; 4096];
@@ -539,7 +569,7 @@ fn emit_nofollow_events(
     bytes: &[u8],
     wd_to_path: &Mutex<HashMap<libc::c_int, PathBuf>>,
     ignored_wds: &Mutex<HashSet<libc::c_int>>,
-    tx: &mpsc::UnboundedSender<WatchInput>,
+    tx: &WatchInputSender,
 ) {
     let event_size = std::mem::size_of::<libc::inotify_event>();
     let mut offset = 0;
@@ -560,7 +590,7 @@ fn emit_nofollow_events(
         if event.mask & libc::IN_ATTRIB != 0
             && let Some(path) = path
         {
-            let _ = tx.send(WatchInput::Direct(vec![WatchEvent::path(
+            tx.send(WatchInput::Direct(vec![WatchEvent::path(
                 "attribute-changed",
                 path,
             )]));
@@ -573,7 +603,7 @@ struct NofollowSymlinkWatcher;
 
 #[cfg(not(any(target_os = "linux", target_os = "android")))]
 impl NofollowSymlinkWatcher {
-    fn new(_tx: mpsc::UnboundedSender<WatchInput>) -> Result<Self, notify::Error> {
+    fn new(_tx: WatchInputSender) -> Result<Self, notify::Error> {
         Ok(Self)
     }
 
@@ -617,8 +647,15 @@ impl WatchManager {
     /// short window, and writes `fs.events` notifications to the client
     /// via the shared stdout writer.
     pub fn new(writer: WriterHandle) -> Result<Arc<Self>, notify::Error> {
-        let (tx, rx) = mpsc::unbounded_channel();
-        let notify_tx = tx.clone();
+        let (tx, rx) = mpsc::channel(WATCH_INPUT_CAPACITY);
+        let overflowed = Arc::new(AtomicBool::new(false));
+        let overflow_notify = Arc::new(Notify::new());
+        let input = WatchInputSender {
+            tx,
+            overflowed: Arc::clone(&overflowed),
+            overflow_notify: Arc::clone(&overflow_notify),
+        };
+        let notify_input = input.clone();
 
         let watcher = FilteredWatcher::new(move |event: notify::Result<Event>| {
             if let Ok(event) = event
@@ -627,20 +664,26 @@ impl WatchManager {
                     EventKind::Create(_) | EventKind::Modify(_) | EventKind::Remove(_)
                 ) || event.need_rescan())
             {
-                // Topology events cannot be dropped, and blocking here can
-                // deadlock notify's watch/unwatch event loop.
-                let _ = notify_tx.send(WatchInput::Notify(event));
+                // Never block notify's callback thread.  Queue overflow is
+                // coalesced into a rescan notification by the debounce task.
+                notify_input.send(WatchInput::Notify(event));
             }
         })?;
 
         let manager = Arc::new(Self {
             watcher: Mutex::new(watcher),
             watched_paths: Mutex::new(HashMap::new()),
-            symlink_watcher: Mutex::new(NofollowSymlinkWatcher::new(tx).ok()),
+            symlink_watcher: Mutex::new(NofollowSymlinkWatcher::new(input).ok()),
         });
 
-        // Spawn the debounce background task
-        tokio::spawn(debounce_loop(rx, writer, Arc::downgrade(&manager)));
+        // Spawn the debounce background task.
+        tokio::spawn(debounce_loop(
+            rx,
+            overflowed,
+            overflow_notify,
+            writer,
+            Arc::downgrade(&manager),
+        ));
 
         Ok(manager)
     }
@@ -771,6 +814,18 @@ impl WatchManager {
             .iter()
             .map(|(p, m)| (p.clone(), matches!(m, RecursiveMode::Recursive)))
             .collect()
+    }
+
+    fn overflow_recovery_paths(&self) -> (HashSet<PathBuf>, HashSet<PathBuf>) {
+        let recursive_roots = lock_or_recover(&self.watcher)
+            .recursive_roots()
+            .into_iter()
+            .collect();
+        let watched_paths = lock_or_recover(&self.watched_paths)
+            .keys()
+            .cloned()
+            .collect();
+        (recursive_roots, watched_paths)
     }
 
     fn recursive_roots_for_event(&self, event: &Event) -> HashSet<PathBuf> {
@@ -1025,27 +1080,36 @@ fn paths_as_events<'paths>(
 /// 4. When the timer fires, send one notification with all collected events
 /// 5. Go back to step 1
 async fn debounce_loop(
-    mut rx: mpsc::UnboundedReceiver<WatchInput>,
+    mut rx: mpsc::Receiver<WatchInput>,
+    overflowed: Arc<AtomicBool>,
+    overflow_notify: Arc<Notify>,
     writer: WriterHandle,
     manager: Weak<WatchManager>,
 ) {
     loop {
-        // Phase 1: Wait for the first event
-        let event = match rx.recv().await {
-            Some(e) => e,
-            None => break, // Channel closed, watcher dropped
+        // Phase 1: Wait for the first event or an overflow wakeup.  The latter
+        // is independent of the bounded channel because the dropped input that
+        // set the overflow flag could not be queued.
+        let event = tokio::select! {
+            event = rx.recv() => match event {
+                Some(event) => Some(event),
+                None => break,
+            },
+            () = overflow_notify.notified() => None,
         };
 
         let mut pending_events: Vec<WatchEvent> = Vec::new();
         let mut roots_to_refresh: HashSet<PathBuf> = HashSet::new();
         let mut suspect_paths: HashSet<PathBuf> = HashSet::new();
-        collect_input(
-            event,
-            &manager,
-            &mut pending_events,
-            &mut roots_to_refresh,
-            &mut suspect_paths,
-        );
+        let mut batch_overflowed = event.is_some_and(|event| {
+            collect_input(
+                event,
+                &manager,
+                &mut pending_events,
+                &mut roots_to_refresh,
+                &mut suspect_paths,
+            )
+        });
 
         // Phase 2: Collect more events during the debounce window
         let deadline = time::Instant::now() + DEBOUNCE_DURATION;
@@ -1057,23 +1121,41 @@ async fn debounce_loop(
                 event = rx.recv() => {
                     match event {
                         Some(e) => {
-                            collect_input(
-                                e,
-                                &manager,
-                                &mut pending_events,
-                                &mut roots_to_refresh,
-                                &mut suspect_paths,
-                            );
+                            if !batch_overflowed {
+                                batch_overflowed = collect_input(
+                                    e,
+                                    &manager,
+                                    &mut pending_events,
+                                    &mut roots_to_refresh,
+                                    &mut suspect_paths,
+                                );
+                            }
                         }
                         None => return, // Channel closed
                     }
                 }
+                () = overflow_notify.notified() => {
+                    // The atomic flag is consumed once after the debounce
+                    // window together with any ordinary queued events.
+                }
             }
         }
 
+        // Always consume the sender flag.  Short-circuiting this swap when the
+        // in-memory batch overflowed would cause a redundant rescan next time.
+        let sender_overflowed = overflowed.swap(false, Ordering::AcqRel);
+        let overflowed = batch_overflowed || sender_overflowed;
         if let Some(manager) = manager.upgrade() {
+            if overflowed {
+                let (all_recursive_roots, all_watched_paths) = manager.overflow_recovery_paths();
+                roots_to_refresh.extend(all_recursive_roots);
+                suspect_paths.extend(all_watched_paths);
+            }
             manager.refresh_recursive_roots(roots_to_refresh).await;
             manager.rearm_suspect_paths(suspect_paths).await;
+        }
+        if overflowed {
+            coalesce_to_rescan(&mut pending_events);
         }
 
         // Phase 3: Send notification with all collected events
@@ -1086,24 +1168,37 @@ async fn debounce_loop(
     }
 }
 
+fn append_watch_events(pending_events: &mut Vec<WatchEvent>, events: Vec<WatchEvent>) -> bool {
+    let remaining = MAX_DEBOUNCE_EVENTS.saturating_sub(pending_events.len());
+    let overflowed = events.len() > remaining;
+    pending_events.extend(events.into_iter().take(remaining));
+    overflowed
+}
+
+fn coalesce_to_rescan(pending_events: &mut Vec<WatchEvent>) {
+    pending_events.clear();
+    pending_events.push(WatchEvent::rescan());
+}
+
 fn collect_input(
     input: WatchInput,
     manager: &Weak<WatchManager>,
     pending_events: &mut Vec<WatchEvent>,
     roots_to_refresh: &mut HashSet<PathBuf>,
     suspect_paths: &mut HashSet<PathBuf>,
-) {
+) -> bool {
     match input {
         WatchInput::Notify(event) => {
+            let rescan_required = event.need_rescan();
             if let Some(manager) = manager.upgrade() {
                 roots_to_refresh.extend(manager.recursive_roots_for_event(&event));
             }
 
             suspect_paths.extend(inode_replacing_paths(&event));
-            pending_events.extend(event_to_watch_events(&event));
+            append_watch_events(pending_events, event_to_watch_events(&event)) || rescan_required
         }
         #[cfg(any(target_os = "linux", target_os = "android"))]
-        WatchInput::Direct(events) => pending_events.extend(events),
+        WatchInput::Direct(events) => append_watch_events(pending_events, events),
     }
 }
 
@@ -1119,21 +1214,54 @@ fn fs_events_notification(events: &[WatchEvent]) -> Notification {
     )
 }
 
-/// Serialize and send an `fs.events` notification over the stdout writer.
-/// Returns an error if serialization or writing fails.
+async fn send_notification_with_limit<W>(
+    writer: &Arc<tokio::sync::Mutex<W>>,
+    events: &[WatchEvent],
+    max_frame_size: usize,
+) -> Result<(), Box<dyn std::error::Error>>
+where
+    W: tokio::io::AsyncWrite + Unpin,
+{
+    let mut batches = vec![events];
+    while let Some(batch) = batches.pop() {
+        if batch.is_empty() {
+            continue;
+        }
+        let bytes = rmp_serde::to_vec_named(&fs_events_notification(batch))?;
+        if bytes.len() > max_frame_size {
+            if batch.len() == 1 {
+                return Err("single fs.events entry exceeds maximum frame size".into());
+            }
+            let middle = batch.len() / 2;
+            // Stack order is reversed so the original event order is retained.
+            batches.push(&batch[middle..]);
+            batches.push(&batch[..middle]);
+            continue;
+        }
+
+        // Each frame is independently valid.  Release the shared writer after
+        // every frame so normal RPC responses can make progress between parts
+        // of a large notification batch.
+        {
+            let mut writer = writer.lock().await;
+            writer
+                .write_all(&(bytes.len() as u32).to_be_bytes())
+                .await?;
+            writer.write_all(&bytes).await?;
+            writer.flush().await?;
+        }
+        tokio::task::yield_now().await;
+    }
+    Ok(())
+}
+
+/// Serialize and send bounded `fs.events` notifications over the stdout writer.
+/// Oversized debounce batches are split and streamed in event order.
 async fn send_notification(
     writer: &WriterHandle,
     events: &[WatchEvent],
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let notification = fs_events_notification(events);
-
-    let bytes = rmp_serde::to_vec_named(&notification)?;
-    let mut w = writer.lock().await;
-    let len_bytes = (bytes.len() as u32).to_be_bytes();
-    w.write_all(&len_bytes).await?;
-    w.write_all(&bytes).await?;
-    w.flush().await?;
-    Ok(())
+    send_notification_with_limit(writer, events, crate::MAX_FRAME_SIZE).await
 }
 
 // ============================================================================
@@ -1181,13 +1309,13 @@ pub async fn handle_add(params: Value) -> HandlerResult {
         }
     })
     .await
-    .map_err(|e| RpcError::internal_error(format!("Task join error: {}", e)))?
-    .map_err(|e| RpcError::internal_error(format!("Failed to watch: {}", e)))?;
+    .map_err(|e| RpcError::internal_error(format!("Task join error: {e}")))?
+    .map_err(|e| RpcError::internal_error(format!("Failed to watch: {e}")))?;
 
     Ok(msgpack_map! {
         "path" => path_to_value(&canonical),
-        "recursive" => Value::Boolean(params.recursive),
-        "nofollow" => Value::Boolean(params.nofollow)
+        "recursive" => Value::Boolean(recursive),
+        "nofollow" => Value::Boolean(nofollow)
     })
 }
 
@@ -1247,12 +1375,24 @@ mod tests {
     #[cfg(target_os = "linux")]
     use std::time::{Duration, Instant};
 
+    fn test_input_channel(capacity: usize) -> (WatchInputSender, mpsc::Receiver<WatchInput>) {
+        let (tx, rx) = mpsc::channel(capacity);
+        (
+            WatchInputSender {
+                tx,
+                overflowed: Arc::new(AtomicBool::new(false)),
+                overflow_notify: Arc::new(Notify::new()),
+            },
+            rx,
+        )
+    }
+
     fn test_manager() -> WatchManager {
-        let (tx, _rx) = mpsc::unbounded_channel();
+        let (input, _rx) = test_input_channel(1);
         WatchManager {
             watcher: Mutex::new(FilteredWatcher::new(|_: notify::Result<Event>| {}).unwrap()),
             watched_paths: Mutex::new(HashMap::new()),
-            symlink_watcher: Mutex::new(NofollowSymlinkWatcher::new(tx).ok()),
+            symlink_watcher: Mutex::new(NofollowSymlinkWatcher::new(input).ok()),
         }
     }
 
@@ -1264,6 +1404,113 @@ mod tests {
             }),
             _ => None,
         }
+    }
+
+    #[tokio::test]
+    async fn test_watch_input_overflow_sets_flag_and_wakes_receiver() {
+        let (input, _rx) = test_input_channel(1);
+        input.send(WatchInput::Notify(Event::new(EventKind::Any)));
+        input.send(WatchInput::Notify(Event::new(EventKind::Any)));
+        assert!(input.overflowed.load(Ordering::Acquire));
+        tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            input.overflow_notify.notified(),
+        )
+        .await
+        .expect("overflow must wake the debounce task");
+    }
+
+    #[test]
+    fn test_debounce_event_batch_is_bounded() {
+        let mut pending = Vec::new();
+        let events = (0..=MAX_DEBOUNCE_EVENTS)
+            .map(|index| WatchEvent::path("changed", PathBuf::from(index.to_string())))
+            .collect();
+        assert!(append_watch_events(&mut pending, events));
+        assert_eq!(pending.len(), MAX_DEBOUNCE_EVENTS);
+        coalesce_to_rescan(&mut pending);
+        assert_eq!(pending, vec![WatchEvent::rescan()]);
+    }
+
+    #[test]
+    fn test_overflow_recovery_includes_recursive_and_direct_watches() {
+        let temp = tempfile::tempdir().unwrap();
+        let recursive = temp.path().join("recursive");
+        let direct = temp.path().join("direct");
+        fs::create_dir_all(&recursive).unwrap();
+        fs::create_dir_all(&direct).unwrap();
+        let manager = test_manager();
+        let recursive = manager.watch(&recursive, true).unwrap();
+        let direct = manager.watch(&direct, false).unwrap();
+
+        let (refresh, rearm) = manager.overflow_recovery_paths();
+        assert!(refresh.contains(&recursive));
+        assert!(!refresh.contains(&direct));
+        assert!(rearm.contains(&recursive));
+        assert!(rearm.contains(&direct));
+    }
+
+    #[tokio::test]
+    async fn test_split_notification_frames_are_streamed_in_order() {
+        use tokio::io::AsyncReadExt;
+
+        let events = vec![
+            WatchEvent::path("created", PathBuf::from("/tmp/first")),
+            WatchEvent::path("deleted", PathBuf::from("/tmp/second")),
+        ];
+        let limit = rmp_serde::to_vec_named(&fs_events_notification(&events[..1]))
+            .unwrap()
+            .len()
+            .max(
+                rmp_serde::to_vec_named(&fs_events_notification(&events[1..]))
+                    .unwrap()
+                    .len(),
+            );
+        let (write, mut read) = tokio::io::duplex(4096);
+        let writer = Arc::new(tokio::sync::Mutex::new(write));
+        send_notification_with_limit(&writer, &events, limit)
+            .await
+            .unwrap();
+        drop(writer);
+
+        let mut bytes = Vec::new();
+        read.read_to_end(&mut bytes).await.unwrap();
+        let mut offset = 0;
+        let mut frame_count = 0;
+        let mut decoded = Vec::new();
+        while offset < bytes.len() {
+            let length = u32::from_be_bytes(bytes[offset..offset + 4].try_into().unwrap()) as usize;
+            assert!(length <= limit);
+            frame_count += 1;
+            offset += 4;
+            let notification: Value =
+                rmp_serde::from_slice(&bytes[offset..offset + length]).unwrap();
+            offset += length;
+            let events = notification
+                .as_map()
+                .and_then(|notification| {
+                    notification
+                        .iter()
+                        .find(|(key, _)| key.as_str() == Some("params"))
+                })
+                .and_then(|(_, params)| params.as_map())
+                .and_then(|params| {
+                    params
+                        .iter()
+                        .find(|(key, _)| key.as_str() == Some("events"))
+                })
+                .and_then(|(_, events)| events.as_array())
+                .unwrap();
+            decoded.extend(events.iter().filter_map(|event| {
+                event
+                    .as_map()
+                    .and_then(|event| event.iter().find(|(key, _)| key.as_str() == Some("action")))
+                    .and_then(|(_, action)| action.as_str())
+                    .map(str::to_owned)
+            }));
+        }
+        assert_eq!(frame_count, 2);
+        assert_eq!(decoded, ["created", "deleted"]);
     }
 
     #[test]
@@ -1309,8 +1556,8 @@ mod tests {
         fs::write(&target, "target").unwrap();
         std::os::unix::fs::symlink(&target, &link).unwrap();
 
-        let (tx, mut rx) = mpsc::unbounded_channel();
-        let mut watcher = NofollowSymlinkWatcher::new(tx).unwrap();
+        let (input, mut rx) = test_input_channel(16);
+        let mut watcher = NofollowSymlinkWatcher::new(input).unwrap();
         assert_eq!(watcher.watch(&link).unwrap(), link);
 
         fs::write(&target, "changed").unwrap();
