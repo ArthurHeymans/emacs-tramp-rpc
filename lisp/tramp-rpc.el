@@ -499,6 +499,9 @@ proxy hops remain."
 
 (require 'tramp-rpc-deploy)
 
+(define-error 'tramp-rpc-server-unavailable
+  "TRAMP-RPC server binary is unavailable" 'remote-file-error)
+
 ;; Silence byte-compiler warnings for functions defined elsewhere
 ;; (vterm variables are declared in tramp-rpc-process.el)
 
@@ -1605,26 +1608,47 @@ Returns non-nil on success."
       (ignore-errors (delete-file socket-path)))
     (with-current-buffer buffer
       (erase-buffer))
-    ;; Start SSH with PTY for interactive password prompt
-    (let ((process-connection-type t))  ; Use PTY for password prompts
-      (setq process (apply #'start-process process-name buffer ssh-args)))
-    (set-process-query-on-exit-flag process nil)
-    (set-process-sentinel process #'ignore)
-    ;; Set up process properties for tramp-process-actions / tramp-read-passwd.
-    ;; pw-vector tells auth-source where to look up credentials.
-    (process-put process 'tramp-vector vec)
-    (tramp-set-connection-property process "hop-vector" vec)
-    (tramp-set-connection-property
-     process "pw-vector"
-     (make-tramp-file-name :method "ssh" :user user :host host :port port))
-    ;; Use upstream tramp-process-actions for password/host-key handling.
-    ;; The custom action checks for the ControlMaster socket appearing.
-    (let ((tramp-rpc--controlmaster-socket-path socket-path))
-      (tramp-process-actions process vec nil
-                             tramp-rpc--controlmaster-actions 60))
-    ;; tramp-process-actions throws on failure; reaching here means success.
-    (sleep-for 0.1)
-    t))
+    (let (success)
+      (unwind-protect
+          (progn
+            ;; Start SSH with PTY for interactive password prompt.
+            (let ((process-connection-type t))
+              (setq process (apply #'start-process process-name buffer ssh-args)))
+            (set-process-query-on-exit-flag process nil)
+            (set-process-sentinel process #'ignore)
+            ;; Set up process properties for tramp-process-actions /
+            ;; tramp-read-passwd.  pw-vector tells auth-source where to look
+            ;; up credentials.
+            (process-put process 'tramp-vector vec)
+            (tramp-set-connection-property process "hop-vector" vec)
+            (tramp-set-connection-property
+             process "pw-vector"
+             (make-tramp-file-name
+              :method "ssh" :user user :host host :port port))
+            ;; Use upstream tramp-process-actions for password/host-key
+            ;; handling.  The custom action checks for the ControlMaster
+            ;; socket appearing.
+            (let ((tramp-rpc--controlmaster-socket-path socket-path))
+              (tramp-process-actions process vec nil
+                                     tramp-rpc--controlmaster-actions 60))
+            ;; tramp-process-actions throws on failure; reaching here means
+            ;; the persistent master owns PROCESS and BUFFER.
+            (sleep-for 0.1)
+            (setq success t))
+        (unless success
+          (when (and process (process-live-p process))
+            (delete-process process))
+          (when (buffer-live-p buffer)
+            (kill-buffer buffer))))
+      success)))
+
+(defun tramp-rpc--server-binary-unavailable-p (process _stderr-buffer)
+  "Return non-nil when PROCESS reports a remote exec failure.
+A missing or non-executable remote binary is reported by the remote shell as
+127 or 126, which ssh propagates.  Do not infer this from free-form stderr:
+wrappers and dynamic loaders can print the same text for unrelated failures."
+  (and (not (process-live-p process))
+       (memq (process-exit-status process) '(126 127))))
 
 (defun tramp-rpc--connection-sentinel (process _event)
   "Discard deferred protocol state when RPC connection PROCESS closes."
@@ -1742,60 +1766,81 @@ Returns the connection plist.  Signals `remote-file-error' on failure."
     (process-put process 'tramp-vector vec)
     (tramp-rpc--install-connection-sentinel process vec)
 
-    ;; Wait for server to be ready by sending a ping, and seed the
-    ;; connection-local system.info cache for later uid/gid/home/shell lookups.
-    ;; `tramp-rpc--call' signals on the usual failed-start paths (a closed
-    ;; transport or timeout).  Tear down that failed transport before retrying.
-    (condition-case err
-        (let ((response (tramp-rpc--cache-system-info
-                         vec (tramp-rpc--call vec "system.info" nil))))
-          (unless response
-            (signal 'remote-file-error
-                    (list "Failed to connect to RPC server on" host))))
-      (remote-file-error
-       (let ((sudo-auth-rejected
+    (condition-case start-error
+        (progn
+          ;; Wait for server to be ready by sending a ping, and seed the
+          ;; connection-local system.info cache for later uid/gid/home/shell
+          ;; lookups.  Tear down a failed transport before retrying.
+          (let ((response (tramp-rpc--cache-system-info
+                           vec (tramp-rpc--call vec "system.info" nil))))
+            (unless response
+              (signal 'remote-file-error
+                      (list "Failed to connect to RPC server on" host))))
+
+          ;; Set connection-local variables in the connection buffer.
+          ;; Every TRAMP backend must call this after establishing the
+          ;; connection so that connection-local variable profiles
+          ;; (registered via `connection-local-set-profiles') are applied.
+          ;; This enables variables like `tramp-direct-async-process',
+          ;; `shell-file-name', `path-separator' etc. to take effect in the
+          ;; connection buffer.
+          (tramp-set-connection-local-variables vec)
+
+          ;; Mark as connected for TRAMP's connectivity checks (used by
+          ;; projectile, etc.)
+          (tramp-set-connection-property process "connected" t)
+
+          ;; Mark as connected on the vec so `tramp-list-connections' finds
+          ;; this connection and `tramp-cleanup-connection' can offer it
+          ;; interactively.  The value is the connection buffer, matching the
+          ;; convention in `tramp-get-buffer'.
+          ;; Emacs 30.x uses "process-buffer"; newer TRAMP (31+) uses
+          ;; " connected".  Set both for compatibility.
+          (tramp-set-connection-property vec "process-buffer" buffer)
+          (tramp-set-connection-property vec " connected" buffer)
+
+          (tramp-rpc--get-connection vec))
+      ((quit error)
+       (let ((binary-unavailable
+              (tramp-rpc--server-binary-unavailable-p process stderr-buffer))
+             (sudo-auth-rejected
               (and sudo-password
                    (tramp-rpc--sudo-auth-rejected-p stderr-buffer))))
-         (tramp-rpc--cleanup-failed-connection vec)
          ;; Missing binaries and other transport failures also reach this
-         ;; handler.  Forget the password only when sudo explicitly rejected it.
+         ;; handler.  Forget the password only when sudo explicitly rejected
+         ;; it, so the next attempt prompts for a fresh password.
          (when sudo-auth-rejected
            (tramp-rpc--clear-sudo-password vec))
-         (signal (if sudo-auth-rejected
-                     'tramp-rpc-sudo-auth-rejected
-                   (car err))
-                 (cdr err)))))
-
-    ;; Set connection-local variables in the connection buffer.
-    ;; Every TRAMP backend must call this after establishing the connection
-    ;; so that connection-local variable profiles (registered via
-    ;; `connection-local-set-profiles') are applied.  This enables variables
-    ;; like `tramp-direct-async-process', `shell-file-name', `path-separator'
-    ;; etc. to take effect in the connection buffer.
-    (tramp-set-connection-local-variables vec)
-
-    ;; Mark as connected for TRAMP's connectivity checks (used by projectile, etc.)
-    (tramp-set-connection-property process "connected" t)
-
-    ;; Mark as connected on the vec so `tramp-list-connections' finds
-    ;; this connection and `tramp-cleanup-connection' can offer it
-    ;; interactively.  The value is the connection buffer, matching the
-    ;; convention in `tramp-get-buffer'.
-    ;; Emacs 30.x uses "process-buffer"; newer TRAMP (31+) uses " connected".
-    ;; Set both for compatibility.
-    (tramp-set-connection-property vec "process-buffer" buffer)
-    (tramp-set-connection-property vec " connected" buffer)
-
-    (tramp-rpc--get-connection vec)))
+         ;; The generation may already have detached itself after a timeout or
+         ;; protocol error, so clean up directly from the local handles.
+         (tramp-rpc--remove-connection vec process)
+         (when (process-live-p process)
+           (delete-process process))
+         (when (buffer-live-p buffer)
+           (kill-buffer buffer))
+         (when (buffer-live-p stderr-buffer)
+           (kill-buffer stderr-buffer))
+         (cond (sudo-auth-rejected
+                (signal 'tramp-rpc-sudo-auth-rejected (cdr start-error)))
+               (binary-unavailable
+                (signal 'tramp-rpc-server-unavailable (cdr start-error)))
+               (t
+                (signal (car start-error) (cdr start-error)))))))))
 
 (defun tramp-rpc--cleanup-failed-connection (vec)
   "Clean up a failed connection attempt for VEC.
 Kills the process if still alive and removes the connection entry."
   (let ((conn (tramp-rpc--get-connection vec)))
     (when conn
-      (let ((proc (plist-get conn :process)))
+      (let ((proc (plist-get conn :process))
+            (buffer (plist-get conn :buffer))
+            (stderr-buffer (plist-get conn :stderr-buffer)))
         (when (process-live-p proc)
-          (delete-process proc)))
+          (delete-process proc))
+        (when (buffer-live-p buffer)
+          (kill-buffer buffer))
+        (when (buffer-live-p stderr-buffer)
+          (kill-buffer stderr-buffer)))
       (tramp-rpc--remove-connection vec))))
 
 (defun tramp-rpc--cleanup-bootstrap-connection (vec)
@@ -1861,8 +1906,8 @@ accidentally routing file operations through tramp-sh."
     (condition-case err
         (tramp-rpc--start-server-process
          vec (tramp-rpc-deploy-expected-binary-localname) sudo-password)
-      (remote-file-error
-       ;; Connection failed - binary likely missing.  Clean up and deploy.
+      ((tramp-rpc-server-unavailable tramp-rpc-sudo-auth-rejected)
+       ;; Binary missing or sudo rejected the password.  Clean up and deploy.
        (tramp-rpc--cleanup-failed-connection vec)
        (let ((binary-path (tramp-rpc-deploy-ensure-binary vec)))
          ;; Close the bootstrap connection - it's no longer needed and

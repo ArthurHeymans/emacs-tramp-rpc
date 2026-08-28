@@ -6258,6 +6258,39 @@ A rejected sudo password must not be reused on the next attempt, otherwise
           (delete-process proc))
         (tramp-rpc--remove-connection vec)))))
 
+(ert-deftest tramp-rpc-mock-test-start-server-quit-cleans-partial-connection ()
+  "Interrupting the readiness probe removes the partial connection."
+  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
+  (let ((vec (tramp-dissect-file-name "/rpc:mock:/"))
+        (orig-make-process (symbol-function 'make-process))
+        proc)
+    (cl-letf (((symbol-function 'make-process)
+               (lambda (&rest _)
+                 (setq proc (funcall orig-make-process
+                                     :name "tramp-rpc-mock-cat"
+                                     :buffer nil
+                                     :command '("cat")
+                                     :connection-type 'pipe
+                                     :noquery t))))
+              ((symbol-function 'tramp-rpc--call)
+               (lambda (&rest _)
+                 (signal 'quit nil))))
+      (unwind-protect
+          (progn
+            (should
+             (eq (condition-case nil
+                     (progn
+                       (tramp-rpc--start-server-process
+                        vec "/tmp/tramp-rpc-server")
+                       nil)
+                   (quit 'quit))
+                 'quit))
+            (should-not (tramp-rpc--get-connection vec))
+            (should-not (process-live-p proc)))
+        (when (process-live-p proc)
+          (delete-process proc))
+        (tramp-rpc--remove-connection vec)))))
+
 (ert-deftest tramp-rpc-mock-test-start-server-sudo-noninteractive-uses-n-H ()
   "When sudo has a cached ticket, start the elevated RPC server with sudo -n -H."
   :tags '(:sudo)
@@ -6298,6 +6331,52 @@ A rejected sudo password must not be reused on the next attempt, otherwise
         (when (processp proc)
           (delete-process proc))
         (tramp-rpc--remove-connection vec)))))
+
+(ert-deftest tramp-rpc-mock-test-server-binary-unavailable-detection ()
+  "Only remote exec failures classify as a deployable missing binary."
+  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
+  (let ((run-case
+         (lambda (exit-status stderr-text)
+           (let* ((stderr-buffer (generate-new-buffer " *tramp-rpc-stderr*"))
+                  (process (make-process :name "tramp-rpc-mock-sh"
+                                        :buffer nil
+                                        :command
+                                        (list "sh" "-c"
+                                              (format "exit %d" exit-status))
+                                        :connection-type 'pipe
+                                        :coding 'binary
+                                        :noquery t
+                                        :stderr stderr-buffer)))
+             (unwind-protect
+                 (progn
+                   (with-current-buffer stderr-buffer
+                     (insert stderr-text))
+                   (while (process-live-p process)
+                     (accept-process-output process 0.1))
+                   (tramp-rpc--server-binary-unavailable-p
+                    process stderr-buffer))
+               (when (process-live-p process) (delete-process process))
+               (when (buffer-live-p stderr-buffer)
+                 (kill-buffer stderr-buffer)))))))
+    ;; Remote shell: missing binary -> deploy and retry.
+    (should (funcall run-case 127
+                     "sh: /tmp/tramp-rpc-server: not found\n"))
+    ;; Remote shell: non-executable binary -> deploy and retry.
+    (should (funcall run-case 126
+                     "sh: /tmp/tramp-rpc-server: Permission denied\n"))
+    ;; Free-form diagnostics from wrappers or dynamic loaders are not enough.
+    (should-not (funcall run-case 1
+                         "error while loading shared libraries: No such file or directory\n"))
+    (should-not (funcall run-case 125 "Permission denied\n"))
+    ;; OpenSSH's own authentication failure (exit 255) must not deploy.
+    (should-not (funcall run-case 255
+                         "Permission denied (publickey,password).\r\n"))
+    ;; A lost ControlMaster socket also matches the text patterns but is
+    ;; OpenSSH's own failure (exit 255), not a missing binary.
+    (should-not (funcall run-case 255
+                         "Control socket connect: No such file or directory\r\n"))))
+
+
 
 (ert-deftest tramp-rpc-mock-test-password-string-unwraps-auth-source-entry ()
   "Normalize auth-source plist secrets before sending them to sudo -S."
