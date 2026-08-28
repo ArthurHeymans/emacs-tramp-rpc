@@ -2598,6 +2598,22 @@ This matches the behavior expected by `tramp-test28-process-file'."
       (should (tramp-rpc-handle-file-regular-p "/rpc:mock:/tmp/file"))
       (should (equal (nreverse calls) '(("/tmp/file" nil)))))))
 
+(ert-deftest tramp-rpc-mock-test-rename-preflight-preserves-destination-error ()
+  "A destination stat error must not be reported as an existing file."
+  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
+  (cl-letf (((symbol-function 'tramp-rpc--call-batch)
+             (lambda (_vec _requests)
+               (list '((type . "file"))
+                     '(:error -32002 :message "Permission denied"
+                       :data ((os_errno . 13))))))
+            ((symbol-function 'tramp-rpc--call)
+             (lambda (&rest _)
+               (ert-fail "rename RPC must not run after failed preflight"))))
+    (should-error
+     (tramp-rpc--rename-file-same-remote
+      "/rpc:mock:/source" "/rpc:mock:/destination" nil)
+     :type 'permission-denied)))
+
 (ert-deftest tramp-rpc-mock-test-connection-cache-clear-clears-ancestor-scans ()
   "Connection cache clearing drops only that connection's ancestor scans."
   (skip-unless tramp-rpc-mock-test--tramp-rpc-magit-loaded)
