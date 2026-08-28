@@ -3337,8 +3337,10 @@ MUSTBENEW requests an overwrite check; `excl' rejects an existing file."
                       (buffer-substring-no-properties
                        (or start (point-min))
                        (or end (point-max)))))
-           ;; Encode using buffer's coding system or default to utf-8
-           (coding (or (and (not (stringp start))
+           ;; Match `write-region': a dynamic output override takes precedence
+           ;; over the visited buffer's coding system.
+           (coding (or coding-system-for-write
+                       (and (not (stringp start))
                             buffer-file-coding-system)
                        'utf-8-unix))
            (content-bytes (encode-coding-string content coding))
