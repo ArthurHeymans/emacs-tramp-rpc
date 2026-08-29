@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 # Run autoload tests for tramp-rpc
 #
 # These tests verify the autoload mechanism works correctly.
