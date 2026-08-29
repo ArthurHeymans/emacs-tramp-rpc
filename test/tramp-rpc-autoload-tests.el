@@ -79,6 +79,13 @@
 (defvar tramp-rpc-autoload-test--autoloads-generated nil
   "Non-nil if autoloads have been generated for this test session.")
 
+(defun tramp-rpc-autoload-test--remove-generated-autoloads ()
+  "Remove the generated source-tree autoload file used by these tests."
+  (when (file-exists-p tramp-rpc-autoload-test--autoloads-file)
+    (delete-file tramp-rpc-autoload-test--autoloads-file)))
+
+(add-hook 'kill-emacs-hook #'tramp-rpc-autoload-test--remove-generated-autoloads)
+
 (defun tramp-rpc-autoload-test--generate-autoloads ()
   "Generate autoloads file for testing.
 Only generates once per test session to avoid file disappearing issues."

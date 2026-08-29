@@ -7054,6 +7054,56 @@ discard it for being unreadable."
       (should (equal (tramp-rpc--remote-path-environment vec)
                      '(("PATH" . "/login/bin:/custom/bin")))))))
 
+(ert-deftest tramp-rpc-mock-test-login-path-cache-survives-connection-start ()
+  "Login PATH caching must keep one stable TRAMP connection-property key."
+  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
+  (let ((vec (make-tramp-file-name :method "rpc" :host "host" :user "user"
+                                   :localname "/"))
+        (fetches 0))
+    (unwind-protect
+        (progn
+          (tramp-flush-connection-property vec "tramp-rpc-login-path")
+          (cl-letf (((symbol-function 'tramp-rpc--fetch-remote-exec-path)
+                     (lambda (_vec)
+                       (cl-incf fetches)
+                       '("/home/user/.local/bin" "/usr/bin"))))
+            (should (equal (tramp-rpc--cached-login-path vec)
+                           '("/home/user/.local/bin" "/usr/bin")))
+            (should (equal (tramp-rpc--cached-login-path vec)
+                           '("/home/user/.local/bin" "/usr/bin")))
+            (should (= fetches 1))))
+      (tramp-flush-connection-property vec "tramp-rpc-login-path"))))
+
+(ert-deftest tramp-rpc-mock-test-shell-process-appends-login-path ()
+  "Shell commands must retain login PATH entries like `tramp-sh'."
+  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
+  (let ((default-directory "/rpc:user@host:/work/")
+        (shell-file-name "/bin/bash")
+        captured-params)
+    (cl-letf (((symbol-function 'tramp-rpc--cached-remote-path)
+               (lambda (_vec) '("/usr/bin" "/bin")))
+              ((symbol-function 'tramp-rpc--cached-login-path)
+               (lambda (_vec) '("/home/user/.local/bin" "/usr/bin")))
+              ((symbol-function 'tramp-rpc--get-direnv-environment)
+               (lambda (&rest _) nil))
+              ((symbol-function 'tramp-rpc--caller-environment)
+               (lambda () nil))
+              ((symbol-function 'tramp-rpc-magit--process-cache-lookup)
+               (lambda (&rest _) nil))
+              ((symbol-function 'tramp-rpc--decode-output)
+               (lambda (output) output))
+              ((symbol-function 'tramp-rpc--call)
+               (lambda (_vec method params)
+                 (should (equal method "process.run"))
+                 (setq captured-params params)
+                 '((exit_code . 0) (stdout . "") (stderr . "")))))
+      (should (= (tramp-rpc-handle-process-file
+                  shell-file-name nil nil nil "-c" "docker ps")
+                 0))
+      (should (equal (alist-get 'cmd captured-params) "/bin/bash"))
+      (should (equal (assoc "PATH" (alist-get 'env captured-params))
+                     '("PATH" . "/usr/bin:/bin:/home/user/.local/bin"))))))
+
 (ert-deftest tramp-rpc-mock-test-magit-prefetch-uses-process-environment ()
   "Magit prefetch must use the same effective environment as `process-file'."
   (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
