@@ -1893,14 +1893,22 @@ Kills the process if still alive and removes the connection entry."
       (tramp-rpc--remove-connection vec))))
 
 (defun tramp-rpc--cleanup-bootstrap-connection (vec)
-  "Close the scpx/scp bootstrap connection for VEC if it exists.
-The bootstrap connection is only needed during deploy and should be
-closed afterward to prevent other packages (vc, diff-hl) from
-accidentally routing file operations through tramp-sh."
+  "Remove the scpx/scp bootstrap connection for VEC if it has state.
+The bootstrap connection is only needed during deployment.  Leaving its
+TRAMP cache entries behind lets background packages keep using tramp-sh for
+the same host while tramp-rpc is active.  In particular, a tramp-sh liveness
+probe can then interleave with RPC startup and corrupt the protocol stream."
   (let* ((bootstrap-vec (tramp-rpc-deploy--bootstrap-vec vec))
          (proc (tramp-get-connection-process bootstrap-vec)))
-    (when (and proc (process-live-p proc))
-      (delete-process proc))))
+    (when (or (process-live-p proc)
+              (tramp-connection-property-p bootstrap-vec "process-buffer")
+              (tramp-connection-property-p bootstrap-vec " process-buffer")
+              (tramp-connection-property-p bootstrap-vec " connected"))
+      ;; Preserve authentication and unrelated asynchronous processes while
+      ;; removing the bootstrap shell, buffers, timers, and cached connection
+      ;; properties.
+      (tramp-cleanup-connection
+       bootstrap-vec 'keep-debug 'keep-password 'keep-processes))))
 
 (defun tramp-rpc--connect (vec)
   "Establish an RPC connection to VEC."
@@ -1943,7 +1951,9 @@ accidentally routing file operations through tramp-sh."
       ;; Never-deploy mode: use the configured path directly, no fallback.
       (let ((binary-path (tramp-rpc-deploy-ensure-binary vec)))
         (condition-case err
-            (tramp-rpc--start-server-process vec binary-path sudo-password)
+            (progn
+              (tramp-rpc--cleanup-bootstrap-connection vec)
+              (tramp-rpc--start-server-process vec binary-path sudo-password))
           (remote-file-error
            (tramp-rpc--cleanup-failed-connection vec)
            (signal 'remote-file-error
@@ -1959,24 +1969,32 @@ accidentally routing file operations through tramp-sh."
     ;; version bump), SSH exits immediately, we catch the error, deploy
     ;; via scpx, and retry.
     (condition-case err
-        (tramp-rpc--start-server-process
-         vec (tramp-rpc-deploy-expected-binary-localname) sudo-password)
+        (progn
+          ;; Remove bootstrap state left by an earlier deployment before the
+          ;; startup probe begins exchanging MessagePack frames.
+          (tramp-rpc--cleanup-bootstrap-connection vec)
+          (tramp-rpc--start-server-process
+           vec (tramp-rpc-deploy-expected-binary-localname) sudo-password))
       ((tramp-rpc-server-unavailable tramp-rpc-sudo-auth-rejected)
        ;; Binary missing or sudo rejected the password.  Clean up and deploy.
        (tramp-rpc--cleanup-failed-connection vec)
-       (let ((binary-path (tramp-rpc-deploy-ensure-binary vec)))
-         ;; Close the bootstrap connection - it's no longer needed and
-         ;; leaving it alive can cause vc/diff-hl sentinels to route
-         ;; file operations through tramp-sh instead of tramp-rpc.
-         (tramp-rpc--cleanup-bootstrap-connection vec)
-         ;; Re-prompt only when sudo explicitly rejected the supplied password.
-         ;; Missing-binary fallback keeps using the still-valid credential.
-         (when (and sudo-ssh-user
-                    (eq (car err) 'tramp-rpc-sudo-auth-rejected))
-           (setq sudo-password
-                 (when (tramp-rpc--sudo-password-required-p vec)
-                   (tramp-rpc--sudo-read-password vec sudo-ssh-user))))
-         (tramp-rpc--start-server-process vec binary-path sudo-password)))))))
+       ;; Deployment uses a bootstrap TRAMP connection.  Remove all of its
+       ;; state before retrying RPC startup, and also when deployment or the
+       ;; retry itself fails.
+       (unwind-protect
+           (let ((binary-path (tramp-rpc-deploy-ensure-binary vec)))
+             (tramp-rpc--cleanup-bootstrap-connection vec)
+             ;; Re-prompt only when sudo explicitly rejected the supplied
+             ;; password.  Missing-binary fallback keeps using the still-valid
+             ;; credential.
+             (when (and sudo-ssh-user
+                        (eq (car err) 'tramp-rpc-sudo-auth-rejected))
+               (setq sudo-password
+                     (when (tramp-rpc--sudo-password-required-p vec)
+                       (tramp-rpc--sudo-read-password vec sudo-ssh-user))))
+             (tramp-rpc--start-server-process
+              vec binary-path sudo-password))
+         (tramp-rpc--cleanup-bootstrap-connection vec)))))))
 
 (defun tramp-rpc--disconnect (vec)
   "Disconnect the RPC connection to VEC explicitly."

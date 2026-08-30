@@ -6245,6 +6245,92 @@ A rejected sudo password must not be reused on the next attempt, otherwise
       (when (buffer-live-p buffer)
         (kill-buffer buffer)))))
 
+(ert-deftest tramp-rpc-mock-test-cleanup-bootstrap-clears-cached-state ()
+  "Bootstrap cleanup should remove live and cached TRAMP connection state."
+  :tags '(:connection-cleanup)
+  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
+  (let ((vec (tramp-dissect-file-name "/rpc:bootstrap-host:/")))
+    (dolist (state '(live-process process-buffer legacy-process-buffer connected))
+      (let ((proc (when (eq state 'live-process)
+                    (make-process :name "tramp-rpc-bootstrap-cleanup-test"
+                                  :command '("cat")
+                                  :connection-type 'pipe
+                                  :noquery t)))
+            cleanup-args)
+        (unwind-protect
+            (cl-letf (((symbol-function 'tramp-rpc-deploy--bootstrap-vec)
+                       (lambda (_vec) vec))
+                      ((symbol-function 'tramp-get-connection-process)
+                       (lambda (_vec) proc))
+                      ((symbol-function 'tramp-connection-property-p)
+                       (lambda (_vec property)
+                         (pcase state
+                           ('process-buffer (equal property "process-buffer"))
+                           ('legacy-process-buffer
+                            (equal property " process-buffer"))
+                           ('connected (equal property " connected")))))
+                      ((symbol-function 'tramp-cleanup-connection)
+                       (lambda (&rest args) (setq cleanup-args args))))
+              (tramp-rpc--cleanup-bootstrap-connection vec)
+              (should (equal cleanup-args
+                             (list vec 'keep-debug 'keep-password
+                                   'keep-processes))))
+          (when (process-live-p proc)
+            (delete-process proc)))))))
+
+(ert-deftest tramp-rpc-mock-test-cleanup-bootstrap-ignores-empty-state ()
+  "Bootstrap cleanup should do nothing when TRAMP has no bootstrap state."
+  :tags '(:connection-cleanup)
+  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
+  (let ((vec (tramp-dissect-file-name "/rpc:bootstrap-host:/"))
+        cleanup-called)
+    (cl-letf (((symbol-function 'tramp-rpc-deploy--bootstrap-vec)
+               (lambda (_vec) vec))
+              ((symbol-function 'tramp-get-connection-process)
+               (lambda (_vec) nil))
+              ((symbol-function 'tramp-connection-property-p)
+               (lambda (&rest _) nil))
+              ((symbol-function 'tramp-cleanup-connection)
+               (lambda (&rest _) (setq cleanup-called t))))
+      (tramp-rpc--cleanup-bootstrap-connection vec)
+      (should-not cleanup-called))))
+
+(ert-deftest tramp-rpc-mock-test-connect-cleans-bootstrap-around-deployment ()
+  "RPC startup should not overlap with stale or newly-created bootstrap state."
+  :tags '(:connection-cleanup)
+  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
+  (let ((vec (tramp-dissect-file-name "/rpc:bootstrap-host:/"))
+        (tramp-rpc-use-controlmaster nil)
+        (tramp-rpc-deploy-never-deploy nil)
+        events)
+    (cl-letf (((symbol-function 'tramp-rpc--ensure-controlmaster-directory)
+               #'ignore)
+              ((symbol-function 'tramp-rpc--detect-sudo-elevation)
+               (lambda (_vec) nil))
+              ((symbol-function 'tramp-rpc-deploy-expected-binary-localname)
+               (lambda () "/expected/tramp-rpc-server"))
+              ((symbol-function 'tramp-rpc-deploy-ensure-binary)
+               (lambda (_vec)
+                 (push 'deploy events)
+                 "/deployed/tramp-rpc-server"))
+              ((symbol-function 'tramp-rpc--cleanup-bootstrap-connection)
+               (lambda (_vec) (push 'cleanup-bootstrap events)))
+              ((symbol-function 'tramp-rpc--cleanup-failed-connection)
+               (lambda (_vec) (push 'cleanup-failed events)))
+              ((symbol-function 'tramp-rpc--start-server-process)
+               (lambda (_vec binary-path &optional _sudo-password)
+                 (if (equal binary-path "/expected/tramp-rpc-server")
+                     (progn
+                       (push 'start-expected events)
+                       (signal 'tramp-rpc-server-unavailable
+                               '("mock missing binary")))
+                   (push 'start-deployed events)
+                   'connection))))
+      (should (eq (tramp-rpc--connect vec) 'connection))
+      (should (equal (nreverse events)
+                     '(cleanup-bootstrap start-expected cleanup-failed deploy
+                       cleanup-bootstrap start-deployed cleanup-bootstrap))))))
+
 (ert-deftest tramp-rpc-mock-test-start-server-sudo-password-uses-stdin ()
   "When sudo needs a password, start the elevated RPC server with sudo -S."
   :tags '(:sudo)
