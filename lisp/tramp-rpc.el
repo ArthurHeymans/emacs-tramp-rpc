@@ -1064,12 +1064,29 @@ server side."
           path))))
 
 (defun tramp-rpc--remote-path-environment (vec)
-  "Return a PATH environment entry for VEC.
+  "Return the configured PATH environment entry for VEC.
 Uses `tramp-remote-path' by default.  A non-nil deprecated
 `tramp-rpc-remote-path' overrides it for compatibility."
   (let ((remote-path (tramp-rpc--cached-remote-path vec)))
     (when remote-path
       `(("PATH" . ,(mapconcat #'identity remote-path ":"))))))
+
+(defun tramp-rpc--cached-login-path (vec)
+  "Return the login shell PATH directories for VEC, caching the result."
+  (with-tramp-connection-property vec "tramp-rpc-login-path"
+    (or (tramp-rpc--fetch-remote-exec-path vec) '())))
+
+(defun tramp-rpc--process-path-environment (vec)
+  "Return the PATH entry used for shell child processes on VEC.
+Configured `tramp-remote-path' entries keep precedence.  Append missing
+entries from the remote login shell PATH so shell commands behave like
+`tramp-sh', whose persistent login shell retains its own PATH."
+  (let ((path (copy-sequence (tramp-rpc--cached-remote-path vec))))
+    (dolist (entry (tramp-rpc--cached-login-path vec))
+      (unless (member entry path)
+        (setq path (append path (list entry)))))
+    (when path
+      `(("PATH" . ,(mapconcat #'identity path ":"))))))
 
 (defvar tramp-remote-process-environment)
 
@@ -1128,14 +1145,18 @@ by `with-environment-variables') are returned as an alist of
         (push (cons (match-string 1 elt) (match-string 2 elt)) env)))
     (nreverse env)))
 
-(defun tramp-rpc--process-environment (vec localname)
+(defun tramp-rpc--process-environment (vec localname &optional login-path)
   "Return the effective child environment for LOCALNAME on VEC.
-The configured remote PATH is the baseline.  Dynamic TRAMP environment,
+The configured remote PATH is the baseline.  When LOGIN-PATH is non-nil,
+append entries from the remote login shell PATH; this matches `tramp-sh' for
+commands run through `shell-file-name'.  Dynamic TRAMP environment,
 EMACSCLIENT_TRAMP, direnv, and caller overrides are merged in that order, so
 later and more specific values replace earlier ones."
   (tramp-rpc--ensure-inside-emacs-env
    (tramp-rpc--merge-environments
-    (tramp-rpc--remote-path-environment vec)
+    (if login-path
+        (tramp-rpc--process-path-environment vec)
+      (tramp-rpc--remote-path-environment vec))
     (tramp-rpc--tramp-remote-process-environment)
     (tramp-rpc--emacsclient-tramp-environment vec)
     (tramp-rpc--get-direnv-environment vec localname)
@@ -1205,6 +1226,7 @@ Also clears the executable, variable `exec-path', and login-shell caches."
       (when-let* ((transport (plist-get current :process)))
         (tramp-rpc-protocol--clear-deferred-polls-for-target transport))
       (remhash key tramp-rpc--connections)
+      (tramp-flush-connection-property vec "tramp-rpc-login-path")
       (remhash key tramp-rpc--exec-path-cache)
       (remhash key tramp-rpc--login-shell-cache))))
 
@@ -4639,9 +4661,12 @@ ARGS contains the original function arguments."
         ;; below, matching `tramp-remote-path' order.
         (let* (;; Like TRAMP's process handlers, pass only the remote-relevant
                ;; environment.  The PATH entry comes from `tramp-remote-path'
-               ;; (or deprecated `tramp-rpc-remote-path'); direnv and dynamic
-               ;; caller variables keep their previous roles and override it.
-               (env (tramp-rpc--process-environment v localname))
+               ;; (or deprecated `tramp-rpc-remote-path').  Shell commands also
+               ;; retain login-shell entries, matching tramp-sh; direnv and
+               ;; dynamic caller variables keep their previous roles and
+               ;; override it.
+               (env (tramp-rpc--process-environment
+                     v localname (equal program shell-file-name)))
                (stdin-content (when (and infile (not (eq infile t)))
                                  (with-temp-buffer
                                    (set-buffer-multibyte nil)
