@@ -6565,6 +6565,66 @@ retry must still happen in that case."
           (should (= establish-calls 2)))
       (delete-directory controlmaster-dir t))))
 
+(ert-deftest tramp-rpc-mock-test-establish-controlmaster-argv-and-connection-type ()
+"The establish command must keep a local PTY but never ask for a remote tty.
+OpenSSH prompts on the controlling terminal, so the establish process needs
+`process-connection-type' t; the ControlMaster itself must run without a
+session terminal (`-N' plus a leading explicit RequestTTY=no) so user SSH
+options can not reintroduce one (see #213)."
+  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
+  (let ((controlmaster-dir (make-temp-file "tramp-rpc-controlmaster" t))
+        ssh-args program connection-type process-buffer)
+    (unwind-protect
+        (progn
+          (let ((vec (tramp-dissect-file-name "/rpc:mock:/"))
+                (tramp-rpc-controlmaster-path
+                 (expand-file-name "%C" controlmaster-dir))
+                ;; Adversarial: user-supplied args must not win over the
+                ;; trailing no-terminal request.
+                (tramp-rpc-ssh-args '("-o" "RequestTTY=yes")))
+            (cl-letf (((symbol-function 'start-process)
+                       (lambda (name buffer prog &rest args)
+                         (setq program prog
+                               ssh-args args
+                               process-buffer buffer
+                               ;; Establish must have bound t locally around
+                               ;; the process start; with a pipe there is no
+                               ;; terminal for ssh to prompt on.
+                               connection-type process-connection-type)
+                         ;; Run a real, harmless child so the process
+                         ;; bookkeeping in the caller works.
+                         (make-process :name name
+                                       :buffer " *tramp-rpc-establish-argv-mock*"
+                                       :command (list "sleep" "60")
+                                       :noquery t)))
+                      ((symbol-function 'tramp-process-actions) #'ignore)
+                      ((symbol-function 'sleep-for) #'ignore))
+              ;; Poison the outer value; establish must locally bind t
+              ;; around the process start, and a regression to a pipe
+              ;; would capture this sentinel and fail the check below.
+              (let ((process-connection-type :pipe-regression-sentinel))
+                (should (tramp-rpc--establish-controlmaster vec)))))
+          ;; The local PTY is what carries password prompts to and from ssh.
+          (should (eq connection-type t))
+          ;; The session-less master must never request a remote terminal.
+          ;; OpenSSH applies the first value of a repeated option, so the
+          ;; enforce request must precede the user-supplied one.
+          (should (< (seq-position ssh-args "RequestTTY=no")
+                     (seq-position ssh-args "RequestTTY=yes")))
+          (should (member "ControlMaster=yes" ssh-args))
+          (should (member "-N" ssh-args)))
+      ;; Resource cleanup runs even when an assertion in the body fails.
+      ;; Delete the mock master process before killing its buffers, so
+      ;; `kill-buffer' is not asked about a running process.
+      (dolist (proc (process-list))
+        (when (string-prefix-p "*tramp-rpc-auth" (process-name proc))
+          (ignore-errors (delete-process proc))))
+      (when (buffer-live-p process-buffer)
+        (kill-buffer process-buffer))
+      (when (buffer-live-p (get-buffer " *tramp-rpc-establish-argv-mock*"))
+        (kill-buffer " *tramp-rpc-establish-argv-mock*"))
+      (ignore-errors (delete-directory controlmaster-dir t)))))
+
 (ert-deftest tramp-rpc-mock-test-controlmaster-action-tolerates-late-socket ()
   "A dead establish process still succeeds when its socket appears late.
 With ControlPersist the ssh parent exits as soon as the master forks to the

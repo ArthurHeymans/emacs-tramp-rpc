@@ -1592,6 +1592,17 @@ Returns non-nil on success."
          (buffer (get-buffer-create (format " *tramp-rpc-auth %s*" host)))
          (ssh-args (append
                     (list "ssh")
+                    ;; Never let this master ask for a remote
+                    ;; pseudo-terminal.  The request stays ahead of
+                    ;; user-supplied arguments on purpose: OpenSSH
+                    ;; resolves repeated options to their first value, so
+                    ;; neither `tramp-rpc-ssh-args' nor ssh_config
+                    ;; (`RequestTTY yes', `-t') can make the session-less
+                    ;; master (`-N', below, which also implies
+                    ;; RequestTTY=no) ask for a remote pseudo-terminal,
+                    ;; say on a ProxyJump hop (see #213).  The master
+                    ;; must stay a plain connection multiplexer.
+                    (list "-o" "RequestTTY=no")
                     tramp-rpc-ssh-args
                     (tramp-rpc--ssh-identity-args user port proxyjump)
                     ;; NO BatchMode - allow password prompts
@@ -1615,7 +1626,17 @@ Returns non-nil on success."
     (let (success)
       (unwind-protect
           (progn
-            ;; Start SSH with PTY for interactive password prompt.
+            ;; Start SSH with a local PTY.  OpenSSH writes password and
+            ;; passphrase prompts to, and reads the reply from, its
+            ;; controlling terminal; `tramp-process-actions' matches those
+            ;; prompts in the process buffer and answers via stdin, which
+            ;; with a PTY is that same terminal.  A controlling terminal is
+            ;; therefore required for authentication: a pipe leaves ssh
+            ;; without one (it will not fall back to reading stdin), and a
+            ;; separate stderr buffer would hide the prompts from the
+            ;; regexp actions (see the review of #213).  Only the local
+            ;; side gets a terminal; the `RequestTTY=no' above keeps any
+            ;; remote tty request out of the ControlMaster itself.
             (let ((process-connection-type t))
               (setq process (apply #'start-process process-name buffer ssh-args)))
             (set-process-query-on-exit-flag process nil)
