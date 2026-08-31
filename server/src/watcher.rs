@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+
 //! Filesystem watcher for cache invalidation notifications.
 //!
 //! Uses inotify (Linux) / kqueue (macOS) via the `notify` crate to watch

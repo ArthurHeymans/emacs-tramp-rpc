@@ -136,7 +136,7 @@ with :notification t, :method, and :params keys."
                                 :key-type 'symbol
                                 :array-type 'list
                                 :bin-type 'msgpack-bin)
-		(when (and end (/= (point) (point-max)))
+		(when (and end (not (eobp)))
 		  (error "Trailing data in MessagePack frame"))))))
          (id (alist-get 'id response))
          (method (alist-get 'method response))
@@ -169,7 +169,7 @@ with :notification t, :method, and :params keys."
     result))
 
 (defun tramp-rpc-protocol-error-p (response)
-  "Return non-nil if RESPONSE contains an error."
+  "Return non-nil for an error RESPONSE."
   (plist-get response :error))
 
 (defun tramp-rpc-protocol-error-message (response)
@@ -263,11 +263,6 @@ Returns a list where each element is either:
 ;; ============================================================================
 ;; Unload support
 ;; ============================================================================
-
-(add-hook 'tramp-rpc-unload-hook
-	  (lambda ()
-	    (when (featurep 'tramp-rpc-protocol)
-	      (unload-feature 'tramp-rpc-protocol 'force))))
 
 (provide 'tramp-rpc-protocol)
 ;;; tramp-rpc-protocol.el ends here

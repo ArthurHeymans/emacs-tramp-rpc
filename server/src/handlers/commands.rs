@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+
 //! Command execution and ancestor scanning for TRAMP-RPC
 //!
 //! This module provides:

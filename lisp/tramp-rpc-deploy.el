@@ -8,6 +8,11 @@
 
 ;; This file is part of tramp-rpc.
 
+;; tramp-rpc is free software: you can redistribute it and/or modify
+;; it under the terms of the GNU General Public License as published by
+;; the Free Software Foundation, either version 3 of the License, or
+;; (at your option) any later version.
+
 ;;; Commentary:
 
 ;; This file handles deployment of the tramp-rpc-server binary to
@@ -22,21 +27,17 @@
 
 (require 'cl-lib)
 (require 'tramp)
+(require 'tramp-sh)
 (require 'url)
-
-;; Silence byte-compiler warnings for functions defined in tramp-sh
-(declare-function tramp-send-command "tramp-sh")
-(declare-function tramp-send-command-and-check "tramp-sh")
-(declare-function tramp-send-command-and-read "tramp-sh")
 
 ;; Functions from tramp-rpc.el.  `tramp-rpc-deploy' is loaded by
 ;; tramp-rpc.el after these helpers have been defined.
 (declare-function tramp-rpc--proxy-hop-string "tramp-rpc")
 (declare-function tramp-rpc--sudo-rpc-hop-vec "tramp-rpc")
 
-;;; ============================================================================
+;; ============================================================================
 ;;; Customization
-;;; ============================================================================
+;; ============================================================================
 
 (defun tramp-rpc-deploy--load-source-file-name ()
   "Return the Elisp source file corresponding to `load-file-name'.
@@ -277,7 +278,7 @@ Messages are logged to *tramp-rpc-deploy* buffer."
   "Log a debug message if `tramp-rpc-deploy-debug' is non-nil.
 FORMAT-STRING and ARGS are passed to `format'."
   (when tramp-rpc-deploy-debug
-    (let* ((line (concat (format-time-string "[%Y-%m-%d %H:%M:%S] ")
+    (let* ((line (concat (format-time-string "[%F %T] ")
                          (apply #'format format-string args)
                          "\n"))
            (log-file (or (getenv "TRAMP_RPC_DEPLOY_DEBUG_LOG")
@@ -293,9 +294,9 @@ FORMAT-STRING and ARGS are passed to `format'."
               (write-region line nil log-file 'append 'silent))
           (error nil))))))
 
-;;; ============================================================================
+;; ============================================================================
 ;;; Architecture detection and path helpers
-;;; ============================================================================
+;; ============================================================================
 
 (defun tramp-rpc-deploy--normalize-hops (hop-string)
   "Convert \"rpc:\" method references in HOP-STRING to \"ssh:\" for bootstrap.
@@ -474,7 +475,7 @@ preserve timestamps."
        t))
 
 (defun tramp-rpc-deploy--source-directory-warning ()
-  "Return a warning string when source-build auto-detection looks suspicious."
+  "Return a warning string for suspicious source-build auto-detection."
   (when (and (memq tramp-rpc-deploy-git-build-policy '(auto build))
              tramp-rpc-deploy-source-directory
              (not (tramp-rpc-deploy--source-has-server-p)))
@@ -562,9 +563,9 @@ outputs whose mtime predates the source files."
                    tramp-rpc-deploy-binary-name
                    (tramp-rpc-deploy--binary-id)))))
 
-;;; ============================================================================
+;; ============================================================================
 ;;; Download from GitHub Releases
-;;; ============================================================================
+;; ============================================================================
 
 (defun tramp-rpc-deploy--release-asset-name (arch)
   "Return the release asset filename for ARCH."
@@ -663,7 +664,9 @@ Returns t if checksum matches, nil otherwise."
           (rename-file temp-path path t)
           (setq temp-path nil))
       (when temp-path
-        (ignore-errors (delete-file temp-path))))))
+        (condition-case nil
+            (delete-file temp-path)
+          (file-missing nil))))))
 
 (defun tramp-rpc-deploy--write-cache-provenance (cache-path kind digest)
   "Atomically record KIND and SHA256 DIGEST for CACHE-PATH."
@@ -677,8 +680,11 @@ Returns t if checksum matches, nil otherwise."
 
 (defun tramp-rpc-deploy--invalidate-cache (cache-path)
   "Remove CACHE-PATH and its provenance after failed source-cache validation."
-  (ignore-errors (delete-file cache-path))
-  (ignore-errors (delete-file (tramp-rpc-deploy--cache-provenance-path cache-path))))
+  (dolist (path (list cache-path
+                      (tramp-rpc-deploy--cache-provenance-path cache-path)))
+    (condition-case nil
+        (delete-file path)
+      (file-missing nil))))
 
 (defun tramp-rpc-deploy--promote-cached-binary (source cache-path kind)
   "Atomically promote SOURCE to CACHE-PATH with KIND and a recorded digest.
@@ -693,13 +699,17 @@ never one authorized by stale provenance."
           (set-file-modes temp-path #o755)
           (let ((digest (tramp-rpc-deploy--compute-checksum temp-path)))
             ;; Remove stale authority before changing the cache binary.
-            (ignore-errors (delete-file provenance-path))
+            (condition-case nil
+                (delete-file provenance-path)
+              (file-missing nil))
             (rename-file temp-path cache-path t)
             (setq temp-path nil)
             (tramp-rpc-deploy--write-cache-provenance cache-path kind digest)
             cache-path))
       (when temp-path
-        (ignore-errors (delete-file temp-path))))))
+        (condition-case nil
+            (delete-file temp-path)
+          (file-missing nil))))))
 
 (defun tramp-rpc-deploy--cached-binary-trusted-p (cache-path)
   "Return non-nil when CACHE-PATH matches a recorded provenance digest."
@@ -785,11 +795,13 @@ release artifact into the cache."
             (message "Downloaded and verified tramp-rpc-server for %s" arch)
             cache-path))
       ;; Never leave downloaded archives or unpromoted extraction behind.
-      (ignore-errors (delete-directory temp-dir t)))))
+      (condition-case nil
+          (delete-directory temp-dir t)
+        (file-missing nil)))))
 
-;;; ============================================================================
+;; ============================================================================
 ;;; Build from source
-;;; ============================================================================
+;; ============================================================================
 
 (defun tramp-rpc-deploy--cargo-available-p ()
   "Check if cargo (Rust) is available."
@@ -845,9 +857,9 @@ Returns the path to the binary on success, nil on failure."
 	   'remote-file-error
 	   (list (format "Build failed (exit %d):\n%s" exit-code (buffer-string)))))))))
 
-;;; ============================================================================
+;; ============================================================================
 ;;; Main logic: ensure local binary exists
-;;; ============================================================================
+;; ============================================================================
 
 (defun tramp-rpc-deploy--ask-git-install-action (arch)
   "Ask how to obtain a git-checkout server binary for ARCH.
@@ -1014,9 +1026,9 @@ Returns the path to the local binary."
        (format "Binary should be placed at:\n   %s"
                (tramp-rpc-deploy--local-cache-path arch))))))
 
-;;; ============================================================================
+;; ============================================================================
 ;;; Remote deployment
-;;; ============================================================================
+;; ============================================================================
 
 (defun tramp-rpc-deploy--remote-binary-exists-p (vec)
   "Check if a regular non-symlink executable binary exists on remote VEC."
@@ -1064,9 +1076,9 @@ Tries sha256sum first, then shasum -a 256 for macOS compatibility."
     ;; would reject every automatic deployment.
     (tramp-send-command
      vec
-     (format (concat "umask 077 && parent=$(cd %s && pwd -P) && "
-                     "directory=$(mktemp -d \"$parent/.tramp-rpc-transfer.XXXXXX\") && "
-                     "printf '%%s\\n%%s\\n' \"$parent\" \"$directory\"")
+     (format "umask 077 && parent=$(cd %s && pwd -P) && \
+directory=$(mktemp -d \"$parent/.tramp-rpc-transfer.XXXXXX\") && \
+printf '%%s\\n%%s\\n' \"$parent\" \"$directory\""
              (tramp-shell-quote-argument parent)))
     (with-current-buffer (tramp-get-connection-buffer vec)
       (goto-char (point-min))
@@ -1180,14 +1192,12 @@ to inline encoding (base64 through the shell), which can be fragile."
                              (dest (tramp-shell-quote-argument remote-local))
                              (digest (tramp-shell-quote-argument local-checksum)))
                          (format
-                          (concat "test -f %s && ! test -L %s && chmod +x %s && "
-                                  "test -f %s && ! test -L %s && "
-                                  "(test ! -e %s && ! test -L %s || "
-                                  "test -f %s && ! test -L %s) && "
-                                  "actual=$({ sha256sum %s 2>/dev/null || "
-                                  "shasum -a 256 %s 2>/dev/null; } | cut -d' ' -f1) && "
-                                  "test \"$actual\" = %s && mv -f %s %s && "
-                                  "test -f %s && ! test -L %s && test -x %s")
+                          "test -f %s && ! test -L %s && chmod +x %s && \
+test -f %s && ! test -L %s && \
+(test ! -e %s && ! test -L %s || test -f %s && ! test -L %s) && \
+actual=$({ sha256sum %s 2>/dev/null || shasum -a 256 %s 2>/dev/null; } | cut -d' ' -f1) && \
+test \"$actual\" = %s && mv -f %s %s && \
+test -f %s && ! test -L %s && test -x %s"
                           tmp tmp tmp tmp tmp dest dest dest dest tmp tmp digest tmp dest
                           dest dest dest)))
                     (signal 'remote-file-error
@@ -1201,9 +1211,14 @@ to inline encoding (base64 through the shell), which can be fragile."
                  (message "Transfer error: %s" err-msg))
                (setq retries (1+ retries))))
           (when staging-directory
-            (ignore-errors
-              (tramp-rpc-deploy--remove-remote-staging-directory
-               vec staging-directory))))))
+            (condition-case cleanup-error
+                (tramp-rpc-deploy--remove-remote-staging-directory
+                 vec staging-directory)
+              ((file-error remote-file-error)
+               (tramp-rpc-deploy--log
+                "Failed to remove remote staging directory %s: %s"
+                staging-directory
+                (error-message-string cleanup-error))))))))
 
     (unless success
       (signal
@@ -1218,9 +1233,9 @@ to inline encoding (base64 through the shell), which can be fragile."
 
     remote-path))
 
-;;; ============================================================================
+;; ============================================================================
 ;;; Public API
-;;; ============================================================================
+;; ============================================================================
 
 (defun tramp-rpc-deploy-expected-binary-localname ()
   "Return the expected remote binary localname without network access.
@@ -1588,11 +1603,6 @@ This helps troubleshoot deployment issues."
 ;; ============================================================================
 ;; Unload support
 ;; ============================================================================
-
-(add-hook 'tramp-rpc-unload-hook
-	  (lambda ()
-	    (when (featurep 'tramp-rpc-deploy)
-	      (unload-feature 'tramp-rpc-deploy 'force))))
 
 (provide 'tramp-rpc-deploy)
 ;;; tramp-rpc-deploy.el ends here

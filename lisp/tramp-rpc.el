@@ -67,7 +67,11 @@
   "TRAMP method for RPC-based remote access.")
 
 ;;;###autoload
-(with-eval-after-load 'tramp
+(eval-and-compile
+  ;; The autoload file must initialize TRAMP before registering the method.
+  ;; This avoids deferred definitions and lets the byte compiler validate every
+  ;; TRAMP variable and function referenced by the registration code.
+  (require 'tramp)
   ;; Check, that `tramp-rpc-method' is still bound.  It isn't after
   ;; unloading `tramp-rpc', but this body still exists as compiled
   ;; function in `after-load-alist'.
@@ -109,15 +113,14 @@
    `(:application tramp :protocol ,tramp-rpc-method)
    'tramp-rpc-connection-local-default-profile)
 
-  ;; Define the predicate inline (as defsubst) so it's available without
+  ;; Define the predicate in the autoload file so it is available without
   ;; loading tramp-rpc.el.  This avoids recursive autoloading: TRAMP calls
   ;; the predicate to decide which handler to use, and if it were an
   ;; autoload stub it would load tramp-rpc.el which `(require 'tramp)'.
-  ;; Reference TRAMP uses the same pattern (defsubst in tramp-loaddefs.el).
   (defvar tramp-rpc--sudo-file-name-p-in-progress nil
     "Non-nil while checking hidden rpc+sudo proxy expansion.")
 
-  (defsubst tramp-rpc-file-name-p (vec-or-filename)
+  (defun tramp-rpc-file-name-p (vec-or-filename)
     "Check if VEC-OR-FILENAME is handled by TRAMP-RPC."
     (when-let* ((vec (tramp-ensure-dissected-file-name vec-or-filename)))
       (string= (tramp-file-name-method vec) tramp-rpc-method)))
@@ -125,7 +128,7 @@
   ;; Detect privilege elevation paths with rpc hops, e.g.
   ;; /rpc:user@host|sudo:root@host:/path.  These are handled by the
   ;; tramp-rpc handler which starts the RPC server via sudo.
-  (defsubst tramp-rpc--sudo-file-name-p (vec-or-filename)
+  (defun tramp-rpc--sudo-file-name-p (vec-or-filename)
     "Check if VEC-OR-FILENAME is a privilege elevation with an rpc hop."
     (when-let* ((vec (tramp-ensure-dissected-file-name vec-or-filename))
                 (target-host (tramp-file-name-host vec)))
@@ -214,22 +217,35 @@ This is called from `tramp-multi-hop-p-hook'."
 
 ;; Now the actual implementation
 (require 'cl-lib)
+(require 'json)
+(require 'seq)
 (require 'tramp)
 (require 'tramp-sh)
 (require 'tramp-rpc-protocol)
 
-;; Check for minimum Tramp version.  The Package-Requires header declares
-;; (tramp "2.8.1.4") but that is only enforced by package.el at install
-;; time.  Guard at load time so that manual installations fail clearly.
-(when (version< tramp-version "2.8.1.4")
-  (error "Tramp RPC requires Tramp >= 2.8.1.4, but %s is loaded"
-         tramp-version))
+;; Package-Requires enforces this for package installations.  Keep loading
+;; harmless for tooling that checks each file against Emacs's older bundled
+;; TRAMP, and report the actionable error when the backend is actually used.
+(defun tramp-rpc--check-tramp-version ()
+  "Signal a clear error unless the loaded TRAMP version is supported."
+  (when (version< tramp-version "2.8.1.4")
+    (error "Tramp RPC requires Tramp >= 2.8.1.4, but %s is loaded"
+           tramp-version)))
 
-;; Silence byte-compiler warnings for functions defined in with-eval-after-load
-(declare-function tramp-add-external-operation "tramp")
-(declare-function tramp-remove-external-operation "tramp")
-(declare-function tramp-handle-insert-directory "tramp")
+(defun tramp-rpc--add-external-operation (&rest args)
+  "Call `tramp-add-external-operation' with ARGS when available."
+  (when (fboundp 'tramp-add-external-operation)
+    (apply (symbol-function 'tramp-add-external-operation) args)))
+
+(defun tramp-rpc--remove-external-operation (&rest args)
+  "Call `tramp-remove-external-operation' with ARGS when available."
+  (when (fboundp 'tramp-remove-external-operation)
+    (apply (symbol-function 'tramp-remove-external-operation) args)))
+
 (declare-function dired-compress-file "dired-aux")
+;; These predicates are emitted inside the single autoload form above.  The
+;; compiler does not discover nested definitions, so declare only those two
+;; autoload-owned functions used by the full implementation below.
 (declare-function tramp-rpc--sudo-file-name-p "tramp-rpc")
 (declare-function tramp-rpc-multi-hop-p "tramp-rpc")
 
@@ -391,9 +407,6 @@ avoids breakage if callers supply numeric defaults."
         ((numberp port) (number-to-string port))
         (t nil)))
 
-(declare-function tramp-read-passwd "tramp")
-(declare-function tramp-clear-passwd "tramp" (vec))
-
 (defun tramp-rpc--sudo-auth-vec (vec)
   "Return the unprivileged rpc vector used to validate sudo for VEC."
   (when-let* ((sudo-hop (tramp-rpc--sudo-rpc-hop-vec vec)))
@@ -497,72 +510,19 @@ proxy hops remain."
                            tramp-postfix-hop-format)
                 tramp-postfix-hop-format)))))
 
-(require 'tramp-rpc-deploy)
-
-(define-error 'tramp-rpc-server-unavailable
-  "TRAMP-RPC server binary is unavailable" 'remote-file-error)
-
-;; Silence byte-compiler warnings for functions defined elsewhere
-;; (vterm variables are declared in tramp-rpc-process.el)
-
-;; Forward declarations for protocol and cache/watch functions.
-(declare-function tramp-rpc-protocol--clear-deferred-polls-for-target
-                  "tramp-rpc-protocol" (target))
-(declare-function tramp-rpc-protocol--clear-deferred-polls
-                  "tramp-rpc-protocol" ())
-
-;; Cache/watch functions (tramp-rpc-magit.el).
-(defvar tramp-rpc--cache-ttl)
-(defvar tramp-rpc--file-exists-cache)
-(defvar tramp-rpc--file-truename-cache)
-(defvar tramp-rpc--file-stat-cache)
-(defvar tramp-rpc--suppress-fs-notifications)
-(defvar tramp-rpc--watched-directories)
-(defvar tramp-rpc-magit--allow-process-cache)
-(declare-function tramp-rpc--cache-get "tramp-rpc-magit")
-(declare-function tramp-rpc--cache-put "tramp-rpc-magit")
-(declare-function tramp-rpc--cache-lookup "tramp-rpc-magit")
-(declare-function tramp-rpc--cache-entry-valid-p "tramp-rpc-magit")
-(declare-function tramp-rpc--file-stat-cache-key "tramp-rpc-magit")
-(declare-function tramp-rpc--cache-file-stat-result "tramp-rpc-magit")
-(declare-function tramp-rpc--invalidate-cache-for-path "tramp-rpc-magit")
-(declare-function tramp-rpc--invalidate-cache-for-subtree "tramp-rpc-magit")
-(declare-function tramp-rpc--connection-key-string "tramp-rpc-magit")
-(declare-function tramp-rpc--directory-watched-p "tramp-rpc-magit")
-(declare-function tramp-rpc--handle-notification "tramp-rpc-magit")
-(declare-function tramp-rpc-watch-directory "tramp-rpc-magit")
-(declare-function tramp-rpc-unwatch-directory "tramp-rpc-magit")
-(declare-function tramp-rpc-clear-file-exists-cache "tramp-rpc-magit")
-(declare-function tramp-rpc-clear-file-truename-cache "tramp-rpc-magit")
-(declare-function tramp-rpc-clear-file-stat-cache "tramp-rpc-magit")
-(declare-function tramp-rpc--clear-file-metadata-caches "tramp-rpc-magit")
-(declare-function tramp-rpc--cleanup-watches-for-connection "tramp-rpc-magit"
-                  (vec &optional connection-process))
-(declare-function tramp-rpc--cleanup-async-processes "tramp-rpc-process")
-(declare-function tramp-rpc--cleanup-pty-processes "tramp-rpc-process")
-(declare-function tramp-rpc--cleanup-process-write-queues "tramp-rpc-process")
-(declare-function tramp-rpc--terminate-async-processes "tramp-rpc-process")
-(declare-function tramp-rpc--terminate-pty-processes "tramp-rpc-process")
-(declare-function tramp-rpc--clear-file-caches-for-connection "tramp-rpc-magit")
-(declare-function tramp-rpc-magit--clear-cache "tramp-rpc-magit")
-(declare-function tramp-rpc-magit--clear-cache-for-connection
-                  "tramp-rpc-magit" (vec))
-(declare-function tramp-rpc-magit--process-cache-lookup "tramp-rpc-magit")
-(declare-function tramp-rpc-magit--process-cache-store "tramp-rpc-magit")
-(declare-function tramp-rpc-magit--file-exists-p "tramp-rpc-magit")
-(declare-function tramp-rpc-magit--clear-status-cache "tramp-rpc-magit")
-(declare-function tramp-rpc-magit--clear-status-cache-for-connection
-                  "tramp-rpc-magit" (vec))
-(declare-function tramp-rpc-magit--prefetch "tramp-rpc-magit")
-(declare-function tramp-rpc-magit--strip-git-prefix-args "tramp-rpc-magit")
-(declare-function tramp-rpc-magit--git-cache-safe-environment-p "tramp-rpc-magit")
-(declare-function tramp-rpc-magit--clear-cache "tramp-rpc-magit")
-(defvar tramp-rpc-magit--debug)
-(defvar tramp-rpc-magit--process-caches)
-
 (defgroup tramp-rpc nil
   "TRAMP backend using RPC."
   :group 'tramp)
+
+;; Helper modules only define functions while the main package is loading.
+;; Runtime integration is installed explicitly after `tramp-rpc' is provided.
+(require 'tramp-rpc-deploy)
+(require 'tramp-rpc-process)
+(require 'tramp-rpc-advice)
+(require 'tramp-rpc-magit)
+
+(define-error 'tramp-rpc-server-unavailable
+  "TRAMP-RPC server binary is unavailable" 'remote-file-error)
 
 (defcustom tramp-rpc-call-timeout 30
   "Maximum seconds to wait for a synchronous RPC call to complete.
@@ -632,10 +592,10 @@ passing any SSH command-line arguments."
 
 (defcustom tramp-rpc-use-direct-ssh-pty t
   "Whether to use direct SSH connections for PTY processes.
-When non-nil, interactive terminal processes (vterm, shell-mode, term-mode)
-use a direct SSH connection with `-t` for the PTY, providing much lower
-latency than the RPC-based PTY.  The SSH connection reuses the existing
-ControlMaster socket, so authentication is already handled.
+When non-nil, interactive terminal processes (`vterm', `shell-mode',
+`term-mode') use a direct SSH connection with `-t` for the PTY.  This provides
+much lower latency than the RPC-based PTY.  The SSH connection reuses the
+existing ControlMaster socket, so authentication is already handled.
 
 Note: `signal-process' on direct SSH PTY sends signal to the local SSH
 process, which may not propagate to the remote process in all cases."
@@ -699,7 +659,7 @@ When TRAMP_RPC_DEBUG_LOG or TRAMP_RPC_DEBUG_DIR is set in the environment,
 also append each line directly to a local log file.  This preserves CI
 telemetry even when later tests unload TRAMP and remove debug buffers."
   (when tramp-rpc-debug
-    (let* ((line (concat (format-time-string "[%Y-%m-%d %H:%M:%S.%3N] ")
+    (let* ((line (concat (format-time-string "[%F %T.%3N] ")
                          (apply #'format format-string args)
                          "\n"))
            (log-file (or (getenv "TRAMP_RPC_DEBUG_LOG")
@@ -1449,9 +1409,9 @@ Creates the directory from `tramp-rpc-controlmaster-path' if needed."
         ;; Set restrictive permissions for security
         (set-file-modes dir #o700)))))
 
-;;; ============================================================================
+;; ============================================================================
 ;;; Authentication via tramp-process-actions
-;;; ============================================================================
+;; ============================================================================
 
 ;; Reuse upstream TRAMP's `tramp-process-actions' state machine for all
 ;; interactive authentication (SSH passwords, sudo, host-key prompts,
@@ -1499,9 +1459,9 @@ for the socket to appear before declaring the attempt dead."
 Handles password prompts, host-key verification, and detects the
 ControlMaster socket file appearing as the success condition.")
 
-;;; ============================================================================
+;; ============================================================================
 ;;; Multi-hop support
-;;; ============================================================================
+;; ============================================================================
 
 (defun tramp-rpc--hops-to-proxyjump (vec)
   "Convert VEC's hop chain to an SSH ProxyJump (-J) string.
@@ -1642,7 +1602,7 @@ Returns non-nil on success."
     ;; create a ControlMaster on top of a stale ControlPath, which later shows
     ;; up as a generic "Tramp failed to connect" during unrelated file ops.
     (when (file-exists-p socket-path)
-      (ignore-errors (delete-file socket-path)))
+      (delete-file socket-path))
     (with-current-buffer buffer
       (erase-buffer))
     (let (success)
@@ -1933,7 +1893,9 @@ probe can then interleave with RPC startup and corrupt the protocol stream."
              ;; Do not tear down a socket that still answers ControlMaster
              ;; checks merely because authentication failed for another reason.
              (signal (car err) (cdr err))
-           (ignore-errors (delete-file socket-path))
+           (condition-case nil
+               (delete-file socket-path)
+             (file-missing nil))
            (sleep-for 0.1)
            (condition-case nil
                (tramp-rpc--establish-controlmaster vec)
@@ -2043,12 +2005,15 @@ down VEC's ControlMaster in that case would disrupt the still-live connection."
       ;; Close the ControlMaster socket gracefully via ssh -O exit.
       ;; This is a local control message (no network round-trip), so fast.
       (when (file-exists-p socket-path)
-        (ignore-errors
-          (apply #'call-process "ssh" nil nil nil
-                 (append
-                  (tramp-rpc--ssh-identity-args user port proxyjump)
-                  (list "-o" (format "ControlPath=%s" socket-path)
-                        "-O" "exit" host)))))
+        (condition-case err
+            (apply #'call-process "ssh" nil nil nil
+                   (append
+                    (tramp-rpc--ssh-identity-args user port proxyjump)
+                    (list "-o" (format "ControlPath=%s" socket-path)
+                          "-O" "exit" host)))
+          (file-error
+           (tramp-rpc--debug "ControlMaster cleanup failed: %s"
+                             (error-message-string err)))))
       ;; Kill the auth process.
       (when (and auth-process (process-live-p auth-process))
         (delete-process auth-process))
@@ -5180,7 +5145,12 @@ Keys are the same connection/path keys as `tramp-rpc--watched-directories'.")
 
 (defun tramp-rpc--file-notify-monitor (vec)
   "Return the file notification monitor symbol for VEC."
-  (let* ((info (ignore-errors (tramp-rpc--system-info vec)))
+  (let* ((info (condition-case err
+                   (tramp-rpc--system-info vec)
+                 (error
+                  (tramp-rpc--debug "system.info probe failed: %s"
+                                    (error-message-string err))
+                  nil)))
          (watcher (and (listp info)
                        (tramp-rpc--decode-string (alist-get 'watcher info))))
          (os (and (listp info)
@@ -5559,7 +5529,13 @@ FLAGS controls the requested operation."
            ;; file-notify does not follow symlinks.  Ask the server for a
            ;; nofollow symlink watch when needed, falling back to a synthetic
            ;; client-side descriptor on platforms without nofollow support.
-           (symlink-watch (ignore-errors (file-symlink-p directory)))
+           (symlink-watch
+            (condition-case err
+                (file-symlink-p directory)
+              (error
+               (tramp-rpc--debug "symlink watch probe failed for %s: %s"
+                                 directory (error-message-string err))
+               nil)))
            (descriptor (tramp-rpc--make-file-notify-descriptor
                         v directory localname)))
       (if entry
@@ -5607,8 +5583,14 @@ FLAGS controls the requested operation."
                                      ;; truename path as a best-effort match key
                                      ;; for symlinked watched directories.
                                      (preexisting
-                                      (ignore-errors
-                                        (file-truename directory))))))
+                                      (condition-case err
+                                          (file-truename directory)
+                                        (error
+                                         (tramp-rpc--debug
+                                          "watch truename probe failed for %s: %s"
+                                          directory
+                                          (error-message-string err))
+                                         nil))))))
           (puthash watch-key
                    (list :count 1
                          :owned (and (not preexisting) (not synthetic))
@@ -5689,16 +5671,6 @@ Lower values mean more responsive but higher CPU usage.
 Also controls process exit detection latency."
   :type 'integer
   :group 'tramp-rpc)
-
-;; Process support, advice functions, and magit integration are now in
-;; separate modules for better organization and maintainability.
-(require 'tramp-rpc-process)
-;; Loading tramp-rpc-advice while this file is being byte-compiled can
-;; recurse on some Emacs/TRAMP combinations.  Advice is still loaded at
-;; runtime when `tramp-rpc' is required normally.
-(unless (bound-and-true-p byte-compile-current-file)
-  (require 'tramp-rpc-advice))
-(require 'tramp-rpc-magit)
 
 ;; ============================================================================
 ;; File name handler registration
@@ -5841,13 +5813,12 @@ Also controls process exit detection latency."
     )
   "Alist of handler functions for TRAMP-RPC method.")
 
-;; Defer registration until tramp-rpc is fully loaded so
-;; `tramp-add-external-operation' can safely `(require 'tramp-rpc)'.
-(with-eval-after-load 'tramp-rpc
-  (tramp-add-external-operation 'locate-dominating-file 'tramp-rpc-handle-locate-dominating-file 'tramp-rpc)
-  (tramp-add-external-operation 'dir-locals--all-files 'tramp-rpc-handle-dir-locals--all-files 'tramp-rpc)
-  (tramp-add-external-operation 'dir-locals-find-file 'tramp-rpc-handle-dir-locals-find-file 'tramp-rpc)
-  (tramp-add-external-operation 'move-file-to-trash 'tramp-rpc-handle-move-file-to-trash 'tramp-rpc 'file))
+(defun tramp-rpc--install-core-external-operations ()
+  "Install external operations implemented by the core module."
+  (tramp-rpc--add-external-operation 'locate-dominating-file 'tramp-rpc-handle-locate-dominating-file 'tramp-rpc)
+  (tramp-rpc--add-external-operation 'dir-locals--all-files 'tramp-rpc-handle-dir-locals--all-files 'tramp-rpc)
+  (tramp-rpc--add-external-operation 'dir-locals-find-file 'tramp-rpc-handle-dir-locals-find-file 'tramp-rpc)
+  (tramp-rpc--add-external-operation 'move-file-to-trash 'tramp-rpc-handle-move-file-to-trash 'tramp-rpc 'file))
 
 ;;;###autoload
 (defun tramp-rpc-file-name-handler (operation &rest args)
@@ -5856,6 +5827,7 @@ Falls back to the local handler when `non-essential' is non-nil and
 a backend function throws `non-essential' (e.g. because no connection
 exists and opening one would block).  This mirrors the catch/throw
 pattern in `tramp-file-name-handler'."
+  (tramp-rpc--check-tramp-version)
   ;; `file-remote-p' is called for everything, even for symbolic
   ;; links which look remote.  We don't want to get an error.
   (let ((non-essential (or non-essential (eq operation 'file-remote-p))))
@@ -5871,8 +5843,8 @@ pattern in `tramp-file-name-handler'."
 ;; Method predicate and handler registration
 ;; ============================================================================
 
-;; `tramp-rpc-file-name-p' is defined as defsubst in the with-eval-after-load
-;; block above (extracted into autoloads).  Re-define it here as defun for
+;; `tramp-rpc-file-name-p' is defined in the autoload block above.  Re-define
+;; it here so the installed implementation is associated with this source file for
 ;; the full-load case so it gets proper byte-compilation.
 (defun tramp-rpc-file-name-p (vec-or-filename)
   "Check if VEC-OR-FILENAME is handled by TRAMP-RPC.
@@ -5881,7 +5853,7 @@ VEC-OR-FILENAME can be either a tramp-file-name struct or a filename string."
     (string= (tramp-file-name-method vec) tramp-rpc-method)))
 
 ;; Re-register with the full defun now that the file is loaded.
-;; (Already registered via with-eval-after-load, but this ensures the
+;; (Already registered by the autoload code, but this ensures the
 ;; byte-compiled defun version is used.)
 (tramp-register-foreign-file-name-handler
  #'tramp-rpc-file-name-p #'tramp-rpc-file-name-handler)
@@ -5972,36 +5944,52 @@ cleanup of all connections has run."
   ;; `tramp-cleanup-all-connections-hook'.
   )
 
-;; Register cleanup hooks.
-(add-hook 'tramp-cleanup-connection-hook #'tramp-rpc-cleanup-connection)
-(add-hook 'tramp-cleanup-all-connections-hook #'tramp-rpc-cleanup-all-connections)
-
 ;; ============================================================================
 ;; Unload support
 ;; ============================================================================
 
-(defvar tramp-rpc-unload-hook nil
-  "Hook run by `tramp-rpc-unload-function' to unload helper modules.")
+(defun tramp-rpc--after-load-integrations (_file)
+  "Install integrations whose optional packages have just loaded."
+  (tramp-rpc-process-install-optional-handlers)
+  (tramp-rpc-advice-install-optional-handlers)
+  (tramp-rpc-magit-install-optional-handlers))
+
+(defun tramp-rpc--unload-from-tramp ()
+  "Unload tramp-rpc when TRAMP itself is unloaded."
+  (when (featurep 'tramp-rpc)
+    (unload-feature 'tramp-rpc 'force)))
+
+(defun tramp-rpc--install ()
+  "Install TRAMP-RPC operations, advice, and lifecycle hooks."
+  (tramp-rpc--install-core-external-operations)
+  (tramp-rpc-handler-install)
+  (tramp-rpc--after-load-integrations nil)
+  (add-hook 'after-load-functions #'tramp-rpc--after-load-integrations)
+  (add-hook 'tramp-cleanup-connection-hook #'tramp-rpc-cleanup-connection)
+  (add-hook 'tramp-cleanup-all-connections-hook
+            #'tramp-rpc-cleanup-all-connections)
+  (add-hook 'tramp-unload-hook #'tramp-rpc--unload-from-tramp))
 
 (defun tramp-rpc-unload-function ()
   "Unload function for tramp-rpc.
 Removes advice and cleans up async processes."
   ;; Remove high-level external operations from tramp-rpc core.
-  (tramp-remove-external-operation 'locate-dominating-file 'tramp-rpc)
-  (tramp-remove-external-operation 'dir-locals--all-files 'tramp-rpc)
-  (tramp-remove-external-operation 'dir-locals-find-file 'tramp-rpc)
-  (tramp-remove-external-operation 'move-file-to-trash 'tramp-rpc)
-  ;; Unload helper modules.  `tramp-rpc.el' requires these modules, so
-  ;; unloading only the top-level feature and loading it again would otherwise
-  ;; leave stale definitions in place (notably `tramp-rpc-process.el').  Helper
-  ;; unload functions also perform their own cleanup before removing symbols.
-  ;; Helper hook entries are idempotent because unloading one helper can unload
-  ;; another as a dependency before its hook entry is reached.
-  (run-hooks 'tramp-rpc-unload-hook)
+  (tramp-rpc--remove-external-operation 'locate-dominating-file 'tramp-rpc)
+  (tramp-rpc--remove-external-operation 'dir-locals--all-files 'tramp-rpc)
+  (tramp-rpc--remove-external-operation 'dir-locals-find-file 'tramp-rpc)
+  (tramp-rpc--remove-external-operation 'move-file-to-trash 'tramp-rpc)
+  ;; Unload helper modules explicitly.  Their standard feature unload
+  ;; functions perform module-specific cleanup.
+  (dolist (feature '(tramp-rpc-advice tramp-rpc-magit tramp-rpc-process
+                     tramp-rpc-deploy tramp-rpc-protocol))
+    (when (featurep feature)
+      (unload-feature feature 'force)))
   ;; Remove multi-hop hook and cleanup hooks.
+  (remove-hook 'after-load-functions #'tramp-rpc--after-load-integrations)
   (remove-hook 'tramp-multi-hop-p-hook #'tramp-rpc-multi-hop-p)
   (remove-hook 'tramp-cleanup-connection-hook #'tramp-rpc-cleanup-connection)
   (remove-hook 'tramp-cleanup-all-connections-hook #'tramp-rpc-cleanup-all-connections)
+  (remove-hook 'tramp-unload-hook #'tramp-rpc--unload-from-tramp)
   ;; Remove method registrations.
   (setq tramp-methods (delete (assoc tramp-rpc-method tramp-methods) tramp-methods))
   (setq tramp-foreign-file-name-handler-alist
@@ -6015,9 +6003,13 @@ Removes advice and cleans up async processes."
   ;; Return nil to allow normal unload to proceed
   nil)
 
-(add-hook 'tramp-unload-hook
-	  (lambda ()
-	    (unload-feature 'tramp-rpc 'force)))
-
 (provide 'tramp-rpc)
+(condition-case err
+    (tramp-rpc--install)
+  (error
+   ;; `tramp-add-external-operation' requires the backend feature, so the
+   ;; feature must be visible during installation.  Do not leave a partially
+   ;; initialized package marked as loaded when installation fails.
+   (setq features (delq 'tramp-rpc features))
+   (signal (car err) (cdr err))))
 ;;; tramp-rpc.el ends here

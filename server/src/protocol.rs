@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+
 //! MessagePack-RPC protocol types for TRAMP-RPC
 
 use rmpv::Value;

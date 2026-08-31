@@ -29,12 +29,9 @@
 ;;; Code:
 
 (require 'cl-lib)
+(require 'eieio)
 (require 'tramp)
-
-;; Functions from tramp.el
-(declare-function tramp-add-external-operation "tramp")
-(declare-function tramp-remove-external-operation "tramp")
-(declare-function tramp-message "tramp-message")
+(require 'tramp-cache)
 
 ;; Functions from tramp-rpc.el
 (declare-function tramp-rpc--debug "tramp-rpc")
@@ -56,20 +53,24 @@
 (declare-function tramp-rpc--file-notify-dispatch "tramp-rpc")
 (declare-function tramp-rpc--file-notify-dispatch-rescan "tramp-rpc")
 (declare-function tramp-rpc--watch-entry-canonical-directory "tramp-rpc")
-
-;; Functions from tramp-cache.el.
-(declare-function tramp-flush-file-properties "tramp-cache")
-(declare-function tramp-flush-directory-properties "tramp-cache")
+(declare-function tramp-rpc--add-external-operation "tramp-rpc")
+(declare-function tramp-rpc--remove-external-operation "tramp-rpc")
 
 ;; Functions from magit-section.el.
-(declare-function magit-section-show "magit-section")
+(autoload 'magit-section-show "magit-section")
 
 ;; Silence byte-compiler warnings for external functions
-(declare-function projectile-dir-files-alien "projectile")
-(declare-function projectile-time-seconds "projectile")
+(autoload 'projectile-dir-files-alien "projectile")
+(autoload 'projectile-time-seconds "projectile")
 
 ;; Variables from magit-diff.el.
 (defvar magit-diff-adjust-tab-width)
+
+(defvar tramp-rpc-magit--magit-enabled nil
+  "Non-nil when Magit integrations are installed.")
+
+(defvar tramp-rpc-magit--projectile-enabled nil
+  "Non-nil when Projectile integrations are installed.")
 
 ;; ============================================================================
 ;; Cache infrastructure
@@ -229,14 +230,12 @@ must still report symlink type for lstat."
                 (remhash (cons candidate t) tramp-rpc--file-stat-cache))
               (flush-tramp-properties (candidate)
                 (when (tramp-tramp-file-p candidate)
-                  (ignore-errors
-                    (with-parsed-tramp-file-name candidate nil
-                      (tramp-flush-file-properties v localname)))))
+                  (with-parsed-tramp-file-name candidate nil
+                    (tramp-flush-file-properties v localname))))
               (flush-tramp-directory-properties (candidate)
                 (when (tramp-tramp-file-p candidate)
-                  (ignore-errors
-                    (with-parsed-tramp-file-name candidate nil
-                      (tramp-flush-directory-properties v localname)))))
+                  (with-parsed-tramp-file-name candidate nil
+                    (tramp-flush-directory-properties v localname))))
               (spellings (path)
                 (delete-dups
                  (list path
@@ -263,10 +262,9 @@ must still report symlink type for lstat."
     (tramp-rpc--invalidate-cache-for-path expanded-file)
     (cl-labels ((flush-tramp-properties (candidate)
                   (when (tramp-tramp-file-p candidate)
-                    (ignore-errors
-                      (with-parsed-tramp-file-name candidate nil
-                        (tramp-flush-file-properties v localname)
-                        (tramp-flush-directory-properties v localname)))))
+                    (with-parsed-tramp-file-name candidate nil
+                      (tramp-flush-file-properties v localname)
+                      (tramp-flush-directory-properties v localname))))
                 (drop-string-prefix (cache)
                   (let (keys)
                     (maphash (lambda (key _value)
@@ -310,9 +308,8 @@ must still report symlink type for lstat."
 (defun tramp-rpc--clear-current-tramp-file-properties ()
   "Clear TRAMP file properties for the current remote connection."
   (when (file-remote-p default-directory)
-    (ignore-errors
-      (with-parsed-tramp-file-name default-directory nil
-        (tramp-flush-directory-properties v "/")))))
+    (with-parsed-tramp-file-name default-directory nil
+      (tramp-flush-directory-properties v "/"))))
 
 (defun tramp-rpc--clear-file-metadata-caches ()
   "Clear cached file metadata."
@@ -333,7 +330,7 @@ must still report symlink type for lstat."
 Entries are keyed by expanded TRAMP filenames; this removes those
 matching the remote prefix of VEC."
   (tramp-rpc-magit--clear-ancestor-caches-for-connection vec)
-  (ignore-errors (tramp-flush-directory-properties vec "/"))
+  (tramp-flush-directory-properties vec "/")
   (let ((prefix (tramp-make-tramp-file-name vec "/")))
     ;; Match the prefix up to the colon-slash that starts the localname.
     ;; e.g. "/rpc:user@host:/" -- any key starting with this belongs to VEC.
@@ -513,7 +510,7 @@ DIRECTORY itself returns the empty string.  Descendants can contain slashes."
                     (tramp-rpc--file-notify-dispatch action path path1 cookie)))))))))))
 
 (defun tramp-rpc-watch-directory (directory &optional recursive)
-  "Start watching DIRECTORY for filesystem changes.
+  "Start watching DIRECTORY for filesystem change events.
 When RECURSIVE is non-nil, watch subdirectories too."
   (interactive "DDirectory to watch: ")
   (with-parsed-tramp-file-name directory nil
@@ -561,7 +558,7 @@ When RECURSIVE is non-nil, watch subdirectories too."
     (tramp-rpc--debug "Watching: %s (recursive=%s)" localname recursive)))
 
 (defun tramp-rpc-unwatch-directory (directory)
-  "Stop watching DIRECTORY for filesystem changes."
+  "Stop watching DIRECTORY for filesystem change events."
   (interactive "DDirectory to unwatch: ")
   (with-parsed-tramp-file-name directory nil
     (let* ((watch-key (format "%s:%s" (tramp-rpc--connection-key-string v)
@@ -1623,7 +1620,7 @@ Returns t, nil, or \\='not-cached if not in cache."
 ;; ============================================================================
 
 (defun tramp-rpc-magit--clear-status-cache ()
-  "Clear all status caches (git state that changes frequently)."
+  "Clear all frequently changing Git status caches."
   (clrhash tramp-rpc-magit--process-caches))
 
 (defun tramp-rpc-magit--clear-status-cache-for-connection (vec)
@@ -1665,7 +1662,10 @@ Returns t, nil, or \\='not-cached if not in cache."
 
 (defun tramp-rpc-magit--section-slot (section slot)
   "Return SECTION's SLOT value, or nil if unavailable."
-  (ignore-errors (eieio-oref section slot)))
+  (when (and (eieio-object-p section)
+             (slot-exists-p section slot)
+             (slot-boundp section slot))
+    (slot-value section slot)))
 
 (defun tramp-rpc-magit--maybe-prefetch-for-section (section)
   "Ensure batched data exists before expanding lazy Magit SECTION."
@@ -1763,15 +1763,14 @@ magit-status on remote repositories."
   (advice-remove 'magit-section-show #'tramp-rpc-magit--section-show-advice)
   (when (fboundp 'magit-section-show)
     (advice-add 'magit-section-show :around #'tramp-rpc-magit--section-show-advice))
-  (with-eval-after-load 'magit-section
-    (advice-remove 'magit-section-show #'tramp-rpc-magit--section-show-advice)
-    (advice-add 'magit-section-show :around #'tramp-rpc-magit--section-show-advice))
-  (tramp-add-external-operation
+
+  (tramp-rpc--add-external-operation
    'magit-status-setup-buffer
    #'tramp-rpc-handle-magit-status-setup-buffer 'tramp-rpc)
-  (tramp-add-external-operation
+  (tramp-rpc--add-external-operation
    'magit-status-refresh-buffer
    #'tramp-rpc-handle-magit-status-refresh-buffer 'tramp-rpc)
+  (setq tramp-rpc-magit--magit-enabled t)
   (message "tramp-rpc magit optimizations enabled"))
 
 ;;;###autoload
@@ -1779,9 +1778,10 @@ magit-status on remote repositories."
   "Disable tramp-rpc magit optimizations."
   (interactive)
   (advice-remove 'magit-section-show #'tramp-rpc-magit--section-show-advice)
-  (tramp-remove-external-operation 'magit-status-setup-buffer 'tramp-rpc)
-  (tramp-remove-external-operation 'magit-status-refresh-buffer 'tramp-rpc)
+  (tramp-rpc--remove-external-operation 'magit-status-setup-buffer 'tramp-rpc)
+  (tramp-rpc--remove-external-operation 'magit-status-refresh-buffer 'tramp-rpc)
   (tramp-rpc-magit--clear-cache)
+  (setq tramp-rpc-magit--magit-enabled nil)
   (message "tramp-rpc magit optimizations disabled"))
 
 ;;;###autoload
@@ -1798,11 +1798,6 @@ magit-status on remote repositories."
   (setq tramp-rpc-magit--debug nil)
   (message "tramp-rpc magit debug disabled"))
 
-;; Fix #m4: Auto-enable behind defcustom gate
-(with-eval-after-load 'magit
-  (with-eval-after-load 'tramp-rpc
-    (when tramp-rpc-magit-optimize
-      (tramp-rpc-magit-enable))))
 
 ;; ============================================================================
 ;; Projectile optimizations
@@ -1849,25 +1844,31 @@ PROJECT-ROOT is the project root directory."
 This ensures fd is not used for remote directories where it may not
 be available, and uses alien indexing for better performance."
   (interactive)
-  (tramp-add-external-operation
+  (tramp-rpc--add-external-operation
    'projectile-dir-files
    #'tramp-rpc-handle-projectile-dir-files 'tramp-rpc)
-  (tramp-add-external-operation
+  (tramp-rpc--add-external-operation
    'projectile-project-files
    #'tramp-rpc-handle-projectile-project-files 'tramp-rpc)
+  (setq tramp-rpc-magit--projectile-enabled t)
   (message "tramp-rpc projectile optimizations enabled"))
 
 ;;;###autoload
 (defun tramp-rpc-projectile-disable ()
   "Disable tramp-rpc projectile optimizations."
   (interactive)
-  (tramp-remove-external-operation 'projectile-dir-files 'tramp-rpc)
-  (tramp-remove-external-operation 'projectile-project-files 'tramp-rpc)
+  (tramp-rpc--remove-external-operation 'projectile-dir-files 'tramp-rpc)
+  (tramp-rpc--remove-external-operation 'projectile-project-files 'tramp-rpc)
+  (setq tramp-rpc-magit--projectile-enabled nil)
   (message "tramp-rpc projectile optimizations disabled"))
 
-;; Auto-enable when projectile is loaded
-(with-eval-after-load 'projectile
-  (with-eval-after-load 'tramp-rpc
+(defun tramp-rpc-magit-install-optional-handlers ()
+  "Install handlers for loaded Magit and Projectile packages."
+  (when (and (featurep 'magit) tramp-rpc-magit-optimize
+             (not tramp-rpc-magit--magit-enabled))
+    (tramp-rpc-magit-enable))
+  (when (and (featurep 'projectile)
+             (not tramp-rpc-magit--projectile-enabled))
     (tramp-rpc-projectile-enable)))
 
 ;; ============================================================================
@@ -1882,11 +1883,6 @@ Removes handlers."
   (tramp-rpc-projectile-disable)
   ;; Return nil to allow normal unload to proceed
   nil)
-
-(add-hook 'tramp-rpc-unload-hook
-	  (lambda ()
-	    (when (featurep 'tramp-rpc-magit)
-	      (unload-feature 'tramp-rpc-magit 'force))))
 
 (provide 'tramp-rpc-magit)
 ;;; tramp-rpc-magit.el ends here
