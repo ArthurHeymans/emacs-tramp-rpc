@@ -55,6 +55,8 @@
 (declare-function tramp-rpc--ssh-detail-user "tramp-rpc")
 (declare-function tramp-rpc--sudo-rpc-hop-vec "tramp-rpc")
 (declare-function tramp-rpc-file-name-p "tramp-rpc")
+(declare-function tramp-rpc--add-external-operation "tramp-rpc")
+(declare-function tramp-rpc--remove-external-operation "tramp-rpc")
 
 ;; Variables from tramp-rpc.el
 (defvar tramp-rpc-use-direct-ssh-pty)
@@ -1640,21 +1642,21 @@ transport is live."
 (defun tramp-rpc-process-install-optional-handlers ()
   "Install handlers for loaded optional terminal packages."
   (when (featurep 'vterm)
-    (tramp-add-external-operation
+    (tramp-rpc--add-external-operation
      'vterm--window-adjust-process-window-size
      #'tramp-rpc-handle-vterm--window-adjust-process-window-size
      'tramp-rpc 'process))
   (when (featurep 'eat)
-    (tramp-add-external-operation
+    (tramp-rpc--add-external-operation
      'eat--adjust-process-window-size
      #'tramp-rpc-handle-eat--adjust-process-window-size
      'tramp-rpc 'process)))
 
 (defun tramp-rpc--process-handler-remove ()
   "Remove handlers."
-  (tramp-remove-external-operation
+  (tramp-rpc--remove-external-operation
    'vterm--window-adjust-process-window-size 'tramp-rpc)
-  (tramp-remove-external-operation
+  (tramp-rpc--remove-external-operation
    'eat--adjust-process-window-size 'tramp-rpc))
 
 ;; ============================================================================

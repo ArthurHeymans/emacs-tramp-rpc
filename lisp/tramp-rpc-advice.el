@@ -51,6 +51,8 @@
 (declare-function tramp-rpc--call "tramp-rpc")
 (declare-function tramp-rpc-file-name-p "tramp-rpc")
 (declare-function tramp-rpc--managed-file-name-p "tramp-rpc")
+(declare-function tramp-rpc--add-external-operation "tramp-rpc")
+(declare-function tramp-rpc--remove-external-operation "tramp-rpc")
 
 ;; Variables from tramp-rpc.el / tramp-rpc-process.el
 (defvar tramp-rpc--delivering-output)
@@ -576,38 +578,38 @@ exited (remote side finished), delete it so the refresh can proceed."
                            'process-coding-system)
     (advice-add 'process-coding-system :around
                 #'tramp-rpc--process-coding-system-advice))
-  (tramp-add-external-operation
+  (tramp-rpc--add-external-operation
      'process-send-string
      #'tramp-rpc-handle-process-send-string 'tramp-rpc 'process)
-    (tramp-add-external-operation
+    (tramp-rpc--add-external-operation
      'process-send-region
      #'tramp-rpc-handle-process-send-region 'tramp-rpc 'process)
-  (tramp-add-external-operation
+  (tramp-rpc--add-external-operation
      'process-send-eof
      #'tramp-rpc-handle-process-send-eof 'tramp-rpc 'process)
   ;; This must be before `tramp-signal-process'.  Since tramp.el is
   ;; required, this is guaranteed.
   (add-hook 'signal-process-functions #'tramp-rpc-handle-signal-process)
-  (tramp-add-external-operation
+  (tramp-rpc--add-external-operation
      'process-status
      #'tramp-rpc-handle-process-status 'tramp-rpc 'process)
-    (tramp-add-external-operation
+    (tramp-rpc--add-external-operation
      'process-exit-status
      #'tramp-rpc-handle-process-exit-status 'tramp-rpc 'process)
-    (tramp-add-external-operation
+    (tramp-rpc--add-external-operation
      'process-command
      #'tramp-rpc-handle-process-command 'tramp-rpc 'process)
-  (tramp-add-external-operation
+  (tramp-rpc--add-external-operation
      'process-tty-name
      #'tramp-rpc-handle-process-tty-name 'tramp-rpc 'process)
-  (tramp-add-external-operation
+  (tramp-rpc--add-external-operation
      'vc-call-backend
      #'tramp-rpc-handle-vc-call-backend 'tramp-rpc
      #'tramp-rpc--vc-call-backend-file-name-for-operation)
-  (tramp-add-external-operation
+  (tramp-rpc--add-external-operation
      'vc-exec-after
      #'tramp-rpc-handle-vc-exec-after 'tramp-rpc 'default-directory)
-  (tramp-add-external-operation
+  (tramp-rpc--add-external-operation
    'vc-dir-refresh
    #'tramp-rpc-handle-vc-dir-refresh 'tramp-rpc
    #'tramp-rpc--vc-dir-refresh-file-name-for-operation))
@@ -617,7 +619,7 @@ exited (remote side finished), delete it so the refresh can proceed."
   (when (featurep 'python)
       (if (tramp-rpc--python-tramp-file-name-external-operation-p)
           (condition-case err
-              (tramp-add-external-operation
+              (tramp-rpc--add-external-operation
                'python-shell--tramp-with-environment
                #'tramp-rpc-handle-python-shell--tramp-with-environment
                'tramp-rpc 'tramp-file-name)
@@ -634,11 +636,11 @@ exited (remote side finished), delete it so the refresh can proceed."
            :around
            #'tramp-rpc-handle-python-shell--tramp-with-environment-compat))))
   (when (featurep 'eglot)
-    (tramp-add-external-operation
+    (tramp-rpc--add-external-operation
        'eglot--cmd
        #'tramp-rpc-handle-eglot--cmd 'tramp-rpc 'default-directory))
   (when (featurep 'magit-process)
-    (tramp-add-external-operation
+    (tramp-rpc--add-external-operation
        'magit-start-process
        #'tramp-rpc-handle-magit-start-process 'tramp-rpc 'default-directory)))
 
@@ -648,25 +650,25 @@ exited (remote side finished), delete it so the refresh can proceed."
                  #'tramp-rpc--set-process-coding-system-advice)
   (advice-remove 'process-coding-system
                  #'tramp-rpc--process-coding-system-advice)
-  (tramp-remove-external-operation 'process-send-string 'tramp-rpc)
-  (tramp-remove-external-operation 'process-send-region 'tramp-rpc)
-  (tramp-remove-external-operation 'process-send-eof 'tramp-rpc)
+  (tramp-rpc--remove-external-operation 'process-send-string 'tramp-rpc)
+  (tramp-rpc--remove-external-operation 'process-send-region 'tramp-rpc)
+  (tramp-rpc--remove-external-operation 'process-send-eof 'tramp-rpc)
   (remove-hook 'signal-process-functions #'tramp-rpc-handle-signal-process)
-  (tramp-remove-external-operation 'process-status 'tramp-rpc)
-  (tramp-remove-external-operation 'process-exit-status 'tramp-rpc)
-  (tramp-remove-external-operation 'process-command 'tramp-rpc)
-  (tramp-remove-external-operation 'process-tty-name 'tramp-rpc)
-  (tramp-remove-external-operation 'vc-call-backend 'tramp-rpc)
-  (tramp-remove-external-operation 'vc-exec-after 'tramp-rpc)
-  (tramp-remove-external-operation
+  (tramp-rpc--remove-external-operation 'process-status 'tramp-rpc)
+  (tramp-rpc--remove-external-operation 'process-exit-status 'tramp-rpc)
+  (tramp-rpc--remove-external-operation 'process-command 'tramp-rpc)
+  (tramp-rpc--remove-external-operation 'process-tty-name 'tramp-rpc)
+  (tramp-rpc--remove-external-operation 'vc-call-backend 'tramp-rpc)
+  (tramp-rpc--remove-external-operation 'vc-exec-after 'tramp-rpc)
+  (tramp-rpc--remove-external-operation
    'python-shell--tramp-with-environment 'tramp-rpc)
   (when (fboundp 'python-shell--tramp-with-environment)
     (advice-remove
      'python-shell--tramp-with-environment
      #'tramp-rpc-handle-python-shell--tramp-with-environment-compat))
-  (tramp-remove-external-operation 'eglot--cmd 'tramp-rpc)
-  (tramp-remove-external-operation 'magit-start-process 'tramp-rpc)
-  (tramp-remove-external-operation 'vc-dir-refresh 'tramp-rpc))
+  (tramp-rpc--remove-external-operation 'eglot--cmd 'tramp-rpc)
+  (tramp-rpc--remove-external-operation 'magit-start-process 'tramp-rpc)
+  (tramp-rpc--remove-external-operation 'vc-dir-refresh 'tramp-rpc))
 
 
 ;; ============================================================================

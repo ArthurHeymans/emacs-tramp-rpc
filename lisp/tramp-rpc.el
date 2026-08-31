@@ -223,12 +223,24 @@ This is called from `tramp-multi-hop-p-hook'."
 (require 'tramp-sh)
 (require 'tramp-rpc-protocol)
 
-;; Check for minimum Tramp version.  The Package-Requires header declares
-;; (tramp "2.8.1.4") but that is only enforced by package.el at install
-;; time.  Guard at load time so that manual installations fail clearly.
-(when (version< tramp-version "2.8.1.4")
-  (error "Tramp RPC requires Tramp >= 2.8.1.4, but %s is loaded"
-         tramp-version))
+;; Package-Requires enforces this for package installations.  Keep loading
+;; harmless for tooling that checks each file against Emacs's older bundled
+;; TRAMP, and report the actionable error when the backend is actually used.
+(defun tramp-rpc--check-tramp-version ()
+  "Signal a clear error unless the loaded TRAMP version is supported."
+  (when (version< tramp-version "2.8.1.4")
+    (error "Tramp RPC requires Tramp >= 2.8.1.4, but %s is loaded"
+           tramp-version)))
+
+(defun tramp-rpc--add-external-operation (&rest args)
+  "Call `tramp-add-external-operation' with ARGS when available."
+  (when (fboundp 'tramp-add-external-operation)
+    (apply (symbol-function 'tramp-add-external-operation) args)))
+
+(defun tramp-rpc--remove-external-operation (&rest args)
+  "Call `tramp-remove-external-operation' with ARGS when available."
+  (when (fboundp 'tramp-remove-external-operation)
+    (apply (symbol-function 'tramp-remove-external-operation) args)))
 
 (declare-function dired-compress-file "dired-aux")
 ;; These predicates are emitted inside the single autoload form above.  The
@@ -647,7 +659,7 @@ When TRAMP_RPC_DEBUG_LOG or TRAMP_RPC_DEBUG_DIR is set in the environment,
 also append each line directly to a local log file.  This preserves CI
 telemetry even when later tests unload TRAMP and remove debug buffers."
   (when tramp-rpc-debug
-    (let* ((line (concat (format-time-string "[%Y-%m-%d %H:%M:%S.%3N] ")
+    (let* ((line (concat (format-time-string "[%F %T.%3N] ")
                          (apply #'format format-string args)
                          "\n"))
            (log-file (or (getenv "TRAMP_RPC_DEBUG_LOG")
@@ -5803,10 +5815,10 @@ Also controls process exit detection latency."
 
 (defun tramp-rpc--install-core-external-operations ()
   "Install external operations implemented by the core module."
-  (tramp-add-external-operation 'locate-dominating-file 'tramp-rpc-handle-locate-dominating-file 'tramp-rpc)
-  (tramp-add-external-operation 'dir-locals--all-files 'tramp-rpc-handle-dir-locals--all-files 'tramp-rpc)
-  (tramp-add-external-operation 'dir-locals-find-file 'tramp-rpc-handle-dir-locals-find-file 'tramp-rpc)
-  (tramp-add-external-operation 'move-file-to-trash 'tramp-rpc-handle-move-file-to-trash 'tramp-rpc 'file))
+  (tramp-rpc--add-external-operation 'locate-dominating-file 'tramp-rpc-handle-locate-dominating-file 'tramp-rpc)
+  (tramp-rpc--add-external-operation 'dir-locals--all-files 'tramp-rpc-handle-dir-locals--all-files 'tramp-rpc)
+  (tramp-rpc--add-external-operation 'dir-locals-find-file 'tramp-rpc-handle-dir-locals-find-file 'tramp-rpc)
+  (tramp-rpc--add-external-operation 'move-file-to-trash 'tramp-rpc-handle-move-file-to-trash 'tramp-rpc 'file))
 
 ;;;###autoload
 (defun tramp-rpc-file-name-handler (operation &rest args)
@@ -5815,6 +5827,7 @@ Falls back to the local handler when `non-essential' is non-nil and
 a backend function throws `non-essential' (e.g. because no connection
 exists and opening one would block).  This mirrors the catch/throw
 pattern in `tramp-file-name-handler'."
+  (tramp-rpc--check-tramp-version)
   ;; `file-remote-p' is called for everything, even for symbolic
   ;; links which look remote.  We don't want to get an error.
   (let ((non-essential (or non-essential (eq operation 'file-remote-p))))
@@ -5961,10 +5974,10 @@ cleanup of all connections has run."
   "Unload function for tramp-rpc.
 Removes advice and cleans up async processes."
   ;; Remove high-level external operations from tramp-rpc core.
-  (tramp-remove-external-operation 'locate-dominating-file 'tramp-rpc)
-  (tramp-remove-external-operation 'dir-locals--all-files 'tramp-rpc)
-  (tramp-remove-external-operation 'dir-locals-find-file 'tramp-rpc)
-  (tramp-remove-external-operation 'move-file-to-trash 'tramp-rpc)
+  (tramp-rpc--remove-external-operation 'locate-dominating-file 'tramp-rpc)
+  (tramp-rpc--remove-external-operation 'dir-locals--all-files 'tramp-rpc)
+  (tramp-rpc--remove-external-operation 'dir-locals-find-file 'tramp-rpc)
+  (tramp-rpc--remove-external-operation 'move-file-to-trash 'tramp-rpc)
   ;; Unload helper modules explicitly.  Their standard feature unload
   ;; functions perform module-specific cleanup.
   (dolist (feature '(tramp-rpc-advice tramp-rpc-magit tramp-rpc-process

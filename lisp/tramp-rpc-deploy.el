@@ -278,7 +278,7 @@ Messages are logged to *tramp-rpc-deploy* buffer."
   "Log a debug message if `tramp-rpc-deploy-debug' is non-nil.
 FORMAT-STRING and ARGS are passed to `format'."
   (when tramp-rpc-deploy-debug
-    (let* ((line (concat (format-time-string "[%Y-%m-%d %H:%M:%S] ")
+    (let* ((line (concat (format-time-string "[%F %T] ")
                          (apply #'format format-string args)
                          "\n"))
            (log-file (or (getenv "TRAMP_RPC_DEPLOY_DEBUG_LOG")
@@ -1076,9 +1076,9 @@ Tries sha256sum first, then shasum -a 256 for macOS compatibility."
     ;; would reject every automatic deployment.
     (tramp-send-command
      vec
-     (format (concat "umask 077 && parent=$(cd %s && pwd -P) && "
-                     "directory=$(mktemp -d \"$parent/.tramp-rpc-transfer.XXXXXX\") && "
-                     "printf '%%s\\n%%s\\n' \"$parent\" \"$directory\"")
+     (format "umask 077 && parent=$(cd %s && pwd -P) && \
+directory=$(mktemp -d \"$parent/.tramp-rpc-transfer.XXXXXX\") && \
+printf '%%s\\n%%s\\n' \"$parent\" \"$directory\""
              (tramp-shell-quote-argument parent)))
     (with-current-buffer (tramp-get-connection-buffer vec)
       (goto-char (point-min))
@@ -1192,14 +1192,12 @@ to inline encoding (base64 through the shell), which can be fragile."
                              (dest (tramp-shell-quote-argument remote-local))
                              (digest (tramp-shell-quote-argument local-checksum)))
                          (format
-                          (concat "test -f %s && ! test -L %s && chmod +x %s && "
-                                  "test -f %s && ! test -L %s && "
-                                  "(test ! -e %s && ! test -L %s || "
-                                  "test -f %s && ! test -L %s) && "
-                                  "actual=$({ sha256sum %s 2>/dev/null || "
-                                  "shasum -a 256 %s 2>/dev/null; } | cut -d' ' -f1) && "
-                                  "test \"$actual\" = %s && mv -f %s %s && "
-                                  "test -f %s && ! test -L %s && test -x %s")
+                          "test -f %s && ! test -L %s && chmod +x %s && \
+test -f %s && ! test -L %s && \
+(test ! -e %s && ! test -L %s || test -f %s && ! test -L %s) && \
+actual=$({ sha256sum %s 2>/dev/null || shasum -a 256 %s 2>/dev/null; } | cut -d' ' -f1) && \
+test \"$actual\" = %s && mv -f %s %s && \
+test -f %s && ! test -L %s && test -x %s"
                           tmp tmp tmp tmp tmp dest dest dest dest tmp tmp digest tmp dest
                           dest dest dest)))
                     (signal 'remote-file-error

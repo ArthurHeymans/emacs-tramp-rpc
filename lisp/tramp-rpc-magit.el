@@ -53,6 +53,8 @@
 (declare-function tramp-rpc--file-notify-dispatch "tramp-rpc")
 (declare-function tramp-rpc--file-notify-dispatch-rescan "tramp-rpc")
 (declare-function tramp-rpc--watch-entry-canonical-directory "tramp-rpc")
+(declare-function tramp-rpc--add-external-operation "tramp-rpc")
+(declare-function tramp-rpc--remove-external-operation "tramp-rpc")
 
 ;; Functions from magit-section.el.
 (autoload 'magit-section-show "magit-section")
@@ -1762,10 +1764,10 @@ magit-status on remote repositories."
   (when (fboundp 'magit-section-show)
     (advice-add 'magit-section-show :around #'tramp-rpc-magit--section-show-advice))
 
-  (tramp-add-external-operation
+  (tramp-rpc--add-external-operation
    'magit-status-setup-buffer
    #'tramp-rpc-handle-magit-status-setup-buffer 'tramp-rpc)
-  (tramp-add-external-operation
+  (tramp-rpc--add-external-operation
    'magit-status-refresh-buffer
    #'tramp-rpc-handle-magit-status-refresh-buffer 'tramp-rpc)
   (setq tramp-rpc-magit--magit-enabled t)
@@ -1776,8 +1778,8 @@ magit-status on remote repositories."
   "Disable tramp-rpc magit optimizations."
   (interactive)
   (advice-remove 'magit-section-show #'tramp-rpc-magit--section-show-advice)
-  (tramp-remove-external-operation 'magit-status-setup-buffer 'tramp-rpc)
-  (tramp-remove-external-operation 'magit-status-refresh-buffer 'tramp-rpc)
+  (tramp-rpc--remove-external-operation 'magit-status-setup-buffer 'tramp-rpc)
+  (tramp-rpc--remove-external-operation 'magit-status-refresh-buffer 'tramp-rpc)
   (tramp-rpc-magit--clear-cache)
   (setq tramp-rpc-magit--magit-enabled nil)
   (message "tramp-rpc magit optimizations disabled"))
@@ -1842,10 +1844,10 @@ PROJECT-ROOT is the project root directory."
 This ensures fd is not used for remote directories where it may not
 be available, and uses alien indexing for better performance."
   (interactive)
-  (tramp-add-external-operation
+  (tramp-rpc--add-external-operation
    'projectile-dir-files
    #'tramp-rpc-handle-projectile-dir-files 'tramp-rpc)
-  (tramp-add-external-operation
+  (tramp-rpc--add-external-operation
    'projectile-project-files
    #'tramp-rpc-handle-projectile-project-files 'tramp-rpc)
   (setq tramp-rpc-magit--projectile-enabled t)
@@ -1855,8 +1857,8 @@ be available, and uses alien indexing for better performance."
 (defun tramp-rpc-projectile-disable ()
   "Disable tramp-rpc projectile optimizations."
   (interactive)
-  (tramp-remove-external-operation 'projectile-dir-files 'tramp-rpc)
-  (tramp-remove-external-operation 'projectile-project-files 'tramp-rpc)
+  (tramp-rpc--remove-external-operation 'projectile-dir-files 'tramp-rpc)
+  (tramp-rpc--remove-external-operation 'projectile-project-files 'tramp-rpc)
   (setq tramp-rpc-magit--projectile-enabled nil)
   (message "tramp-rpc projectile optimizations disabled"))
 
