@@ -510,7 +510,7 @@ DIRECTORY itself returns the empty string.  Descendants can contain slashes."
                     (tramp-rpc--file-notify-dispatch action path path1 cookie)))))))))))
 
 (defun tramp-rpc-watch-directory (directory &optional recursive)
-  "Start watching DIRECTORY for filesystem changes.
+  "Start watching DIRECTORY for filesystem change events.
 When RECURSIVE is non-nil, watch subdirectories too."
   (interactive "DDirectory to watch: ")
   (with-parsed-tramp-file-name directory nil
@@ -558,7 +558,7 @@ When RECURSIVE is non-nil, watch subdirectories too."
     (tramp-rpc--debug "Watching: %s (recursive=%s)" localname recursive)))
 
 (defun tramp-rpc-unwatch-directory (directory)
-  "Stop watching DIRECTORY for filesystem changes."
+  "Stop watching DIRECTORY for filesystem change events."
   (interactive "DDirectory to unwatch: ")
   (with-parsed-tramp-file-name directory nil
     (let* ((watch-key (format "%s:%s" (tramp-rpc--connection-key-string v)
@@ -1620,7 +1620,7 @@ Returns t, nil, or \\='not-cached if not in cache."
 ;; ============================================================================
 
 (defun tramp-rpc-magit--clear-status-cache ()
-  "Clear all status caches (git state that changes frequently)."
+  "Clear all frequently changing Git status caches."
   (clrhash tramp-rpc-magit--process-caches))
 
 (defun tramp-rpc-magit--clear-status-cache-for-connection (vec)

@@ -1396,7 +1396,7 @@ EVENT is the process event string."
 ;; ============================================================================
 
 (defun tramp-rpc--adjust-pty-window-size (process _windows)
-  "Adjust PTY window size when Emacs window size changes.
+  "Adjust PTY window size after an Emacs window resize.
 PROCESS is the local relay process, WINDOWS is the list of windows.
 Returns nil to tell Emacs not to call `set-process-window-size' on
 the local relay process (we handle resizing via RPC to the remote)."

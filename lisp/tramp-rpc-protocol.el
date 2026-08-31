@@ -169,7 +169,7 @@ with :notification t, :method, and :params keys."
     result))
 
 (defun tramp-rpc-protocol-error-p (response)
-  "Return non-nil if RESPONSE contains an error."
+  "Return non-nil for an error RESPONSE."
   (plist-get response :error))
 
 (defun tramp-rpc-protocol-error-message (response)

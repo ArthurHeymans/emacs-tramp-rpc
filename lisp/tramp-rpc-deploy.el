@@ -475,7 +475,7 @@ preserve timestamps."
        t))
 
 (defun tramp-rpc-deploy--source-directory-warning ()
-  "Return a warning string when source-build auto-detection looks suspicious."
+  "Return a warning string for suspicious source-build auto-detection."
   (when (and (memq tramp-rpc-deploy-git-build-policy '(auto build))
              tramp-rpc-deploy-source-directory
              (not (tramp-rpc-deploy--source-has-server-p)))
