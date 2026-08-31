@@ -27,19 +27,17 @@
 ;;; Code:
 
 (require 'cl-lib)
+(require 'msgpack)
 (require 'tramp)
+(require 'tramp-sh)
 (require 'tramp-rpc-protocol)
 
-;; Functions from tramp.el
-(declare-function tramp-add-external-operation "tramp")
-(declare-function tramp-remove-external-operation "tramp")
 (declare-function tramp-rpc--sudo-password-required-p "tramp-rpc")
 (declare-function tramp-rpc--sudo-read-password "tramp-rpc")
 
 ;; Silence byte-compiler warnings for variables defined in vterm
 (defvar vterm-copy-mode)
 (defvar vterm-min-window-width)
-(defvar vterm--term)
 
 ;; Functions from tramp-rpc.el (loaded before us)
 (declare-function tramp-rpc--debug "tramp-rpc")
@@ -128,6 +126,7 @@ the next read cannot discard output waiting for relay delivery."
   "TRAMP-RPC process write failed" 'remote-file-error)
 
 (declare-function tramp-rpc--get-connection "tramp-rpc" (vec))
+(declare-function tramp-rpc--connection-key "tramp-rpc")
 
 (defun tramp-rpc--process-write-queue-key (vec pid &optional connection)
   "Return the write queue key for VEC and remote PID.
@@ -1457,9 +1456,11 @@ WINDOWS is the list of windows displaying the process buffer."
            (cons (max width vterm-min-window-width) height))
          ;; Display updater: call vterm--set-size
          (lambda (width height)
-           (when (and (boundp 'vterm--term) vterm--term
-                    (fboundp 'vterm--set-size))
-             (vterm--set-size vterm--term height width))))))
+           (when-let* (((boundp 'vterm--term))
+                       (term (symbol-value 'vterm--term))
+                       ((fboundp 'vterm--set-size)))
+             (funcall (symbol-function 'vterm--set-size)
+                      term height width))))))
    ;; Not our process, call original
    (t (tramp-run-real-handler
        'vterm--window-adjust-process-window-size (list process windows)))))
@@ -1610,21 +1611,15 @@ transport is live."
    tramp-rpc--async-processes)
   (tramp-rpc--cleanup-process-write-queues vec connection-process))
 
-;; Forward declare for cleanup
-(declare-function tramp-rpc--connection-key "tramp-rpc")
-
-;; Install terminal emulator handler.  When vterm/eat is already loaded while
-;; `tramp-rpc' is being required, defer until `tramp-rpc' is provided; otherwise
-;; `tramp-add-external-operation' calls `(require 'tramp-rpc)' recursively.
-(with-eval-after-load 'vterm
-  (with-eval-after-load 'tramp-rpc
+;; Install optional terminal emulator handlers after their packages load.
+(defun tramp-rpc-process-install-optional-handlers ()
+  "Install handlers for loaded optional terminal packages."
+  (when (featurep 'vterm)
     (tramp-add-external-operation
      'vterm--window-adjust-process-window-size
      #'tramp-rpc-handle-vterm--window-adjust-process-window-size
-     'tramp-rpc 'process)))
-
-(with-eval-after-load 'eat
-  (with-eval-after-load 'tramp-rpc
+     'tramp-rpc 'process))
+  (when (featurep 'eat)
     (tramp-add-external-operation
      'eat--adjust-process-window-size
      #'tramp-rpc-handle-eat--adjust-process-window-size
@@ -1652,11 +1647,6 @@ Removes handlers and cleans up async processes."
   (tramp-rpc--cleanup-pty-processes)
   ;; Return nil to allow normal unload to proceed
   nil)
-
-(add-hook 'tramp-rpc-unload-hook
-	  (lambda ()
-	    (when (featurep 'tramp-rpc-process)
-	      (unload-feature 'tramp-rpc-process 'force))))
 
 (provide 'tramp-rpc-process)
 ;;; tramp-rpc-process.el ends here

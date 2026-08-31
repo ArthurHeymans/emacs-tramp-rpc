@@ -217,6 +217,8 @@ This is called from `tramp-multi-hop-p-hook'."
 
 ;; Now the actual implementation
 (require 'cl-lib)
+(require 'json)
+(require 'seq)
 (require 'tramp)
 (require 'tramp-sh)
 (require 'tramp-rpc-protocol)
@@ -496,72 +498,19 @@ proxy hops remain."
                            tramp-postfix-hop-format)
                 tramp-postfix-hop-format)))))
 
-(require 'tramp-rpc-deploy)
-
-(define-error 'tramp-rpc-server-unavailable
-  "TRAMP-RPC server binary is unavailable" 'remote-file-error)
-
-;; Silence byte-compiler warnings for functions defined elsewhere
-;; (vterm variables are declared in tramp-rpc-process.el)
-
-;; Forward declarations for protocol and cache/watch functions.
-(declare-function tramp-rpc-protocol--clear-deferred-polls-for-target
-                  "tramp-rpc-protocol" (target))
-(declare-function tramp-rpc-protocol--clear-deferred-polls
-                  "tramp-rpc-protocol" ())
-
-;; Cache/watch functions (tramp-rpc-magit.el).
-(defvar tramp-rpc--cache-ttl)
-(defvar tramp-rpc--file-exists-cache)
-(defvar tramp-rpc--file-truename-cache)
-(defvar tramp-rpc--file-stat-cache)
-(defvar tramp-rpc--suppress-fs-notifications)
-(defvar tramp-rpc--watched-directories)
-(defvar tramp-rpc-magit--allow-process-cache)
-(declare-function tramp-rpc--cache-get "tramp-rpc-magit")
-(declare-function tramp-rpc--cache-put "tramp-rpc-magit")
-(declare-function tramp-rpc--cache-lookup "tramp-rpc-magit")
-(declare-function tramp-rpc--cache-entry-valid-p "tramp-rpc-magit")
-(declare-function tramp-rpc--file-stat-cache-key "tramp-rpc-magit")
-(declare-function tramp-rpc--cache-file-stat-result "tramp-rpc-magit")
-(declare-function tramp-rpc--invalidate-cache-for-path "tramp-rpc-magit")
-(declare-function tramp-rpc--invalidate-cache-for-subtree "tramp-rpc-magit")
-(declare-function tramp-rpc--connection-key-string "tramp-rpc-magit")
-(declare-function tramp-rpc--directory-watched-p "tramp-rpc-magit")
-(declare-function tramp-rpc--handle-notification "tramp-rpc-magit")
-(declare-function tramp-rpc-watch-directory "tramp-rpc-magit")
-(declare-function tramp-rpc-unwatch-directory "tramp-rpc-magit")
-(declare-function tramp-rpc-clear-file-exists-cache "tramp-rpc-magit")
-(declare-function tramp-rpc-clear-file-truename-cache "tramp-rpc-magit")
-(declare-function tramp-rpc-clear-file-stat-cache "tramp-rpc-magit")
-(declare-function tramp-rpc--clear-file-metadata-caches "tramp-rpc-magit")
-(declare-function tramp-rpc--cleanup-watches-for-connection "tramp-rpc-magit"
-                  (vec &optional connection-process))
-(declare-function tramp-rpc--cleanup-async-processes "tramp-rpc-process")
-(declare-function tramp-rpc--cleanup-pty-processes "tramp-rpc-process")
-(declare-function tramp-rpc--cleanup-process-write-queues "tramp-rpc-process")
-(declare-function tramp-rpc--terminate-async-processes "tramp-rpc-process")
-(declare-function tramp-rpc--terminate-pty-processes "tramp-rpc-process")
-(declare-function tramp-rpc--clear-file-caches-for-connection "tramp-rpc-magit")
-(declare-function tramp-rpc-magit--clear-cache "tramp-rpc-magit")
-(declare-function tramp-rpc-magit--clear-cache-for-connection
-                  "tramp-rpc-magit" (vec))
-(declare-function tramp-rpc-magit--process-cache-lookup "tramp-rpc-magit")
-(declare-function tramp-rpc-magit--process-cache-store "tramp-rpc-magit")
-(declare-function tramp-rpc-magit--file-exists-p "tramp-rpc-magit")
-(declare-function tramp-rpc-magit--clear-status-cache "tramp-rpc-magit")
-(declare-function tramp-rpc-magit--clear-status-cache-for-connection
-                  "tramp-rpc-magit" (vec))
-(declare-function tramp-rpc-magit--prefetch "tramp-rpc-magit")
-(declare-function tramp-rpc-magit--strip-git-prefix-args "tramp-rpc-magit")
-(declare-function tramp-rpc-magit--git-cache-safe-environment-p "tramp-rpc-magit")
-(declare-function tramp-rpc-magit--clear-cache "tramp-rpc-magit")
-(defvar tramp-rpc-magit--debug)
-(defvar tramp-rpc-magit--process-caches)
-
 (defgroup tramp-rpc nil
   "TRAMP backend using RPC."
   :group 'tramp)
+
+;; Helper modules only define functions while the main package is loading.
+;; Runtime integration is installed explicitly after `tramp-rpc' is provided.
+(require 'tramp-rpc-deploy)
+(require 'tramp-rpc-process)
+(require 'tramp-rpc-advice)
+(require 'tramp-rpc-magit)
+
+(define-error 'tramp-rpc-server-unavailable
+  "TRAMP-RPC server binary is unavailable" 'remote-file-error)
 
 (defcustom tramp-rpc-call-timeout 30
   "Maximum seconds to wait for a synchronous RPC call to complete.
@@ -5689,16 +5638,6 @@ Also controls process exit detection latency."
   :type 'integer
   :group 'tramp-rpc)
 
-;; Process support, advice functions, and magit integration are now in
-;; separate modules for better organization and maintainability.
-(require 'tramp-rpc-process)
-;; Loading tramp-rpc-advice while this file is being byte-compiled can
-;; recurse on some Emacs/TRAMP combinations.  Advice is still loaded at
-;; runtime when `tramp-rpc' is required normally.
-(unless (bound-and-true-p byte-compile-current-file)
-  (require 'tramp-rpc-advice))
-(require 'tramp-rpc-magit)
-
 ;; ============================================================================
 ;; File name handler registration
 ;; ============================================================================
@@ -5840,9 +5779,8 @@ Also controls process exit detection latency."
     )
   "Alist of handler functions for TRAMP-RPC method.")
 
-;; Defer registration until tramp-rpc is fully loaded so
-;; `tramp-add-external-operation' can safely `(require 'tramp-rpc)'.
-(with-eval-after-load 'tramp-rpc
+(defun tramp-rpc--install-core-external-operations ()
+  "Install external operations implemented by the core module."
   (tramp-add-external-operation 'locate-dominating-file 'tramp-rpc-handle-locate-dominating-file 'tramp-rpc)
   (tramp-add-external-operation 'dir-locals--all-files 'tramp-rpc-handle-dir-locals--all-files 'tramp-rpc)
   (tramp-add-external-operation 'dir-locals-find-file 'tramp-rpc-handle-dir-locals-find-file 'tramp-rpc)
@@ -5971,16 +5909,31 @@ cleanup of all connections has run."
   ;; `tramp-cleanup-all-connections-hook'.
   )
 
-;; Register cleanup hooks.
-(add-hook 'tramp-cleanup-connection-hook #'tramp-rpc-cleanup-connection)
-(add-hook 'tramp-cleanup-all-connections-hook #'tramp-rpc-cleanup-all-connections)
-
 ;; ============================================================================
 ;; Unload support
 ;; ============================================================================
 
-(defvar tramp-rpc-unload-hook nil
-  "Hook run by `tramp-rpc-unload-function' to unload helper modules.")
+(defun tramp-rpc--after-load-integrations (_file)
+  "Install integrations whose optional packages have just loaded."
+  (tramp-rpc-process-install-optional-handlers)
+  (tramp-rpc-advice-install-optional-handlers)
+  (tramp-rpc-magit-install-optional-handlers))
+
+(defun tramp-rpc--unload-from-tramp ()
+  "Unload tramp-rpc when TRAMP itself is unloaded."
+  (when (featurep 'tramp-rpc)
+    (unload-feature 'tramp-rpc 'force)))
+
+(defun tramp-rpc--install ()
+  "Install TRAMP-RPC operations, advice, and lifecycle hooks."
+  (tramp-rpc--install-core-external-operations)
+  (tramp-rpc-handler-install)
+  (tramp-rpc--after-load-integrations nil)
+  (add-hook 'after-load-functions #'tramp-rpc--after-load-integrations)
+  (add-hook 'tramp-cleanup-connection-hook #'tramp-rpc-cleanup-connection)
+  (add-hook 'tramp-cleanup-all-connections-hook
+            #'tramp-rpc-cleanup-all-connections)
+  (add-hook 'tramp-unload-hook #'tramp-rpc--unload-from-tramp))
 
 (defun tramp-rpc-unload-function ()
   "Unload function for tramp-rpc.
@@ -5990,17 +5943,18 @@ Removes advice and cleans up async processes."
   (tramp-remove-external-operation 'dir-locals--all-files 'tramp-rpc)
   (tramp-remove-external-operation 'dir-locals-find-file 'tramp-rpc)
   (tramp-remove-external-operation 'move-file-to-trash 'tramp-rpc)
-  ;; Unload helper modules.  `tramp-rpc.el' requires these modules, so
-  ;; unloading only the top-level feature and loading it again would otherwise
-  ;; leave stale definitions in place (notably `tramp-rpc-process.el').  Helper
-  ;; unload functions also perform their own cleanup before removing symbols.
-  ;; Helper hook entries are idempotent because unloading one helper can unload
-  ;; another as a dependency before its hook entry is reached.
-  (run-hooks 'tramp-rpc-unload-hook)
+  ;; Unload helper modules explicitly.  Their standard feature unload
+  ;; functions perform module-specific cleanup.
+  (dolist (feature '(tramp-rpc-advice tramp-rpc-magit tramp-rpc-process
+                     tramp-rpc-deploy tramp-rpc-protocol))
+    (when (featurep feature)
+      (unload-feature feature 'force)))
   ;; Remove multi-hop hook and cleanup hooks.
+  (remove-hook 'after-load-functions #'tramp-rpc--after-load-integrations)
   (remove-hook 'tramp-multi-hop-p-hook #'tramp-rpc-multi-hop-p)
   (remove-hook 'tramp-cleanup-connection-hook #'tramp-rpc-cleanup-connection)
   (remove-hook 'tramp-cleanup-all-connections-hook #'tramp-rpc-cleanup-all-connections)
+  (remove-hook 'tramp-unload-hook #'tramp-rpc--unload-from-tramp)
   ;; Remove method registrations.
   (setq tramp-methods (delete (assoc tramp-rpc-method tramp-methods) tramp-methods))
   (setq tramp-foreign-file-name-handler-alist
@@ -6014,9 +5968,13 @@ Removes advice and cleans up async processes."
   ;; Return nil to allow normal unload to proceed
   nil)
 
-(add-hook 'tramp-unload-hook
-	  (lambda ()
-	    (unload-feature 'tramp-rpc 'force)))
-
 (provide 'tramp-rpc)
+(condition-case err
+    (tramp-rpc--install)
+  (error
+   ;; `tramp-add-external-operation' requires the backend feature, so the
+   ;; feature must be visible during installation.  Do not leave a partially
+   ;; initialized package marked as loaded when installation fails.
+   (setq features (delq 'tramp-rpc features))
+   (signal (car err) (cdr err))))
 ;;; tramp-rpc.el ends here

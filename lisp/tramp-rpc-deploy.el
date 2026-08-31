@@ -27,12 +27,8 @@
 
 (require 'cl-lib)
 (require 'tramp)
+(require 'tramp-sh)
 (require 'url)
-
-;; Silence byte-compiler warnings for functions defined in tramp-sh
-(declare-function tramp-send-command "tramp-sh")
-(declare-function tramp-send-command-and-check "tramp-sh")
-(declare-function tramp-send-command-and-read "tramp-sh")
 
 ;; Functions from tramp-rpc.el.  `tramp-rpc-deploy' is loaded by
 ;; tramp-rpc.el after these helpers have been defined.
@@ -1593,11 +1589,6 @@ This helps troubleshoot deployment issues."
 ;; ============================================================================
 ;; Unload support
 ;; ============================================================================
-
-(add-hook 'tramp-rpc-unload-hook
-	  (lambda ()
-	    (when (featurep 'tramp-rpc-deploy)
-	      (unload-feature 'tramp-rpc-deploy 'force))))
 
 (provide 'tramp-rpc-deploy)
 ;;; tramp-rpc-deploy.el ends here

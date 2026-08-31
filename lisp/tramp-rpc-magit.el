@@ -30,11 +30,7 @@
 
 (require 'cl-lib)
 (require 'tramp)
-
-;; Functions from tramp.el
-(declare-function tramp-add-external-operation "tramp")
-(declare-function tramp-remove-external-operation "tramp")
-(declare-function tramp-message "tramp-message")
+(require 'tramp-cache)
 
 ;; Functions from tramp-rpc.el
 (declare-function tramp-rpc--debug "tramp-rpc")
@@ -57,19 +53,21 @@
 (declare-function tramp-rpc--file-notify-dispatch-rescan "tramp-rpc")
 (declare-function tramp-rpc--watch-entry-canonical-directory "tramp-rpc")
 
-;; Functions from tramp-cache.el.
-(declare-function tramp-flush-file-properties "tramp-cache")
-(declare-function tramp-flush-directory-properties "tramp-cache")
-
 ;; Functions from magit-section.el.
-(declare-function magit-section-show "magit-section")
+(autoload 'magit-section-show "magit-section")
 
 ;; Silence byte-compiler warnings for external functions
-(declare-function projectile-dir-files-alien "projectile")
-(declare-function projectile-time-seconds "projectile")
+(autoload 'projectile-dir-files-alien "projectile")
+(autoload 'projectile-time-seconds "projectile")
 
 ;; Variables from magit-diff.el.
 (defvar magit-diff-adjust-tab-width)
+
+(defvar tramp-rpc-magit--magit-enabled nil
+  "Non-nil when Magit integrations are installed.")
+
+(defvar tramp-rpc-magit--projectile-enabled nil
+  "Non-nil when Projectile integrations are installed.")
 
 ;; ============================================================================
 ;; Cache infrastructure
@@ -1763,15 +1761,14 @@ magit-status on remote repositories."
   (advice-remove 'magit-section-show #'tramp-rpc-magit--section-show-advice)
   (when (fboundp 'magit-section-show)
     (advice-add 'magit-section-show :around #'tramp-rpc-magit--section-show-advice))
-  (with-eval-after-load 'magit-section
-    (advice-remove 'magit-section-show #'tramp-rpc-magit--section-show-advice)
-    (advice-add 'magit-section-show :around #'tramp-rpc-magit--section-show-advice))
+
   (tramp-add-external-operation
    'magit-status-setup-buffer
    #'tramp-rpc-handle-magit-status-setup-buffer 'tramp-rpc)
   (tramp-add-external-operation
    'magit-status-refresh-buffer
    #'tramp-rpc-handle-magit-status-refresh-buffer 'tramp-rpc)
+  (setq tramp-rpc-magit--magit-enabled t)
   (message "tramp-rpc magit optimizations enabled"))
 
 ;;;###autoload
@@ -1782,6 +1779,7 @@ magit-status on remote repositories."
   (tramp-remove-external-operation 'magit-status-setup-buffer 'tramp-rpc)
   (tramp-remove-external-operation 'magit-status-refresh-buffer 'tramp-rpc)
   (tramp-rpc-magit--clear-cache)
+  (setq tramp-rpc-magit--magit-enabled nil)
   (message "tramp-rpc magit optimizations disabled"))
 
 ;;;###autoload
@@ -1798,11 +1796,6 @@ magit-status on remote repositories."
   (setq tramp-rpc-magit--debug nil)
   (message "tramp-rpc magit debug disabled"))
 
-;; Fix #m4: Auto-enable behind defcustom gate
-(with-eval-after-load 'magit
-  (with-eval-after-load 'tramp-rpc
-    (when tramp-rpc-magit-optimize
-      (tramp-rpc-magit-enable))))
 
 ;; ============================================================================
 ;; Projectile optimizations
@@ -1855,6 +1848,7 @@ be available, and uses alien indexing for better performance."
   (tramp-add-external-operation
    'projectile-project-files
    #'tramp-rpc-handle-projectile-project-files 'tramp-rpc)
+  (setq tramp-rpc-magit--projectile-enabled t)
   (message "tramp-rpc projectile optimizations enabled"))
 
 ;;;###autoload
@@ -1863,11 +1857,16 @@ be available, and uses alien indexing for better performance."
   (interactive)
   (tramp-remove-external-operation 'projectile-dir-files 'tramp-rpc)
   (tramp-remove-external-operation 'projectile-project-files 'tramp-rpc)
+  (setq tramp-rpc-magit--projectile-enabled nil)
   (message "tramp-rpc projectile optimizations disabled"))
 
-;; Auto-enable when projectile is loaded
-(with-eval-after-load 'projectile
-  (with-eval-after-load 'tramp-rpc
+(defun tramp-rpc-magit-install-optional-handlers ()
+  "Install handlers for loaded Magit and Projectile packages."
+  (when (and (featurep 'magit) tramp-rpc-magit-optimize
+             (not tramp-rpc-magit--magit-enabled))
+    (tramp-rpc-magit-enable))
+  (when (and (featurep 'projectile)
+             (not tramp-rpc-magit--projectile-enabled))
     (tramp-rpc-projectile-enable)))
 
 ;; ============================================================================
@@ -1882,11 +1881,6 @@ Removes handlers."
   (tramp-rpc-projectile-disable)
   ;; Return nil to allow normal unload to proceed
   nil)
-
-(add-hook 'tramp-rpc-unload-hook
-	  (lambda ()
-	    (when (featurep 'tramp-rpc-magit)
-	      (unload-feature 'tramp-rpc-magit 'force))))
 
 (provide 'tramp-rpc-magit)
 ;;; tramp-rpc-magit.el ends here

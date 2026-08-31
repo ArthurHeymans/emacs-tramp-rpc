@@ -264,10 +264,5 @@ Returns a list where each element is either:
 ;; Unload support
 ;; ============================================================================
 
-(add-hook 'tramp-rpc-unload-hook
-	  (lambda ()
-	    (when (featurep 'tramp-rpc-protocol)
-	      (unload-feature 'tramp-rpc-protocol 'force))))
-
 (provide 'tramp-rpc-protocol)
 ;;; tramp-rpc-protocol.el ends here
