@@ -1590,7 +1590,7 @@ Returns non-nil on success."
     ;; create a ControlMaster on top of a stale ControlPath, which later shows
     ;; up as a generic "Tramp failed to connect" during unrelated file ops.
     (when (file-exists-p socket-path)
-      (ignore-errors (delete-file socket-path)))
+      (delete-file socket-path))
     (with-current-buffer buffer
       (erase-buffer))
     (let (success)
@@ -1881,7 +1881,9 @@ probe can then interleave with RPC startup and corrupt the protocol stream."
              ;; Do not tear down a socket that still answers ControlMaster
              ;; checks merely because authentication failed for another reason.
              (signal (car err) (cdr err))
-           (ignore-errors (delete-file socket-path))
+           (condition-case nil
+               (delete-file socket-path)
+             (file-missing nil))
            (sleep-for 0.1)
            (condition-case nil
                (tramp-rpc--establish-controlmaster vec)
@@ -1991,12 +1993,15 @@ down VEC's ControlMaster in that case would disrupt the still-live connection."
       ;; Close the ControlMaster socket gracefully via ssh -O exit.
       ;; This is a local control message (no network round-trip), so fast.
       (when (file-exists-p socket-path)
-        (ignore-errors
-          (apply #'call-process "ssh" nil nil nil
-                 (append
-                  (tramp-rpc--ssh-identity-args user port proxyjump)
-                  (list "-o" (format "ControlPath=%s" socket-path)
-                        "-O" "exit" host)))))
+        (condition-case err
+            (apply #'call-process "ssh" nil nil nil
+                   (append
+                    (tramp-rpc--ssh-identity-args user port proxyjump)
+                    (list "-o" (format "ControlPath=%s" socket-path)
+                          "-O" "exit" host)))
+          (file-error
+           (tramp-rpc--debug "ControlMaster cleanup failed: %s"
+                             (error-message-string err)))))
       ;; Kill the auth process.
       (when (and auth-process (process-live-p auth-process))
         (delete-process auth-process))
@@ -5128,7 +5133,12 @@ Keys are the same connection/path keys as `tramp-rpc--watched-directories'.")
 
 (defun tramp-rpc--file-notify-monitor (vec)
   "Return the file notification monitor symbol for VEC."
-  (let* ((info (ignore-errors (tramp-rpc--system-info vec)))
+  (let* ((info (condition-case err
+                   (tramp-rpc--system-info vec)
+                 (error
+                  (tramp-rpc--debug "system.info probe failed: %s"
+                                    (error-message-string err))
+                  nil)))
          (watcher (and (listp info)
                        (tramp-rpc--decode-string (alist-get 'watcher info))))
          (os (and (listp info)
@@ -5507,7 +5517,13 @@ FLAGS controls the requested operation."
            ;; file-notify does not follow symlinks.  Ask the server for a
            ;; nofollow symlink watch when needed, falling back to a synthetic
            ;; client-side descriptor on platforms without nofollow support.
-           (symlink-watch (ignore-errors (file-symlink-p directory)))
+           (symlink-watch
+            (condition-case err
+                (file-symlink-p directory)
+              (error
+               (tramp-rpc--debug "symlink watch probe failed for %s: %s"
+                                 directory (error-message-string err))
+               nil)))
            (descriptor (tramp-rpc--make-file-notify-descriptor
                         v directory localname)))
       (if entry
@@ -5555,8 +5571,14 @@ FLAGS controls the requested operation."
                                      ;; truename path as a best-effort match key
                                      ;; for symlinked watched directories.
                                      (preexisting
-                                      (ignore-errors
-                                        (file-truename directory))))))
+                                      (condition-case err
+                                          (file-truename directory)
+                                        (error
+                                         (tramp-rpc--debug
+                                          "watch truename probe failed for %s: %s"
+                                          directory
+                                          (error-message-string err))
+                                         nil))))))
           (puthash watch-key
                    (list :count 1
                          :owned (and (not preexisting) (not synthetic))

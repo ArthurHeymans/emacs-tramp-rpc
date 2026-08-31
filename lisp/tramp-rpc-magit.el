@@ -29,6 +29,7 @@
 ;;; Code:
 
 (require 'cl-lib)
+(require 'eieio)
 (require 'tramp)
 (require 'tramp-cache)
 
@@ -227,14 +228,12 @@ must still report symlink type for lstat."
                 (remhash (cons candidate t) tramp-rpc--file-stat-cache))
               (flush-tramp-properties (candidate)
                 (when (tramp-tramp-file-p candidate)
-                  (ignore-errors
-                    (with-parsed-tramp-file-name candidate nil
-                      (tramp-flush-file-properties v localname)))))
+                  (with-parsed-tramp-file-name candidate nil
+                    (tramp-flush-file-properties v localname))))
               (flush-tramp-directory-properties (candidate)
                 (when (tramp-tramp-file-p candidate)
-                  (ignore-errors
-                    (with-parsed-tramp-file-name candidate nil
-                      (tramp-flush-directory-properties v localname)))))
+                  (with-parsed-tramp-file-name candidate nil
+                    (tramp-flush-directory-properties v localname))))
               (spellings (path)
                 (delete-dups
                  (list path
@@ -261,10 +260,9 @@ must still report symlink type for lstat."
     (tramp-rpc--invalidate-cache-for-path expanded-file)
     (cl-labels ((flush-tramp-properties (candidate)
                   (when (tramp-tramp-file-p candidate)
-                    (ignore-errors
-                      (with-parsed-tramp-file-name candidate nil
-                        (tramp-flush-file-properties v localname)
-                        (tramp-flush-directory-properties v localname)))))
+                    (with-parsed-tramp-file-name candidate nil
+                      (tramp-flush-file-properties v localname)
+                      (tramp-flush-directory-properties v localname))))
                 (drop-string-prefix (cache)
                   (let (keys)
                     (maphash (lambda (key _value)
@@ -308,9 +306,8 @@ must still report symlink type for lstat."
 (defun tramp-rpc--clear-current-tramp-file-properties ()
   "Clear TRAMP file properties for the current remote connection."
   (when (file-remote-p default-directory)
-    (ignore-errors
-      (with-parsed-tramp-file-name default-directory nil
-        (tramp-flush-directory-properties v "/")))))
+    (with-parsed-tramp-file-name default-directory nil
+      (tramp-flush-directory-properties v "/"))))
 
 (defun tramp-rpc--clear-file-metadata-caches ()
   "Clear cached file metadata."
@@ -331,7 +328,7 @@ must still report symlink type for lstat."
 Entries are keyed by expanded TRAMP filenames; this removes those
 matching the remote prefix of VEC."
   (tramp-rpc-magit--clear-ancestor-caches-for-connection vec)
-  (ignore-errors (tramp-flush-directory-properties vec "/"))
+  (tramp-flush-directory-properties vec "/")
   (let ((prefix (tramp-make-tramp-file-name vec "/")))
     ;; Match the prefix up to the colon-slash that starts the localname.
     ;; e.g. "/rpc:user@host:/" -- any key starting with this belongs to VEC.
@@ -1663,7 +1660,10 @@ Returns t, nil, or \\='not-cached if not in cache."
 
 (defun tramp-rpc-magit--section-slot (section slot)
   "Return SECTION's SLOT value, or nil if unavailable."
-  (ignore-errors (eieio-oref section slot)))
+  (when (and (eieio-object-p section)
+             (slot-exists-p section slot)
+             (slot-boundp section slot))
+    (slot-value section slot)))
 
 (defun tramp-rpc-magit--maybe-prefetch-for-section (section)
   "Ensure batched data exists before expanding lazy Magit SECTION."

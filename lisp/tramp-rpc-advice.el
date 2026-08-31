@@ -559,7 +559,7 @@ exited (remote side finished), delete it so the refresh can proceed."
                (or (process-get proc :tramp-rpc-exited)
                    (not (process-live-p proc))))
       (remhash proc tramp-rpc--async-processes)
-      (ignore-errors (delete-process proc))))
+      (delete-process proc)))
   (tramp-run-real-handler 'vc-dir-refresh nil))
 
 ;; ============================================================================

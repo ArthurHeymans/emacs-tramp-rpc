@@ -71,6 +71,18 @@
 ;; Process tracking state
 ;; ============================================================================
 
+(defmacro tramp-rpc--best-effort (&rest body)
+  "Run BODY for teardown and log failures instead of hiding them.
+Best-effort cleanup must not replace an active transport or process error, but
+unexpected failures remain visible in TRAMP-RPC debug output."
+  (declare (indent 0) (debug t))
+  `(condition-case err
+       (progn ,@body)
+     (error
+      (tramp-rpc--debug "best-effort cleanup failed in %S: %s"
+                        ',(car body) (error-message-string err))
+      nil)))
+
 (defvar tramp-rpc--async-processes (make-hash-table :test 'eq)
   "Hash table mapping local relay processes to their remote process info.
 Value is a plist with :vec, :pid, :connection-process, :delivery-timer,
@@ -199,8 +211,8 @@ Return (STDOUT-PROCESS . STDERR-PROCESS)."
       (unless complete
         (dolist (process (list stderr-process stdout-process))
           (when (process-live-p process)
-            (ignore-errors (delete-process process))))
-        (ignore-errors (funcall cleanup))))))
+            (tramp-rpc--best-effort (delete-process process))))
+        (tramp-rpc--best-effort (funcall cleanup))))))
 
 (defun tramp-rpc--configure-relay-coding (process coding)
   "Configure PROCESS's binary relay and remember public CODING.
@@ -545,12 +557,12 @@ EVENT is the process event string."
                   (and (processp connection)
                        (process-get connection :tramp-rpc-transport-dead)))
         (when (and vec pid)
-          (ignore-errors
+          (tramp-rpc--best-effort
             (tramp-rpc--kill-remote-process
              vec pid 9 (process-get proc :tramp-rpc-connection)))))
       (when-let* ((stderr-process (plist-get info :stderr-process)))
         (when (process-live-p stderr-process)
-          (ignore-errors (delete-process stderr-process))))
+          (tramp-rpc--best-effort (delete-process stderr-process))))
       (let ((remote-exit (process-get proc :tramp-rpc-exit-code)))
         (tramp-rpc--call-user-sentinel-once
          proc user-sentinel
@@ -658,7 +670,7 @@ EXIT-CODE is the process exit status."
       ;; Send EOF to the stderr cat relay so it exits cleanly.
       (when-let* ((stderr-process (plist-get info :stderr-process)))
         (when (process-live-p stderr-process)
-          (ignore-errors (process-send-eof stderr-process))))
+          (tramp-rpc--best-effort (process-send-eof stderr-process))))
       ;; Send EOF to the LOCAL cat relay (not the remote process).
       ;; Bind `tramp-rpc--closing-local-relay' so the `process-send-eof'
       ;; handler calls the original function instead of routing to the
@@ -668,7 +680,7 @@ EXIT-CODE is the process exit status."
       ;; `tramp-rpc--install-process-cleanup' then deletes the process.
       (when (process-live-p local-process)
         (let ((tramp-rpc--closing-local-relay t))
-          (ignore-errors (process-send-eof local-process))))
+          (tramp-rpc--best-effort (process-send-eof local-process))))
       ;; Now mark as exited so process-status handler returns 'exit.
       (process-put local-process :tramp-rpc-exited t))))
 
@@ -692,7 +704,7 @@ update is still running."
                   (when (processp proc)
                     (remhash proc tramp-rpc--async-processes)
                     (unless (process-live-p proc)
-                      (ignore-errors
+                      (tramp-rpc--best-effort
                         (delete-process proc))))))))
     (cond
      ((process-live-p process)
@@ -778,9 +790,14 @@ VEC is the TRAMP connection vector."
              (not (member "--command" args))
              (not (member "--login" args))
              (not (cl-intersection login-args args :test #'string=))
-             (equal base (ignore-errors
-                           (file-name-nondirectory
-                            (tramp-rpc--get-remote-login-shell vec)))))
+             (equal base
+                    (condition-case err
+                        (file-name-nondirectory
+                         (tramp-rpc--get-remote-login-shell vec))
+                      ((file-error remote-file-error)
+                       (tramp-rpc--debug "login shell probe failed: %s"
+                                         (error-message-string err))
+                       nil))))
         ;; bash refuses `bash -l --noediting -i' but accepts `bash --noediting -i -l'.
         (append command login-args)
       command)))
@@ -883,7 +900,7 @@ Resolves program path and loads direnv environment from working directory."
                     (tramp-rpc--start-cat-relays
                      (or name "tramp-rpc-async") buffer stderr-buffer
                      (lambda ()
-                       (ignore-errors
+                       (tramp-rpc--best-effort
                          (tramp-rpc--kill-remote-process
                           v remote-pid 9 connection)))))
                    (local-process (car relays))
@@ -1182,7 +1199,7 @@ DIRENV-ENV is an optional alist of environment variables for the process."
           (tramp-rpc--start-cat-relays
            (or name "tramp-rpc-pty") actual-buffer nil
            (lambda ()
-             (ignore-errors
+             (tramp-rpc--best-effort
                (tramp-rpc--call vec "process.close_pty"
                                 `((pid . ,remote-pid)) connection)))))
          (local-process (car relays)))
@@ -1328,7 +1345,7 @@ EXIT-CODE is the process exit status."
     (when-let* ((vec (process-get local-process :tramp-rpc-vec))
                (pid (process-get local-process :tramp-rpc-pid))
                (connection (process-get local-process :tramp-rpc-connection)))
-      (ignore-errors
+      (tramp-rpc--best-effort
         (tramp-rpc--call vec "process.close_pty" `((pid . ,pid)) connection)))
     ;; A terminal server response without a status is abnormal.  In
     ;; particular, do not translate a killed remote PTY into local success.
@@ -1341,7 +1358,7 @@ EXIT-CODE is the process exit status."
     ;; deleting it here discards the final output returned with EXITED.
     (when (process-live-p local-process)
       (let ((tramp-rpc--closing-local-relay t))
-        (ignore-errors (process-send-eof local-process))))))
+        (tramp-rpc--best-effort (process-send-eof local-process))))))
 
 (defun tramp-rpc--pty-sentinel (process event)
   "Sentinel for PTY relay PROCESS, preserving its user sentinel once.
@@ -1357,7 +1374,7 @@ EVENT is the process event string."
                                     :tramp-rpc-transport-dead)))
         (when-let* ((vec (plist-get info :vec))
                     (pid (plist-get info :pid)))
-          (ignore-errors
+          (tramp-rpc--best-effort
             (tramp-rpc--call vec "process.kill_pty"
                              `((pid . ,pid) (signal . 9))
                              (process-get process :tramp-rpc-connection)))))
@@ -1386,12 +1403,16 @@ the local relay process (we handle resizing via RPC to the remote)."
     (when-let* ((vec (process-get process :tramp-rpc-vec))
                (pid (process-get process :tramp-rpc-pid)))
       (let ((size (tramp-rpc--get-terminal-size (process-buffer process))))
-        ;; Resize the remote PTY
-        (ignore-errors
-          (tramp-rpc--call-fast vec "process.resize_pty"
-                                `((pid . ,pid)
-                                  (cols . ,(car size))
-                                  (rows . ,(cdr size))))))))
+        ;; Resize the remote PTY.  A transport race is expected when the
+        ;; process exits while Emacs is dispatching a window change.
+        (condition-case err
+            (tramp-rpc--call-fast vec "process.resize_pty"
+                                  `((pid . ,pid)
+                                    (cols . ,(car size))
+                                    (rows . ,(cdr size))))
+          ((file-error remote-file-error)
+           (tramp-rpc--debug "PTY resize failed: %s"
+                             (error-message-string err)))))))
   ;; Return nil - we handle resizing ourselves, Emacs shouldn't try to
   ;; set-process-window-size on our local relay process
   nil)
@@ -1420,12 +1441,16 @@ Returns the final (width . height) cons, or nil if resize was not handled."
                   (setq width (car adjusted)
                         height (cdr adjusted))))
               (when (and (> width 0) (> height 0))
-                ;; Resize remote PTY
-                (ignore-errors
-                  (tramp-rpc--call-fast vec "process.resize_pty"
-                                        `((pid . ,pid)
-                                          (cols . ,width)
-                                          (rows . ,height))))
+                ;; Resize remote PTY.  Ignore only the expected transport race
+                ;; when the process exits during a display update.
+                (condition-case err
+                    (tramp-rpc--call-fast vec "process.resize_pty"
+                                          `((pid . ,pid)
+                                            (cols . ,width)
+                                            (rows . ,height)))
+                  ((file-error remote-file-error)
+                   (tramp-rpc--debug "terminal resize failed: %s"
+                                     (error-message-string err))))
                 ;; Let terminal-specific code update display
                 (when display-updater
                   (funcall display-updater width height))
@@ -1517,7 +1542,7 @@ callbacks that mutate the process registry."
          (push (cons (plist-get info :vec) (plist-get info :pid)) targets)))
      tramp-rpc--pty-processes)
     (dolist (target targets)
-      (ignore-errors
+      (tramp-rpc--best-effort
         (tramp-rpc--call (car target) "process.kill_pty"
                          `((pid . ,(cdr target)) (signal . 9)) connection)))))
 
@@ -1577,7 +1602,7 @@ generation has been detached from global connection lookup."
          (push (cons (plist-get info :vec) (plist-get info :pid)) targets)))
      tramp-rpc--async-processes)
     (dolist (target targets)
-      (ignore-errors
+      (tramp-rpc--best-effort
         (tramp-rpc--call (car target) "process.kill"
                          `((pid . ,(cdr target)) (signal . 9)) connection)))))
 
@@ -1601,7 +1626,7 @@ transport is live."
        (tramp-rpc--cancel-process-timers tramp-rpc--async-processes local-process)
        (when-let* ((stderr-process (plist-get info :stderr-process)))
          (when (process-live-p stderr-process)
-           (ignore-errors (delete-process stderr-process))))
+           (tramp-rpc--best-effort (delete-process stderr-process))))
        ;; Keep tracking while delete-process dispatches the wrapped sentinel.
        (process-put local-process :tramp-rpc-transport-cleanup t)
        (process-put local-process :tramp-rpc-transport-dead t)

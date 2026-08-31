@@ -664,7 +664,9 @@ Returns t if checksum matches, nil otherwise."
           (rename-file temp-path path t)
           (setq temp-path nil))
       (when temp-path
-        (ignore-errors (delete-file temp-path))))))
+        (condition-case nil
+            (delete-file temp-path)
+          (file-missing nil))))))
 
 (defun tramp-rpc-deploy--write-cache-provenance (cache-path kind digest)
   "Atomically record KIND and SHA256 DIGEST for CACHE-PATH."
@@ -678,8 +680,11 @@ Returns t if checksum matches, nil otherwise."
 
 (defun tramp-rpc-deploy--invalidate-cache (cache-path)
   "Remove CACHE-PATH and its provenance after failed source-cache validation."
-  (ignore-errors (delete-file cache-path))
-  (ignore-errors (delete-file (tramp-rpc-deploy--cache-provenance-path cache-path))))
+  (dolist (path (list cache-path
+                      (tramp-rpc-deploy--cache-provenance-path cache-path)))
+    (condition-case nil
+        (delete-file path)
+      (file-missing nil))))
 
 (defun tramp-rpc-deploy--promote-cached-binary (source cache-path kind)
   "Atomically promote SOURCE to CACHE-PATH with KIND and a recorded digest.
@@ -694,13 +699,17 @@ never one authorized by stale provenance."
           (set-file-modes temp-path #o755)
           (let ((digest (tramp-rpc-deploy--compute-checksum temp-path)))
             ;; Remove stale authority before changing the cache binary.
-            (ignore-errors (delete-file provenance-path))
+            (condition-case nil
+                (delete-file provenance-path)
+              (file-missing nil))
             (rename-file temp-path cache-path t)
             (setq temp-path nil)
             (tramp-rpc-deploy--write-cache-provenance cache-path kind digest)
             cache-path))
       (when temp-path
-        (ignore-errors (delete-file temp-path))))))
+        (condition-case nil
+            (delete-file temp-path)
+          (file-missing nil))))))
 
 (defun tramp-rpc-deploy--cached-binary-trusted-p (cache-path)
   "Return non-nil when CACHE-PATH matches a recorded provenance digest."
@@ -786,7 +795,9 @@ release artifact into the cache."
             (message "Downloaded and verified tramp-rpc-server for %s" arch)
             cache-path))
       ;; Never leave downloaded archives or unpromoted extraction behind.
-      (ignore-errors (delete-directory temp-dir t)))))
+      (condition-case nil
+          (delete-directory temp-dir t)
+        (file-missing nil)))))
 
 ;; ============================================================================
 ;;; Build from source
@@ -1202,9 +1213,14 @@ to inline encoding (base64 through the shell), which can be fragile."
                  (message "Transfer error: %s" err-msg))
                (setq retries (1+ retries))))
           (when staging-directory
-            (ignore-errors
-              (tramp-rpc-deploy--remove-remote-staging-directory
-               vec staging-directory))))))
+            (condition-case cleanup-error
+                (tramp-rpc-deploy--remove-remote-staging-directory
+                 vec staging-directory)
+              ((file-error remote-file-error)
+               (tramp-rpc-deploy--log
+                "Failed to remove remote staging directory %s: %s"
+                staging-directory
+                (error-message-string cleanup-error))))))))
 
     (unless success
       (signal
