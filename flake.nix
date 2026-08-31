@@ -19,6 +19,22 @@
       inherit (nixpkgs) lib;
       forAllSystems = lib.genAttrs lib.systems.flakeExposed;
 
+      trampRpcVersion =
+        let
+          versionPrefix = ";; Version: ";
+        in
+        lib.removePrefix versionPrefix (
+          lib.findFirst (lib.hasPrefix versionPrefix)
+            (throw "Could not find Version header in lisp/tramp-rpc.el")
+            (lib.splitString "\n" (builtins.readFile "${self}/lisp/tramp-rpc.el"))
+        );
+      trampVersion = "2.8.2";
+      defaultServerArchs =
+        pkgs: with pkgs.pkgsCross; [
+          musl64
+          aarch64-multiplatform-musl
+        ];
+
       rustTargets = [
         "x86_64-unknown-linux-musl"
         "aarch64-unknown-linux-musl"
@@ -40,36 +56,52 @@
             eself: _: {
               tramp-rpc = eself.callPackage (
                 {
-                  archs ? with super.pkgsCross; [
-                    musl64
-                    aarch64-multiplatform-musl
-                  ],
+                  archs ? defaultServerArchs super,
+                  serverPackages ? map (arch: {
+                    package = arch.callPackage ./default.nix { };
+                    system = arch.stdenv.hostPlatform.system;
+                  }) archs,
                   lib,
                   melpaBuild,
-                  tramp,
                   msgpack,
                 }:
                 let
-                  versionPrefix = ";; Version: ";
-                  version = lib.removePrefix versionPrefix (
-                    lib.findFirst (lib.hasPrefix versionPrefix)
-                      (throw "Could not find Version header in lisp/tramp-rpc.el")
-                      (lib.splitString "\n" (builtins.readFile "${self}/lisp/tramp-rpc.el"))
-                  );
-                  serverFor = arch: arch.callPackage ./default.nix { };
+                  # nixpkgs' GNU ELPA snapshot is older than the minimum
+                  # version required by tramp-rpc.
+                  trampForTrampRpc = melpaBuild {
+                    pname = "tramp";
+                    version = trampVersion;
+                    src = super.fetchFromGitHub {
+                      owner = "emacsmirror";
+                      repo = "tramp";
+                      rev = "904779d264156bfb4ecfc7fa6c40910354cf4ee8";
+                      hash = "sha256-Bw/uysv6SbTmfwg/uSBga+wQRD+tEB/3f6FqE02Wqeg=";
+                    };
+                    files = ''("lisp/*.el")'';
+                    postPatch = ''
+                      substitute lisp/trampver.el.in lisp/trampver.el \
+                        --replace-fail '@configure_input@' 'Generated for the tramp-rpc Nix package' \
+                        --replace-fail '@PACKAGE_VERSION@' '${trampVersion}' \
+                        --replace-fail '@PACKAGE_BUGREPORT@' 'tramp-devel@gnu.org' \
+                        --replace-fail '@EMACS_REQUIRED_VERSION@' '28.1' \
+                        --replace-fail '@PACKAGE_URL@' 'https://www.gnu.org/software/tramp/' \
+                        --replace-fail '@TRAMP_EMACS_VERSION_CHECK@' '"ok"'
+                    '';
+                    packageRequires = [ ];
+                  };
                 in
                 melpaBuild rec {
                   pname = "tramp-rpc";
-                  inherit version;
+                  version = trampRpcVersion;
                   src = self;
                   files = ''("lisp/*")'';
 
-                  postInstall = lib.concatMapStringsSep "\n" (arch: ''
-                    install -m755 -D ${serverFor arch}/bin/tramp-rpc-server $out/share/emacs/site-lisp/elpa/${pname}-${version}/binaries/${arch.stdenv.hostPlatform.system}/tramp-rpc-server
-                  '') archs;
+                  postInstall = lib.concatMapStringsSep "\n" (server: ''
+                    install -m755 -D ${server.package}/bin/tramp-rpc-server $out/share/emacs/site-lisp/elpa/${pname}-${version}/binaries/${server.system}/tramp-rpc-server
+                  '') serverPackages;
 
                   packageRequires = [
-                    tramp
+                    trampForTrampRpc
                     msgpack
                   ];
                 }
@@ -86,6 +118,47 @@
         {
           tramp-rpc-server = pkgs.pkgsStatic.callPackage ./default.nix { };
           default = self'.tramp-rpc-server;
+        }
+      );
+
+      checks = lib.genAttrs [ "x86_64-linux" ] (
+        system:
+        let
+          pkgs = import nixpkgs {
+            inherit system;
+            overlays = [ self.overlays.default ];
+          };
+          emacsPackages = pkgs.emacsPackagesFor pkgs.emacs;
+          emacsWithTrampRpc = emacsPackages.emacsWithPackages (epkgs: [
+            (epkgs.tramp-rpc.override {
+              serverPackages = [
+                {
+                  package = pkgs.writeShellScriptBin "tramp-rpc-server" "exit 0";
+                  system = pkgs.stdenv.hostPlatform.system;
+                }
+              ];
+            })
+          ]);
+
+        in
+        {
+          emacs-package =
+            pkgs.runCommand "tramp-rpc-emacs-package-check"
+              {
+                nativeBuildInputs = [ emacsWithTrampRpc ];
+              }
+              ''
+                export HOME="$TMPDIR"
+                emacs --batch --eval '
+                  (progn
+                    (require (quote tramp-rpc))
+                    (let* ((arch (tramp-rpc-deploy--detect-local-arch))
+                           (binary (tramp-rpc-deploy--bundled-binary-path arch)))
+                      (unless (and binary (file-executable-p binary))
+                        (error "Missing executable bundled server binary for %s: %S"
+                               arch binary))))'
+                touch "$out"
+              '';
         }
       );
 

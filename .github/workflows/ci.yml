@@ -41,6 +41,9 @@ jobs:
           nix develop .#armv7-unknown-linux-musleabihf --command true
           nix develop .#armv5te-unknown-linux-musleabi --command true
 
+      - name: Test Nix Emacs package
+        run: nix build .#checks.x86_64-linux.emacs-package
+
   rust-linux:
     name: Rust ${{ matrix.name }}
     needs: nix-setup
