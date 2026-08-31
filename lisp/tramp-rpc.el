@@ -67,7 +67,11 @@
   "TRAMP method for RPC-based remote access.")
 
 ;;;###autoload
-(with-eval-after-load 'tramp
+(eval-and-compile
+  ;; The autoload file must initialize TRAMP before registering the method.
+  ;; This avoids deferred definitions and lets the byte compiler validate every
+  ;; TRAMP variable and function referenced by the registration code.
+  (require 'tramp)
   ;; Check, that `tramp-rpc-method' is still bound.  It isn't after
   ;; unloading `tramp-rpc', but this body still exists as compiled
   ;; function in `after-load-alist'.
@@ -109,15 +113,14 @@
    `(:application tramp :protocol ,tramp-rpc-method)
    'tramp-rpc-connection-local-default-profile)
 
-  ;; Define the predicate inline (as defsubst) so it's available without
+  ;; Define the predicate in the autoload file so it is available without
   ;; loading tramp-rpc.el.  This avoids recursive autoloading: TRAMP calls
   ;; the predicate to decide which handler to use, and if it were an
   ;; autoload stub it would load tramp-rpc.el which `(require 'tramp)'.
-  ;; Reference TRAMP uses the same pattern (defsubst in tramp-loaddefs.el).
   (defvar tramp-rpc--sudo-file-name-p-in-progress nil
     "Non-nil while checking hidden rpc+sudo proxy expansion.")
 
-  (defsubst tramp-rpc-file-name-p (vec-or-filename)
+  (defun tramp-rpc-file-name-p (vec-or-filename)
     "Check if VEC-OR-FILENAME is handled by TRAMP-RPC."
     (when-let* ((vec (tramp-ensure-dissected-file-name vec-or-filename)))
       (string= (tramp-file-name-method vec) tramp-rpc-method)))
@@ -125,7 +128,7 @@
   ;; Detect privilege elevation paths with rpc hops, e.g.
   ;; /rpc:user@host|sudo:root@host:/path.  These are handled by the
   ;; tramp-rpc handler which starts the RPC server via sudo.
-  (defsubst tramp-rpc--sudo-file-name-p (vec-or-filename)
+  (defun tramp-rpc--sudo-file-name-p (vec-or-filename)
     "Check if VEC-OR-FILENAME is a privilege elevation with an rpc hop."
     (when-let* ((vec (tramp-ensure-dissected-file-name vec-or-filename))
                 (target-host (tramp-file-name-host vec)))
@@ -225,11 +228,10 @@ This is called from `tramp-multi-hop-p-hook'."
   (error "Tramp RPC requires Tramp >= 2.8.1.4, but %s is loaded"
          tramp-version))
 
-;; Silence byte-compiler warnings for functions defined in with-eval-after-load
-(declare-function tramp-add-external-operation "tramp")
-(declare-function tramp-remove-external-operation "tramp")
-(declare-function tramp-handle-insert-directory "tramp")
 (declare-function dired-compress-file "dired-aux")
+;; These predicates are emitted inside the single autoload form above.  The
+;; compiler does not discover nested definitions, so declare only those two
+;; autoload-owned functions used by the full implementation below.
 (declare-function tramp-rpc--sudo-file-name-p "tramp-rpc")
 (declare-function tramp-rpc-multi-hop-p "tramp-rpc")
 
@@ -390,9 +392,6 @@ avoids breakage if callers supply numeric defaults."
   (cond ((stringp port) port)
         ((numberp port) (number-to-string port))
         (t nil)))
-
-(declare-function tramp-read-passwd "tramp")
-(declare-function tramp-clear-passwd "tramp" (vec))
 
 (defun tramp-rpc--sudo-auth-vec (vec)
   "Return the unprivileged rpc vector used to validate sudo for VEC."
@@ -5871,8 +5870,8 @@ pattern in `tramp-file-name-handler'."
 ;; Method predicate and handler registration
 ;; ============================================================================
 
-;; `tramp-rpc-file-name-p' is defined as defsubst in the with-eval-after-load
-;; block above (extracted into autoloads).  Re-define it here as defun for
+;; `tramp-rpc-file-name-p' is defined in the autoload block above.  Re-define
+;; it here so the installed implementation is associated with this source file for
 ;; the full-load case so it gets proper byte-compilation.
 (defun tramp-rpc-file-name-p (vec-or-filename)
   "Check if VEC-OR-FILENAME is handled by TRAMP-RPC.
@@ -5881,7 +5880,7 @@ VEC-OR-FILENAME can be either a tramp-file-name struct or a filename string."
     (string= (tramp-file-name-method vec) tramp-rpc-method)))
 
 ;; Re-register with the full defun now that the file is loaded.
-;; (Already registered via with-eval-after-load, but this ensures the
+;; (Already registered by the autoload code, but this ensures the
 ;; byte-compiled defun version is used.)
 (tramp-register-foreign-file-name-handler
  #'tramp-rpc-file-name-p #'tramp-rpc-file-name-handler)
