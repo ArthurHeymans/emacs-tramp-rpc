@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+
 //! File metadata operations
 
 use crate::protocol::{FileAttributes, FileType, RpcError, from_value};

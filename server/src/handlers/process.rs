@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+
 //! Process execution operations
 
 use crate::msgpack_map;

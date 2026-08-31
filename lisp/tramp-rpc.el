@@ -632,10 +632,10 @@ passing any SSH command-line arguments."
 
 (defcustom tramp-rpc-use-direct-ssh-pty t
   "Whether to use direct SSH connections for PTY processes.
-When non-nil, interactive terminal processes (vterm, shell-mode, term-mode)
-use a direct SSH connection with `-t` for the PTY, providing much lower
-latency than the RPC-based PTY.  The SSH connection reuses the existing
-ControlMaster socket, so authentication is already handled.
+When non-nil, interactive terminal processes (`vterm', `shell-mode',
+`term-mode') use a direct SSH connection with `-t` for the PTY.  This provides
+much lower latency than the RPC-based PTY.  The SSH connection reuses the
+existing ControlMaster socket, so authentication is already handled.
 
 Note: `signal-process' on direct SSH PTY sends signal to the local SSH
 process, which may not propagate to the remote process in all cases."
@@ -1449,9 +1449,9 @@ Creates the directory from `tramp-rpc-controlmaster-path' if needed."
         ;; Set restrictive permissions for security
         (set-file-modes dir #o700)))))
 
-;;; ============================================================================
+;; ============================================================================
 ;;; Authentication via tramp-process-actions
-;;; ============================================================================
+;; ============================================================================
 
 ;; Reuse upstream TRAMP's `tramp-process-actions' state machine for all
 ;; interactive authentication (SSH passwords, sudo, host-key prompts,
@@ -1499,9 +1499,9 @@ for the socket to appear before declaring the attempt dead."
 Handles password prompts, host-key verification, and detects the
 ControlMaster socket file appearing as the success condition.")
 
-;;; ============================================================================
+;; ============================================================================
 ;;; Multi-hop support
-;;; ============================================================================
+;; ============================================================================
 
 (defun tramp-rpc--hops-to-proxyjump (vec)
   "Convert VEC's hop chain to an SSH ProxyJump (-J) string.

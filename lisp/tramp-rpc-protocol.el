@@ -136,7 +136,7 @@ with :notification t, :method, and :params keys."
                                 :key-type 'symbol
                                 :array-type 'list
                                 :bin-type 'msgpack-bin)
-		(when (and end (/= (point) (point-max)))
+		(when (and end (not (eobp)))
 		  (error "Trailing data in MessagePack frame"))))))
          (id (alist-get 'id response))
          (method (alist-get 'method response))

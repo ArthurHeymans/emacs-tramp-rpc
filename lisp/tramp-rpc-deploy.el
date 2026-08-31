@@ -8,6 +8,11 @@
 
 ;; This file is part of tramp-rpc.
 
+;; tramp-rpc is free software: you can redistribute it and/or modify
+;; it under the terms of the GNU General Public License as published by
+;; the Free Software Foundation, either version 3 of the License, or
+;; (at your option) any later version.
+
 ;;; Commentary:
 
 ;; This file handles deployment of the tramp-rpc-server binary to
@@ -34,9 +39,9 @@
 (declare-function tramp-rpc--proxy-hop-string "tramp-rpc")
 (declare-function tramp-rpc--sudo-rpc-hop-vec "tramp-rpc")
 
-;;; ============================================================================
+;; ============================================================================
 ;;; Customization
-;;; ============================================================================
+;; ============================================================================
 
 (defun tramp-rpc-deploy--load-source-file-name ()
   "Return the Elisp source file corresponding to `load-file-name'.
@@ -293,9 +298,9 @@ FORMAT-STRING and ARGS are passed to `format'."
               (write-region line nil log-file 'append 'silent))
           (error nil))))))
 
-;;; ============================================================================
+;; ============================================================================
 ;;; Architecture detection and path helpers
-;;; ============================================================================
+;; ============================================================================
 
 (defun tramp-rpc-deploy--normalize-hops (hop-string)
   "Convert \"rpc:\" method references in HOP-STRING to \"ssh:\" for bootstrap.
@@ -562,9 +567,9 @@ outputs whose mtime predates the source files."
                    tramp-rpc-deploy-binary-name
                    (tramp-rpc-deploy--binary-id)))))
 
-;;; ============================================================================
+;; ============================================================================
 ;;; Download from GitHub Releases
-;;; ============================================================================
+;; ============================================================================
 
 (defun tramp-rpc-deploy--release-asset-name (arch)
   "Return the release asset filename for ARCH."
@@ -787,9 +792,9 @@ release artifact into the cache."
       ;; Never leave downloaded archives or unpromoted extraction behind.
       (ignore-errors (delete-directory temp-dir t)))))
 
-;;; ============================================================================
+;; ============================================================================
 ;;; Build from source
-;;; ============================================================================
+;; ============================================================================
 
 (defun tramp-rpc-deploy--cargo-available-p ()
   "Check if cargo (Rust) is available."
@@ -845,9 +850,9 @@ Returns the path to the binary on success, nil on failure."
 	   'remote-file-error
 	   (list (format "Build failed (exit %d):\n%s" exit-code (buffer-string)))))))))
 
-;;; ============================================================================
+;; ============================================================================
 ;;; Main logic: ensure local binary exists
-;;; ============================================================================
+;; ============================================================================
 
 (defun tramp-rpc-deploy--ask-git-install-action (arch)
   "Ask how to obtain a git-checkout server binary for ARCH.
@@ -1014,9 +1019,9 @@ Returns the path to the local binary."
        (format "Binary should be placed at:\n   %s"
                (tramp-rpc-deploy--local-cache-path arch))))))
 
-;;; ============================================================================
+;; ============================================================================
 ;;; Remote deployment
-;;; ============================================================================
+;; ============================================================================
 
 (defun tramp-rpc-deploy--remote-binary-exists-p (vec)
   "Check if a regular non-symlink executable binary exists on remote VEC."
@@ -1218,9 +1223,9 @@ to inline encoding (base64 through the shell), which can be fragile."
 
     remote-path))
 
-;;; ============================================================================
+;; ============================================================================
 ;;; Public API
-;;; ============================================================================
+;; ============================================================================
 
 (defun tramp-rpc-deploy-expected-binary-localname ()
   "Return the expected remote binary localname without network access.
