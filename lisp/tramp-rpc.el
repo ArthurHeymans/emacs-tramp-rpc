@@ -247,7 +247,9 @@ This is called from `tramp-multi-hop-p-hook'."
 ;; autoload-owned functions used by the full implementation below.
 (declare-function tramp-rpc--sudo-file-name-p "tramp-rpc")
 (declare-function tramp-rpc-multi-hop-p "tramp-rpc")
-(declare-function tramp-sh-handle-copy-file "tramp-sh" (&rest args))
+(declare-function tramp-sh-handle-copy-file "tramp-sh"
+                  (filename newname &optional ok-if-already-exists keep-date
+                            preserve-uid-gid preserve-extended-attributes))
 
 (defvar tramp-rpc--sudo-file-name-p-in-progress nil
   "Non-nil while checking hidden rpc+sudo proxy expansion.")
@@ -1036,10 +1038,21 @@ ARGS contains the remaining arguments of the advised TRAMP property function."
 (defmacro tramp-rpc--with-route-connection-property (vec property &rest body)
   "Evaluate BODY once and cache it under route-aware PROPERTY for VEC."
   (declare (indent 2) (debug t))
-  `(let ((tramp-rpc--route-property-access t))
-     (with-tramp-connection-property
-         ,vec (tramp-rpc--route-property-name ,vec ,property)
-       ,@body)))
+  (let ((cached-vec (make-symbol "vec"))
+        (cached-property (make-symbol "property"))
+        (missing (make-symbol "missing"))
+        (value (make-symbol "value")))
+    `(let* ((,cached-vec ,vec)
+            (,cached-property ,property)
+            (,missing (make-symbol "missing"))
+            (,value (tramp-rpc--get-route-connection-property
+                     ,cached-vec ,cached-property ,missing)))
+       (if (eq ,value ,missing)
+           (let ((,value (progn ,@body)))
+             (tramp-rpc--set-route-connection-property
+              ,cached-vec ,cached-property ,value)
+             ,value)
+         ,value))))
 
 (defun tramp-rpc--get-route-connection-property (vec property default)
   "Return route-aware connection PROPERTY for VEC, or DEFAULT."
@@ -3663,7 +3676,9 @@ PRESERVE-PERMISSIONS non-nil preserves file permissions."
 
 (defun tramp-rpc--copy-directory-fallback
     (dirname newname keep-date parents copy-contents)
-  "Run generic directory copy and invalidate only its source and destination."
+  "Copy DIRNAME to NEWNAME with the generic TRAMP handler.
+KEEP-DATE, PARENTS, and COPY-CONTENTS are passed through unchanged.  Invalidate
+only the source path and destination subtree caches."
   (prog1
       (tramp-handle-copy-directory
        dirname newname keep-date parents copy-contents)
@@ -3829,8 +3844,9 @@ COPY-CONTENTS non-nil copies directory contents."
               (tramp-flush-directory-properties v2 copied-parent-localname)
               (tramp-flush-connection-properties v2)
               (tramp-rpc--invalidate-cache-for-path dirname)
-              (tramp-rpc--invalidate-cache-for-subtree
-               (tramp-make-tramp-file-name v2 (file-name-quote copied-localname)))))))
+              ;; Preserve NEWNAME's quoted or unquoted spelling so custom cache
+              ;; keys and TRAMP properties for that spelling are both cleared.
+              (tramp-rpc--invalidate-cache-for-subtree newname)))))
     (tramp-rpc--copy-directory-fallback
      dirname newname keep-date parents copy-contents)))
 

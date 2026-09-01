@@ -7703,6 +7703,16 @@ discard it for being unreadable."
       (should (equal (seq-take captured 2) '("/bin/sh" "-c")))
       (should (string-match-p "2>/tmp/stderr\\\\ file" (nth 2 captured))))))
 
+(ert-deftest tramp-rpc-mock-test-make-process-pty-sudo-rejects-stderr-file ()
+  "PTY sudo must not hide an interactive password prompt in a stderr file."
+  (let ((default-directory "/rpc:user@host:/work/"))
+    (should-error
+     (tramp-rpc-handle-make-process
+      :name "sudo-stderr-pty" :buffer nil
+      :command '("sudo" "id") :connection-type 'pty
+      :stderr "/rpc:user@host:/tmp/stderr" :noquery t)
+     :type 'file-error)))
+
 (ert-deftest tramp-rpc-mock-test-make-process-sudo-pipe-uses-stdin-password ()
   "Pipe-mode literal sudo should authenticate in the same stdin context."
   (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
@@ -7996,6 +8006,30 @@ discard it for being unreadable."
       (tramp-flush-connection-properties direct)
       (tramp-flush-connection-properties hopped))))
 
+(ert-deftest tramp-rpc-mock-test-route-property-cache-qualifies-nested-writes ()
+  "Route-aware cache bodies still qualify nested generic property writes."
+  (let ((vec (tramp-dissect-file-name "/rpc:user@target:/"))
+        (evaluations 0))
+    (unwind-protect
+        (progn
+          (should
+           (eq (tramp-rpc--with-route-connection-property vec "test-property"
+                 (setq evaluations (1+ evaluations))
+                 (tramp-set-connection-property vec "uid-integer" 1000)
+                 'cached)
+               'cached))
+          (should
+           (eq (tramp-rpc--with-route-connection-property vec "test-property"
+                 (setq evaluations (1+ evaluations))
+                 'recomputed)
+               'cached))
+          (should (= evaluations 1))
+          (should (= (tramp-get-connection-property vec "uid-integer" nil) 1000))
+          (let ((tramp-rpc--route-property-access t))
+            (should-not
+             (tramp-get-connection-property vec "uid-integer" nil))))
+      (tramp-flush-connection-properties vec))))
+
 (ert-deftest tramp-rpc-mock-test-sudo-route-properties-do-not-collide ()
   "Generic TRAMP properties distinguish separate sudo-via-RPC routes."
   (let* ((first (make-tramp-file-name
@@ -8153,6 +8187,21 @@ discard it for being unreadable."
     (should (string-match-p "shasum -a 256" command))
     (should (string-match-p "mv -f" command))))
 
+(ert-deftest tramp-rpc-mock-test-deploy-debug-log-supports-relative-path ()
+  "Deployment debug logging accepts a file in `default-directory'."
+  (let ((directory (make-temp-file "tramp-rpc-deploy-log" t))
+        (old-log-file (getenv "TRAMP_RPC_DEPLOY_DEBUG_LOG")))
+    (unwind-protect
+        (let ((default-directory (file-name-as-directory directory))
+              (tramp-rpc-deploy-debug t))
+          (setenv "TRAMP_RPC_DEPLOY_DEBUG_LOG" "deploy.log")
+          (tramp-rpc-deploy--log "relative log")
+          (with-temp-buffer
+            (insert-file-contents (expand-file-name "deploy.log" directory))
+            (should (string-match-p "relative log" (buffer-string)))))
+      (setenv "TRAMP_RPC_DEPLOY_DEBUG_LOG" old-log-file)
+      (delete-directory directory t))))
+
 (ert-deftest tramp-rpc-mock-test-deploy-diagnose-ssh-returns-status-and-output ()
   "The deploy diagnostic SSH helper keeps argv separate and returns status."
   (let (program args)
@@ -8168,6 +8217,48 @@ discard it for being unreadable."
     (should (equal args
                    '("-o" "BatchMode=yes" "-o" "ConnectTimeout=10"
                      "-l" "user name" "--" "-host" "echo ok")))))
+
+(ert-deftest tramp-rpc-mock-test-deploy-diagnose-ssh-handles-missing-program ()
+  "A missing SSH executable is returned as a failed diagnostic result."
+  (cl-letf (((symbol-function 'call-process)
+             (lambda (&rest _args)
+               (signal 'file-missing '("Searching for program" "ssh")))))
+    (let ((result (tramp-rpc-deploy--diagnose-ssh "host" nil "true")))
+      (should (= (car result) 127))
+      (should (string-match-p "ssh" (cdr result))))))
+
+(ert-deftest tramp-rpc-mock-test-deploy-diagnose-ssh-normalizes-signal-status ()
+  "A signal-terminated SSH process returns numeric failure and its message."
+  (cl-letf (((symbol-function 'call-process)
+             (lambda (_program _infile destination _display &rest _args)
+               (when destination (insert "partial output"))
+               "killed by signal 15")))
+    (let ((result (tramp-rpc-deploy--diagnose-ssh "host" nil "true")))
+      (should (= (car result) 128))
+      (should (equal (cdr result)
+                     "partial output\nkilled by signal 15")))))
+
+(ert-deftest tramp-rpc-mock-test-deploy-diagnose-includes-failure-output ()
+  "Deployment diagnostics retain output from every failed remote check."
+  (let ((tramp-rpc-deploy-bootstrap-method "rsync")
+        (buffer-name "*tramp-rpc-diagnose*"))
+    (unwind-protect
+        (cl-letf (((symbol-function 'tramp-rpc-deploy--diagnose-ssh)
+                   (lambda (_host _user command &optional _timeout)
+                     (cond
+                      ((string-match-p "SSH_OK" command) '(0 . "SSH_OK"))
+                      ((string-match-p "uname" command) '(1 . "arch failure"))
+                      ((string-match-p "mkdir" command) '(1 . "directory failure"))
+                      ((string-match-p "sha256sum" command) '(0 . "checksum failure NONE"))
+                      ((string-match-p "rsync" command) '(0 . "rsync failure NONE")))))
+                  ((symbol-function 'display-buffer) #'ignore))
+          (tramp-rpc-deploy-diagnose "host" "")
+          (with-current-buffer buffer-name
+            (dolist (message '("arch failure" "directory failure"
+                               "checksum failure NONE" "rsync failure NONE"))
+              (should (string-match-p message (buffer-string))))))
+      (when-let* ((buffer (get-buffer buffer-name)))
+        (kill-buffer buffer)))))
 
 ;;; ============================================================================
 ;;; Test Runner

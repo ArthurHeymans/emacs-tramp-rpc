@@ -809,11 +809,16 @@ turn an explicit nil into the dynamic `process-connection-type'.  Native
 `make-process' treats explicit nil as a pipe, so pass `pipe' to the skeleton
 for that one case.
 
-String `:stderr' values retain TRAMP's same-remote file semantics."
+A remote string `:stderr' value retains TRAMP's same-remote file semantics.
+For compatibility, a non-remote string names an Emacs buffer."
   (let ((args (copy-sequence args)))
     (when (and (plist-member args :connection-type)
                (null (plist-get args :connection-type)))
       (setq args (plist-put args :connection-type 'pipe)))
+    (when-let* ((stderr (plist-get args :stderr)))
+      (when (and (stringp stderr)
+                 (not (tramp-tramp-file-p stderr)))
+        (setq args (plist-put args :stderr (get-buffer-create stderr)))))
     args))
 
 (defun tramp-rpc--redirect-command-stderr (command stderr-file)
@@ -870,11 +875,16 @@ Resolves program path and loads direnv environment from working directory."
                                       (cdr command)))
               (setq command (append (list (car command) "-n")
                                     (cdr command))))))
+        (when (and use-pty sudo-command stderr-file)
+          (tramp-error
+           v 'file-error
+           "Cannot redirect stderr for an interactive PTY sudo process"))
         (when use-pty
           (setq command (tramp-rpc--maybe-login-shell-command v command)))
         ;; TRAMP string :stderr means a same-remote file, in both pipe and PTY
         ;; modes.  Redirect in one argv-safe shell wrapper; buffer stderr keeps
-        ;; using the separate local relay below.
+        ;; using the separate local relay below.  PTY sudo is rejected above
+        ;; because redirecting its prompt would leave the user waiting blindly.
         (when stderr-file
           (setq command (tramp-rpc--redirect-command-stderr command stderr-file)
                 stderr nil))

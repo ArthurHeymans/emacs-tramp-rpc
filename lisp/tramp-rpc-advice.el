@@ -156,7 +156,7 @@ Return `not-managed' when PROCESS must use the native handler."
          proc)))
 
 (defun tramp-rpc-handle-process-send-string (process string)
-  "Handler for `process-send-string' for TRAMP-RPC processes."
+  "Send STRING to the TRAMP-RPC PROCESS."
   (when (eq (tramp-rpc--send-managed-process-string
              process string "SEND-STRING")
             'not-managed)

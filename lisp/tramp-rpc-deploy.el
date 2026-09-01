@@ -292,7 +292,8 @@ FORMAT-STRING and ARGS are passed to `format'."
       (when log-file
         (condition-case nil
             (progn
-              (make-directory (file-name-directory log-file) t)
+              (when-let* ((directory (file-name-directory log-file)))
+                (make-directory directory t))
               (write-region line nil log-file 'append 'silent))
           (error nil))))))
 
@@ -1503,6 +1504,7 @@ binary lookup, and remote installation target."
 
 (defun tramp-rpc-deploy--diagnose-ssh (host user command &optional connect-timeout)
   "Run SSH COMMAND on HOST as USER and return (STATUS . OUTPUT).
+STATUS is always numeric; signal termination is reported as failure in OUTPUT.
 When CONNECT-TIMEOUT is non-nil, use a ten-second connection timeout."
   (let ((args (append
                (list "-o" "BatchMode=yes")
@@ -1510,8 +1512,17 @@ When CONNECT-TIMEOUT is non-nil, use a ten-second connection timeout."
                (when user (list "-l" user))
                (list "--" host command))))
     (with-temp-buffer
-      (let ((status (apply #'call-process "ssh" nil t nil args)))
-        (cons status (buffer-string))))))
+      (condition-case error-data
+          (let ((status (apply #'call-process "ssh" nil t nil args))
+                (output (buffer-string)))
+            (if (integerp status)
+                (cons status output)
+              (cons 128
+                    (concat output
+                            (unless (string-empty-p output) "\n")
+                            status))))
+        (file-missing
+         (cons 127 (error-message-string error-data)))))))
 
 (defun tramp-rpc-deploy-diagnose (host &optional user)
   "Run diagnostics for deploying to HOST.
@@ -1560,7 +1571,9 @@ This helps troubleshoot deployment issues."
                         host user "uname -m && uname -s"))
                (output (cdr result)))
           (if (not (zerop (car result)))
-              (insert "   [FAIL] Could not detect architecture\n")
+              (progn
+                (insert "   [FAIL] Could not detect architecture\n")
+                (insert (format "   Output: %s\n" (string-trim output))))
             (insert (format "   [OK] Architecture: %s\n" (string-trim output)))))
 
         ;; Remote directory writable
@@ -1576,7 +1589,8 @@ This helps troubleshoot deployment issues."
                (output (cdr result)))
           (if (and (zerop (car result)) (string-match-p "WRITABLE" output))
               (insert (format "   [OK] Directory %s is writable\n" dir))
-            (insert (format "   [FAIL] Directory %s not writable\n" dir))))
+            (insert (format "   [FAIL] Directory %s not writable\n" dir))
+            (insert (format "   Output: %s\n" (string-trim output)))))
 
         ;; Checksum command
         (cl-incf test-num)
@@ -1587,7 +1601,9 @@ This helps troubleshoot deployment issues."
                (output (string-trim (cdr result))))
           (if (or (not (zerop (car result)))
                   (string-match-p "NONE" output))
-              (insert "   [FAIL] No checksum command found (need sha256sum or shasum)\n")
+              (progn
+                (insert "   [FAIL] No checksum command found (need sha256sum or shasum)\n")
+                (insert (format "   Output: %s\n" output)))
             (insert (format "   [OK] Found: %s\n" output))))
 
         ;; Conditional: rsync availability (when using rsync bootstrap method)
@@ -1599,7 +1615,9 @@ This helps troubleshoot deployment issues."
                  (output (string-trim (cdr result))))
             (if (or (not (zerop (car result)))
                     (string-match-p "NONE" output))
-                (insert "   [FAIL] rsync not found on remote (needed for rsync bootstrap method)\n")
+                (progn
+                  (insert "   [FAIL] rsync not found on remote (needed for rsync bootstrap method)\n")
+                  (insert (format "   Output: %s\n" output)))
               (insert (format "   [OK] Found: %s\n" output)))))
 
         ;; Local binary availability

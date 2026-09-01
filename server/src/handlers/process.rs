@@ -11,6 +11,9 @@ use nix::sys::wait::{WaitPidFlag, WaitStatus, waitpid};
 use nix::unistd::{Pid, tcgetpgrp};
 use rmpv::Value;
 use rustix::io::fcntl_dupfd_cloexec;
+#[cfg(target_vendor = "apple")]
+use rustix::pipe::pipe;
+#[cfg(not(target_vendor = "apple"))]
 use rustix::pipe::{PipeFlags, pipe_with};
 use rustix::process::{Pid as RustixPid, Signal as RustixSignal};
 #[cfg(any(target_os = "linux", target_os = "android"))]
@@ -44,7 +47,16 @@ pub(crate) fn is_benign_stdin_error(error: &std::io::Error) -> bool {
 }
 
 fn merged_output_fds() -> std::io::Result<(OwnedFd, OwnedFd, OwnedFd)> {
+    #[cfg(target_vendor = "apple")]
+    let (read_fd, write_fd) = {
+        let (read_fd, write_fd) = pipe()?;
+        set_fd_cloexec(read_fd.as_raw_fd())?;
+        set_fd_cloexec(write_fd.as_raw_fd())?;
+        (read_fd, write_fd)
+    };
+    #[cfg(not(target_vendor = "apple"))]
     let (read_fd, write_fd) = pipe_with(PipeFlags::CLOEXEC)?;
+
     let stderr_fd = fcntl_dupfd_cloexec(&write_fd, 0)?;
     Ok((read_fd, write_fd, stderr_fd))
 }
