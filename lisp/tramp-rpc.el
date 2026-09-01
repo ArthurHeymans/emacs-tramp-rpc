@@ -991,6 +991,83 @@ Otherwise clear all entries."
 (defvar tramp-rpc--login-shell-cache (make-hash-table :test 'equal)
   "Cache of remote login shell keyed by connection-key.")
 
+(defconst tramp-rpc--generic-route-connection-properties
+  '("uname" "uid-integer" "uid-string" "gid-integer" "gid-string" "~")
+  "Generic TRAMP properties populated by tramp-rpc that depend on the route.
+Home-directory properties named ~USER are route-sensitive as well.")
+
+(defconst tramp-rpc--owned-route-connection-properties
+  '("tramp-rpc-login-path" "rpc-signal-strings"
+    " rpc-acl-enabled" " rpc-selinux-enabled" "tramp-rpc-system-info")
+  "Project-specific route-aware TRAMP connection properties.")
+
+(defvar tramp-rpc--route-property-access nil
+  "Non-nil while accessing an explicitly route-qualified TRAMP property.")
+
+(defun tramp-rpc--generic-route-connection-property-p (vec property)
+  "Return non-nil when PROPERTY on VEC needs route-aware TRAMP storage."
+  (and (tramp-file-name-p vec)
+       (or (string= (tramp-file-name-method vec) tramp-rpc-method)
+           ;; The sudo predicate consults TRAMP method/connection metadata.
+           ;; Suppress this advice during that probe to avoid recursive
+           ;; property qualification.
+           (let ((tramp-rpc--route-property-access t))
+             (tramp-rpc--sudo-file-name-p vec)))
+       (stringp property)
+       (or (member property tramp-rpc--generic-route-connection-properties)
+           (string-prefix-p "~" property))))
+
+(defun tramp-rpc--route-property-name (vec property)
+  "Return route-aware TRAMP connection PROPERTY name for VEC."
+  (format "%s:%s" property
+          (secure-hash 'sha1 (prin1-to-string (tramp-rpc--connection-key vec)))))
+
+(defun tramp-rpc--route-generic-connection-property-advice
+    (original vec property &rest args)
+  "Call ORIGINAL with route-aware PROPERTY when VEC is an RPC target.
+ARGS contains the remaining arguments of the advised TRAMP property function."
+  (apply original vec
+         (if (and (not tramp-rpc--route-property-access)
+                  (tramp-rpc--generic-route-connection-property-p vec property))
+             (tramp-rpc--route-property-name vec property)
+           property)
+         args))
+
+(defmacro tramp-rpc--with-route-connection-property (vec property &rest body)
+  "Evaluate BODY once and cache it under route-aware PROPERTY for VEC."
+  (declare (indent 2) (debug t))
+  `(let ((tramp-rpc--route-property-access t))
+     (with-tramp-connection-property
+         ,vec (tramp-rpc--route-property-name ,vec ,property)
+       ,@body)))
+
+(defun tramp-rpc--get-route-connection-property (vec property default)
+  "Return route-aware connection PROPERTY for VEC, or DEFAULT."
+  (let ((tramp-rpc--route-property-access t))
+    (tramp-get-connection-property
+     vec (tramp-rpc--route-property-name vec property) default)))
+
+(defun tramp-rpc--set-route-connection-property (vec property value)
+  "Set route-aware connection PROPERTY for VEC to VALUE."
+  (let ((tramp-rpc--route-property-access t))
+    (tramp-set-connection-property
+     vec (tramp-rpc--route-property-name vec property) value)))
+
+(defun tramp-rpc--flush-route-connection-property (vec property)
+  "Flush route-aware connection PROPERTY for VEC."
+  (let ((tramp-rpc--route-property-access t))
+    (tramp-flush-connection-property
+     vec (tramp-rpc--route-property-name vec property))))
+
+(defun tramp-rpc--flush-owned-route-connection-properties (vec)
+  "Flush every route-dependent connection property owned for VEC."
+  (dolist (property (append tramp-rpc--owned-route-connection-properties
+                            tramp-rpc--generic-route-connection-properties
+                            (when-let* ((user (tramp-file-name-user vec)))
+                              (unless (string-empty-p user)
+                                (list (concat "~" user))))))
+    (tramp-rpc--flush-route-connection-property vec property)))
+
 (defun tramp-rpc--environment-with (env key value)
   "Return ENV with KEY set to VALUE.
 ENV is an alist of (KEY . VALUE) string pairs.  If KEY already exists,
@@ -1046,7 +1123,7 @@ Uses `tramp-remote-path' by default.  A non-nil deprecated
 
 (defun tramp-rpc--cached-login-path (vec)
   "Return the login shell PATH directories for VEC, caching the result."
-  (with-tramp-connection-property vec "tramp-rpc-login-path"
+  (tramp-rpc--with-route-connection-property vec "tramp-rpc-login-path"
     (or (tramp-rpc--fetch-remote-exec-path vec) '())))
 
 (defun tramp-rpc--process-path-environment (vec)
@@ -1199,7 +1276,7 @@ Also clears the executable, variable `exec-path', and login-shell caches."
       (when-let* ((transport (plist-get current :process)))
         (tramp-rpc-protocol--clear-deferred-polls-for-target transport))
       (remhash key tramp-rpc--connections)
-      (tramp-flush-connection-property vec "tramp-rpc-login-path")
+      (tramp-rpc--flush-owned-route-connection-properties vec)
       (remhash key tramp-rpc--exec-path-cache)
       (remhash key tramp-rpc--login-shell-cache))))
 
@@ -1816,9 +1893,8 @@ Returns the connection plist.  Signals `remote-file-error' on failure."
           ;; this connection and `tramp-cleanup-connection' can offer it
           ;; interactively.  The value is the connection buffer, matching the
           ;; convention in `tramp-get-buffer'.
-          ;; Emacs 30.x uses "process-buffer"; newer TRAMP (31+) uses
-          ;; " connected".  Set both for compatibility.
-          (tramp-set-connection-property vec "process-buffer" buffer)
+          ;; Keep TRAMP's private leading-space connection properties.
+          (tramp-set-connection-property vec " process-buffer" buffer)
           (tramp-set-connection-property vec " connected" buffer)
 
           (tramp-rpc--get-connection vec))
@@ -1874,7 +1950,6 @@ probe can then interleave with RPC startup and corrupt the protocol stream."
   (let* ((bootstrap-vec (tramp-rpc-deploy--bootstrap-vec vec))
          (proc (tramp-get-connection-process bootstrap-vec)))
     (when (or (process-live-p proc)
-              (tramp-connection-property-p bootstrap-vec "process-buffer")
               (tramp-connection-property-p bootstrap-vec " process-buffer")
               (tramp-connection-property-p bootstrap-vec " connected"))
       ;; Preserve authentication and unrelated asynchronous processes while
@@ -4320,7 +4395,8 @@ PROPERTY must start with a space so TRAMP keeps it ephemeral.  Successful
 probes cache both enabled and disabled results.  Transport and RPC errors
 return nil without caching so a later operation can retry."
   (let* ((missing (make-symbol "missing"))
-         (cached (tramp-get-connection-property vec property missing)))
+         (cached (tramp-rpc--get-route-connection-property
+                  vec property missing)))
     (if (not (eq cached missing))
         cached
       (condition-case nil
@@ -4329,7 +4405,7 @@ return nil without caching so a later operation can retry."
                                             (args . ,args)
                                             (cwd . "/"))))
                  (enabled (zerop (alist-get 'exit_code result))))
-            (tramp-set-connection-property vec property enabled)
+            (tramp-rpc--set-route-connection-property vec property enabled)
             enabled)
         (error nil)))))
 
@@ -4903,7 +4979,8 @@ REPLACE non-nil replaces the accessible buffer contents."
 (defun tramp-rpc--cache-system-info (vec info)
   "Store system.info INFO for VEC and seed related TRAMP properties."
   (when info
-    (tramp-set-connection-property vec tramp-rpc--system-info-property info)
+    (tramp-rpc--set-route-connection-property
+     vec tramp-rpc--system-info-property info)
     ;; Store remote uname so `tramp-check-remote-uname' works.  The server
     ;; returns "linux" or "macos"; map to the kernel names tramp-sh expects.
     (when-let* ((os (alist-get 'os info)))
@@ -4932,7 +5009,8 @@ REPLACE non-nil replaces the accessible buffer contents."
 
 (defun tramp-rpc--cached-system-info (vec)
   "Return the system.info cached for VEC, or nil.  Never issues an RPC."
-  (tramp-get-connection-property vec tramp-rpc--system-info-property nil))
+  (tramp-rpc--get-route-connection-property
+   vec tramp-rpc--system-info-property nil))
 
 (defun tramp-rpc--system-info (vec)
   "Return cached system.info for VEC, fetching it at most once per connection."
@@ -4943,7 +5021,7 @@ REPLACE non-nil replaces the accessible buffer contents."
         ;; connection setup so a cold caller does not immediately send a second
         ;; identical RPC.
         (tramp-rpc--ensure-connection vec)
-        (or (tramp-get-connection-property
+        (or (tramp-rpc--get-route-connection-property
              vec tramp-rpc--system-info-property nil)
             (tramp-rpc--cache-system-info
              vec (tramp-rpc--call vec "system.info" nil))))))
@@ -5900,6 +5978,14 @@ cleanup of all connections has run."
 (defun tramp-rpc--install ()
   "Install TRAMP-RPC operations, advice, and lifecycle hooks."
   (tramp-rpc--install-core-external-operations)
+  (dolist (function '(tramp-get-connection-property
+                      tramp-set-connection-property
+                      tramp-flush-connection-property
+                      tramp-connection-property-p))
+    (unless (advice-member-p
+             #'tramp-rpc--route-generic-connection-property-advice function)
+      (advice-add function :around
+                  #'tramp-rpc--route-generic-connection-property-advice)))
   (tramp-rpc-handler-install)
   (tramp-rpc--after-load-integrations nil)
   (add-hook 'after-load-functions #'tramp-rpc--after-load-integrations)
@@ -5922,7 +6008,12 @@ Removes advice and cleans up async processes."
                      tramp-rpc-deploy tramp-rpc-protocol))
     (when (featurep feature)
       (unload-feature feature 'force)))
-  ;; Remove multi-hop hook and cleanup hooks.
+  ;; Remove multi-hop hook, property advice, and cleanup hooks.
+  (dolist (function '(tramp-get-connection-property
+                      tramp-set-connection-property
+                      tramp-flush-connection-property
+                      tramp-connection-property-p))
+    (advice-remove function #'tramp-rpc--route-generic-connection-property-advice))
   (remove-hook 'after-load-functions #'tramp-rpc--after-load-integrations)
   (remove-hook 'tramp-multi-hop-p-hook #'tramp-rpc-multi-hop-p)
   (remove-hook 'tramp-cleanup-connection-hook #'tramp-rpc-cleanup-connection)
