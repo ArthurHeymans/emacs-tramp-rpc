@@ -212,7 +212,7 @@ Returns the length as an integer, or nil if the BUFFER is too short."
 
 (defun tramp-rpc-protocol-try-read-message (buffer)
   "Try to read a complete message from BUFFER.
-BUFFER should the process buffer containing received data.  Returns a
+BUFFER should be the process buffer containing received data.  Returns a
 MESSAGE if a complete message is available, where MESSAGE is the decoded
 response plist.  Returns nil if no complete message yet."
   (with-current-buffer buffer
@@ -259,10 +259,6 @@ Returns a list where each element is either:
                         :data (alist-get 'data error-obj))
                 (alist-get 'result result-obj)))
             results-array)))
-
-;; ============================================================================
-;; Unload support
-;; ============================================================================
 
 (provide 'tramp-rpc-protocol)
 ;;; tramp-rpc-protocol.el ends here

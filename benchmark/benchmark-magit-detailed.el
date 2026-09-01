@@ -22,7 +22,7 @@
 ;; Silence byte-compiler warnings
 (declare-function tramp-rpc--call "tramp-rpc")
 (declare-function tramp-rpc--call-pipelined "tramp-rpc")
-(declare-function tramp-rpc-run-git-commands "tramp-rpc")
+
 (declare-function tramp-rpc-magit--prefetch-git-commands "tramp-rpc-magit")
 (declare-function tramp-rpc--decode-output "tramp-rpc")
 (declare-function tramp-rpc-magit-enable "tramp-rpc-magit")
@@ -42,9 +42,32 @@
 
 (defmacro tramp-rpc-magit-bench--time (&rest body)
   "Execute BODY and return elapsed time in seconds."
+  (declare (indent 0) (debug t))
   `(let ((start (current-time)))
      ,@body
      (float-time (time-subtract (current-time) start))))
+
+(defun tramp-rpc-magit-bench--run-git-commands (directory commands)
+  "Run git COMMANDS in DIRECTORY using pipelined RPC."
+  (with-parsed-tramp-file-name directory nil
+    (let* ((requests
+            (mapcar (lambda (args)
+                      (cons "process.run"
+                            `((cmd . "git")
+                              (args . ,(vconcat args))
+                              (cwd . ,(file-name-unquote localname)))))
+                    commands))
+           (results (tramp-rpc--call-pipelined v requests)))
+      (mapcar (lambda (result)
+                (if (plist-get result :error)
+                    (list :exit-code -1 :stdout ""
+                          :stderr (or (plist-get result :message) "RPC error"))
+                  (list :exit-code (alist-get 'exit_code result)
+                        :stdout (tramp-rpc--decode-output
+                                 (alist-get 'stdout result))
+                        :stderr (tramp-rpc--decode-output
+                                 (alist-get 'stderr result)))))
+              results))))
 
 (defvar tramp-rpc-magit-bench--process-file-log nil
   "Log of process-file calls during benchmarking.")
@@ -129,7 +152,8 @@
       ;; Time batched execution using new API
       (setq batch-time
             (tramp-rpc-magit-bench--time
-             (tramp-rpc-run-git-commands default-directory commands)))
+             (tramp-rpc-magit-bench--run-git-commands
+              default-directory commands)))
 
       (with-current-buffer (get-buffer-create "*Batching Comparison*")
         (erase-buffer)
