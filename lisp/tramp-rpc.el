@@ -242,12 +242,12 @@ This is called from `tramp-multi-hop-p-hook'."
   (when (fboundp 'tramp-remove-external-operation)
     (apply (symbol-function 'tramp-remove-external-operation) args)))
 
-(declare-function dired-compress-file "dired-aux")
 ;; These predicates are emitted inside the single autoload form above.  The
 ;; compiler does not discover nested definitions, so declare only those two
 ;; autoload-owned functions used by the full implementation below.
 (declare-function tramp-rpc--sudo-file-name-p "tramp-rpc")
 (declare-function tramp-rpc-multi-hop-p "tramp-rpc")
+(declare-function tramp-sh-handle-copy-file "tramp-sh" (&rest args))
 
 (defvar tramp-rpc--sudo-file-name-p-in-progress nil
   "Non-nil while checking hidden rpc+sudo proxy expansion.")
@@ -2799,19 +2799,12 @@ ELOOP errors to nil (the file effectively doesn't exist for stat)."
 
 (defun tramp-rpc--file-exists-cache-lookup (filename)
   "Return cached `file-exists-p' value for FILENAME, or `not-cached'.
-Unlike `tramp-rpc--cache-get', this preserves cached nil values."
+FILENAME is expanded before lookup.  Full cache inhibition bypasses the
+stored entry without purging it."
   (if (eq remote-file-name-inhibit-cache t)
       'not-cached
-    (let* ((expanded (expand-file-name filename))
-         (entry (gethash expanded tramp-rpc--file-exists-cache)))
-    (if (not entry)
-        'not-cached
-      (let ((timestamp (car entry))
-            (value (cdr entry)))
-        (if (tramp-rpc--cache-entry-valid-p timestamp)
-            value
-          (remhash expanded tramp-rpc--file-exists-cache)
-          'not-cached))))))
+    (tramp-rpc--cache-lookup
+     tramp-rpc--file-exists-cache (expand-file-name filename))))
 
 (defun tramp-rpc-handle-file-exists-p (filename)
   "Like `file-exists-p' for TRAMP-RPC files.
@@ -3590,9 +3583,6 @@ MESSAGE describes the error."
     (signal 'file-error
             (tramp-rpc--error-args
              operation "Too many levels of symbolic links" message filename data)))
-   ((= code tramp-rpc-protocol-error-io)
-    (signal 'remote-file-error
-            (tramp-rpc--error-args operation nil message filename data)))
    (t
     (signal 'remote-file-error
             (tramp-rpc--error-args operation nil message filename data)))))
@@ -3671,6 +3661,15 @@ PRESERVE-PERMISSIONS non-nil preserves file permissions."
         (tramp-flush-directory-properties v2 v2-localname)
         (tramp-rpc--invalidate-cache-for-path newname)))))
 
+(defun tramp-rpc--copy-directory-fallback
+    (dirname newname keep-date parents copy-contents)
+  "Run generic directory copy and invalidate only its source and destination."
+  (prog1
+      (tramp-handle-copy-directory
+       dirname newname keep-date parents copy-contents)
+    (tramp-rpc--invalidate-cache-for-path dirname)
+    (tramp-rpc--invalidate-cache-for-subtree newname)))
+
 (cl-defun tramp-rpc-handle-copy-directory
     (dirname newname &optional keep-date parents copy-contents)
   "Like `copy-directory' for TRAMP-RPC files.
@@ -3729,10 +3728,10 @@ COPY-CONTENTS non-nil copies directory contents."
                  (stats (tramp-rpc--call-batch
                          v1
                          `(("file.stat" . ,(append (tramp-rpc--encode-path src-localname)
-                                                    '((lstat . t))))
+                                                   '((lstat . t))))
                            ("file.stat" . ,(tramp-rpc--encode-path src-localname))
                            ("file.stat" . ,(append (tramp-rpc--encode-path actual-dest-localname)
-                                                    '((lstat . t))))
+                                                   '((lstat . t))))
                            ("file.stat" . ,(tramp-rpc--encode-path actual-dest-localname))
                            ("file.stat" . ,(tramp-rpc--encode-path parent-localname)))))
                  (source-lstat (tramp-rpc--batch-result-or-signal
@@ -3750,17 +3749,15 @@ COPY-CONTENTS non-nil copies directory contents."
             (if (or source-symlink-target
                     (and copy-directory-create-symlink
                          (equal source-lstat-type "symlink")))
-                (prog1
-                    (tramp-rpc--call
-                     v2 "file.make_symlink"
-                     `((target . ,(tramp-rpc--path-to-bin
-                                   (or source-symlink-target
-                                       (tramp-rpc--decode-string
-                                        (alist-get 'link_target source-lstat)))))
-                       (link_path . ,(tramp-rpc--path-to-bin symlink-dest-localname))))
-                  (tramp-rpc-clear-all-caches))
+                (tramp-rpc--call
+                 v2 "file.make_symlink"
+                 `((target . ,(tramp-rpc--path-to-bin
+                               (or source-symlink-target
+                                   (tramp-rpc--decode-string
+                                    (alist-get 'link_target source-lstat)))))
+                   (link_path . ,(tramp-rpc--path-to-bin symlink-dest-localname))))
               (let* ((source-stat (tramp-rpc--batch-result-or-signal
-                                    "file.stat" dirname source-stat-result))
+                                   "file.stat" dirname source-stat-result))
                      (actual-dest-lstat
                       (tramp-rpc--batch-result-or-signal
                        "file.stat" actual-dest actual-dest-lstat-result))
@@ -3801,7 +3798,7 @@ COPY-CONTENTS non-nil copies directory contents."
                     (signal 'file-error (list "Not a directory" parent))))
                 (when (zerop (logand (or (alist-get 'mode source-stat) 0) #o200))
                   (cl-return-from tramp-rpc-handle-copy-directory
-                    (tramp-handle-copy-directory
+                    (tramp-rpc--copy-directory-fallback
                      dirname newname keep-date parents copy-contents)))
                 (tramp-rpc--call v1 "file.copy"
                                  `((src . ,(tramp-rpc--path-to-bytes src-localname))
@@ -3834,7 +3831,8 @@ COPY-CONTENTS non-nil copies directory contents."
               (tramp-rpc--invalidate-cache-for-path dirname)
               (tramp-rpc--invalidate-cache-for-subtree
                (tramp-make-tramp-file-name v2 (file-name-quote copied-localname)))))))
-    (tramp-handle-copy-directory dirname newname keep-date parents copy-contents)))
+    (tramp-rpc--copy-directory-fallback
+     dirname newname keep-date parents copy-contents)))
 
 (cl-defun tramp-rpc-handle-copy-file
     (filename newname &optional ok-if-already-exists keep-time
@@ -3848,6 +3846,16 @@ PRESERVE-UID-GID requests ownership preservation on generic fallback paths.
 PRESERVE-PERMISSIONS non-nil preserves file permissions."
   (setq filename (expand-file-name filename)
         newname (expand-file-name newname))
+  ;; The RPC copy primitive cannot reliably change ownership as an
+  ;; unprivileged user.  Preserve upstream behavior instead of silently
+  ;; dropping PRESERVE-UID-GID.
+  (when (and preserve-uid-gid
+             (or (tramp-tramp-file-p filename)
+                 (tramp-tramp-file-p newname)))
+    (cl-return-from tramp-rpc-handle-copy-file
+      (tramp-sh-handle-copy-file
+       filename newname ok-if-already-exists keep-time
+       preserve-uid-gid preserve-permissions)))
   ;; Fast path for same-remote copies: batch source/destination stats, then do
   ;; the server-side copy.  This avoids the generic preflight predicates each
   ;; costing their own network round-trip.
@@ -3930,7 +3938,7 @@ PRESERVE-PERMISSIONS non-nil preserves file permissions."
                                  (file-attributes filename))))
       (when preserve-permissions
         (set-file-extended-attributes newname (file-extended-attributes
-					      filename))))
+					       filename))))
      ;; Neither remote - should not reach this handler, but be safe.
      (t
       (tramp-run-real-handler
@@ -4510,94 +4518,56 @@ Returns t on success, nil on failure."
         (zerop (alist-get 'exit_code result))))))
 
 ;; ============================================================================
-;; Dired operations
-;; ============================================================================
-
-(defun tramp-rpc-handle-dired-compress-file (file)
-  "Like `dired-compress-file' for TRAMP-RPC files.
-FILE is the file name being handled."
-  (tramp-run-real-handler #'dired-compress-file (list file)))
-
-;; ============================================================================
 ;; Process operations
 ;; ============================================================================
 
-(defun tramp-rpc-run-git-commands (directory commands)
-  "Run multiple git COMMANDS in DIRECTORY using pipelined RPC.
-COMMANDS is a list of lists, where each sublist is arguments to git.
-For example: ((\"rev-parse\" \"HEAD\") (\"status\" \"--porcelain\"))
+(defun tramp-rpc--route-process-file-stream (destination output &optional file-p)
+  "Route OUTPUT to DESTINATION.
+When FILE-P is non-nil, a string DESTINATION names a file; otherwise it names
+an Emacs buffer, matching `call-process' and `process-file'."
+  (cond
+   ((null destination) nil)
+   ((eq destination t) (insert output))
+   ((bufferp destination)
+    (with-current-buffer destination (insert output)))
+   ((and (stringp destination) file-p)
+    (with-temp-file destination (insert output)))
+   ((stringp destination)
+    (with-current-buffer (get-buffer-create destination) (insert output)))))
 
-Returns a list of plists, each containing:
-  :exit-code - the exit code of the command
-  :stdout    - standard output as a string
-  :stderr    - standard error as a string
-
-This is much faster than running each command sequentially over TRAMP
-because all commands are sent in a single network round-trip."
-  (with-parsed-tramp-file-name directory nil
-    (setq localname (file-name-unquote localname))
-    (let* ((requests
-            (mapcar (lambda (args)
-                      (cons "process.run"
-                            `((cmd . "git")
-                              (args . ,(vconcat args))
-                              (cwd . ,localname))))
-                    commands))
-           (results (tramp-rpc--call-pipelined v requests)))
-      ;; Convert results to a more convenient format
-      (mapcar (lambda (result)
-                (if (plist-get result :error)
-                    (list :exit-code -1
-                          :stdout ""
-                          :stderr (or (plist-get result :message) "RPC error"))
-                  (list :exit-code (alist-get 'exit_code result)
-                        :stdout (tramp-rpc--decode-output
-                                 (alist-get 'stdout result))
-                        :stderr (tramp-rpc--decode-output
-                                 (alist-get 'stderr result)))))
-              results))))
+(defun tramp-rpc--process-file-merge-output-p (destination)
+  "Return non-nil when DESTINATION requires ordered combined output."
+  (or (not (consp destination))
+      (eq (car destination) :file)
+      (eq (cadr destination) t)))
 
 (defun tramp-rpc--route-process-file-output (destination stdout &optional stderr)
   "Route `process-file' STDOUT and STDERR according to DESTINATION.
-DESTINATION follows the `process-file' convention:
-  nil       - discard
-  t         - insert into current buffer
-  string    - write to file
-  buffer    - insert into buffer
-  (stdout-dest . stderr-dest) - cons for separate handling"
-  (cond
-   ((null destination) nil)
-   ((eq destination t)
-    (insert stdout))
-   ((stringp destination)
-    (with-temp-file destination
-      (insert stdout)))
-   ((bufferp destination)
-    (with-current-buffer destination
-      (insert stdout)))
-   ((consp destination)
-    (let ((stdout-dest (car destination))
-          (stderr-dest (cadr destination)))
-      (when stdout-dest
-        (cond
-         ((eq stdout-dest t) (insert stdout))
-         ((stringp stdout-dest)
-          (with-temp-file stdout-dest (insert stdout)))
-         ((bufferp stdout-dest)
-          (with-current-buffer stdout-dest (insert stdout)))))
-      (when (and stderr-dest stderr)
-        (cond
-         ((stringp stderr-dest)
-          (with-temp-file stderr-dest (insert stderr)))
-         ((bufferp stderr-dest)
-          (with-current-buffer stderr-dest (insert stderr)))))))))
+DESTINATION follows the `process-file' convention: nil discards output; t,
+a buffer, or a buffer name receives combined output; (:file FILE) writes
+combined output to FILE; and (STDOUT-DEST STDERR-DEST) separates the streams.
+A t STDERR-DEST mixes stderr into STDOUT-DEST."
+  (let ((combined (concat stdout (or stderr ""))))
+    (cond
+     ((and (consp destination) (eq (car destination) :file))
+      (tramp-rpc--route-process-file-stream (cadr destination) combined t))
+     ((consp destination)
+      (let ((stdout-destination (car destination))
+            (stderr-destination (cadr destination)))
+        (if (eq stderr-destination t)
+            (tramp-rpc--route-process-file-stream stdout-destination combined)
+          (tramp-rpc--route-process-file-stream stdout-destination stdout)
+          (when stderr
+            (tramp-rpc--route-process-file-stream stderr-destination stderr t)))))
+     (t
+      (tramp-rpc--route-process-file-stream destination combined)))))
 
 (defun tramp-rpc--get-signal-strings (vec)
   "Strings to return by `process-file' in case of signals on VEC.
 Runs `kill -l' on the remote host to get signal names, then maps
 signal numbers to human-readable strings like \"Interrupt\" or
 \"Signal 2\".  The result is cached per connection."
-  (with-tramp-connection-property vec "rpc-signal-strings"
+  (tramp-rpc--with-route-connection-property vec "rpc-signal-strings"
     (let* ((result (tramp-rpc--call vec "process.run"
                                     `((cmd . "/bin/sh")
                                       (args . ["-c" "kill -l"])
@@ -4665,88 +4635,88 @@ ARGS contains the original function arguments."
                (env (tramp-rpc--process-environment
                      v localname (equal program shell-file-name)))
                (stdin-content (when (and infile (not (eq infile t)))
-                                 (with-temp-buffer
-                                   (set-buffer-multibyte nil)
-                                   (insert-file-contents-literally infile)
-                                   (buffer-string))))
-               dispatched)
-          ;; Once dispatch is attempted, clear after every exit when Emacs says
-          ;; the command may have side effects.  This includes decoding,
-          ;; prefetch, and output-routing failures, and prevents metadata cached
-          ;; while the command ran from surviving it.
+                                (with-temp-buffer
+                                  (set-buffer-multibyte nil)
+                                  (insert-file-contents-literally infile)
+                                  (buffer-string)))))
+          ;; Clear after every RPC exit when Emacs says the command may have side
+          ;; effects.  This includes decoding, prefetch, and output-routing
+          ;; failures, and prevents metadata cached while the command ran from
+          ;; surviving it.
           (unwind-protect
-              (progn
-                (setq dispatched t)
-                (let ((result
-                       (condition-case err
-                           (tramp-rpc--call
-                            v "process.run"
-                            `((cmd . ,program)
-                              (args . ,(vconcat args))
-                              (cwd . ,localname)
-                              (env . ,env)
-                              ,@(when stdin-content
-                                  `((stdin . ,stdin-content)))))
-                         ;; The server marks confirmed spawn ENOENT as
-                         ;; `file-missing'.  Shell-based TRAMP returns status
-                         ;; 127 and leaves the diagnostic on stderr, so preserve
-                         ;; both parts of that contract for split destinations.
-                         (file-missing
-                          (tramp-rpc--route-process-file-output
-                           destination "" (concat (error-message-string err) "\n"))
-                          127))))
-                  (if (eq result 127)
-                      127
-                    (if result
-                        (let ((exit-code (alist-get 'exit_code result))
-                              (stdout (tramp-rpc--decode-output
-                                       (alist-get 'stdout result)))
-                              (stderr (tramp-rpc--decode-output
-                                       (alist-get 'stderr result))))
+              (let ((result
+                     (condition-case err
+                         (tramp-rpc--call
+                          v "process.run"
+                          `((cmd . ,program)
+                            (args . ,(vconcat args))
+                            (cwd . ,localname)
+                            (env . ,env)
+                            ,@(when (tramp-rpc--process-file-merge-output-p
+                                     destination)
+                                '((merge_stderr . t)))
+                            ,@(when stdin-content
+                                `((stdin . ,stdin-content)))))
+                       ;; The server marks confirmed spawn ENOENT as
+                       ;; `file-missing'.  Shell-based TRAMP returns status
+                       ;; 127 and leaves the diagnostic on stderr, so preserve
+                       ;; both parts of that contract for split destinations.
+                       (file-missing
+                        (tramp-rpc--route-process-file-output
+                         destination "" (concat (error-message-string err) "\n"))
+                        127))))
+                (if (eq result 127)
+                    127
+                  (if result
+                      (let ((exit-code (alist-get 'exit_code result))
+                            (stdout (tramp-rpc--decode-output
+                                     (alist-get 'stdout result)))
+                            (stderr (tramp-rpc--decode-output
+                                     (alist-get 'stderr result))))
 
-                          ;; Memoize uncached Magit git calls made during lazy
-                          ;; remote status expansion.
-                          (when (null infile)
-                            (tramp-rpc-magit--process-cache-store
-                             program args exit-code stdout))
+                        ;; Memoize uncached Magit git calls made during lazy
+                        ;; remote status expansion.
+                        (when (null infile)
+                          (tramp-rpc-magit--process-cache-store
+                           program args exit-code stdout))
 
-                          ;; Let the real `update-index --refresh' run, then
-                          ;; build the read snapshot used by later Magit calls.
-                          (when (and
-                                 (null infile)
-                                 (bound-and-true-p
-                                  tramp-rpc-magit--allow-process-cache)
-                                 (or (string-suffix-p "/git" program)
-                                     (string= "git" program))
-                                 (= exit-code 0)
-                                 (tramp-rpc-magit--git-cache-safe-environment-p))
-                            (let ((core-args
-                                   (tramp-rpc-magit--strip-git-prefix-args args)))
-                              (when (and
-                                     (equal (car core-args) "update-index")
-                                     (member "--refresh" core-args))
-                                (tramp-rpc-magit--clear-status-cache-for-connection v)
-                                (tramp-rpc-magit--prefetch default-directory))))
-
-                          (tramp-rpc--route-process-file-output
-                           destination stdout stderr)
-
-                          ;; Handle signal strings when requested by Emacs.
-                          (if (and
+                        ;; Let the real `update-index --refresh' run, then
+                        ;; build the read snapshot used by later Magit calls.
+                        (when (and
+                               (null infile)
                                (bound-and-true-p
-                                process-file-return-signal-string)
-                               (natnump exit-code) (>= exit-code 128))
-                              (let ((strings (tramp-rpc--get-signal-strings v)))
-                                (aref strings (- exit-code 128)))
-                            exit-code))
-                      ;; A successful RPC result is always non-nil.
-                      (signal 'remote-file-error
-                              (list "Empty process.run response"))))))
+                                tramp-rpc-magit--allow-process-cache)
+                               (or (string-suffix-p "/git" program)
+                                   (string= "git" program))
+                               (= exit-code 0)
+                               (tramp-rpc-magit--git-cache-safe-environment-p))
+                          (let ((core-args
+                                 (tramp-rpc-magit--strip-git-prefix-args args)))
+                            (when (and
+                                   (equal (car core-args) "update-index")
+                                   (member "--refresh" core-args))
+                              (tramp-rpc-magit--clear-status-cache-for-connection v)
+                              (tramp-rpc-magit--prefetch default-directory))))
+
+                        (tramp-rpc--route-process-file-output
+                         destination stdout stderr)
+
+                        ;; Handle signal strings when requested by Emacs.
+                        (if (and
+                             (bound-and-true-p
+                              process-file-return-signal-string)
+                             (natnump exit-code) (>= exit-code 128))
+                            (let ((strings (tramp-rpc--get-signal-strings v)))
+                              (aref strings (- exit-code 128)))
+                          exit-code))
+                    ;; A successful RPC result is always non-nil.
+                    (signal 'remote-file-error
+                            (list "Empty process.run response")))))
             ;; Any external command may mutate the filesystem, and watcher
             ;; delivery is asynchronous.  Honor Emacs' conservative default;
             ;; callers with a proven read-only scope can bind
             ;; `process-file-side-effects' to nil.
-            (when (and dispatched process-file-side-effects)
+            (when process-file-side-effects
               (tramp-rpc--clear-file-caches-for-connection v))))))))
 
 (defun tramp-rpc-handle-vc-registered (file)
@@ -5363,23 +5333,15 @@ the empty string."
     (when (hash-table-p tramp-rpc--file-notify-descriptors)
       (maphash
        (lambda (_descriptor data)
-         (let* ((watch-key (plist-get data :watch-key))
-                (watch-entry (and watch-key
-                                  (gethash watch-key
-                                           tramp-rpc--file-notify-watch-counts)))
-                (canonical-directory
-                 (or (plist-get watch-entry :canonical-directory)
-                     (plist-get data :canonical-directory)))
-                (directory (plist-get data :directory))
-                (relative (and canonical-directory directory
-                               (tramp-rpc--file-notify-relative-name
-                                canonical-directory file-name))))
-           (when relative
-             (let ((alias (if (string-empty-p relative)
-                              (directory-file-name directory)
-                            (expand-file-name relative directory))))
-               (unless (string= alias file-name)
-                 (cl-pushnew alias aliases :test #'string=))))))
+         (when-let* ((canonical-directory
+                      (tramp-rpc--file-notify-canonical-directory data))
+                     ((tramp-rpc--file-notify-relative-name
+                       canonical-directory file-name))
+                     (alias
+                      (tramp-rpc--file-notify-original-spelling
+                       data file-name))
+                     ((not (string= alias file-name))))
+           (cl-pushnew alias aliases :test #'string=)))
        tramp-rpc--file-notify-descriptors))
     aliases))
 
@@ -5725,7 +5687,7 @@ Also controls process exit detection latency."
     (file-name-all-completions . tramp-rpc-handle-file-name-all-completions)
     (make-directory . tramp-rpc-handle-make-directory)
     (delete-directory . tramp-rpc-handle-delete-directory)
-    (dired-compress-file . tramp-rpc-handle-dired-compress-file)
+
     (insert-directory . tramp-rpc-handle-insert-directory)
     (copy-directory . tramp-rpc-handle-copy-directory)
 
