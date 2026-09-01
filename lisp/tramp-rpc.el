@@ -530,12 +530,25 @@ The value must be a positive number."
   :type 'number
   :group 'tramp-rpc)
 
+(defcustom tramp-rpc-poll-interval 0.1
+  "Seconds between synchronous RPC response polls.
+The value must be a positive number."
+  :type 'number
+  :group 'tramp-rpc)
+
 (defun tramp-rpc--configured-call-timeout ()
   "Return the validated synchronous RPC call timeout."
   (unless (and (numberp tramp-rpc-call-timeout)
                (> tramp-rpc-call-timeout 0))
     (user-error "`tramp-rpc-call-timeout' must be a positive number"))
   tramp-rpc-call-timeout)
+
+(defun tramp-rpc--configured-poll-interval ()
+  "Return the validated synchronous RPC poll interval."
+  (unless (and (numberp tramp-rpc-poll-interval)
+               (> tramp-rpc-poll-interval 0))
+    (user-error "`tramp-rpc-poll-interval' must be a positive number"))
+  tramp-rpc-poll-interval)
 
 (defcustom tramp-rpc-use-controlmaster t
   "Whether to use SSH ControlMaster for connection sharing.
@@ -2195,7 +2208,8 @@ Returns the request ID."
 CONNECTION, when non-nil, is the captured connection generation to use.
 Returns the result or signals an error."
   (tramp-rpc--call-with-timeout
-   vec method params (tramp-rpc--configured-call-timeout) 0.1 connection))
+   vec method params (tramp-rpc--configured-call-timeout)
+   (tramp-rpc--configured-poll-interval) connection))
 
 (defun tramp-rpc--call-fast (vec method params)
   "Call METHOD with PARAMS with shorter timeout for low-latency ops.
@@ -2271,8 +2285,52 @@ connection's filter, and therefore no nested wait, can run inside BODY."
                           (eq timer (plist-get info timer-key))))
                (timer-activate timer))))))))
 
+(defun tramp-rpc--wait-for-response-ids
+    (conn process buffer ids timeout poll-interval label)
+  "Wait for IDS from PROCESS and return response state.
+CONN supplies the SSH stderr stream, BUFFER holds decoded responses, TIMEOUT
+is a wall-clock limit, and POLL-INTERVAL controls output polling.  LABEL is
+used only for debug messages.  The returned plist contains :responses,
+:remaining, :elapsed, and :process-live."
+  (let ((start-time (float-time))
+        (deadline (+ (float-time) timeout))
+        (remaining (copy-sequence ids))
+        (responses (make-hash-table :test 'eql)))
+    (cl-labels
+        ((collect ()
+           (dolist (id (copy-sequence remaining))
+             (when-let* ((response
+                          (tramp-rpc--find-response-by-id id process)))
+               (puthash id response responses)
+               (setq remaining (delete id remaining))))))
+      (with-current-buffer buffer
+        (collect)
+        (while (and remaining
+                    (< (float-time) deadline)
+                    (process-live-p process))
+          (if (not (tramp-rpc--process-accessible-p process))
+              (if non-essential
+                  (progn
+                    (tramp-rpc--debug "LOCKED-%s (non-essential, bailing)" label)
+                    (throw 'non-essential 'non-essential))
+                (sleep-for poll-interval)
+                (collect))
+            (if (tramp-rpc--with-suspended-timers-preserving-process-timers
+                  (with-local-quit
+                    (tramp-rpc--drain-connection-stderr conn)
+                    (accept-process-output process poll-interval nil t)
+                    (tramp-rpc--drain-connection-stderr conn)
+                    t))
+                (collect)
+              (tramp-rpc--debug "QUIT-%s (user interrupted)" label)
+              (keyboard-quit))))))
+    (list :responses responses
+          :remaining remaining
+          :elapsed (- (float-time) start-time)
+          :process-live (process-live-p process))))
+
 (defun tramp-rpc--call-with-timeout (vec method params total-timeout poll-interval
-                                          &optional connection)
+                                         &optional connection)
   "Call METHOD with PARAMS on the RPC server for VEC.
 TOTAL-TIMEOUT is maximum seconds to wait.
 POLL-INTERVAL is seconds between `accept-process-output' checks.
@@ -2296,66 +2354,18 @@ Returns the result or signals an error."
       ;; Send request (binary data with length prefix, no newline)
       (process-send-string process request)
 
-      ;; Wait for response with matching ID using wall-clock deadline.
-    ;; NOTE: We use (float-time) instead of decrementing a counter because
-    ;; accept-process-output can return early (e.g. async process output
-    ;; arrives), and decrementing by poll-interval each iteration would
-    ;; cause premature timeouts when there is concurrent I/O traffic.
-    (with-current-buffer buffer
-      (let ((start-time (float-time))
-            (deadline (+ (float-time) total-timeout))
-            response)
-        ;; A transport sentinel may have injected an error before the loop.
-        (setq response (tramp-rpc--find-response-by-id expected-id process))
-        ;; Wait for a response with the correct ID
-        (while (and (not response)
-                    (< (float-time) deadline)
-                    (process-live-p process))
-          ;; Check if process is locked to another thread before trying to accept
-          (if (not (tramp-rpc--process-accessible-p process))
-              (progn
-                ;; Process locked - if non-essential, bail out; otherwise sleep and retry
-                (if non-essential
-                    (progn
-                      (tramp-rpc--debug "LOCKED id=%s method=%s (non-essential, bailing)"
-                                       expected-id method)
-                      (throw 'non-essential 'non-essential))
-                  ;; Sleep briefly - other thread may receive our response
-                  (sleep-for poll-interval)
-                  ;; Check if other thread already got our response
-                  (setq response (tramp-rpc--find-response-by-id expected-id process))))
-            ;; Process is accessible - proceed with accept-process-output
-            ;; Use same pattern as tramp-accept-process-output:
-            ;; - poll-interval timeout to avoid spinning
-            ;; - JUST-THIS-ONE=t to only accept from this process (Bug#12145)
-            ;; - with-local-quit to allow C-g, returns t on success
-            ;; - Propagate quit if user pressed C-g
-            ;; - suspended timers to prevent deferred process sentinels
-            ;;   (scheduled via run-at-time 0) from firing inside
-            ;;   accept-process-output and blocking this call.  The
-            ;;   sentinels will run when control returns to the command
-            ;;   loop.  (Mirrors tramp-accept-process-output.)  The
-            ;;   wrapper additionally keeps process timers this wait
-            ;;   scheduled, which the plain suspension would discard.
-            (if (tramp-rpc--with-suspended-timers-preserving-process-timers
-                  (with-local-quit
-                    (tramp-rpc--drain-connection-stderr conn)
-                    (accept-process-output process poll-interval nil t)
-                    (tramp-rpc--drain-connection-stderr conn)
-                    t))
-                ;; Check if our response arrived in pending responses
-                (setq response (tramp-rpc--find-response-by-id expected-id process))
-              ;; User quit - propagate it
-              (tramp-rpc--debug "QUIT id=%s (user interrupted)" expected-id)
-              (keyboard-quit))))
+      (let* ((state (tramp-rpc--wait-for-response-ids
+                     conn process buffer (list expected-id) total-timeout
+                     poll-interval "CALL"))
+             (response (gethash expected-id (plist-get state :responses))))
 
         (unless response
           (if (or (process-get process :tramp-rpc-transport-dead)
-                  (not (process-live-p process)))
+                  (not (plist-get state :process-live)))
               (signal 'remote-file-error
                       (list (format "RPC transport disconnected from %s"
                                     (tramp-file-name-host vec))))
-            (let ((elapsed (- (float-time) start-time))
+            (let ((elapsed (plist-get state :elapsed))
                   (stderr-tail (tramp-rpc--connection-stderr-tail conn)))
               (tramp-rpc--debug
                "TIMEOUT id=%s method=%s elapsed=%.1fs buffer-size=%d process-live=%s stderr-tail=%S"
@@ -2379,9 +2389,9 @@ Returns the result or signals an error."
                   (data (tramp-rpc-protocol-error-data response))
                   (os-errno (tramp-rpc-protocol-error-errno response)))
               (tramp-rpc--debug "ERROR id=%s code=%s msg=%s errno=%s"
-                               expected-id code msg os-errno)
+				expected-id code msg os-errno)
               (tramp-rpc--signal-rpc-error "RPC" msg code os-errno nil data))
-          (plist-get response :result)))))))
+          (plist-get response :result))))))
 
 (defun tramp-rpc--call-batch (vec requests)
   "Execute multiple RPC REQUESTS in a single round-trip for VEC.
@@ -2399,6 +2409,7 @@ Returns:
    ((type . \"file\") ...)    ; file.stat result
    (:error -32001 :message \"...\"))  ; or error plist"
   (let* ((timeout (tramp-rpc--configured-call-timeout))
+         (poll-interval (tramp-rpc--configured-poll-interval))
          (conn (tramp-rpc--ensure-connection vec))
          (process (plist-get conn :process))
          (buffer (plist-get conn :buffer))
@@ -2407,59 +2418,26 @@ Returns:
                             requests)))
          (expected-id (car id-and-request))
          (request (cdr id-and-request)))
-
     (tramp-rpc--debug "SEND-BATCH id=%s count=%d" expected-id (length requests))
     (tramp-rpc--track-pending-request process expected-id)
-
     (tramp-rpc--with-pending-requests
         (process buffer (list expected-id) vec "Batch RPC interrupted\n")
-      ;; Send batch request (binary data with length prefix, no newline)
       (process-send-string process request)
-
-      ;; Wait for response with matching ID using wall-clock deadline
-    (with-current-buffer buffer
-      (let ((start-time (float-time))
-            (deadline (+ (float-time) timeout))
-            response)
-        ;; A transport sentinel may have injected an error before the loop.
-        (setq response (tramp-rpc--find-response-by-id expected-id process))
-        (while (and (not response)
-                    (< (float-time) deadline)
-                    (process-live-p process))
-          ;; Check if process is locked to another thread before trying to accept
-          (if (not (tramp-rpc--process-accessible-p process))
-              ;; Process locked - if non-essential, bail out; otherwise sleep and retry
-              (if non-essential
-                  (progn
-                    (tramp-rpc--debug "LOCKED-BATCH id=%s (non-essential, bailing)" expected-id)
-                    (throw 'non-essential 'non-essential))
-                ;; Sleep briefly - other thread may receive our response
-                (sleep-for 0.1)
-                ;; Check if other thread already got our response
-                (setq response (tramp-rpc--find-response-by-id expected-id process)))
-            ;; Process is accessible
-            (if (tramp-rpc--with-suspended-timers-preserving-process-timers
-                  (with-local-quit
-                    (tramp-rpc--drain-connection-stderr conn)
-                    (accept-process-output process 0.1 nil t)
-                    (tramp-rpc--drain-connection-stderr conn)
-                    t))
-                ;; Check if our response arrived in pending responses
-                (setq response (tramp-rpc--find-response-by-id expected-id process))
-              (tramp-rpc--debug "QUIT-BATCH id=%s (user interrupted)" expected-id)
-              (keyboard-quit))))
-
+      (let* ((state (tramp-rpc--wait-for-response-ids
+                     conn process buffer (list expected-id) timeout
+                     poll-interval "BATCH"))
+             (response (gethash expected-id (plist-get state :responses))))
         (unless response
           (if (or (process-get process :tramp-rpc-transport-dead)
-                  (not (process-live-p process)))
+                  (not (plist-get state :process-live)))
               (signal 'remote-file-error
                       (list (format "RPC transport disconnected from %s"
                                     (tramp-file-name-host vec))))
-            (let ((elapsed (- (float-time) start-time))
+            (let ((elapsed (plist-get state :elapsed))
                   (stderr-tail (tramp-rpc--connection-stderr-tail conn)))
               (tramp-rpc--debug
                "TIMEOUT-BATCH id=%s elapsed=%.1fs buffer-size=%d process-live=%s stderr-tail=%S"
-               expected-id elapsed (buffer-size) (process-live-p process)
+               expected-id elapsed (buffer-size) (plist-get state :process-live)
                stderr-tail)
               (tramp-rpc--invalidate-timed-out-connection
                process vec "Batch RPC timeout\n")
@@ -2471,17 +2449,16 @@ Returns:
                        (tramp-file-name-host vec) expected-id elapsed)
                       (when stderr-tail
                         (format "; SSH stderr: %s" stderr-tail))))))))
-
         (tramp-rpc--debug "RECV-BATCH id=%s (found)" expected-id)
         (if (tramp-rpc-protocol-error-p response)
             (progn
               (tramp-rpc--debug "ERROR-BATCH id=%s msg=%s"
-                               expected-id (tramp-rpc-protocol-error-message response))
-              (signal
-	       'remote-file-error
-	       (list "Batch RPC error"
-                     (tramp-rpc-protocol-error-message response))))
-          (tramp-rpc-protocol-decode-batch-response response)))))))
+                                expected-id
+                                (tramp-rpc-protocol-error-message response))
+              (signal 'remote-file-error
+		      (list "Batch RPC error"
+			    (tramp-rpc-protocol-error-message response))))
+          (tramp-rpc-protocol-decode-batch-response response))))))
 
 ;; ============================================================================
 ;; Request pipelining support
@@ -2530,77 +2507,38 @@ TIMEOUT is the maximum time to wait in seconds.
 When nil, `tramp-rpc-call-timeout' is used.  CONNECTION, when non-nil, is the
 captured connection generation to use."
   (let* ((timeout (or timeout (tramp-rpc--configured-call-timeout)))
+         (poll-interval (tramp-rpc--configured-poll-interval))
          (conn (or connection (tramp-rpc--ensure-connection vec)))
          (process (plist-get conn :process))
-         (buffer (plist-get conn :buffer))
-         (deadline (+ (float-time) timeout))
-         (remaining-ids (copy-sequence ids))
-         (responses (make-hash-table :test 'eql)))
+         (buffer (plist-get conn :buffer)))
     (tramp-rpc--debug "RECV-PIPE waiting for %d responses: %S" (length ids) ids)
     (tramp-rpc--with-pending-requests
         (process buffer ids vec "Pipelined RPC interrupted\n")
-      (progn
-          (with-current-buffer buffer
-            ;; Consume transport-death errors before checking process status.
-            (dolist (id remaining-ids)
-              (let ((response (tramp-rpc--find-response-by-id id process)))
-                (when response
-                  (puthash id response responses)
-                  (setq remaining-ids (delete id remaining-ids)))))
-            (while (and remaining-ids
-                  (< (float-time) deadline)
-                  (process-live-p process))
-        ;; Check if process is locked to another thread before trying to accept
-        (if (not (tramp-rpc--process-accessible-p process))
-            ;; Process locked - if non-essential, bail out; otherwise sleep and retry
-            (if non-essential
-                (progn
-                  (tramp-rpc--debug "LOCKED-PIPE (non-essential, bailing)")
-                  (throw 'non-essential 'non-essential))
-              ;; Sleep briefly - other thread may receive our responses
-              (sleep-for 0.1)
-              ;; Check if other thread already got any of our responses
-              (dolist (id remaining-ids)
-                (let ((response (tramp-rpc--find-response-by-id id process)))
-                  (when response
-                    (tramp-rpc--debug "RECV-PIPE found id=%s (after sleep)" id)
-                    (puthash id response responses)
-                    (setq remaining-ids (delete id remaining-ids))))))
-          ;; Process is accessible
-          (if (tramp-rpc--with-suspended-timers-preserving-process-timers
-                (with-local-quit
-                  (tramp-rpc--drain-connection-stderr conn)
-                  (accept-process-output process 0.1 nil t)
-                  (tramp-rpc--drain-connection-stderr conn)
-                  t))
-              ;; Check for each remaining ID in pending responses
-              (dolist (id remaining-ids)
-                (let ((response (tramp-rpc--find-response-by-id id process)))
-                  (when response
-                    (tramp-rpc--debug "RECV-PIPE found id=%s" id)
-                    ;; Store response by ID
-                    (puthash id response responses)
-                    ;; Remove from remaining
-                    (setq remaining-ids (delete id remaining-ids)))))
-            (tramp-rpc--debug "RECV-PIPE quit (user interrupted)")
-            (keyboard-quit)))))
-          (when remaining-ids
-            (tramp-rpc--debug "RECV-PIPE missing ids: %S" remaining-ids)
-            (let ((process-live (process-live-p process)))
-              (when process-live
-                (tramp-rpc--invalidate-timed-out-connection
-                 process vec "Pipelined RPC timeout\n"))
-              (signal
-               'remote-file-error
-               (list (if process-live
-                         (format "Timeout waiting for pipelined RPC responses from %s (missing ids: %S)"
-                                 (tramp-file-name-host vec) remaining-ids)
-                       (format "RPC process died waiting for pipelined responses from %s (missing ids: %S)"
-                               (tramp-file-name-host vec) remaining-ids))))))
-          ;; Convert hash table to alist in original order
-          (mapcar (lambda (id)
-                    (cons id (gethash id responses)))
-                  ids)))))
+      (let* ((state (tramp-rpc--wait-for-response-ids
+                     conn process buffer ids timeout poll-interval "PIPE"))
+             (remaining-ids (plist-get state :remaining))
+             (responses (plist-get state :responses)))
+        (when remaining-ids
+          (tramp-rpc--debug "RECV-PIPE missing ids: %S" remaining-ids)
+          (let ((process-live (plist-get state :process-live))
+                (stderr-tail (tramp-rpc--connection-stderr-tail conn)))
+            (when process-live
+              (tramp-rpc--invalidate-timed-out-connection
+               process vec "Pipelined RPC timeout\n"))
+            (signal
+             'remote-file-error
+             (list
+              (if process-live
+                  (concat
+                   (format
+                    "Timeout waiting for pipelined RPC responses from %s (missing ids: %S)"
+                    (tramp-file-name-host vec) remaining-ids)
+                   (when stderr-tail
+                     (format "; SSH stderr: %s" stderr-tail)))
+                (format
+                 "RPC process died waiting for pipelined responses from %s (missing ids: %S)"
+                 (tramp-file-name-host vec) remaining-ids))))))
+        (mapcar (lambda (id) (cons id (gethash id responses))) ids)))))
 
 (defun tramp-rpc--call-pipelined (vec requests)
   "Execute multiple REQUESTS in a pipelined fashion for VEC.

@@ -162,6 +162,49 @@
       (should (process-live-p process))
       (should-not (process-get process :tramp-rpc-pending-ids)))))
 
+(ert-deftest tramp-rpc-mock-test-request-pipeline-collects-partial-responses ()
+  "Pipelined waiting retains partial completion and original ID order."
+  (tramp-rpc-mock-test-request--with-connection (process buffer)
+    (let* ((vec (tramp-rpc-mock-test-request--vec))
+           (connection (list :process process :buffer buffer :vec vec))
+           (pending (tramp-rpc--get-pending-responses buffer))
+           (tramp-rpc-poll-interval 0.001)
+           delivered)
+      (process-put process :tramp-rpc-pending-ids '(301 302))
+      (puthash 301 '(:id 301 :result first) pending)
+      (cl-letf (((symbol-function 'accept-process-output)
+                 (lambda (&rest _)
+                   (unless delivered
+                     (setq delivered t)
+                     (puthash 302 '(:id 302 :result second) pending))
+                   t)))
+        (should
+         (equal (tramp-rpc--receive-responses
+                 vec '(301 302) 1 connection)
+                '((301 :id 301 :result first)
+                  (302 :id 302 :result second))))))))
+
+(ert-deftest tramp-rpc-mock-test-request-pipeline-timeout-includes-stderr ()
+  "Pipelined timeout diagnostics include missing IDs and SSH stderr."
+  (tramp-rpc-mock-test-request--with-connection (process buffer)
+    (let* ((stderr-buffer (generate-new-buffer " *tramp-rpc-request-stderr*"))
+           (vec (tramp-rpc-mock-test-request--vec))
+           (connection (list :process process :buffer buffer :vec vec
+                             :stderr-buffer stderr-buffer))
+           message)
+      (unwind-protect
+          (progn
+            (with-current-buffer stderr-buffer (insert "permission denied"))
+            (cl-letf (((symbol-function 'tramp-rpc--invalidate-timed-out-connection)
+                       #'ignore))
+              (condition-case err
+                  (tramp-rpc--receive-responses vec '(401 402) 0 connection)
+                (remote-file-error
+                 (setq message (error-message-string err)))))
+            (should (string-match-p "missing ids: (401 402)" message))
+            (should (string-match-p "SSH stderr: permission denied" message)))
+        (kill-buffer stderr-buffer)))))
+
 (ert-deftest tramp-rpc-mock-test-request-timeout-invalidates-ssh-generation ()
   "Timeout invalidation removes the transport and its ControlMaster."
   (tramp-rpc-mock-test-request--with-connection (process buffer)
