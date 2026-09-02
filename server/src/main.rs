@@ -582,12 +582,15 @@ async fn main() -> std::process::ExitCode {
     let stdout: WriterHandle = Arc::new(Mutex::new(BufWriter::new(tokio::io::stdout())));
 
     // Initialize the filesystem watcher for cache invalidation notifications.
-    // If this fails (e.g. inotify not available), we continue without watching.
+    // If this fails (e.g. inotify not available), we continue without watching
+    // but record the state so `system.info` reports actual availability
+    // instead of just the compiled backend kind.
     // NOTE: Do NOT use eprintln! here or anywhere in the server -- SSH forwards
     // the remote process's stderr over the same pipe to Emacs, where it gets
     // mixed with the binary msgpack protocol on stdout and corrupts framing.
-    if let Ok(manager) = watcher::WatchManager::new(Arc::clone(&stdout)) {
-        watcher::init(manager);
+    match watcher::WatchManager::new(Arc::clone(&stdout)) {
+        Ok(manager) => watcher::init(manager),
+        Err(_) => watcher::set_unavailable(),
     }
 
     match run_connection(

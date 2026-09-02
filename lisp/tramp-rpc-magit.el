@@ -62,6 +62,8 @@
 (defvar tramp-rpc--connections)
 (defvar tramp-rpc--exec-path-cache)
 (defvar tramp-rpc--login-shell-cache)
+(defvar tramp-rpc--watcher-degraded)
+(defvar tramp-rpc--watcher-unavailable-ttl)
 
 ;; Functions from magit-section.el.
 (autoload 'magit-section-show "magit-section")
@@ -105,27 +107,34 @@ STAT may be nil, which records a missing file.")
 (defun tramp-rpc--effective-cache-ttl ()
   "Return the current TTL for TRAMP-RPC metadata caches.
 `remote-file-name-inhibit-cache' t disables caching, while a numeric value
-caps the project-specific TTL.  Nil retains the explicit TRAMP-RPC TTL."
-  (cond
-   ((eq remote-file-name-inhibit-cache t) 0)
-   ((numberp remote-file-name-inhibit-cache)
-    (min tramp-rpc--cache-ttl (max 0 remote-file-name-inhibit-cache)))
-   (t tramp-rpc--cache-ttl)))
+caps the project-specific TTL.  Nil retains the explicit TRAMP-RPC TTL.
+When push notifications are unavailable (`tramp-rpc--watcher-degraded'),
+caches are TTL-only, so cap to `tramp-rpc--watcher-unavailable-ttl'."
+  (let ((ttl (cond
+                ((eq remote-file-name-inhibit-cache t) 0)
+                ((numberp remote-file-name-inhibit-cache)
+                 (min tramp-rpc--cache-ttl (max 0 remote-file-name-inhibit-cache)))
+                (t tramp-rpc--cache-ttl))))
+    (if (and (boundp 'tramp-rpc--watcher-degraded)
+             tramp-rpc--watcher-degraded)
+        (min ttl tramp-rpc--watcher-unavailable-ttl)
+      ttl)))
 
 (defun tramp-rpc--cache-entry-valid-p (timestamp)
   "Return non-nil when a cache entry created at TIMESTAMP is reusable."
-  (let ((age (- (float-time) timestamp)))
+  (let ((age (- (float-time) timestamp))
+        (ttl (tramp-rpc--effective-cache-ttl)))
     (cond
      ((eq remote-file-name-inhibit-cache t) nil)
      ((numberp remote-file-name-inhibit-cache)
-      (< age (tramp-rpc--effective-cache-ttl)))
+      (< age ttl))
      ;; TRAMP also binds this to `current-time' to invalidate entries older
      ;; than the start of a compound operation.
      ((consp remote-file-name-inhibit-cache)
       (and (not (time-less-p (seconds-to-time timestamp)
                              remote-file-name-inhibit-cache))
-           (< age tramp-rpc--cache-ttl)))
-     (t (< age tramp-rpc--cache-ttl)))))
+           (< age ttl)))
+     (t (< age ttl)))))
 
 (defun tramp-rpc--cache-get (cache key)
   "Get value for KEY from CACHE if not expired.
@@ -794,10 +803,16 @@ Returns the cache hash table, or nil if none."
        (tramp-rpc-magit--get-cache-key v default-directory)))))
 
 (defun tramp-rpc-magit--process-cache-timestamp-valid-p (timestamp)
-  "Return non-nil when process cache TIMESTAMP is within its own TTL."
+  "Return non-nil when process cache TIMESTAMP is within its own TTL.
+When push notifications are unavailable, cap to
+`tramp-rpc--watcher-unavailable-ttl' so unwatched changes surface promptly."
   (or (null tramp-rpc-magit-process-cache-ttl)
-      (<= (- (float-time) timestamp)
-          tramp-rpc-magit-process-cache-ttl)))
+      (let ((ttl tramp-rpc-magit-process-cache-ttl))
+        (when (and (boundp 'tramp-rpc--watcher-degraded)
+                   tramp-rpc--watcher-degraded
+                   (boundp 'tramp-rpc--watcher-unavailable-ttl))
+          (setq ttl (min ttl tramp-rpc--watcher-unavailable-ttl)))
+        (<= (- (float-time) timestamp) ttl))))
 
 (defun tramp-rpc-magit--set-process-cache (vec directory cache)
   "Set the `process-file' CACHE for VEC and DIRECTORY."

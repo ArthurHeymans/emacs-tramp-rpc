@@ -4975,9 +4975,36 @@ REPLACE non-nil replaces the accessible buffer contents."
 (defconst tramp-rpc--system-info-property "tramp-rpc-system-info"
   "TRAMP connection property storing the cached system.info response.")
 
+(defcustom tramp-rpc--watcher-unavailable-ttl 30
+  "TTL cap in seconds for caches when push notifications are unavailable.
+When the server reports `watcher_available' as false, `fs.events'
+notifications are not running and caches are TTL-only.  Capping to a short
+TTL bounds staleness instead of serving up to `tramp-rpc--cache-ttl'
+seconds of stale metadata."
+  :type 'number
+  :group 'tramp-rpc)
+
+(defvar tramp-rpc--watcher-degraded nil
+  "Non-nil when any known connection lacks push notifications.
+Set from `system.info' `watcher_available'.  Once set, metadata and Magit
+process caches use `tramp-rpc--watcher-unavailable-ttl' as a cap.  Global
+(and conservative: one degraded host shortens TTLs for all) because cache
+validity checks do not carry connection context.")
+
+(defun tramp-rpc--note-watcher-availability (info)
+  "Update `tramp-rpc--watcher-degraded' from system.info INFO.
+INFO is the decoded response alist.  Missing `watcher_available' means an
+old server that predates the field; assume available to preserve behavior.
+An explicit non-t value marks degraded."
+  (when info
+    (let ((cell (assq 'watcher_available info)))
+      (when (and cell (not (eq (cdr cell) t)))
+        (setq tramp-rpc--watcher-degraded t)))))
+
 (defun tramp-rpc--cache-system-info (vec info)
   "Store system.info INFO for VEC and seed related TRAMP properties."
   (when info
+    (tramp-rpc--note-watcher-availability info)
     (tramp-rpc--set-route-connection-property
      vec tramp-rpc--system-info-property info)
     ;; Store remote uname so `tramp-check-remote-uname' works.  The server
