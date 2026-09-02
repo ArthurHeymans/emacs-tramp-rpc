@@ -2223,11 +2223,18 @@ Uses length-prefixed binary framing: <4-byte BE length><msgpack payload>."
                 (delete-region (point-min) (mark-marker))
                 (goto-char (point-min))
                 ;; Check for server-initiated notification (no id, has method).
+                ;; Isolated: a throwing notification handler must not strand
+                ;; already-buffered frames behind it in the process filter.
                 (if (plist-get response :notification)
-                    (tramp-rpc--handle-notification
-                     process
-                     (plist-get response :method)
-                     (plist-get response :params))
+                    (condition-case notify-error
+                        (tramp-rpc--handle-notification
+                         process
+                         (plist-get response :method)
+                         (plist-get response :params))
+                      (error
+                       (tramp-rpc--debug
+                        "notification handler failed for %s: %S"
+                        (plist-get response :method) notify-error)))
                   ;; A cleaned generation may still receive buffered output.
                   ;; Its injected transport-death errors belong to live waiters
                   ;; and must not be overwritten by late normal responses.

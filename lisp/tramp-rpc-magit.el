@@ -393,11 +393,14 @@ Used during operations that will invalidate caches themselves.")
   "Handle a server-initiated notification.
 PROCESS is the connection, METHOD is the notification method,
 PARAMS is the notification parameters."
-  (cond
-   ((string= method "fs.events")
-    (tramp-rpc--handle-fs-events process params))
-   (t
-    (tramp-rpc--debug "Unknown notification: %s" method))))
+  (condition-case notify-error
+      (cond
+       ((string= method "fs.events")
+        (tramp-rpc--handle-fs-events process params))
+       (t
+        (tramp-rpc--debug "Unknown notification: %s" method)))
+    (error
+     (tramp-rpc--debug "notification %s failed: %S" method notify-error))))
 
 (defun tramp-rpc--fs-event-path (vec event key)
   "Return EVENT's KEY path as a TRAMP file name on VEC, or nil."
