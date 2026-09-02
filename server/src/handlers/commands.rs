@@ -27,6 +27,13 @@ use super::HandlerResult;
 /// Prevents resource exhaustion from excessively large batches.
 const MAX_PARALLEL_COMMANDS: usize = 256;
 
+/// Default per-command timeout for `commands.run_parallel`.  Without it one
+/// hung `git` stalls the whole batch until the Lisp 30s call timeout fires,
+/// discarding completed results and tearing down the connection.
+const DEFAULT_PARALLEL_COMMAND_TIMEOUT_MS: u64 = 25_000;
+/// Hard cap so a client cannot request an unbounded hang.
+const MAX_PARALLEL_COMMAND_TIMEOUT_MS: u64 = 120_000;
+
 /// Global child budget for `commands.run_parallel` requests.  Request-level
 /// admission alone is insufficient because each admitted request can fan out
 /// into hundreds of operating-system processes.
@@ -78,6 +85,17 @@ pub async fn run_parallel(params: Value) -> HandlerResult {
         /// Clear the inherited server environment before applying `env`.
         #[serde(default)]
         clear_env: bool,
+        /// Per-command timeout in milliseconds.  Each hung command fails
+        /// individually instead of stalling the whole batch until the Lisp
+        /// call timeout tears down the connection.  Defaults to
+        /// `DEFAULT_PARALLEL_COMMAND_TIMEOUT_MS`, capped at
+        /// `MAX_PARALLEL_COMMAND_TIMEOUT_MS`.
+        #[serde(default = "default_parallel_timeout_ms")]
+        timeout_ms: u64,
+    }
+
+    fn default_parallel_timeout_ms() -> u64 {
+        DEFAULT_PARALLEL_COMMAND_TIMEOUT_MS
     }
 
     let params: Params = from_value(params).map_err(|e| RpcError::invalid_params(e.to_string()))?;
@@ -100,16 +118,41 @@ pub async fn run_parallel(params: Value) -> HandlerResult {
     let remaining = Arc::new(Semaphore::new(crate::MAX_RESPONSE_OUTPUT_BYTES));
     let env = params.env.map(Arc::new);
     let clear_env = params.clear_env;
+    let timeout_ms = params.timeout_ms.clamp(1, MAX_PARALLEL_COMMAND_TIMEOUT_MS);
+    let timeout = std::time::Duration::from_millis(timeout_ms);
     let results = futures::future::join_all(params.commands.into_iter().map(|entry| {
         let remaining = Arc::clone(&remaining);
         let env = env.clone();
         async move {
+            // The per-command deadline covers queueing for the global child
+            // permit as well as execution.  All batch entries start their
+            // clocks together, so N hung waves cannot stack into N x timeout
+            // past the Lisp call timeout; the whole batch fails fast.
+            let deadline = tokio::time::Instant::now() + timeout;
+            let timeout_error = |key: String| {
+                (
+                    key,
+                    msgpack_map! {
+                        "exit_code" => -1i32,
+                        "stdout" => Value::Binary(vec![]),
+                        "stderr" => Value::Binary(
+                            format!("Command timed out after {timeout_ms}ms").into_bytes()
+                        ),
+                        "timed_out" => Value::Boolean(true)
+                    },
+                )
+            };
             // Valid batch entries queue behind earlier entries.  Dropping the
             // request future on transport cancellation cancels this wait.
-            let _child_permit = PARALLEL_CHILD_ADMISSIONS
-                .acquire()
-                .await
-                .expect("parallel child admission semaphore is never closed");
+            let _child_permit = match tokio::time::timeout_at(
+                deadline,
+                PARALLEL_CHILD_ADMISSIONS.acquire(),
+            )
+            .await
+            {
+                Ok(permit) => permit.expect("parallel child admission semaphore is never closed"),
+                Err(_) => return timeout_error(entry.key),
+            };
             let mut cmd = Command::new(&entry.cmd);
             cmd.args(&entry.args);
             if let Some(ref cwd) = entry.cwd {
@@ -161,20 +204,38 @@ pub async fn run_parallel(params: Value) -> HandlerResult {
                         }
                         Ok(())
                     };
-                    let result = tokio::try_join!(
-                        write_stdin,
-                        super::process::read_sync_output(
-                            stdout,
-                            Arc::clone(&remaining),
-                            crate::MAX_RESPONSE_OUTPUT_BYTES,
-                        ),
-                        super::process::read_sync_output(
-                            stderr,
-                            remaining,
-                            crate::MAX_RESPONSE_OUTPUT_BYTES,
-                        ),
-                        child.wait()
-                    );
+                    // Isolate hung commands: each command gets its own deadline
+                    // so one stuck `git` fails individually while completed
+                    // results are preserved, instead of stalling `join_all`
+                    // until the Lisp call timeout tears down the connection.
+                    // The deadline was set before queueing, so queue wait
+                    // consumes the same budget.
+                    let run = async {
+                        tokio::try_join!(
+                            write_stdin,
+                            super::process::read_sync_output(
+                                stdout,
+                                Arc::clone(&remaining),
+                                crate::MAX_RESPONSE_OUTPUT_BYTES,
+                            ),
+                            super::process::read_sync_output(
+                                stderr,
+                                remaining,
+                                crate::MAX_RESPONSE_OUTPUT_BYTES,
+                            ),
+                            child.wait()
+                        )
+                    };
+                    let result = match tokio::time::timeout_at(deadline, run).await {
+                        Ok(result) => result,
+                        Err(_) => {
+                            let _ = child.kill().await;
+                            let _ = child.wait().await;
+                            Err(std::io::Error::other(format!(
+                                "Command timed out after {timeout_ms}ms"
+                            )))
+                        }
+                    };
                     match result {
                         Ok(((), stdout, stderr, status)) => {
                             process_group.disarm();
@@ -187,10 +248,13 @@ pub async fn run_parallel(params: Value) -> HandlerResult {
                         Err(error) => {
                             let _ = child.kill().await;
                             let _ = child.wait().await;
+                            let message = error.to_string();
+                            let timed_out = message.starts_with("Command timed out");
                             msgpack_map! {
                                 "exit_code" => -1i32,
                                 "stdout" => Value::Binary(vec![]),
-                                "stderr" => Value::Binary(error.to_string().into_bytes())
+                                "stderr" => Value::Binary(message.into_bytes()),
+                                "timed_out" => Value::Boolean(timed_out)
                             }
                         }
                     }
