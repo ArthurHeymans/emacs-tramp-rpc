@@ -3618,10 +3618,12 @@ OPERATION names the attempted operation."
     result))
 
 (cl-defun tramp-rpc--copy-file-same-remote
-    (filename newname ok-if-already-exists keep-time preserve-permissions)
+    (filename newname ok-if-already-exists keep-time preserve-uid-gid
+              preserve-permissions)
   "Copy FILENAME to NEWNAME on one TRAMP-RPC remote with fewer round-trips.
 OK-IF-ALREADY-EXISTS controls existing-destination handling.
 KEEP-TIME non-nil preserves timestamps.
+PRESERVE-UID-GID non-nil preserves ownership for regular files.
 PRESERVE-PERMISSIONS non-nil preserves file permissions."
   (with-parsed-tramp-file-name filename v1
     (with-parsed-tramp-file-name newname v2
@@ -3645,7 +3647,8 @@ PRESERVE-PERMISSIONS non-nil preserves file permissions."
             (tramp-rpc--copy-file-same-remote
              filename
              (expand-file-name (file-name-nondirectory filename) newname)
-             ok-if-already-exists keep-time preserve-permissions)))
+             ok-if-already-exists keep-time preserve-uid-gid
+             preserve-permissions)))
         (unless ok-if-already-exists
           (when dest-stat
             (signal 'file-already-exists (list newname))))
@@ -3665,10 +3668,18 @@ PRESERVE-PERMISSIONS non-nil preserves file permissions."
                                       (file-name-unquote v1-localname)))
                              (dest . ,(tramp-rpc--path-to-bin
                                        (file-name-unquote v2-localname)))
-                             (preserve . ,(if (or keep-time preserve-permissions)
+                             (preserve . ,(if (or keep-time preserve-uid-gid
+                                                   preserve-permissions)
                                               t :msgpack-false))
                              (overwrite . ,(if ok-if-already-exists
-                                               t :msgpack-false))))))
+                                               t :msgpack-false))))
+          (when preserve-uid-gid
+            (tramp-rpc--call
+             v2 "file.chown"
+             `((path . ,(tramp-rpc--path-to-bin
+                         (file-name-unquote v2-localname)))
+               (uid . ,(alist-get 'uid source-stat))
+               (gid . ,(alist-get 'gid source-stat)))))))
         (tramp-flush-file-properties v1 v1-localname)
         (tramp-flush-file-properties v2 v2-localname)
         (tramp-flush-directory-properties v2 v2-localname)
@@ -3862,9 +3873,20 @@ PRESERVE-UID-GID requests ownership preservation on generic fallback paths.
 PRESERVE-PERMISSIONS non-nil preserves file permissions."
   (setq filename (expand-file-name filename)
         newname (expand-file-name newname))
-  ;; The RPC copy primitive cannot reliably change ownership as an
-  ;; unprivileged user.  Preserve upstream behavior instead of silently
-  ;; dropping PRESERVE-UID-GID.
+  ;; Fast path for same-remote copies: batch source/destination stats, then do
+  ;; the server-side copy.  This avoids the generic preflight predicates each
+  ;; costing their own network round-trip.  Keep ownership preservation on the
+  ;; RPC connection: `tramp-sh-handle-copy-file' cannot drive an rpc method's
+  ;; non-shell transport and can wait forever when a file watch is active.
+  (when (and (tramp-tramp-file-p filename)
+             (tramp-tramp-file-p newname)
+             (tramp-equal-remote filename newname))
+    (cl-return-from tramp-rpc-handle-copy-file
+      (tramp-rpc--copy-file-same-remote
+       filename newname ok-if-already-exists keep-time preserve-uid-gid
+       preserve-permissions)))
+  ;; For copies crossing the RPC boundary, retain TRAMP's ownership-preserving
+  ;; fallback rather than silently ignoring PRESERVE-UID-GID.
   (when (and preserve-uid-gid
              (or (tramp-tramp-file-p filename)
                  (tramp-tramp-file-p newname)))
@@ -3872,15 +3894,6 @@ PRESERVE-PERMISSIONS non-nil preserves file permissions."
       (tramp-sh-handle-copy-file
        filename newname ok-if-already-exists keep-time
        preserve-uid-gid preserve-permissions)))
-  ;; Fast path for same-remote copies: batch source/destination stats, then do
-  ;; the server-side copy.  This avoids the generic preflight predicates each
-  ;; costing their own network round-trip.
-  (when (and (tramp-tramp-file-p filename)
-             (tramp-tramp-file-p newname)
-             (tramp-equal-remote filename newname))
-    (cl-return-from tramp-rpc-handle-copy-file
-      (tramp-rpc--copy-file-same-remote
-       filename newname ok-if-already-exists keep-time preserve-permissions)))
   ;; When NEWNAME is a directory name (trailing /), copy INTO it.
   (when (and (directory-name-p newname)
              (file-directory-p newname))

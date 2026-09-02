@@ -8150,11 +8150,10 @@ discard it for being unreadable."
     (should (equal paths '("/rpc:one:/source")))
     (should (equal subtrees '("/rpc:two:/dest")))))
 
-(ert-deftest tramp-rpc-mock-test-copy-file-preserve-uid-gid-uses-upstream ()
-  "Every remote ownership-preserving combination uses upstream TRAMP."
+(ert-deftest tramp-rpc-mock-test-copy-file-preserve-uid-gid-uses-upstream-cross-boundary ()
+  "Ownership-preserving copies crossing the RPC boundary use upstream TRAMP."
   (should (fboundp 'tramp-sh-handle-copy-file))
-  (dolist (files '(("/rpc:mock:/source" "/rpc:mock:/dest")
-                   ("/rpc:mock:/source" "/tmp/dest")
+  (dolist (files '(("/rpc:mock:/source" "/tmp/dest")
                    ("/tmp/source" "/rpc:mock:/dest")
                    ("/rpc:one:/source" "/rpc:two:/dest")))
     (let (arguments)
@@ -8165,6 +8164,27 @@ discard it for being unreadable."
               (car files) (cadr files) t t t t)
              'upstream)))
       (should (equal (nth 4 arguments) t)))))
+
+(ert-deftest tramp-rpc-mock-test-copy-file-preserve-uid-gid-same-remote-uses-rpc ()
+  "Same-remote ownership preservation copies and changes ownership via RPC."
+  (let (calls)
+    (cl-letf (((symbol-function 'tramp-rpc--call-batch)
+               (lambda (&rest _args)
+                 '(((type . "file") (uid . 42) (gid . 84)) nil)))
+              ((symbol-function 'tramp-rpc--call)
+               (lambda (_vec method params)
+                 (push (cons method params) calls)
+                 t))
+              ((symbol-function 'tramp-flush-file-properties) #'ignore)
+              ((symbol-function 'tramp-flush-directory-properties) #'ignore)
+              ((symbol-function 'tramp-rpc--invalidate-cache-for-path) #'ignore))
+      (tramp-rpc--copy-file-same-remote
+       "/rpc:mock:/source" "/rpc:mock:/dest" t t t t))
+    (setq calls (nreverse calls))
+    (should (equal (mapcar #'car calls) '("file.copy" "file.chown")))
+    (should (eq (alist-get 'preserve (cdr (car calls))) t))
+    (should (= (alist-get 'uid (cdr (cadr calls))) 42))
+    (should (= (alist-get 'gid (cdr (cadr calls))) 84))))
 
 (ert-deftest tramp-rpc-mock-test-remote-stderr-command-wrapper-is-argv-safe ()
   "Remote stderr redirection preserves command argv in pipe and PTY paths."
@@ -8226,6 +8246,15 @@ discard it for being unreadable."
     (let ((result (tramp-rpc-deploy--diagnose-ssh "host" nil "true")))
       (should (= (car result) 127))
       (should (string-match-p "ssh" (cdr result))))))
+
+(ert-deftest tramp-rpc-mock-test-deploy-diagnose-ssh-handles-file-errors ()
+  "SSH launch errors such as permission failures are diagnostic results."
+  (cl-letf (((symbol-function 'call-process)
+             (lambda (&rest _args)
+               (signal 'file-error '("Opening process" "Permission denied")))))
+    (let ((result (tramp-rpc-deploy--diagnose-ssh "host" nil "true")))
+      (should (= (car result) 127))
+      (should (string-match-p "Permission denied" (cdr result))))))
 
 (ert-deftest tramp-rpc-mock-test-deploy-diagnose-ssh-normalizes-signal-status ()
   "A signal-terminated SSH process returns numeric failure and its message."

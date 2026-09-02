@@ -34,6 +34,13 @@
 ;; tramp-rpc.el after these helpers have been defined.
 (declare-function tramp-rpc--proxy-hop-string "tramp-rpc")
 (declare-function tramp-rpc--sudo-rpc-hop-vec "tramp-rpc")
+(declare-function tramp-send-command
+                  "tramp-sh" (vec command &optional neveropen nooutput))
+(declare-function tramp-send-command-and-check
+                  "tramp-sh"
+                  (vec command &optional subshell dont-suppress-err exit-status))
+(declare-function tramp-send-command-and-read
+                  "tramp-sh" (vec command &optional noerror marker))
 
 ;; ============================================================================
 ;;; Customization
@@ -1521,7 +1528,7 @@ When CONNECT-TIMEOUT is non-nil, use a ten-second connection timeout."
                     (concat output
                             (unless (string-empty-p output) "\n")
                             status))))
-        (file-missing
+        (file-error
          (cons 127 (error-message-string error-data)))))))
 
 (defun tramp-rpc-deploy-diagnose (host &optional user)
