@@ -151,6 +151,40 @@ static USER_NAMES: std::sync::LazyLock<Mutex<HashMap<u32, Option<String>>>> =
 static GROUP_NAMES: std::sync::LazyLock<Mutex<HashMap<u32, Option<String>>>> =
     std::sync::LazyLock::new(|| Mutex::new(HashMap::new()));
 
+/// Short negative cache for transient NSS failures (LDAP/SSSD outage).
+/// Without this, every directory entry with the same uid/gid retries libc +
+/// `getent` (~2s each), turning one listing into a per-entry retry storm.
+/// Entries expire after `TRANSIENT_NSS_TTL` so recovery is still prompt.
+const TRANSIENT_NSS_TTL: Duration = Duration::from_secs(10);
+static TRANSIENT_USER_FAILURES: std::sync::LazyLock<Mutex<HashMap<u32, Instant>>> =
+    std::sync::LazyLock::new(|| Mutex::new(HashMap::new()));
+static TRANSIENT_GROUP_FAILURES: std::sync::LazyLock<Mutex<HashMap<u32, Instant>>> =
+    std::sync::LazyLock::new(|| Mutex::new(HashMap::new()));
+
+fn transient_failure_recent(cache: &Mutex<HashMap<u32, Instant>>, id: u32) -> bool {
+    let mut cache = cache.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(&at) = cache.get(&id) {
+        if at.elapsed() < TRANSIENT_NSS_TTL {
+            return true;
+        }
+        cache.remove(&id);
+    }
+    false
+}
+
+fn record_transient_failure(cache: &Mutex<HashMap<u32, Instant>>, id: u32) {
+    let mut cache = cache.lock().unwrap_or_else(|e| e.into_inner());
+    cache.insert(id, Instant::now());
+    // Bound growth: outages can touch many distinct ids; drop expired first,
+    // then cap at a generous size to avoid unbounded memory.
+    if cache.len() > 4096 {
+        cache.retain(|_, at| at.elapsed() < TRANSIENT_NSS_TTL);
+    }
+    if cache.len() > 8192 {
+        cache.clear();
+    }
+}
+
 /// Initial buffer size hint from sysconf, or a reasonable default.
 fn sysconf_bufsize(name: libc::c_int, fallback: usize) -> usize {
     let ret = unsafe { libc::sysconf(name) };
@@ -289,8 +323,9 @@ fn nss_name_from_ptr(ptr: *const libc::c_char) -> Option<String> {
 ///
 /// Uses `getpwuid_r` or `getgrgid_r` (selected by `kind`) with a
 /// sysconf-hinted buffer that doubles on `ERANGE`, falls back to `getent`
-/// on libc errors, and caches only definitive results so transient failures
-/// (timeout, backend unavailable) can be retried on a later lookup.
+/// on libc errors, caches definitive results indefinitely, and caches
+/// transient failures (timeout, backend unavailable) for `TRANSIENT_NSS_TTL`
+/// so one listing under outage does not retry per entry.
 fn resolve_nss_name(
     cache: &'static Mutex<HashMap<u32, Option<String>>>,
     kind: NssKind,
@@ -302,6 +337,15 @@ fn resolve_nss_name(
         if let Some(result) = c.get(&id) {
             return result.clone();
         }
+    }
+    // Short negative cache for transient outage: fail fast without hitting
+    // libc/getent again within the TTL window.
+    let transient_cache = match kind {
+        NssKind::User => &*TRANSIENT_USER_FAILURES,
+        NssKind::Group => &*TRANSIENT_GROUP_FAILURES,
+    };
+    if transient_failure_recent(transient_cache, id) {
+        return None;
     }
 
     let (bufsize_hint, database) = match kind {
@@ -377,15 +421,19 @@ fn resolve_nss_name(
         break Ok(name_str);
     };
 
-    // Cache only definitive results. Transient failures (Err) are not
-    // cached so a later lookup can succeed once the service recovers.
+    // Cache definitive results indefinitely; cache transient failures for
+    // TRANSIENT_NSS_TTL so a later lookup can succeed once the service
+    // recovers, without retrying per directory entry during an outage.
     match name_result {
         Ok(name) => {
             let mut c = cache.lock().unwrap_or_else(|e| e.into_inner());
             c.insert(id, name.clone());
             name
         }
-        Err(()) => None,
+        Err(()) => {
+            record_transient_failure(transient_cache, id);
+            None
+        }
     }
 }
 

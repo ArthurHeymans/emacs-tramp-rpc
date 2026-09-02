@@ -50,11 +50,31 @@ fn path_cstring(bytes: &[u8]) -> Result<CString, std::ffi::NulError> {
     CString::new(bytes)
 }
 
-/// Get FileAttributes using fstatat relative to directory fd
+/// Get FileAttributes using fstatat relative to directory fd.
+/// When `resolve_names` is false, `uname`/`gname` are left as None so the
+/// caller can batch-resolve distinct uid/gids once per listing instead of
+/// once per entry (critical under NSS outage: each miss can cost ~2s).
 fn get_file_attributes_at(
     dir_fd: libc::c_int,
     name: &[u8],
     follow_symlinks: bool,
+) -> Option<FileAttributes> {
+    get_file_attributes_at_inner(dir_fd, name, follow_symlinks, true)
+}
+
+fn get_file_attributes_at_raw(
+    dir_fd: libc::c_int,
+    name: &[u8],
+    follow_symlinks: bool,
+) -> Option<FileAttributes> {
+    get_file_attributes_at_inner(dir_fd, name, follow_symlinks, false)
+}
+
+fn get_file_attributes_at_inner(
+    dir_fd: libc::c_int,
+    name: &[u8],
+    follow_symlinks: bool,
+    resolve_names: bool,
 ) -> Option<FileAttributes> {
     let mut stat_buf: libc::stat = unsafe { std::mem::zeroed() };
 
@@ -123,14 +143,24 @@ fn get_file_attributes_at(
     let uid = stat_buf.st_uid;
     let gid = stat_buf.st_gid;
     let (atime, mtime, ctime, mode) = extract_stat_fields(&stat_buf);
+    // Batch path (resolve_names=false) defers NSS so the listing can resolve
+    // each distinct uid/gid once instead of once per entry.
+    let (uname, gname) = if resolve_names {
+        (
+            super::file::get_user_name(uid),
+            super::file::get_group_name(gid),
+        )
+    } else {
+        (None, None)
+    };
 
     Some(FileAttributes {
         file_type,
         nlinks: stat_buf.st_nlink as u64,
         uid,
         gid,
-        uname: super::file::get_user_name(uid),
-        gname: super::file::get_group_name(gid),
+        uname,
+        gname,
         atime,
         mtime,
         ctime,
@@ -261,8 +291,10 @@ fn list_dir_sync(
 
         let attrs = if include_attrs {
             // Use lstat (follow_symlinks=false) so symlinks show as symlinks
-            // with their link_target resolved, matching Emacs expectations
-            dir_fd.and_then(|fd| get_file_attributes_at(fd, &name_bytes, false))
+            // with their link_target resolved, matching Emacs expectations.
+            // Defer NSS: resolve each distinct uid/gid once below instead of
+            // once per entry, so an LDAP outage costs per-id, not per-entry.
+            dir_fd.and_then(|fd| get_file_attributes_at_raw(fd, &name_bytes, false))
         } else {
             None
         };
@@ -272,6 +304,35 @@ fn list_dir_sync(
             file_type,
             attrs,
         });
+    }
+
+    // Batch-resolve NSS names for distinct ids only.  With the transient
+    // negative cache in file.rs, an outage yields at most one ~2s miss per
+    // distinct id per TTL window, not one per directory entry.
+    if include_attrs {
+        use std::collections::{HashMap, HashSet};
+        let mut uids = HashSet::new();
+        let mut gids = HashSet::new();
+        for entry in &results {
+            if let Some(attrs) = entry.attrs.as_ref() {
+                uids.insert(attrs.uid);
+                gids.insert(attrs.gid);
+            }
+        }
+        let unames: HashMap<u32, Option<String>> = uids
+            .into_iter()
+            .map(|uid| (uid, super::file::get_user_name(uid)))
+            .collect();
+        let gnames: HashMap<u32, Option<String>> = gids
+            .into_iter()
+            .map(|gid| (gid, super::file::get_group_name(gid)))
+            .collect();
+        for entry in &mut results {
+            if let Some(attrs) = entry.attrs.as_mut() {
+                attrs.uname = unames.get(&attrs.uid).cloned().flatten();
+                attrs.gname = gnames.get(&attrs.gid).cloned().flatten();
+            }
+        }
     }
 
     // Sort by name
