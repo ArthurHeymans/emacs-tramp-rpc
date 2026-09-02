@@ -262,12 +262,6 @@ Emacs to retain decoder state across RPC chunks."
   "Return the exact queue key for VEC, PID, and OWNER.
 Capture a connection only when this is the first operation for OWNER."
   (or (and (processp owner) (process-get owner :tramp-rpc-write-queue-key))
-      (let (key)
-        (maphash (lambda (candidate queue)
-                   (when (and owner (eq owner (plist-get queue :owner-process)))
-                     (setq key candidate)))
-                 tramp-rpc--process-write-queues)
-        key)
       (let* ((connection (or (and (processp owner)
                                   (process-get owner :tramp-rpc-connection))
                              (tramp-rpc--ensure-connection vec)))
@@ -815,9 +809,8 @@ turn an explicit nil into the dynamic `process-connection-type'.  Native
 `make-process' treats explicit nil as a pipe, so pass `pipe' to the skeleton
 for that one case.
 
-The skeleton also treats string `:stderr' as a remote stderr file.  Preserve
-tramp-rpc's existing compatibility behavior where non-remote strings name
-stderr buffers."
+A remote string `:stderr' value retains TRAMP's same-remote file semantics.
+For compatibility, a non-remote string names an Emacs buffer."
   (let ((args (copy-sequence args)))
     (when (and (plist-member args :connection-type)
                (null (plist-get args :connection-type)))
@@ -827,6 +820,15 @@ stderr buffers."
                  (not (tramp-tramp-file-p stderr)))
         (setq args (plist-put args :stderr (get-buffer-create stderr)))))
     args))
+
+(defun tramp-rpc--redirect-command-stderr (command stderr-file)
+  "Return COMMAND wrapped to redirect stderr to remote STDERR-FILE safely."
+  (append
+   (list "/bin/sh" "-c"
+         (format "exec \"$@\" 2>%s"
+                 (tramp-shell-quote-argument stderr-file))
+         "tramp-rpc-stderr")
+   command))
 
 (defun tramp-rpc-handle-make-process (&rest args)
   "Create an async process on the remote host.
@@ -849,6 +851,9 @@ Resolves program path and loads direnv environment from working directory."
              ;; non-PTY from the RPC process launcher's perspective.
              (use-pty (eq connection-type 'pty))
              (pipe-sudo (and sudo-command (not use-pty)))
+             (stderr-file (when (stringp stderr)
+                            (tramp-file-local-name
+                             (expand-file-name stderr))))
              (sudo-password nil)
              ;; Native process creation resolves omitted/nil coding from
              ;; `default-process-coding-system'.
@@ -870,8 +875,19 @@ Resolves program path and loads direnv environment from working directory."
                                       (cdr command)))
               (setq command (append (list (car command) "-n")
                                     (cdr command))))))
+        (when (and use-pty sudo-command stderr-file)
+          (tramp-error
+           v 'file-error
+           "Cannot redirect stderr for an interactive PTY sudo process"))
         (when use-pty
           (setq command (tramp-rpc--maybe-login-shell-command v command)))
+        ;; TRAMP string :stderr means a same-remote file, in both pipe and PTY
+        ;; modes.  Redirect in one argv-safe shell wrapper; buffer stderr keeps
+        ;; using the separate local relay below.  PTY sudo is rejected above
+        ;; because redirecting its prompt would leave the user waiting blindly.
+        (when stderr-file
+          (setq command (tramp-rpc--redirect-command-stderr command stderr-file)
+                stderr nil))
         ;; Use the same effective environment as synchronous and parallel RPC
         ;; processes, including configured PATH, direnv, and caller overrides.
         (let ((process-env (tramp-rpc--process-environment v localname)))

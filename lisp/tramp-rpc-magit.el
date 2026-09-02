@@ -55,6 +55,13 @@
 (declare-function tramp-rpc--watch-entry-canonical-directory "tramp-rpc")
 (declare-function tramp-rpc--add-external-operation "tramp-rpc")
 (declare-function tramp-rpc--remove-external-operation "tramp-rpc")
+(declare-function tramp-rpc--clear-direnv-cache "tramp-rpc" (&optional vec))
+(declare-function tramp-rpc--flush-owned-route-connection-properties
+                  "tramp-rpc" (vec))
+
+(defvar tramp-rpc--connections)
+(defvar tramp-rpc--exec-path-cache)
+(defvar tramp-rpc--login-shell-cache)
 
 ;; Functions from magit-section.el.
 (autoload 'magit-section-show "magit-section")
@@ -134,7 +141,7 @@ Returns the cached value, or nil if not found or expired."
 
 (defun tramp-rpc--cache-put (cache key value)
   "Store VALUE for KEY in CACHE with current timestamp.
-Evicts oldest 25%% of entries when cache exceeds max size."
+Evicts the oldest 25% of entries when cache reaches the maximum size."
   ;; Check if eviction is needed
   (when (>= (hash-table-count cache) tramp-rpc--cache-max-size)
     (tramp-rpc--cache-evict cache))
@@ -171,7 +178,7 @@ must still report symlink type for lstat."
       (tramp-rpc--cache-put tramp-rpc--file-stat-cache key stat))))
 
 (defun tramp-rpc--cache-evict (cache)
-  "Evict oldest 25%% of entries from CACHE."
+  "Evict the oldest 25% of entries from CACHE."
   (let ((entries nil))
     ;; Collect all entries with timestamps
     (maphash (lambda (key value)
@@ -186,6 +193,21 @@ must still report symlink type for lstat."
           (remhash (caar entries) cache)
           (setq entries (cdr entries)))))))
 
+(defun tramp-rpc-magit--hash-remove-if (predicate table &optional callback)
+  "Remove TABLE entries satisfying PREDICATE without mutating during `maphash'.
+PREDICATE receives key and value.  CALLBACK, when non-nil, is called with each
+removed key and value.  Return the number of removed entries."
+  (let (entries)
+    (maphash (lambda (key value)
+               (when (funcall predicate key value)
+                 (push (cons key value) entries)))
+             table)
+    (dolist (entry entries)
+      (remhash (car entry) table)
+      (when callback
+        (funcall callback (car entry) (cdr entry))))
+    (length entries)))
+
 (defvar tramp-rpc-magit--ancestor-scan-caches)
 (defvar tramp-rpc-magit--prefetch-directories)
 
@@ -198,23 +220,16 @@ must still report symlink type for lstat."
 
 (defun tramp-rpc-magit--clear-ancestor-caches-for-connection (vec)
   "Clear ancestor caches belonging to the connection identified by VEC."
-  (let ((connection-key (tramp-rpc--connection-key-string vec))
-        ancestor-keys prefetch-keys)
-    (maphash
+  (let ((connection-key (tramp-rpc--connection-key-string vec)))
+    (tramp-rpc-magit--hash-remove-if
      (lambda (key _entry)
-       (when (and (consp key) (equal (car key) connection-key))
-         (push key ancestor-keys)))
+       (and (consp key) (equal (car key) connection-key)))
      tramp-rpc-magit--ancestor-scan-caches)
-    (dolist (key ancestor-keys)
-      (remhash key tramp-rpc-magit--ancestor-scan-caches))
-    (maphash
+    (tramp-rpc-magit--hash-remove-if
      (lambda (directory _timestamp)
-       (when (equal (tramp-rpc-magit--file-connection-key directory)
-                    connection-key)
-         (push directory prefetch-keys)))
-     tramp-rpc-magit--prefetch-directories)
-    (dolist (key prefetch-keys)
-      (remhash key tramp-rpc-magit--prefetch-directories))))
+       (equal (tramp-rpc-magit--file-connection-key directory)
+              connection-key))
+     tramp-rpc-magit--prefetch-directories)))
 
 (defun tramp-rpc--invalidate-cache-for-path (filename)
   "Invalidate cache entries for FILENAME."
@@ -266,26 +281,22 @@ must still report symlink type for lstat."
                       (tramp-flush-file-properties v localname)
                       (tramp-flush-directory-properties v localname))))
                 (drop-string-prefix (cache)
-                  (let (keys)
-                    (maphash (lambda (key _value)
-                               (when (and (stringp key)
-                                          (string-prefix-p expanded-dir key))
-                                 (push key keys)))
-                             cache)
-                    (dolist (key keys)
-                      (remhash key cache)
-                      (flush-tramp-properties key))))
+                  (tramp-rpc-magit--hash-remove-if
+                   (lambda (key _value)
+                     (and (stringp key)
+                          (string-prefix-p expanded-dir key)))
+                   cache
+                   (lambda (key _value)
+                     (flush-tramp-properties key))))
                 (drop-stat-prefix ()
-                  (let (keys)
-                    (maphash (lambda (key _value)
-                               (when (and (consp key)
-                                          (stringp (car key))
-                                          (string-prefix-p expanded-dir (car key)))
-                                 (push key keys)))
-                             tramp-rpc--file-stat-cache)
-                    (dolist (key keys)
-                      (remhash key tramp-rpc--file-stat-cache)
-                      (flush-tramp-properties (car key))))))
+                  (tramp-rpc-magit--hash-remove-if
+                   (lambda (key _value)
+                     (and (consp key)
+                          (stringp (car key))
+                          (string-prefix-p expanded-dir (car key))))
+                   tramp-rpc--file-stat-cache
+                   (lambda (key _value)
+                     (flush-tramp-properties (car key))))))
       (drop-string-prefix tramp-rpc--file-exists-cache)
       (drop-string-prefix tramp-rpc--file-truename-cache)
       (drop-stat-prefix))))
@@ -305,25 +316,27 @@ must still report symlink type for lstat."
   (interactive)
   (clrhash tramp-rpc--file-stat-cache))
 
-(defun tramp-rpc--clear-current-tramp-file-properties ()
-  "Clear TRAMP file properties for the current remote connection."
-  (when (file-remote-p default-directory)
-    (with-parsed-tramp-file-name default-directory nil
-      (tramp-flush-directory-properties v "/"))))
-
 (defun tramp-rpc--clear-file-metadata-caches ()
   "Clear cached file metadata."
   (clrhash tramp-rpc--file-exists-cache)
   (clrhash tramp-rpc--file-truename-cache)
   (clrhash tramp-rpc--file-stat-cache)
-  (tramp-rpc-magit--clear-ancestor-caches)
-  (tramp-rpc--clear-current-tramp-file-properties))
+  (tramp-rpc-magit--clear-ancestor-caches))
 
 (defun tramp-rpc-clear-all-caches ()
-  "Clear all tramp-rpc caches."
+  "Clear all project-owned caches and route-aware connection properties."
   (interactive)
   (tramp-rpc-magit--clear-cache)
-  (tramp-rpc--clear-file-metadata-caches))
+  (tramp-rpc--clear-file-metadata-caches)
+  (tramp-rpc--clear-direnv-cache)
+  (clrhash tramp-rpc--exec-path-cache)
+  (clrhash tramp-rpc--login-shell-cache)
+  (maphash
+   (lambda (_key connection)
+     (when-let* ((vec (plist-get connection :vec)))
+       (tramp-flush-directory-properties vec "/")
+       (tramp-rpc--flush-owned-route-connection-properties vec)))
+   tramp-rpc--connections))
 
 (defun tramp-rpc--clear-file-caches-for-connection (vec)
   "Clear file-exists and `file-truename' cache entries for connection VEC.
@@ -335,22 +348,13 @@ matching the remote prefix of VEC."
     ;; Match the prefix up to the colon-slash that starts the localname.
     ;; e.g. "/rpc:user@host:/" -- any key starting with this belongs to VEC.
     (dolist (cache (list tramp-rpc--file-exists-cache
-                        tramp-rpc--file-truename-cache))
-      (let ((keys-to-remove nil))
-        (maphash (lambda (key _value)
-                   (when (string-prefix-p prefix key)
-                     (push key keys-to-remove)))
-                 cache)
-        (dolist (key keys-to-remove)
-          (remhash key cache))))
-    (let ((keys-to-remove nil))
-      (maphash (lambda (key _value)
-                 (when (and (consp key)
-                            (string-prefix-p prefix (car key)))
-                   (push key keys-to-remove)))
-               tramp-rpc--file-stat-cache)
-      (dolist (key keys-to-remove)
-        (remhash key tramp-rpc--file-stat-cache)))))
+                         tramp-rpc--file-truename-cache))
+      (tramp-rpc-magit--hash-remove-if
+       (lambda (key _value) (string-prefix-p prefix key)) cache))
+    (tramp-rpc-magit--hash-remove-if
+     (lambda (key _value)
+       (and (consp key) (string-prefix-p prefix (car key))))
+     tramp-rpc--file-stat-cache)))
 
 ;; ============================================================================
 ;; Filesystem watching
@@ -371,11 +375,6 @@ Used during operations that will invalidate caches themselves.")
   (let ((key (tramp-rpc--connection-key vec)))
     (format "%S" key)))
 
-(defun tramp-rpc--directory-watched-p (localname vec)
-  "Return non-nil if LOCALNAME on VEC is being watched."
-  (let ((conn-key (tramp-rpc--connection-key-string vec)))
-    (gethash (format "%s:%s" conn-key localname)
-             tramp-rpc--watched-directories)))
 
 (defun tramp-rpc--watch-entry-recursive-p (entry)
   "Return non-nil if watched-directory ENTRY is recursive."
@@ -594,21 +593,19 @@ When RECURSIVE is non-nil, watch subdirectories too."
 
 (defun tramp-rpc--cleanup-watches-for-connection (vec &optional connection-process)
   "Remove watched directory entries for VEC's CONNECTION-PROCESS."
-  (let ((conn-key (tramp-rpc--connection-key-string vec))
-        (keys-to-remove nil))
-    (maphash (lambda (key value)
-               (when (and (string-prefix-p (concat conn-key ":") key)
-                          (or (null connection-process)
-                              (null (plist-get value :connection-process))
-                              (eq connection-process
-                                  (plist-get value :connection-process))))
-                 (push key keys-to-remove)))
-             tramp-rpc--watched-directories)
-    (dolist (key keys-to-remove)
-      (remhash key tramp-rpc--watched-directories))
-    (when keys-to-remove
+  (let* ((conn-key (tramp-rpc--connection-key-string vec))
+         (removed
+          (tramp-rpc-magit--hash-remove-if
+           (lambda (key value)
+             (and (string-prefix-p (concat conn-key ":") key)
+                  (or (null connection-process)
+                      (null (plist-get value :connection-process))
+                      (eq connection-process
+                          (plist-get value :connection-process)))))
+           tramp-rpc--watched-directories)))
+    (when (> removed 0)
       (tramp-rpc--debug "Cleaned up %d watches for %s"
-                        (length keys-to-remove) conn-key))))
+                        removed conn-key))))
 
 (defun tramp-rpc-list-watches ()
   "List currently watched directories."
@@ -689,20 +686,61 @@ large worktrees must be split without losing item/result ordering.")
 (defvar tramp-rpc-magit--ancestor-scan-caches (make-hash-table :test 'equal)
   "Cached ancestor scans keyed by remote search directory.")
 
+(defcustom tramp-rpc-magit-ancestor-cache-max-size 128
+  "Maximum number of cached ancestor scans."
+  :type 'integer
+  :group 'tramp-rpc)
+
 (defvar tramp-rpc-magit--prefetch-directories (make-hash-table :test 'equal)
   "Remote directories with active prefetch snapshots, keyed by directory.
 Values are creation timestamps so independent repositories cannot clobber
 one another's ancestor-discovery state.")
 
+(defcustom tramp-rpc-magit-prefetch-directory-max-size 128
+  "Maximum number of active prefetch directory snapshots."
+  :type 'integer
+  :group 'tramp-rpc)
+
+(defcustom tramp-rpc-magit-process-cache-max-size 64
+  "Maximum number of per-directory Magit process caches."
+  :type 'integer
+  :group 'tramp-rpc)
+
+(defun tramp-rpc-magit--bound-table
+    (table max-size &optional timestamp-function timestamp-valid-p)
+  "Prune expired entries and bound TABLE to MAX-SIZE.
+TIMESTAMP-FUNCTION extracts an entry timestamp.  TIMESTAMP-VALID-P checks
+that timestamp and defaults to the file metadata cache policy.  Overflow
+eviction follows the oldest timestamps without a full sort on normal cache
+admission."
+  (when timestamp-function
+    (let ((valid-p (or timestamp-valid-p
+                       #'tramp-rpc--cache-entry-valid-p)))
+      (tramp-rpc-magit--hash-remove-if
+       (lambda (_key value)
+         (when-let* ((timestamp (funcall timestamp-function value)))
+           (not (funcall valid-p timestamp))))
+       table)))
+  (let ((excess (- (hash-table-count table) (max 0 max-size))))
+    (dotimes (_ excess)
+      (let (oldest-key oldest-time)
+        (maphash
+         (lambda (key value)
+           (let ((time (and timestamp-function
+                            (funcall timestamp-function value))))
+             (when (or (null oldest-key)
+                       (null time)
+                       (and oldest-time (< time oldest-time)))
+               (setq oldest-key key oldest-time time))))
+         table)
+        (when oldest-key
+          (remhash oldest-key table))))))
+
 (defun tramp-rpc-magit--prune-prefetch-directories ()
   "Remove expired entries from `tramp-rpc-magit--prefetch-directories'."
-  (let (expired)
-    (maphash (lambda (directory timestamp)
-               (unless (tramp-rpc--cache-entry-valid-p timestamp)
-                 (push directory expired)))
-             tramp-rpc-magit--prefetch-directories)
-    (dolist (directory expired)
-      (remhash directory tramp-rpc-magit--prefetch-directories))))
+  (tramp-rpc-magit--bound-table
+   tramp-rpc-magit--prefetch-directories
+   tramp-rpc-magit-prefetch-directory-max-size #'identity))
 
 (defvar tramp-rpc-magit--debug nil
   "When non-nil, log cache hits/misses for debugging.")
@@ -742,9 +780,7 @@ Returns a cons cell (connection-key . directory) for hash table lookups."
     (cond
      ((not cache) nil)
      ((and time
-           tramp-rpc-magit-process-cache-ttl
-           (> (- (float-time) time)
-              tramp-rpc-magit-process-cache-ttl))
+           (not (tramp-rpc-magit--process-cache-timestamp-valid-p time)))
       (remhash key tramp-rpc-magit--process-caches)
       nil)
      (t cache))))
@@ -757,11 +793,22 @@ Returns the cache hash table, or nil if none."
       (tramp-rpc-magit--valid-process-cache
        (tramp-rpc-magit--get-cache-key v default-directory)))))
 
+(defun tramp-rpc-magit--process-cache-timestamp-valid-p (timestamp)
+  "Return non-nil when process cache TIMESTAMP is within its own TTL."
+  (or (null tramp-rpc-magit-process-cache-ttl)
+      (<= (- (float-time) timestamp)
+          tramp-rpc-magit-process-cache-ttl)))
+
 (defun tramp-rpc-magit--set-process-cache (vec directory cache)
   "Set the `process-file' CACHE for VEC and DIRECTORY."
   (let ((key (tramp-rpc-magit--get-cache-key vec directory)))
     (puthash key (list :time (float-time) :cache cache)
-             tramp-rpc-magit--process-caches)))
+             tramp-rpc-magit--process-caches)
+    (tramp-rpc-magit--bound-table
+     tramp-rpc-magit--process-caches tramp-rpc-magit-process-cache-max-size
+     (lambda (entry)
+       (and (listp entry) (plist-get entry :time)))
+     #'tramp-rpc-magit--process-cache-timestamp-valid-p)))
 
 
 (defun tramp-rpc-magit--process-cache-key (&rest args)
@@ -1413,6 +1460,9 @@ as the `process-file' cache.  Also fetches ancestor markers."
       (tramp-rpc-magit--prune-prefetch-directories)
       (puthash (expand-file-name directory) (float-time)
                tramp-rpc-magit--prefetch-directories)
+      (tramp-rpc-magit--bound-table
+       tramp-rpc-magit--prefetch-directories
+       tramp-rpc-magit-prefetch-directory-max-size #'identity)
       (with-parsed-tramp-file-name directory nil
         ;; Build command list and run in parallel on server.  `update-index
         ;; --refresh' is intentionally not part of this prefetch; it is run by
@@ -1449,7 +1499,10 @@ as the `process-file' cache.  Also fetches ancestor markers."
           (puthash (tramp-rpc-magit--ancestor-scan-cache-key
                     (file-name-as-directory (expand-file-name directory)))
                    (cons (float-time) scan)
-                   tramp-rpc-magit--ancestor-scan-caches))
+                   tramp-rpc-magit--ancestor-scan-caches)
+          (tramp-rpc-magit--bound-table
+           tramp-rpc-magit--ancestor-scan-caches
+           tramp-rpc-magit-ancestor-cache-max-size #'car))
         (when tramp-rpc-magit--debug
           (let ((cache (tramp-rpc-magit--get-process-cache)))
             (tramp-rpc--debug "tramp-rpc-magit: prefetched %d commands + ancestors for %s"
@@ -1524,6 +1577,9 @@ the server scans the entire tree in one operation."
                    directory tramp-rpc-magit--ancestor-marker-names)))
         (puthash key (cons (float-time) scan)
                  tramp-rpc-magit--ancestor-scan-caches)
+        (tramp-rpc-magit--bound-table
+         tramp-rpc-magit--ancestor-scan-caches
+         tramp-rpc-magit-ancestor-cache-max-size #'car)
         scan))))
 
 (defun tramp-rpc-magit--ancestor-cache-covers-p (scan-directory candidate-dir)
@@ -1619,21 +1675,13 @@ Returns t, nil, or \\='not-cached if not in cache."
 ;; Cache clearing
 ;; ============================================================================
 
-(defun tramp-rpc-magit--clear-status-cache ()
-  "Clear all frequently changing Git status caches."
-  (clrhash tramp-rpc-magit--process-caches))
-
 (defun tramp-rpc-magit--clear-status-cache-for-connection (vec)
   "Clear status caches belonging to the connection identified by VEC."
-  (let ((connection-key (tramp-rpc--connection-key-string vec))
-        process-keys)
-    (maphash
+  (let ((connection-key (tramp-rpc--connection-key-string vec)))
+    (tramp-rpc-magit--hash-remove-if
      (lambda (key _entry)
-       (when (and (consp key) (equal (car key) connection-key))
-         (push key process-keys)))
-     tramp-rpc-magit--process-caches)
-    (dolist (key process-keys)
-      (remhash key tramp-rpc-magit--process-caches))))
+       (and (consp key) (equal (car key) connection-key)))
+     tramp-rpc-magit--process-caches)))
 
 (defun tramp-rpc-magit--clear-cache-for-connection (vec)
   "Clear Magit caches belonging to the connection identified by VEC."

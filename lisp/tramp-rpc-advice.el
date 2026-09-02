@@ -33,7 +33,6 @@
 
 (require 'tramp)
 (require 'msgpack)
-(require 'seq)
 
 ;; Functions from tramp-rpc-process.el
 (declare-function tramp-rpc--write-remote-process "tramp-rpc-process"
@@ -44,7 +43,6 @@
                   (vec pid &optional owner-process))
 (declare-function tramp-rpc--kill-remote-process "tramp-rpc-process"
                   (vec pid &optional signal connection))
-(declare-function tramp-rpc--cleanup-async-processes "tramp-rpc-process")
 
 ;; Functions from tramp-rpc.el
 (declare-function tramp-rpc--debug "tramp-rpc")
@@ -57,7 +55,6 @@
 ;; Variables from tramp-rpc.el / tramp-rpc-process.el
 (defvar tramp-rpc--delivering-output)
 (defvar tramp-rpc--closing-local-relay)
-(defvar tramp-rpc--pty-processes)
 (defvar tramp-rpc--async-processes)
 (defvar tramp-rpc-synchronous-pipe-writes)
 
@@ -114,98 +111,67 @@ PROCESS is the process being handled."
 ;; Process I/O handler
 ;; ============================================================================
 
+(defun tramp-rpc--resolve-process (process)
+  "Return the process object denoted by PROCESS, or nil."
+  (cond
+   ((processp process) process)
+   ((bufferp process) (get-buffer-process process))
+   ((stringp process)
+    (when-let* ((buffer (get-buffer process)))
+      (get-buffer-process buffer)))))
+
+(defun tramp-rpc--send-managed-process-string (process string operation)
+  "Send STRING to RPC-managed PROCESS for OPERATION.
+Return `not-managed' when PROCESS must use the native handler."
+  (let ((proc (tramp-rpc--managed-send-process process)))
+    (cond
+     ((not proc) 'not-managed)
+     ((process-get proc :tramp-rpc-pty)
+      (let ((vec (process-get proc :tramp-rpc-vec))
+            (pid (process-get proc :tramp-rpc-pid)))
+        (tramp-rpc--debug "%s PTY pid=%s len=%d" operation pid (length string))
+        (tramp-rpc--call
+         vec "process.write_pty"
+         `((pid . ,pid)
+           (data . ,(msgpack-bin-make
+                     (tramp-rpc--encode-process-input proc string))))
+         (process-get proc :tramp-rpc-connection))
+        nil))
+     (t
+      (let ((vec (process-get proc :tramp-rpc-vec))
+            (pid (process-get proc :tramp-rpc-pid)))
+        (tramp-rpc--debug "%s pipe pid=%s len=%d" operation pid (length string))
+        (tramp-rpc--write-remote-process
+         vec pid (tramp-rpc--encode-process-input proc string) proc)
+        (when tramp-rpc-synchronous-pipe-writes
+          (tramp-rpc--drain-write-queue vec pid proc)))))))
+
+(defun tramp-rpc--managed-send-process (process)
+  "Return PROCESS's RPC-managed process, or nil when native delivery is needed."
+  (when-let* ((proc (tramp-rpc--resolve-process process)))
+    (and (not tramp-rpc--delivering-output)
+         (not (process-get proc :tramp-rpc-direct-ssh))
+         (process-get proc :tramp-rpc-pid)
+         (process-get proc :tramp-rpc-vec)
+         proc)))
+
 (defun tramp-rpc-handle-process-send-string (process string)
-  "Handler for `process-send-string' for TRAMP-RPC processes.
-PROCESS is the process being handled.
-STRING is the text being handled."
-  ;; If we're delivering output to the local relay, bypass this handler
-  (if tramp-rpc--delivering-output
-      (tramp-run-real-handler #'process-send-string (list process string))
-    ;; process-send-string can receive a buffer/buffer-name instead of process
-    (let ((proc (cond
-                 ((processp process) process)
-                 ((or (bufferp process) (stringp process))
-                  (get-buffer-process (get-buffer process)))
-                 (t nil))))
-      (cond
-       ;; Direct SSH PTY - use normal process-send-string (low latency)
-       ((and proc (process-get proc :tramp-rpc-direct-ssh))
-        (tramp-run-real-handler #'process-send-string (list process string)))
-       ;; RPC-based PTY process - use PTY write (async, fire-and-forget)
-       ((and proc (process-get proc :tramp-rpc-pty)
-             (process-get proc :tramp-rpc-pid))
-        (let ((vec (process-get proc :tramp-rpc-vec))
-              (pid (process-get proc :tramp-rpc-pid)))
-          (tramp-rpc--debug "SEND-STRING PTY pid=%s len=%d" pid (length string))
-          ;; Match local `process-send-string' semantics: return only after the
-          ;; bytes reached the remote PTY's kernel buffer.
-          (let ((data-bytes (tramp-rpc--encode-process-input proc string)))
-            (tramp-rpc--call vec "process.write_pty"
-                             `((pid . ,pid)
-                               (data . ,(msgpack-bin-make data-bytes)))
-                             (process-get proc :tramp-rpc-connection)))
-          nil))
-       ;; Regular async RPC process (pipe-based)
-       ((and proc
-             (process-get proc :tramp-rpc-pid)
-             (process-get proc :tramp-rpc-vec)
-             (not (process-get proc :tramp-rpc-pty)))
-        (tramp-rpc--debug "SEND-STRING pipe pid=%s len=%d"
-                         (process-get proc :tramp-rpc-pid) (length string))
-        (let ((vec (process-get proc :tramp-rpc-vec))
-              (pid (process-get proc :tramp-rpc-pid)))
-          (tramp-rpc--write-remote-process
-           vec pid (tramp-rpc--encode-process-input proc string) proc)
-          (when tramp-rpc-synchronous-pipe-writes
-            (tramp-rpc--drain-write-queue vec pid proc))))
-       ;; Not an RPC process, use original function
-       (t (tramp-run-real-handler #'process-send-string (list process string)))))))
+  "Send STRING to the TRAMP-RPC PROCESS."
+  (when (eq (tramp-rpc--send-managed-process-string
+             process string "SEND-STRING")
+            'not-managed)
+    (tramp-run-real-handler #'process-send-string (list process string))))
 
 (defun tramp-rpc-handle-process-send-region (process start end)
   "Handler for `process-send-region' for TRAMP-RPC processes.
 PROCESS is the process being handled.
 START and END are buffer positions delimiting the text to send."
-  ;; If we're delivering output to the local relay, bypass this handler
-  (if tramp-rpc--delivering-output
-      (tramp-run-real-handler #'process-send-region (list process start end))
-    (let ((proc (cond
-                 ((processp process) process)
-                 ((or (bufferp process) (stringp process))
-                  (get-buffer-process (get-buffer process)))
-                 (t nil))))
-      (cond
-       ;; Direct SSH PTY - use normal process-send-region (low latency)
-       ((and proc (process-get proc :tramp-rpc-direct-ssh))
-        (tramp-run-real-handler #'process-send-region (list process start end)))
-       ;; RPC-based PTY process - use PTY write
-       ((and proc (process-get proc :tramp-rpc-pty)
-             (process-get proc :tramp-rpc-pid))
-        (let ((vec (process-get proc :tramp-rpc-vec))
-              (pid (process-get proc :tramp-rpc-pid))
-              (string (buffer-substring-no-properties start end)))
-          (tramp-rpc--debug "SEND-REGION PTY pid=%s len=%d" pid (length string))
-          (let ((data-bytes (tramp-rpc--encode-process-input proc string)))
-            (tramp-rpc--call vec "process.write_pty"
-                             `((pid . ,pid)
-                               (data . ,(msgpack-bin-make data-bytes)))
-                             (process-get proc :tramp-rpc-connection)))
-          nil))
-       ;; Regular async RPC process (pipe-based)
-       ((and proc
-             (process-get proc :tramp-rpc-pid)
-             (process-get proc :tramp-rpc-vec)
-             (not (process-get proc :tramp-rpc-pty)))
-        (let ((string (buffer-substring-no-properties start end)))
-          (tramp-rpc--debug "SEND-REGION pipe pid=%s len=%d"
-                           (process-get proc :tramp-rpc-pid) (length string))
-          (let ((vec (process-get proc :tramp-rpc-vec))
-                (pid (process-get proc :tramp-rpc-pid)))
-            (tramp-rpc--write-remote-process
-             vec pid (tramp-rpc--encode-process-input proc string) proc)
-            (when tramp-rpc-synchronous-pipe-writes
-              (tramp-rpc--drain-write-queue vec pid proc)))))
-       ;; Not an RPC process, use original function
-       (t (tramp-run-real-handler #'process-send-region (list process start end)))))))
+  (if-let* ((proc (tramp-rpc--managed-send-process process)))
+      (tramp-rpc--send-managed-process-string
+       proc (buffer-substring-no-properties start end) "SEND-REGION")
+    ;; Preserve native region delivery for bypasses and non-RPC processes.
+    (tramp-run-real-handler #'process-send-region
+                            (list process start end))))
 
 (defun tramp-rpc-handle-process-send-eof (&optional process)
   "Handler for `process-send-eof' for TRAMP-RPC processes.

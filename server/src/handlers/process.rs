@@ -10,13 +10,18 @@ use nix::sys::termios::{LocalFlags, OutputFlags, SetArg, tcgetattr, tcsetattr};
 use nix::sys::wait::{WaitPidFlag, WaitStatus, waitpid};
 use nix::unistd::{Pid, tcgetpgrp};
 use rmpv::Value;
+use rustix::io::fcntl_dupfd_cloexec;
+#[cfg(target_vendor = "apple")]
+use rustix::pipe::pipe;
+#[cfg(not(target_vendor = "apple"))]
+use rustix::pipe::{PipeFlags, pipe_with};
 use rustix::process::{Pid as RustixPid, Signal as RustixSignal};
 #[cfg(any(target_os = "linux", target_os = "android"))]
 use rustix_libc_wrappers::process::SignalExt;
 use serde::Deserialize;
 use std::collections::HashMap;
 use std::io::ErrorKind;
-use std::os::fd::{AsRawFd, RawFd};
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::os::unix::process::ExitStatusExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command as StdCommand, ExitStatus, Stdio};
@@ -39,6 +44,28 @@ pub(crate) fn is_benign_stdin_error(error: &std::io::Error) -> bool {
         error.kind(),
         ErrorKind::BrokenPipe | ErrorKind::WriteZero | ErrorKind::ConnectionReset
     )
+}
+
+fn merged_output_fds() -> std::io::Result<(OwnedFd, OwnedFd, OwnedFd)> {
+    #[cfg(target_vendor = "apple")]
+    let (read_fd, write_fd) = {
+        let (read_fd, write_fd) = pipe()?;
+        set_fd_cloexec(read_fd.as_raw_fd())?;
+        set_fd_cloexec(write_fd.as_raw_fd())?;
+        (read_fd, write_fd)
+    };
+    #[cfg(not(target_vendor = "apple"))]
+    let (read_fd, write_fd) = pipe_with(PipeFlags::CLOEXEC)?;
+
+    let stderr_fd = fcntl_dupfd_cloexec(&write_fd, 0)?;
+    Ok((read_fd, write_fd, stderr_fd))
+}
+
+fn merged_output_pipe() -> std::io::Result<(Stdio, Stdio, tokio::fs::File)> {
+    let (read_fd, write_fd, stderr_fd) = merged_output_fds()?;
+    let reader = tokio::fs::File::from_std(std::fs::File::from(read_fd));
+
+    Ok((Stdio::from(write_fd), Stdio::from(stderr_fd), reader))
 }
 
 pub(crate) async fn read_sync_output<R>(
@@ -324,6 +351,9 @@ async fn run_with_output_limit(params: Value, output_limit: usize) -> HandlerRes
         /// Clear environment before setting env vars
         #[serde(default)]
         clear_env: bool,
+        /// Capture stdout and stderr through one ordered pipe
+        #[serde(default)]
+        merge_stderr: bool,
     }
 
     let params: Params = from_value(params).map_err(|e| RpcError::invalid_params(e.to_string()))?;
@@ -353,8 +383,17 @@ async fn run_with_output_limit(params: Value, output_limit: usize) -> HandlerRes
         Stdio::null()
     });
 
-    cmd.stdout(Stdio::piped());
-    cmd.stderr(Stdio::piped());
+    let merged_reader = if params.merge_stderr {
+        let (stdout, stderr, reader) =
+            merged_output_pipe().map_err(|error| RpcError::process_error(error.to_string()))?;
+        cmd.stdout(stdout);
+        cmd.stderr(stderr);
+        Some(reader)
+    } else {
+        cmd.stdout(Stdio::piped());
+        cmd.stderr(Stdio::piped());
+        None
+    };
     cmd.kill_on_drop(true);
     configure_process_group(&mut cmd);
 
@@ -371,6 +410,10 @@ async fn run_with_output_limit(params: Value, output_limit: usize) -> HandlerRes
             return Err(spawn_error(error, executable_missing));
         }
     };
+    // Tokio's Command retains custom Stdio handles after spawn.  Drop it so
+    // the parent does not keep the merged pipe's write ends open and prevent
+    // the reader from observing EOF after the child exits.
+    drop(cmd);
     let child_pid = child
         .id()
         .ok_or_else(|| RpcError::process_error("Spawned process has no PID"))?;
@@ -382,14 +425,20 @@ async fn run_with_output_limit(params: Value, output_limit: usize) -> HandlerRes
     // early (`head`, `grep -q', ...) is normal and its output must survive.
     let stdin_data = params.stdin;
     let mut stdin = child.stdin.take();
-    let stdout = child
-        .stdout
-        .take()
-        .ok_or_else(|| RpcError::process_error("Failed to capture process stdout"))?;
-    let stderr = child
-        .stderr
-        .take()
-        .ok_or_else(|| RpcError::process_error("Failed to capture process stderr"))?;
+    let separate_streams = if merged_reader.is_none() {
+        Some((
+            child
+                .stdout
+                .take()
+                .ok_or_else(|| RpcError::process_error("Failed to capture process stdout"))?,
+            child
+                .stderr
+                .take()
+                .ok_or_else(|| RpcError::process_error("Failed to capture process stderr"))?,
+        ))
+    } else {
+        None
+    };
     let write_stdin = async move {
         if let Some(data) = stdin_data
             && let Some(mut stdin) = stdin.take()
@@ -406,18 +455,40 @@ async fn run_with_output_limit(params: Value, output_limit: usize) -> HandlerRes
     // intentionally per-run rather than server-wide, so admission permits up
     // to GENERAL_TASK_LIMIT concurrent allocations of this size.
     let remaining = Arc::new(Semaphore::new(output_limit));
-    let result = tokio::try_join!(
-        write_stdin,
-        read_sync_output(stdout, Arc::clone(&remaining), output_limit),
-        read_sync_output(stderr, remaining, output_limit),
-        async {
-            child
-                .wait()
-                .await
-                .map_err(|e| std::io::Error::other(format!("Failed to wait for process: {e}")))
-        }
-    );
-    let ((), stdout, stderr, status) = match result {
+    let result =
+        if let Some(reader) = merged_reader {
+            tokio::try_join!(
+                write_stdin,
+                read_sync_output(reader, remaining, output_limit),
+                async {
+                    child.wait().await.map_err(|e| {
+                        std::io::Error::other(format!("Failed to wait for process: {e}"))
+                    })
+                }
+            )
+            .map(|((), output, status)| (output, Vec::new(), status))
+        } else {
+            let (stdout, stderr) = match separate_streams {
+                Some(streams) => streams,
+                None => {
+                    return Err(RpcError::process_error(
+                        "Separate process streams were not captured",
+                    ));
+                }
+            };
+            tokio::try_join!(
+                write_stdin,
+                read_sync_output(stdout, Arc::clone(&remaining), output_limit),
+                read_sync_output(stderr, remaining, output_limit),
+                async {
+                    child.wait().await.map_err(|e| {
+                        std::io::Error::other(format!("Failed to wait for process: {e}"))
+                    })
+                }
+            )
+            .map(|((), stdout, stderr, status)| (stdout, stderr, status))
+        };
+    let (stdout, stderr, status) = match result {
         Ok(result) => result,
         Err(error) => {
             let _ = child.kill().await;
@@ -1321,7 +1392,6 @@ pub async fn list(_params: Value) -> HandlerResult {
 // PTY (Pseudo-Terminal) Process Management
 // ============================================================================
 
-use std::os::unix::io::{FromRawFd, OwnedFd};
 use std::os::unix::process::CommandExt;
 use tokio::io::Interest;
 use tokio::io::unix::AsyncFd;
@@ -2671,6 +2741,40 @@ mod tests {
         assert_eq!(
             map_get(&result, "exit_code").and_then(Value::as_i64),
             Some(3)
+        );
+    }
+
+    #[test]
+    fn merged_output_descriptors_are_close_on_exec() {
+        let (read_fd, stdout_fd, stderr_fd) = merged_output_fds().expect("merged output pipe");
+        for fd in [&read_fd, &stdout_fd, &stderr_fd] {
+            let flags = rustix::io::fcntl_getfd(fd).expect("descriptor flags");
+            assert!(flags.contains(rustix::io::FdFlags::CLOEXEC));
+        }
+    }
+
+    #[tokio::test]
+    async fn process_run_merge_stderr_preserves_stream_order() {
+        let params = Value::Map(vec![
+            (Value::String("cmd".into()), Value::String("/bin/sh".into())),
+            (
+                Value::String("args".into()),
+                Value::Array(vec![
+                    Value::String("-c".into()),
+                    Value::String("printf stderr >&2; printf stdout".into()),
+                ]),
+            ),
+            (Value::String("merge_stderr".into()), Value::Boolean(true)),
+        ]);
+
+        let result = run(params).await.expect("merged process output");
+        assert_eq!(
+            map_get(&result, "stdout").and_then(Value::as_slice),
+            Some(b"stderrstdout".as_slice())
+        );
+        assert_eq!(
+            map_get(&result, "stderr").and_then(Value::as_slice),
+            Some([].as_slice())
         );
     }
 
