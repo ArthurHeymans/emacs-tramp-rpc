@@ -33,7 +33,7 @@ notify = "8.2"
 ignore = "0.4"
 
 # Safe syscall wrappers.
-rustix = { version = "1", features = ["std", "fs", "pipe", "process"] }
+rustix = { version = "1", features = ["std", "fs", "pipe", "process", "termios"] }
 
 # Linux real-time signal bounds are provided by libc at runtime.
 [target.'cfg(any(target_os = "linux", target_os = "android"))'.dependencies]

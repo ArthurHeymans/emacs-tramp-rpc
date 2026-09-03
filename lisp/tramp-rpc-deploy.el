@@ -27,13 +27,13 @@
 
 (require 'cl-lib)
 (require 'tramp)
+(require 'tramp-rpc-protocol)
+(require 'tramp-rpc-hops)
 (require 'tramp-sh)
 (require 'url)
 
 ;; Functions from tramp-rpc.el.  `tramp-rpc-deploy' is loaded by
 ;; tramp-rpc.el after these helpers have been defined.
-(declare-function tramp-rpc--proxy-hop-string "tramp-rpc")
-(declare-function tramp-rpc--sudo-rpc-hop-vec "tramp-rpc")
 (declare-function tramp-send-command
                   "tramp-sh" (vec command &optional neveropen nooutput))
 (declare-function tramp-send-command-and-check
