@@ -1277,10 +1277,13 @@ This matches the behavior expected by `tramp-test28-process-file'."
          (process (make-pipe-process :name "tramp-rpc-pipeline-test"
                                      :buffer buffer :noquery t))
          (vec (tramp-dissect-file-name "/rpc:mock:/tmp/"))
+         (conn (tramp-rpc--attach-connection
+                (tramp-rpc--make-connection :process process :buffer buffer
+                                            :vec vec)))
          (calls 0))
     (unwind-protect
         (cl-letf (((symbol-function 'tramp-rpc--ensure-connection)
-                   (lambda (_vec) (list :process process :buffer buffer)))
+                   (lambda (_vec) conn))
                   ((symbol-function 'float-time)
                    (lambda (&rest _)
                      (setq calls (1+ calls))
@@ -1293,8 +1296,9 @@ This matches the behavior expected by `tramp-test28-process-file'."
             (remote-file-error
              (should (string-match-p "Timeout" (error-message-string err)))))
           (should-not (process-live-p process))
-          (should-not (process-get process :tramp-rpc-pending-ids))
-          (should-not (gethash buffer tramp-rpc--pending-responses)))
+          (should-not (tramp-rpc-connection-pending-ids conn))
+          (should (zerop (hash-table-count
+                          (tramp-rpc-connection-pending-responses conn)))))
       (when (process-live-p process) (delete-process process))
       (kill-buffer buffer))))
 
@@ -1328,8 +1332,8 @@ This matches the behavior expected by `tramp-test28-process-file'."
 (declare-function tramp-rpc--acl-enabled-p "tramp-rpc" (vec))
 (declare-function tramp-rpc--selinux-enabled-p "tramp-rpc" (vec))
 (declare-function tramp-rpc-handle-file-regular-p "tramp-rpc" (filename))
-(declare-function tramp-rpc--clear-file-caches-for-connection "tramp-rpc-magit" (vec))
-(declare-function tramp-rpc--invalidate-cache-for-subtree "tramp-rpc-magit" (directory))
+(declare-function tramp-rpc--clear-file-caches-for-connection "tramp-rpc-cache" (vec))
+(declare-function tramp-rpc--invalidate-cache-for-subtree "tramp-rpc-cache" (directory))
 (declare-function tramp-rpc-magit--clear-status-cache-for-connection
                   "tramp-rpc-magit" (vec))
 (defvar tramp-rpc-magit-disable-remote-diff-tab-width-detection)
@@ -1381,9 +1385,9 @@ This matches the behavior expected by `tramp-test28-process-file'."
     (unwind-protect
         (progn
           (puthash (tramp-rpc--connection-key vec-a)
-                   (list :process connection-a) tramp-rpc--connections)
+                   (tramp-rpc--make-connection :process connection-a) tramp-rpc--connections)
           (puthash (tramp-rpc--connection-key vec-b)
-                   (list :process connection-b) tramp-rpc--connections)
+                   (tramp-rpc--make-connection :process connection-b) tramp-rpc--connections)
           (cl-letf (((symbol-function 'tramp-rpc--ensure-connection)
                      (lambda (vec) (tramp-rpc--get-connection vec)))
                     ((symbol-function 'tramp-rpc--call-async)
@@ -1415,9 +1419,9 @@ This matches the behavior expected by `tramp-test28-process-file'."
     (unwind-protect
         (progn
           (puthash (tramp-rpc--connection-key vec)
-                   (list :process connection) tramp-rpc--connections)
+                   (tramp-rpc--make-connection :process connection) tramp-rpc--connections)
           (cl-letf (((symbol-function 'tramp-rpc--ensure-connection)
-                     (lambda (_vec) (list :process connection)))
+                     (lambda (_vec) (tramp-rpc--make-connection :process connection)))
                     ((symbol-function 'tramp-rpc--call-async)
                      (lambda (_vec _method params callback &optional _connection)
                        (setq requests (append requests (list params)))
@@ -1445,9 +1449,9 @@ This matches the behavior expected by `tramp-test28-process-file'."
     (unwind-protect
         (progn
           (puthash (tramp-rpc--connection-key vec)
-                   (list :process connection) tramp-rpc--connections)
+                   (tramp-rpc--make-connection :process connection) tramp-rpc--connections)
           (cl-letf (((symbol-function 'tramp-rpc--ensure-connection)
-                     (lambda (_vec) (list :process connection)))
+                     (lambda (_vec) (tramp-rpc--make-connection :process connection)))
                     ((symbol-function 'tramp-rpc--call-async)
                      (lambda (_vec _method _params cb &optional _connection) (setq callback cb))))
             (tramp-rpc--write-remote-process vec 1 "late")
@@ -1471,9 +1475,9 @@ This matches the behavior expected by `tramp-test28-process-file'."
     (unwind-protect
         (progn
           (puthash (tramp-rpc--connection-key vec)
-                   (list :process connection) tramp-rpc--connections)
+                   (tramp-rpc--make-connection :process connection) tramp-rpc--connections)
           (cl-letf (((symbol-function 'tramp-rpc--ensure-connection)
-                     (lambda (_vec) (list :process connection)))
+                     (lambda (_vec) (tramp-rpc--make-connection :process connection)))
                     ((symbol-function 'tramp-rpc--call-async)
                      (lambda (&rest _args) nil))
                     ((symbol-function 'tramp-rpc--call)
@@ -1499,7 +1503,7 @@ This matches the behavior expected by `tramp-test28-process-file'."
          (buffer (generate-new-buffer " *tramp-rpc-queue-unavailable*"))
          (connection (start-process "tramp-rpc-queue-unavailable"
                                     buffer "sleep" "10"))
-         (connection-info (list :process connection))
+         (connection-info (tramp-rpc--make-connection :process connection))
          (tramp-rpc--connections (make-hash-table :test 'equal))
          (key (tramp-rpc--process-write-queue-key vec 1 connection))
          (queue (list :vec vec :pid 1 :connection connection-info
@@ -1546,9 +1550,9 @@ This matches the behavior expected by `tramp-test28-process-file'."
     (unwind-protect
         (progn
           (puthash (tramp-rpc--connection-key vec)
-                   (list :process connection) tramp-rpc--connections)
+                   (tramp-rpc--make-connection :process connection) tramp-rpc--connections)
           (cl-letf (((symbol-function 'tramp-rpc--ensure-connection)
-                     (lambda (_vec) (list :process connection)))
+                     (lambda (_vec) (tramp-rpc--make-connection :process connection)))
                     ((symbol-function 'tramp-rpc--drain-write-queue)
                      (lambda (&rest _args)
                        (when drain-error
@@ -1590,7 +1594,7 @@ This matches the behavior expected by `tramp-test28-process-file'."
          callback)
     (unwind-protect
         (progn
-          (puthash (tramp-rpc--connection-key vec) (list :process connection)
+          (puthash (tramp-rpc--connection-key vec) (tramp-rpc--make-connection :process connection)
                    tramp-rpc--connections)
           (cl-letf (((symbol-function 'tramp-rpc--ensure-connection)
                      (lambda (_vec) (tramp-rpc--get-connection vec)))
@@ -1653,7 +1657,7 @@ This matches the behavior expected by `tramp-test28-process-file'."
         (progn
           (process-put owner :tramp-rpc-vec vec)
           (process-put owner :tramp-rpc-pid 1)
-          (puthash (tramp-rpc--connection-key vec) (list :process connection)
+          (puthash (tramp-rpc--connection-key vec) (tramp-rpc--make-connection :process connection)
                    tramp-rpc--connections)
           (cl-letf (((symbol-function 'tramp-rpc--ensure-connection)
                      (lambda (_vec) (tramp-rpc--get-connection vec)))
@@ -1683,7 +1687,7 @@ This matches the behavior expected by `tramp-test28-process-file'."
          close-connection)
     (unwind-protect
         (progn
-          (puthash (tramp-rpc--connection-key vec) (list :process connection-a)
+          (puthash (tramp-rpc--connection-key vec) (tramp-rpc--make-connection :process connection-a)
                    tramp-rpc--connections)
           (cl-letf (((symbol-function 'tramp-rpc--ensure-connection)
                      (lambda (_vec) (tramp-rpc--get-connection vec)))
@@ -1694,7 +1698,7 @@ This matches the behavior expected by `tramp-test28-process-file'."
                        (setq close-connection connection))))
             (tramp-rpc--write-remote-process vec 1 "old" owner)
             ;; The same TRAMP vector now names a newer connection generation.
-            (puthash (tramp-rpc--connection-key vec) (list :process connection-b)
+            (puthash (tramp-rpc--connection-key vec) (tramp-rpc--make-connection :process connection-b)
                      tramp-rpc--connections)
             (should-error (tramp-rpc--drain-write-queue vec 1 owner)
                           :type 'tramp-rpc-process-write-error)
@@ -1714,8 +1718,8 @@ This matches the behavior expected by `tramp-test28-process-file'."
 (ert-deftest tramp-rpc-mock-test-rpc-pty-write-uses-creation-generation ()
   "An RPC PTY write after reconnect stays on its creation generation."
   (let* ((vec (tramp-dissect-file-name "/rpc:pty-reconnect:/tmp/"))
-         (connection-a (list :process 'connection-a))
-         (connection-b (list :process 'connection-b))
+         (connection-a (tramp-rpc--make-connection :process 'connection-a))
+         (connection-b (tramp-rpc--make-connection :process 'connection-b))
          (current-connection connection-a)
          (tramp-rpc--pty-processes (make-hash-table :test 'eq))
          process write-connection)
@@ -1775,20 +1779,17 @@ This matches the behavior expected by `tramp-test28-process-file'."
 
 (ert-deftest tramp-rpc-mock-test-call-async-send-failure-rolls-back-callback ()
   "A rejected async send must not leave callback state behind."
-  (let ((tramp-rpc--async-callbacks (make-hash-table :test 'eql))
-        (tramp-rpc--async-callback-processes (make-hash-table :test 'eql))
-        (process 'dead-transport))
+  (let ((conn (tramp-rpc--make-connection :process 'dead-transport)))
     (cl-letf (((symbol-function 'tramp-rpc-protocol-encode-request-with-id)
                (lambda (_method _params) (cons 77 "request")))
               ((symbol-function 'process-send-string)
                (lambda (_process _request)
                  (error "transport is dead"))))
       (should-error
-       (tramp-rpc--call-async nil "test" nil #'ignore
-                              (list :process process))
+       (tramp-rpc--call-async nil "test" nil #'ignore conn)
        :type 'error)
-      (should-not (gethash 77 tramp-rpc--async-callbacks))
-      (should-not (gethash 77 tramp-rpc--async-callback-processes)))))
+      (should (zerop (hash-table-count
+                      (tramp-rpc-connection-async-callbacks conn)))))))
 
 (ert-deftest tramp-rpc-mock-test-transport-death-cleans-one-generation ()
   "A dead RPC transport wakes waiters and removes only its generation."
@@ -1801,11 +1802,9 @@ This matches the behavior expected by `tramp-test28-process-file'."
          (stderr (start-process "tramp-rpc-death-stderr" nil "cat"))
          (pty (make-pipe-process :name "tramp-rpc-death-pty" :noquery t))
          (timer (run-at-time 60 nil #'ignore))
-         (conn (list :process connection :buffer buffer))
+         (conn (tramp-rpc--make-connection :process connection :buffer buffer
+                                           :vec vec))
          (tramp-rpc--connections (make-hash-table :test 'equal))
-         (tramp-rpc--async-callbacks (make-hash-table :test 'eql))
-         (tramp-rpc--async-callback-processes (make-hash-table :test 'eql))
-         (tramp-rpc--pending-responses (make-hash-table :test 'eq))
          (tramp-rpc--async-processes (make-hash-table :test 'eq))
          (tramp-rpc--pty-processes (make-hash-table :test 'eq))
          (tramp-rpc--process-write-queues (make-hash-table :test 'equal))
@@ -1813,12 +1812,10 @@ This matches the behavior expected by `tramp-test28-process-file'."
     (unwind-protect
         (progn
           (puthash (tramp-rpc--connection-key vec) conn tramp-rpc--connections)
-          (process-put connection :tramp-rpc-vec vec)
-          (process-put connection :tramp-rpc-buffer buffer)
-          (tramp-rpc--track-pending-request connection 9)
+          (tramp-rpc--attach-connection conn)
+          (tramp-rpc--track-pending-request conn 9)
           (puthash 10 (lambda (_response) (setq callbacks (1+ callbacks)))
-                   tramp-rpc--async-callbacks)
-          (puthash 10 connection tramp-rpc--async-callback-processes)
+                   (tramp-rpc-connection-async-callbacks conn))
           (puthash relay (list :vec vec :pid 1 :connection-process connection
                                :stderr-process stderr :timer timer)
                    tramp-rpc--async-processes)
@@ -1829,15 +1826,15 @@ This matches the behavior expected by `tramp-test28-process-file'."
                          :pending (list (list :data "queued")))
                    tramp-rpc--process-write-queues)
           (puthash (tramp-rpc--connection-key vec)
-                   (list :process replacement :buffer replacement-buffer)
+                   (tramp-rpc--make-connection :process replacement :buffer replacement-buffer)
                    tramp-rpc--connections)
           (tramp-rpc--install-connection-sentinel connection vec)
           (delete-process connection)
           ;; A duplicate sentinel/event must not invoke callbacks or touch NEW.
           (tramp-rpc--connection-transport-death connection vec "again")
           (should (= callbacks 1))
-          (should (gethash 9 (tramp-rpc--get-pending-responses buffer)))
-          (should-not (gethash 10 tramp-rpc--async-callbacks))
+          (should (gethash 9 (tramp-rpc-connection-pending-responses conn)))
+          (should-not (gethash 10 (tramp-rpc-connection-async-callbacks conn)))
           (should-not (gethash relay tramp-rpc--async-processes))
           (should-not (gethash pty tramp-rpc--pty-processes))
           (should-not (gethash (list connection 1)
@@ -1926,14 +1923,14 @@ This matches the behavior expected by `tramp-test28-process-file'."
          (buffer (generate-new-buffer " *tramp-rpc-sync-death*"))
          (process (start-process "tramp-rpc-sync-death" buffer "sh" "-c"
                                  "sleep 0.05"))
-         (conn (list :process process :buffer buffer))
+         (conn (tramp-rpc--make-connection :process process :buffer buffer
+                                           :vec vec))
          (tramp-rpc--connections (make-hash-table :test 'equal))
          (started (float-time)))
     (unwind-protect
         (progn
           (puthash (tramp-rpc--connection-key vec) conn tramp-rpc--connections)
-          (process-put process :tramp-rpc-vec vec)
-          (process-put process :tramp-rpc-buffer buffer)
+          (tramp-rpc--attach-connection conn)
           (tramp-rpc--install-connection-sentinel process vec)
           (cl-letf (((symbol-function 'tramp-rpc--ensure-connection)
                      (lambda (_vec) conn)))
@@ -1948,8 +1945,7 @@ This matches the behavior expected by `tramp-test28-process-file'."
   "RPC PTY construction retains the transport generation used at exit."
   (let* ((connection-process
           (make-pipe-process :name "tramp-rpc-old-generation-mock" :noquery t))
-         (connection (list :process connection-process
-                           :generation connection-process))
+         (connection (tramp-rpc--make-connection :process connection-process))
          (vec (tramp-dissect-file-name "/rpc:pty-generation:/tmp/"))
          (tramp-rpc--pty-processes (make-hash-table :test 'eq))
          local-process captured-connection)
@@ -1983,7 +1979,7 @@ This matches the behavior expected by `tramp-test28-process-file'."
   (let* ((vec (tramp-dissect-file-name "/rpc:sentinel-generation:/tmp/"))
          (transport (make-pipe-process :name "tramp-rpc-sentinel-transport"
                                        :noquery t))
-         (connection (list :process transport :generation transport))
+         (connection (tramp-rpc--make-connection :process transport))
          (pipe (make-pipe-process :name "tramp-rpc-sentinel-pipe" :noquery t))
          (pty (make-pipe-process :name "tramp-rpc-sentinel-pty" :noquery t))
          (tramp-rpc--async-processes (make-hash-table :test 'eq))
@@ -2029,7 +2025,7 @@ This matches the behavior expected by `tramp-test28-process-file'."
     (unwind-protect
         (progn
           (puthash (tramp-rpc--connection-key vec)
-                   (list :process connection :buffer buffer)
+                   (tramp-rpc--make-connection :process connection :buffer buffer)
                    tramp-rpc--connections)
           (puthash relay (list :vec vec :pid 3 :connection-process connection)
                    tramp-rpc--async-processes)
@@ -2044,7 +2040,7 @@ This matches the behavior expected by `tramp-test28-process-file'."
                        ;; Cleanup RPCs use the detached generation while its
                        ;; filter still accepts their acknowledgements.
                        (should-not (tramp-rpc--get-connection vec))
-                       (should (eq connection (plist-get captured-connection :process)))
+                       (should (eq connection (tramp-rpc-connection-process captured-connection)))
                        (should-not (process-get connection :tramp-rpc-transport-dead))
                        (should-not (process-get connection :tramp-rpc-transport-cleaned))
                        (push method calls) '((ok . t))))
@@ -2068,32 +2064,27 @@ This matches the behavior expected by `tramp-test28-process-file'."
   (let* ((vec (tramp-dissect-file-name "/rpc:disconnect-callback:/tmp/"))
          (buffer (generate-new-buffer " *tramp-rpc-disconnect-callback*"))
          (process (start-process "tramp-rpc-disconnect-callback" buffer "sleep" "10"))
+         (conn (tramp-rpc--make-connection :process process :buffer buffer
+                                           :vec vec))
          (tramp-rpc--connections (make-hash-table :test 'equal))
-         (tramp-rpc--pending-responses (make-hash-table :test 'eq))
-         (tramp-rpc--async-callbacks (make-hash-table :test 'eql))
-         (tramp-rpc--async-callback-processes (make-hash-table :test 'eql))
          (tramp-rpc--async-processes (make-hash-table :test 'eq))
          (tramp-rpc--pty-processes (make-hash-table :test 'eq))
          (callback-response nil))
     (unwind-protect
         (progn
-          (puthash (tramp-rpc--connection-key vec)
-                   (list :process process :buffer buffer)
-                   tramp-rpc--connections)
-          (process-put process :tramp-rpc-vec vec)
-          (process-put process :tramp-rpc-buffer buffer)
-          (tramp-rpc--track-pending-request process 41)
+          (puthash (tramp-rpc--connection-key vec) conn tramp-rpc--connections)
+          (tramp-rpc--attach-connection conn)
+          (tramp-rpc--track-pending-request conn 41)
           (puthash 42 (lambda (response) (setq callback-response response))
-                   tramp-rpc--async-callbacks)
-          (puthash 42 process tramp-rpc--async-callback-processes)
+                   (tramp-rpc-connection-async-callbacks conn))
           (cl-letf (((symbol-function 'tramp-rpc--call) (lambda (&rest _) nil))
                     ((symbol-function 'tramp-flush-directory-properties) #'ignore)
                     ((symbol-function 'tramp-flush-connection-properties) #'ignore))
             (tramp-rpc--disconnect vec))
           (should (plist-get (cadr callback-response) :message))
           (should (string-match-p "closed" (plist-get (cadr callback-response) :message)))
-          (should (gethash 41 (tramp-rpc--get-pending-responses buffer)))
-          (should-not (gethash 42 tramp-rpc--async-callbacks)))
+          (should (gethash 41 (tramp-rpc-connection-pending-responses conn)))
+          (should-not (gethash 42 (tramp-rpc-connection-async-callbacks conn))))
       (when (process-live-p process) (delete-process process))
       (when (buffer-live-p buffer) (kill-buffer buffer)))))
 
@@ -2247,7 +2238,7 @@ This matches the behavior expected by `tramp-test28-process-file'."
     (unwind-protect
         (progn
           (puthash (tramp-rpc--connection-key vec)
-                   (list :process connection :buffer buffer :vec vec)
+                   (tramp-rpc--make-connection :process connection :buffer buffer :vec vec)
                    tramp-rpc--connections)
           (puthash relay (list :vec vec :pid 7 :connection-process connection)
                    tramp-rpc--async-processes)
@@ -2295,7 +2286,7 @@ This matches the behavior expected by `tramp-test28-process-file'."
                     ((symbol-function 'tramp-rpc--clear-file-caches-for-connection)
                      #'ignore))
             (tramp-rpc--set-connection vec-a process buffer))
-          (should (equal (plist-get (tramp-rpc--get-connection vec-a) :vec)
+          (should (equal (tramp-rpc-connection-vec (tramp-rpc--get-connection vec-a))
                          vec-a))
           (should (equal (process-get process :tramp-rpc-vec) vec-a))
           (should-not (gethash key-a tramp-rpc-magit--process-caches))
@@ -2324,7 +2315,7 @@ This matches the behavior expected by `tramp-test28-process-file'."
           (process-put process-a :tramp-rpc-vec vec)
           (process-put process-b :tramp-rpc-vec vec)
           (puthash (tramp-rpc--connection-key vec)
-                   (list :process process-b :buffer buffer-b)
+                   (tramp-rpc--make-connection :process process-b :buffer buffer-b)
                    tramp-rpc--connections)
           (puthash 'replacement 'present tramp-rpc-magit--process-caches)
           (tramp-rpc--connection-transport-death process-a vec "stale")
@@ -2344,9 +2335,9 @@ This matches the behavior expected by `tramp-test28-process-file'."
          (process-b (start-process "tramp-rpc-cache-callback-b" buffer-b "cat"))
          (filename (tramp-make-tramp-file-name vec "/new"))
          (stat-key (cons filename nil))
+         (conn-a (tramp-rpc--make-connection :process process-a :buffer buffer-a
+                                             :vec vec))
          (tramp-rpc--connections (make-hash-table :test 'equal))
-         (tramp-rpc--async-callbacks (make-hash-table :test 'eql))
-         (tramp-rpc--async-callback-processes (make-hash-table :test 'eql))
          (tramp-rpc--async-processes (make-hash-table :test 'eq))
          (tramp-rpc--pty-processes (make-hash-table :test 'eq))
          (tramp-rpc--process-write-queues (make-hash-table :test 'equal))
@@ -2356,11 +2347,8 @@ This matches the behavior expected by `tramp-test28-process-file'."
          (tramp-rpc-magit--process-caches (make-hash-table :test 'equal)))
     (unwind-protect
         (progn
-          (process-put process-a :tramp-rpc-vec vec)
-          (process-put process-a :tramp-rpc-buffer buffer-a)
-          (puthash (tramp-rpc--connection-key vec)
-                   (list :process process-a :buffer buffer-a)
-                   tramp-rpc--connections)
+          (tramp-rpc--attach-connection conn-a)
+          (puthash (tramp-rpc--connection-key vec) conn-a tramp-rpc--connections)
           (puthash 1
                    (lambda (_response)
                      (tramp-rpc--set-connection vec process-b buffer-b)
@@ -2368,12 +2356,11 @@ This matches the behavior expected by `tramp-test28-process-file'."
                      (puthash filename 'new tramp-rpc--file-truename-cache)
                      (puthash stat-key 'new tramp-rpc--file-stat-cache)
                      (puthash 'new 'present tramp-rpc-magit--process-caches))
-                   tramp-rpc--async-callbacks)
-          (puthash 1 process-a tramp-rpc--async-callback-processes)
+                   (tramp-rpc-connection-async-callbacks conn-a))
           (cl-letf (((symbol-function 'tramp-flush-directory-properties) #'ignore))
             (tramp-rpc--connection-transport-death process-a vec "dead"))
           (should (eq process-b
-                      (plist-get (tramp-rpc--get-connection vec) :process)))
+                      (tramp-rpc-connection-process (tramp-rpc--get-connection vec))))
           (should (eq (gethash filename tramp-rpc--file-exists-cache) 'new))
           (should (eq (gethash filename tramp-rpc--file-truename-cache) 'new))
           (should (eq (gethash stat-key tramp-rpc--file-stat-cache) 'new))
@@ -3009,7 +2996,7 @@ This matches the behavior expected by `tramp-test28-process-file'."
     (unwind-protect
         (progn
           (process-put proc :tramp-rpc-vec vec)
-          (puthash (tramp-rpc--connection-key vec) (list :process proc)
+          (puthash (tramp-rpc--connection-key vec) (tramp-rpc--make-connection :process proc)
                    tramp-rpc--connections)
           (cl-letf (((symbol-function 'tramp-rpc-magit--clear-status-cache-for-connection)
                      (lambda (_vec) (cl-incf status-clears)))
@@ -3054,7 +3041,7 @@ This matches the behavior expected by `tramp-test28-process-file'."
     (unwind-protect
         (progn
           (process-put proc :tramp-rpc-vec vec)
-          (puthash (tramp-rpc--connection-key vec) (list :process proc)
+          (puthash (tramp-rpc--connection-key vec) (tramp-rpc--make-connection :process proc)
                    tramp-rpc--connections)
           (cl-letf (((symbol-function 'tramp-rpc-magit--clear-status-cache-for-connection)
                      (lambda (_vec) (cl-incf status-clears)))
@@ -3146,7 +3133,7 @@ This matches the behavior expected by `tramp-test28-process-file'."
     (unwind-protect
         (progn
           (process-put retired :tramp-rpc-vec vec)
-          (puthash (tramp-rpc--connection-key vec) (list :process current)
+          (puthash (tramp-rpc--connection-key vec) (tramp-rpc--make-connection :process current)
                    tramp-rpc--connections)
           (cl-letf (((symbol-function 'tramp-rpc-magit--clear-status-cache-for-connection)
                      (lambda (_vec) (cl-incf status-clears)))
@@ -3201,7 +3188,7 @@ This matches the behavior expected by `tramp-test28-process-file'."
           (puthash "/rpc:cache-b:/repo-b/" (float-time)
                    tramp-rpc-magit--prefetch-directories)
           (process-put proc :tramp-rpc-vec vec-a)
-          (puthash (tramp-rpc--connection-key vec-a) (list :process proc)
+          (puthash (tramp-rpc--connection-key vec-a) (tramp-rpc--make-connection :process proc)
                    tramp-rpc--connections)
           (cl-letf (((symbol-function 'tramp-message) #'ignore)
                     ((symbol-function 'tramp-rpc--file-notify-dispatch) #'ignore)
@@ -3248,7 +3235,7 @@ This matches the behavior expected by `tramp-test28-process-file'."
     (unwind-protect
         (progn
           (process-put proc :tramp-rpc-vec vec)
-          (puthash (tramp-rpc--connection-key vec) (list :process proc)
+          (puthash (tramp-rpc--connection-key vec) (tramp-rpc--make-connection :process proc)
                    tramp-rpc--connections)
           (puthash descriptor
                    (list :watch-key watch-key
@@ -3293,7 +3280,7 @@ This matches the behavior expected by `tramp-test28-process-file'."
     (unwind-protect
         (progn
           (process-put proc :tramp-rpc-vec vec)
-          (puthash (tramp-rpc--connection-key vec) (list :process proc)
+          (puthash (tramp-rpc--connection-key vec) (tramp-rpc--make-connection :process proc)
                    tramp-rpc--connections)
           (cl-letf (((symbol-function 'tramp-rpc--call)
                      (lambda (_vec method _params)
@@ -3770,7 +3757,7 @@ This matches the behavior expected by `tramp-test28-process-file'."
            :coding 'binary
            :noquery t
            :stderr stderr-buffer))
-         (conn (list :process process
+         (conn (tramp-rpc--make-connection :process process
                      :buffer stdout-buffer
                      :stderr-buffer stderr-buffer)))
     (unwind-protect
@@ -6202,9 +6189,8 @@ A rejected sudo password must not be reused on the next attempt, otherwise
          (key (tramp-rpc--connection-key vec)))
     (unwind-protect
         (progn
-          (puthash key (list :process proc :buffer buffer)
+          (puthash key (tramp-rpc--make-connection :process proc :buffer buffer)
                    tramp-rpc--connections)
-          (puthash buffer 'pending tramp-rpc--pending-responses)
           (cl-letf (((symbol-function 'tramp-rpc--cleanup-async-processes)
                      (lambda (&rest _) nil))
                     ((symbol-function 'tramp-rpc--cleanup-pty-processes)
@@ -6224,10 +6210,8 @@ A rejected sudo password must not be reused on the next attempt, otherwise
                     ((symbol-function 'tramp-flush-connection-properties)
                      (lambda (&rest _) nil)))
             (tramp-rpc-cleanup-connection vec))
-          (should-not (gethash key tramp-rpc--connections))
-          (should-not (gethash buffer tramp-rpc--pending-responses)))
+          (should-not (gethash key tramp-rpc--connections)))
       (remhash key tramp-rpc--connections)
-      (remhash buffer tramp-rpc--pending-responses)
       (when (process-live-p proc)
         (delete-process proc))
       (when (buffer-live-p buffer)
@@ -7890,7 +7874,7 @@ discard it for being unreadable."
          (tramp-rpc--connections (make-hash-table :test 'equal))
          (tramp-rpc--exec-path-cache (make-hash-table :test 'equal))
          (tramp-rpc--login-shell-cache (make-hash-table :test 'equal)))
-    (puthash 'connection (list :vec vec) tramp-rpc--connections)
+    (puthash 'connection (tramp-rpc--make-connection :vec vec) tramp-rpc--connections)
     (puthash 'key 'value tramp-rpc--exec-path-cache)
     (puthash 'key 'value tramp-rpc--login-shell-cache)
     (tramp-set-connection-property vec "~" "/home/user")

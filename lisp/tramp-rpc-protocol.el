@@ -27,6 +27,49 @@
 
 (declare-function tramp-message "tramp-message")
 
+(defgroup tramp-rpc nil
+  "TRAMP backend using RPC."
+  :group 'tramp)
+
+(defcustom tramp-rpc-debug nil
+  "When non-nil, log debug messages to *tramp-rpc-debug* buffer.
+Set to t to enable debugging for hang diagnosis."
+  :type 'boolean
+  :group 'tramp-rpc)
+
+(defun tramp-rpc--debug-log (format-string &rest args)
+  "Append a formatted debug line to the *tramp-rpc-debug* buffer.
+FORMAT-STRING and ARGS are passed to `format'.
+
+When TRAMP_RPC_DEBUG_LOG or TRAMP_RPC_DEBUG_DIR is set in the environment,
+also append each line directly to a local log file.  This preserves CI
+telemetry even when later tests unload TRAMP and remove debug buffers.
+Callers should use the `tramp-rpc--debug' macro, which skips argument
+evaluation entirely when `tramp-rpc-debug' is nil."
+  (let* ((line (concat (format-time-string "[%F %T.%3N] ")
+                       (apply #'format format-string args)
+                       "\n"))
+         (log-file (or (getenv "TRAMP_RPC_DEBUG_LOG")
+                       (when-let* ((dir (getenv "TRAMP_RPC_DEBUG_DIR")))
+                         (expand-file-name "tramp-rpc-debug-live.log" dir)))))
+    (with-current-buffer (get-buffer-create "*tramp-rpc-debug*")
+      (goto-char (point-max))
+      (insert line))
+    (when log-file
+      (condition-case nil
+          (progn
+            (make-directory (file-name-directory log-file) t)
+            (write-region line nil log-file 'append 'silent))
+        (error nil)))))
+
+(defmacro tramp-rpc--debug (format-string &rest args)
+  "Log FORMAT-STRING with ARGS to the debug buffer when `tramp-rpc-debug' is set.
+ARGS are not evaluated unless debugging is enabled, so callers may pass
+expensive expressions such as buffer sizes or `prin1' of large values."
+  (declare (indent 0) (debug t))
+  `(when tramp-rpc-debug
+     (tramp-rpc--debug-log ,format-string ,@args)))
+
 (defvar tramp-rpc-protocol--request-id 0
   "Counter for generating unique request IDs.")
 

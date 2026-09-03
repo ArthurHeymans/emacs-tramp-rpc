@@ -146,7 +146,7 @@ Value is a cons cell (CHECKED . RESULT).")
   "Clear TRAMP/TRAMP-RPC caches before call-count measurement."
   (maphash
    (lambda (_key conn)
-     (let* ((proc (plist-get conn :process))
+     (let* ((proc (tramp-rpc-connection-process conn))
             (vec (and proc (process-get proc :tramp-rpc-vec))))
        (when vec
          ;; Keep the startup system.info response warm.  It is connection

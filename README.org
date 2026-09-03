@@ -179,14 +179,16 @@ TRAMP's ad-hoc multi-hop syntax works with the ~rpc~ method:
 
 The Emacs Lisp client is organized into focused modules:
 
-| Module                     | Lines | Purpose                                    |
-|----------------------------+-------+--------------------------------------------|
-| ~tramp-rpc.el~             | ~2450 | Core RPC communication & file handlers     |
-| ~tramp-rpc-process.el~     | ~1050 | Async process & PTY support                |
-| ~tramp-rpc-magit.el~       | ~780  | Magit/Projectile optimizations & caching   |
-| ~tramp-rpc-deploy.el~      | ~950  | Binary deployment & version management     |
-| ~tramp-rpc-advice.el~      | ~330  | Advice functions for process/VC integration|
-| ~tramp-rpc-protocol.el~    | ~190  | MessagePack-RPC protocol implementation    |
+| Module                     | Purpose                                              |
+|----------------------------+------------------------------------------------------|
+| ~tramp-rpc.el~             | Connection lifecycle, RPC primitives, file handlers  |
+| ~tramp-rpc-process.el~     | Async process & PTY support                          |
+| ~tramp-rpc-cache.el~       | Metadata caches & filesystem watch notifications     |
+| ~tramp-rpc-magit.el~       | Magit/Projectile prefetch and process-file cache     |
+| ~tramp-rpc-deploy.el~      | Binary deployment & version management               |
+| ~tramp-rpc-advice.el~      | Advice functions for process/VC integration          |
+| ~tramp-rpc-connection.el~  | The per-generation ~tramp-rpc-connection~ struct     |
+| ~tramp-rpc-protocol.el~    | MessagePack-RPC framing, debug logging, base group   |
 
 *** Core Module (~tramp-rpc.el~)
 
@@ -197,6 +199,16 @@ The core module provides:
 - All TRAMP file handler operations (~file-exists-p~, ~file-attributes~, ~insert-file-contents~, etc.)
 - File name handler registration and dispatch
 
+*** Connection Module (~tramp-rpc-connection.el~)
+
+Defines ~tramp-rpc-connection~, the object describing one transport
+generation: the SSH process, its response buffer, and all request state
+belonging to exactly that generation (pending synchronous IDs, buffered
+responses, async callbacks, and cleanup flags).  A replacement connection
+for the same host is a new generation and can never observe the old one's
+state.  The transport process carries a single back pointer to its
+generation for use by process filters and sentinels.
+
 *** Process Module (~tramp-rpc-process.el~)
 
 Handles all process-related functionality:
@@ -206,12 +218,18 @@ Handles all process-related functionality:
 - Process I/O queuing with async callback-based reading
 - Adaptive polling for long-running processes
 
+*** Cache Module (~tramp-rpc-cache.el~)
+
+Client-side metadata caches and the watch machinery keeping them fresh:
+- TTL-based caches for ~file-exists-p~, ~file-truename~ and ~file.stat~ with max-size eviction
+- Invalidation by path, subtree, and connection
+- Watch management via server push notifications (~watch.add~/~watch.remove~, ~fs.events~)
+- Dispatch of ~fs.events~ to public ~file-notify~ descriptors
+
 *** Magit Module (~tramp-rpc-magit.el~)
 
 Optimizations for git/magit/projectile on remote hosts:
 - Parallel git command prefetch via ~commands.run_parallel~ RPC (sends ~60+ git commands in a single round-trip)
-- TTL-based caches for file-exists and file-truename with max-size eviction
-- Filesystem watch management via server push notifications for cache invalidation
 - Process-file cache for serving git commands from prefetched data
 - Ancestor directory scanning for fast project/VC root detection
 - Projectile integration (force git ls-files, alien indexing for remote)

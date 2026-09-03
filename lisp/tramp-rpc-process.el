@@ -31,6 +31,7 @@
 (require 'tramp)
 (require 'tramp-sh)
 (require 'tramp-rpc-protocol)
+(require 'tramp-rpc-connection)
 
 (declare-function tramp-rpc--sudo-password-required-p "tramp-rpc")
 (declare-function tramp-rpc--sudo-read-password "tramp-rpc")
@@ -40,7 +41,6 @@
 (defvar vterm-min-window-width)
 
 ;; Functions from tramp-rpc.el (loaded before us)
-(declare-function tramp-rpc--debug "tramp-rpc")
 (declare-function tramp-rpc--ensure-connection "tramp-rpc")
 (declare-function tramp-rpc--call "tramp-rpc" (vec method params &optional connection))
 (declare-function tramp-rpc--call-fast "tramp-rpc")
@@ -146,7 +146,7 @@ the next read cannot discard output waiting for relay delivery."
   "Return the write queue key for VEC and remote PID.
 CONNECTION is the captured RPC connection process."
   (list (or connection
-            (plist-get (tramp-rpc--get-connection vec) :process)
+            (tramp-rpc--connection-transport (tramp-rpc--get-connection vec))
             vec)
         pid))
 
@@ -155,7 +155,7 @@ CONNECTION is the captured RPC connection process."
   (let ((connection (plist-get queue :connection-process))
         (current (tramp-rpc--get-connection (plist-get queue :vec))))
     (and connection current
-         (eq connection (plist-get current :process)))))
+         (eq connection (tramp-rpc-connection-process current)))))
 
 (defun tramp-rpc--process-write-queue-live-p (queue)
   "Return non-nil when QUEUE still owns live local and RPC processes."
@@ -266,7 +266,7 @@ Capture a connection only when this is the first operation for OWNER."
                                   (process-get owner :tramp-rpc-connection))
                              (tramp-rpc--ensure-connection vec)))
              (key (tramp-rpc--process-write-queue-key
-                   vec pid (plist-get connection :process))))
+                   vec pid (tramp-rpc-connection-process connection))))
         (when (processp owner)
           (process-put owner :tramp-rpc-connection connection)
           (process-put owner :tramp-rpc-write-queue-key key))
@@ -299,7 +299,7 @@ The queue remains bound to OWNER-PROCESS's original connection generation."
                          (tramp-rpc--ensure-connection vec)))
          (state (or queue
                     (list :vec vec :pid pid :connection connection
-                          :connection-process (plist-get connection :process)
+                          :connection-process (tramp-rpc-connection-process connection)
                           :owner-process owner-process :pending nil
                           :current nil :writing nil))))
     (cond
@@ -428,8 +428,8 @@ PID is the remote process ID."
                    queue :connection-replaced))
       (puthash queue-key queue tramp-rpc--process-write-queues)
       (tramp-rpc--signal-process-write-failure queue))
-    (unless (eq (plist-get connection :process)
-                (plist-get (tramp-rpc--get-connection vec) :process))
+    (unless (eq (tramp-rpc-connection-process connection)
+                (tramp-rpc--connection-transport (tramp-rpc--get-connection vec)))
       (tramp-rpc--signal-process-write-failure
        (list :failure (list :reason :connection-replaced
                             :pending-bytes 0))))
@@ -550,8 +550,7 @@ EVENT is the process event string."
       (tramp-rpc--cancel-process-timers tramp-rpc--async-processes proc)
       (unless (or (process-get proc :tramp-rpc-exited)
                   (process-get proc :tramp-rpc-transport-cleanup)
-                  (and (processp connection)
-                       (process-get connection :tramp-rpc-transport-dead)))
+                  (tramp-rpc--transport-dead-p connection))
         (when (and vec pid)
           (tramp-rpc--best-effort
             (tramp-rpc--kill-remote-process
@@ -944,7 +943,7 @@ Resolves program path and loads direnv environment from working directory."
               (let ((connection (tramp-rpc--get-connection v)))
                 (process-put local-process :tramp-rpc-connection connection)
                 (process-put local-process :tramp-rpc-connection-process
-                             (plist-get connection :process)))
+                             (tramp-rpc--connection-transport connection)))
               (process-put local-process 'tramp-vector v)
               (process-put local-process 'remote-command orig-command)
 
@@ -1149,7 +1148,7 @@ DIRENV-ENV is an optional alist of environment variables from direnv."
     ;; Store tramp-rpc metadata for compatibility with other code
     (let ((connection (tramp-rpc--get-connection vec)))
       (process-put process :tramp-rpc-connection-process
-                   (plist-get connection :process)))
+                   (tramp-rpc--connection-transport connection)))
     (puthash process
              (list :vec vec
                    :connection-process
@@ -1247,14 +1246,14 @@ DIRENV-ENV is an optional alist of environment variables for the process."
     ;; Track the PTY process and its exact transport generation.
     (puthash local-process
              (list :vec vec :pid remote-pid
-                   :connection-process (plist-get connection :process)
+                   :connection-process (tramp-rpc-connection-process connection)
                    :rpc-pty t
                    :poll-timer nil)
              tramp-rpc--pty-processes)
     ;; PTY exit uses the exact transport generation that created it.
     (process-put local-process :tramp-rpc-connection connection)
     (process-put local-process :tramp-rpc-connection-process
-                 (plist-get connection :process))
+                 (tramp-rpc-connection-process connection))
 
     ;; Start async read loop
     (tramp-rpc--pty-start-async-read local-process)
@@ -1387,9 +1386,8 @@ EVENT is the process event string."
       ;; A transport cleanup already requested/closed the remote PTY.
       (unless (or (process-get process :tramp-rpc-exited)
                   (process-get process :tramp-rpc-transport-cleanup)
-                  (and (processp (plist-get info :connection-process))
-                       (process-get (plist-get info :connection-process)
-                                    :tramp-rpc-transport-dead)))
+                  (tramp-rpc--transport-dead-p
+                   (plist-get info :connection-process)))
         (when-let* ((vec (plist-get info :vec))
                     (pid (plist-get info :pid)))
           (tramp-rpc--best-effort
@@ -1571,7 +1569,7 @@ state is removed."
   (when (and remote-cleanup vec connection-process
              (process-live-p connection-process))
     (when-let* ((connection (tramp-rpc--get-connection vec)))
-      (when (eq connection-process (plist-get connection :process))
+      (when (eq connection-process (tramp-rpc-connection-process connection))
         (tramp-rpc--terminate-pty-processes vec connection-process connection))))
   (maphash
    (lambda (local-process info)
@@ -1631,7 +1629,7 @@ transport is live."
   (when (and remote-cleanup vec connection-process
              (process-live-p connection-process))
     (when-let* ((connection (tramp-rpc--get-connection vec)))
-      (when (eq connection-process (plist-get connection :process))
+      (when (eq connection-process (tramp-rpc-connection-process connection))
         (tramp-rpc--terminate-async-processes vec connection-process connection))))
   (maphash
    (lambda (local-process info)

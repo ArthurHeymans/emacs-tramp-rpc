@@ -9,9 +9,9 @@
 
 use crate::protocol::{DirEntry, FileAttributes, FileType, RpcError, from_value};
 use rmpv::Value;
+use rustix::fs::{AtFlags, Mode, OFlags, Stat};
 use serde::Deserialize;
-use std::ffi::CString;
-use std::os::fd::{FromRawFd, OwnedFd};
+use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use tokio::fs;
@@ -21,7 +21,7 @@ use super::file::{bytes_to_path, file_type_from_metadata_ft, map_io_error};
 
 use crate::protocol::path_or_bytes;
 
-/// Extract time and mode fields from libc::stat in a cross-platform way
+/// Extract time and mode fields from `stat` in a cross-platform way
 /// Returns (atime, mtime, ctime, mode)
 /// - On Linux: st_mode is u32; time fields are i32 on 32-bit, i64 on 64-bit
 /// - On macOS and FreeBSD: st_mode is u16, time fields are i64
@@ -31,7 +31,7 @@ fn stat_time_to_i64<T: Into<i64>>(time: T) -> i64 {
 }
 
 #[inline]
-fn extract_stat_fields(stat_buf: &libc::stat) -> (i64, i64, i64, u32) {
+fn extract_stat_fields(stat_buf: &Stat) -> (i64, i64, i64, u32) {
     #[cfg(any(target_os = "macos", target_os = "freebsd"))]
     let mode = stat_buf.st_mode as u32;
     #[cfg(not(any(target_os = "macos", target_os = "freebsd")))]
@@ -45,17 +45,12 @@ fn extract_stat_fields(stat_buf: &libc::stat) -> (i64, i64, i64, u32) {
     )
 }
 
-/// Null-terminate raw path bytes for libc calls.
-fn path_cstring(bytes: &[u8]) -> Result<CString, std::ffi::NulError> {
-    CString::new(bytes)
-}
-
 /// Get FileAttributes using fstatat relative to directory fd.
 /// When `resolve_names` is false, `uname`/`gname` are left as None so the
 /// caller can batch-resolve distinct uid/gids once per listing instead of
 /// once per entry (critical under NSS outage: each miss can cost ~2s).
 fn get_file_attributes_at(
-    dir_fd: libc::c_int,
+    dir_fd: BorrowedFd<'_>,
     name: &[u8],
     follow_symlinks: bool,
 ) -> Option<FileAttributes> {
@@ -63,7 +58,7 @@ fn get_file_attributes_at(
 }
 
 fn get_file_attributes_at_raw(
-    dir_fd: libc::c_int,
+    dir_fd: BorrowedFd<'_>,
     name: &[u8],
     follow_symlinks: bool,
 ) -> Option<FileAttributes> {
@@ -71,46 +66,30 @@ fn get_file_attributes_at_raw(
 }
 
 fn get_file_attributes_at_inner(
-    dir_fd: libc::c_int,
+    dir_fd: BorrowedFd<'_>,
     name: &[u8],
     follow_symlinks: bool,
     resolve_names: bool,
 ) -> Option<FileAttributes> {
-    let mut stat_buf: libc::stat = unsafe { std::mem::zeroed() };
-
-    let Ok(name_cstr) = path_cstring(name) else {
-        return None;
-    };
-
     let flags = if follow_symlinks {
-        0
+        AtFlags::empty()
     } else {
-        libc::AT_SYMLINK_NOFOLLOW
+        AtFlags::SYMLINK_NOFOLLOW
     };
 
-    let result = unsafe {
-        libc::fstatat(
-            dir_fd,
-            name_cstr.as_ptr() as *const libc::c_char,
-            &mut stat_buf,
-            flags,
-        )
-    };
-
-    if result != 0 {
-        return None;
-    }
+    // rustix accepts raw path bytes and rejects embedded NULs itself.
+    let stat_buf = rustix::fs::statat(dir_fd, name, flags).ok()?;
 
     // Determine file type from stat mode
-    let file_type = match stat_buf.st_mode & libc::S_IFMT {
-        libc::S_IFREG => FileType::File,
-        libc::S_IFDIR => FileType::Directory,
-        libc::S_IFLNK => FileType::Symlink,
-        libc::S_IFCHR => FileType::CharDevice,
-        libc::S_IFBLK => FileType::BlockDevice,
-        libc::S_IFIFO => FileType::Fifo,
-        libc::S_IFSOCK => FileType::Socket,
-        _ => FileType::Unknown,
+    let file_type = match rustix::fs::FileType::from_raw_mode(stat_buf.st_mode as _) {
+        rustix::fs::FileType::RegularFile => FileType::File,
+        rustix::fs::FileType::Directory => FileType::Directory,
+        rustix::fs::FileType::Symlink => FileType::Symlink,
+        rustix::fs::FileType::CharacterDevice => FileType::CharDevice,
+        rustix::fs::FileType::BlockDevice => FileType::BlockDevice,
+        rustix::fs::FileType::Fifo => FileType::Fifo,
+        rustix::fs::FileType::Socket => FileType::Socket,
+        rustix::fs::FileType::Unknown => FileType::Unknown,
     };
 
     // Get link target if symlink
@@ -120,21 +99,9 @@ fn get_file_attributes_at_inner(
             None
         } else {
             // Use readlinkat with the dir fd
-            let mut buf = vec![0u8; 4096];
-            let len = unsafe {
-                libc::readlinkat(
-                    dir_fd,
-                    name_cstr.as_ptr() as *const libc::c_char,
-                    buf.as_mut_ptr() as *mut libc::c_char,
-                    buf.len(),
-                )
-            };
-            if len >= 0 {
-                buf.truncate(len as usize);
-                Some(buf)
-            } else {
-                None
-            }
+            rustix::fs::readlinkat(dir_fd, name, Vec::new())
+                .ok()
+                .map(std::ffi::CString::into_bytes)
         }
     } else {
         None
@@ -201,7 +168,7 @@ pub async fn list(params: Value) -> HandlerResult {
     let results =
         tokio::task::spawn_blocking(move || list_dir_sync(&path, include_attrs, include_hidden))
             .await
-            .map_err(|e| RpcError::internal_error(format!("Task join error: {}", e)))?
+            .map_err(|e| RpcError::internal_error(format!("Task join error: {e}")))?
             .map_err(|e| map_io_error(e, &path_str))?;
 
     // Convert to array of map values with named fields
@@ -215,33 +182,17 @@ fn list_dir_sync(
     include_attrs: bool,
     include_hidden: bool,
 ) -> Result<Vec<DirEntry>, std::io::Error> {
-    // Open directory fd for fstatat
-    let dir_fd = if include_attrs {
-        let path_cstr = path_cstring(path.as_os_str().as_bytes()).map_err(|error| {
-            std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                format!("invalid path: {error}"),
-            )
-        })?;
-        let fd = unsafe {
-            libc::open(
-                path_cstr.as_ptr() as *const libc::c_char,
-                libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC,
-            )
-        };
-        if fd < 0 {
-            return Err(std::io::Error::last_os_error());
-        }
-        Some(fd)
+    // Open directory fd for fstatat.  The `OwnedFd` closes it on all exit paths.
+    let dir_handle: Option<OwnedFd> = if include_attrs {
+        Some(rustix::fs::open(
+            path,
+            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
+            Mode::empty(),
+        )?)
     } else {
         None
     };
-
-    // Close the directory descriptor on all exit paths.
-    let _fd_guard = dir_fd.map(|fd| {
-        // SAFETY: `fd` is a fresh, uniquely-owned descriptor from `libc::open`.
-        unsafe { OwnedFd::from_raw_fd(fd) }
-    });
+    let dir_fd = dir_handle.as_ref().map(AsFd::as_fd);
 
     let mut results: Vec<DirEntry> = Vec::new();
 

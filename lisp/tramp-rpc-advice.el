@@ -33,6 +33,8 @@
 
 (require 'tramp)
 (require 'msgpack)
+(require 'tramp-rpc-protocol)
+(require 'tramp-rpc-connection)
 
 ;; Functions from tramp-rpc-process.el
 (declare-function tramp-rpc--write-remote-process "tramp-rpc-process"
@@ -45,7 +47,6 @@
                   (vec pid &optional signal connection))
 
 ;; Functions from tramp-rpc.el
-(declare-function tramp-rpc--debug "tramp-rpc")
 (declare-function tramp-rpc--call "tramp-rpc")
 (declare-function tramp-rpc-file-name-p "tramp-rpc")
 (declare-function tramp-rpc--managed-file-name-p "tramp-rpc")

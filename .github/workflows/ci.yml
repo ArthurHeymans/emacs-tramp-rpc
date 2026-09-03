@@ -176,6 +176,8 @@ jobs:
             -f package-lint-batch-and-exit \
             lisp/tramp-rpc.el \
             lisp/tramp-rpc-advice.el \
+            lisp/tramp-rpc-cache.el \
+            lisp/tramp-rpc-connection.el \
             lisp/tramp-rpc-deploy.el \
             lisp/tramp-rpc-magit.el \
             lisp/tramp-rpc-process.el \
@@ -190,6 +192,8 @@ jobs:
             --eval "(dolist (file command-line-args-left) (checkdoc-file file))" \
             lisp/tramp-rpc.el \
             lisp/tramp-rpc-advice.el \
+            lisp/tramp-rpc-cache.el \
+            lisp/tramp-rpc-connection.el \
             lisp/tramp-rpc-deploy.el \
             lisp/tramp-rpc-magit.el \
             lisp/tramp-rpc-process.el \
