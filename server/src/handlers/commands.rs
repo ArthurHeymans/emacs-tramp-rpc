@@ -191,6 +191,9 @@ pub async fn run_parallel(params: Value) -> HandlerResult {
                     let mut stdin = child.stdin.take();
                     let stdout = child.stdout.take().expect("piped stdout");
                     let stderr = child.stderr.take().expect("piped stderr");
+                    let output_budget = Arc::new(super::process::RetainedOutputBudget::new(
+                        Arc::clone(&remaining),
+                    ));
                     let write_stdin = async move {
                         if let Some(data) = stdin_data
                             && let Some(mut stdin) = stdin.take()
@@ -215,12 +218,12 @@ pub async fn run_parallel(params: Value) -> HandlerResult {
                             write_stdin,
                             super::process::read_sync_output(
                                 stdout,
-                                Arc::clone(&remaining),
+                                Arc::clone(&output_budget),
                                 crate::MAX_RESPONSE_OUTPUT_BYTES,
                             ),
                             super::process::read_sync_output(
                                 stderr,
-                                remaining,
+                                Arc::clone(&output_budget),
                                 crate::MAX_RESPONSE_OUTPUT_BYTES,
                             ),
                             child.wait()
@@ -239,6 +242,7 @@ pub async fn run_parallel(params: Value) -> HandlerResult {
                     match result {
                         Ok(((), stdout, stderr, status)) => {
                             process_group.disarm();
+                            output_budget.commit();
                             msgpack_map! {
                                 "exit_code" => exit_code_from_status(status),
                                 "stdout" => Value::Binary(stdout),

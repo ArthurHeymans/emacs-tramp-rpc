@@ -25,7 +25,7 @@ use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::os::unix::process::ExitStatusExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command as StdCommand, ExitStatus, Stdio};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex as StdMutex, OnceLock};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 use tokio::process::{Child, ChildStderr, ChildStdin, ChildStdout, Command};
@@ -68,9 +68,48 @@ fn merged_output_pipe() -> std::io::Result<(Stdio, Stdio, tokio::fs::File)> {
     Ok((Stdio::from(write_fd), Stdio::from(stderr_fd), reader))
 }
 
+pub(crate) struct RetainedOutputBudget {
+    remaining: Arc<Semaphore>,
+    retained: AtomicUsize,
+    committed: AtomicBool,
+}
+
+impl RetainedOutputBudget {
+    pub(crate) fn new(remaining: Arc<Semaphore>) -> Self {
+        Self {
+            remaining,
+            retained: AtomicUsize::new(0),
+            committed: AtomicBool::new(false),
+        }
+    }
+
+    fn retain(&self, bytes: usize, output_limit: usize) -> std::io::Result<()> {
+        let permits = u32::try_from(bytes).expect("output buffer length fits in u32");
+        let permit = self.remaining.try_acquire_many(permits).map_err(|_| {
+            std::io::Error::other(format!("Process output exceeds {output_limit} byte limit"))
+        })?;
+        permit.forget();
+        self.retained.fetch_add(bytes, Ordering::Relaxed);
+        Ok(())
+    }
+
+    pub(crate) fn commit(&self) {
+        self.committed.store(true, Ordering::Relaxed);
+    }
+}
+
+impl Drop for RetainedOutputBudget {
+    fn drop(&mut self) {
+        if !self.committed.load(Ordering::Relaxed) {
+            self.remaining
+                .add_permits(self.retained.load(Ordering::Relaxed));
+        }
+    }
+}
+
 pub(crate) async fn read_sync_output<R>(
     mut reader: R,
-    remaining: Arc<Semaphore>,
+    budget: Arc<RetainedOutputBudget>,
     output_limit: usize,
 ) -> std::io::Result<Vec<u8>>
 where
@@ -83,12 +122,8 @@ where
         if read == 0 {
             return Ok(output);
         }
-        let permits = u32::try_from(read).expect("output buffer length fits in u32");
-        let permit = remaining.try_acquire_many(permits).map_err(|_| {
-            std::io::Error::other(format!("Process output exceeds {output_limit} byte limit"))
-        })?;
         // Consumed permits represent bytes retained in the response buffers.
-        permit.forget();
+        budget.retain(read, output_limit)?;
         output.extend_from_slice(&buffer[..read]);
     }
 }
@@ -455,11 +490,12 @@ async fn run_with_output_limit(params: Value, output_limit: usize) -> HandlerRes
     // intentionally per-run rather than server-wide, so admission permits up
     // to GENERAL_TASK_LIMIT concurrent allocations of this size.
     let remaining = Arc::new(Semaphore::new(output_limit));
+    let output_budget = Arc::new(RetainedOutputBudget::new(remaining));
     let result =
         if let Some(reader) = merged_reader {
             tokio::try_join!(
                 write_stdin,
-                read_sync_output(reader, remaining, output_limit),
+                read_sync_output(reader, Arc::clone(&output_budget), output_limit),
                 async {
                     child.wait().await.map_err(|e| {
                         std::io::Error::other(format!("Failed to wait for process: {e}"))
@@ -478,8 +514,8 @@ async fn run_with_output_limit(params: Value, output_limit: usize) -> HandlerRes
             };
             tokio::try_join!(
                 write_stdin,
-                read_sync_output(stdout, Arc::clone(&remaining), output_limit),
-                read_sync_output(stderr, remaining, output_limit),
+                read_sync_output(stdout, Arc::clone(&output_budget), output_limit),
+                read_sync_output(stderr, Arc::clone(&output_budget), output_limit),
                 async {
                     child.wait().await.map_err(|e| {
                         std::io::Error::other(format!("Failed to wait for process: {e}"))
@@ -497,6 +533,7 @@ async fn run_with_output_limit(params: Value, output_limit: usize) -> HandlerRes
         }
     };
     process_group.disarm();
+    output_budget.commit();
 
     // Return binary data directly (no encoding needed!)
     let exit_code = crate::protocol::exit_code_from_status(status);
@@ -2697,10 +2734,27 @@ mod tests {
 
     #[tokio::test]
     async fn synchronous_output_reader_enforces_shared_limit() {
-        let error = read_sync_output(&b"oversized"[..], Arc::new(Semaphore::new(4)), 4)
+        let budget = Arc::new(RetainedOutputBudget::new(Arc::new(Semaphore::new(4))));
+        let error = read_sync_output(&b"oversized"[..], budget, 4)
             .await
             .expect_err("output above the remaining response budget should fail");
         assert!(error.to_string().contains("output exceeds"));
+    }
+
+    #[tokio::test]
+    async fn discarded_output_restores_shared_budget() {
+        let remaining = Arc::new(Semaphore::new(16));
+        let budget = Arc::new(RetainedOutputBudget::new(Arc::clone(&remaining)));
+
+        let output = read_sync_output(&b"12345678"[..], Arc::clone(&budget), 16)
+            .await
+            .expect("output within the budget");
+        assert_eq!(output, b"12345678");
+        assert_eq!(remaining.available_permits(), 8);
+
+        drop(output);
+        drop(budget);
+        assert_eq!(remaining.available_permits(), 16);
     }
 
     #[tokio::test]
@@ -4235,7 +4289,8 @@ mod tests {
 
         let mut output = Vec::new();
         let mut exited = false;
-        for _ in 0..40 {
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+        while tokio::time::Instant::now() < deadline {
             let read = read_pty(Value::Map(vec![
                 (Value::String("pid".into()), Value::Integer(pid.into())),
                 (
@@ -4252,6 +4307,10 @@ mod tests {
             if exited {
                 break;
             }
+            // Some PTY backends report immediate readability while process
+            // teardown is still in progress; avoid exhausting a fixed poll
+            // count before the exit status becomes observable.
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
         assert!(exited);
         assert!(

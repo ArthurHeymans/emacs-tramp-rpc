@@ -245,6 +245,23 @@ fn deferred_bytes(deferred: &VecDeque<DeferredRequest>) -> usize {
     deferred.iter().map(|r| r.frame_size).sum()
 }
 
+fn enqueue_deferred(
+    deferred: &mut VecDeque<DeferredRequest>,
+    request: Request,
+    frame_size: usize,
+) -> Result<(), Box<Response>> {
+    if frame_size > DEFERRED_BYTE_LIMIT {
+        return Err(Box::new(Response::error(
+            Some(request.id),
+            RpcError::invalid_request(format!(
+                "Request frame exceeds {DEFERRED_BYTE_LIMIT} byte deferred limit"
+            )),
+        )));
+    }
+    deferred.push_back(DeferredRequest::new(request, frame_size));
+    Ok(())
+}
+
 async fn write_response<W>(writer: &Arc<Mutex<W>>, response: &Response)
 where
     W: AsyncWrite + Unpin,
@@ -553,7 +570,9 @@ async fn accept_frame<W>(
         .iter()
         .any(|queued| task_class(&queued.method) == class)
     {
-        deferred.push_back(DeferredRequest::new(request, frame_size));
+        if let Err(response) = enqueue_deferred(deferred, request, frame_size) {
+            let _ = errors.send(*response).await;
+        }
         return;
     }
 
@@ -566,14 +585,20 @@ async fn accept_frame<W>(
             Some(byte_permit) => spawn_request(tasks, request, permit, byte_permit, writer),
             None => {
                 drop(permit);
-                deferred.push_back(DeferredRequest::new(request, frame_size))
+                if let Err(response) = enqueue_deferred(deferred, request, frame_size) {
+                    let _ = errors.send(*response).await;
+                }
             }
         },
-        // Queue rather than reject.  The caller stops reading frames once the
-        // queue is full by count or bytes, so the client is throttled instead
-        // of being handed a synthetic error for a request it was entitled to
-        // make.
-        None => deferred.push_back(DeferredRequest::new(request, frame_size)),
+        // Queue rather than reject when the request fits the deferred byte
+        // limit.  An individual frame larger than the entire queue budget can
+        // never become admissible there, so reject it instead of deadlocking
+        // the connection around an unstartable request.
+        None => {
+            if let Err(response) = enqueue_deferred(deferred, request, frame_size) {
+                let _ = errors.send(*response).await;
+            }
+        }
     }
 }
 
@@ -755,6 +780,19 @@ mod tests {
         let response = errors_rx.recv().await.expect("oversized frame response");
         assert_eq!(response.error.unwrap().code, RpcError::INVALID_REQUEST);
         assert_eq!(frames_rx.recv().await, Some(vec![0xc0]));
+    }
+
+    #[test]
+    fn test_individually_oversized_request_is_not_deferred() {
+        let request = decode_request(&make_request("file.stat", Value::Nil)).unwrap();
+        let mut deferred = VecDeque::new();
+
+        let response = enqueue_deferred(&mut deferred, request, DEFERRED_BYTE_LIMIT + 1)
+            .expect_err("an individually oversized request must be rejected");
+
+        assert!(deferred.is_empty());
+        assert!(matches!(response.id, Some(RequestId::Number(1))));
+        assert_eq!(response.error.unwrap().code, RpcError::INVALID_REQUEST);
     }
 
     #[test]

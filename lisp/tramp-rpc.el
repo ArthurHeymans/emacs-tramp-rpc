@@ -4995,7 +4995,7 @@ seconds of stale metadata."
   "Non-nil when any known connection lacks push notifications.
 Set from `system.info' `watcher_available'.  Once set, metadata and Magit
 process caches use `tramp-rpc--watcher-unavailable-ttl' as a cap.  Global
-(and conservative: one degraded host shortens TTLs for all) because cache
+\\=(and conservative: one degraded host shortens TTLs for all) because cache
 validity checks do not carry connection context.")
 
 (defun tramp-rpc--note-watcher-availability (info)
