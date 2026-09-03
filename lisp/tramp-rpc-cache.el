@@ -17,14 +17,16 @@
 
 ;; This file provides the client-side metadata caches and the filesystem
 ;; watch machinery that keeps them fresh:
-;; - TTL-based `file-exists-p', `file-truename' and file.stat caches
+;; - TTL-based `file-exists-p', `file-truename' and file.stat caches, and
+;;   the file.stat to `file-attributes' conversion
 ;; - Cache invalidation for paths, subtrees and whole connections
 ;; - Watch management (add/remove/list watched directories)
 ;; - Dispatch of server-initiated fs.events notifications to cache
 ;;   invalidation and to public file-notify descriptors
 ;;
-;; Magit-specific status prefetching lives in tramp-rpc-magit.el and hooks
-;; into this module through the connection-scoped clearing functions.
+;; Magit-specific status prefetching lives in tramp-rpc-magit.el and keeps
+;; its own derived caches fresh by registering on the hooks below; this
+;; module never refers to it.
 
 ;;; Code:
 
@@ -33,34 +35,31 @@
 (require 'tramp-cache)
 (require 'tramp-rpc-protocol)
 (require 'tramp-rpc-connection)
+(require 'tramp-rpc-transport)
 
 ;; Functions from tramp-rpc.el
-(declare-function tramp-rpc--call "tramp-rpc")
-(declare-function tramp-rpc--get-connection "tramp-rpc" (vec))
-(declare-function tramp-rpc--connection-key "tramp-rpc")
-(declare-function tramp-rpc--decode-string "tramp-rpc")
 (declare-function tramp-rpc--canonical-watch-active-p "tramp-rpc")
 (declare-function tramp-rpc--file-notify-alias-paths "tramp-rpc")
 (declare-function tramp-rpc--file-notify-dispatch "tramp-rpc")
 (declare-function tramp-rpc--file-notify-dispatch-rescan "tramp-rpc")
 (declare-function tramp-rpc--watch-entry-canonical-directory "tramp-rpc")
-(declare-function tramp-rpc--clear-direnv-cache "tramp-rpc" (&optional vec))
-(declare-function tramp-rpc--flush-owned-route-connection-properties
-                  "tramp-rpc" (vec))
 
-;; Functions from tramp-rpc-magit.el
-(declare-function tramp-rpc-magit--clear-cache "tramp-rpc-magit")
-(declare-function tramp-rpc-magit--clear-ancestor-caches "tramp-rpc-magit")
-(declare-function tramp-rpc-magit--clear-ancestor-caches-for-connection
-                  "tramp-rpc-magit" (vec))
-(declare-function tramp-rpc-magit--clear-status-cache-for-connection
-                  "tramp-rpc-magit" (vec))
+;; ============================================================================
+;; Hooks into higher layers
+;; ============================================================================
 
-(defvar tramp-rpc--connections)
-(defvar tramp-rpc--exec-path-cache)
-(defvar tramp-rpc--login-shell-cache)
-(defvar tramp-rpc--watcher-degraded)
-(defvar tramp-rpc--watcher-unavailable-ttl)
+(defvar tramp-rpc-cache-invalidate-functions nil
+  "Functions called with VEC when cached file metadata for VEC is dropped.
+Run for path, subtree and connection-wide invalidation so modules deriving
+state from file metadata can drop their entries for that connection.  VEC
+is nil when every cache is cleared, regardless of connection.")
+
+(defvar tramp-rpc-fs-events-functions nil
+  "Functions called with VEC when the server reports filesystem events on VEC.
+Run before the event paths are invalidated.  Not run while
+`tramp-rpc--suppress-fs-notifications' is non-nil unless the batch contains
+a rescan, since a rescan means concrete events were lost.")
+
 
 ;; ============================================================================
 ;; Cache infrastructure
@@ -167,6 +166,37 @@ must still report symlink type for lstat."
     (dolist (key (delete-dups keys))
       (tramp-rpc--cache-put tramp-rpc--file-stat-cache key stat))))
 
+(defun tramp-rpc--convert-file-attributes (stat id-format)
+  "Convert STAT result to Emacs `file-attributes' format.
+ID-FORMAT specifies whether to use numeric or string IDs."
+  (let* ((type-str (alist-get 'type stat))
+         (type (pcase type-str
+                 ("file" nil)
+                 ("directory" t)
+                 ("symlink" (tramp-rpc--decode-string (alist-get 'link_target stat)))
+                 (_ nil)))
+         (nlinks (alist-get 'nlinks stat))
+         (uid (alist-get 'uid stat))
+         (gid (alist-get 'gid stat))
+         (uname (tramp-rpc--decode-string (alist-get 'uname stat)))
+         (gname (tramp-rpc--decode-string (alist-get 'gname stat)))
+         (atime (seconds-to-time (alist-get 'atime stat)))
+         (mtime (seconds-to-time (alist-get 'mtime stat)))
+         (ctime (seconds-to-time (alist-get 'ctime stat)))
+         (size (alist-get 'size stat))
+         (mode (tramp-file-mode-from-int (alist-get 'mode stat)))
+         (inode (alist-get 'inode stat))
+         (dev (alist-get 'dev stat)))
+    ;; Quote a symlink target which looks remote.
+    (when (and (stringp type) (tramp-tramp-file-p type))
+      (setq type (file-name-quote type 'top)))
+    ;; Return in file-attributes format
+    (list type nlinks
+          (if (eq id-format 'string) (or uname (number-to-string uid)) uid)
+          (if (eq id-format 'string) (or gname (number-to-string gid)) gid)
+          atime mtime ctime
+          size mode nil inode dev)))
+
 (defun tramp-rpc--cache-evict (cache)
   "Evict the oldest 25% of entries from CACHE."
   (let ((entries nil))
@@ -200,11 +230,11 @@ removed key and value.  Return the number of removed entries."
 
 (defun tramp-rpc--invalidate-cache-for-path (filename)
   "Invalidate cache entries for FILENAME."
-  ;; Ancestor scans are keyed by connection.  A mutation on one remote must
-  ;; not evict Magit's repository discovery results for every other remote.
+  ;; Derived caches are keyed by connection.  A mutation on one remote must
+  ;; not evict state for every other remote.
   (when (tramp-tramp-file-p filename)
     (with-parsed-tramp-file-name filename nil
-      (tramp-rpc-magit--clear-ancestor-caches-for-connection v)))
+      (run-hook-with-args 'tramp-rpc-cache-invalidate-functions v)))
   (cl-labels ((drop (candidate)
                 (remhash candidate tramp-rpc--file-exists-cache)
                 (remhash candidate tramp-rpc--file-truename-cache)
@@ -284,16 +314,15 @@ removed key and value.  Return the number of removed entries."
   (clrhash tramp-rpc--file-stat-cache))
 
 (defun tramp-rpc--clear-file-metadata-caches ()
-  "Clear cached file metadata."
+  "Clear cached file metadata for every connection."
   (clrhash tramp-rpc--file-exists-cache)
   (clrhash tramp-rpc--file-truename-cache)
   (clrhash tramp-rpc--file-stat-cache)
-  (tramp-rpc-magit--clear-ancestor-caches))
+  (run-hook-with-args 'tramp-rpc-cache-invalidate-functions nil))
 
 (defun tramp-rpc-clear-all-caches ()
   "Clear all project-owned caches and route-aware connection properties."
   (interactive)
-  (tramp-rpc-magit--clear-cache)
   (tramp-rpc--clear-file-metadata-caches)
   (tramp-rpc--clear-direnv-cache)
   (clrhash tramp-rpc--exec-path-cache)
@@ -306,10 +335,11 @@ removed key and value.  Return the number of removed entries."
    tramp-rpc--connections))
 
 (defun tramp-rpc--clear-file-caches-for-connection (vec)
-  "Clear file-exists and `file-truename' cache entries for connection VEC.
-Entries are keyed by expanded TRAMP filenames; this removes those
-matching the remote prefix of VEC."
-  (tramp-rpc-magit--clear-ancestor-caches-for-connection vec)
+  "Clear cached file metadata for connection VEC.
+Entries are keyed by expanded TRAMP filenames; this removes those matching
+the remote prefix of VEC and lets derived caches follow through
+`tramp-rpc-cache-invalidate-functions'."
+  (run-hook-with-args 'tramp-rpc-cache-invalidate-functions vec)
   (tramp-flush-directory-properties vec "/")
   (let ((prefix (tramp-make-tramp-file-name vec "/")))
     ;; Match the prefix up to the colon-slash that starts the localname.
@@ -348,17 +378,11 @@ Used during operations that will invalidate caches themselves.")
   (and (consp entry) (plist-get entry :recursive)))
 
 (defun tramp-rpc--handle-notification (process method params)
-  "Handle a server-initiated notification.
-PROCESS is the connection, METHOD is the notification method,
-PARAMS is the notification parameters."
-  (condition-case notify-error
-      (cond
-       ((string= method "fs.events")
-        (tramp-rpc--handle-fs-events process params))
-       (t
-        (tramp-rpc--debug "Unknown notification: %s" method)))
-    (error
-     (tramp-rpc--debug "notification %s failed: %S" method notify-error))))
+  "Handle the server notification METHOD with PARAMS received on PROCESS.
+Only \"fs.events\" belongs to this module; other methods are left to the
+remaining `tramp-rpc-notification-functions'."
+  (when (string= method "fs.events")
+    (tramp-rpc--handle-fs-events process params)))
 
 (defun tramp-rpc--fs-event-path (vec event key)
   "Return EVENT's KEY path as a TRAMP file name on VEC, or nil."
@@ -428,10 +452,11 @@ DIRECTORY itself returns the empty string.  Descendants can contain slashes."
                   (cl-some (lambda (event)
                              (equal (alist-get 'action event) "rescan"))
                            events))
-          ;; Git state changed on this transport, not every remote connection.
-          ;; A rescan means concrete events were lost, so it must invalidate
-          ;; status state even while ordinary notification handling is suppressed.
-          (tramp-rpc-magit--clear-status-cache-for-connection vec))
+          ;; The remote changed on this transport, not every remote
+          ;; connection.  A rescan means concrete events were lost, so it
+          ;; must be reported even while ordinary notification handling is
+          ;; suppressed.
+          (run-hook-with-args 'tramp-rpc-fs-events-functions vec))
         (let (renamed-pairs)
           ;; Linux/inotify can report the same rename as both a combined pair
           ;; and as cookie-tracked from/to events in one debounce batch.  Emacs'
@@ -586,6 +611,15 @@ When RECURSIVE is non-nil, watch subdirectories too."
         (message "Watched directories:\n%s"
                  (mapconcat #'identity watches "\n"))
       (message "No directories being watched."))))
+
+;; Keep the caches and watches consistent with transport generations, and
+;; receive server notifications.
+(add-hook 'tramp-rpc-connection-invalidate-functions
+          #'tramp-rpc--clear-file-caches-for-connection t)
+(add-hook 'tramp-rpc-transport-cleanup-functions
+          #'tramp-rpc--cleanup-watches-for-connection t)
+(add-hook 'tramp-rpc-notification-functions
+          #'tramp-rpc--handle-notification t)
 
 (provide 'tramp-rpc-cache)
 ;;; tramp-rpc-cache.el ends here

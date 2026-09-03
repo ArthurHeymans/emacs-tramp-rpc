@@ -32,42 +32,15 @@
 (require 'tramp-sh)
 (require 'tramp-rpc-protocol)
 (require 'tramp-rpc-connection)
+(require 'tramp-rpc-transport)
 
-(declare-function tramp-rpc--sudo-password-required-p "tramp-rpc")
-(declare-function tramp-rpc--sudo-read-password "tramp-rpc")
 
 ;; Silence byte-compiler warnings for variables defined in vterm
 (defvar vterm-copy-mode)
 (defvar vterm-min-window-width)
 
-;; Functions from tramp-rpc.el (loaded before us)
-(declare-function tramp-rpc--ensure-connection "tramp-rpc")
-(declare-function tramp-rpc--call "tramp-rpc" (vec method params &optional connection))
-(declare-function tramp-rpc--call-fast "tramp-rpc")
-(declare-function tramp-rpc--call-async "tramp-rpc" (vec method params callback &optional connection))
-(declare-function tramp-rpc--get-remote-login-shell "tramp-rpc")
-(declare-function tramp-rpc--process-environment "tramp-rpc")
-(declare-function tramp-rpc--binary-bytes "tramp-rpc")
-(declare-function tramp-rpc--controlmaster-socket-path "tramp-rpc")
-(declare-function tramp-rpc--hops-to-proxyjump "tramp-rpc")
-(declare-function tramp-rpc--port-to-string "tramp-rpc" (port))
-(declare-function tramp-rpc--ssh-identity-args "tramp-rpc" (user port proxyjump))
-(declare-function tramp-rpc--ssh-detail-user "tramp-rpc")
-(declare-function tramp-rpc--sudo-rpc-hop-vec "tramp-rpc")
+;; Emitted inside the autoload form in tramp-rpc.el.
 (declare-function tramp-rpc-file-name-p "tramp-rpc")
-(declare-function tramp-rpc--add-external-operation "tramp-rpc")
-(declare-function tramp-rpc--remove-external-operation "tramp-rpc")
-
-;; Variables from tramp-rpc.el
-(defvar tramp-rpc-use-direct-ssh-pty)
-(defvar tramp-rpc-use-controlmaster)
-(defvar tramp-rpc-controlmaster-persist)
-(defvar tramp-rpc-ssh-options)
-(defvar tramp-rpc-ssh-args)
-(defvar tramp-rpc-async-read-timeout-ms)
-(defvar tramp-rpc--delivering-output)
-(defvar tramp-rpc--closing-local-relay)
-(defvar tramp-rpc--process-timer-recorder)
 
 ;; ============================================================================
 ;; Process tracking state
@@ -84,6 +57,34 @@ unexpected failures remain visible in TRAMP-RPC debug output."
       (tramp-rpc--debug "best-effort cleanup failed in %S: %s"
                         ',(car body) (error-message-string err))
       nil)))
+
+(defvar tramp-rpc--delivering-output nil
+  "Non-nil while delivering process output to the local relay.
+Used by advice functions to bypass interception during output delivery.")
+
+(defvar tramp-rpc--closing-local-relay nil
+  "Non-nil while sending EOF to a local cat relay process.
+Tells the `process-send-eof' advice to call the original function
+instead of routing to the remote process.")
+
+(defcustom tramp-rpc-async-read-timeout-ms 200
+  "Timeout in milliseconds for async process reads.
+The server will block for this long waiting for data before returning.
+Lower values mean more responsive but higher CPU usage.
+Also controls process exit detection latency."
+  :type 'integer
+  :group 'tramp-rpc)
+
+(defcustom tramp-rpc-synchronous-pipe-writes nil
+  "Whether pipe process writes wait for remote acknowledgement.
+When nil, `process-send-string' and `process-send-region' enqueue ordered
+writes and return without a network round trip.  Asynchronous failures are
+reported by the next write or by a flush operation such as
+`process-send-eof'.  When non-nil, every write drains its queue before
+returning, providing immediate error reporting at the cost of one or more
+round trips."
+  :type 'boolean
+  :group 'tramp-rpc)
 
 (defvar tramp-rpc--async-processes (make-hash-table :test 'eq)
   "Hash table mapping local relay processes to their remote process info.
@@ -139,8 +140,6 @@ the next read cannot discard output waiting for relay delivery."
 (define-error 'tramp-rpc-process-write-error
   "TRAMP-RPC process write failed" 'remote-file-error)
 
-(declare-function tramp-rpc--get-connection "tramp-rpc" (vec))
-(declare-function tramp-rpc--connection-key "tramp-rpc")
 
 (defun tramp-rpc--process-write-queue-key (vec pid &optional connection)
   "Return the write queue key for VEC and remote PID.
@@ -1688,6 +1687,18 @@ Removes handlers and cleans up async processes."
   (tramp-rpc--cleanup-pty-processes)
   ;; Return nil to allow normal unload to proceed
   nil)
+
+;; Relay teardown runs from the transport's generation cleanup: remote
+;; children are signalled while the transport is still live, local relays
+;; are removed once it is dead.
+(add-hook 'tramp-rpc-transport-terminate-functions
+          #'tramp-rpc--terminate-async-processes t)
+(add-hook 'tramp-rpc-transport-terminate-functions
+          #'tramp-rpc--terminate-pty-processes t)
+(add-hook 'tramp-rpc-transport-cleanup-functions
+          #'tramp-rpc--cleanup-async-processes t)
+(add-hook 'tramp-rpc-transport-cleanup-functions
+          #'tramp-rpc--cleanup-pty-processes t)
 
 (provide 'tramp-rpc-process)
 ;;; tramp-rpc-process.el ends here

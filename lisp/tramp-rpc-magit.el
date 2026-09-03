@@ -33,23 +33,11 @@
 (require 'tramp-cache)
 (require 'tramp-rpc-protocol)
 (require 'tramp-rpc-connection)
+(require 'tramp-rpc-transport)
 (require 'tramp-rpc-cache)
 
 ;; Functions from tramp-rpc.el
-(declare-function tramp-rpc--call "tramp-rpc")
-(declare-function tramp-rpc--get-connection "tramp-rpc" (vec))
-(declare-function tramp-rpc--call-batch "tramp-rpc")
-(declare-function tramp-rpc--decode-output "tramp-rpc")
-(declare-function tramp-rpc--process-environment "tramp-rpc")
-(declare-function tramp-rpc--decode-string "tramp-rpc")
-(declare-function tramp-rpc--binary-bytes "tramp-rpc")
-(declare-function tramp-rpc--path-to-bytes "tramp-rpc")
-(declare-function tramp-rpc--path-to-compatible-value "tramp-rpc")
-(declare-function tramp-rpc--encode-path "tramp-rpc")
-(declare-function tramp-rpc--convert-file-attributes "tramp-rpc")
 (declare-function tramp-rpc-file-name-p "tramp-rpc")
-(declare-function tramp-rpc--add-external-operation "tramp-rpc")
-(declare-function tramp-rpc--remove-external-operation "tramp-rpc")
 
 ;; Functions from magit-section.el.
 (autoload 'magit-section-show "magit-section")
@@ -1157,22 +1145,28 @@ Returns t, nil, or \\='not-cached if not in cache."
        (and (consp key) (equal (car key) connection-key)))
      tramp-rpc-magit--process-caches)))
 
-(defun tramp-rpc-magit--clear-cache-for-connection (vec)
-  "Clear Magit caches belonging to the connection identified by VEC."
-  (tramp-rpc-magit--clear-status-cache-for-connection vec)
-  (tramp-rpc-magit--clear-ancestor-caches-for-connection vec))
-
 (defun tramp-rpc-magit--clear-caches-for-directory (directory)
-  "Clear Magit and file metadata caches for remote DIRECTORY only."
+  "Clear Magit and file metadata caches for remote DIRECTORY only.
+The file metadata clear also drops the ancestor scans for that connection
+through `tramp-rpc-cache-invalidate-functions'."
   (when (file-remote-p directory)
     (with-parsed-tramp-file-name directory nil
-      (tramp-rpc-magit--clear-cache-for-connection v)
+      (tramp-rpc-magit--clear-status-cache-for-connection v)
       (tramp-rpc--clear-file-caches-for-connection v))))
 
 (defun tramp-rpc-magit--clear-cache ()
   "Clear all magit-related caches."
   (clrhash tramp-rpc-magit--process-caches)
   (tramp-rpc-magit--clear-ancestor-caches))
+
+(defun tramp-rpc-magit--cache-invalidated (vec)
+  "Drop Magit caches derived from file metadata that was invalidated.
+Ancestor scans are computed from marker-file metadata, so they go with it
+for VEC's connection.  A nil VEC means every cache is being cleared, so
+all Magit caches go, including prefetched status."
+  (if vec
+      (tramp-rpc-magit--clear-ancestor-caches-for-connection vec)
+    (tramp-rpc-magit--clear-cache)))
 
 ;; ============================================================================
 ;; Lazy Magit section expansion
@@ -1405,6 +1399,16 @@ Removes handlers."
   (tramp-rpc-projectile-disable)
   ;; Return nil to allow normal unload to proceed
   nil)
+
+;; Prefetched status output is keyed by connection and stale as soon as the
+;; server reports a change or the connection is retired.  Ancestor scans
+;; follow the file metadata they were derived from.
+(add-hook 'tramp-rpc-connection-invalidate-functions
+          #'tramp-rpc-magit--clear-status-cache-for-connection t)
+(add-hook 'tramp-rpc-fs-events-functions
+          #'tramp-rpc-magit--clear-status-cache-for-connection t)
+(add-hook 'tramp-rpc-cache-invalidate-functions
+          #'tramp-rpc-magit--cache-invalidated t)
 
 (provide 'tramp-rpc-magit)
 ;;; tramp-rpc-magit.el ends here

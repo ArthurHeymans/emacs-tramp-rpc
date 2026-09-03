@@ -179,9 +179,11 @@ jobs:
             lisp/tramp-rpc-cache.el \
             lisp/tramp-rpc-connection.el \
             lisp/tramp-rpc-deploy.el \
+            lisp/tramp-rpc-hops.el \
             lisp/tramp-rpc-magit.el \
             lisp/tramp-rpc-process.el \
-            lisp/tramp-rpc-protocol.el
+            lisp/tramp-rpc-protocol.el \
+            lisp/tramp-rpc-transport.el
 
       - name: Check documentation strings
         run: |
@@ -195,9 +197,11 @@ jobs:
             lisp/tramp-rpc-cache.el \
             lisp/tramp-rpc-connection.el \
             lisp/tramp-rpc-deploy.el \
+            lisp/tramp-rpc-hops.el \
             lisp/tramp-rpc-magit.el \
             lisp/tramp-rpc-process.el \
-            lisp/tramp-rpc-protocol.el
+            lisp/tramp-rpc-protocol.el \
+            lisp/tramp-rpc-transport.el
 
       - name: Check function declarations
         run: |

@@ -5,7 +5,7 @@
 (require 'cl-lib)
 (require 'tramp-rpc)
 
-(declare-function tramp-rpc--invalidate-timed-out-connection "tramp-rpc"
+(declare-function tramp-rpc--invalidate-timed-out-connection "tramp-rpc-transport"
                   (process vec event))
 (declare-function tramp-rpc-mock-test--wait-for "tramp-rpc-mock-tests"
                   (predicate description &optional process))
@@ -98,7 +98,7 @@ SPEC is (PROCESS BUFFER [CONNECTION]); CONNECTION defaults to `connection'."
                 ((symbol-function 'tramp-rpc--cleanup-file-notify-for-connection) #'ignore)
                 ((symbol-function 'tramp-rpc--clear-direnv-cache) #'ignore)
                 ((symbol-function 'tramp-rpc--clear-file-caches-for-connection) #'ignore)
-                ((symbol-function 'tramp-rpc-magit--clear-cache-for-connection) #'ignore)
+                ((symbol-function 'tramp-rpc-magit--clear-status-cache-for-connection) #'ignore)
                 ((symbol-function 'tramp-rpc--cleanup-controlmaster-unlocked) #'ignore))
         (should (eq (condition-case nil
                         (progn
@@ -133,7 +133,7 @@ SPEC is (PROCESS BUFFER [CONNECTION]); CONNECTION defaults to `connection'."
                 ((symbol-function 'tramp-rpc--cleanup-file-notify-for-connection) #'ignore)
                 ((symbol-function 'tramp-rpc--clear-direnv-cache) #'ignore)
                 ((symbol-function 'tramp-rpc--clear-file-caches-for-connection) #'ignore)
-                ((symbol-function 'tramp-rpc-magit--clear-cache-for-connection) #'ignore)
+                ((symbol-function 'tramp-rpc-magit--clear-status-cache-for-connection) #'ignore)
                 ((symbol-function 'tramp-rpc--cleanup-controlmaster-unlocked) #'ignore))
         (should
          (eq (condition-case nil
@@ -222,7 +222,7 @@ SPEC is (PROCESS BUFFER [CONNECTION]); CONNECTION defaults to `connection'."
                 ((symbol-function 'tramp-rpc--cleanup-file-notify-for-connection) #'ignore)
                 ((symbol-function 'tramp-rpc--clear-direnv-cache) #'ignore)
                 ((symbol-function 'tramp-rpc--clear-file-caches-for-connection) #'ignore)
-                ((symbol-function 'tramp-rpc-magit--clear-cache-for-connection) #'ignore)
+                ((symbol-function 'tramp-rpc-magit--clear-status-cache-for-connection) #'ignore)
                 ((symbol-function 'tramp-rpc--cleanup-controlmaster-unlocked)
                  (lambda (cleaned-vec)
                    (setq controlmaster-cleaned cleaned-vec))))
@@ -306,7 +306,7 @@ SPEC is (PROCESS BUFFER [CONNECTION]); CONNECTION defaults to `connection'."
                       ((symbol-function 'tramp-rpc--clear-direnv-cache) #'ignore)
                       ((symbol-function 'tramp-rpc--clear-file-caches-for-connection)
                        #'ignore)
-                      ((symbol-function 'tramp-rpc-magit--clear-cache-for-connection)
+                      ((symbol-function 'tramp-rpc-magit--clear-status-cache-for-connection)
                        #'ignore)
                       ((symbol-function 'tramp-rpc--controlmaster-socket-path)
                        (lambda (_v) "/tmp/tramp-rpc-mock-shared-socket"))

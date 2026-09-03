@@ -35,29 +35,14 @@
 (require 'msgpack)
 (require 'tramp-rpc-protocol)
 (require 'tramp-rpc-connection)
-
-;; Functions from tramp-rpc-process.el
-(declare-function tramp-rpc--write-remote-process "tramp-rpc-process"
-                  (vec pid data &optional owner-process))
-(declare-function tramp-rpc--drain-write-queue "tramp-rpc-process")
-(declare-function tramp-rpc--encode-process-input "tramp-rpc-process")
-(declare-function tramp-rpc--close-remote-stdin "tramp-rpc-process"
-                  (vec pid &optional owner-process))
-(declare-function tramp-rpc--kill-remote-process "tramp-rpc-process"
-                  (vec pid &optional signal connection))
+(require 'tramp-rpc-hops)
+(require 'tramp-rpc-transport)
+(require 'tramp-rpc-process)
 
 ;; Functions from tramp-rpc.el
-(declare-function tramp-rpc--call "tramp-rpc")
 (declare-function tramp-rpc-file-name-p "tramp-rpc")
-(declare-function tramp-rpc--managed-file-name-p "tramp-rpc")
-(declare-function tramp-rpc--add-external-operation "tramp-rpc")
-(declare-function tramp-rpc--remove-external-operation "tramp-rpc")
 
 ;; Variables from tramp-rpc.el / tramp-rpc-process.el
-(defvar tramp-rpc--delivering-output)
-(defvar tramp-rpc--closing-local-relay)
-(defvar tramp-rpc--async-processes)
-(defvar tramp-rpc-synchronous-pipe-writes)
 
 ;; Functions from vc-dispatcher.el (used by vc-exec-after handler)
 (declare-function vc-exec-after "vc-dispatcher")

@@ -27,6 +27,16 @@
 
 (declare-function tramp-message "tramp-message")
 
+(defun tramp-rpc--add-external-operation (&rest args)
+  "Call `tramp-add-external-operation' with ARGS when available."
+  (when (fboundp 'tramp-add-external-operation)
+    (apply (symbol-function 'tramp-add-external-operation) args)))
+
+(defun tramp-rpc--remove-external-operation (&rest args)
+  "Call `tramp-remove-external-operation' with ARGS when available."
+  (when (fboundp 'tramp-remove-external-operation)
+    (apply (symbol-function 'tramp-remove-external-operation) args)))
+
 (defgroup tramp-rpc nil
   "TRAMP backend using RPC."
   :group 'tramp)
@@ -302,6 +312,84 @@ Returns a list where each element is either:
                         :data (alist-get 'data error-obj))
                 (alist-get 'result result-obj)))
             results-array)))
+
+;; ============================================================================
+;; MessagePack value helpers
+;; ============================================================================
+
+(defun tramp-rpc--decode-string (data)
+  "Decode binary DATA to a multibyte UTF-8 string.
+MessagePack `bin' values carry bytes; MessagePack `str' values are already
+text strings.  Returns nil if DATA is nil."
+  (cond
+   ((null data) nil)
+   ((msgpack-bin-p data)
+    (decode-coding-string (msgpack-bin-string data) 'utf-8-unix))
+   ((stringp data) data)
+   (t data)))
+
+(defun tramp-rpc--binary-bytes (data)
+  "Return raw bytes from DATA, unwrapping MessagePack bin values."
+  (cond
+   ((msgpack-bin-p data) (msgpack-bin-string data))
+   ((and (stringp data) (multibyte-string-p data))
+    (encode-coding-string data 'utf-8-unix))
+   (t data)))
+
+(defun tramp-rpc--decode-output (data)
+  "Decode binary process DATA as UTF-8.
+This helper is for synchronous command/file paths.  Async relays keep their
+bytes raw and let the relay process decoder handle incremental output.
+The server never reports a process output encoding, so UTF-8 is assumed,
+matching `tramp-sh' behavior for command output."
+  (if data
+      (decode-coding-string (tramp-rpc--binary-bytes data) 'utf-8-unix)
+    ""))
+
+(defun tramp-rpc--decode-filename (entry)
+  "Get filename from directory ENTRY.
+With MessagePack, filenames come as raw bytes - decode to UTF-8."
+  (tramp-rpc--decode-string (alist-get 'name entry)))
+
+(defun tramp-rpc--path-to-bytes (path)
+  "Convert PATH to a unibyte string for MessagePack transmission.
+Handles both multibyte UTF-8 strings and unibyte byte strings.
+Strips Emacs file-name quoting (the /: prefix) before sending to
+the server, since the remote side does not understand it."
+  (let ((unquoted (file-name-unquote path)))
+    (if (multibyte-string-p unquoted)
+        (encode-coding-string unquoted 'utf-8-unix)
+      unquoted)))
+
+(defun tramp-rpc--path-to-string (path)
+  "Return unquoted PATH as a text string for RPC fields typed as strings."
+  (let ((unquoted (file-name-unquote path)))
+    (if (multibyte-string-p unquoted)
+        unquoted
+      (decode-coding-string unquoted 'utf-8-unix))))
+
+(defun tramp-rpc--path-to-bin (path)
+  "Return PATH as an explicit MessagePack bin value."
+  (msgpack-bin-make (tramp-rpc--path-to-bytes path)))
+
+(defun tramp-rpc--path-to-compatible-value (path)
+  "Return PATH as text when UTF-8-compatible, otherwise MessagePack binary.
+Using text for ordinary paths preserves compatibility with older servers whose
+path parameters predate binary-path support."
+  (let* ((bytes (tramp-rpc--path-to-bytes path))
+         (decoded (decode-coding-string bytes 'utf-8-unix)))
+    (if (and (cl-every (lambda (char)
+                         (not (eq (char-charset char) 'eight-bit)))
+                       decoded)
+             (equal bytes (encode-coding-string decoded 'utf-8-unix)))
+        decoded
+      (msgpack-bin-make bytes))))
+
+(defun tramp-rpc--encode-path (path)
+  "Encode PATH for transmission to path-or-bytes server parameters.
+Returns an alist with PATH as an explicit MessagePack bin value."
+  `((path . ,(tramp-rpc--path-to-bin path))))
+
 
 (provide 'tramp-rpc-protocol)
 ;;; tramp-rpc-protocol.el ends here
