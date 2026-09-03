@@ -54,6 +54,7 @@ async fn system_info() -> HandlerResult {
         "os" => std::env::consts::OS,
         "arch" => std::env::consts::ARCH,
         "watcher" => watcher_kind(),
+        "watcher_available" => Value::Boolean(crate::watcher::is_active()),
         "max_read_chunk_bytes" => io::MAX_FILE_READ_CHUNK_BYTES as u64,
         "hostname" => hostname(),
         "uid" => getuid().as_raw(),

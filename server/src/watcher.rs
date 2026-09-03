@@ -37,14 +37,31 @@ const MAX_DEBOUNCE_EVENTS: usize = 8192;
 /// Global WatchManager instance, initialized in main().
 static WATCH_MANAGER: OnceLock<Arc<WatchManager>> = OnceLock::new();
 
+/// Whether the global watcher actually initialized.  `system.info.watcher`
+/// previously reported `RecommendedWatcher::kind()` even when `init` failed,
+/// so the client could not reliably shorten caches.  This tracks reality.
+static WATCHER_ACTIVE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 /// Get the global WatchManager, if initialized.
 pub fn get() -> Option<&'static Arc<WatchManager>> {
     WATCH_MANAGER.get()
 }
 
+/// Whether filesystem push notifications are actually running.
+pub fn is_active() -> bool {
+    WATCHER_ACTIVE.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// Initialize the global WatchManager. Called once from main().
 pub fn init(manager: Arc<WatchManager>) {
     let _ = WATCH_MANAGER.set(manager);
+    WATCHER_ACTIVE.store(true, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Record that watcher initialization failed; client should treat caches as
+/// TTL-only without push invalidation.
+pub fn set_unavailable() {
+    WATCHER_ACTIVE.store(false, std::sync::atomic::Ordering::Relaxed);
 }
 
 /// Helper to lock a std::sync::Mutex, recovering from poisoning.

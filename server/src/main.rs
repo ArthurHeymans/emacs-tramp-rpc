@@ -19,10 +19,27 @@ use protocol::{Request, RequestId, Response, RpcError};
 use rmpv::Value;
 use std::collections::VecDeque;
 use std::io::Cursor;
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufWriter};
 use tokio::sync::{Mutex, OwnedSemaphorePermit, Semaphore, mpsc};
 use tokio::task::JoinSet;
+
+/// Global byte budget for active request params.  Slot admission alone bounds
+/// task count (16 general), but each active request retains its decoded params
+/// (including stdin blobs up to 100MiB).  Without byte admission, 16 large
+/// active requests could retain ~1.6GiB.  This semaphore bounds retained
+/// active params; permits are held for the task lifetime alongside slot
+/// permits.  Deferred (queued) params are bounded separately by
+/// `DEFERRED_BYTE_LIMIT`; see below.
+static ACTIVE_PARAM_BYTES: LazyLock<Arc<Semaphore>> =
+    LazyLock::new(|| Arc::new(Semaphore::new(128 * 1024 * 1024)));
+
+fn try_acquire_param_bytes(size: usize) -> Option<OwnedSemaphorePermit> {
+    let permits = u32::try_from(size).ok()?;
+    Arc::clone(&ACTIVE_PARAM_BYTES)
+        .try_acquire_many_owned(permits)
+        .ok()
+}
 
 pub(crate) const MAX_FRAME_SIZE: usize = 100 * 1024 * 1024;
 pub(crate) const MAX_RESPONSE_OUTPUT_BYTES: usize = MAX_FRAME_SIZE - 1024 * 1024;
@@ -37,6 +54,22 @@ const PTY_WRITE_TASK_LIMIT: usize = 16;
 /// error would just surface as a spurious `remote-file-error' in the middle
 /// of an ordinary file operation.
 const DEFERRED_REQUEST_LIMIT: usize = 64;
+/// Byte budget for decoded-but-not-yet-started requests.  The deferred queue
+/// retains full request params (including `process.run' stdin blobs), so a
+/// count-only bound can retain ~64 x 100MiB ~= 6.4GiB.  Ordinary traffic
+/// (KB-sized requests) stays governed by the count limit; large frames hit
+/// this byte limit first and apply backpressure via the bounded frame channel
+/// and OS pipe.
+///
+/// Bound note: the check runs before receiving the next frame, so the queue
+/// can overshoot by one frame plus up to FRAME_CHANNEL_SIZE in-flight frames.
+/// Worst queued ~= LIMIT + 3 x MAX_FRAME.  With 32MiB this is ~332MiB, far
+/// below the unbounded 6.4GiB.  Active params are separately bounded by
+/// ACTIVE_PARAM_BYTES (128MiB); active response buffers remain per-request
+/// bounded (MAX_RESPONSE_OUTPUT_BYTES each, 16 max) and require the trusted
+/// client to request 16 concurrent large outputs — mitigated by per-command
+/// timeouts and the per-batch shared output budget.
+const DEFERRED_BYTE_LIMIT: usize = 32 * 1024 * 1024;
 const ERROR_RESPONSE_CHANNEL_SIZE: usize = 16;
 const EOF_TASK_JOIN_WAIT: std::time::Duration = std::time::Duration::from_millis(500);
 
@@ -175,6 +208,60 @@ fn request_permit_count(method: &str) -> usize {
     }
 }
 
+/// A decoded request retained in the deferred queue, with its wire size.
+/// `frame_size` approximates retained params (including stdin blobs) so the
+/// queue can be byte-bounded, not just count-bounded.
+struct DeferredRequest {
+    request: Request,
+    frame_size: usize,
+}
+
+impl DeferredRequest {
+    fn new(request: Request, frame_size: usize) -> Self {
+        Self {
+            request,
+            frame_size,
+        }
+    }
+
+    /// Test-only constructor with zero wire size (no byte-budget impact).
+    #[cfg(test)]
+    fn for_test(request: Request) -> Self {
+        Self {
+            request,
+            frame_size: 0,
+        }
+    }
+}
+
+impl std::ops::Deref for DeferredRequest {
+    type Target = Request;
+    fn deref(&self) -> &Self::Target {
+        &self.request
+    }
+}
+
+fn deferred_bytes(deferred: &VecDeque<DeferredRequest>) -> usize {
+    deferred.iter().map(|r| r.frame_size).sum()
+}
+
+fn enqueue_deferred(
+    deferred: &mut VecDeque<DeferredRequest>,
+    request: Request,
+    frame_size: usize,
+) -> Result<(), Box<Response>> {
+    if frame_size > DEFERRED_BYTE_LIMIT {
+        return Err(Box::new(Response::error(
+            Some(request.id),
+            RpcError::invalid_request(format!(
+                "Request frame exceeds {DEFERRED_BYTE_LIMIT} byte deferred limit"
+            )),
+        )));
+    }
+    deferred.push_back(DeferredRequest::new(request, frame_size));
+    Ok(())
+}
+
 async fn write_response<W>(writer: &Arc<Mutex<W>>, response: &Response)
 where
     W: AsyncWrite + Unpin,
@@ -203,13 +290,17 @@ fn spawn_request<W>(
     tasks: &mut JoinSet<()>,
     request: Request,
     permit: OwnedSemaphorePermit,
+    byte_permit: OwnedSemaphorePermit,
     writer: &Arc<Mutex<W>>,
 ) where
     W: AsyncWrite + Unpin + Send + 'static,
 {
     let writer = Arc::clone(writer);
     tasks.spawn(async move {
+        // Hold both the slot permit and the param-byte permit for the task
+        // lifetime, bounding active retained params to ACTIVE_PARAM_BYTES.
         let _permit = permit;
+        let _byte_permit = byte_permit;
         #[cfg(test)]
         let panic_after_response = request.method == "test.panic";
         let response = handlers::dispatch(request).await;
@@ -248,7 +339,7 @@ where
 
     let mut tasks: JoinSet<()> = JoinSet::new();
     let admissions = Admissions::default();
-    let mut deferred: VecDeque<Request> = VecDeque::new();
+    let mut deferred: VecDeque<DeferredRequest> = VecDeque::new();
     let mut general_bypass_budget = None;
 
     loop {
@@ -259,10 +350,11 @@ where
             &admissions,
             &mut general_bypass_budget,
         );
-        // Stop pulling frames while the backlog is full.  The bounded frame
-        // channel then stops draining the pipe, which is the throttle the
-        // client can actually observe.
-        let accepting = deferred.len() < DEFERRED_REQUEST_LIMIT;
+        // Stop pulling frames while the backlog is full by count or bytes.
+        // The bounded frame channel then stops draining the pipe, which is
+        // the throttle the client can actually observe.
+        let accepting = deferred.len() < DEFERRED_REQUEST_LIMIT
+            && deferred_bytes(&deferred) < DEFERRED_BYTE_LIMIT;
 
         if tasks.is_empty() {
             if !accepting {
@@ -341,7 +433,7 @@ async fn drain_tasks_for(tasks: &mut JoinSet<()>, wait: std::time::Duration) {
 /// already-arriving one-permit work once, but are then reserved as they return,
 /// preventing both head-of-line idling and indefinite batch starvation.
 fn start_admissible<W>(
-    deferred: &mut VecDeque<Request>,
+    deferred: &mut VecDeque<DeferredRequest>,
     tasks: &mut JoinSet<()>,
     writer: &Arc<Mutex<W>>,
     admissions: &Admissions,
@@ -353,24 +445,37 @@ fn start_admissible<W>(
     let mut general_waiting = false;
     let mut control_blocked = false;
     let mut pty_write_blocked = false;
-    while let Some(request) = deferred.pop_front() {
+    while let Some(deferred_req) = deferred.pop_front() {
+        let request = deferred_req.request;
         let class = task_class(&request.method);
         let permit_count = request_permit_count(&request.method);
+        // Re-wrap for potential re-queue, preserving the wire size.
+        let rewrap = |request: Request| DeferredRequest::new(request, deferred_req.frame_size);
 
         if class == TaskClass::General && general_waiting {
             let Some(budget) = general_bypass_budget.as_mut() else {
-                still_deferred.push_back(request);
+                still_deferred.push_back(rewrap(request));
                 continue;
             };
             if permit_count > *budget {
-                still_deferred.push_back(request);
+                still_deferred.push_back(rewrap(request));
                 continue;
             }
             if let Some(permit) = admissions.try_acquire_many(class, permit_count) {
-                *budget -= permit_count;
-                spawn_request(tasks, request, permit, writer);
+                match try_acquire_param_bytes(deferred_req.frame_size) {
+                    Some(byte_permit) => {
+                        *budget -= permit_count;
+                        spawn_request(tasks, request, permit, byte_permit, writer);
+                    }
+                    None => {
+                        // Slot released on drop; byte budget is the binding
+                        // constraint.  Requeue and keep waiting.
+                        drop(permit);
+                        still_deferred.push_back(rewrap(request));
+                    }
+                }
             } else {
-                still_deferred.push_back(request);
+                still_deferred.push_back(rewrap(request));
             }
             continue;
         }
@@ -381,16 +486,39 @@ fn start_admissible<W>(
             TaskClass::PtyWrite => pty_write_blocked,
         };
         if blocked {
-            still_deferred.push_back(request);
+            still_deferred.push_back(rewrap(request));
             continue;
         }
 
         match admissions.try_acquire_many(class, permit_count) {
             Some(permit) => {
-                if class == TaskClass::General && permit_count > 1 {
-                    *general_bypass_budget = None;
+                match try_acquire_param_bytes(deferred_req.frame_size) {
+                    Some(byte_permit) => {
+                        if class == TaskClass::General && permit_count > 1 {
+                            *general_bypass_budget = None;
+                        }
+                        spawn_request(tasks, request, permit, byte_permit, writer);
+                    }
+                    None => {
+                        // Byte budget bound active params; release the slot and
+                        // treat like slot exhaustion so backpressure applies.
+                        drop(permit);
+                        if class == TaskClass::General && permit_count > 1 {
+                            if general_bypass_budget.is_none() {
+                                *general_bypass_budget =
+                                    Some(admissions.available_permits(TaskClass::General));
+                            }
+                            general_waiting = true;
+                        } else {
+                            match class {
+                                TaskClass::General => general_waiting = true,
+                                TaskClass::Control => control_blocked = true,
+                                TaskClass::PtyWrite => pty_write_blocked = true,
+                            }
+                        }
+                        still_deferred.push_back(rewrap(request));
+                    }
                 }
-                spawn_request(tasks, request, permit, writer);
             }
             None => {
                 if class == TaskClass::General && permit_count > 1 {
@@ -406,7 +534,7 @@ fn start_admissible<W>(
                         TaskClass::PtyWrite => pty_write_blocked = true,
                     }
                 }
-                still_deferred.push_back(request);
+                still_deferred.push_back(rewrap(request));
             }
         }
     }
@@ -415,7 +543,7 @@ fn start_admissible<W>(
 
 async fn accept_frame<W>(
     payload: Vec<u8>,
-    deferred: &mut VecDeque<Request>,
+    deferred: &mut VecDeque<DeferredRequest>,
     admissions: &Admissions,
     tasks: &mut JoinSet<()>,
     writer: &Arc<Mutex<W>>,
@@ -423,8 +551,10 @@ async fn accept_frame<W>(
 ) where
     W: AsyncWrite + Unpin + Send + 'static,
 {
-    // Decode and validate before spawning.  This lets the frame Vec be freed
-    // before a handler awaits, while retaining the request params it needs.
+    // Decode and validate before spawning.  The frame Vec is freed after
+    // decode, but retained params (e.g. stdin blobs) keep ~payload.len()
+    // bytes alive, so track the wire size for byte-bounded backpressure.
+    let frame_size = payload.len();
     let request = match decode_request(&payload) {
         Ok(request) => request,
         Err(response) => {
@@ -440,18 +570,35 @@ async fn accept_frame<W>(
         .iter()
         .any(|queued| task_class(&queued.method) == class)
     {
-        deferred.push_back(request);
+        if let Err(response) = enqueue_deferred(deferred, request, frame_size) {
+            let _ = errors.send(*response).await;
+        }
         return;
     }
 
     // A batch reserves its full subrequest concurrency from the shared general
     // admission bound, so concurrent batches cannot multiply that limit.
+    // Active params are additionally byte-bounded: a slot without byte budget
+    // defers, so 16 large active requests cannot retain ~1.6GiB.
     match admissions.try_acquire_many(class, request_permit_count(&request.method)) {
-        Some(permit) => spawn_request(tasks, request, permit, writer),
-        // Queue rather than reject.  The caller stops reading frames once the
-        // queue is full, so the client is throttled instead of being handed a
-        // synthetic error for a request it was entitled to make.
-        None => deferred.push_back(request),
+        Some(permit) => match try_acquire_param_bytes(frame_size) {
+            Some(byte_permit) => spawn_request(tasks, request, permit, byte_permit, writer),
+            None => {
+                drop(permit);
+                if let Err(response) = enqueue_deferred(deferred, request, frame_size) {
+                    let _ = errors.send(*response).await;
+                }
+            }
+        },
+        // Queue rather than reject when the request fits the deferred byte
+        // limit.  An individual frame larger than the entire queue budget can
+        // never become admissible there, so reject it instead of deadlocking
+        // the connection around an unstartable request.
+        None => {
+            if let Err(response) = enqueue_deferred(deferred, request, frame_size) {
+                let _ = errors.send(*response).await;
+            }
+        }
     }
 }
 
@@ -460,12 +607,15 @@ async fn main() -> std::process::ExitCode {
     let stdout: WriterHandle = Arc::new(Mutex::new(BufWriter::new(tokio::io::stdout())));
 
     // Initialize the filesystem watcher for cache invalidation notifications.
-    // If this fails (e.g. inotify not available), we continue without watching.
+    // If this fails (e.g. inotify not available), we continue without watching
+    // but record the state so `system.info` reports actual availability
+    // instead of just the compiled backend kind.
     // NOTE: Do NOT use eprintln! here or anywhere in the server -- SSH forwards
     // the remote process's stderr over the same pipe to Emacs, where it gets
     // mixed with the binary msgpack protocol on stdout and corrupts framing.
-    if let Ok(manager) = watcher::WatchManager::new(Arc::clone(&stdout)) {
-        watcher::init(manager);
+    match watcher::WatchManager::new(Arc::clone(&stdout)) {
+        Ok(manager) => watcher::init(manager),
+        Err(_) => watcher::set_unavailable(),
     }
 
     match run_connection(
@@ -633,6 +783,19 @@ mod tests {
     }
 
     #[test]
+    fn test_individually_oversized_request_is_not_deferred() {
+        let request = decode_request(&make_request("file.stat", Value::Nil)).unwrap();
+        let mut deferred = VecDeque::new();
+
+        let response = enqueue_deferred(&mut deferred, request, DEFERRED_BYTE_LIMIT + 1)
+            .expect_err("an individually oversized request must be rejected");
+
+        assert!(deferred.is_empty());
+        assert!(matches!(response.id, Some(RequestId::Number(1))));
+        assert_eq!(response.error.unwrap().code, RpcError::INVALID_REQUEST);
+    }
+
+    #[test]
     fn test_batches_reserve_shared_general_admission() {
         let admissions = Admissions::default();
         let mut permits = Vec::new();
@@ -668,36 +831,36 @@ mod tests {
             )
             .expect("hold all but three general permits");
         let mut deferred = VecDeque::from([
-            Request {
+            DeferredRequest::for_test(Request {
                 version: "2.0".into(),
                 id: RequestId::Number(1),
                 method: "batch".into(),
                 params: Value::Nil,
-            },
-            Request {
+            }),
+            DeferredRequest::for_test(Request {
                 version: "2.0".into(),
                 id: RequestId::Number(2),
                 method: "process.status".into(),
                 params: Value::Nil,
-            },
-            Request {
+            }),
+            DeferredRequest::for_test(Request {
                 version: "2.0".into(),
                 id: RequestId::Number(3),
                 method: "process.status".into(),
                 params: Value::Nil,
-            },
-            Request {
+            }),
+            DeferredRequest::for_test(Request {
                 version: "2.0".into(),
                 id: RequestId::Number(4),
                 method: "process.status".into(),
                 params: Value::Nil,
-            },
-            Request {
+            }),
+            DeferredRequest::for_test(Request {
                 version: "2.0".into(),
                 id: RequestId::Number(5),
                 method: "process.status".into(),
                 params: Value::Nil,
-            },
+            }),
         ]);
         let writer = Arc::new(Mutex::new(tokio::io::sink()));
         let mut tasks = JoinSet::new();
@@ -728,12 +891,12 @@ mod tests {
                 GENERAL_TASK_LIMIT - handlers::BATCH_CONCURRENCY + 1,
             )
             .expect("hold all but three general permits");
-        let mut deferred = VecDeque::from([Request {
+        let mut deferred = VecDeque::from([DeferredRequest::for_test(Request {
             version: "2.0".into(),
             id: RequestId::Number(1),
             method: "batch".into(),
             params: Value::Nil,
-        }]);
+        })]);
         let writer = Arc::new(Mutex::new(tokio::io::sink()));
         let mut tasks = JoinSet::new();
         let mut bypass_budget = None;
