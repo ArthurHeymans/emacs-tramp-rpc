@@ -66,12 +66,15 @@
 (defconst tramp-rpc-method "rpc"
   "TRAMP method for RPC-based remote access.")
 
+(eval-when-compile
+  ;; Compile the deferred registration against TRAMP's real declarations
+  ;; without loading TRAMP when the generated autoload file is evaluated.
+  (require 'tramp))
+
 ;;;###autoload
-(eval-and-compile
-  ;; The autoload file must initialize TRAMP before registering the method.
-  ;; This avoids deferred definitions and lets the byte compiler validate every
-  ;; TRAMP variable and function referenced by the registration code.
-  (require 'tramp)
+(progn
+  (defun tramp-rpc--autoload-register ()
+    "Register TRAMP-RPC after TRAMP has initialized."
   ;; Check, that `tramp-rpc-method' is still bound.  It isn't after
   ;; unloading `tramp-rpc', but this body still exists as compiled
   ;; function in `after-load-alist'.
@@ -91,8 +94,8 @@
   ;;   /rpc:host|su::/path or /rpc:host|docker:container:/path, are
   ;;   handled by tramp-sh, which logs in through the rpc hop as if it
   ;;   were ssh (issue #99).  That happens without ever loading
-  ;;   tramp-rpc.el, so the full parameter set must be installed here at
-  ;;   autoload time, not when the main file is loaded.  RPC-to-RPC
+  ;;   tramp-rpc.el, so the full parameter set must be installed here when
+  ;;   TRAMP loads, not when the main file is loaded.  RPC-to-RPC
   ;;   chains remain RPC-backed.
   ;; This is future-proof: if ssh's parameters change in future TRAMP
   ;; versions, rpc automatically inherits the updates.
@@ -214,6 +217,12 @@ This is called from `tramp-multi-hop-p-hook'."
                (string= (tramp-file-name-method hop-vec) tramp-rpc-method)
                (string= (tramp-file-name-host hop-vec) target-host)))))
   (add-hook 'tramp-multi-hop-p-hook #'tramp-rpc-multi-hop-p)))
+
+  ;; TRAMP runs `tramp--startup-hook' after its methods and handlers are
+  ;; initialized.  If TRAMP was loaded first, register immediately instead.
+  (if (featurep 'tramp)
+      (tramp-rpc--autoload-register)
+    (add-hook 'tramp--startup-hook #'tramp-rpc--autoload-register)))
 
 ;; Now the actual implementation
 (require 'cl-lib)
