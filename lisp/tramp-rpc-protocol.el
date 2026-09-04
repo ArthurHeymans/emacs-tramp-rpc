@@ -3,8 +3,8 @@
 ;; Copyright (C) 2026 Arthur Heymans <arthur@aheymans.xyz>
 
 ;; Author: Arthur Heymans <arthur@aheymans.xyz>
+;; Assisted-by: various LLMs
 ;; Keywords: comm, processes
-;; Package-Requires: ((emacs "30.1") (msgpack "0.1.1"))
 
 ;; This file is part of tramp-rpc.
 
@@ -27,11 +27,70 @@
 
 (declare-function tramp-message "tramp-message")
 
+(defun tramp-rpc--add-external-operation (&rest args)
+  "Call `tramp-add-external-operation' with ARGS when available."
+  (when (fboundp 'tramp-add-external-operation)
+    (apply (symbol-function 'tramp-add-external-operation) args)))
+
+(defun tramp-rpc--remove-external-operation (&rest args)
+  "Call `tramp-remove-external-operation' with ARGS when available."
+  (when (fboundp 'tramp-remove-external-operation)
+    (apply (symbol-function 'tramp-remove-external-operation) args)))
+
+(defgroup tramp-rpc nil
+  "TRAMP backend using RPC."
+  :group 'tramp)
+
+(defcustom tramp-rpc-debug nil
+  "When non-nil, log debug messages to *tramp-rpc-debug* buffer.
+Set to t to enable debugging for hang diagnosis."
+  :type 'boolean
+  :group 'tramp-rpc)
+
+(defun tramp-rpc--debug-log (format-string &rest args)
+  "Append a formatted debug line to the *tramp-rpc-debug* buffer.
+FORMAT-STRING and ARGS are passed to `format'.
+
+When TRAMP_RPC_DEBUG_LOG or TRAMP_RPC_DEBUG_DIR is set in the environment,
+also append each line directly to a local log file.  This preserves CI
+telemetry even when later tests unload TRAMP and remove debug buffers.
+Callers should use the `tramp-rpc--debug' macro, which skips argument
+evaluation entirely when `tramp-rpc-debug' is nil."
+  (let* ((line (concat (format-time-string "[%F %T.%3N] ")
+                       (apply #'format format-string args)
+                       "\n"))
+         (log-file (or (getenv "TRAMP_RPC_DEBUG_LOG")
+                       (when-let* ((dir (getenv "TRAMP_RPC_DEBUG_DIR")))
+                         (expand-file-name "tramp-rpc-debug-live.log" dir)))))
+    (with-current-buffer (get-buffer-create "*tramp-rpc-debug*")
+      (goto-char (point-max))
+      (insert line))
+    (when log-file
+      (condition-case nil
+          (progn
+            (make-directory (file-name-directory log-file) t)
+            (write-region line nil log-file 'append 'silent))
+        (error nil)))))
+
+(defmacro tramp-rpc--debug (format-string &rest args)
+  "Log FORMAT-STRING with ARGS to the debug buffer when `tramp-rpc-debug' is set.
+ARGS are not evaluated unless debugging is enabled, so callers may pass
+expensive expressions such as buffer sizes or `prin1' of large values."
+  (declare (indent 0) (debug t))
+  `(when tramp-rpc-debug
+     (tramp-rpc--debug-log ,format-string ,@args)))
+
 (defvar tramp-rpc-protocol--request-id 0
   "Counter for generating unique request IDs.")
 
 (defvar tramp-rpc-protocol--message-target nil
   "TRAMP vector or process used for level-6 protocol debug messages.")
+
+(defconst tramp-rpc-protocol-max-frame-size (* 100 1024 1024)
+  "Largest MessagePack frame accepted from or sent to the RPC server.")
+
+(define-error 'tramp-rpc-protocol-frame-too-large
+  "TRAMP-RPC MessagePack frame exceeds the configured limit")
 
 (defvar tramp-rpc-protocol--deferred-poll-messages (make-hash-table :test 'eql)
   "Idle polling requests awaiting a response, keyed by request ID.
@@ -95,7 +154,13 @@ Returns a cons cell (ID . BYTES) for pipelining support."
                     (id . ,id)
                     (method . ,method)
                     (params . ,params)))
-         (payload (msgpack-encode request)))
+         (payload (msgpack-encode request))
+         (payload-size (length payload)))
+    (when (> payload-size tramp-rpc-protocol-max-frame-size)
+      (signal 'tramp-rpc-protocol-frame-too-large
+              (list (format "RPC request %s is %d bytes; maximum is %d"
+                            method payload-size
+                            tramp-rpc-protocol-max-frame-size))))
     ;; Idle process reads are continuous long polls.  Defer their request log
     ;; until the response is known so empty polls produce no debug noise while
     ;; output, exits, and errors still retain the complete request/response pair.
@@ -105,18 +170,27 @@ Returns a cons cell (ID . BYTES) for pipelining support."
       (tramp-rpc-protocol--message request))
     (cons id (tramp-rpc-protocol--length-prefix payload))))
 
-(defun tramp-rpc-protocol-decode-response (buffer start)
-  "Decode a MessagePack-RPC response or notification in BUFEER from START.
+(defun tramp-rpc-protocol-decode-response (buffer start &optional end)
+  "Decode a MessagePack-RPC response or notification in BUFFER from START.
+START is the buffer position of the encoded object.
+When END is non-nil, require the MessagePack object to consume exactly the
+bounded frame ending there.
 Returns a plist with :id, :result, and :error keys for responses.
 For server-initiated notifications (no :id, has :method), returns a plist
 with :notification t, :method, and :params keys."
   (let* ((response
 	  (with-current-buffer buffer
-	    (goto-char start)
-	    (msgpack-read :map-type 'alist
-                          :key-type 'symbol
-                          :array-type 'list
-                          :bin-type 'msgpack-bin)))
+	    (save-restriction
+	      (when end
+		(narrow-to-region start end))
+	      (goto-char start)
+	      (prog1
+		  (msgpack-read :map-type 'alist
+                                :key-type 'symbol
+                                :array-type 'list
+                                :bin-type 'msgpack-bin)
+		(when (and end (not (eobp)))
+		  (error "Trailing data in MessagePack frame"))))))
          (id (alist-get 'id response))
          (method (alist-get 'method response))
          (result
@@ -148,7 +222,7 @@ with :notification t, :method, and :params keys."
     result))
 
 (defun tramp-rpc-protocol-error-p (response)
-  "Return non-nil if RESPONSE contains an error."
+  "Return non-nil for an error RESPONSE."
   (plist-get response :error))
 
 (defun tramp-rpc-protocol-error-message (response)
@@ -191,15 +265,20 @@ Returns the length as an integer, or nil if the BUFFER is too short."
 
 (defun tramp-rpc-protocol-try-read-message (buffer)
   "Try to read a complete message from BUFFER.
-BUFFER should the process buffer containing received data.  Returns a
+BUFFER should be the process buffer containing received data.  Returns a
 MESSAGE if a complete message is available, where MESSAGE is the decoded
 response plist.  Returns nil if no complete message yet."
   (with-current-buffer buffer
     (when-let* ((start (+ (mark-marker) 4))
-		(len (tramp-rpc-protocol-read-length buffer))
-		((>= (point-max) (+ start len))))
-      (set-marker (mark-marker) (+ start len))
-      (tramp-rpc-protocol-decode-response buffer start))))
+		(len (tramp-rpc-protocol-read-length buffer)))
+      (when (> len tramp-rpc-protocol-max-frame-size)
+	(error "RPC frame length %d exceeds maximum %d"
+	       len tramp-rpc-protocol-max-frame-size))
+      (let ((end (+ start len)))
+	(when (>= (point-max) end)
+	  (prog1 (tramp-rpc-protocol-decode-response buffer start end)
+	    ;; Commit the framing cursor only after successful exact decoding.
+	    (set-marker (mark-marker) end)))))))
 
 ;; ============================================================================
 ;; Batch request support
@@ -235,13 +314,82 @@ Returns a list where each element is either:
             results-array)))
 
 ;; ============================================================================
-;; Unload support
+;; MessagePack value helpers
 ;; ============================================================================
 
-(add-hook 'tramp-rpc-unload-hook
-	  (lambda ()
-	    (when (featurep 'tramp-rpc-protocol)
-	      (unload-feature 'tramp-rpc-protocol 'force))))
+(defun tramp-rpc--decode-string (data)
+  "Decode binary DATA to a multibyte UTF-8 string.
+MessagePack `bin' values carry bytes; MessagePack `str' values are already
+text strings.  Returns nil if DATA is nil."
+  (cond
+   ((null data) nil)
+   ((msgpack-bin-p data)
+    (decode-coding-string (msgpack-bin-string data) 'utf-8-unix))
+   ((stringp data) data)
+   (t data)))
+
+(defun tramp-rpc--binary-bytes (data)
+  "Return raw bytes from DATA, unwrapping MessagePack bin values."
+  (cond
+   ((msgpack-bin-p data) (msgpack-bin-string data))
+   ((and (stringp data) (multibyte-string-p data))
+    (encode-coding-string data 'utf-8-unix))
+   (t data)))
+
+(defun tramp-rpc--decode-output (data)
+  "Decode binary process DATA as UTF-8.
+This helper is for synchronous command/file paths.  Async relays keep their
+bytes raw and let the relay process decoder handle incremental output.
+The server never reports a process output encoding, so UTF-8 is assumed,
+matching `tramp-sh' behavior for command output."
+  (if data
+      (decode-coding-string (tramp-rpc--binary-bytes data) 'utf-8-unix)
+    ""))
+
+(defun tramp-rpc--decode-filename (entry)
+  "Get filename from directory ENTRY.
+With MessagePack, filenames come as raw bytes - decode to UTF-8."
+  (tramp-rpc--decode-string (alist-get 'name entry)))
+
+(defun tramp-rpc--path-to-bytes (path)
+  "Convert PATH to a unibyte string for MessagePack transmission.
+Handles both multibyte UTF-8 strings and unibyte byte strings.
+Strips Emacs file-name quoting (the /: prefix) before sending to
+the server, since the remote side does not understand it."
+  (let ((unquoted (file-name-unquote path)))
+    (if (multibyte-string-p unquoted)
+        (encode-coding-string unquoted 'utf-8-unix)
+      unquoted)))
+
+(defun tramp-rpc--path-to-string (path)
+  "Return unquoted PATH as a text string for RPC fields typed as strings."
+  (let ((unquoted (file-name-unquote path)))
+    (if (multibyte-string-p unquoted)
+        unquoted
+      (decode-coding-string unquoted 'utf-8-unix))))
+
+(defun tramp-rpc--path-to-bin (path)
+  "Return PATH as an explicit MessagePack bin value."
+  (msgpack-bin-make (tramp-rpc--path-to-bytes path)))
+
+(defun tramp-rpc--path-to-compatible-value (path)
+  "Return PATH as text when UTF-8-compatible, otherwise MessagePack binary.
+Using text for ordinary paths preserves compatibility with older servers whose
+path parameters predate binary-path support."
+  (let* ((bytes (tramp-rpc--path-to-bytes path))
+         (decoded (decode-coding-string bytes 'utf-8-unix)))
+    (if (and (cl-every (lambda (char)
+                         (not (eq (char-charset char) 'eight-bit)))
+                       decoded)
+             (equal bytes (encode-coding-string decoded 'utf-8-unix)))
+        decoded
+      (msgpack-bin-make bytes))))
+
+(defun tramp-rpc--encode-path (path)
+  "Encode PATH for transmission to path-or-bytes server parameters.
+Returns an alist with PATH as an explicit MessagePack bin value."
+  `((path . ,(tramp-rpc--path-to-bin path))))
+
 
 (provide 'tramp-rpc-protocol)
 ;;; tramp-rpc-protocol.el ends here

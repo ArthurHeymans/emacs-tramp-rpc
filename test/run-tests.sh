@@ -30,6 +30,7 @@ TRAMP_RPC_TEST_HOST_ENV_SET="${TRAMP_RPC_TEST_HOST+x}"
 MSGPACK_SOURCE_ENV="${MSGPACK_SOURCE-}"
 MSGPACK_SOURCE_ENV_SET="${MSGPACK_SOURCE+x}"
 if [[ -f "$PROJECT_DIR/.config.local" ]]; then
+    # shellcheck source=/dev/null
     source "$PROJECT_DIR/.config.local"
 fi
 if [[ -n "$TRAMP_SOURCE_ENV_SET" ]]; then TRAMP_SOURCE="$TRAMP_SOURCE_ENV"; fi
@@ -39,8 +40,8 @@ if [[ -n "$MSGPACK_SOURCE_ENV_SET" ]]; then MSGPACK_SOURCE="$MSGPACK_SOURCE_ENV"
 
 expand_home() {
     case "$1" in
-        "~") printf '%s' "$HOME" ;;
-        "~/"*) printf '%s/%s' "$HOME" "${1#\~/}" ;;
+        \~) printf '%s' "$HOME" ;;
+        \~/*) printf '%s/%s' "$HOME" "${1#\~/}" ;;
         *) printf '%s' "$1" ;;
     esac
 }
@@ -131,7 +132,7 @@ run_mock_selector() {
 
 run_protocol_tests() {
     echo -e "${YELLOW}Running protocol tests...${NC}"
-    run_mock_selector "^tramp-rpc-mock-test-protocol" 9
+    run_mock_selector "^tramp-rpc-mock-test-protocol"
 }
 
 server_available() {

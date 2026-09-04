@@ -138,10 +138,24 @@ Access remote files using the ~rpc~ method:
 
 On first connection, the server binary is automatically obtained and deployed:
 
-1. *Release/package installs*: download from GitHub Releases first (fastest, ~850KB download), then build from source if Rust is installed and download fails.
+1. *Release/package installs*: download from GitHub Releases first (fastest, ~850KB download), then build from source if Rust 1.88 or later is installed and download fails.
 2. *Git checkout installs*: reuse a fresh source build or source-tree keyed cache.  Automatic file operations do not prompt when a binary is missing; run ~M-x tramp-rpc-deploy-install-binary~ to choose whether to download a checksum-verified release binary, build the checkout with Cargo, or skip.  A downloaded fallback remains keyed to that source tree, while strict ~build~ policy uses a separate identity.
 
 The binary is cached locally in =~/.emacs.d/tramp-rpc/= and deployed to =~/.cache/emacs/tramp-rpc/= on the remote host.
+
+** Multi-hop (~|~) file names
+
+TRAMP's ad-hoc multi-hop syntax works with the ~rpc~ method:
+
+- ~/rpc:user@host|sudo:root@host:/path~ stays RPC-accelerated: the RPC
+  server on =host= is started via sudo, so file operations run with
+  root privileges at full RPC speed.
+- Chains ending in shell-based methods such as ~su~ or ~docker~, e.g.
+  ~/rpc:host|su::/path~ or ~/rpc:host|docker:container:/path~, use
+  TRAMP's regular shell-based handler, which logs in through the rpc hop
+  as if it were ~ssh~.  The RPC server and its speedup are not used for
+  these chains.  RPC-to-RPC chains remain RPC-backed at the final target;
+  intermediate rpc hops provide SSH routing.
 
 ** Deployment Commands
 
@@ -165,23 +179,56 @@ The binary is cached locally in =~/.emacs.d/tramp-rpc/= and deployed to =~/.cach
 
 The Emacs Lisp client is organized into focused modules:
 
-| Module                     | Lines | Purpose                                    |
-|----------------------------+-------+--------------------------------------------|
-| ~tramp-rpc.el~             | ~2450 | Core RPC communication & file handlers     |
-| ~tramp-rpc-process.el~     | ~1050 | Async process & PTY support                |
-| ~tramp-rpc-magit.el~       | ~780  | Magit/Projectile optimizations & caching   |
-| ~tramp-rpc-deploy.el~      | ~950  | Binary deployment & version management     |
-| ~tramp-rpc-advice.el~      | ~330  | Advice functions for process/VC integration|
-| ~tramp-rpc-protocol.el~    | ~190  | MessagePack-RPC protocol implementation    |
+The modules form a strict layering; each requires only the ones below it.
+Where a lower layer needs to reach up, it runs a hook that the upper layer
+registers on at load time.  The only ~declare-function~ back-references
+left are for functions emitted by the autoload form and for the
+file-notify dispatch callbacks in ~tramp-rpc.el~.
+
+| Module                     | Purpose                                              |
+|----------------------------+------------------------------------------------------|
+| ~tramp-rpc.el~             | TRAMP file handlers, file-notify, registration       |
+| ~tramp-rpc-magit.el~       | Magit/Projectile prefetch and process-file cache     |
+| ~tramp-rpc-advice.el~      | Advice functions for process/VC integration          |
+| ~tramp-rpc-process.el~     | Async process & PTY support                          |
+| ~tramp-rpc-cache.el~       | Metadata caches & filesystem watch notifications     |
+| ~tramp-rpc-transport.el~   | SSH/ControlMaster, connection generations, RPC calls |
+| ~tramp-rpc-deploy.el~      | Binary deployment & version management               |
+| ~tramp-rpc-hops.el~        | Hop-chain analysis and sudo elevation                |
+| ~tramp-rpc-connection.el~  | The per-generation ~tramp-rpc-connection~ struct     |
+| ~tramp-rpc-protocol.el~    | MessagePack-RPC framing, value helpers, debug logging|
 
 *** Core Module (~tramp-rpc.el~)
 
 The core module provides:
-- SSH ControlMaster connection management
-- RPC call/batch/pipeline primitives
-- Direnv environment caching for processes
 - All TRAMP file handler operations (~file-exists-p~, ~file-attributes~, ~insert-file-contents~, etc.)
-- File name handler registration and dispatch
+- Public ~file-notify~ descriptors on top of server watches
+- File name handler registration, dispatch, and unload
+
+*** Transport Module (~tramp-rpc-transport.el~)
+
+Everything needed to reach a host and talk to its server:
+- SSH ControlMaster and multi-hop (ProxyJump) setup, authentication via ~tramp-process-actions~
+- Server process startup, including sudo-via-RPC privilege elevation
+- Connection generation lookup, replacement and cleanup
+- RPC call primitives: synchronous, batch, pipelined and asynchronous calls
+- The effective remote process environment (PATH, login shell, direnv)
+
+Upper layers plug into the transport through hooks instead of being
+called by name: ~tramp-rpc-connection-invalidate-functions~,
+~tramp-rpc-transport-terminate-functions~,
+~tramp-rpc-transport-cleanup-functions~ and
+~tramp-rpc-notification-functions~.
+
+*** Connection Module (~tramp-rpc-connection.el~)
+
+Defines ~tramp-rpc-connection~, the object describing one transport
+generation: the SSH process, its response buffer, and all request state
+belonging to exactly that generation (pending synchronous IDs, buffered
+responses, async callbacks, and cleanup flags).  A replacement connection
+for the same host is a new generation and can never observe the old one's
+state.  The transport process carries a single back pointer to its
+generation for use by process filters and sentinels.
 
 *** Process Module (~tramp-rpc-process.el~)
 
@@ -191,12 +238,23 @@ Handles all process-related functionality:
 - Terminal resize handling for vterm/eat/shell-mode
 - Process I/O queuing with server-pushed output and exit notifications
 
+*** Cache Module (~tramp-rpc-cache.el~)
+
+Client-side metadata caches and the watch machinery keeping them fresh:
+- TTL-based caches for ~file-exists-p~, ~file-truename~ and ~file.stat~ with max-size eviction
+- Invalidation by path, subtree, and connection
+- Watch management via server push notifications (~watch.add~/~watch.remove~, ~fs.events~)
+- Dispatch of ~fs.events~ to public ~file-notify~ descriptors
+
+Modules with caches derived from file metadata register on
+~tramp-rpc-cache-invalidate-functions~ and ~tramp-rpc-fs-events-functions~;
+this is how the Magit module drops its ancestor scans and prefetched
+status without the cache module knowing about it.
+
 *** Magit Module (~tramp-rpc-magit.el~)
 
 Optimizations for git/magit/projectile on remote hosts:
 - Parallel git command prefetch via ~commands.run_parallel~ RPC (sends ~60+ git commands in a single round-trip)
-- TTL-based caches for file-exists and file-truename with max-size eviction
-- Filesystem watch management via server push notifications for cache invalidation
 - Process-file cache for serving git commands from prefetched data
 - Ancestor directory scanning for fast project/VC root detection
 - Projectile integration (force git ls-files, alien indexing for remote)
@@ -241,6 +299,7 @@ The dispatcher exposes these public methods:
 | Process | ~process.status~ | Return managed process status. |
 | Process | ~process.close_stdin~ | Close managed process stdin. |
 | Process | ~process.kill~ | Signal a managed process. |
+| Process | ~process.signal~ | Signal a positive OS PID permitted by the server's credentials. |
 | Process | ~process.list~ | List managed processes. |
 | PTY | ~process.start_pty~ | Start a pseudo-terminal process. |
 | PTY | ~process.subscribe_pty~ | Subscribe to pseudo-terminal output and exit notifications. |
@@ -440,7 +499,7 @@ ssh -o BatchMode=yes user@host echo success
 
 If GitHub downloads fail (corporate firewall, etc.), you can:
 
-1. Install Rust and let tramp-rpc build locally:
+1. Install Rust 1.88 or later and let tramp-rpc build locally:
    #+begin_src bash
    curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
    #+end_src

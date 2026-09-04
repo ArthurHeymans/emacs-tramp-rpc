@@ -3,6 +3,7 @@
 ;; Copyright (C) 2026 Arthur Heymans <arthur@aheymans.xyz>
 
 ;; Author: Arthur Heymans <arthur@aheymans.xyz>
+;; Assisted-by: various LLMs
 
 ;; This file is part of tramp-rpc.
 
@@ -43,6 +44,9 @@
 (declare-function tramp-rpc--sudo-file-name-p "tramp-rpc")
 (declare-function make-tramp-file-name "tramp")
 (declare-function tramp-dissect-file-name "tramp")
+(declare-function tramp-compute-multi-hops "tramp")
+(declare-function tramp-file-name-method "tramp")
+(declare-function tramp-file-name-hop "tramp")
 (declare-function tramp-find-foreign-file-name-handler "tramp")
 (declare-function tramp-get-method-parameter "tramp")
 (declare-function loaddefs-generate "autoload")
@@ -74,6 +78,13 @@
 
 (defvar tramp-rpc-autoload-test--autoloads-generated nil
   "Non-nil if autoloads have been generated for this test session.")
+
+(defun tramp-rpc-autoload-test--remove-generated-autoloads ()
+  "Remove the generated source-tree autoload file used by these tests."
+  (when (file-exists-p tramp-rpc-autoload-test--autoloads-file)
+    (delete-file tramp-rpc-autoload-test--autoloads-file)))
+
+(add-hook 'kill-emacs-hook #'tramp-rpc-autoload-test--remove-generated-autoloads)
 
 (defun tramp-rpc-autoload-test--generate-autoloads ()
   "Generate autoloads file for testing.
@@ -154,21 +165,43 @@ This allows testing autoload behavior in a clean state."
   ;; Handler should be defined as autoload stub
   (should (fboundp 'tramp-rpc-file-name-handler))
   (should (autoloadp (symbol-function 'tramp-rpc-file-name-handler)))
-  ;; Predicate is NOT defined yet -- it's inside with-eval-after-load 'tramp
-  ;; so it only becomes available after tramp loads
-  (should-not (fboundp 'tramp-rpc-file-name-p)))
+  ;; The predicate is defined directly by the autoload registration form so
+  ;; handler lookup never recursively loads the full package.
+  (should (fboundp 'tramp-rpc-file-name-p))
+  (should-not (autoloadp (symbol-function 'tramp-rpc-file-name-p))))
 
 (ert-deftest tramp-rpc-autoload-test-method-registration ()
-  "Test that method is registered when tramp loads."
+  "Test that the method inherits ssh parameters when tramp loads."
   (tramp-rpc-autoload-test--clean-environment)
   (tramp-rpc-autoload-test--generate-autoloads)
   (load tramp-rpc-autoload-test--autoloads-file nil t)
-  ;; Before loading tramp, method should not be in tramp-methods
-  ;; (tramp-methods may not even exist yet)
-  ;; Load tramp
+  ;; Loading the autoload file initializes TRAMP before registering the method.
+  (should (featurep 'tramp))
+  ;; Shell-based chains through an rpc hop are handled by tramp-sh without
+  ;; loading tramp-rpc.el, so the autoloaded method must be usable as ssh.
+  (should (assoc "rpc" tramp-methods))
+  (let ((rpc-vec (make-tramp-file-name :method "rpc" :host "host"))
+        (ssh-vec (make-tramp-file-name :method "ssh" :host "host")))
+    (dolist (parameter '(tramp-login-program
+                         tramp-login-args
+                         tramp-remote-shell-login))
+      (should (equal (tramp-get-method-parameter rpc-vec parameter)
+                     (tramp-get-method-parameter ssh-vec parameter))))))
+
+(ert-deftest tramp-rpc-autoload-test-shell-chain-dispatch ()
+  "Test that an rpc-to-su chain dispatches without loading tramp-rpc.el."
+  (tramp-rpc-autoload-test--clean-environment)
+  (tramp-rpc-autoload-test--generate-autoloads)
+  (load tramp-rpc-autoload-test--autoloads-file nil t)
   (require 'tramp)
-  ;; Now method should be registered
-  (should (assoc "rpc" tramp-methods)))
+  (let* ((vec (tramp-dissect-file-name "/rpc:host|su::/path"))
+         (chain (tramp-compute-multi-hops vec)))
+    (should (equal (tramp-file-name-method vec) "su"))
+    (should (equal (tramp-file-name-hop vec) "rpc:host|"))
+    (should (equal (mapcar #'tramp-file-name-method chain) '("rpc" "su")))
+    (should (eq (tramp-find-foreign-file-name-handler vec)
+                'tramp-sh-file-name-handler))
+    (should-not (featurep 'tramp-rpc))))
 
 (ert-deftest tramp-rpc-autoload-test-predicate-available-after-tramp ()
   "Test that predicate is available after tramp loads (no autoload needed)."
@@ -177,7 +210,7 @@ This allows testing autoload behavior in a clean state."
   (add-to-list 'load-path tramp-rpc-autoload-test--lisp-dir)
   (load tramp-rpc-autoload-test--autoloads-file nil t)
   (require 'tramp)
-  ;; Predicate should be defined inline (defsubst from with-eval-after-load),
+  ;; Predicate should be defined directly by the autoload registration form,
   ;; NOT as an autoload stub.  This is the key fix: calling the predicate
   ;; must not trigger loading tramp-rpc.el to avoid recursive autoloading.
   (should (fboundp 'tramp-rpc-file-name-p))
@@ -191,15 +224,11 @@ This allows testing autoload behavior in a clean state."
   (tramp-rpc-autoload-test--generate-autoloads)
   (add-to-list 'load-path tramp-rpc-autoload-test--lisp-dir)
   (load tramp-rpc-autoload-test--autoloads-file nil t)
-  ;; Before loading tramp, handler should not be registered
-  (should-not (rassq 'tramp-rpc-file-name-handler
-                     tramp-foreign-file-name-handler-alist))
-  ;; Load tramp - this triggers with-eval-after-load which registers handler
-  (require 'tramp)
-  ;; Now handler should be registered via tramp-register-foreign-file-name-handler
+  ;; Loading autoloads initializes TRAMP and registers the handler immediately.
+  (should (featurep 'tramp))
   (should (rassq 'tramp-rpc-file-name-handler
                  tramp-foreign-file-name-handler-alist))
-  ;; The predicate should be a real function (defsubst), not an autoload
+  ;; The predicate should be a real function, not an autoload.
   (should (fboundp 'tramp-rpc-file-name-p))
   (should-not (autoloadp (symbol-function 'tramp-rpc-file-name-p))))
 
@@ -285,10 +314,10 @@ This allows testing autoload behavior in a clean state."
       (should (string-match-p "defconst tramp-rpc-method" content))
       ;; Should have autoload for handler
       (should (string-match-p "autoload.*tramp-rpc-file-name-handler" content))
-      ;; Should have with-eval-after-load
-      (should (string-match-p "with-eval-after-load 'tramp" content))
-      ;; Should define predicate inline (defsubst, not autoload stub)
-      (should (string-match-p "defsubst tramp-rpc-file-name-p" content))
+      ;; Should initialize TRAMP within the autoload registration form.
+      (should (string-match-p "require 'tramp" content))
+      ;; Should define predicate inline, not as an autoload stub.
+      (should (string-match-p "defun tramp-rpc-file-name-p" content))
       ;; Should NOT have an autoload stub for file-name-p
       (should-not (string-match-p "autoload.*tramp-rpc-file-name-p" content))
       ;; Should add to tramp-methods

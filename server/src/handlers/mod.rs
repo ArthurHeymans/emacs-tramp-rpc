@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+
 //! Request handlers for TRAMP-RPC operations
 
 pub mod commands;
@@ -5,9 +7,10 @@ pub mod dir;
 pub mod file;
 pub mod io;
 pub mod process;
+pub mod system;
 
 use crate::msgpack_map;
-use crate::protocol::{Request, RequestId, Response, RpcError, from_value};
+use crate::protocol::{Request, Response, RpcError, from_value};
 use futures::{StreamExt, TryStreamExt};
 use rmpv::Value;
 
@@ -38,68 +41,6 @@ pub async fn cleanup_managed_processes() -> Result<(), RpcError> {
 
 pub type HandlerResult = Result<Value, RpcError>;
 
-/// Get system information
-fn system_info() -> HandlerResult {
-    use std::env;
-
-    Ok(msgpack_map! {
-        "version" => env!("CARGO_PKG_VERSION"),
-        "os" => std::env::consts::OS,
-        "arch" => std::env::consts::ARCH,
-        "watcher" => watcher_kind(),
-        "max_read_chunk_bytes" => io::MAX_FILE_READ_CHUNK_BYTES as u64,
-        "hostname" => hostname(),
-        "uid" => unsafe { libc::getuid() },
-        "gid" => unsafe { libc::getgid() },
-        "home" => env::var("HOME").ok().into_value(),
-        "user" => env::var("USER").ok().into_value(),
-        "shell" => login_shell().into_value()
-    })
-}
-
-fn watcher_kind() -> &'static str {
-    use notify::{RecommendedWatcher, Watcher, WatcherKind};
-
-    match RecommendedWatcher::kind() {
-        WatcherKind::Inotify => "inotify",
-        WatcherKind::Fsevent => "fsevent",
-        WatcherKind::Kqueue => "kqueue",
-        WatcherKind::PollWatcher => "poll",
-        WatcherKind::ReadDirectoryChangesWatcher => "windows",
-        WatcherKind::NullWatcher => "null",
-        _ => "unknown",
-    }
-}
-
-/// Look up the current user's login shell from the passwd database.
-/// Uses getpwuid_r (reentrant) for thread safety, matching the pattern
-/// in file.rs for get_user_name/get_group_name.
-fn login_shell() -> Option<String> {
-    let uid = unsafe { libc::getuid() };
-    let mut buf = vec![0u8; 1024];
-    let mut pwd: libc::passwd = unsafe { std::mem::zeroed() };
-    let mut result_ptr: *mut libc::passwd = std::ptr::null_mut();
-
-    let ret = unsafe {
-        libc::getpwuid_r(
-            uid,
-            &mut pwd,
-            buf.as_mut_ptr() as *mut libc::c_char,
-            buf.len(),
-            &mut result_ptr,
-        )
-    };
-
-    if ret != 0 || result_ptr.is_null() {
-        return None;
-    }
-
-    let shell = unsafe { std::ffi::CStr::from_ptr(pwd.pw_shell) };
-    shell.to_str().ok().map(|s| s.to_string())
-}
-
-use crate::protocol::IntoValue;
-
 /// Maximum entries accepted by one batch request.  This remains well above
 /// the existing 10-stat benchmark while bounding per-request work.
 const MAX_BATCH_ENTRIES: usize = 64;
@@ -113,172 +54,6 @@ where
     F: std::future::Future,
 {
     futures::stream::iter(futures).buffered(BATCH_CONCURRENCY)
-}
-
-fn hostname() -> String {
-    let mut buf = [0u8; 256];
-    unsafe {
-        if libc::gethostname(buf.as_mut_ptr() as *mut libc::c_char, buf.len()) == 0 {
-            let len = buf.iter().position(|&c| c == 0).unwrap_or(buf.len());
-            String::from_utf8_lossy(&buf[..len]).into_owned()
-        } else {
-            "unknown".to_string()
-        }
-    }
-}
-
-/// Get environment variable
-fn system_getenv(params: Value) -> HandlerResult {
-    #[derive(serde::Deserialize)]
-    struct Params {
-        name: String,
-    }
-
-    let params: Params = from_value(params).map_err(|e| RpcError::invalid_params(e.to_string()))?;
-
-    Ok(std::env::var(&params.name).ok().into_value())
-}
-
-/// Expand path with tilde and environment variables
-fn system_expand_path(params: Value) -> HandlerResult {
-    #[derive(serde::Deserialize)]
-    struct Params {
-        path: String,
-    }
-
-    let params: Params = from_value(params).map_err(|e| RpcError::invalid_params(e.to_string()))?;
-
-    let expanded = expand_tilde(&params.path);
-    Ok(expanded.into_value())
-}
-
-/// Get filesystem information (like df)
-fn system_statvfs(params: Value) -> HandlerResult {
-    #[derive(serde::Deserialize)]
-    struct Params {
-        path: String,
-    }
-
-    let params: Params = from_value(params).map_err(|e| RpcError::invalid_params(e.to_string()))?;
-
-    use std::ffi::CString;
-    let expanded = expand_tilde(&params.path);
-    let path_cstr =
-        CString::new(expanded.as_str()).map_err(|_| RpcError::invalid_params("Invalid path"))?;
-
-    let mut stat: libc::statvfs = unsafe { std::mem::zeroed() };
-    let result = unsafe { libc::statvfs(path_cstr.as_ptr(), &mut stat) };
-
-    if result != 0 {
-        return Err(RpcError::io_error(std::io::Error::last_os_error()));
-    }
-
-    // Return values in bytes (multiply by block size)
-    // Allow unnecessary casts for cross-platform compatibility (types differ between Linux/macOS)
-    #[allow(clippy::unnecessary_cast)]
-    let block_size = stat.f_frsize as u64;
-    #[allow(clippy::unnecessary_cast)]
-    let total = stat.f_blocks as u64 * block_size;
-    #[allow(clippy::unnecessary_cast)]
-    let free = stat.f_bfree as u64 * block_size;
-    #[allow(clippy::unnecessary_cast)]
-    let available = stat.f_bavail as u64 * block_size;
-
-    Ok(msgpack_map! {
-        "total" => total,
-        "free" => free,
-        "available" => available,
-        "block_size" => block_size
-    })
-}
-
-fn supplementary_groups_with<F>(
-    initial_count: usize,
-    mut getgroups: F,
-) -> std::io::Result<Vec<libc::gid_t>>
-where
-    F: FnMut(&mut [libc::gid_t]) -> std::io::Result<usize>,
-{
-    let mut count = initial_count;
-    loop {
-        let mut groups = vec![0; count];
-        match getgroups(&mut groups) {
-            Ok(actual_count) => {
-                if actual_count > groups.len() {
-                    count = actual_count;
-                    continue;
-                }
-                groups.truncate(actual_count);
-                return Ok(groups);
-            }
-            // Group membership can change after the sizing call.  Retry with a
-            // larger buffer instead of relying on a fixed supplementary limit.
-            Err(error)
-                if matches!(
-                    error.raw_os_error(),
-                    Some(libc::EINVAL) | Some(libc::ERANGE)
-                ) =>
-            {
-                count = count.saturating_mul(2).max(1);
-            }
-            Err(error) => return Err(error),
-        }
-    }
-}
-
-fn supplementary_groups() -> std::io::Result<Vec<libc::gid_t>> {
-    let count = unsafe { libc::getgroups(0, std::ptr::null_mut()) };
-    if count < 0 {
-        return Err(std::io::Error::last_os_error());
-    }
-
-    supplementary_groups_with(count as usize, |groups| {
-        let actual_count =
-            unsafe { libc::getgroups(groups.len() as libc::c_int, groups.as_mut_ptr()) };
-        if actual_count < 0 {
-            Err(std::io::Error::last_os_error())
-        } else {
-            Ok(actual_count as usize)
-        }
-    })
-}
-
-/// Get groups for the current user
-fn system_groups() -> HandlerResult {
-    let groups = supplementary_groups().map_err(RpcError::io_error)?;
-
-    // Convert to group info with names
-    let group_info: Vec<Value> = groups
-        .iter()
-        .map(|&gid| {
-            let gname = get_group_name(gid);
-            msgpack_map! {
-                "gid" => gid,
-                "name" => gname.into_value()
-            }
-        })
-        .collect();
-
-    Ok(Value::Array(group_info))
-}
-
-/// Get group name from gid (delegates to file.rs's mutex-protected, cached version)
-fn get_group_name(gid: libc::gid_t) -> Option<String> {
-    file::get_group_name(gid)
-}
-
-/// Expand ~ to home directory
-pub(crate) fn expand_tilde(path: &str) -> String {
-    if path.starts_with("~/") {
-        if let Ok(home) = std::env::var("HOME") {
-            return format!("{}{}", home, &path[1..]);
-        }
-    } else if path == "~"
-        && let Ok(home) = std::env::var("HOME")
-    {
-        return home;
-    }
-    path.to_string()
 }
 
 fn validate_batch_response_size(
@@ -325,21 +100,12 @@ async fn batch_execute(params: Value) -> HandlerResult {
     }
 
     let results = bounded_batch_futures(batch_params.requests.into_iter().map(|req| async move {
-        // Create a fake Request to reuse dispatch logic.
-        let fake_request = Request {
-            version: "2.0".to_string(),
-            id: RequestId::Number(0), // Dummy ID, not used in batch
-            method: req.method,
-            params: req.params,
-        };
-
-        // Get the result by calling the handler directly (not full dispatch).
-        let response = dispatch_inner(fake_request).await;
-
-        // Convert Response to a result object.
-        let result = match (response.result, response.error) {
-            (Some(result), None) => msgpack_map! { "result" => result },
-            (None, Some(error)) => {
+        // Batch subrequests have no request id of their own; route them
+        // directly to the handlers instead of round-tripping through a
+        // synthetic Request/Response pair.
+        let result = match route(req.method, req.params).await {
+            Ok(value) => msgpack_map! { "result" => value },
+            Err(error) => {
                 let mut error_fields = vec![
                     (
                         Value::String("code".into()),
@@ -357,7 +123,6 @@ async fn batch_execute(params: Value) -> HandlerResult {
                     "error" => Value::Map(error_fields)
                 }
             }
-            _ => msgpack_map! { "result" => Value::Nil },
         };
         Ok::<Value, RpcError>(result)
     }))
@@ -387,14 +152,22 @@ async fn batch_execute(params: Value) -> HandlerResult {
     Ok(msgpack_map! { "results" => Value::Array(results) })
 }
 
-/// Inner dispatch that handles the actual method routing
-/// Used by both single requests and batch requests
+/// Dispatch a single request to its handler and wrap the outcome in a
+/// response for its request id.
 async fn dispatch_inner(request: Request) -> Response {
     let Request {
         id, method, params, ..
     } = request;
+    match route(method, params).await {
+        Ok(value) => Response::success(id, value),
+        Err(error) => Response::error(Some(id), error),
+    }
+}
 
-    let result = match method.as_str() {
+/// Route a method to its handler.  Shared by single requests and batch
+/// subrequests.
+async fn route(method: String, params: Value) -> HandlerResult {
+    match method.as_str() {
         // File metadata operations
         "file.stat" => file::stat(params).await,
         "file.truename" => file::truename(params).await,
@@ -426,6 +199,7 @@ async fn dispatch_inner(request: Request) -> Response {
         "process.status" => process::status(params).await,
         "process.close_stdin" => process::close_stdin(params).await,
         "process.kill" => process::kill(params).await,
+        "process.signal" => process::signal_pid(params).await,
         "process.list" => process::list(params).await,
 
         // PTY (pseudo-terminal) process operations
@@ -440,11 +214,11 @@ async fn dispatch_inner(request: Request) -> Response {
         "process.list_pty" => process::list_pty(params).await,
 
         // System info
-        "system.info" => system_info(),
-        "system.getenv" => system_getenv(params),
-        "system.expand_path" => system_expand_path(params),
-        "system.statvfs" => system_statvfs(params),
-        "system.groups" => system_groups(),
+        "system.info" => system::system_info().await,
+        "system.getenv" => system::system_getenv(params),
+        "system.expand_path" => system::system_expand_path(params).await,
+        "system.statvfs" => system::system_statvfs(params).await,
+        "system.groups" => system::system_groups().await,
 
         // Parallel command execution and ancestor scanning
         "commands.run_parallel" => commands::run_parallel(params).await,
@@ -458,58 +232,18 @@ async fn dispatch_inner(request: Request) -> Response {
         }
 
         // Filesystem watch operations (for cache invalidation)
-        "watch.add" => crate::watcher::handle_add(params),
-        "watch.remove" => crate::watcher::handle_remove(params),
+        "watch.add" => crate::watcher::handle_add(params).await,
+        "watch.remove" => crate::watcher::handle_remove(params).await,
         "watch.list" => crate::watcher::handle_list(params),
 
         // Note: "batch" is NOT allowed in batch (no recursion)
         _ => Err(RpcError::method_not_found(&method)),
-    };
-
-    match result {
-        Ok(value) => Response::success(id, value),
-        Err(error) => Response::error(Some(id), error),
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn groups_retry_after_erange() {
-        let mut calls = 0;
-        let groups = supplementary_groups_with(1, |buffer| {
-            calls += 1;
-            if calls == 1 {
-                return Err(std::io::Error::from_raw_os_error(libc::ERANGE));
-            }
-            assert!(buffer.len() >= 2);
-            buffer[..2].copy_from_slice(&[10, 20]);
-            Ok(2)
-        })
-        .expect("retry getgroups after ERANGE");
-
-        assert_eq!(groups, vec![10, 20]);
-        assert_eq!(calls, 2);
-    }
-
-    #[test]
-    fn groups_retry_after_zero_length_sizing_call() {
-        let mut calls = 0;
-        let groups = supplementary_groups_with(0, |buffer| {
-            calls += 1;
-            if buffer.is_empty() {
-                return Ok(2);
-            }
-            buffer.copy_from_slice(&[10, 20]);
-            Ok(2)
-        })
-        .expect("retry getgroups after sizing call");
-
-        assert_eq!(groups, vec![10, 20]);
-        assert_eq!(calls, 2);
-    }
 
     use crate::msgpack_map;
     use futures::StreamExt;
@@ -640,7 +374,7 @@ mod tests {
         let result = msgpack_map! {
             "results" => Value::Array(vec![Value::Binary(vec![0; 64])]),
         };
-        let response = Response::success(RequestId::Number(99), result.clone());
+        let response = Response::success(crate::protocol::RequestId::Number(99), result.clone());
         let inner_size = rmp_serde::to_vec_named(&result).unwrap().len();
         let frame_size = rmp_serde::to_vec_named(&response).unwrap().len();
         assert!(frame_size > inner_size);

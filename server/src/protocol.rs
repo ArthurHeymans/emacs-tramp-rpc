@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+
 //! MessagePack-RPC protocol types for TRAMP-RPC
 
 use rmpv::Value;
@@ -100,7 +102,7 @@ impl RpcError {
     pub fn method_not_found(method: &str) -> Self {
         Self {
             code: Self::METHOD_NOT_FOUND,
-            message: format!("Method not found: {}", method),
+            message: format!("Method not found: {method}"),
             data: None,
         }
     }
@@ -124,7 +126,7 @@ impl RpcError {
     pub fn file_not_found(path: &str) -> Self {
         Self {
             code: Self::FILE_NOT_FOUND,
-            message: format!("File not found: {}", path),
+            message: format!("File not found: {path}"),
             data: None,
         }
     }
@@ -132,7 +134,7 @@ impl RpcError {
     pub fn permission_denied(path: &str) -> Self {
         Self {
             code: Self::PERMISSION_DENIED,
-            message: format!("Permission denied: {}", path),
+            message: format!("Permission denied: {path}"),
             data: None,
         }
     }
@@ -419,59 +421,20 @@ pub trait IntoValue {
     fn into_value(self) -> Value;
 }
 
-impl IntoValue for bool {
-    fn into_value(self) -> Value {
-        Value::Boolean(self)
-    }
+/// Implement `IntoValue` for every type with an existing `From<T> for Value`.
+macro_rules! impl_into_value_from {
+    ($($t:ty),* $(,)?) => {
+        $(
+            impl IntoValue for $t {
+                fn into_value(self) -> Value {
+                    self.into()
+                }
+            }
+        )*
+    };
 }
 
-impl IntoValue for i32 {
-    fn into_value(self) -> Value {
-        Value::Integer(self.into())
-    }
-}
-
-impl IntoValue for i64 {
-    fn into_value(self) -> Value {
-        Value::Integer(self.into())
-    }
-}
-
-impl IntoValue for u32 {
-    fn into_value(self) -> Value {
-        Value::Integer(self.into())
-    }
-}
-
-impl IntoValue for u64 {
-    fn into_value(self) -> Value {
-        Value::Integer(self.into())
-    }
-}
-
-impl IntoValue for usize {
-    fn into_value(self) -> Value {
-        Value::Integer((self as u64).into())
-    }
-}
-
-impl IntoValue for String {
-    fn into_value(self) -> Value {
-        Value::String(self.into())
-    }
-}
-
-impl IntoValue for &str {
-    fn into_value(self) -> Value {
-        Value::String(self.to_string().into())
-    }
-}
-
-impl IntoValue for Vec<u8> {
-    fn into_value(self) -> Value {
-        Value::Binary(self)
-    }
-}
+impl_into_value_from!(bool, i32, i64, u32, u64, usize, String, &str, Vec<u8>);
 
 impl IntoValue for Vec<String> {
     fn into_value(self) -> Value {

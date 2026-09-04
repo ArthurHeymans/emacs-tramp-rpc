@@ -1,6 +1,7 @@
 ;;; benchmark-magit.el --- Benchmark magit-like operations via TRAMP -*- lexical-binding: t; -*-
 
 ;; Copyright (C) 2026 Arthur Heymans <arthur@aheymans.xyz>
+;; Assisted-by: various LLMs
 
 ;;; Commentary:
 

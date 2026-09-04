@@ -24,3 +24,12 @@ result
 
 # entire.io local tool state
 .entire/
+
+# Local agent/tooling state
+/.local/
+/.pi-subagents/
+/.pi-lens/
+/review-loop/
+/.cache/
+/.ruff_cache/
+/.config.local

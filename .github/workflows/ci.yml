@@ -41,6 +41,9 @@ jobs:
           nix develop .#armv7-unknown-linux-musleabihf --command true
           nix develop .#armv5te-unknown-linux-musleabi --command true
 
+      - name: Test Nix Emacs package
+        run: nix build .#checks.x86_64-linux.emacs-package
+
   rust-linux:
     name: Rust ${{ matrix.name }}
     needs: nix-setup
@@ -141,26 +144,72 @@ jobs:
               --eval "(package-refresh-contents)" \
               --eval "(setq package-install-upgrade-built-in t)" \
               --eval "(package-install 'tramp)" \
-              --eval "(package-install 'msgpack)" && break
+              --eval "(package-install 'msgpack)" \
+              --eval "(package-install 'package-lint)" && break
+            if [ "$attempt" -eq 3 ]; then
+              echo "Dependency installation failed after $attempt attempts" >&2
+              exit 1
+            fi
             echo "Attempt $attempt failed, retrying in 10s..."
             sleep 10
           done
 
       - name: Byte-compile
         run: |
+          rm -f lisp/*.elc
           emacs -Q --batch \
             --eval "(require 'package)" \
             --eval "(add-to-list 'package-archives '(\"melpa\" . \"https://melpa.org/packages/\") t)" \
             --eval "(package-initialize)" \
-            --eval "(setq byte-compile-error-on-warn t)" \
+            --eval "(setq byte-compile-error-on-warn t byte-compile-warnings t load-prefer-newer t)" \
             --eval "(push \"$(pwd)/lisp\" load-path)" \
             -f batch-byte-compile lisp/*.el
 
-      - name: Check package metadata
+      - name: Package lint
         run: |
           emacs -Q --batch \
             --eval "(require 'package)" \
-            --eval "(with-current-buffer (find-file-noselect \"lisp/tramp-rpc.el\") (package-buffer-info))"
+            --eval "(package-initialize)" \
+            --eval "(require 'package-lint)" \
+            --eval "(setq package-lint-main-file \"lisp/tramp-rpc.el\")" \
+            --eval "(setq package-lint-batch-fail-on-warnings t)" \
+            -f package-lint-batch-and-exit \
+            lisp/tramp-rpc.el \
+            lisp/tramp-rpc-advice.el \
+            lisp/tramp-rpc-cache.el \
+            lisp/tramp-rpc-connection.el \
+            lisp/tramp-rpc-deploy.el \
+            lisp/tramp-rpc-hops.el \
+            lisp/tramp-rpc-magit.el \
+            lisp/tramp-rpc-process.el \
+            lisp/tramp-rpc-protocol.el \
+            lisp/tramp-rpc-transport.el
+
+      - name: Check documentation strings
+        run: |
+          emacs -Q --batch \
+            --eval "(require 'checkdoc)" \
+            --eval "(setq checkdoc-autofix-flag 'never)" \
+            --eval "(setq checkdoc-create-error-function (lambda (text start _end &optional _unfixable) (error \"%s:%d: checkdoc: %s\" buffer-file-name (line-number-at-pos start) text)))" \
+            --eval "(dolist (file command-line-args-left) (checkdoc-file file))" \
+            lisp/tramp-rpc.el \
+            lisp/tramp-rpc-advice.el \
+            lisp/tramp-rpc-cache.el \
+            lisp/tramp-rpc-connection.el \
+            lisp/tramp-rpc-deploy.el \
+            lisp/tramp-rpc-hops.el \
+            lisp/tramp-rpc-magit.el \
+            lisp/tramp-rpc-process.el \
+            lisp/tramp-rpc-protocol.el \
+            lisp/tramp-rpc-transport.el
+
+      - name: Check function declarations
+        run: |
+          emacs -Q --batch \
+            --eval "(require 'package)" \
+            --eval "(package-initialize)" \
+            --eval "(require 'check-declare)" \
+            --eval "(kill-emacs (if (check-declare-directory \"lisp\") 1 0))"
 
   test-autoload:
     name: Autoload Tests (${{ matrix.emacs_label }})
@@ -195,6 +244,10 @@ jobs:
               --eval "(setq package-install-upgrade-built-in t)" \
               --eval "(package-install 'tramp)" \
               --eval "(package-install 'msgpack)" && break
+            if [ "$attempt" -eq 3 ]; then
+              echo "Dependency installation failed after $attempt attempts" >&2
+              exit 1
+            fi
             echo "Attempt $attempt failed, retrying in 10s..."
             sleep 10
           done
@@ -235,6 +288,10 @@ jobs:
               --eval "(setq package-install-upgrade-built-in t)" \
               --eval "(package-install 'tramp)" \
               --eval "(package-install 'msgpack)" && break
+            if [ "$attempt" -eq 3 ]; then
+              echo "Dependency installation failed after $attempt attempts" >&2
+              exit 1
+            fi
             echo "Attempt $attempt failed, retrying in 10s..."
             sleep 10
           done
@@ -248,6 +305,16 @@ jobs:
             --eval "(setq debug-on-error t)" \
             -l test/tramp-rpc-mock-tests.el \
             --eval "(ert-run-tests-batch-and-exit \"^tramp-rpc-mock-test-protocol\")"
+
+      - name: Run request lifecycle tests
+        run: |
+          emacs -Q --batch \
+            --eval "(require 'package)" \
+            --eval "(add-to-list 'package-archives '(\"melpa\" . \"https://melpa.org/packages/\") t)" \
+            --eval "(package-initialize)" \
+            --eval "(setq debug-on-error t)" \
+            -l test/tramp-rpc-mock-tests.el \
+            --eval "(ert-run-tests-batch-and-exit \"^tramp-rpc-mock-test-request\")"
 
   test-multi-hop:
     name: Multi-Hop Tests (${{ matrix.emacs_label }})
@@ -287,6 +354,10 @@ jobs:
               --eval "(setq package-install-upgrade-built-in t)" \
               --eval "(package-install 'tramp)" \
               --eval "(package-install 'msgpack)" && break
+            if [ "$attempt" -eq 3 ]; then
+              echo "Dependency installation failed after $attempt attempts" >&2
+              exit 1
+            fi
             echo "Attempt $attempt failed, retrying in 10s..."
             sleep 10
           done
@@ -345,6 +416,10 @@ jobs:
               --eval "(setq package-install-upgrade-built-in t)" \
               --eval "(package-install 'tramp)" \
               --eval "(package-install 'msgpack)" && break
+            if [ "$attempt" -eq 3 ]; then
+              echo "Dependency installation failed after $attempt attempts" >&2
+              exit 1
+            fi
             echo "Attempt $attempt failed, retrying in 10s..."
             sleep 10
           done
@@ -428,6 +503,10 @@ jobs:
               --eval "(setq package-install-upgrade-built-in t)" \
               --eval "(package-install 'tramp)" \
               --eval "(package-install 'msgpack)" && break
+            if [ "$attempt" -eq 3 ]; then
+              echo "Dependency installation failed after $attempt attempts" >&2
+              exit 1
+            fi
             echo "Attempt $attempt failed, retrying in 10s..."
             sleep 10
           done
@@ -526,6 +605,10 @@ jobs:
               --eval "(package-initialize)" \
               --eval "(package-refresh-contents)" \
               --eval "(package-install 'msgpack)" && break
+            if [ "$attempt" -eq 3 ]; then
+              echo "Dependency installation failed after $attempt attempts" >&2
+              exit 1
+            fi
             echo "Attempt $attempt failed, retrying in 10s..."
             sleep 10
           done

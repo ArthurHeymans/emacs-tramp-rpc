@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+
 //! Directory operations
 //!
 //! Optimized to use:
@@ -7,7 +9,9 @@
 
 use crate::protocol::{DirEntry, FileAttributes, FileType, RpcError, from_value};
 use rmpv::Value;
+use rustix::fs::{AtFlags, Mode, OFlags, Stat};
 use serde::Deserialize;
+use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use tokio::fs;
@@ -17,7 +21,7 @@ use super::file::{bytes_to_path, file_type_from_metadata_ft, map_io_error};
 
 use crate::protocol::path_or_bytes;
 
-/// Extract time and mode fields from libc::stat in a cross-platform way
+/// Extract time and mode fields from `stat` in a cross-platform way
 /// Returns (atime, mtime, ctime, mode)
 /// - On Linux: st_mode is u32; time fields are i32 on 32-bit, i64 on 64-bit
 /// - On macOS and FreeBSD: st_mode is u16, time fields are i64
@@ -27,7 +31,7 @@ fn stat_time_to_i64<T: Into<i64>>(time: T) -> i64 {
 }
 
 #[inline]
-fn extract_stat_fields(stat_buf: &libc::stat) -> (i64, i64, i64, u32) {
+fn extract_stat_fields(stat_buf: &Stat) -> (i64, i64, i64, u32) {
     #[cfg(any(target_os = "macos", target_os = "freebsd"))]
     let mode = stat_buf.st_mode as u32;
     #[cfg(not(any(target_os = "macos", target_os = "freebsd")))]
@@ -41,47 +45,51 @@ fn extract_stat_fields(stat_buf: &libc::stat) -> (i64, i64, i64, u32) {
     )
 }
 
-/// Get FileAttributes using fstatat relative to directory fd
+/// Get FileAttributes using fstatat relative to directory fd.
+/// When `resolve_names` is false, `uname`/`gname` are left as None so the
+/// caller can batch-resolve distinct uid/gids once per listing instead of
+/// once per entry (critical under NSS outage: each miss can cost ~2s).
 fn get_file_attributes_at(
-    dir_fd: libc::c_int,
+    dir_fd: BorrowedFd<'_>,
     name: &[u8],
     follow_symlinks: bool,
 ) -> Option<FileAttributes> {
-    let mut stat_buf: libc::stat = unsafe { std::mem::zeroed() };
+    get_file_attributes_at_inner(dir_fd, name, follow_symlinks, true)
+}
 
-    // Create null-terminated name
-    let mut name_cstr = name.to_vec();
-    name_cstr.push(0);
+fn get_file_attributes_at_raw(
+    dir_fd: BorrowedFd<'_>,
+    name: &[u8],
+    follow_symlinks: bool,
+) -> Option<FileAttributes> {
+    get_file_attributes_at_inner(dir_fd, name, follow_symlinks, false)
+}
 
+fn get_file_attributes_at_inner(
+    dir_fd: BorrowedFd<'_>,
+    name: &[u8],
+    follow_symlinks: bool,
+    resolve_names: bool,
+) -> Option<FileAttributes> {
     let flags = if follow_symlinks {
-        0
+        AtFlags::empty()
     } else {
-        libc::AT_SYMLINK_NOFOLLOW
+        AtFlags::SYMLINK_NOFOLLOW
     };
 
-    let result = unsafe {
-        libc::fstatat(
-            dir_fd,
-            name_cstr.as_ptr() as *const libc::c_char,
-            &mut stat_buf,
-            flags,
-        )
-    };
-
-    if result != 0 {
-        return None;
-    }
+    // rustix accepts raw path bytes and rejects embedded NULs itself.
+    let stat_buf = rustix::fs::statat(dir_fd, name, flags).ok()?;
 
     // Determine file type from stat mode
-    let file_type = match stat_buf.st_mode & libc::S_IFMT {
-        libc::S_IFREG => FileType::File,
-        libc::S_IFDIR => FileType::Directory,
-        libc::S_IFLNK => FileType::Symlink,
-        libc::S_IFCHR => FileType::CharDevice,
-        libc::S_IFBLK => FileType::BlockDevice,
-        libc::S_IFIFO => FileType::Fifo,
-        libc::S_IFSOCK => FileType::Socket,
-        _ => FileType::Unknown,
+    let file_type = match rustix::fs::FileType::from_raw_mode(stat_buf.st_mode as _) {
+        rustix::fs::FileType::RegularFile => FileType::File,
+        rustix::fs::FileType::Directory => FileType::Directory,
+        rustix::fs::FileType::Symlink => FileType::Symlink,
+        rustix::fs::FileType::CharacterDevice => FileType::CharDevice,
+        rustix::fs::FileType::BlockDevice => FileType::BlockDevice,
+        rustix::fs::FileType::Fifo => FileType::Fifo,
+        rustix::fs::FileType::Socket => FileType::Socket,
+        rustix::fs::FileType::Unknown => FileType::Unknown,
     };
 
     // Get link target if symlink
@@ -91,21 +99,9 @@ fn get_file_attributes_at(
             None
         } else {
             // Use readlinkat with the dir fd
-            let mut buf = vec![0u8; 4096];
-            let len = unsafe {
-                libc::readlinkat(
-                    dir_fd,
-                    name_cstr.as_ptr() as *const libc::c_char,
-                    buf.as_mut_ptr() as *mut libc::c_char,
-                    buf.len(),
-                )
-            };
-            if len >= 0 {
-                buf.truncate(len as usize);
-                Some(buf)
-            } else {
-                None
-            }
+            rustix::fs::readlinkat(dir_fd, name, Vec::new())
+                .ok()
+                .map(std::ffi::CString::into_bytes)
         }
     } else {
         None
@@ -114,14 +110,24 @@ fn get_file_attributes_at(
     let uid = stat_buf.st_uid;
     let gid = stat_buf.st_gid;
     let (atime, mtime, ctime, mode) = extract_stat_fields(&stat_buf);
+    // Batch path (resolve_names=false) defers NSS so the listing can resolve
+    // each distinct uid/gid once instead of once per entry.
+    let (uname, gname) = if resolve_names {
+        (
+            super::file::get_user_name(uid),
+            super::file::get_group_name(gid),
+        )
+    } else {
+        (None, None)
+    };
 
     Some(FileAttributes {
         file_type,
         nlinks: stat_buf.st_nlink as u64,
         uid,
         gid,
-        uname: super::file::get_user_name(uid),
-        gname: super::file::get_group_name(gid),
+        uname,
+        gname,
         atime,
         mtime,
         ctime,
@@ -153,7 +159,7 @@ pub async fn list(params: Value) -> HandlerResult {
 
     let params: Params = from_value(params).map_err(|e| RpcError::invalid_params(e.to_string()))?;
 
-    let path = bytes_to_path(&params.path);
+    let path = bytes_to_path(&params.path).await?;
     let path_str = path.to_string_lossy().into_owned();
     let include_attrs = params.include_attrs;
     let include_hidden = params.include_hidden;
@@ -162,7 +168,7 @@ pub async fn list(params: Value) -> HandlerResult {
     let results =
         tokio::task::spawn_blocking(move || list_dir_sync(&path, include_attrs, include_hidden))
             .await
-            .map_err(|e| RpcError::internal_error(format!("Task join error: {}", e)))?
+            .map_err(|e| RpcError::internal_error(format!("Task join error: {e}")))?
             .map_err(|e| map_io_error(e, &path_str))?;
 
     // Convert to array of map values with named fields
@@ -176,36 +182,17 @@ fn list_dir_sync(
     include_attrs: bool,
     include_hidden: bool,
 ) -> Result<Vec<DirEntry>, std::io::Error> {
-    // Open directory fd for fstatat
-    let dir_fd = if include_attrs {
-        let mut path_cstr = path.as_os_str().as_bytes().to_vec();
-        path_cstr.push(0);
-        let fd = unsafe {
-            libc::open(
-                path_cstr.as_ptr() as *const libc::c_char,
-                libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC,
-            )
-        };
-        if fd < 0 {
-            return Err(std::io::Error::last_os_error());
-        }
-        Some(fd)
+    // Open directory fd for fstatat.  The `OwnedFd` closes it on all exit paths.
+    let dir_handle: Option<OwnedFd> = if include_attrs {
+        Some(rustix::fs::open(
+            path,
+            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
+            Mode::empty(),
+        )?)
     } else {
         None
     };
-
-    // Ensure we close the fd on all exit paths
-    struct DirFdGuard(Option<libc::c_int>);
-    impl Drop for DirFdGuard {
-        fn drop(&mut self) {
-            if let Some(fd) = self.0 {
-                unsafe {
-                    libc::close(fd);
-                }
-            }
-        }
-    }
-    let _guard = DirFdGuard(dir_fd);
+    let dir_fd = dir_handle.as_ref().map(AsFd::as_fd);
 
     let mut results: Vec<DirEntry> = Vec::new();
 
@@ -255,8 +242,10 @@ fn list_dir_sync(
 
         let attrs = if include_attrs {
             // Use lstat (follow_symlinks=false) so symlinks show as symlinks
-            // with their link_target resolved, matching Emacs expectations
-            dir_fd.and_then(|fd| get_file_attributes_at(fd, &name_bytes, false))
+            // with their link_target resolved, matching Emacs expectations.
+            // Defer NSS: resolve each distinct uid/gid once below instead of
+            // once per entry, so an LDAP outage costs per-id, not per-entry.
+            dir_fd.and_then(|fd| get_file_attributes_at_raw(fd, &name_bytes, false))
         } else {
             None
         };
@@ -266,6 +255,35 @@ fn list_dir_sync(
             file_type,
             attrs,
         });
+    }
+
+    // Batch-resolve NSS names for distinct ids only.  With the transient
+    // negative cache in file.rs, an outage yields at most one ~2s miss per
+    // distinct id per TTL window, not one per directory entry.
+    if include_attrs {
+        use std::collections::{HashMap, HashSet};
+        let mut uids = HashSet::new();
+        let mut gids = HashSet::new();
+        for entry in &results {
+            if let Some(attrs) = entry.attrs.as_ref() {
+                uids.insert(attrs.uid);
+                gids.insert(attrs.gid);
+            }
+        }
+        let unames: HashMap<u32, Option<String>> = uids
+            .into_iter()
+            .map(|uid| (uid, super::file::get_user_name(uid)))
+            .collect();
+        let gnames: HashMap<u32, Option<String>> = gids
+            .into_iter()
+            .map(|gid| (gid, super::file::get_group_name(gid)))
+            .collect();
+        for entry in &mut results {
+            if let Some(attrs) = entry.attrs.as_mut() {
+                attrs.uname = unames.get(&attrs.uid).cloned().flatten();
+                attrs.gname = gnames.get(&attrs.gid).cloned().flatten();
+            }
+        }
     }
 
     // Sort by name
@@ -311,7 +329,7 @@ pub async fn create(params: Value) -> HandlerResult {
 
     let params: Params = from_value(params).map_err(|e| RpcError::invalid_params(e.to_string()))?;
 
-    let path = bytes_to_path(&params.path);
+    let path = bytes_to_path(&params.path).await?;
     let path_str = path.to_string_lossy().into_owned();
 
     let created_paths = if params.parents {
@@ -361,7 +379,7 @@ pub async fn remove(params: Value) -> HandlerResult {
 
     let params: Params = from_value(params).map_err(|e| RpcError::invalid_params(e.to_string()))?;
 
-    let path = bytes_to_path(&params.path);
+    let path = bytes_to_path(&params.path).await?;
     let path_str = path.to_string_lossy().into_owned();
 
     let result = if params.recursive {

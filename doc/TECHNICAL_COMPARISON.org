@@ -187,6 +187,7 @@ TRAMP-RPC exposes these method categories:
 | process.read      | pid, timeout_ms?             | {stdout, stderr, exited}   |
 | process.write     | pid, data                    | {written}                  |
 | process.kill      | pid, signal?                 | boolean                    |
+| process.signal    | OS pid permitted by server credentials, signal | boolean         |
 | process.close_stdin | pid                        | boolean                    |
 | process.list      | (none)                       | [{pid, cmd, running}]      |
 | process.start_pty | cmd, args, cwd, rows, cols   | {pid, tty_name}            |
