@@ -3299,9 +3299,27 @@ cleanup of all connections has run."
             #'tramp-rpc-cleanup-all-connections)
   (add-hook 'tramp-unload-hook #'tramp-rpc--unload-from-tramp))
 
+(defun tramp-rpc--sanitize-native-comp-load-history ()
+  "Remove malformed native-comp entries that prevent unloading.
+
+Native compilation can record anonymous compiled functions as
+`(defun . --anonymous-lambda)' in `load-history'.  Emacs bug#80446
+causes `unload-feature' to reject those entries.  Remove them from all
+TRAMP-RPC modules before any of the modules are unloaded."
+  (dolist (entry load-history)
+    (when (and (stringp (car entry))
+               (string-match-p
+                (rx bos "tramp-rpc" (opt "-" (+ nonl))
+                    (| ".el" ".elc" ".eln") eos)
+                (file-name-nondirectory (car entry))))
+      (setcdr entry
+              (delete '(defun . --anonymous-lambda) (cdr entry))))))
+
 (defun tramp-rpc-unload-function ()
   "Unload function for tramp-rpc.
 Removes advice and cleans up async processes."
+  ;; Work around Emacs bug#80446 before explicitly unloading helper modules.
+  (tramp-rpc--sanitize-native-comp-load-history)
   ;; Remove high-level external operations from tramp-rpc core.
   (tramp-rpc--remove-external-operation 'locate-dominating-file 'tramp-rpc)
   (tramp-rpc--remove-external-operation 'dir-locals--all-files 'tramp-rpc)
