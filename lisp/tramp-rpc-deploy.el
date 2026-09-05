@@ -1281,14 +1281,14 @@ removed after installation, leaving only the versioned deployed binary."
                                     ""))
                    (command
                     (format
-                     (concat path-prefix
+                     (concat "%s"
                              "cd %s && cargo build --release --manifest-path %s && "
                              "test -f %s && ! test -L %s && mkdir -p %s && "
                              "chmod +x %s && "
                              "if test ! -e %s && ! test -L %s; then "
                              "mv -f %s %s; fi && "
                              "test -f %s && ! test -L %s && test -x %s")
-                     root manifest output output parent output
+                     path-prefix root manifest output output parent output
                      destination destination output destination
                      destination destination destination)))
               (unless

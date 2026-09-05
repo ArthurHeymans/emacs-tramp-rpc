@@ -5503,10 +5503,19 @@ This matches the behavior expected by `tramp-test28-process-file'."
                       ((symbol-function 'tramp-get-connection-buffer)
                        (lambda (_vec) buffer))
                       ((symbol-function 'tramp-get-remote-path)
-                       (lambda (_vec) '("/home/mock/.cargo/bin" "/usr/bin"))))
+                       (lambda (_vec) '("/home/mock/%s/.cargo/bin" "/usr/bin"))))
               (should (equal (tramp-rpc-deploy--build-binary-on-remote
                               vec "x86_64-freebsd")
                              remote-path))
+              (let ((build-command
+                     (seq-find (lambda (command)
+                                 (string-prefix-p "PATH=" command))
+                               commands)))
+                (should build-command)
+                (should (string-match-p
+                         (regexp-quote
+                          "PATH=/home/mock/\\%s/.cargo/bin\\:/usr/bin:$PATH; export PATH; ")
+                         build-command)))
               (should (member
                        "umask 077 && mktemp -d /tmp/tramp-rpc-build.XXXXXXXXXX"
                        commands)))))
