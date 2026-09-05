@@ -33,35 +33,16 @@
 
 (require 'tramp)
 (require 'msgpack)
-
-;; Functions from tramp.el
-(declare-function tramp-add-external-operation "tramp")
-(declare-function tramp-remove-external-operation "tramp")
-(declare-function tramp-dissect-file-name "tramp" (name &optional nodefault))
-
-;; Functions from tramp-rpc-process.el
-(declare-function tramp-rpc--write-remote-process "tramp-rpc-process"
-                  (vec pid data &optional owner-process))
-(declare-function tramp-rpc--drain-write-queue "tramp-rpc-process")
-(declare-function tramp-rpc--encode-process-input "tramp-rpc-process")
-(declare-function tramp-rpc--close-remote-stdin "tramp-rpc-process"
-                  (vec pid &optional owner-process))
-(declare-function tramp-rpc--kill-remote-process "tramp-rpc-process"
-                  (vec pid &optional signal connection))
-(declare-function tramp-rpc--cleanup-async-processes "tramp-rpc-process")
+(require 'tramp-rpc-protocol)
+(require 'tramp-rpc-connection)
+(require 'tramp-rpc-hops)
+(require 'tramp-rpc-transport)
+(require 'tramp-rpc-process)
 
 ;; Functions from tramp-rpc.el
-(declare-function tramp-rpc--debug "tramp-rpc")
-(declare-function tramp-rpc--call "tramp-rpc")
 (declare-function tramp-rpc-file-name-p "tramp-rpc")
-(declare-function tramp-rpc--managed-file-name-p "tramp-rpc")
 
 ;; Variables from tramp-rpc.el / tramp-rpc-process.el
-(defvar tramp-rpc--delivering-output)
-(defvar tramp-rpc--closing-local-relay)
-(defvar tramp-rpc--pty-processes)
-(defvar tramp-rpc--async-processes)
-(defvar tramp-rpc-synchronous-pipe-writes)
 
 ;; Functions from vc-dispatcher.el (used by vc-exec-after handler)
 (declare-function vc-exec-after "vc-dispatcher")
@@ -116,98 +97,67 @@ PROCESS is the process being handled."
 ;; Process I/O handler
 ;; ============================================================================
 
+(defun tramp-rpc--resolve-process (process)
+  "Return the process object denoted by PROCESS, or nil."
+  (cond
+   ((processp process) process)
+   ((bufferp process) (get-buffer-process process))
+   ((stringp process)
+    (when-let* ((buffer (get-buffer process)))
+      (get-buffer-process buffer)))))
+
+(defun tramp-rpc--send-managed-process-string (process string operation)
+  "Send STRING to RPC-managed PROCESS for OPERATION.
+Return `not-managed' when PROCESS must use the native handler."
+  (let ((proc (tramp-rpc--managed-send-process process)))
+    (cond
+     ((not proc) 'not-managed)
+     ((process-get proc :tramp-rpc-pty)
+      (let ((vec (process-get proc :tramp-rpc-vec))
+            (pid (process-get proc :tramp-rpc-pid)))
+        (tramp-rpc--debug "%s PTY pid=%s len=%d" operation pid (length string))
+        (tramp-rpc--call
+         vec "process.write_pty"
+         `((pid . ,pid)
+           (data . ,(msgpack-bin-make
+                     (tramp-rpc--encode-process-input proc string))))
+         (process-get proc :tramp-rpc-connection))
+        nil))
+     (t
+      (let ((vec (process-get proc :tramp-rpc-vec))
+            (pid (process-get proc :tramp-rpc-pid)))
+        (tramp-rpc--debug "%s pipe pid=%s len=%d" operation pid (length string))
+        (tramp-rpc--write-remote-process
+         vec pid (tramp-rpc--encode-process-input proc string) proc)
+        (when tramp-rpc-synchronous-pipe-writes
+          (tramp-rpc--drain-write-queue vec pid proc)))))))
+
+(defun tramp-rpc--managed-send-process (process)
+  "Return PROCESS's RPC-managed process, or nil when native delivery is needed."
+  (when-let* ((proc (tramp-rpc--resolve-process process)))
+    (and (not tramp-rpc--delivering-output)
+         (not (process-get proc :tramp-rpc-direct-ssh))
+         (process-get proc :tramp-rpc-pid)
+         (process-get proc :tramp-rpc-vec)
+         proc)))
+
 (defun tramp-rpc-handle-process-send-string (process string)
-  "Handler for `process-send-string' for TRAMP-RPC processes.
-PROCESS is the process being handled.
-STRING is the text being handled."
-  ;; If we're delivering output to the local relay, bypass this handler
-  (if tramp-rpc--delivering-output
-      (tramp-run-real-handler #'process-send-string (list process string))
-    ;; process-send-string can receive a buffer/buffer-name instead of process
-    (let ((proc (cond
-                 ((processp process) process)
-                 ((or (bufferp process) (stringp process))
-                  (get-buffer-process (get-buffer process)))
-                 (t nil))))
-      (cond
-       ;; Direct SSH PTY - use normal process-send-string (low latency)
-       ((and proc (process-get proc :tramp-rpc-direct-ssh))
-        (tramp-run-real-handler #'process-send-string (list process string)))
-       ;; RPC-based PTY process - use PTY write (async, fire-and-forget)
-       ((and proc (process-get proc :tramp-rpc-pty)
-             (process-get proc :tramp-rpc-pid))
-        (let ((vec (process-get proc :tramp-rpc-vec))
-              (pid (process-get proc :tramp-rpc-pid)))
-          (tramp-rpc--debug "SEND-STRING PTY pid=%s len=%d" pid (length string))
-          ;; Match local `process-send-string' semantics: return only after the
-          ;; bytes reached the remote PTY's kernel buffer.
-          (let ((data-bytes (tramp-rpc--encode-process-input proc string)))
-            (tramp-rpc--call vec "process.write_pty"
-                             `((pid . ,pid)
-                               (data . ,(msgpack-bin-make data-bytes)))
-                             (process-get proc :tramp-rpc-connection)))
-          nil))
-       ;; Regular async RPC process (pipe-based)
-       ((and proc
-             (process-get proc :tramp-rpc-pid)
-             (process-get proc :tramp-rpc-vec)
-             (not (process-get proc :tramp-rpc-pty)))
-        (tramp-rpc--debug "SEND-STRING pipe pid=%s len=%d"
-                         (process-get proc :tramp-rpc-pid) (length string))
-        (let ((vec (process-get proc :tramp-rpc-vec))
-              (pid (process-get proc :tramp-rpc-pid)))
-          (tramp-rpc--write-remote-process
-           vec pid (tramp-rpc--encode-process-input proc string) proc)
-          (when tramp-rpc-synchronous-pipe-writes
-            (tramp-rpc--drain-write-queue vec pid proc))))
-       ;; Not an RPC process, use original function
-       (t (tramp-run-real-handler #'process-send-string (list process string)))))))
+  "Send STRING to the TRAMP-RPC PROCESS."
+  (when (eq (tramp-rpc--send-managed-process-string
+             process string "SEND-STRING")
+            'not-managed)
+    (tramp-run-real-handler #'process-send-string (list process string))))
 
 (defun tramp-rpc-handle-process-send-region (process start end)
   "Handler for `process-send-region' for TRAMP-RPC processes.
 PROCESS is the process being handled.
 START and END are buffer positions delimiting the text to send."
-  ;; If we're delivering output to the local relay, bypass this handler
-  (if tramp-rpc--delivering-output
-      (tramp-run-real-handler #'process-send-region (list process start end))
-    (let ((proc (cond
-                 ((processp process) process)
-                 ((or (bufferp process) (stringp process))
-                  (get-buffer-process (get-buffer process)))
-                 (t nil))))
-      (cond
-       ;; Direct SSH PTY - use normal process-send-region (low latency)
-       ((and proc (process-get proc :tramp-rpc-direct-ssh))
-        (tramp-run-real-handler #'process-send-region (list process start end)))
-       ;; RPC-based PTY process - use PTY write
-       ((and proc (process-get proc :tramp-rpc-pty)
-             (process-get proc :tramp-rpc-pid))
-        (let ((vec (process-get proc :tramp-rpc-vec))
-              (pid (process-get proc :tramp-rpc-pid))
-              (string (buffer-substring-no-properties start end)))
-          (tramp-rpc--debug "SEND-REGION PTY pid=%s len=%d" pid (length string))
-          (let ((data-bytes (tramp-rpc--encode-process-input proc string)))
-            (tramp-rpc--call vec "process.write_pty"
-                             `((pid . ,pid)
-                               (data . ,(msgpack-bin-make data-bytes)))
-                             (process-get proc :tramp-rpc-connection)))
-          nil))
-       ;; Regular async RPC process (pipe-based)
-       ((and proc
-             (process-get proc :tramp-rpc-pid)
-             (process-get proc :tramp-rpc-vec)
-             (not (process-get proc :tramp-rpc-pty)))
-        (let ((string (buffer-substring-no-properties start end)))
-          (tramp-rpc--debug "SEND-REGION pipe pid=%s len=%d"
-                           (process-get proc :tramp-rpc-pid) (length string))
-          (let ((vec (process-get proc :tramp-rpc-vec))
-                (pid (process-get proc :tramp-rpc-pid)))
-            (tramp-rpc--write-remote-process
-             vec pid (tramp-rpc--encode-process-input proc string) proc)
-            (when tramp-rpc-synchronous-pipe-writes
-              (tramp-rpc--drain-write-queue vec pid proc)))))
-       ;; Not an RPC process, use original function
-       (t (tramp-run-real-handler #'process-send-region (list process start end)))))))
+  (if-let* ((proc (tramp-rpc--managed-send-process process)))
+      (tramp-rpc--send-managed-process-string
+       proc (buffer-substring-no-properties start end) "SEND-REGION")
+    ;; Preserve native region delivery for bypasses and non-RPC processes.
+    (tramp-run-real-handler #'process-send-region
+                            (list process start end))))
 
 (defun tramp-rpc-handle-process-send-eof (&optional process)
   "Handler for `process-send-eof' for TRAMP-RPC processes.
@@ -563,7 +513,7 @@ exited (remote side finished), delete it so the refresh can proceed."
                (or (process-get proc :tramp-rpc-exited)
                    (not (process-live-p proc))))
       (remhash proc tramp-rpc--async-processes)
-      (ignore-errors (delete-process proc))))
+      (delete-process proc)))
   (tramp-run-real-handler 'vc-dir-refresh nil))
 
 ;; ============================================================================
@@ -580,49 +530,48 @@ exited (remote side finished), delete it so the refresh can proceed."
                            'process-coding-system)
     (advice-add 'process-coding-system :around
                 #'tramp-rpc--process-coding-system-advice))
-  (with-eval-after-load 'tramp-rpc
-    (tramp-add-external-operation
+  (tramp-rpc--add-external-operation
      'process-send-string
      #'tramp-rpc-handle-process-send-string 'tramp-rpc 'process)
-    (tramp-add-external-operation
+    (tramp-rpc--add-external-operation
      'process-send-region
      #'tramp-rpc-handle-process-send-region 'tramp-rpc 'process)
-    (tramp-add-external-operation
+  (tramp-rpc--add-external-operation
      'process-send-eof
-     #'tramp-rpc-handle-process-send-eof 'tramp-rpc 'process))
+     #'tramp-rpc-handle-process-send-eof 'tramp-rpc 'process)
   ;; This must be before `tramp-signal-process'.  Since tramp.el is
   ;; required, this is guaranteed.
   (add-hook 'signal-process-functions #'tramp-rpc-handle-signal-process)
-  (with-eval-after-load 'tramp-rpc
-    (tramp-add-external-operation
+  (tramp-rpc--add-external-operation
      'process-status
      #'tramp-rpc-handle-process-status 'tramp-rpc 'process)
-    (tramp-add-external-operation
+    (tramp-rpc--add-external-operation
      'process-exit-status
      #'tramp-rpc-handle-process-exit-status 'tramp-rpc 'process)
-    (tramp-add-external-operation
+    (tramp-rpc--add-external-operation
      'process-command
      #'tramp-rpc-handle-process-command 'tramp-rpc 'process)
-    (tramp-add-external-operation
+  (tramp-rpc--add-external-operation
      'process-tty-name
-     #'tramp-rpc-handle-process-tty-name 'tramp-rpc 'process))
-  (with-eval-after-load 'tramp-rpc
-    (tramp-add-external-operation
+     #'tramp-rpc-handle-process-tty-name 'tramp-rpc 'process)
+  (tramp-rpc--add-external-operation
      'vc-call-backend
      #'tramp-rpc-handle-vc-call-backend 'tramp-rpc
      #'tramp-rpc--vc-call-backend-file-name-for-operation)
-    (tramp-add-external-operation
+  (tramp-rpc--add-external-operation
      'vc-exec-after
-     #'tramp-rpc-handle-vc-exec-after 'tramp-rpc 'default-directory))
-  ;; If python/eglot/magit-process is already loaded while `tramp-rpc'
-  ;; is being required, defer registration until `tramp-rpc' is
-  ;; provided; otherwise `tramp-add-external-operation' calls
-  ;; `(require 'tramp-rpc)' recursively.
-  (with-eval-after-load 'python
-    (with-eval-after-load 'tramp-rpc
+     #'tramp-rpc-handle-vc-exec-after 'tramp-rpc 'default-directory)
+  (tramp-rpc--add-external-operation
+   'vc-dir-refresh
+   #'tramp-rpc-handle-vc-dir-refresh 'tramp-rpc
+   #'tramp-rpc--vc-dir-refresh-file-name-for-operation))
+
+(defun tramp-rpc-advice-install-optional-handlers ()
+  "Install handlers for loaded optional integration packages."
+  (when (featurep 'python)
       (if (tramp-rpc--python-tramp-file-name-external-operation-p)
           (condition-case err
-              (tramp-add-external-operation
+              (tramp-rpc--add-external-operation
                'python-shell--tramp-with-environment
                #'tramp-rpc-handle-python-shell--tramp-with-environment
                'tramp-rpc 'tramp-file-name)
@@ -637,22 +586,15 @@ exited (remote side finished), delete it so the refresh can proceed."
           (advice-add
            'python-shell--tramp-with-environment
            :around
-           #'tramp-rpc-handle-python-shell--tramp-with-environment-compat)))))
-  (with-eval-after-load 'eglot
-    (with-eval-after-load 'tramp-rpc
-      (tramp-add-external-operation
+           #'tramp-rpc-handle-python-shell--tramp-with-environment-compat))))
+  (when (featurep 'eglot)
+    (tramp-rpc--add-external-operation
        'eglot--cmd
-       #'tramp-rpc-handle-eglot--cmd 'tramp-rpc 'default-directory)))
-  (with-eval-after-load 'magit-process
-    (with-eval-after-load 'tramp-rpc
-      (tramp-add-external-operation
+       #'tramp-rpc-handle-eglot--cmd 'tramp-rpc 'default-directory))
+  (when (featurep 'magit-process)
+    (tramp-rpc--add-external-operation
        'magit-start-process
        #'tramp-rpc-handle-magit-start-process 'tramp-rpc 'default-directory)))
-  (with-eval-after-load 'tramp-rpc
-    (tramp-add-external-operation
-     'vc-dir-refresh
-     #'tramp-rpc-handle-vc-dir-refresh 'tramp-rpc
-     #'tramp-rpc--vc-dir-refresh-file-name-for-operation)))
 
 (defun tramp-rpc-handler-remove ()
   "Remove all process handler installed by tramp-rpc."
@@ -660,35 +602,26 @@ exited (remote side finished), delete it so the refresh can proceed."
                  #'tramp-rpc--set-process-coding-system-advice)
   (advice-remove 'process-coding-system
                  #'tramp-rpc--process-coding-system-advice)
-  (tramp-remove-external-operation 'process-send-string 'tramp-rpc)
-  (tramp-remove-external-operation 'process-send-region 'tramp-rpc)
-  (tramp-remove-external-operation 'process-send-eof 'tramp-rpc)
+  (tramp-rpc--remove-external-operation 'process-send-string 'tramp-rpc)
+  (tramp-rpc--remove-external-operation 'process-send-region 'tramp-rpc)
+  (tramp-rpc--remove-external-operation 'process-send-eof 'tramp-rpc)
   (remove-hook 'signal-process-functions #'tramp-rpc-handle-signal-process)
-  (tramp-remove-external-operation 'process-status 'tramp-rpc)
-  (tramp-remove-external-operation 'process-exit-status 'tramp-rpc)
-  (tramp-remove-external-operation 'process-command 'tramp-rpc)
-  (tramp-remove-external-operation 'process-tty-name 'tramp-rpc)
-  (tramp-remove-external-operation 'vc-call-backend 'tramp-rpc)
-  (tramp-remove-external-operation 'vc-exec-after 'tramp-rpc)
-  (tramp-remove-external-operation
+  (tramp-rpc--remove-external-operation 'process-status 'tramp-rpc)
+  (tramp-rpc--remove-external-operation 'process-exit-status 'tramp-rpc)
+  (tramp-rpc--remove-external-operation 'process-command 'tramp-rpc)
+  (tramp-rpc--remove-external-operation 'process-tty-name 'tramp-rpc)
+  (tramp-rpc--remove-external-operation 'vc-call-backend 'tramp-rpc)
+  (tramp-rpc--remove-external-operation 'vc-exec-after 'tramp-rpc)
+  (tramp-rpc--remove-external-operation
    'python-shell--tramp-with-environment 'tramp-rpc)
   (when (fboundp 'python-shell--tramp-with-environment)
     (advice-remove
      'python-shell--tramp-with-environment
      #'tramp-rpc-handle-python-shell--tramp-with-environment-compat))
-  (tramp-remove-external-operation 'eglot--cmd 'tramp-rpc)
-  (tramp-remove-external-operation 'magit-start-process 'tramp-rpc)
-  (tramp-remove-external-operation 'vc-dir-refresh 'tramp-rpc))
+  (tramp-rpc--remove-external-operation 'eglot--cmd 'tramp-rpc)
+  (tramp-rpc--remove-external-operation 'magit-start-process 'tramp-rpc)
+  (tramp-rpc--remove-external-operation 'vc-dir-refresh 'tramp-rpc))
 
-(defcustom tramp-rpc-install-handler-on-load t
-  "Whether to install process handler when tramp-rpc-advice is loaded.
-Set to nil before loading to prevent automatic handler installation."
-  :type 'boolean
-  :group 'tramp-rpc)
-
-;; Install handler when loaded (if enabled)
-(when tramp-rpc-install-handler-on-load
-  (tramp-rpc-handler-install))
 
 ;; ============================================================================
 ;; Unload support
@@ -701,24 +634,6 @@ Removes handler."
   (tramp-rpc-handler-remove)
   ;; Return nil to allow normal unload to proceed
   nil)
-
-(add-hook 'tramp-rpc-unload-hook
-	  (lambda ()
-	    (when (featurep 'tramp-rpc-advice)
-	      ;; When Emacs is configured --with-native-compilation,
-	      ;; `load-history' contains `--anonymous-lambda' defun
-	      ;; entries for tramp-rpc-advice.el.  This raises an
-	      ;; `cl--assertion-failed' error when unloading.  Emacs
-	      ;; bug#80446.
-	      (dolist (entry load-history)
-		(when (string-match-p
-		       (rx "tramp-rpc-advice" (| ".el" ".elc") eos) (car entry))
-		  (setcdr entry
-			  (seq-remove
-			   (lambda (item)
-			     (equal item '(defun . --anonymous-lambda)))
-			   (cdr entry)))))
-	      (unload-feature 'tramp-rpc-advice 'force))))
 
 (provide 'tramp-rpc-advice)
 ;;; tramp-rpc-advice.el ends here

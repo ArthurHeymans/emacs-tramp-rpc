@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+
 //! MessagePack-RPC protocol types for TRAMP-RPC
 
 use rmpv::Value;
@@ -100,7 +102,7 @@ impl RpcError {
     pub fn method_not_found(method: &str) -> Self {
         Self {
             code: Self::METHOD_NOT_FOUND,
-            message: format!("Method not found: {}", method),
+            message: format!("Method not found: {method}"),
             data: None,
         }
     }
@@ -124,7 +126,7 @@ impl RpcError {
     pub fn file_not_found(path: &str) -> Self {
         Self {
             code: Self::FILE_NOT_FOUND,
-            message: format!("File not found: {}", path),
+            message: format!("File not found: {path}"),
             data: None,
         }
     }
@@ -132,7 +134,7 @@ impl RpcError {
     pub fn permission_denied(path: &str) -> Self {
         Self {
             code: Self::PERMISSION_DENIED,
-            message: format!("Permission denied: {}", path),
+            message: format!("Permission denied: {path}"),
             data: None,
         }
     }

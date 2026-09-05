@@ -1,0 +1,36 @@
+name: melpazoid
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+    branches: [main, master]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.10"
+      - name: Install melpazoid
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y emacs
+          git clone --depth 1 https://github.com/riscy/melpazoid.git ~/melpazoid
+      - name: Run MELPA package checks
+        env:
+          LOCAL_REPO: ${{ github.workspace }}
+          RECIPE: >-
+            (tramp-rpc :fetcher github
+             :repo "ArthurHeymans/emacs-tramp-rpc"
+             :files (:defaults "Cargo.toml" "Cargo.lock" "server" ".cargo"))
+          WARN_IS_ERROR: true
+          EXIST_OK: false
+        run: make -C ~/melpazoid

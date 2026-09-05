@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+
 //! File metadata operations
 
 use crate::protocol::{FileAttributes, FileType, RpcError, from_value};
@@ -149,16 +151,39 @@ static USER_NAMES: std::sync::LazyLock<Mutex<HashMap<u32, Option<String>>>> =
 static GROUP_NAMES: std::sync::LazyLock<Mutex<HashMap<u32, Option<String>>>> =
     std::sync::LazyLock::new(|| Mutex::new(HashMap::new()));
 
-/// Initial buffer size hint from sysconf, or a reasonable default.
-fn sysconf_bufsize(name: libc::c_int, fallback: usize) -> usize {
-    let ret = unsafe { libc::sysconf(name) };
-    if ret > 0 { ret as usize } else { fallback }
+/// Short negative cache for transient NSS failures (LDAP/SSSD outage).
+/// Without this, every directory entry with the same uid/gid retries libc +
+/// `getent` (~2s each), turning one listing into a per-entry retry storm.
+/// Entries expire after `TRANSIENT_NSS_TTL` so recovery is still prompt.
+const TRANSIENT_NSS_TTL: Duration = Duration::from_secs(10);
+static TRANSIENT_USER_FAILURES: std::sync::LazyLock<Mutex<HashMap<u32, Instant>>> =
+    std::sync::LazyLock::new(|| Mutex::new(HashMap::new()));
+static TRANSIENT_GROUP_FAILURES: std::sync::LazyLock<Mutex<HashMap<u32, Instant>>> =
+    std::sync::LazyLock::new(|| Mutex::new(HashMap::new()));
+
+fn transient_failure_recent(cache: &Mutex<HashMap<u32, Instant>>, id: u32) -> bool {
+    let mut cache = cache.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(&at) = cache.get(&id) {
+        if at.elapsed() < TRANSIENT_NSS_TTL {
+            return true;
+        }
+        cache.remove(&id);
+    }
+    false
 }
 
-/// Maximum buffer size we will attempt before giving up (64 KiB).
-/// Even large LDAP group records with many members stay well below this;
-/// if a record genuinely exceeds 64 KiB the getent fallback will handle it.
-const MAX_NSS_BUFSIZE: usize = 64 * 1024;
+fn record_transient_failure(cache: &Mutex<HashMap<u32, Instant>>, id: u32) {
+    let mut cache = cache.lock().unwrap_or_else(|e| e.into_inner());
+    cache.insert(id, Instant::now());
+    // Bound growth: outages can touch many distinct ids; drop expired first,
+    // then cap at a generous size to avoid unbounded memory.
+    if cache.len() > 4096 {
+        cache.retain(|_, at| at.elapsed() < TRANSIENT_NSS_TTL);
+    }
+    if cache.len() > 8192 {
+        cache.clear();
+    }
+}
 
 /// Maximum wall-clock time to wait for a `getent` fallback lookup before
 /// giving up. NSS backends (LDAP, SSSD) can hang indefinitely when the
@@ -268,27 +293,27 @@ fn getent_name(database: &str, id: u32) -> Result<Option<String>, ()> {
     }
 }
 
-/// Extract an owned name from a successful `getpwuid_r`/`getgrgid_r` result.
+/// Reentrant passwd/group lookup by id through nix, which retries with a
+/// growing buffer on `ERANGE` so large LDAP/SSSD records still resolve.
 ///
-/// `ptr` is the struct's name field (`pw_name`/`gr_name`), valid only when the
-/// reentrant lookup succeeded.  Returns `None` for a null pointer or when the
-/// name is not valid UTF-8.
-fn nss_name_from_ptr(ptr: *const libc::c_char) -> Option<String> {
-    if ptr.is_null() {
-        return None;
+/// Returns `Ok(Some(name))` on a hit, `Ok(None)` when libc reports a miss and
+/// `Err(errno)` when the backend failed (unavailable, timeout, ...).
+fn nss_name_by_id(kind: NssKind, id: u32) -> nix::Result<Option<String>> {
+    match kind {
+        NssKind::User => nix::unistd::User::from_uid(nix::unistd::Uid::from_raw(id))
+            .map(|user| user.map(|user| user.name)),
+        NssKind::Group => nix::unistd::Group::from_gid(nix::unistd::Gid::from_raw(id))
+            .map(|group| group.map(|group| group.name)),
     }
-    // SAFETY: `ptr` is a valid NUL-terminated string owned by the `passwd` or
-    // `group` struct populated by a successful getpwuid_r/getgrgid_r call.
-    let name = unsafe { std::ffi::CStr::from_ptr(ptr) };
-    name.to_str().ok().map(str::to_string)
 }
 
 /// Shared NSS name resolution for both uid and gid.
 ///
-/// Uses `getpwuid_r` or `getgrgid_r` (selected by `kind`) with a
-/// sysconf-hinted buffer that doubles on `ERANGE`, falls back to `getent`
-/// on libc errors, and caches only definitive results so transient failures
-/// (timeout, backend unavailable) can be retried on a later lookup.
+/// Uses `getpwuid_r` or `getgrgid_r` (selected by `kind`) through nix, falls
+/// back to `getent` on libc misses and errors, caches definitive results
+/// indefinitely, and caches transient failures (timeout, backend
+/// unavailable) for `TRANSIENT_NSS_TTL` so one listing under outage does not
+/// retry per entry.
 fn resolve_nss_name(
     cache: &'static Mutex<HashMap<u32, Option<String>>>,
     kind: NssKind,
@@ -301,89 +326,42 @@ fn resolve_nss_name(
             return result.clone();
         }
     }
+    // Short negative cache for transient outage: fail fast without hitting
+    // libc/getent again within the TTL window.
+    let transient_cache = match kind {
+        NssKind::User => &*TRANSIENT_USER_FAILURES,
+        NssKind::Group => &*TRANSIENT_GROUP_FAILURES,
+    };
+    if transient_failure_recent(transient_cache, id) {
+        return None;
+    }
 
-    let (bufsize_hint, database) = match kind {
-        NssKind::User => (libc::_SC_GETPW_R_SIZE_MAX, "passwd"),
-        NssKind::Group => (libc::_SC_GETGR_R_SIZE_MAX, "group"),
+    let database = match kind {
+        NssKind::User => "passwd",
+        NssKind::Group => "group",
     };
 
-    let mut bufsize = sysconf_bufsize(bufsize_hint, 1024);
-
-    let name_result: Result<Option<String>, ()> = loop {
-        let mut buf = vec![0u8; bufsize];
-
-        // Perform the appropriate libc call and extract (ret, name_string).
-        // The name pointer is converted to an owned String within the match
-        // arm while `buf` is still in scope, so no raw pointer escapes.
-        let (ret, result_null, name_str) = match kind {
-            NssKind::User => {
-                let mut pwd: libc::passwd = unsafe { std::mem::zeroed() };
-                let mut result_ptr: *mut libc::passwd = std::ptr::null_mut();
-                let ret = unsafe {
-                    libc::getpwuid_r(
-                        id,
-                        &mut pwd,
-                        buf.as_mut_ptr() as *mut libc::c_char,
-                        buf.len(),
-                        &mut result_ptr,
-                    )
-                };
-                let name_str = if ret == 0 && !result_ptr.is_null() {
-                    nss_name_from_ptr(pwd.pw_name)
-                } else {
-                    None
-                };
-                (ret, result_ptr.is_null(), name_str)
-            }
-            NssKind::Group => {
-                let mut grp: libc::group = unsafe { std::mem::zeroed() };
-                let mut result_ptr: *mut libc::group = std::ptr::null_mut();
-                let ret = unsafe {
-                    libc::getgrgid_r(
-                        id,
-                        &mut grp,
-                        buf.as_mut_ptr() as *mut libc::c_char,
-                        buf.len(),
-                        &mut result_ptr,
-                    )
-                };
-                let name_str = if ret == 0 && !result_ptr.is_null() {
-                    nss_name_from_ptr(grp.gr_name)
-                } else {
-                    None
-                };
-                (ret, result_ptr.is_null(), name_str)
-            }
-        };
-
-        if ret == libc::ERANGE && bufsize < MAX_NSS_BUFSIZE {
-            bufsize = bufsize.saturating_mul(2).min(MAX_NSS_BUFSIZE);
-            continue;
-        }
-
-        if ret == 0 && result_null {
-            // Some NSS stacks can report a libc miss here while
-            // `getent` still resolves through another backend.
-            break getent_name(database, id);
-        }
-
-        if ret != 0 {
-            // libc error (backend unavailable, etc.): try getent fallback.
-            break getent_name(database, id);
-        }
-
-        break Ok(name_str);
+    let name_result: Result<Option<String>, ()> = match nss_name_by_id(kind, id) {
+        Ok(Some(name)) => Ok(Some(name)),
+        // Some NSS stacks can report a libc miss here while `getent` still
+        // resolves through another backend; libc errors (backend unavailable,
+        // etc.) take the same fallback.
+        Ok(None) | Err(_) => getent_name(database, id),
     };
 
-    // Cache only definitive results. Transient failures (Err) are not
-    // cached so a later lookup can succeed once the service recovers.
+    // Cache definitive results indefinitely; cache transient failures for
+    // TRANSIENT_NSS_TTL so a later lookup can succeed once the service
+    // recovers, without retrying per directory entry during an outage.
     match name_result {
         Ok(name) => {
             let mut c = cache.lock().unwrap_or_else(|e| e.into_inner());
             c.insert(id, name.clone());
             name
         }
-        Err(()) => None,
+        Err(()) => {
+            record_transient_failure(transient_cache, id);
+            None
+        }
     }
 }
 
@@ -397,36 +375,14 @@ pub fn get_group_name(gid: u32) -> Option<String> {
 
 /// Resolve the login shell for `uid` via getpwuid_r.
 ///
-/// Uses a sysconf-hinted buffer that doubles on `ERANGE`, so passwd records
-/// larger than the initial hint (large LDAP/SSSD entries) still resolve
+/// nix retries with a growing buffer on `ERANGE`, so passwd records larger
+/// than the initial sysconf hint (large LDAP/SSSD entries) still resolve
 /// instead of being reported as absent.
 pub(crate) fn get_user_login_shell(uid: u32) -> Option<String> {
-    let mut bufsize = sysconf_bufsize(libc::_SC_GETPW_R_SIZE_MAX, 1024);
-    loop {
-        let mut buf = vec![0u8; bufsize];
-        let mut pwd: libc::passwd = unsafe { std::mem::zeroed() };
-        let mut result_ptr: *mut libc::passwd = std::ptr::null_mut();
-        let ret = unsafe {
-            libc::getpwuid_r(
-                uid,
-                &mut pwd,
-                buf.as_mut_ptr() as *mut libc::c_char,
-                buf.len(),
-                &mut result_ptr,
-            )
-        };
-        if ret == libc::ERANGE && bufsize < MAX_NSS_BUFSIZE {
-            bufsize = bufsize.saturating_mul(2).min(MAX_NSS_BUFSIZE);
-            continue;
-        }
-        if ret != 0 || result_ptr.is_null() {
-            return None;
-        }
-        // Extract owned data while `buf` is still alive: the passwd strings
-        // point into it.
-        let shell = unsafe { std::ffi::CStr::from_ptr(pwd.pw_shell) };
-        return shell.to_str().ok().map(str::to_owned);
-    }
+    nix::unistd::User::from_uid(nix::unistd::Uid::from_raw(uid))
+        .ok()
+        .flatten()
+        .and_then(|user| user.shell.into_os_string().into_string().ok())
 }
 
 /// Cache of user name -> resolved home directory.
@@ -459,33 +415,11 @@ pub(crate) fn get_user_home_dir(user: &str) -> Option<Vec<u8>> {
 }
 
 fn getpwnam_home_dir_uncached(user: &str) -> Option<Vec<u8>> {
-    let user_c = std::ffi::CString::new(user).ok()?;
-    let mut bufsize = sysconf_bufsize(libc::_SC_GETPW_R_SIZE_MAX, 1024);
-    loop {
-        let mut buf = vec![0u8; bufsize];
-        let mut pwd: libc::passwd = unsafe { std::mem::zeroed() };
-        let mut result_ptr: *mut libc::passwd = std::ptr::null_mut();
-        let ret = unsafe {
-            libc::getpwnam_r(
-                user_c.as_ptr(),
-                &mut pwd,
-                buf.as_mut_ptr() as *mut libc::c_char,
-                buf.len(),
-                &mut result_ptr,
-            )
-        };
-        if ret == libc::ERANGE && bufsize < MAX_NSS_BUFSIZE {
-            bufsize = bufsize.saturating_mul(2).min(MAX_NSS_BUFSIZE);
-            continue;
-        }
-        if ret != 0 || result_ptr.is_null() {
-            return None;
-        }
-        // Extract owned data while `buf` is still alive: the passwd strings
-        // point into it.  Keep raw bytes: home directories need not be UTF-8.
-        let dir = unsafe { std::ffi::CStr::from_ptr(pwd.pw_dir) };
-        return Some(dir.to_bytes().to_vec());
-    }
+    // Keep raw bytes: home directories need not be UTF-8.
+    nix::unistd::User::from_name(user)
+        .ok()
+        .flatten()
+        .map(|user| OsStrExt::as_bytes(user.dir.as_os_str()).to_vec())
 }
 
 pub fn map_io_error(err: std::io::Error, path: &str) -> RpcError {
@@ -522,13 +456,13 @@ pub async fn bytes_to_path(bytes: &[u8]) -> Result<PathBuf, RpcError> {
         .is_some_and(|rest| !rest.is_empty() && !rest.starts_with(b"/"))
     {
         let bytes = bytes.to_vec();
-        tokio::task::spawn_blocking(move || super::expand_tilde_bytes(&bytes))
+        tokio::task::spawn_blocking(move || super::system::expand_tilde_bytes(&bytes))
             .await
             .map_err(|error| {
                 RpcError::internal_error(format!("Tilde expansion task join error: {error}"))
             })?
     } else {
-        super::expand_tilde_bytes(bytes)
+        super::system::expand_tilde_bytes(bytes)
     };
 
     Ok(match expanded {
@@ -663,26 +597,58 @@ mod tests {
         assert!(!cache.contains_key(&user));
     }
 
-    /// sysconf_bufsize should return a positive value for _SC_GETPW_R_SIZE_MAX.
-    #[test]
-    fn test_sysconf_bufsize_pw() {
-        let size = sysconf_bufsize(libc::_SC_GETPW_R_SIZE_MAX, 1024);
-        assert!(size > 0, "sysconf should return a positive buffer size");
+    /// Independent oracle for the nix passwd/group mapping: the `getent`
+    /// binary resolves through the same NSS stack but shares no code with
+    /// our wrappers, so a mixed-up field (name, dir, shell) or a spurious
+    /// libc miss shows up as a mismatch.  Returns the colon-separated record
+    /// fields, or None when `getent` is unavailable or the key is absent.
+    fn getent_fields(database: &str, key: &str) -> Option<Vec<String>> {
+        let output = Command::new("getent")
+            .arg(database)
+            .arg(key)
+            .output()
+            .ok()?;
+        if !output.status.success() {
+            return None;
+        }
+        let stdout = String::from_utf8(output.stdout).ok()?;
+        Some(
+            stdout
+                .lines()
+                .next()?
+                .split(':')
+                .map(str::to_owned)
+                .collect(),
+        )
     }
 
-    /// sysconf_bufsize should return a positive value for _SC_GETGR_R_SIZE_MAX.
+    /// The uid, login shell and `~user` lookups must agree field for field
+    /// with `getent passwd`.  The direct libc lookup is checked as well,
+    /// since `get_user_name` would otherwise hide a libc miss behind its own
+    /// `getent` fallback.
     #[test]
-    fn test_sysconf_bufsize_gr() {
-        let size = sysconf_bufsize(libc::_SC_GETGR_R_SIZE_MAX, 1024);
-        assert!(size > 0, "sysconf should return a positive buffer size");
+    fn test_passwd_lookups_match_getent() {
+        let uid = nix::unistd::getuid().as_raw();
+        let Some(fields) = getent_fields("passwd", &uid.to_string()) else {
+            return; // no getent on this platform, or no passwd entry
+        };
+        let (name, dir, shell) = (&fields[0], &fields[5], &fields[6]);
+        assert_eq!(nss_name_by_id(NssKind::User, uid), Ok(Some(name.clone())));
+        assert_eq!(get_user_name(uid).as_deref(), Some(name.as_str()));
+        assert_eq!(get_user_login_shell(uid).as_deref(), Some(shell.as_str()));
+        assert_eq!(get_user_home_dir(name), Some(dir.as_bytes().to_vec()));
     }
 
-    /// sysconf_bufsize should return the fallback for an invalid argument.
+    /// The gid lookup must agree with `getent group`, directly and cached.
     #[test]
-    fn test_sysconf_bufsize_fallback() {
-        // -1 is not a valid sysconf name, so it should return the fallback.
-        let size = sysconf_bufsize(-1, 4096);
-        assert_eq!(size, 4096, "invalid sysconf should return fallback");
+    fn test_group_lookup_matches_getent() {
+        let gid = nix::unistd::getgid().as_raw();
+        let Some(fields) = getent_fields("group", &gid.to_string()) else {
+            return; // no getent on this platform, or no group entry
+        };
+        let name = &fields[0];
+        assert_eq!(nss_name_by_id(NssKind::Group, gid), Ok(Some(name.clone())));
+        assert_eq!(get_group_name(gid).as_deref(), Some(name.as_str()));
     }
 
     /// Verify that file.stat via the RPC handler returns uname/gname for

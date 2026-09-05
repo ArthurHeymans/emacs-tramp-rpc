@@ -8,6 +8,11 @@
 
 ;; This file is part of tramp-rpc.
 
+;; tramp-rpc is free software: you can redistribute it and/or modify
+;; it under the terms of the GNU General Public License as published by
+;; the Free Software Foundation, either version 3 of the License, or
+;; (at your option) any later version.
+
 ;;; Commentary:
 
 ;; This file handles deployment of the tramp-rpc-server binary to
@@ -22,26 +27,34 @@
 
 (require 'cl-lib)
 (require 'tramp)
+(require 'tramp-rpc-protocol)
+(require 'tramp-rpc-hops)
+(require 'tramp-sh)
 (require 'url)
 
-;; Silence byte-compiler warnings for functions defined in tramp-sh
-(declare-function tramp-send-command "tramp-sh")
-(declare-function tramp-send-command-and-check "tramp-sh")
-(declare-function tramp-send-command-and-read "tramp-sh")
+;; Silence byte-compiler warnings for functions defined in tramp-sh.
 (declare-function tramp-get-remote-path "tramp-sh")
 (declare-function tramp-get-connection-process "tramp")
 (declare-function tramp-check-for-regexp "tramp")
 (declare-function tramp-get-remote-null-device "tramp")
 
-;; Functions from tramp-rpc.el.  `tramp-rpc-deploy' is loaded by
-;; tramp-rpc.el after these helpers have been defined.
-(declare-function tramp-rpc--proxy-hop-string "tramp-rpc")
-(declare-function tramp-rpc--sudo-rpc-hop-vec "tramp-rpc")
-(declare-function tramp-rpc--clear-connection-failure "tramp-rpc" (vec))
+;; Functions from sibling modules.  `tramp-rpc-deploy' is loaded by
+;; tramp-rpc-transport.el before the complete backend is initialized.
+(declare-function tramp-send-command
+                  "tramp-sh" (vec command &optional neveropen nooutput))
+(declare-function tramp-send-command-and-check
+                  "tramp-sh"
+                  (vec command &optional subshell dont-suppress-err exit-status))
+(declare-function tramp-send-command-and-read
+                  "tramp-sh" (vec command &optional noerror marker))
+(declare-function tramp-rpc--proxy-hop-string "tramp-rpc-hops" (vec))
+(declare-function tramp-rpc--sudo-rpc-hop-vec "tramp-rpc-hops" (vec))
+(declare-function tramp-rpc--clear-connection-failure
+                  "tramp-rpc-transport" (vec))
 
-;;; ============================================================================
+;; ============================================================================
 ;;; Customization
-;;; ============================================================================
+;; ============================================================================
 
 (defun tramp-rpc-deploy--load-source-file-name ()
   "Return the Elisp source file corresponding to `load-file-name'.
@@ -302,7 +315,9 @@ Legacy methods (use inline encoding for file transfer):
 
 (defcustom tramp-rpc-deploy-debug nil
   "When non-nil, log verbose debug messages during deployment.
-Messages are logged to *tramp-rpc-deploy* buffer."
+Messages are logged to *tramp-rpc-deploy*.  TRAMP_RPC_DEPLOY_DEBUG_LOG names
+an additional log file; otherwise TRAMP_RPC_DEBUG_DIR writes
+tramp-rpc-deploy-live.log in that directory."
   :type 'boolean
   :group 'tramp-rpc-deploy)
 
@@ -315,7 +330,7 @@ probe found no usable toolchain or could not be completed.")
   "Log a debug message if `tramp-rpc-deploy-debug' is non-nil.
 FORMAT-STRING and ARGS are passed to `format'."
   (when tramp-rpc-deploy-debug
-    (let* ((line (concat (format-time-string "[%Y-%m-%d %H:%M:%S] ")
+    (let* ((line (concat (format-time-string "[%F %T] ")
                          (apply #'format format-string args)
                          "\n"))
            (log-file (or (getenv "TRAMP_RPC_DEPLOY_DEBUG_LOG")
@@ -327,24 +342,14 @@ FORMAT-STRING and ARGS are passed to `format'."
       (when log-file
         (condition-case nil
             (progn
-              (make-directory (file-name-directory log-file) t)
+              (when-let* ((directory (file-name-directory log-file)))
+                (make-directory directory t))
               (write-region line nil log-file 'append 'silent))
           (error nil))))))
 
-;;; ============================================================================
+;; ============================================================================
 ;;; Architecture detection and path helpers
-;;; ============================================================================
-
-(defun tramp-rpc-deploy--normalize-machine (machine)
-  "Normalize MACHINE names used by local and remote architecture probes."
-  (pcase machine
-    ((or "x86_64" "amd64") "x86_64")
-    ((or "aarch64" "arm64") "aarch64")
-    ((or "armv7l" "armv7") "armv7")
-    ((or "armv6l" "armv6" "arm") "armv6")
-    ((or "armv5tel" "armv5te") "armv5te")
-    ("i686" "i686")
-    (_ machine)))
+;; ============================================================================
 
 (defun tramp-rpc-deploy--normalize-hops (hop-string)
   "Convert \"rpc:\" method references in HOP-STRING to \"ssh:\" for bootstrap.
@@ -397,6 +402,39 @@ standard TRAMP can traverse them."
                  (tramp-rpc--proxy-hop-string vec)
                (tramp-file-name-hop vec)))))))
 
+(defconst tramp-rpc-deploy--architecture-aliases
+  '(("amd64" . "x86_64")
+    ("arm64" . "aarch64")
+    ("armv7l" . "armv7")
+    ("armv6l" . "arm")
+    ("armv5tel" . "armv5te"))
+  "Machine-name aliases accepted during architecture detection.")
+
+(defconst tramp-rpc-deploy--artifact-targets
+  '(("x86_64-linux" . "x86_64-unknown-linux-musl")
+    ("aarch64-linux" . "aarch64-unknown-linux-musl")
+    ("i686-linux" . "i686-unknown-linux-musl")
+    ("armv7-linux" . "armv7-unknown-linux-musleabihf")
+    ("armv5te-linux" . "armv5te-unknown-linux-musleabi")
+    ("arm-linux" . "arm-unknown-linux-musleabihf")
+    ("x86_64-darwin" . "x86_64-apple-darwin")
+    ("aarch64-darwin" . "aarch64-apple-darwin"))
+  "Supported release artifact architectures and Rust target triples.")
+
+(defun tramp-rpc-deploy--normalize-machine (machine)
+  "Return canonical spelling for MACHINE while accepting known aliases."
+  (or (cdr (assoc machine tramp-rpc-deploy--architecture-aliases)) machine))
+
+(defun tramp-rpc-deploy--supported-architectures ()
+  "Return supported release artifact architecture names."
+  (mapcar #'car tramp-rpc-deploy--artifact-targets))
+
+(defun tramp-rpc-deploy--rust-target-for-arch (arch)
+  "Return the release Rust target triple for ARCH, or nil.
+Accept the historical `armv6-linux' spelling as an alias for `arm-linux'."
+  (cdr (assoc (if (string= arch "armv6-linux") "arm-linux" arch)
+              tramp-rpc-deploy--artifact-targets)))
+
 (defun tramp-rpc-deploy--detect-remote-arch (vec)
   "Detect the architecture of remote host specified by VEC.
 Returns a string like \"x86_64-linux\" or \"aarch64-darwin\"."
@@ -406,54 +444,30 @@ Returns a string like \"x86_64-linux\" or \"aarch64-darwin\"."
          (uname-s (string-trim
                    (tramp-send-command-and-read
                     vec "echo \\\"`uname -s`\\\"")))
-         (arch (tramp-rpc-deploy--normalize-machine uname-m))
-         (os (pcase (downcase uname-s)
-               ("linux" "linux")
-               ("darwin" "darwin")
-               (_ (downcase uname-s)))))
-    (format "%s-%s" arch os)))
+         (machine (tramp-rpc-deploy--normalize-machine uname-m))
+         (os (downcase uname-s)))
+    (format "%s-%s" machine os)))
 
 (defun tramp-rpc-deploy--detect-local-arch ()
   "Detect the architecture of the local system.
 Returns a string like \"x86_64-linux\" or \"aarch64-darwin\"."
-  (let* ((configuration (downcase system-configuration))
-         (machine (car (split-string configuration "-")))
-         (normalized-machine (tramp-rpc-deploy--normalize-machine machine))
-         (os (pcase system-type
+  (let* ((os (pcase system-type
                ('gnu/linux "linux")
                ('darwin "darwin")
-               ('berkeley-unix
-                (if (string-match
-                     "\\(freebsd\\|netbsd\\|openbsd\\|dragonfly\\)"
-                     configuration)
-                    (match-string 1 configuration)
-                  "berkeley-unix"))
-               (_ (symbol-name system-type)))))
+               (_ (symbol-name system-type))))
+         (machine (car (split-string system-configuration "-")))
+         (normalized-machine (tramp-rpc-deploy--normalize-machine machine)))
     (format "%s-%s" normalized-machine os)))
 
-(defun tramp-rpc-deploy--rust-target-for-arch (arch)
-  "Return the release Rust target triple for ARCH, or nil.
-Known release targets use musl on Linux so the resulting binaries are
-portable.  A nil result signifies that we don't have official binaries."
-  (pcase arch
-    ("x86_64-linux" "x86_64-unknown-linux-musl")
-    ("aarch64-linux" "aarch64-unknown-linux-musl")
-    ("i686-linux" "i686-unknown-linux-musl")
-    ("armv7-linux" "armv7-unknown-linux-musleabihf")
-    ("armv5te-linux" "armv5te-unknown-linux-musleabi")
-    ("armv6-linux" "arm-unknown-linux-musleabihf")
-    ("x86_64-darwin" "x86_64-apple-darwin")
-    ("aarch64-darwin" "aarch64-apple-darwin")
-    (_ nil)))
-
 (defun tramp-rpc-deploy--arch-to-rust-target (arch)
-  "Convert ARCH string to a Rust target triple.
-Signal when ARCH has no release artifact mapping."
+  "Convert ARCH string to Rust target triple.
+E.g., \"x86_64-linux\" -> \"x86_64-unknown-linux-musl\".
+Linux targets use musl for fully static binaries."
   (or (tramp-rpc-deploy--rust-target-for-arch arch)
       (signal 'remote-file-error (list "Unknown architecture" arch))))
 
 (defun tramp-rpc-deploy--platform-supported-p (arch)
-  "Return t when ARCH has a known bundled release target; else nil."
+  "Return non-nil when ARCH has an official release artifact."
   (and (tramp-rpc-deploy--rust-target-for-arch arch) t))
 
 (defun tramp-rpc-deploy--source-root ()
@@ -534,7 +548,7 @@ preserve timestamps."
        t))
 
 (defun tramp-rpc-deploy--source-directory-warning ()
-  "Return a warning string when source-build auto-detection looks suspicious."
+  "Return a warning string for suspicious source-build auto-detection."
   (when (and (memq tramp-rpc-deploy-git-build-policy '(auto build))
              tramp-rpc-deploy-source-directory
              (not (tramp-rpc-deploy--source-has-server-p)))
@@ -630,9 +644,9 @@ outputs whose mtime predates the source files."
                    tramp-rpc-deploy-binary-name
                    (tramp-rpc-deploy--binary-id)))))
 
-;;; ============================================================================
+;; ============================================================================
 ;;; Download from GitHub Releases
-;;; ============================================================================
+;; ============================================================================
 
 (defun tramp-rpc-deploy--release-asset-name (arch)
   "Return the release asset filename for ARCH."
@@ -737,7 +751,9 @@ Returns t if checksum matches, nil otherwise."
           (rename-file temp-path path t)
           (setq temp-path nil))
       (when temp-path
-        (ignore-errors (delete-file temp-path))))))
+        (condition-case nil
+            (delete-file temp-path)
+          (file-missing nil))))))
 
 (defun tramp-rpc-deploy--write-cache-provenance (cache-path kind digest)
   "Atomically record KIND and SHA256 DIGEST for CACHE-PATH."
@@ -751,8 +767,11 @@ Returns t if checksum matches, nil otherwise."
 
 (defun tramp-rpc-deploy--invalidate-cache (cache-path)
   "Remove CACHE-PATH and its provenance after failed source-cache validation."
-  (ignore-errors (delete-file cache-path))
-  (ignore-errors (delete-file (tramp-rpc-deploy--cache-provenance-path cache-path))))
+  (dolist (path (list cache-path
+                      (tramp-rpc-deploy--cache-provenance-path cache-path)))
+    (condition-case nil
+        (delete-file path)
+      (file-missing nil))))
 
 (defun tramp-rpc-deploy--promote-cached-binary (source cache-path kind)
   "Atomically promote SOURCE to CACHE-PATH with KIND and a recorded digest.
@@ -767,13 +786,17 @@ never one authorized by stale provenance."
           (set-file-modes temp-path #o755)
           (let ((digest (tramp-rpc-deploy--compute-checksum temp-path)))
             ;; Remove stale authority before changing the cache binary.
-            (ignore-errors (delete-file provenance-path))
+            (condition-case nil
+                (delete-file provenance-path)
+              (file-missing nil))
             (rename-file temp-path cache-path t)
             (setq temp-path nil)
             (tramp-rpc-deploy--write-cache-provenance cache-path kind digest)
             cache-path))
       (when temp-path
-        (ignore-errors (delete-file temp-path))))))
+        (condition-case nil
+            (delete-file temp-path)
+          (file-missing nil))))))
 
 (defun tramp-rpc-deploy--cached-binary-trusted-p (cache-path)
   "Return non-nil when CACHE-PATH matches a recorded provenance digest."
@@ -859,7 +882,9 @@ release artifact into the cache."
             (message "Downloaded and verified tramp-rpc-server for %s" arch)
             cache-path))
       ;; Never leave downloaded archives or unpromoted extraction behind.
-      (ignore-errors (delete-directory temp-dir t)))))
+      (condition-case nil
+          (delete-directory temp-dir t)
+        (file-missing nil)))))
 
 (defun tramp-rpc-deploy--safe-source-archive-member-p (member)
   "Return non-nil when MEMBER cannot escape an extraction directory."
@@ -920,7 +945,7 @@ returns or signals."
 
 ;;; ============================================================================
 ;;; Build from source
-;;; ============================================================================
+;; ============================================================================
 
 (defun tramp-rpc-deploy--cargo-available-p ()
   "Check if cargo (Rust) is available."
@@ -1338,7 +1363,7 @@ missing, or this is a noninteractive/reentrant deployment."
 
 ;;; ============================================================================
 ;;; Main logic: ensure local binary exists
-;;; ============================================================================
+;; ============================================================================
 
 (defun tramp-rpc-deploy--ask-git-install-action (arch &optional vec)
   "Ask how to obtain a git-checkout server binary for ARCH.
@@ -1528,19 +1553,48 @@ Returns the path to the local binary."
        (format "Binary should be placed at:\n   %s"
                (tramp-rpc-deploy--local-cache-path arch))))))
 
-;;; ============================================================================
+;; ============================================================================
 ;;; Remote deployment
-;;; ============================================================================
+;; ============================================================================
+
+(defun tramp-rpc-deploy--regular-nonsymlink-test (path &optional executable)
+  "Return a shell test for regular, non-symlink PATH.
+When EXECUTABLE is non-nil, require execute permission too."
+  (let ((quoted (tramp-shell-quote-argument path)))
+    (format "test -f %s && ! test -L %s%s"
+            quoted quoted (if executable (format " && test -x %s" quoted) ""))))
+
+(defun tramp-rpc-deploy--checksum-shell-fragment (path)
+  "Return a shell fragment that prints PATH's SHA256 digest."
+  (let ((quoted (tramp-shell-quote-argument path)))
+    (format "{ sha256sum %s 2>/dev/null || shasum -a 256 %s 2>/dev/null; } | cut -d' ' -f1"
+            quoted quoted)))
+
+(defun tramp-rpc-deploy--activation-command (temporary destination checksum)
+  "Build the atomic remote activation transaction.
+TEMPORARY and DESTINATION are remote local names.  CHECKSUM is the expected
+SHA256 digest."
+  (let ((tmp (tramp-shell-quote-argument temporary))
+        (dest (tramp-shell-quote-argument destination))
+        (digest (tramp-shell-quote-argument checksum)))
+    (format
+     "%s && chmod +x %s && %s && (test ! -e %s && ! test -L %s || %s) && actual=$(%s) && test \"$actual\" = %s && mv -f %s %s && %s"
+     (tramp-rpc-deploy--regular-nonsymlink-test temporary)
+     tmp
+     (tramp-rpc-deploy--regular-nonsymlink-test temporary)
+     dest dest
+     (tramp-rpc-deploy--regular-nonsymlink-test destination)
+     (tramp-rpc-deploy--checksum-shell-fragment temporary)
+     digest tmp dest
+     (tramp-rpc-deploy--regular-nonsymlink-test destination t))))
 
 (defun tramp-rpc-deploy--remote-binary-exists-p (vec)
   "Check if a regular non-symlink executable binary exists on remote VEC."
   (let* ((remote-path (tramp-rpc-deploy--remote-binary-path vec))
-         (path (tramp-shell-quote-argument
-                (tramp-file-local-name remote-path))))
+         (path (tramp-file-local-name remote-path)))
     ;; Use tramp-sh operations for checking since we're bootstrapping.
     (tramp-send-command-and-check
-     vec (format "test -f %s && ! test -L %s && test -x %s"
-                 path path path))))
+     vec (tramp-rpc-deploy--regular-nonsymlink-test path t))))
 
 (defun tramp-rpc-deploy--ensure-remote-directory (vec)
   "Ensure the remote deployment directory exists on VEC."
@@ -1559,10 +1613,7 @@ Returns the path to the local binary."
   "Get SHA256 checksum of remote PATH on VEC.
 Tries sha256sum first, then shasum -a 256 for macOS compatibility."
   ;; Try sha256sum first (Linux), then shasum -a 256 (macOS)
-  (tramp-send-command vec
-   (format "{ sha256sum %s 2>/dev/null || shasum -a 256 %s 2>/dev/null; } | cut -d' ' -f1"
-           (tramp-shell-quote-argument path)
-           (tramp-shell-quote-argument path)))
+  (tramp-send-command vec (tramp-rpc-deploy--checksum-shell-fragment path))
   (with-current-buffer (tramp-get-connection-buffer vec)
     (goto-char (point-min))
     ;; Match exactly 64 hex chars to avoid false positives from error messages
@@ -1578,9 +1629,9 @@ Tries sha256sum first, then shasum -a 256 for macOS compatibility."
     ;; would reject every automatic deployment.
     (tramp-send-command
      vec
-     (format (concat "umask 077 && parent=$(cd %s && pwd -P) && "
-                     "directory=$(mktemp -d \"$parent/.tramp-rpc-transfer.XXXXXX\") && "
-                     "printf '%%s\\n%%s\\n' \"$parent\" \"$directory\"")
+     (format "umask 077 && parent=$(cd %s && pwd -P) && \
+directory=$(mktemp -d \"$parent/.tramp-rpc-transfer.XXXXXX\") && \
+printf '%%s\\n%%s\\n' \"$parent\" \"$directory\""
              (tramp-shell-quote-argument parent)))
     (with-current-buffer (tramp-get-connection-buffer vec)
       (goto-char (point-min))
@@ -1690,20 +1741,8 @@ to inline encoding (base64 through the shell), which can be fragile."
                   (unless
                       (tramp-send-command-and-check
                        vec
-                       (let ((tmp (tramp-shell-quote-argument remote-tmp-local))
-                             (dest (tramp-shell-quote-argument remote-local))
-                             (digest (tramp-shell-quote-argument local-checksum)))
-                         (format
-                          (concat "test -f %s && ! test -L %s && chmod +x %s && "
-                                  "test -f %s && ! test -L %s && "
-                                  "(test ! -e %s && ! test -L %s || "
-                                  "test -f %s && ! test -L %s) && "
-                                  "actual=$({ sha256sum %s 2>/dev/null || "
-                                  "shasum -a 256 %s 2>/dev/null; } | cut -d' ' -f1) && "
-                                  "test \"$actual\" = %s && mv -f %s %s && "
-                                  "test -f %s && ! test -L %s && test -x %s")
-                          tmp tmp tmp tmp tmp dest dest dest dest tmp tmp digest tmp dest
-                          dest dest dest)))
+                       (tramp-rpc-deploy--activation-command
+                        remote-tmp-local remote-local local-checksum))
                     (signal 'remote-file-error
                             (list "Remote activation failed; existing binary was preserved")))
                   (setq success t)
@@ -1715,9 +1754,14 @@ to inline encoding (base64 through the shell), which can be fragile."
                  (message "Transfer error: %s" err-msg))
                (setq retries (1+ retries))))
           (when staging-directory
-            (ignore-errors
-              (tramp-rpc-deploy--remove-remote-staging-directory
-               vec staging-directory))))))
+            (condition-case cleanup-error
+                (tramp-rpc-deploy--remove-remote-staging-directory
+                 vec staging-directory)
+              ((file-error remote-file-error)
+               (tramp-rpc-deploy--log
+                "Failed to remove remote staging directory %s: %s"
+                staging-directory
+                (error-message-string cleanup-error))))))))
 
     (unless success
       (signal
@@ -1732,9 +1776,9 @@ to inline encoding (base64 through the shell), which can be fragile."
 
     remote-path))
 
-;;; ============================================================================
+;; ============================================================================
 ;;; Public API
-;;; ============================================================================
+;; ============================================================================
 
 (defun tramp-rpc-deploy-expected-binary-localname ()
   "Return the expected remote binary localname without network access.
@@ -2033,7 +2077,7 @@ binary lookup, and remote installation target."
 
       (insert "Cached Binaries:\n")
       (insert "----------------\n")
-      (dolist (arch tramp-rpc-deploy-release-architectures)
+      (dolist (arch (tramp-rpc-deploy--supported-architectures))
         (let ((path (tramp-rpc-deploy--local-cache-path arch)))
           (insert (format "  %s: %s\n"
                           arch
@@ -2045,9 +2089,31 @@ binary lookup, and remote installation target."
       (insert "\n")
       (insert "Download URLs:\n")
       (insert "--------------\n")
-      (dolist (arch tramp-rpc-deploy-release-architectures)
+      (dolist (arch (tramp-rpc-deploy--supported-architectures))
         (insert (format "  %s:\n    %s\n" arch (tramp-rpc-deploy--download-url arch)))))
     (display-buffer buf)))
+
+(defun tramp-rpc-deploy--diagnose-ssh (host user command &optional connect-timeout)
+  "Run SSH COMMAND on HOST as USER and return (STATUS . OUTPUT).
+STATUS is always numeric; signal termination is reported as failure in OUTPUT.
+When CONNECT-TIMEOUT is non-nil, use a ten-second connection timeout."
+  (let ((args (append
+               (list "-o" "BatchMode=yes")
+               (when connect-timeout (list "-o" "ConnectTimeout=10"))
+               (when user (list "-l" user))
+               (list "--" host command))))
+    (with-temp-buffer
+      (condition-case error-data
+          (let ((status (apply #'call-process "ssh" nil t nil args))
+                (output (buffer-string)))
+            (if (integerp status)
+                (cons status output)
+              (cons 128
+                    (concat output
+                            (unless (string-empty-p output) "\n")
+                            status))))
+        (file-error
+         (cons 127 (error-message-string error-data)))))))
 
 (defun tramp-rpc-deploy-diagnose (host &optional user)
   "Run diagnostics for deploying to HOST.
@@ -2081,14 +2147,10 @@ This helps troubleshoot deployment issues."
         ;; SSH connectivity
         (cl-incf test-num)
         (insert (format "\n%d. Testing SSH connectivity...\n" test-num))
-        (let* ((ssh-cmd (append
-                         (list "ssh" "-o" "BatchMode=yes" "-o" "ConnectTimeout=10")
-                         (when user (list "-l" user))
-                         (list host "echo 'SSH_OK'")))
-               (output (with-temp-buffer
-                         (apply #'call-process (car ssh-cmd) nil t nil (cdr ssh-cmd))
-                         (buffer-string))))
-          (if (string-match-p "SSH_OK" output)
+        (let* ((result (tramp-rpc-deploy--diagnose-ssh
+                        host user "echo 'SSH_OK'" t))
+               (output (cdr result)))
+          (if (and (zerop (car result)) (string-match-p "SSH_OK" output))
               (insert "   [OK] SSH connection successful\n")
             (insert "   [FAIL] SSH connection failed\n")
             (insert (format "   Output: %s\n" (string-trim output)))))
@@ -2096,68 +2158,63 @@ This helps troubleshoot deployment issues."
         ;; Remote architecture
         (cl-incf test-num)
         (insert (format "\n%d. Detecting remote architecture...\n" test-num))
-        (let* ((ssh-cmd (append
-                         (list "ssh" "-o" "BatchMode=yes")
-                         (when user (list "-l" user))
-                         (list host "uname -m && uname -s")))
-               (output (with-temp-buffer
-                         (if (zerop (apply #'call-process (car ssh-cmd) nil t nil (cdr ssh-cmd)))
-                             (buffer-string)
-                           "FAILED"))))
-          (if (string-match-p "FAILED" output)
-              (insert "   [FAIL] Could not detect architecture\n")
+        (let* ((result (tramp-rpc-deploy--diagnose-ssh
+                        host user "uname -m && uname -s"))
+               (output (cdr result)))
+          (if (not (zerop (car result)))
+              (progn
+                (insert "   [FAIL] Could not detect architecture\n")
+                (insert (format "   Output: %s\n" (string-trim output))))
             (insert (format "   [OK] Architecture: %s\n" (string-trim output)))))
 
         ;; Remote directory writable
         (cl-incf test-num)
         (insert (format "\n%d. Testing remote directory access...\n" test-num))
         (let* ((dir tramp-rpc-deploy-remote-directory)
-               (ssh-cmd (append
-                         (list "ssh" "-o" "BatchMode=yes")
-                          (when user (list "-l" user))
-                          (list host (format "mkdir -p %s && test -w %s && echo 'WRITABLE'"
-                                             (tramp-shell-quote-argument dir)
-                                             (tramp-shell-quote-argument dir)))))
-               (output (with-temp-buffer
-                         (apply #'call-process (car ssh-cmd) nil t nil (cdr ssh-cmd))
-                         (buffer-string))))
-          (if (string-match-p "WRITABLE" output)
+               (result
+                (tramp-rpc-deploy--diagnose-ssh
+                 host user
+                 (format "mkdir -p %s && test -w %s && echo 'WRITABLE'"
+                         (tramp-shell-quote-argument dir)
+                         (tramp-shell-quote-argument dir))))
+               (output (cdr result)))
+          (if (and (zerop (car result)) (string-match-p "WRITABLE" output))
               (insert (format "   [OK] Directory %s is writable\n" dir))
-            (insert (format "   [FAIL] Directory %s not writable\n" dir))))
+            (insert (format "   [FAIL] Directory %s not writable\n" dir))
+            (insert (format "   Output: %s\n" (string-trim output)))))
 
         ;; Checksum command
         (cl-incf test-num)
         (insert (format "\n%d. Testing checksum command availability...\n" test-num))
-        (let* ((ssh-cmd (append
-                         (list "ssh" "-o" "BatchMode=yes")
-                         (when user (list "-l" user))
-                         (list host "which sha256sum || which shasum || echo 'NONE'")))
-               (output (with-temp-buffer
-                         (apply #'call-process (car ssh-cmd) nil t nil (cdr ssh-cmd))
-                         (string-trim (buffer-string)))))
-          (if (string-match-p "NONE" output)
-              (insert "   [FAIL] No checksum command found (need sha256sum or shasum)\n")
+        (let* ((result (tramp-rpc-deploy--diagnose-ssh
+                        host user
+                        "which sha256sum || which shasum || echo 'NONE'"))
+               (output (string-trim (cdr result))))
+          (if (or (not (zerop (car result)))
+                  (string-match-p "NONE" output))
+              (progn
+                (insert "   [FAIL] No checksum command found (need sha256sum or shasum)\n")
+                (insert (format "   Output: %s\n" output)))
             (insert (format "   [OK] Found: %s\n" output))))
 
         ;; Conditional: rsync availability (when using rsync bootstrap method)
         (when (string= tramp-rpc-deploy-bootstrap-method "rsync")
           (cl-incf test-num)
           (insert (format "\n%d. Testing rsync availability on remote...\n" test-num))
-          (let* ((ssh-cmd (append
-                           (list "ssh" "-o" "BatchMode=yes")
-                           (when user (list "-l" user))
-                           (list host "which rsync || echo 'NONE'")))
-                 (output (with-temp-buffer
-                           (apply #'call-process (car ssh-cmd) nil t nil (cdr ssh-cmd))
-                           (string-trim (buffer-string)))))
-            (if (string-match-p "NONE" output)
-                (insert "   [FAIL] rsync not found on remote (needed for rsync bootstrap method)\n")
+          (let* ((result (tramp-rpc-deploy--diagnose-ssh
+                          host user "which rsync || echo 'NONE'"))
+                 (output (string-trim (cdr result))))
+            (if (or (not (zerop (car result)))
+                    (string-match-p "NONE" output))
+                (progn
+                  (insert "   [FAIL] rsync not found on remote (needed for rsync bootstrap method)\n")
+                  (insert (format "   Output: %s\n" output)))
               (insert (format "   [OK] Found: %s\n" output)))))
 
         ;; Local binary availability
         (cl-incf test-num)
         (insert (format "\n%d. Checking local binary cache...\n" test-num))
-        (dolist (arch tramp-rpc-deploy-release-architectures)
+        (dolist (arch (tramp-rpc-deploy--supported-architectures))
           (let ((path (tramp-rpc-deploy--local-cache-path arch))
                 (bundled (tramp-rpc-deploy--bundled-binary-path arch)))
             (cond
@@ -2173,15 +2230,6 @@ This helps troubleshoot deployment issues."
         (insert "  2. Retry the connection and check *tramp-rpc-deploy* buffer\n")
         (insert "  3. Manually test: ssh " (if user (concat user "@") "") host " echo success\n")))
     (display-buffer buf)))
-
-;; ============================================================================
-;; Unload support
-;; ============================================================================
-
-(add-hook 'tramp-rpc-unload-hook
-	  (lambda ()
-	    (when (featurep 'tramp-rpc-deploy)
-	      (unload-feature 'tramp-rpc-deploy 'force))))
 
 (provide 'tramp-rpc-deploy)
 ;;; tramp-rpc-deploy.el ends here

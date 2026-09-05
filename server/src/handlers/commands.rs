@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+
 //! Command execution and ancestor scanning for TRAMP-RPC
 //!
 //! This module provides:
@@ -5,25 +7,30 @@
 //! - `ancestors.scan`: Scan ancestor directories for marker files
 
 use crate::msgpack_map;
-use crate::protocol::{IntoValue, RpcError, exit_code_from_status, from_value};
+use crate::protocol::{IntoValue, RpcError, from_value};
 use rmpv::Value;
 use serde::Deserialize;
 use std::collections::HashMap;
 use std::fs::File;
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
-use std::process::Stdio;
 use std::sync::{Arc, LazyLock};
 use std::time::UNIX_EPOCH;
-use tokio::io::AsyncWriteExt;
-use tokio::process::Command;
 use tokio::sync::Semaphore;
 
 use super::HandlerResult;
+use super::process::{ChildError, ChildSpec, run_child};
 
 /// Maximum number of commands that can be run in a single request.
 /// Prevents resource exhaustion from excessively large batches.
 const MAX_PARALLEL_COMMANDS: usize = 256;
+
+/// Default per-command timeout for `commands.run_parallel`.  Without it one
+/// hung `git` stalls the whole batch until the Lisp 30s call timeout fires,
+/// discarding completed results and tearing down the connection.
+const DEFAULT_PARALLEL_COMMAND_TIMEOUT_MS: u64 = 25_000;
+/// Hard cap so a client cannot request an unbounded hang.
+const MAX_PARALLEL_COMMAND_TIMEOUT_MS: u64 = 120_000;
 
 /// Global child budget for `commands.run_parallel` requests.  Request-level
 /// admission alone is insufficient because each admitted request can fan out
@@ -76,6 +83,17 @@ pub async fn run_parallel(params: Value) -> HandlerResult {
         /// Clear the inherited server environment before applying `env`.
         #[serde(default)]
         clear_env: bool,
+        /// Per-command timeout in milliseconds.  Each hung command fails
+        /// individually instead of stalling the whole batch until the Lisp
+        /// call timeout tears down the connection.  Defaults to
+        /// `DEFAULT_PARALLEL_COMMAND_TIMEOUT_MS`, capped at
+        /// `MAX_PARALLEL_COMMAND_TIMEOUT_MS`.
+        #[serde(default = "default_parallel_timeout_ms")]
+        timeout_ms: u64,
+    }
+
+    fn default_parallel_timeout_ms() -> u64 {
+        DEFAULT_PARALLEL_COMMAND_TIMEOUT_MS
     }
 
     let params: Params = from_value(params).map_err(|e| RpcError::invalid_params(e.to_string()))?;
@@ -98,106 +116,75 @@ pub async fn run_parallel(params: Value) -> HandlerResult {
     let remaining = Arc::new(Semaphore::new(crate::MAX_RESPONSE_OUTPUT_BYTES));
     let env = params.env.map(Arc::new);
     let clear_env = params.clear_env;
+    let timeout_ms = params.timeout_ms.clamp(1, MAX_PARALLEL_COMMAND_TIMEOUT_MS);
+    let timeout = std::time::Duration::from_millis(timeout_ms);
     let results = futures::future::join_all(params.commands.into_iter().map(|entry| {
         let remaining = Arc::clone(&remaining);
         let env = env.clone();
         async move {
+            // The per-command deadline covers queueing for the global child
+            // permit as well as execution.  All batch entries start their
+            // clocks together, so N hung waves cannot stack into N x timeout
+            // past the Lisp call timeout; the whole batch fails fast.
+            let deadline = tokio::time::Instant::now() + timeout;
+            let failure = |message: Vec<u8>, timed_out: Option<bool>| {
+                let mut fields = vec![
+                    (
+                        Value::String("exit_code".into()),
+                        Value::Integer((-1i32).into()),
+                    ),
+                    (Value::String("stdout".into()), Value::Binary(vec![])),
+                    (Value::String("stderr".into()), Value::Binary(message)),
+                ];
+                if let Some(timed_out) = timed_out {
+                    fields.push((Value::String("timed_out".into()), Value::Boolean(timed_out)));
+                }
+                Value::Map(fields)
+            };
+            let timeout_message = || format!("Command timed out after {timeout_ms}ms").into_bytes();
             // Valid batch entries queue behind earlier entries.  Dropping the
             // request future on transport cancellation cancels this wait.
-            let _child_permit = PARALLEL_CHILD_ADMISSIONS
-                .acquire()
-                .await
-                .expect("parallel child admission semaphore is never closed");
-            let mut cmd = Command::new(&entry.cmd);
-            cmd.args(&entry.args);
-            if let Some(ref cwd) = entry.cwd {
-                cmd.current_dir(super::expand_tilde(cwd));
-            }
-            if clear_env {
-                cmd.env_clear();
-            }
-            if let Some(env) = env {
-                cmd.envs(env.iter());
-            }
-            cmd.stdin(if entry.stdin.is_some() {
-                Stdio::piped()
-            } else {
-                Stdio::null()
-            });
-            cmd.stdout(Stdio::piped());
-            cmd.stderr(Stdio::piped());
-            cmd.kill_on_drop(true);
-            super::process::configure_process_group(&mut cmd);
-
-            let value = match cmd.spawn() {
-                Ok(mut child) => {
-                    let Some(child_pid) = child.id() else {
-                        return (
-                            entry.key,
-                            msgpack_map! {
-                                "exit_code" => -1i32,
-                                "stdout" => Value::Binary(vec![]),
-                                "stderr" => Value::Binary(b"Spawned process has no PID".to_vec())
-                            },
-                        );
-                    };
-                    let mut process_group = super::process::ProcessGroupGuard::new(child_pid);
-                    let stdin_data = entry.stdin;
-                    let mut stdin = child.stdin.take();
-                    let stdout = child.stdout.take().expect("piped stdout");
-                    let stderr = child.stderr.take().expect("piped stderr");
-                    let write_stdin = async move {
-                        if let Some(data) = stdin_data
-                            && let Some(mut stdin) = stdin.take()
-                            && let Err(error) = stdin.write_all(&data).await
-                            // A child that stops reading early is not an error.
-                            && !super::process::is_benign_stdin_error(&error)
-                        {
-                            return Err(std::io::Error::other(format!(
-                                "Failed to write stdin: {error}"
-                            )));
-                        }
-                        Ok(())
-                    };
-                    let result = tokio::try_join!(
-                        write_stdin,
-                        super::process::read_sync_output(
-                            stdout,
-                            Arc::clone(&remaining),
-                            crate::MAX_RESPONSE_OUTPUT_BYTES,
-                        ),
-                        super::process::read_sync_output(
-                            stderr,
-                            remaining,
-                            crate::MAX_RESPONSE_OUTPUT_BYTES,
-                        ),
-                        child.wait()
-                    );
-                    match result {
-                        Ok(((), stdout, stderr, status)) => {
-                            process_group.disarm();
-                            msgpack_map! {
-                                "exit_code" => exit_code_from_status(status),
-                                "stdout" => Value::Binary(stdout),
-                                "stderr" => Value::Binary(stderr)
-                            }
-                        }
-                        Err(error) => {
-                            let _ = child.kill().await;
-                            let _ = child.wait().await;
-                            msgpack_map! {
-                                "exit_code" => -1i32,
-                                "stdout" => Value::Binary(vec![]),
-                                "stderr" => Value::Binary(error.to_string().into_bytes())
-                            }
-                        }
-                    }
-                }
-                Err(error) => msgpack_map! {
-                    "exit_code" => -1i32,
-                    "stdout" => Value::Binary(vec![]),
-                    "stderr" => Value::Binary(error.to_string().into_bytes())
+            let _child_permit = match tokio::time::timeout_at(
+                deadline,
+                PARALLEL_CHILD_ADMISSIONS.acquire(),
+            )
+            .await
+            {
+                Ok(permit) => permit.expect("parallel child admission semaphore is never closed"),
+                Err(_) => return (entry.key, failure(timeout_message(), Some(true))),
+            };
+            let spec = ChildSpec {
+                cmd: entry.cmd,
+                args: entry.args,
+                cwd: entry.cwd,
+                env,
+                clear_env,
+                stdin: entry.stdin,
+                merge_stderr: false,
+            };
+            // Isolate hung commands: each command gets its own deadline so
+            // one stuck `git` fails individually while completed results are
+            // preserved, instead of stalling `join_all` until the Lisp call
+            // timeout tears down the connection.  The deadline was set before
+            // queueing, so queue wait consumes the same budget.
+            let value = match run_child(
+                spec,
+                remaining,
+                crate::MAX_RESPONSE_OUTPUT_BYTES,
+                Some(deadline),
+            )
+            .await
+            {
+                Ok(result) => msgpack_map! {
+                    "exit_code" => result.exit_code,
+                    "stdout" => Value::Binary(result.stdout),
+                    "stderr" => Value::Binary(result.stderr)
                 },
+                Err(ChildError::Spawn(error) | ChildError::Setup(error)) => {
+                    failure(error.to_string().into_bytes(), None)
+                }
+                Err(ChildError::Io(error)) => failure(error.to_string().into_bytes(), Some(false)),
+                Err(ChildError::TimedOut) => failure(timeout_message(), Some(true)),
             };
             (entry.key, value)
         }
@@ -301,7 +288,7 @@ pub async fn ancestors_scan(params: Value) -> HandlerResult {
         Ok(Value::Map(pairs))
     })
     .await
-    .map_err(|e| RpcError::internal_error(format!("Task join error: {}", e)))?
+    .map_err(|e| RpcError::internal_error(format!("Task join error: {e}")))?
 }
 
 fn canonical_or_original(path: &Path) -> PathBuf {
@@ -351,8 +338,7 @@ fn find_dominating_dir(
             Some(parent) if parent != current => {
                 if depth >= MAX_DOMINATING_DEPTH {
                     return Err(RpcError::invalid_params(format!(
-                        "Maximum ancestor traversal depth ({}) exceeded",
-                        MAX_DOMINATING_DEPTH
+                        "Maximum ancestor traversal depth ({MAX_DOMINATING_DEPTH}) exceeded"
                     )));
                 }
                 current = parent.to_path_buf();
@@ -394,7 +380,7 @@ pub async fn highlevel_test_files_in_dir(params: Value) -> HandlerResult {
     let params: Params = from_value(params).map_err(|e| RpcError::invalid_params(e.to_string()))?;
 
     tokio::task::spawn_blocking(move || {
-        let dir = canonical_or_original(Path::new(&super::expand_tilde(&params.directory)));
+        let dir = canonical_or_original(Path::new(&super::system::expand_tilde(&params.directory)));
         if !dir.is_dir() {
             return Ok(Value::Array(vec![]));
         }
@@ -409,7 +395,7 @@ pub async fn highlevel_test_files_in_dir(params: Value) -> HandlerResult {
         Ok(Value::Array(found))
     })
     .await
-    .map_err(|e| RpcError::internal_error(format!("Task join error: {}", e)))?
+    .map_err(|e| RpcError::internal_error(format!("Task join error: {e}")))?
 }
 
 /// Locate marker files in ancestor directories.
@@ -425,7 +411,7 @@ pub async fn highlevel_locate_dominating_file_multi(params: Value) -> HandlerRes
     let params: Params = from_value(params).map_err(|e| RpcError::invalid_params(e.to_string()))?;
 
     tokio::task::spawn_blocking(move || {
-        let path = PathBuf::from(super::expand_tilde(&params.file));
+        let path = PathBuf::from(super::system::expand_tilde(&params.file));
         // Preserve lexical path shape instead of canonicalizing symlinks.
         // TRAMP clients rely on this to compute repo-relative paths correctly.
         let Some(existing_start) = find_existing_start(&path) else {
@@ -446,7 +432,7 @@ pub async fn highlevel_locate_dominating_file_multi(params: Value) -> HandlerRes
         Ok(Value::Array(marker_paths))
     })
     .await
-    .map_err(|e| RpcError::internal_error(format!("Task join error: {}", e)))?
+    .map_err(|e| RpcError::internal_error(format!("Task join error: {e}")))?
 }
 
 /// Prepare dir-locals data in one RPC call.
@@ -462,7 +448,7 @@ pub async fn highlevel_dir_locals_find_file_cache_update(params: Value) -> Handl
     let params: Params = from_value(params).map_err(|e| RpcError::invalid_params(e.to_string()))?;
 
     tokio::task::spawn_blocking(move || {
-        let file_path = PathBuf::from(super::expand_tilde(&params.file));
+        let file_path = PathBuf::from(super::system::expand_tilde(&params.file));
         // Keep lexical (non-canonical) path shape to match locate-dominating behavior.
         let lexical_file = file_path.clone();
         let file_value = lexical_file.to_string_lossy().to_string().into_value();
@@ -557,7 +543,7 @@ pub async fn highlevel_dir_locals_find_file_cache_update(params: Value) -> Handl
         })
     })
     .await
-    .map_err(|e| RpcError::internal_error(format!("Task join error: {}", e)))?
+    .map_err(|e| RpcError::internal_error(format!("Task join error: {e}")))?
 }
 
 #[cfg(test)]

@@ -82,7 +82,8 @@
 
 (require 'tramp-rpc)
 
-(declare-function tramp-rpc--decode-output "tramp-rpc" (data))
+(declare-function tramp-rpc--decode-output "tramp-rpc-protocol" (data))
+(declare-function tramp-rpc--get-route-connection-property "tramp-rpc-transport" (vec property default))
 (declare-function tramp-rpc--handle-async-read-response "tramp-rpc-process")
 (declare-function tramp-rpc--start-cat-relays
                   "tramp-rpc-process" (name buffer stderr-buffer cleanup))
@@ -144,14 +145,14 @@ Value is a cons cell (CHECKED . RESULT).")
   "Clear TRAMP/TRAMP-RPC caches before call-count measurement."
   (maphash
    (lambda (_key conn)
-     (let* ((proc (plist-get conn :process))
+     (let* ((proc (tramp-rpc-connection-process conn))
             (vec (and proc (process-get proc :tramp-rpc-vec))))
        (when vec
          ;; Keep the startup system.info response warm.  It is connection
          ;; metadata, not a file-operation cache, and refetching it makes call
          ;; counts depend on whether this connection was just replaced.
          (let ((system-info
-                (tramp-get-connection-property
+                (tramp-rpc--get-route-connection-property
                  vec tramp-rpc--system-info-property nil)))
            (tramp-flush-directory-properties vec "/")
            (tramp-flush-connection-properties vec)
