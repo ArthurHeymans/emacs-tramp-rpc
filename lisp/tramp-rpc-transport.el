@@ -888,10 +888,12 @@ completion) from blocking on unreachable hosts."
              (buffer-live-p (tramp-rpc-connection-buffer conn)))
         conn
       (or
-       ;; Completion can probe the same unreachable host several times in one
-       ;; command.  Reuse a recent deployment failure instead of reconnecting.
+       ;; Essential operations can reuse a recent deployment failure instead of
+       ;; reconnecting.  Non-essential operations must reach the
+       ;; `tramp-connectable-p' fallback below.
        (when-let* ((failure (tramp-rpc--recent-connection-failure vec)))
-         (tramp-rpc--signal-recent-connection-failure vec failure))
+         (unless non-essential
+           (tramp-rpc--signal-recent-connection-failure vec failure)))
        (with-mutex (tramp-rpc--connection-lifecycle-mutex vec)
          ;; Another thread may have reconnected while this one waited.
          (setq conn (tramp-rpc--get-connection vec))

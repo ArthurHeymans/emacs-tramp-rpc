@@ -7855,6 +7855,34 @@ It should attempt to connect (and fail), not silently bail."
        (tramp-rpc--ensure-connection vec)
        :type 'remote-file-error))))
 
+(ert-deftest tramp-rpc-mock-test-ensure-connection-cached-failure-respects-essentiality ()
+  "Use the non-essential fallback instead of replaying a cached failure."
+  :tags '(:non-essential)
+  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
+  (let* ((vec (make-tramp-file-name :method "rpc"
+                                    :host "cached-failure-test-host"
+                                    :localname "/tmp"))
+         (tramp-rpc-connection-failure-cache-timeout 30)
+         (failure '(remote-file-error "cached connection failure"))
+         connectable-called)
+    (unwind-protect
+        (progn
+          (tramp-rpc--remember-connection-failure vec failure)
+          (let ((non-essential t))
+            (should (eq 'non-essential
+                        (catch 'non-essential
+                          (cl-letf (((symbol-function 'tramp-connectable-p)
+                                     (lambda (_filename)
+                                       (setq connectable-called t)
+                                       nil)))
+                            (tramp-rpc--ensure-connection vec))
+                          'did-not-throw)))
+            (should connectable-called))
+          (let ((non-essential nil))
+            (should-error (tramp-rpc--ensure-connection vec)
+                          :type 'remote-file-error)))
+      (tramp-rpc--clear-connection-failure vec))))
+
 (ert-deftest tramp-rpc-mock-test-handler-catches-non-essential ()
   "Test that `tramp-rpc-file-name-handler' falls back for non-essential ops.
 When `non-essential' is t and no connection exists, file-exists-p on
