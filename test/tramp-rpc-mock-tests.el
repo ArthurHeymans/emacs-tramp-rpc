@@ -5412,6 +5412,11 @@ This matches the behavior expected by `tramp-test28-process-file'."
               ((symbol-function 'tramp-rpc-deploy--ensure-local-binary)
                (lambda (_arch)
                  (signal 'remote-file-error '("local artifact unavailable"))))
+              ((symbol-function 'tramp-rpc-deploy--remote-source-build-available-p)
+               (lambda () t))
+              ((symbol-function
+                'tramp-rpc-deploy--build-binary-on-remote-with-source-fallback)
+               (lambda (_vec _arch) remote-binary))
               ((symbol-function 'tramp-rpc-deploy--build-binary-on-remote)
                (lambda (_vec _arch) remote-binary)))
       (should (equal (tramp-rpc-deploy-ensure-binary vec) remote-binary)))))
@@ -7398,7 +7403,8 @@ retry must still happen in that case."
           (should-error (tramp-rpc--connect vec) :type 'remote-file-error)
           (should (seq-some (lambda (message)
                               (string-match-p "deployment on mock failed" message))
-                            messages)))
+                            messages))
+          (should (tramp-rpc--recent-connection-failure vec)))
       (tramp-rpc--clear-connection-failure vec))))
 
 (ert-deftest tramp-rpc-mock-test-report-status-avoids-minibuffer-display ()
@@ -7445,13 +7451,90 @@ retry must still happen in that case."
         (cl-letf (((symbol-function 'tramp-rpc--connect-uncached)
                    (lambda (_vec)
                      (setq attempts (1+ attempts))
-                     (signal 'remote-file-error '("no Rust toolchain"))))
+                     (signal 'tramp-rpc-server-unavailable '("server unavailable"))))
                   ((symbol-function 'tramp-rpc--report-status)
                    (lambda (&rest _) nil)))
-          (should-error (tramp-rpc--connect vec) :type 'remote-file-error)
-          (should-error (tramp-rpc--connect vec) :type 'remote-file-error)
+          (should-error (tramp-rpc--connect vec) :type 'tramp-rpc-server-unavailable)
+          (should-error (tramp-rpc--connect vec) :type 'tramp-rpc-server-unavailable)
           (should (= attempts 1)))
       (tramp-rpc--clear-connection-failure vec))))
+
+(ert-deftest tramp-rpc-mock-test-connect-retry-propagates-retry-error ()
+  "A failed ControlMaster retry reports the retry's condition."
+  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
+  (let* ((vec (tramp-dissect-file-name "/rpc:mock:/"))
+         (establish-calls 0)
+         (messages nil))
+    (cl-letf (((symbol-function 'tramp-rpc--establish-controlmaster)
+               (lambda (_vec)
+                 (setq establish-calls (1+ establish-calls))
+                 (if (= establish-calls 1)
+                     (signal 'file-error '("initial failure"))
+                   (signal 'remote-file-error '("retry failure")))))
+              ((symbol-function 'tramp-rpc--controlmaster-active-p)
+               (lambda (_vec) nil))
+              ((symbol-function 'tramp-rpc--controlmaster-socket-path)
+               (lambda (_vec) "/tmp/tramp-rpc-test-socket"))
+              ((symbol-function 'delete-file) #'ignore)
+              ((symbol-function 'sleep-for) #'ignore)
+              ((symbol-function 'tramp-rpc--report-status)
+               (lambda (format-string &rest args)
+                 (push (apply #'format format-string args) messages)))
+              ((symbol-function 'tramp-rpc--detect-sudo-elevation)
+               (lambda (_vec) nil)))
+      (let ((err (should-error (tramp-rpc--connect vec)
+                               :type 'remote-file-error)))
+        (should (string-match-p "retry failure" (error-message-string err)))
+        (should (= establish-calls 2))
+        (should (seq-some (lambda (message)
+                            (string-match-p "retry failure" message))
+                          messages))))))
+
+(ert-deftest tramp-rpc-mock-test-connect-retry-preserves-socket-delete-error ()
+  "A ControlMaster socket deletion error prevents a retry."
+  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
+  (let* ((vec (tramp-dissect-file-name "/rpc:mock:/"))
+         (establish-calls 0))
+    (cl-letf (((symbol-function 'tramp-rpc--establish-controlmaster)
+               (lambda (_vec)
+                 (setq establish-calls (1+ establish-calls))
+                 (signal 'file-error '("initial failure"))))
+              ((symbol-function 'tramp-rpc--controlmaster-active-p)
+               (lambda (_vec) nil))
+              ((symbol-function 'tramp-rpc--controlmaster-socket-path)
+               (lambda (_vec) "/tmp/tramp-rpc-test-socket"))
+              ((symbol-function 'delete-file)
+               (lambda (_path)
+                 (signal 'file-error '("socket deletion failure"))))
+              ((symbol-function 'tramp-rpc--detect-sudo-elevation)
+               (lambda (_vec) nil)))
+      (let ((err (should-error (tramp-rpc--connect vec) :type 'file-error)))
+        (should (string-match-p "socket deletion failure"
+                                (error-message-string err)))
+        (should (= establish-calls 1))))))
+
+(ert-deftest tramp-rpc-mock-test-connect-failure-cache-classifies-errors ()
+  "Only deployment failures and server unavailability enter the cache."
+  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
+  (let* ((vec (tramp-dissect-file-name "/rpc:mock:/"))
+         (tramp-rpc-connection-failure-cache-timeout 30))
+    (unwind-protect
+        (progn
+          (tramp-rpc--remember-connection-failure
+           vec '(remote-file-error "SSH connection failure"))
+          (should-not (tramp-rpc--recent-connection-failure vec))
+          (tramp-rpc--remember-connection-failure
+           vec '(tramp-rpc-sudo-auth-rejected "bad password") t)
+          (should-not (tramp-rpc--recent-connection-failure vec))
+          (tramp-rpc--remember-connection-failure
+           vec '(remote-file-error "deployment failure") t)
+          (should (tramp-rpc--recent-connection-failure vec))
+          (tramp-rpc--clear-connection-failure vec)
+          (tramp-rpc--remember-connection-failure
+           vec '(tramp-rpc-server-unavailable "missing server"))
+          (should (tramp-rpc--recent-connection-failure vec)))
+      (tramp-rpc--clear-connection-failure vec))))
+
 (ert-deftest tramp-rpc-mock-test-establish-controlmaster-argv-and-connection-type ()
 "The establish command must keep a local PTY but never ask for a remote tty.
 OpenSSH prompts on the controlling terminal, so the establish process needs
@@ -7863,7 +7946,7 @@ It should attempt to connect (and fail), not silently bail."
                                     :host "cached-failure-test-host"
                                     :localname "/tmp"))
          (tramp-rpc-connection-failure-cache-timeout 30)
-         (failure '(remote-file-error "cached connection failure"))
+         (failure '(tramp-rpc-server-unavailable "cached connection failure"))
          connectable-called)
     (unwind-protect
         (progn

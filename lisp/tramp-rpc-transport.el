@@ -253,13 +253,15 @@ Expired entries are removed."
       (remhash key tramp-rpc--connection-failures)
       nil))))
 
-(defun tramp-rpc--remember-connection-failure (vec error)
-  "Cache deployment-related ERROR as the recent failure for VEC.
-Plain `file-error' conditions from SSH authentication are intentionally not
-cached, since those can require an immediate retry or password interaction."
-  (when (and (memq (car error)
-                   '(remote-file-error tramp-rpc-server-unavailable
-                     tramp-rpc-sudo-auth-rejected))
+(defun tramp-rpc--remember-connection-failure (vec error &optional deployment-p)
+  "Cache deployment ERROR as the recent failure for VEC.
+When DEPLOYMENT-P is non-nil, ERROR was signaled while obtaining the server
+binary.  SSH `remote-file-error' and sudo authentication failures are not
+cached, since corrected credentials and transient connection failures should
+be retried."
+  (when (and (not (eq (car error) 'tramp-rpc-sudo-auth-rejected))
+             (or deployment-p
+                 (eq (car error) 'tramp-rpc-server-unavailable))
              (numberp tramp-rpc-connection-failure-cache-timeout)
              (> tramp-rpc-connection-failure-cache-timeout 0))
     (puthash (tramp-rpc--connection-key vec)
@@ -1426,7 +1428,11 @@ probe can then interleave with RPC startup and corrupt the protocol stream."
                 "TRAMP-RPC: SSH connection to %s failed: %s"
                 (tramp-file-name-host vec) (error-message-string err))
                (signal (car err) (cdr err)))
-           (ignore-errors (delete-file socket-path))
+           (condition-case delete-error
+               (delete-file socket-path)
+             (file-missing nil)
+             (file-error
+              (signal (car delete-error) (cdr delete-error))))
            (tramp-rpc--report-status
             "TRAMP-RPC: SSH connection to %s did not establish; retrying..."
             (tramp-file-name-host vec))
@@ -1438,7 +1444,7 @@ probe can then interleave with RPC startup and corrupt the protocol stream."
                "TRAMP-RPC: SSH connection to %s failed: %s"
                (tramp-file-name-host vec)
                (error-message-string retry-error))
-              (signal (car err) (cdr err)))))))))
+              (signal (car retry-error) (cdr retry-error)))))))))
   (let* ((sudo-ssh-user (tramp-rpc--detect-sudo-elevation vec))
          ;; TRAMP's sudo method opens an elevated backend connection.  For the
          ;; RPC backend that means starting the server via sudo.  Prefer sudo
@@ -1496,6 +1502,8 @@ probe can then interleave with RPC startup and corrupt the protocol stream."
                   (condition-case deploy-error
                       (tramp-rpc-deploy-ensure-binary vec)
                     (error
+                     (tramp-rpc--remember-connection-failure
+                      vec deploy-error t)
                      ;; Deployment errors can otherwise be hidden by the
                      ;; file-name-handler error path.  Keep the original error
                      ;; for callers, but leave an immediate local diagnostic.
