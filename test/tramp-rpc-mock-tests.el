@@ -1211,6 +1211,51 @@ This matches the behavior expected by `tramp-test28-process-file'."
 (defconst tramp-rpc-mock-test--tramp-rpc-loaded t
   "The full TRAMP-RPC backend was loaded successfully.")
 
+(ert-deftest tramp-rpc-mock-test-sanitize-native-comp-load-history ()
+  "Malformed native-comp entries are removed only from TRAMP-RPC modules."
+  (let* ((anonymous '(defun . --anonymous-lambda))
+         (rpc-entries
+          (mapcar (lambda (extension)
+                    (list (concat "/tmp/tramp-rpc-test" extension)
+                          '(defun . retained-function)
+                          anonymous anonymous))
+                  '(".el" ".elc" ".eln")))
+         (other-entry (list "/tmp/tramp-rpc/other-package.eln" anonymous))
+         (similar-entry (list "/tmp/tramp-rpcx.el" anonymous))
+         (load-history (append (list other-entry similar-entry) rpc-entries)))
+    (tramp-rpc--sanitize-native-comp-load-history)
+    (dolist (entry rpc-entries)
+      (should (equal (cdr entry) '((defun . retained-function)))))
+    (should (equal other-entry
+                   '("/tmp/tramp-rpc/other-package.eln"
+                     (defun . --anonymous-lambda))))
+    (should (equal similar-entry
+                   '("/tmp/tramp-rpcx.el"
+                     (defun . --anonymous-lambda))))))
+
+(ert-deftest tramp-rpc-mock-test-unload-sanitizes-before-cleanup ()
+  "Unload sanitizes native-comp history before using helper modules."
+  (let (sanitized cleanup-started helper-unloaded)
+    (cl-letf (((symbol-function 'tramp-rpc--sanitize-native-comp-load-history)
+               (lambda () (setq sanitized t)))
+              ((symbol-function 'tramp-rpc--remove-external-operation)
+               (lambda (&rest _args)
+                 (should sanitized)
+                 (setq cleanup-started t)))
+              ((symbol-function 'featurep)
+               (lambda (feature)
+                 (eq feature 'tramp-rpc-advice)))
+              ((symbol-function 'unload-feature)
+               (lambda (feature &optional _force)
+                 (should sanitized)
+                 (should cleanup-started)
+                 (setq helper-unloaded feature)
+                 (throw 'helper-unloaded nil))))
+      (catch 'helper-unloaded (tramp-rpc-unload-function)))
+    (should sanitized)
+    (should cleanup-started)
+    (should (eq helper-unloaded 'tramp-rpc-advice))))
+
 (load (expand-file-name "tramp-rpc-request-tests.el"
                         (file-name-directory (or load-file-name buffer-file-name))))
 

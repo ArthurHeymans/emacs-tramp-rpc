@@ -165,6 +165,17 @@ jobs:
             --eval "(push \"$(pwd)/lisp\" load-path)" \
             -f batch-byte-compile lisp/*.el
 
+      - name: Test native-compiled unload
+        if: matrix.emacs_version == 'release-snapshot'
+        run: |
+          nix shell nixpkgs#emacs-nox --command \
+            emacs -Q --batch \
+              --eval "(require 'package)" \
+              --eval "(package-initialize)" \
+              -L lisp \
+              -l test/tramp-rpc-native-unload-tests.el \
+              --eval "(ert-run-tests-batch-and-exit \"^tramp-rpc-native-unload-test-\")"
+
       - name: Package lint
         run: |
           emacs -Q --batch \
