@@ -121,6 +121,11 @@ The directory must exist and be writable."
   :type 'string
   :group 'tramp-rpc)
 
+(defvar tramp-rpc--owned-controlmasters (make-hash-table :test 'equal)
+  "Map owned ControlMaster socket paths to their establishing processes.
+An entry remains valid after its process exits because `ControlPersist' can
+leave the master running in the background.")
+
 (defcustom tramp-rpc-controlmaster-persist 600
   "How long (in seconds) to keep ControlMaster connections alive.
 Set to 0 to close immediately when last connection exits.
@@ -1062,6 +1067,7 @@ Returns non-nil on success."
     ;; create a ControlMaster on top of a stale ControlPath, which later shows
     ;; up as a generic "Tramp failed to connect" during unrelated file ops.
     (when (file-exists-p socket-path)
+      (remhash socket-path tramp-rpc--owned-controlmasters)
       (delete-file socket-path))
     (with-current-buffer buffer
       (erase-buffer))
@@ -1101,8 +1107,10 @@ Returns non-nil on success."
             ;; tramp-process-actions throws on failure; reaching here means
             ;; the persistent master owns PROCESS and BUFFER.
             (sleep-for 0.1)
+            (puthash socket-path process tramp-rpc--owned-controlmasters)
             (setq success t))
         (unless success
+          (remhash socket-path tramp-rpc--owned-controlmasters)
           (when (and process (process-live-p process))
             (delete-process process))
           (when (buffer-live-p buffer)
@@ -1456,11 +1464,11 @@ receive `ssh -O exit', which would disconnect that other session."
                   (tramp-rpc--ssh-detail-port vec)))
            (proxyjump (tramp-rpc--hops-to-proxyjump vec))
            (socket-path (tramp-rpc--controlmaster-socket-path vec))
-           (auth-process-name (format "*tramp-rpc-auth %s*" host))
-           (auth-buffer-name (format " *tramp-rpc-auth %s*" host))
-           (auth-process (get-process auth-process-name))
-           (auth-buffer (get-buffer auth-buffer-name))
-           (owned (and auth-process (process-live-p auth-process))))
+           (auth-process
+            (gethash socket-path tramp-rpc--owned-controlmasters))
+           (auth-buffer (and (processp auth-process)
+                             (process-buffer auth-process)))
+           (owned (processp auth-process)))
       ;; Close the ControlMaster socket gracefully via ssh -O exit.
       ;; This is a local control message (no network round-trip), so fast.
       (when (and owned (file-exists-p socket-path))
@@ -1478,7 +1486,8 @@ receive `ssh -O exit', which would disconnect that other session."
         (delete-process auth-process))
       ;; Kill the auth buffer.
       (when (buffer-live-p auth-buffer)
-        (kill-buffer auth-buffer)))))
+        (kill-buffer auth-buffer))
+      (remhash socket-path tramp-rpc--owned-controlmasters))))
 
 (defun tramp-rpc--cleanup-controlmaster (vec &optional expected-process)
   "Clean up the ControlMaster process and socket for VEC.

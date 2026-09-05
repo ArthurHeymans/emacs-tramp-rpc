@@ -28,9 +28,7 @@ use super::super::HandlerResult;
 use super::super::system::expand_tilde;
 #[cfg(target_os = "macos")]
 use super::signal_process;
-use super::subscription::{
-    PushSubscription, new_pty_subscription, send_process_notification, stop_push_subscription,
-};
+use super::subscription::{PushSubscription, send_process_notification, stop_push_subscription};
 use super::{
     MANAGED_CHILD_WAIT, MANAGED_PTY_CHILD_WAIT, MAX_PROCESS_READ_BYTES, SignalCode, dup_cloexec,
     require_process_group_signal, set_fd_cloexec, set_fd_nonblocking, signal_process_group,
@@ -1000,23 +998,16 @@ pub async fn kill_pty(params: Value) -> HandlerResult {
     // without turning a survivable signal such as SIGINT into SIGKILL.
     // Explicit close and connection cleanup retain escalation authority.
     // Explicit SIGKILL also opts out of output draining.
-    if let Err(error) = terminate_pty_process(
+    // If SIGKILL fails after cancellation, the terminal entry deliberately
+    // remains marked as terminating; PtyIoState cancellation is irreversible.
+    terminate_pty_process(
         params.pid,
         signal,
         false,
         signal == libc::SIGKILL,
         signal == libc::SIGKILL,
     )
-    .await
-    {
-        if let Some(managed) = get_pty_process_map().lock().await.get_mut(&params.pid) {
-            managed.terminating = false;
-            if managed.subscription_requested && managed.push_subscription.is_none() {
-                managed.push_subscription = Some(new_pty_subscription(params.pid));
-            }
-        }
-        return Err(error);
-    }
+    .await?;
     if signal == libc::SIGKILL && subscribed {
         let exit_code = shared_exit_status
             .as_ref()
@@ -1060,15 +1051,8 @@ pub async fn close_pty(params: Value) -> HandlerResult {
         stop_push_subscription(subscription).await;
     }
     // Explicit close is the opt-out from kill's drain-preserving ownership.
-    if let Err(error) = terminate_pty_process(params.pid, libc::SIGKILL, true, true, false).await {
-        if let Some(managed) = get_pty_process_map().lock().await.get_mut(&params.pid) {
-            managed.terminating = false;
-            if managed.subscription_requested && managed.push_subscription.is_none() {
-                managed.push_subscription = Some(new_pty_subscription(params.pid));
-            }
-        }
-        return Err(error);
-    }
+    // A failure leaves the entry terminal because cancellation is irreversible.
+    terminate_pty_process(params.pid, libc::SIGKILL, true, true, false).await?;
     discard_terminated_pty_status(params.pid);
     Ok(Value::Boolean(true))
 }

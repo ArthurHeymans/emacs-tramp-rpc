@@ -200,16 +200,9 @@ run_stress_tests() {
 
 run_stress_remote_tests() {
     echo -e "${YELLOW}Running SSH subscriber stress tests against ${TRAMP_RPC_TEST_HOST:-localhost}...${NC}"
-    # Stress-remote tests load tramp-rpc directly; pass TRAMP_SOURCE as a plain
-    # load-path entry so both flat checkouts (no lisp/ subdir) and lisp/-layout
-    # checkouts work.
-    local extra_load_args=()
-    if [[ -n "$TRAMP_SOURCE" ]]; then
-        extra_load_args=(-L "$TRAMP_SOURCE")
-    fi
-    require_supported_tramp "${extra_load_args[@]}"
+    require_supported_tramp "${EMACS_LOAD_PATH_ARGS[@]}"
     run_ert_selector "$SCRIPT_DIR/tramp-rpc-stress-remote-tests.el" \
-        "\"^tramp-rpc-stress-remote-test-\"" nil "${extra_load_args[@]}"
+        "\"^tramp-rpc-stress-remote-test-\"" nil "${EMACS_LOAD_PATH_ARGS[@]}"
 }
 
 run_all_tests() {

@@ -493,7 +493,7 @@ PID is the remote process ID."
     match))
 
 (defun tramp-rpc--handle-process-output-notification (connection params)
-  "Handle a process output notification received on CONNECTION."
+  "Handle process output PARAMS received on CONNECTION."
   (when-let* ((pid (alist-get 'pid params))
               (local-process
                (tramp-rpc--find-async-process-for-notification connection pid))
@@ -507,7 +507,7 @@ PID is the remote process ID."
          local-process stdout stderr (plist-get info :stderr-buffer))))))
 
 (defun tramp-rpc--handle-process-exit-notification (connection params)
-  "Handle a process exit notification received on CONNECTION."
+  "Handle process exit PARAMS received on CONNECTION."
   (when-let* ((pid (alist-get 'pid params))
               (local-process
                (tramp-rpc--find-async-process-for-notification connection pid)))
@@ -1428,7 +1428,7 @@ Returns (COLS . ROWS)."
        #'tramp-rpc--deliver-pending-pty-output local-process))))
 
 (defun tramp-rpc--handle-pty-output-notification (connection params)
-  "Queue a PTY output notification received on CONNECTION."
+  "Queue PTY output PARAMS received on CONNECTION."
   (when-let* ((pid (alist-get 'pid params))
               (local-process
                (tramp-rpc--find-pty-process-for-notification connection pid))
@@ -1437,7 +1437,7 @@ Returns (COLS . ROWS)."
      local-process (tramp-rpc--binary-bytes output))))
 
 (defun tramp-rpc--handle-pty-exit-notification (connection params)
-  "Queue a PTY exit notification received on CONNECTION."
+  "Queue PTY exit PARAMS received on CONNECTION."
   (when-let* ((pid (alist-get 'pid params))
               (local-process
                (tramp-rpc--find-pty-process-for-notification connection pid)))

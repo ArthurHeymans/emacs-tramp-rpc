@@ -6648,7 +6648,9 @@ session terminal (`-N' plus a leading explicit RequestTTY=no) so user SSH
 options can not reintroduce one (see #213)."
   (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
   (let ((controlmaster-dir (make-temp-file "tramp-rpc-controlmaster" t))
-        ssh-args program connection-type process-buffer)
+        (tramp-rpc--owned-controlmasters (make-hash-table :test 'equal))
+        ssh-args program connection-type process-buffer establish-process
+        owned-socket)
     (unwind-protect
         (progn
           (let ((vec (tramp-dissect-file-name "/rpc:mock:/"))
@@ -6657,6 +6659,8 @@ options can not reintroduce one (see #213)."
                 ;; Adversarial: user-supplied args must not win over the
                 ;; trailing no-terminal request.
                 (tramp-rpc-ssh-args '("-o" "RequestTTY=yes")))
+            (setq owned-socket
+                  (tramp-rpc--controlmaster-socket-path vec))
             (cl-letf (((symbol-function 'start-process)
                        (lambda (name buffer prog &rest args)
                          (setq program prog
@@ -6668,10 +6672,12 @@ options can not reintroduce one (see #213)."
                                connection-type process-connection-type)
                          ;; Run a real, harmless child so the process
                          ;; bookkeeping in the caller works.
-                         (make-process :name name
-                                       :buffer " *tramp-rpc-establish-argv-mock*"
-                                       :command (list "sleep" "60")
-                                       :noquery t)))
+                         (setq establish-process
+                               (make-process
+                                :name name
+                                :buffer " *tramp-rpc-establish-argv-mock*"
+                                :command (list "sleep" "60")
+                                :noquery t))))
                       ((symbol-function 'tramp-process-actions) #'ignore)
                       ((symbol-function 'sleep-for) #'ignore))
               ;; Poison the outer value; establish must locally bind t
@@ -6687,7 +6693,10 @@ options can not reintroduce one (see #213)."
           (should (< (seq-position ssh-args "RequestTTY=no")
                      (seq-position ssh-args "RequestTTY=yes")))
           (should (member "ControlMaster=yes" ssh-args))
-          (should (member "-N" ssh-args)))
+          (should (member "-N" ssh-args))
+          (should (eq (gethash owned-socket
+                               tramp-rpc--owned-controlmasters)
+                      establish-process)))
       ;; Resource cleanup runs even when an assertion in the body fails.
       ;; Delete the mock master process before killing its buffers, so
       ;; `kill-buffer' is not asked about a running process.
@@ -6699,6 +6708,50 @@ options can not reintroduce one (see #213)."
       (when (buffer-live-p (get-buffer " *tramp-rpc-establish-argv-mock*"))
         (kill-buffer " *tramp-rpc-establish-argv-mock*"))
       (ignore-errors (delete-directory controlmaster-dir t)))))
+
+(ert-deftest tramp-rpc-mock-test-controlmaster-cleanup-uses-exact-owned-socket ()
+  "Cleanup targets the exact owned socket after its auth process exits."
+  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
+  (let* ((vec-a (tramp-dissect-file-name "/rpc:user-a@same-host:/"))
+         (vec-b (tramp-dissect-file-name "/rpc:user-b@same-host:/"))
+         (socket-a (make-temp-file "tramp-rpc-owned-a"))
+         (socket-b (make-temp-file "tramp-rpc-owned-b"))
+         (buffer-a (generate-new-buffer " *tramp-rpc-owned-a*"))
+         (buffer-b (generate-new-buffer " *tramp-rpc-owned-b*"))
+         (process-a (make-pipe-process :name "tramp-rpc-owned-a"
+                                       :buffer buffer-a :noquery t))
+         (process-b (make-pipe-process :name "tramp-rpc-owned-b"
+                                       :buffer buffer-b :noquery t))
+         (tramp-rpc--owned-controlmasters (make-hash-table :test 'equal))
+         exit-args)
+    (unwind-protect
+        (progn
+          (puthash socket-a process-a tramp-rpc--owned-controlmasters)
+          (puthash socket-b process-b tramp-rpc--owned-controlmasters)
+          ;; ControlPersist can outlive this establishing process.
+          (delete-process process-a)
+          (cl-letf (((symbol-function 'tramp-rpc--controlmaster-socket-path)
+                     (lambda (vec)
+                       (if (equal (tramp-file-name-user vec) "user-a")
+                           socket-a
+                         socket-b)))
+                    ((symbol-function 'call-process)
+                     (lambda (_program _infile _destination _display &rest args)
+                       (setq exit-args args)
+                       0)))
+            (tramp-rpc--cleanup-controlmaster-unlocked vec-a))
+          (should (member (format "ControlPath=%s" socket-a) exit-args))
+          (should-not (member (format "ControlPath=%s" socket-b) exit-args))
+          (should-not (gethash socket-a tramp-rpc--owned-controlmasters))
+          (should (eq (gethash socket-b tramp-rpc--owned-controlmasters)
+                      process-b))
+          (should (process-live-p process-b)))
+      (when (process-live-p process-a) (delete-process process-a))
+      (when (process-live-p process-b) (delete-process process-b))
+      (when (buffer-live-p buffer-a) (kill-buffer buffer-a))
+      (when (buffer-live-p buffer-b) (kill-buffer buffer-b))
+      (when (file-exists-p socket-a) (delete-file socket-a))
+      (when (file-exists-p socket-b) (delete-file socket-b)))))
 
 (ert-deftest tramp-rpc-mock-test-controlmaster-action-tolerates-late-socket ()
   "A dead establish process still succeeds when its socket appears late.
