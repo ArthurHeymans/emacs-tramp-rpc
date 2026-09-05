@@ -1120,14 +1120,11 @@ resolved value, so export it explicitly for the source build."
                 (directory-file-name directory))))
           files))))
 
-(defun tramp-rpc-deploy--copy-source-to-remote (vec remote-root)
-  "Copy the build-relevant source tree below REMOTE-ROOT on VEC."
-  (let* ((root (tramp-rpc-deploy--source-root))
-         (files (tramp-rpc-deploy--source-file-list))
-         (directories (tramp-rpc-deploy--remote-source-directories files root)))
-    (unless (and root files)
-      (signal 'remote-file-error
-              (list "Source directory is unavailable or contains no server sources")))
+(defun tramp-rpc-deploy--copy-source-files-to-remote (vec remote-root root files)
+  "Copy FILES from ROOT below REMOTE-ROOT on VEC, one file at a time.
+This is the compatibility path for hosts without a usable local or remote
+tar command."
+  (let ((directories (tramp-rpc-deploy--remote-source-directories files root)))
     (let ((directory-arguments
            (mapconcat
             (lambda (directory)
@@ -1148,19 +1145,103 @@ resolved value, so export it explicitly for the source build."
       (let* ((relative (file-relative-name file root))
              (remote-file (expand-file-name relative remote-root))
              (remote-path (tramp-make-tramp-file-name vec remote-file)))
-        (copy-file file remote-path t)))))
+        ;; Tramp normally suspends timers while it owns the connection.  The
+        ;; source-copy reporter only updates the minibuffer, so keep its timer
+        ;; live without allowing another Tramp progress reporter to re-enter.
+        (let ((tramp-dont-suspend-timers t)
+              (tramp-inhibit-progress-reporter t))
+          (copy-file file remote-path t))))))
 
-(defun tramp-rpc-deploy--run-with-progress-reporter (vec arch function)
+(defun tramp-rpc-deploy--make-source-archive (root files)
+  "Create a tar archive containing FILES below ROOT.
+Return the temporary archive path, or signal when the archive cannot be
+created.  The archive is deliberately uncompressed: eliminating the
+per-file SSH handshakes dominates this transfer, and remote source-build
+hosts are only assumed to provide the basic tar extractor."
+  (unless (executable-find "tar")
+    (signal 'remote-file-error
+            (list "Local tar command is unavailable for source transfer")))
+  (let* ((archive (make-temp-file "tramp-rpc-source-" nil ".tar"))
+         (output (generate-new-buffer " *tramp-rpc-source-archive*"))
+         (relative-files (mapcar (lambda (file)
+                                   (file-relative-name file root))
+                                 files))
+         (success nil))
+    (unwind-protect
+        (let ((exit-code
+               (apply #'call-process
+                      "tar" nil output nil
+                      (append (list "-cf" archive "-C" root "--")
+                              relative-files))))
+          (if (and (integerp exit-code) (zerop exit-code))
+              (progn
+                (setq success t)
+                archive)
+            (let ((details (with-current-buffer output
+                             (string-trim (buffer-string)))))
+              (signal
+               'remote-file-error
+               (list (format "Could not create source archive%s"
+                             (if (string-empty-p details)
+                                 ""
+                               (concat ": " details))))))))
+      (unless success
+        (ignore-errors (delete-file archive)))
+      (when (buffer-live-p output)
+        (kill-buffer output)))))
+
+(defun tramp-rpc-deploy--copy-source-to-remote (vec remote-root)
+  "Copy the build-relevant source tree below REMOTE-ROOT on VEC.
+Use one tar transfer followed by one remote extraction so high-latency SSH
+connections do not pay a connection setup for every source file.  Fall back
+to the original per-file transfer when tar is unavailable on either side."
+  (let* ((root (tramp-rpc-deploy--source-root))
+         (files (tramp-rpc-deploy--source-file-list))
+         (archive nil)
+         (remote-archive (expand-file-name ".tramp-rpc-source.tar" remote-root)))
+    (unless (and root files)
+      (signal 'remote-file-error
+              (list "Source directory is unavailable or contains no server sources")))
+    (condition-case archive-error
+        (setq archive (tramp-rpc-deploy--make-source-archive root files))
+      (remote-file-error
+       (tramp-rpc-deploy--log "Source archive unavailable; using serial copy: %s"
+                              (error-message-string archive-error))))
+    (if (not archive)
+        (tramp-rpc-deploy--copy-source-files-to-remote vec remote-root root files)
+      (unwind-protect
+          (progn
+            (let ((tramp-dont-suspend-timers t)
+                  (tramp-inhibit-progress-reporter t))
+              (copy-file archive
+                         (tramp-make-tramp-file-name vec remote-archive)
+                         t))
+            (if (tramp-send-command-and-check
+                 vec
+                 (format "tar -xf %s -C %s"
+                         (tramp-shell-quote-argument remote-archive)
+                         (tramp-shell-quote-argument remote-root)))
+                t
+              (tramp-rpc-deploy--log
+               "Remote tar extraction unavailable; using serial source copy")
+              (tramp-rpc-deploy--copy-source-files-to-remote
+               vec remote-root root files)))
+        (delete-file archive)))))
+
+(defun tramp-rpc-deploy--run-with-progress-reporter
+    (vec arch function &optional progress-message)
   "Call FUNCTION while reporting a remote build for ARCH on VEC.
 This uses a local reporter instead of `with-tramp-progress-reporter'.
 Deployment is invoked from inside a TRAMP file operation, where TRAMP can
 intentionally suppress its nested progress reporters and messages.  The
-build is synchronous, so FUNCTION receives a tick function which it should
-  call while waiting for the remote command."
+operation is synchronous, so FUNCTION receives a tick function which it should
+call while waiting for the remote command.  PROGRESS-MESSAGE overrides the
+default build message and is used for source transfer progress."
   (if noninteractive
       (funcall function nil)
-    (let* ((text (format "Building tramp-rpc-server remotely for %s on %s"
-                         arch (tramp-file-name-host vec)))
+    (let* ((text (or progress-message
+                     (format "Building tramp-rpc-server remotely for %s on %s"
+                             arch (tramp-file-name-host vec))))
            (reporter
             ;; This status is specifically the long-running operation the
             ;; user initiated.  Do not inherit TRAMP's message suppression.
@@ -1178,13 +1259,15 @@ build is synchronous, so FUNCTION receives a tick function which it should
                  ;; The caller may currently be in a minibuffer.  TRAMP's
                  ;; normal wait loop uses `nodisp', so redisplay explicitly.
                  (redisplay t)))))
-        (unwind-protect
-            (progn
-              (tick)
-              (funcall function #'tick))
-          (let ((inhibit-message nil)
-                (message-log-max nil))
-            (progress-reporter-done reporter)))))))
+        (let ((timer (run-at-time 0.2 0.2 #'tick)))
+          (unwind-protect
+              (progn
+                (tick)
+                (funcall function #'tick))
+            (cancel-timer timer)
+            (let ((inhibit-message nil)
+                  (message-log-max nil))
+              (progress-reporter-done reporter))))))))
 
 (defun tramp-rpc-deploy--send-command-and-check-with-progress
     (vec command tick)
@@ -1265,7 +1348,12 @@ removed after installation, leaving only the versioned deployed binary."
                           directory))
               (signal 'remote-file-error
                       (list "Could not create remote source-build directory")))
-            (tramp-rpc-deploy--copy-source-to-remote vec directory)
+            (tramp-rpc-deploy--run-with-progress-reporter
+             vec arch
+             (lambda (_tick)
+               (tramp-rpc-deploy--copy-source-to-remote vec directory))
+             (format "Copying tramp-rpc-server sources to %s"
+                     (tramp-file-name-host vec)))
             (setq build-output
                   (expand-file-name
                    (format "target/release/%s" tramp-rpc-deploy-binary-name)
