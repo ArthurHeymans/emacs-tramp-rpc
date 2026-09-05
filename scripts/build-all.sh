@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 # Build tramp-rpc-server with size-optimized static musl linking
 
 set -e

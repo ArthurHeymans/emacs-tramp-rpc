@@ -73,6 +73,21 @@ No RPC can be sent any more; functions remove local state tied to PROCESS.")
 METHOD is the notification name, for example \"fs.events\", and PARAMS its
 decoded parameters.  Notifications nobody handles are discarded.")
 
+(defun tramp-rpc--report-status (format-string &rest args)
+  "Display a status message using FORMAT-STRING and ARGS inside TRAMP.
+TRAMP suppresses some nested messages while a file-name handler is running.
+Connection setup can also spend a long time inside a synchronous SSH wait, so
+make the status visible without forcing a synchronous redisplay."
+  (let ((text (apply #'format format-string args)))
+    (let ((inhibit-message nil))
+      ;; Keep the diagnostic in `*Messages*' for post-mortem inspection.
+      (message "%s" text))))
+
+(defun tramp-rpc--clear-status ()
+  "Clear the current connection status message from the echo area."
+  (let ((inhibit-message nil))
+    (message nil)))
+
 (define-error 'tramp-rpc-server-unavailable
   "TRAMP-RPC server binary is unavailable" 'remote-file-error)
 
@@ -203,6 +218,64 @@ treated like `tramp-own-remote-path'."
   "Hash table mapping normalized connection keys to `tramp-rpc-connection'.
 Keys include target method/user/host/port plus the effective route (explicit
 or hidden TRAMP ad-hoc proxy hops).")
+
+(defcustom tramp-rpc-connection-failure-cache-timeout 10
+  "Seconds to suppress repeated connection attempts after a failure.
+
+TRAMP's file-name completion may ask several remote predicates for one
+minibuffer input.  When connection setup fails, retrying the same SSH and
+deployment sequence for every predicate is both slow and noisy.  The most
+recent error is reused during this short interval.  Set this to zero to
+disable the backoff."
+  :type 'number
+  :group 'tramp-rpc)
+
+(defvar tramp-rpc--connection-failures (make-hash-table :test 'equal)
+  "Recent failed connection attempts keyed by normalized connection key.")
+
+(defun tramp-rpc--clear-connection-failure (vec)
+  "Forget a cached connection failure for VEC."
+  (remhash (tramp-rpc--connection-key vec) tramp-rpc--connection-failures))
+
+(defun tramp-rpc--recent-connection-failure (vec)
+  "Return a recent cached connection failure for VEC, or nil.
+Expired entries are removed."
+  (let* ((key (tramp-rpc--connection-key vec))
+         (entry (gethash key tramp-rpc--connection-failures))
+         (timeout tramp-rpc-connection-failure-cache-timeout))
+    (cond
+     ((not entry) nil)
+     ((and (numberp timeout)
+           (> timeout 0)
+           (< (- (float-time) (plist-get entry :timestamp)) timeout))
+      entry)
+     (t
+      (remhash key tramp-rpc--connection-failures)
+      nil))))
+
+(defun tramp-rpc--remember-connection-failure (vec error &optional deployment-p)
+  "Cache deployment ERROR as the recent failure for VEC.
+When DEPLOYMENT-P is non-nil, ERROR was signaled while obtaining the server
+binary.  SSH `remote-file-error' and sudo authentication failures are not
+cached, since corrected credentials and transient connection failures should
+be retried."
+  (when (and (not (eq (car error) 'tramp-rpc-sudo-auth-rejected))
+             (or deployment-p
+                 (eq (car error) 'tramp-rpc-server-unavailable))
+             (numberp tramp-rpc-connection-failure-cache-timeout)
+             (> tramp-rpc-connection-failure-cache-timeout 0))
+    (puthash (tramp-rpc--connection-key vec)
+             (list :timestamp (float-time)
+                   :error (copy-tree error))
+             tramp-rpc--connection-failures)))
+
+(defun tramp-rpc--signal-recent-connection-failure (vec entry)
+  "Report and re-signal cached connection failure ENTRY for VEC."
+  (let ((error (plist-get entry :error)))
+    (tramp-rpc--report-status
+     "TRAMP-RPC: previous connection attempt to %s failed: %s"
+     (tramp-file-name-host vec) (error-message-string error))
+    (signal (car error) (cdr error))))
 
 (defvar tramp-rpc--connection-lifecycle-mutexes (make-hash-table :test 'equal)
   "Mutexes serializing connection replacement and ControlMaster teardown.")
@@ -816,24 +889,31 @@ completion) from blocking on unreachable hosts."
              (process-live-p (tramp-rpc-connection-process conn))
              (buffer-live-p (tramp-rpc-connection-buffer conn)))
         conn
-      (with-mutex (tramp-rpc--connection-lifecycle-mutex vec)
-        ;; Another thread may have reconnected while this one waited.
-        (setq conn (tramp-rpc--get-connection vec))
-        (if (and conn
-                 (process-live-p (tramp-rpc-connection-process conn))
-                 (buffer-live-p (tramp-rpc-connection-buffer conn)))
-            conn
-          ;; Stale connection - remove it before reconnecting.
-          (when conn
-            (tramp-rpc--remove-connection vec))
-          ;; During non-essential operations, don't open new connections.
-          ;; This mirrors the (unless (tramp-connectable-p vec)
-          ;; (throw 'non-essential 'non-essential)) pattern used by every
-          ;; standard TRAMP backend in their maybe-open-connection functions.
-          (unless (tramp-connectable-p vec)
-            (throw 'non-essential 'non-essential))
-          ;; Need to establish connection.
-          (tramp-rpc--connect vec))))))
+      (or
+       ;; Essential operations can reuse a recent deployment failure instead of
+       ;; reconnecting.  Non-essential operations must reach the
+       ;; `tramp-connectable-p' fallback below.
+       (when-let* ((failure (tramp-rpc--recent-connection-failure vec)))
+         (unless non-essential
+           (tramp-rpc--signal-recent-connection-failure vec failure)))
+       (with-mutex (tramp-rpc--connection-lifecycle-mutex vec)
+         ;; Another thread may have reconnected while this one waited.
+         (setq conn (tramp-rpc--get-connection vec))
+         (if (and conn
+                  (process-live-p (tramp-rpc-connection-process conn))
+                  (buffer-live-p (tramp-rpc-connection-buffer conn)))
+             conn
+           ;; Stale connection - remove it before reconnecting.
+           (when conn
+             (tramp-rpc--remove-connection vec))
+           ;; During non-essential operations, don't open new connections.
+           ;; This mirrors the (unless (tramp-connectable-p vec)
+           ;; (throw 'non-essential 'non-essential)) pattern used by every
+           ;; standard TRAMP backend in their maybe-open-connection functions.
+           (unless (tramp-connectable-p vec)
+             (throw 'non-essential 'non-essential))
+           ;; Need to establish connection.
+           (tramp-rpc--connect vec)))))))
 
 (defun tramp-rpc--ensure-controlmaster-directory ()
   "Ensure the ControlMaster socket directory exists.
@@ -1303,7 +1383,23 @@ probe can then interleave with RPC startup and corrupt the protocol stream."
        bootstrap-vec 'keep-debug 'keep-password 'keep-processes))))
 
 (defun tramp-rpc--connect (vec)
-  "Establish an RPC connection to VEC."
+  "Establish an RPC connection to VEC, reusing a recent failure if needed."
+  (if-let* ((failure (tramp-rpc--recent-connection-failure vec)))
+      (tramp-rpc--signal-recent-connection-failure vec failure)
+    (condition-case err
+        (prog1 (tramp-rpc--connect-uncached vec)
+          (tramp-rpc--clear-connection-failure vec))
+      (error
+       ;; Deployment failures are commonly followed by several TRAMP probes
+       ;; for the same path.  Cache only the errors that are safe to replay.
+       (tramp-rpc--remember-connection-failure vec err)
+       (signal (car err) (cdr err))))))
+
+(defun tramp-rpc--connect-uncached (vec)
+  "Establish an RPC connection to VEC without consulting failure cache."
+  (tramp-rpc--report-status
+   "TRAMP-RPC: connecting to %s (checking SSH and server availability)..."
+   (tramp-file-name-host vec))
   ;; Ensure ControlMaster directory exists
   (tramp-rpc--ensure-controlmaster-directory)
   ;; When ControlMaster is enabled, establish it first.
@@ -1311,6 +1407,9 @@ probe can then interleave with RPC startup and corrupt the protocol stream."
   ;; - Key-based: connects silently
   ;; - Password: prompts user, then subsequent connections reuse it
   (when tramp-rpc-use-controlmaster
+    (tramp-rpc--report-status
+     "TRAMP-RPC: establishing SSH connection to %s..."
+     (tramp-file-name-host vec))
     (condition-case err
         (tramp-rpc--establish-controlmaster vec)
       ((file-error remote-file-error)
@@ -1324,15 +1423,28 @@ probe can then interleave with RPC startup and corrupt the protocol stream."
          (if (tramp-rpc--controlmaster-active-p vec)
              ;; Do not tear down a socket that still answers ControlMaster
              ;; checks merely because authentication failed for another reason.
-             (signal (car err) (cdr err))
-           (condition-case nil
+             (progn
+               (tramp-rpc--report-status
+                "TRAMP-RPC: SSH connection to %s failed: %s"
+                (tramp-file-name-host vec) (error-message-string err))
+               (signal (car err) (cdr err)))
+           (condition-case delete-error
                (delete-file socket-path)
-             (file-missing nil))
+             (file-missing nil)
+             (file-error
+              (signal (car delete-error) (cdr delete-error))))
+           (tramp-rpc--report-status
+            "TRAMP-RPC: SSH connection to %s did not establish; retrying..."
+            (tramp-file-name-host vec))
            (sleep-for 0.1)
-           (condition-case nil
+           (condition-case retry-error
                (tramp-rpc--establish-controlmaster vec)
              ((file-error remote-file-error)
-              (signal (car err) (cdr err)))))))))
+              (tramp-rpc--report-status
+               "TRAMP-RPC: SSH connection to %s failed: %s"
+               (tramp-file-name-host vec)
+               (error-message-string retry-error))
+              (signal (car retry-error) (cdr retry-error)))))))))
   (let* ((sudo-ssh-user (tramp-rpc--detect-sudo-elevation vec))
          ;; TRAMP's sudo method opens an elevated backend connection.  For the
          ;; RPC backend that means starting the server via sudo.  Prefer sudo
@@ -1344,17 +1456,19 @@ probe can then interleave with RPC startup and corrupt the protocol stream."
     (if tramp-rpc-deploy-never-deploy
       ;; Never-deploy mode: use the configured path directly, no fallback.
       (let ((binary-path (tramp-rpc-deploy-ensure-binary vec)))
-        (condition-case err
-            (progn
-              (tramp-rpc--cleanup-bootstrap-connection vec)
-              (tramp-rpc--start-server-process vec binary-path sudo-password))
-          (remote-file-error
-           (tramp-rpc--cleanup-failed-connection vec)
-           (signal 'remote-file-error
-                   (list (format
-			  "tramp-rpc-server not found at \"%s\" on %s (never-deploy is set, no deployment attempted). Set `tramp-rpc-deploy-remote-binary-path' to the correct path. Original error: %s"
-                          binary-path (tramp-file-name-host vec)
-                          (error-message-string err)))))))
+        (prog1
+            (condition-case err
+                (progn
+                  (tramp-rpc--cleanup-bootstrap-connection vec)
+                  (tramp-rpc--start-server-process vec binary-path sudo-password))
+              (remote-file-error
+               (tramp-rpc--cleanup-failed-connection vec)
+               (signal 'remote-file-error
+                       (list (format
+			      "tramp-rpc-server not found at \"%s\" on %s (never-deploy is set, no deployment attempted). Set `tramp-rpc-deploy-remote-binary-path' to the correct path. Original error: %s"
+                              binary-path (tramp-file-name-host vec)
+                              (error-message-string err))))))
+          (tramp-rpc--clear-status)))
     ;; Normal mode: try expected path first, deploy on failure.
     ;; This avoids opening a bootstrap (scpx) connection just to run
     ;; `test -x binary', which takes ~6s for tramp-sh to establish the
@@ -1362,21 +1476,42 @@ probe can then interleave with RPC startup and corrupt the protocol stream."
     ;; this connects directly.  If it doesn't exist (first time or after
     ;; version bump), SSH exits immediately, we catch the error, deploy
     ;; via scpx, and retry.
+    (tramp-rpc--report-status
+     "TRAMP-RPC: checking for an existing server on %s..."
+     (tramp-file-name-host vec))
     (condition-case err
-        (progn
-          ;; Remove bootstrap state left by an earlier deployment before the
-          ;; startup probe begins exchanging MessagePack frames.
-          (tramp-rpc--cleanup-bootstrap-connection vec)
-          (tramp-rpc--start-server-process
-           vec (tramp-rpc-deploy-expected-binary-localname) sudo-password))
+        (prog1
+            (progn
+              ;; Remove bootstrap state left by an earlier deployment before
+              ;; the startup probe begins exchanging MessagePack frames.
+              (tramp-rpc--cleanup-bootstrap-connection vec)
+              (tramp-rpc--start-server-process
+               vec (tramp-rpc-deploy-expected-binary-localname) sudo-password))
+          (tramp-rpc--clear-status))
       ((tramp-rpc-server-unavailable tramp-rpc-sudo-auth-rejected)
        ;; Binary missing or sudo rejected the password.  Clean up and deploy.
        (tramp-rpc--cleanup-failed-connection vec)
+       (tramp-rpc--report-status
+        "TRAMP-RPC: server unavailable on %s; starting deployment..."
+        (tramp-file-name-host vec))
        ;; Deployment uses a bootstrap TRAMP connection.  Remove all of its
        ;; state before retrying RPC startup, and also when deployment or the
        ;; retry itself fails.
        (unwind-protect
-           (let ((binary-path (tramp-rpc-deploy-ensure-binary vec)))
+           (let ((binary-path
+                  (condition-case deploy-error
+                      (tramp-rpc-deploy-ensure-binary vec)
+                    (error
+                     (tramp-rpc--remember-connection-failure
+                      vec deploy-error t)
+                     ;; Deployment errors can otherwise be hidden by the
+                     ;; file-name-handler error path.  Keep the original error
+                     ;; for callers, but leave an immediate local diagnostic.
+                     (tramp-rpc--report-status
+                      "TRAMP-RPC: deployment on %s failed: %s"
+                      (tramp-file-name-host vec)
+                      (error-message-string deploy-error))
+                     (signal (car deploy-error) (cdr deploy-error))))))
              (tramp-rpc--cleanup-bootstrap-connection vec)
              ;; Re-prompt only when sudo explicitly rejected the supplied
              ;; password.  Missing-binary fallback keeps using the still-valid
@@ -1386,12 +1521,22 @@ probe can then interleave with RPC startup and corrupt the protocol stream."
                (setq sudo-password
                      (when (tramp-rpc--sudo-password-required-p vec)
                        (tramp-rpc--sudo-read-password vec sudo-ssh-user))))
-             (tramp-rpc--start-server-process
-              vec binary-path sudo-password))
-         (tramp-rpc--cleanup-bootstrap-connection vec)))))))
+             (prog1
+                 (tramp-rpc--start-server-process
+                  vec binary-path sudo-password)
+               (tramp-rpc--clear-status)))
+         (tramp-rpc--cleanup-bootstrap-connection vec)))
+      (remote-file-error
+       ;; A connection/authentication failure other than a missing executable
+       ;; must not be mistaken for a silent deployment failure.
+       (tramp-rpc--report-status
+        "TRAMP-RPC: connection to %s failed: %s"
+        (tramp-file-name-host vec) (error-message-string err))
+       (signal (car err) (cdr err)))))))
 
 (defun tramp-rpc--disconnect (vec)
   "Disconnect the RPC connection to VEC explicitly."
+  (tramp-rpc--clear-connection-failure vec)
   (when-let* ((conn (tramp-rpc--get-connection vec))
               (connection-process (tramp-rpc-connection-process conn)))
     (tramp-rpc--cleanup-connection-generation

@@ -39,7 +39,8 @@ TRAMP-RPC replaces this with a lightweight Rust server that runs on the remote h
 - Tramp 2.8.1.4 or later (install from GNU ELPA if your Emacs bundles an older version)
 - =msgpack.el= 0.1.1 or later (installed automatically from MELPA)
 - SSH access to remote hosts
-- Remote host running Linux or macOS (x86_64 or aarch64)
+- A remote host with either a published release architecture or a usable
+  Rust/Cargo toolchain for a native source build
 
 * Installation
 
@@ -138,8 +139,10 @@ Access remote files using the ~rpc~ method:
 
 On first connection, the server binary is automatically obtained and deployed:
 
-1. *Release/package installs*: download from GitHub Releases first (fastest, ~850KB download), then build from source if Rust 1.88 or later is installed and download fails.
-2. *Git checkout installs*: reuse a fresh source build or source-tree keyed cache.  Automatic file operations do not prompt when a binary is missing; run ~M-x tramp-rpc-deploy-install-binary~ to choose whether to download a checksum-verified release binary, build the checkout with Cargo, or skip.  A downloaded fallback remains keyed to that source tree, while strict ~build~ policy uses a separate identity.
+1. *Release/package installs*: try the checksum-verified release binary from GitHub Releases first.  If a matching source tree is present and the local and remote platforms match, attempt a local source build.  If a binary is unavailable for the platform or the remote is a different platform, TRAMP-RPC downloads the source archive for the installed release and tries to build it natively on the remote host.  For a supported platform with a usable remote Rust toolchain, interactive deployment asks whether to download the release binary or build remotely.
+2. *Git checkout installs*: use the checked-out Rust sources when a source build is selected or needed.  With the default ~auto~ policy, existing source builds and source-tree keyed caches are reused.  When a new binary is needed on a supported remote platform with a usable Rust toolchain, interactive deployment asks whether to download a release binary, build remotely, or skip.  Run ~M-x tramp-rpc-deploy-install-binary~ to choose a release binary, a local or remote build of the checkout, or skip.  Strict ~build~ policy always uses checkout sources; ~release~ policy uses release-version paths and artifacts.
+
+The default source-directory detection follows package-manager source links when they exist.  An archive/package installation normally contains only the Elisp files, so it has no local checkout to build.  In that case the tagged release source archive is downloaded temporarily for a remote build.  Set ~tramp-rpc-deploy-source-directory~ to a local checkout to use it, or to ~nil~ to disable all source builds.
 
 The binary is cached locally in =~/.emacs.d/tramp-rpc/= and deployed to =~/.cache/emacs/tramp-rpc/= on the remote host.
 
@@ -342,9 +345,17 @@ Download from GitHub Releases
          ├─ Success ────────────────► Cache locally, transfer to remote
          │
          ▼
-Build with cargo (if Rust installed)
+Build locally with Cargo when the platforms match
          │
          ├─ Success ────────────────► Cache locally, transfer to remote
+         │
+         ▼
+Use a local checkout, or download the matching release source archive
+         │
+         ▼
+Copy sources and build natively on remote with Cargo
+         │
+         ├─ Success ────────────────► Install remote binary
          │
          ▼
 Error with helpful instructions
@@ -362,6 +373,23 @@ Error with helpful instructions
 | Linux          | arm/ARMv6    | ✓      |
 | macOS          | x86_64       | ✓      |
 | macOS (Apple Silicon) | aarch64 | ✓   |
+
+Other UNIX-like platforms MAY work using source builds.  When no release binary exists, automatic deployment attempts a native remote build.  For a supported platform with a usable remote Rust toolchain, interactive deployment asks whether to download the release binary or build remotely.
+
+** Source and binary selection
+
+The deployment source depends on how the Elisp package was installed:
+
+| Installation                           | Release binary                                  | Source used for a remote build                                       |
+|----------------------------------------+-------------------------------------------------+----------------------------------------------------------------------|
+| Archive/package install                | GitHub release binary (for supported platforms) | Matching ~vVERSION~ source archive from GitHub, downloaded temporarily |
+| Git checkout / recipe with ~auto~ policy | Existing source-keyed artifacts by default      | The detected local checkout                                          |
+| Git checkout with ~release~ policy       | Release-version binary and cache paths          | The detected local checkout if a source fallback is needed           |
+| Git checkout with ~build~ policy         | Not used as a fallback                          | The detected local checkout only                                     |
+
+~tramp-rpc-deploy-prefer-build~ can be set to prefer a local source build before trying a release binary.
+
+~tramp-rpc-deploy-source-directory~ is automatically inferred when possible, including source links created by checkout-oriented package managers.  A package archive generally has no Rust sources, and source builds will fall back to a release source archive.  Setting this option to ~nil~ disables both checkout and release-archive source builds.
 
 ** Manual Binary Installation
 
@@ -496,7 +524,7 @@ ssh -o BatchMode=yes user@host echo success
 
 If GitHub downloads fail (corporate firewall, etc.), you can:
 
-1. Install Rust 1.88 or later and let tramp-rpc build locally:
+1. Install Rust (see [[file:Cargo.toml][Cargo.toml]] for the current MSRV) and let tramp-rpc build (either locally or on the remote host for a source checkout):
    #+begin_src bash
    curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
    #+end_src
@@ -651,7 +679,7 @@ emacs -Q --batch \
 
 The GitHub Actions workflow runs:
 
-1. *Rust Build* - Builds for 4 targets (x86_64/aarch64 Linux/macOS) with format check
+1. *Rust Build* - Builds for multiple targets (including x86_64/aarch64 Linux/macOS) with format check
 2. *Elisp Byte-compile* - Verifies all .el files compile without errors
 3. *Autoload Tests* - Verifies method registration and handler setup
 4. *Protocol Tests* - MessagePack-RPC encoding/decoding (no server)

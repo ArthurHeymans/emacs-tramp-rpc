@@ -3255,7 +3255,8 @@ cleanup of all connections has run."
           (when (process-live-p proc)
             (delete-process proc)))
         (kill-buffer buf)))
-    (clrhash tramp-rpc--connections))
+    (clrhash tramp-rpc--connections)
+    (clrhash tramp-rpc--connection-failures))
   ;; Clear all RPC-specific caches.
   (tramp-rpc-protocol--clear-deferred-polls)
   (tramp-rpc--clear-direnv-cache)
