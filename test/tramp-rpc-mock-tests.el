@@ -5213,6 +5213,26 @@ issue #268 (0.13 fails to download prebuilt binary)."
                   (should-not (equal id1 (tramp-rpc-deploy--binary-id))))))))
       (delete-directory dir t))))
 
+(ert-deftest tramp-rpc-mock-test-deploy-source-hash-ignores-remote-default-directory ()
+  "Source hashing must not reconnect through an inherited remote directory."
+  :tags '(:deploy)
+  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
+  (let ((dir (make-temp-file "tramp-rpc-source" t)))
+    (unwind-protect
+        (progn
+          (make-directory (expand-file-name "server/src" dir) t)
+          (with-temp-file (expand-file-name "Cargo.toml" dir)
+            (insert "[workspace]\nmembers = [\"server\"]\n"))
+          (with-temp-file (expand-file-name "server/src/main.rs" dir)
+            (insert "fn main() {}\n"))
+          (let ((tramp-rpc-deploy-source-directory dir)
+                (default-directory "/rpc:must-not-connect:~/workspace/"))
+            (cl-letf (((symbol-function 'tramp-rpc--ensure-connection)
+                       (lambda (&rest _args)
+                         (ert-fail "Source hashing attempted a remote connection"))))
+              (should (stringp (tramp-rpc-deploy--source-tree-hash))))))
+      (delete-directory dir t))))
+
 (ert-deftest tramp-rpc-mock-test-deploy-binary-id-release-policy ()
   "Test that release policy keeps version-keyed ids for git checkouts."
   :tags '(:deploy)
@@ -6628,7 +6648,9 @@ session terminal (`-N' plus a leading explicit RequestTTY=no) so user SSH
 options can not reintroduce one (see #213)."
   (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
   (let ((controlmaster-dir (make-temp-file "tramp-rpc-controlmaster" t))
-        ssh-args program connection-type process-buffer)
+        (tramp-rpc--owned-controlmasters (make-hash-table :test 'equal))
+        ssh-args program connection-type process-buffer establish-process
+        owned-socket)
     (unwind-protect
         (progn
           (let ((vec (tramp-dissect-file-name "/rpc:mock:/"))
@@ -6637,6 +6659,8 @@ options can not reintroduce one (see #213)."
                 ;; Adversarial: user-supplied args must not win over the
                 ;; trailing no-terminal request.
                 (tramp-rpc-ssh-args '("-o" "RequestTTY=yes")))
+            (setq owned-socket
+                  (tramp-rpc--controlmaster-socket-path vec))
             (cl-letf (((symbol-function 'start-process)
                        (lambda (name buffer prog &rest args)
                          (setq program prog
@@ -6648,10 +6672,12 @@ options can not reintroduce one (see #213)."
                                connection-type process-connection-type)
                          ;; Run a real, harmless child so the process
                          ;; bookkeeping in the caller works.
-                         (make-process :name name
-                                       :buffer " *tramp-rpc-establish-argv-mock*"
-                                       :command (list "sleep" "60")
-                                       :noquery t)))
+                         (setq establish-process
+                               (make-process
+                                :name name
+                                :buffer " *tramp-rpc-establish-argv-mock*"
+                                :command (list "sleep" "60")
+                                :noquery t))))
                       ((symbol-function 'tramp-process-actions) #'ignore)
                       ((symbol-function 'sleep-for) #'ignore))
               ;; Poison the outer value; establish must locally bind t
@@ -6667,7 +6693,10 @@ options can not reintroduce one (see #213)."
           (should (< (seq-position ssh-args "RequestTTY=no")
                      (seq-position ssh-args "RequestTTY=yes")))
           (should (member "ControlMaster=yes" ssh-args))
-          (should (member "-N" ssh-args)))
+          (should (member "-N" ssh-args))
+          (should (eq (gethash owned-socket
+                               tramp-rpc--owned-controlmasters)
+                      establish-process)))
       ;; Resource cleanup runs even when an assertion in the body fails.
       ;; Delete the mock master process before killing its buffers, so
       ;; `kill-buffer' is not asked about a running process.
@@ -6679,6 +6708,50 @@ options can not reintroduce one (see #213)."
       (when (buffer-live-p (get-buffer " *tramp-rpc-establish-argv-mock*"))
         (kill-buffer " *tramp-rpc-establish-argv-mock*"))
       (ignore-errors (delete-directory controlmaster-dir t)))))
+
+(ert-deftest tramp-rpc-mock-test-controlmaster-cleanup-uses-exact-owned-socket ()
+  "Cleanup targets the exact owned socket after its auth process exits."
+  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
+  (let* ((vec-a (tramp-dissect-file-name "/rpc:user-a@same-host:/"))
+         (vec-b (tramp-dissect-file-name "/rpc:user-b@same-host:/"))
+         (socket-a (make-temp-file "tramp-rpc-owned-a"))
+         (socket-b (make-temp-file "tramp-rpc-owned-b"))
+         (buffer-a (generate-new-buffer " *tramp-rpc-owned-a*"))
+         (buffer-b (generate-new-buffer " *tramp-rpc-owned-b*"))
+         (process-a (make-pipe-process :name "tramp-rpc-owned-a"
+                                       :buffer buffer-a :noquery t))
+         (process-b (make-pipe-process :name "tramp-rpc-owned-b"
+                                       :buffer buffer-b :noquery t))
+         (tramp-rpc--owned-controlmasters (make-hash-table :test 'equal))
+         exit-args)
+    (unwind-protect
+        (progn
+          (puthash socket-a process-a tramp-rpc--owned-controlmasters)
+          (puthash socket-b process-b tramp-rpc--owned-controlmasters)
+          ;; ControlPersist can outlive this establishing process.
+          (delete-process process-a)
+          (cl-letf (((symbol-function 'tramp-rpc--controlmaster-socket-path)
+                     (lambda (vec)
+                       (if (equal (tramp-file-name-user vec) "user-a")
+                           socket-a
+                         socket-b)))
+                    ((symbol-function 'call-process)
+                     (lambda (_program _infile _destination _display &rest args)
+                       (setq exit-args args)
+                       0)))
+            (tramp-rpc--cleanup-controlmaster-unlocked vec-a))
+          (should (member (format "ControlPath=%s" socket-a) exit-args))
+          (should-not (member (format "ControlPath=%s" socket-b) exit-args))
+          (should-not (gethash socket-a tramp-rpc--owned-controlmasters))
+          (should (eq (gethash socket-b tramp-rpc--owned-controlmasters)
+                      process-b))
+          (should (process-live-p process-b)))
+      (when (process-live-p process-a) (delete-process process-a))
+      (when (process-live-p process-b) (delete-process process-b))
+      (when (buffer-live-p buffer-a) (kill-buffer buffer-a))
+      (when (buffer-live-p buffer-b) (kill-buffer buffer-b))
+      (when (file-exists-p socket-a) (delete-file socket-a))
+      (when (file-exists-p socket-b) (delete-file socket-b)))))
 
 (ert-deftest tramp-rpc-mock-test-controlmaster-action-tolerates-late-socket ()
   "A dead establish process still succeeds when its socket appears late.
@@ -8286,6 +8359,101 @@ discard it for being unreadable."
               (should (string-match-p message (buffer-string))))))
       (when-let* ((buffer (get-buffer buffer-name)))
         (kill-buffer buffer)))))
+
+(ert-deftest tramp-rpc-mock-test-async-read-subscribes-instead-of-polling ()
+  "Async process startup subscribes on its captured connection."
+  (let* ((process (start-process "tramp-rpc-mock-subscribe" nil "cat"))
+         (connection-process
+          (start-process "tramp-rpc-mock-subscribe-connection" nil "cat"))
+         (connection (list :process connection-process))
+         (vec (tramp-dissect-file-name "/rpc:user@host:/"))
+         (tramp-rpc--async-processes (make-hash-table :test 'eq))
+         method-called connection-called)
+    (unwind-protect
+        (progn
+          (process-put process :tramp-rpc-connection connection)
+          (puthash process
+                   (list :vec vec :pid 42
+                         :connection-process connection-process)
+                   tramp-rpc--async-processes)
+          (cl-letf (((symbol-function 'tramp-rpc--call-async)
+                     (lambda (_vec method _params _callback
+                                   &optional rpc-connection)
+                       (setq method-called method
+                             connection-called rpc-connection))))
+            (tramp-rpc--start-async-read process))
+          (should (equal method-called "process.subscribe"))
+          (should (eq connection-called connection)))
+      (dolist (proc (list process connection-process))
+        (when (process-live-p proc)
+          (delete-process proc))))))
+
+(ert-deftest tramp-rpc-mock-test-rpc-pty-subscribes-instead-of-polling ()
+  "RPC PTY startup subscribes on its captured connection."
+  (let* ((process (start-process "tramp-rpc-mock-pty-subscribe" nil "cat"))
+         (connection-process
+          (start-process "tramp-rpc-mock-pty-connection" nil "cat"))
+         (connection (list :process connection-process))
+         (vec (tramp-dissect-file-name "/rpc:user@host:/"))
+         (tramp-rpc--pty-processes (make-hash-table :test 'eq))
+         method-called connection-called)
+    (unwind-protect
+        (progn
+          (process-put process :tramp-rpc-vec vec)
+          (process-put process :tramp-rpc-pid 42)
+          (process-put process :tramp-rpc-connection connection)
+          (puthash process
+                   (list :vec vec :pid 42 :rpc-pty t
+                         :connection-process connection-process)
+                   tramp-rpc--pty-processes)
+          (cl-letf (((symbol-function 'tramp-rpc--call-async)
+                     (lambda (_vec method _params _callback
+                                   &optional rpc-connection)
+                       (setq method-called method
+                             connection-called rpc-connection))))
+            (tramp-rpc--pty-start-async-read process))
+          (should (equal method-called "process.subscribe_pty"))
+          (should (eq connection-called connection)))
+      (dolist (proc (list process connection-process))
+        (when (process-live-p proc)
+          (delete-process proc))))))
+
+(ert-deftest tramp-rpc-mock-test-push-notifications-deliver-ordered-output ()
+  "Push notifications deliver each output chunk once and in order."
+  (let* ((buffer (generate-new-buffer " *tramp-rpc-async-output*"))
+         (process (let ((process-connection-type nil))
+                    (start-process "tramp-rpc-async-output" buffer "cat")))
+         (connection (let ((process-connection-type nil))
+                       (start-process "tramp-rpc-push-connection" nil "cat")))
+         (tramp-rpc--async-processes (make-hash-table :test 'eq)))
+    (unwind-protect
+        (progn
+          (set-process-filter
+           process
+           (lambda (_process output)
+             (with-current-buffer buffer
+               (goto-char (point-max))
+               (insert output))))
+          (puthash process
+                   (list :pid 1 :connection-process connection
+                         :pending-output nil :pending-exit nil
+                         :delivery-timer nil)
+                   tramp-rpc--async-processes)
+          (tramp-rpc--handle-process-output-notification
+           connection '((pid . 1) (stdout . "chunk-a")))
+          (tramp-rpc--handle-process-output-notification
+           connection '((pid . 1) (stdout . "chunk-b")))
+          (tramp-rpc-mock-test--wait-for
+           (lambda ()
+             (with-current-buffer buffer
+               (equal (buffer-string) "chunk-achunk-b")))
+           "ordered push output")
+          (with-current-buffer buffer
+            (should (equal (buffer-string) "chunk-achunk-b"))))
+      (dolist (proc (list process connection))
+        (when (process-live-p proc)
+          (delete-process proc)))
+      (kill-buffer buffer))))
 
 ;;; ============================================================================
 ;;; Test Runner

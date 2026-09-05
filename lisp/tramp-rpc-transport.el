@@ -121,6 +121,11 @@ The directory must exist and be writable."
   :type 'string
   :group 'tramp-rpc)
 
+(defvar tramp-rpc--owned-controlmasters (make-hash-table :test 'equal)
+  "Map owned ControlMaster socket paths to their establishing processes.
+An entry remains valid after its process exits because `ControlPersist' can
+leave the master running in the background.")
+
 (defcustom tramp-rpc-controlmaster-persist 600
   "How long (in seconds) to keep ControlMaster connections alive.
 Set to 0 to close immediately when last connection exits.
@@ -128,6 +133,28 @@ Set to \"yes\" to keep alive indefinitely."
   :type '(choice (integer :tag "Seconds")
                  (const :tag "Indefinitely" "yes"))
   :group 'tramp-rpc)
+
+(defcustom tramp-rpc-server-alive-interval 30
+  "SSH ServerAliveInterval in seconds for RPC connections, or nil to disable.
+Server-pushed process notifications generate no traffic while remote processes
+are idle, so keepalives prevent firewalls and NAT routers from silently
+discarding the connection."
+  :type '(choice (integer :tag "Interval (seconds)")
+                 (const :tag "Disabled" nil))
+  :group 'tramp-rpc)
+
+(defcustom tramp-rpc-server-alive-count-max 3
+  "Number of unanswered SSH keepalives before an RPC connection is dead."
+  :type 'integer
+  :group 'tramp-rpc)
+
+(defun tramp-rpc--server-alive-args ()
+  "Return SSH keepalive arguments configured for RPC connections."
+  (when tramp-rpc-server-alive-interval
+    (list "-o" (format "ServerAliveInterval=%d"
+                       tramp-rpc-server-alive-interval)
+          "-o" (format "ServerAliveCountMax=%d"
+                       tramp-rpc-server-alive-count-max))))
 
 (defcustom tramp-rpc-ssh-options nil
   "Additional SSH options to pass when connecting.
@@ -1031,6 +1058,7 @@ Returns non-nil on success."
                           "-o" (format "ControlPath=%s" socket-path)
                           "-o" (format "ControlPersist=%s"
                                        tramp-rpc-controlmaster-persist))
+                    (tramp-rpc--server-alive-args)
                     ;; Connect and immediately exit, leaving ControlMaster running
                     (list "-N" host)))
          process)
@@ -1039,6 +1067,7 @@ Returns non-nil on success."
     ;; create a ControlMaster on top of a stale ControlPath, which later shows
     ;; up as a generic "Tramp failed to connect" during unrelated file ops.
     (when (file-exists-p socket-path)
+      (remhash socket-path tramp-rpc--owned-controlmasters)
       (delete-file socket-path))
     (with-current-buffer buffer
       (erase-buffer))
@@ -1078,8 +1107,10 @@ Returns non-nil on success."
             ;; tramp-process-actions throws on failure; reaching here means
             ;; the persistent master owns PROCESS and BUFFER.
             (sleep-for 0.1)
+            (puthash socket-path process tramp-rpc--owned-controlmasters)
             (setq success t))
         (unless success
+          (remhash socket-path tramp-rpc--owned-controlmasters)
           (when (and process (process-live-p process))
             (delete-process process))
           (when (buffer-live-p buffer)
@@ -1125,6 +1156,7 @@ Returns the connection plist.  Signals `remote-file-error' on failure."
                     ;; User-specified SSH options
                     (mapcan (lambda (opt) (list "-o" opt))
                             tramp-rpc-ssh-options)
+                    (tramp-rpc--server-alive-args)
                     ;; ControlMaster options for connection sharing
                     ;; Use the expanded socket path to match what establish-controlmaster created
                     (when tramp-rpc-use-controlmaster
@@ -1422,7 +1454,9 @@ down VEC's ControlMaster in that case would disrupt the still-live connection."
       nil)))
 
 (defun tramp-rpc--cleanup-controlmaster-unlocked (vec)
-  "Clean up VEC's ControlMaster while holding its lifecycle mutex."
+  "Clean up VEC's owned ControlMaster while holding its lifecycle mutex.
+A socket reused from another Emacs process is not owned here and must not
+receive `ssh -O exit', which would disconnect that other session."
   (when tramp-rpc-use-controlmaster
     (let* ((host (tramp-file-name-host vec))
            (user (tramp-rpc--ssh-detail-user vec))
@@ -1430,13 +1464,14 @@ down VEC's ControlMaster in that case would disrupt the still-live connection."
                   (tramp-rpc--ssh-detail-port vec)))
            (proxyjump (tramp-rpc--hops-to-proxyjump vec))
            (socket-path (tramp-rpc--controlmaster-socket-path vec))
-           (auth-process-name (format "*tramp-rpc-auth %s*" host))
-           (auth-buffer-name (format " *tramp-rpc-auth %s*" host))
-           (auth-process (get-process auth-process-name))
-           (auth-buffer (get-buffer auth-buffer-name)))
+           (auth-process
+            (gethash socket-path tramp-rpc--owned-controlmasters))
+           (auth-buffer (and (processp auth-process)
+                             (process-buffer auth-process)))
+           (owned (processp auth-process)))
       ;; Close the ControlMaster socket gracefully via ssh -O exit.
       ;; This is a local control message (no network round-trip), so fast.
-      (when (file-exists-p socket-path)
+      (when (and owned (file-exists-p socket-path))
         (condition-case err
             (apply #'call-process "ssh" nil nil nil
                    (append
@@ -1451,7 +1486,8 @@ down VEC's ControlMaster in that case would disrupt the still-live connection."
         (delete-process auth-process))
       ;; Kill the auth buffer.
       (when (buffer-live-p auth-buffer)
-        (kill-buffer auth-buffer)))))
+        (kill-buffer auth-buffer))
+      (remhash socket-path tramp-rpc--owned-controlmasters))))
 
 (defun tramp-rpc--cleanup-controlmaster (vec &optional expected-process)
   "Clean up the ControlMaster process and socket for VEC.

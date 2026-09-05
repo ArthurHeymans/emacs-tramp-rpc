@@ -450,28 +450,69 @@ PID is the remote process ID."
                    connection)) ; SIGTERM
 
 ;; ============================================================================
-;; Async Callback-based Process Reading (for LSP and interactive processes)
+;; Server-pushed Process Output (for LSP and interactive processes)
 ;; ============================================================================
 
 (defun tramp-rpc--start-async-read (local-process)
-  "Start an async read loop for LOCAL-PROCESS.
-Sends a blocking read request; when response arrives, delivers output
-and chains another read.  This provides fast async I/O for LSP servers."
+  "Subscribe LOCAL-PROCESS to server-pushed output and exit events."
   (when (and (processp local-process)
              (process-live-p local-process)
              (gethash local-process tramp-rpc--async-processes))
     (let* ((info (gethash local-process tramp-rpc--async-processes))
            (vec (plist-get info :vec))
-           (pid (plist-get info :pid)))
+           (pid (plist-get info :pid))
+           (connection (process-get local-process :tramp-rpc-connection)))
       (when (and vec pid)
-        (tramp-rpc--debug "ASYNC-READ starting for pid=%s process=%s" pid local-process)
-        ;; Send async read request with blocking timeout on server
+        (tramp-rpc--debug "ASYNC-PUSH subscribe pid=%s process=%s"
+                          pid local-process)
         (tramp-rpc--call-async
-         vec "process.read"
-         `((pid . ,pid) (timeout_ms . ,tramp-rpc-async-read-timeout-ms))
+         vec "process.subscribe" `((pid . ,pid))
          (lambda (response)
-           (tramp-rpc--debug "ASYNC-READ callback invoked for pid=%s" pid)
-           (tramp-rpc--handle-async-read-response local-process response)))))))
+           (when (tramp-rpc-protocol-error-p response)
+             (tramp-rpc--debug
+              "ASYNC-PUSH subscribe failed pid=%s: %s"
+              pid (tramp-rpc-protocol-error-message response))
+             (tramp-rpc--best-effort
+               (tramp-rpc--kill-remote-process vec pid 9 connection))
+             (when (process-live-p local-process)
+               (tramp-rpc--best-effort (delete-process local-process)))))
+         connection)))))
+
+(defun tramp-rpc--find-async-process-for-notification (connection pid)
+  "Find the local relay for remote PID on exact CONNECTION generation."
+  (let (match)
+    (when (and (processp connection) (integerp pid))
+      (maphash
+       (lambda (local-process info)
+         (when (and (null match)
+                    (process-live-p local-process)
+                    (= (or (plist-get info :pid) -1) pid)
+                    (eq connection (plist-get info :connection-process)))
+           (setq match local-process)))
+       tramp-rpc--async-processes))
+    match))
+
+(defun tramp-rpc--handle-process-output-notification (connection params)
+  "Handle process output PARAMS received on CONNECTION."
+  (when-let* ((pid (alist-get 'pid params))
+              (local-process
+               (tramp-rpc--find-async-process-for-notification connection pid))
+              (info (gethash local-process tramp-rpc--async-processes)))
+    (let ((stdout (when-let* ((value (alist-get 'stdout params)))
+                    (tramp-rpc--binary-bytes value)))
+          (stderr (when-let* ((value (alist-get 'stderr params)))
+                    (tramp-rpc--binary-bytes value))))
+      (when (or stdout stderr)
+        (tramp-rpc--queue-process-output
+         local-process stdout stderr (plist-get info :stderr-buffer))))))
+
+(defun tramp-rpc--handle-process-exit-notification (connection params)
+  "Handle process exit PARAMS received on CONNECTION."
+  (when-let* ((pid (alist-get 'pid params))
+              (local-process
+               (tramp-rpc--find-async-process-for-notification connection pid)))
+    (tramp-rpc--queue-process-exit
+     local-process (alist-get 'exit_code params))))
 
 (defun tramp-rpc--deliver-process-output (local-process stdout stderr stderr-buffer)
   "Deliver STDOUT and STDERR to LOCAL-PROCESS.
@@ -504,13 +545,18 @@ STDERR-BUFFER is the separate stderr buffer, or nil to mix with stdout."
             (process-send-string local-process stderr))))))))
 
 (defun tramp-rpc--deliver-pending-process-output (local-process)
-  "Deliver all queued output chunks for LOCAL-PROCESS in response order."
+  "Deliver queued output and then any exit for LOCAL-PROCESS."
   (when-let* ((info (gethash local-process tramp-rpc--async-processes)))
-    (let ((pending (plist-get info :pending-output)))
-      (puthash local-process (plist-put info :pending-output nil)
-               tramp-rpc--async-processes)
+    (let ((pending (plist-get info :pending-output))
+          (pending-exit (plist-get info :pending-exit)))
+      (setq info (plist-put info :pending-output nil))
+      (setq info (plist-put info :pending-exit nil))
+      (puthash local-process info tramp-rpc--async-processes)
       (dolist (chunk pending)
-        (apply #'tramp-rpc--deliver-process-output local-process chunk)))))
+        (apply #'tramp-rpc--deliver-process-output local-process chunk))
+      (when pending-exit
+        (accept-process-output local-process 0.01 nil t)
+        (tramp-rpc--handle-process-exit local-process (cdr pending-exit))))))
 
 (defun tramp-rpc--queue-process-output (local-process stdout stderr stderr-buffer)
   "Queue one non-exit output chunk and schedule its exact delivery once.
@@ -522,6 +568,17 @@ STDERR-BUFFER receives standard error output."
     (setq info (plist-put info :pending-output
                           (append (plist-get info :pending-output)
                                   (list (list stdout stderr stderr-buffer)))))
+    (puthash local-process info tramp-rpc--async-processes)
+    (unless (plist-get info :delivery-timer)
+      (tramp-rpc--schedule-process-timer
+       tramp-rpc--async-processes local-process :delivery-timer
+       #'tramp-rpc--deliver-pending-process-output local-process))))
+
+(defun tramp-rpc--queue-process-exit (local-process exit-code)
+  "Queue EXIT-CODE after all pending output for LOCAL-PROCESS."
+  (when-let* ((info (gethash local-process tramp-rpc--async-processes)))
+    (setq info (plist-put info :pending-exit
+                          (cons 'exit (if (integerp exit-code) exit-code -1))))
     (puthash local-process info tramp-rpc--async-processes)
     (unless (plist-get info :delivery-timer)
       (tramp-rpc--schedule-process-timer
@@ -548,6 +605,7 @@ EVENT is the process event string."
            (connection (plist-get info :connection-process)))
       (tramp-rpc--cancel-process-timers tramp-rpc--async-processes proc)
       (unless (or (process-get proc :tramp-rpc-exited)
+                  (process-get proc :tramp-rpc-remote-exited)
                   (process-get proc :tramp-rpc-transport-cleanup)
                   (tramp-rpc--transport-dead-p connection))
         (when (and vec pid)
@@ -557,6 +615,7 @@ EVENT is the process event string."
       (when-let* ((stderr-process (plist-get info :stderr-process)))
         (when (process-live-p stderr-process)
           (tramp-rpc--best-effort (delete-process stderr-process))))
+      (process-put proc :tramp-rpc-exited t)
       (let ((remote-exit (process-get proc :tramp-rpc-exit-code)))
         (tramp-rpc--call-user-sentinel-once
          proc user-sentinel
@@ -655,28 +714,31 @@ EXIT-CODE is the process exit status."
                      (tramp-rpc--process-write-queue-key
                       vec pid (plist-get info :connection-process)))
                  tramp-rpc--process-write-queues))
-      ;; Store exit code (the sentinel reads this to construct the event
-      ;; string).  Do NOT set :tramp-rpc-exited yet — the process-status
-      ;; handler returns 'exit when that flag is set, which makes
-      ;; `process-live-p' return nil and would prevent the EOF below
-      ;; from being sent.
       (process-put local-process :tramp-rpc-exit-code (or exit-code 0))
-      ;; Send EOF to the stderr cat relay so it exits cleanly.
-      (when-let* ((stderr-process (plist-get info :stderr-process)))
-        (when (process-live-p stderr-process)
-          (tramp-rpc--best-effort (process-send-eof stderr-process))))
-      ;; Send EOF to the LOCAL cat relay (not the remote process).
-      ;; Bind `tramp-rpc--closing-local-relay' so the `process-send-eof'
-      ;; handler calls the original function instead of routing to the
-      ;; remote stdin (which has already exited).  Cat will flush any
-      ;; remaining data to stdout, then exit naturally on EOF.  Emacs
-      ;; fires the sentinel chain; the cleanup installed by
-      ;; `tramp-rpc--install-process-cleanup' then deletes the process.
-      (when (process-live-p local-process)
-        (let ((tramp-rpc--closing-local-relay t))
-          (tramp-rpc--best-effort (process-send-eof local-process))))
-      ;; Now mark as exited so process-status handler returns 'exit.
-      (process-put local-process :tramp-rpc-exited t))))
+      (process-put local-process :tramp-rpc-remote-exited t)
+      ;; Finish a separate stderr relay before closing stdout, so the public
+      ;; process cannot report exit while final stderr bytes remain queued.
+      (if-let* ((stderr-process (plist-get info :stderr-process))
+                ((process-live-p stderr-process)))
+          (let ((old-sentinel (process-sentinel stderr-process)))
+            (set-process-sentinel
+             stderr-process
+             (lambda (process event)
+               (when (memq (process-status process) '(exit signal))
+                 (tramp-rpc--close-local-relay local-process))
+               (when old-sentinel
+                 (tramp-rpc--best-effort
+                   (funcall old-sentinel process event)))))
+            (condition-case nil
+                (process-send-eof stderr-process)
+              (error (tramp-rpc--close-local-relay local-process))))
+        (tramp-rpc--close-local-relay local-process)))))
+
+(defun tramp-rpc--close-local-relay (local-process)
+  "Send local EOF to LOCAL-PROCESS and let its output drain naturally."
+  (when (process-live-p local-process)
+    (let ((tramp-rpc--closing-local-relay t))
+      (tramp-rpc--best-effort (process-send-eof local-process)))))
 
 ;; ============================================================================
 ;; Process cleanup after exit
@@ -966,6 +1028,7 @@ Resolves program path and loads direnv environment from working directory."
                              :stderr-buffer stderr-buffer
                              :stderr-process stderr-process
                              :pending-output nil
+                             :pending-exit nil
                              :delivery-timer nil
                              :poll-timer nil)
                        tramp-rpc--async-processes)
@@ -1247,6 +1310,9 @@ DIRENV-ENV is an optional alist of environment variables for the process."
              (list :vec vec :pid remote-pid
                    :connection-process (tramp-rpc-connection-process connection)
                    :rpc-pty t
+                   :pending-output nil
+                   :pending-exit nil
+                   :delivery-timer nil
                    :poll-timer nil)
              tramp-rpc--pty-processes)
     ;; PTY exit uses the exact transport generation that created it.
@@ -1291,63 +1357,118 @@ Returns (COLS . ROWS)."
       '(80 . 24))))
 
 (defun tramp-rpc--pty-start-async-read (local-process)
-  "Start an async read loop for LOCAL-PROCESS.
-Sends a blocking read request; when response arrives, delivers output
-and chains another read.  This provides truly async PTY I/O."
+  "Subscribe LOCAL-PROCESS to server-pushed PTY output and exit events."
   (when (and (processp local-process)
              (process-live-p local-process)
              (gethash local-process tramp-rpc--pty-processes))
     (let* ((vec (process-get local-process :tramp-rpc-vec))
-           (pid (process-get local-process :tramp-rpc-pid)))
+           (pid (process-get local-process :tramp-rpc-pid))
+           (connection (process-get local-process :tramp-rpc-connection)))
       (when (and vec pid)
-        ;; Send async read request with blocking timeout on server
         (tramp-rpc--call-async
-         vec "process.read_pty"
-         `((pid . ,pid) (timeout_ms . 100))
+         vec "process.subscribe_pty" `((pid . ,pid))
          (lambda (response)
-           (tramp-rpc--pty-handle-async-response local-process response)))))))
+           (when (tramp-rpc-protocol-error-p response)
+             (tramp-rpc--debug
+              "PTY-PUSH subscribe failed pid=%s: %s"
+              pid (tramp-rpc-protocol-error-message response))
+             (tramp-rpc--best-effort
+               (tramp-rpc--call vec "process.close_pty"
+                                `((pid . ,pid)) connection))
+             (when (process-live-p local-process)
+               (tramp-rpc--best-effort (delete-process local-process)))))
+         connection)))))
+
+(defun tramp-rpc--find-pty-process-for-notification (connection pid)
+  "Find the RPC PTY relay for remote PID on exact CONNECTION generation."
+  (let (match)
+    (when (and (processp connection) (integerp pid))
+      (maphash
+       (lambda (local-process info)
+         (when (and (null match)
+                    (plist-get info :rpc-pty)
+                    (process-live-p local-process)
+                    (= (or (plist-get info :pid) -1) pid)
+                    (eq connection (plist-get info :connection-process)))
+           (setq match local-process)))
+       tramp-rpc--pty-processes))
+    match))
+
+(defun tramp-rpc--deliver-pending-pty-output (local-process)
+  "Deliver queued PTY bytes and then any exit for LOCAL-PROCESS."
+  (when-let* ((info (gethash local-process tramp-rpc--pty-processes)))
+    (let ((pending (plist-get info :pending-output))
+          (pending-exit (plist-get info :pending-exit)))
+      (setq info (plist-put info :pending-output nil))
+      (setq info (plist-put info :pending-exit nil))
+      (puthash local-process info tramp-rpc--pty-processes)
+      (dolist (output pending)
+        (when (and output (process-live-p local-process))
+          (let ((tramp-rpc--delivering-output t))
+            (process-send-string local-process output))))
+      (when pending-exit
+        (tramp-rpc--handle-pty-exit local-process (cdr pending-exit))))))
+
+(defun tramp-rpc--queue-pty-delivery
+    (local-process &optional output exit-code exit-p)
+  "Queue PTY OUTPUT and optional EXIT-CODE for LOCAL-PROCESS."
+  (when-let* ((info (gethash local-process tramp-rpc--pty-processes)))
+    (when output
+      (setq info (plist-put info :pending-output
+                            (append (plist-get info :pending-output)
+                                    (list output)))))
+    (when exit-p
+      (setq info (plist-put info :pending-exit
+                            (cons 'exit
+                                  (if (integerp exit-code) exit-code -1)))))
+    (puthash local-process info tramp-rpc--pty-processes)
+    (unless (plist-get info :delivery-timer)
+      (tramp-rpc--schedule-process-timer
+       tramp-rpc--pty-processes local-process :delivery-timer
+       #'tramp-rpc--deliver-pending-pty-output local-process))))
+
+(defun tramp-rpc--handle-pty-output-notification (connection params)
+  "Queue PTY output PARAMS received on CONNECTION."
+  (when-let* ((pid (alist-get 'pid params))
+              (local-process
+               (tramp-rpc--find-pty-process-for-notification connection pid))
+              (output (alist-get 'output params)))
+    (tramp-rpc--queue-pty-delivery
+     local-process (tramp-rpc--binary-bytes output))))
+
+(defun tramp-rpc--handle-pty-exit-notification (connection params)
+  "Queue PTY exit PARAMS received on CONNECTION."
+  (when-let* ((pid (alist-get 'pid params))
+              (local-process
+               (tramp-rpc--find-pty-process-for-notification connection pid)))
+    (tramp-rpc--queue-pty-delivery
+     local-process nil (alist-get 'exit_code params) t)))
 
 (defun tramp-rpc--pty-handle-async-response (local-process response)
-  "Handle async read response for LOCAL-PROCESS.
-RESPONSE is the decoded RPC response plist."
-  ;; Check process is still valid
+  "Handle a legacy polling RESPONSE for LOCAL-PROCESS.
+The push model does not call this function, but retaining it keeps the process
+module compatible with callers that already have an in-flight read response."
   (when (and (processp local-process)
              (process-live-p local-process)
              (gethash local-process tramp-rpc--pty-processes))
     (condition-case err
         (if-let* ((rpc-error (plist-get response :error)))
-            ;; A read error is terminal.  Do not schedule another poll: the
-            ;; remote descriptor may be invalid and retrying would spin
-            ;; forever.  -1 preserves the abnormal-exit sentinel contract.
             (progn
               (tramp-rpc--debug "PTY read RPC error: %S" rpc-error)
               (tramp-rpc--handle-pty-exit local-process -1))
           (let ((result (plist-get response :result)))
             (unless (and (listp result) (assq 'output result))
               (error "Malformed PTY read response: %S" response))
-            (let* (;; Keep PTY bytes raw; the relay decoder owns character
-                   ;; conversion and preserves split multibyte sequences.
-                   (output (when-let* ((o (alist-get 'output result)))
-                             (tramp-rpc--binary-bytes o)))
-                   (exited (alist-get 'exited result))
-                   (exit-code (alist-get 'exit_code result)))
-
-              ;; Feed raw bytes to the relay.  Its read-side decoder is
-            ;; incremental, so a character split across RPC responses is kept
-            ;; intact instead of being decoded once per chunk.
-            (when (and output (> (length output) 0))
-              (let ((tramp-rpc--delivering-output t))
-                (process-send-string local-process output)))
-
-            ;; Handle process exit or chain next read
-            (if exited
-                (tramp-rpc--handle-pty-exit local-process exit-code)
-              ;; Chain via a tracked timer so cleanup can cancel it.
-              (tramp-rpc--schedule-process-timer
-               tramp-rpc--pty-processes local-process :poll-timer
-               #'tramp-rpc--pty-start-async-read local-process)))))
+            (let ((output (when-let* ((value (alist-get 'output result)))
+                            (tramp-rpc--binary-bytes value)))
+                  (exited (alist-get 'exited result))
+                  (exit-code (alist-get 'exit_code result)))
+              (when (and output (> (length output) 0))
+                (let ((tramp-rpc--delivering-output t))
+                  (process-send-string local-process output)))
+              (when exited
+                (tramp-rpc--handle-pty-exit local-process exit-code)))))
       (error
-       ;; Malformed successful responses are terminal too; never keep polling.
        (tramp-rpc--debug "PTY read response error: %S" err)
        (tramp-rpc--handle-pty-exit local-process -1)))))
 
@@ -1367,7 +1488,7 @@ EXIT-CODE is the process exit status."
     ;; particular, do not translate a killed remote PTY into local success.
     (process-put local-process :tramp-rpc-exit-code
                  (if (integerp exit-code) exit-code -1))
-    (process-put local-process :tramp-rpc-exited t)
+    (process-put local-process :tramp-rpc-remote-exited t)
     ;; Close the relay's local stdin and let cat flush the final PTY bytes
     ;; before exiting naturally.  A zero-timeout `accept-process-output' after
     ;; `process-send-string' does not wait for the relay round trip, while
@@ -1384,6 +1505,7 @@ EVENT is the process event string."
       (tramp-rpc--cancel-process-timers tramp-rpc--pty-processes process)
       ;; A transport cleanup already requested/closed the remote PTY.
       (unless (or (process-get process :tramp-rpc-exited)
+                  (process-get process :tramp-rpc-remote-exited)
                   (process-get process :tramp-rpc-transport-cleanup)
                   (tramp-rpc--transport-dead-p
                    (plist-get info :connection-process)))
@@ -1393,6 +1515,7 @@ EVENT is the process event string."
             (tramp-rpc--call vec "process.kill_pty"
                              `((pid . ,pid) (signal . 9))
                              (process-get process :tramp-rpc-connection)))))
+      (process-put process :tramp-rpc-exited t)
       (let ((exit-code (process-get process :tramp-rpc-exit-code)))
         (tramp-rpc--call-user-sentinel-once
          process (process-get process :tramp-rpc-user-sentinel)
@@ -1688,6 +1811,18 @@ Removes handlers and cleans up async processes."
   ;; Return nil to allow normal unload to proceed
   nil)
 
+(defun tramp-rpc--handle-process-notification (process method params)
+  "Dispatch process notification METHOD with PARAMS received on PROCESS."
+  (pcase method
+    ("process.output"
+     (tramp-rpc--handle-process-output-notification process params))
+    ("process.exit"
+     (tramp-rpc--handle-process-exit-notification process params))
+    ("process.pty_output"
+     (tramp-rpc--handle-pty-output-notification process params))
+    ("process.pty_exit"
+     (tramp-rpc--handle-pty-exit-notification process params))))
+
 ;; Relay teardown runs from the transport's generation cleanup: remote
 ;; children are signalled while the transport is still live, local relays
 ;; are removed once it is dead.
@@ -1699,6 +1834,8 @@ Removes handlers and cleans up async processes."
           #'tramp-rpc--cleanup-async-processes t)
 (add-hook 'tramp-rpc-transport-cleanup-functions
           #'tramp-rpc--cleanup-pty-processes t)
+(add-hook 'tramp-rpc-notification-functions
+          #'tramp-rpc--handle-process-notification t)
 
 (provide 'tramp-rpc-process)
 ;;; tramp-rpc-process.el ends here

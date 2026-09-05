@@ -28,6 +28,7 @@ use super::super::HandlerResult;
 use super::super::system::expand_tilde;
 #[cfg(target_os = "macos")]
 use super::signal_process;
+use super::subscription::{PushSubscription, send_process_notification, stop_push_subscription};
 use super::{
     MANAGED_CHILD_WAIT, MANAGED_PTY_CHILD_WAIT, MAX_PROCESS_READ_BYTES, SignalCode, dup_cloexec,
     require_process_group_signal, set_fd_cloexec, set_fd_nonblocking, signal_process_group,
@@ -117,6 +118,9 @@ pub(super) struct ManagedPtyProcess {
     // before explicit SIGKILL removes its registry entry.
     pub(super) shared_exit_status: Arc<StdMutex<Option<i32>>>,
     pub(super) output_eof: bool,
+    pub(super) push_subscription: Option<PushSubscription>,
+    pub(super) subscription_requested: bool,
+    pub(super) terminating: bool,
 }
 
 pub(super) fn set_window_size<Fd: AsFd>(
@@ -409,6 +413,9 @@ pub async fn start_pty(params: Value) -> HandlerResult {
         exit_status: None,
         shared_exit_status: Arc::new(StdMutex::new(None)),
         output_eof: false,
+        push_subscription: None,
+        subscription_requested: false,
+        terminating: false,
     };
 
     processes.insert(our_pid, managed);
@@ -962,18 +969,37 @@ pub async fn kill_pty(params: Value) -> HandlerResult {
 
     let params: Params = from_value(params).map_err(|e| RpcError::invalid_params(e.to_string()))?;
     let signal = params.signal.resolve()?;
-    // Signaling an unknown pid is an error; close_pty stays idempotent by
-    // calling terminate_pty_process directly.
-    if !get_pty_process_map().lock().await.contains_key(&params.pid) {
-        return Err(RpcError::process_error(format!(
-            "PTY process not found: {}",
-            params.pid
-        )));
+    let (subscription, shared_exit_status) = {
+        let mut processes = get_pty_process_map().lock().await;
+        let managed = processes.get_mut(&params.pid).ok_or_else(|| {
+            RpcError::process_error(format!("PTY process not found: {}", params.pid))
+        })?;
+        if managed.terminating {
+            return Err(RpcError::process_error(format!(
+                "PTY process is already terminating: {}",
+                params.pid
+            )));
+        }
+        if signal == libc::SIGKILL {
+            managed.terminating = true;
+            (
+                managed.push_subscription.take(),
+                Some(Arc::clone(&managed.shared_exit_status)),
+            )
+        } else {
+            (None, None)
+        }
+    };
+    let subscribed = subscription.is_some();
+    if let Some(subscription) = subscription {
+        stop_push_subscription(subscription).await;
     }
     // Match local signal-process semantics: forward the requested signal
     // without turning a survivable signal such as SIGINT into SIGKILL.
     // Explicit close and connection cleanup retain escalation authority.
     // Explicit SIGKILL also opts out of output draining.
+    // If SIGKILL fails after cancellation, the terminal entry deliberately
+    // remains marked as terminating; PtyIoState cancellation is irreversible.
     terminate_pty_process(
         params.pid,
         signal,
@@ -982,6 +1008,18 @@ pub async fn kill_pty(params: Value) -> HandlerResult {
         signal == libc::SIGKILL,
     )
     .await?;
+    if signal == libc::SIGKILL && subscribed {
+        let exit_code = shared_exit_status
+            .as_ref()
+            .and_then(|status| *status.lock().expect("shared PTY exit status lock"))
+            .map(i64::from)
+            .unwrap_or_else(|| i64::from(128 + signal));
+        let _ = send_process_notification(
+            "process.pty_exit",
+            msgpack_map! { "pid" => params.pid, "exit_code" => exit_code },
+        )
+        .await;
+    }
     Ok(Value::Boolean(true))
 }
 
@@ -993,7 +1031,27 @@ pub async fn close_pty(params: Value) -> HandlerResult {
     }
 
     let params: Params = from_value(params).map_err(|e| RpcError::invalid_params(e.to_string()))?;
+    let subscription = {
+        let mut processes = get_pty_process_map().lock().await;
+        match processes.get_mut(&params.pid) {
+            Some(managed) if managed.terminating => {
+                return Err(RpcError::process_error(format!(
+                    "PTY process is already terminating: {}",
+                    params.pid
+                )));
+            }
+            Some(managed) => {
+                managed.terminating = true;
+                managed.push_subscription.take()
+            }
+            None => None,
+        }
+    };
+    if let Some(subscription) = subscription {
+        stop_push_subscription(subscription).await;
+    }
     // Explicit close is the opt-out from kill's drain-preserving ownership.
+    // A failure leaves the entry terminal because cancellation is irreversible.
     terminate_pty_process(params.pid, libc::SIGKILL, true, true, false).await?;
     discard_terminated_pty_status(params.pid);
     Ok(Value::Boolean(true))

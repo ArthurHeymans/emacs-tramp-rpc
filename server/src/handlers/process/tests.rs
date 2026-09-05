@@ -1147,6 +1147,66 @@ async fn pipe_and_pty_kill_validate_signals_consistently() {
 }
 
 #[tokio::test]
+async fn failed_pty_teardown_does_not_restore_cancelled_subscription() {
+    let _test_lock = test_process_map_lock().await;
+
+    for close in [false, true] {
+        let start = start_pty(Value::Map(vec![
+            (Value::String("cmd".into()), Value::String("sleep".into())),
+            (
+                Value::String("args".into()),
+                Value::Array(vec![Value::String("30".into())]),
+            ),
+        ]))
+        .await
+        .expect("start PTY");
+        let pid = map_get(&start, "pid").and_then(Value::as_u64).unwrap() as u32;
+        subscribe_pty(Value::Map(vec![(
+            Value::String("pid".into()),
+            Value::Integer(pid.into()),
+        )]))
+        .await
+        .expect("subscribe to PTY");
+
+        set_test_process_group_signal_error(Some(libc::EIO));
+        let result = if close {
+            close_pty(Value::Map(vec![(
+                Value::String("pid".into()),
+                Value::Integer(pid.into()),
+            )]))
+            .await
+        } else {
+            kill_pty(Value::Map(vec![
+                (Value::String("pid".into()), Value::Integer(pid.into())),
+                (
+                    Value::String("signal".into()),
+                    Value::Integer((libc::SIGKILL as i64).into()),
+                ),
+            ]))
+            .await
+        };
+        set_test_process_group_signal_error(None);
+        assert!(result.is_err(), "injected signal failure must propagate");
+
+        {
+            let mut processes = get_pty_process_map().lock().await;
+            let managed = processes.get_mut(&pid).expect("terminal PTY entry");
+            assert!(managed.terminating);
+            assert!(managed.io.is_closed());
+            assert!(managed.push_subscription.is_none());
+            // Permit explicit cleanup after checking the terminal state.
+            managed.terminating = false;
+        }
+        close_pty(Value::Map(vec![(
+            Value::String("pid".into()),
+            Value::Integer(pid.into()),
+        )]))
+        .await
+        .expect("clean up terminal PTY");
+    }
+}
+
+#[tokio::test]
 async fn repeated_kill_after_reap_preserves_exit_status() {
     let _test_lock = test_process_map_lock().await;
     let pid = start_pipe_process("sleep 30").await;
@@ -2157,6 +2217,9 @@ async fn pty_read_close_race_does_not_leak_duplicated_fds() {
                 exit_status: None,
                 shared_exit_status: Arc::new(StdMutex::new(None)),
                 output_eof: false,
+                push_subscription: None,
+                subscription_requested: false,
+                terminating: false,
             },
         );
         assert_eq!(fd_target_count(&fd_target), 1);

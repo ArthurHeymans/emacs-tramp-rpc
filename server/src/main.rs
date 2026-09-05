@@ -611,6 +611,7 @@ async fn accept_frame<W>(
 #[tokio::main]
 async fn main() -> std::process::ExitCode {
     let stdout: WriterHandle = Arc::new(Mutex::new(BufWriter::new(tokio::io::stdout())));
+    handlers::process::init_notification_writer(Arc::clone(&stdout));
 
     // Initialize the filesystem watcher for cache invalidation notifications.
     // If this fails (e.g. inotify not available), we continue without watching
