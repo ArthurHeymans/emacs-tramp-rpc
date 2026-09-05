@@ -1422,7 +1422,7 @@ a remote build is offered if the remote has a usable Rust toolchain."
       (?s nil))))
 
 (defun tramp-rpc-deploy--git-install-action (arch &optional vec)
-  "Ask for the action used to obtain a git binary for ARCH."
+  "Ask for the action used to obtain a git binary for ARCH and optionally VEC."
   (or (tramp-rpc-deploy--ask-git-install-action arch vec)
       (signal
        'remote-file-error
@@ -1441,12 +1441,14 @@ a remote build is offered if the remote has a usable Rust toolchain."
     '(download build))))
 
 (defun tramp-rpc-deploy--ensure-local-binary (arch &optional install-action)
-  "Ensure a local binary exists for ARCH.
+  "Ensure a local binary exists for ARCH with optional INSTALL-ACTION.
 Tries in order:
 1. Check bundled binaries (useful for development)
 2. Check source-tree build output for source-build policies
 3. Check local cache
-4. Download from GitHub releases or build from source according to policy
+4. Download from GitHub releases or build from source according to policy.
+
+When INSTALL-ACTION is non-nil, use it as the acquisition method.
 
 Returns the path to the local binary."
   (let ((bundled-path (tramp-rpc-deploy--bundled-binary-path arch))

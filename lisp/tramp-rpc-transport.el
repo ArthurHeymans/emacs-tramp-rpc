@@ -74,7 +74,7 @@ METHOD is the notification name, for example \"fs.events\", and PARAMS its
 decoded parameters.  Notifications nobody handles are discarded.")
 
 (defun tramp-rpc--report-status (format-string &rest args)
-  "Display a connection status message even inside a TRAMP operation.
+  "Display a status message using FORMAT-STRING and ARGS inside TRAMP.
 TRAMP suppresses some nested messages while a file-name handler is running.
 Connection setup can also spend a long time inside a synchronous SSH wait, so
 make the status visible without forcing a synchronous redisplay."
