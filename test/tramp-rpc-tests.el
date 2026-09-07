@@ -2309,6 +2309,57 @@ This matches the upstream `tramp-test28-process-file' test."
       (when (and (bufferp buf) (buffer-live-p buf))
         (kill-buffer buf)))))
 
+(ert-deftest tramp-rpc-test14-quit-preserves-concurrent-process ()
+  "A quit inside a synchronous wait must not kill a concurrent remote process.
+Long-running remote processes such as an ACP agent share the connection with
+ordinary synchronous file and process operations.  Interrupting one of those
+waits used to retire the whole transport and take the agent down with it."
+  :tags '(:process :expensive-test)
+  (skip-unless (tramp-rpc-test-enabled))
+
+  (let* ((default-directory (tramp-rpc-test--remote-directory))
+         (buffer (generate-new-buffer "*tramp-rpc-quit-longrun*"))
+         (armed nil)
+         (waits 0)
+         (probe (lambda (&rest _)
+                  (when (and armed (> (cl-incf waits) 2))
+                    (setq armed nil)
+                    (signal 'quit nil))))
+         proc)
+    (unwind-protect
+        (progn
+          (setq proc (start-file-process
+                      "tramp-rpc-quit-longrun" buffer
+                      "sh" "-c"
+                      "i=0; while [ $i -lt 30 ]; do echo tick $i; i=$((i+1)); sleep 1; done"))
+          (with-timeout (10 (error "Remote process produced no output"))
+            (while (zerop (buffer-size buffer))
+              (accept-process-output proc 0.1)))
+          (should (process-live-p proc))
+          (advice-add 'accept-process-output :before probe
+                      '((name . tramp-rpc-test-quit-probe)))
+          (setq armed t
+                waits 0)
+          (should (eq 'quit
+                      (condition-case nil
+                          (progn (process-file "sh" nil nil nil "-c" "sleep 6")
+                                 'returned)
+                        (quit 'quit))))
+          (setq quit-flag nil)
+          (advice-remove 'accept-process-output 'tramp-rpc-test-quit-probe)
+          ;; The interrupted wait must not have taken the agent down.
+          (should (process-live-p proc))
+          (let ((before (buffer-size buffer)))
+            (accept-process-output proc 3)
+            (should (> (buffer-size buffer) before)))
+          ;; The transport must still serve new requests.
+          (should (file-exists-p default-directory))
+          (should (eq 7 (process-file "sh" nil nil nil "-c" "exit 7"))))
+      (advice-remove 'accept-process-output 'tramp-rpc-test-quit-probe)
+      (setq quit-flag nil)
+      (when (processp proc) (ignore-errors (delete-process proc)))
+      (when (buffer-live-p buffer) (kill-buffer buffer)))))
+
 ;;; ============================================================================
 ;;; Test 15: Copy/Rename Between Local and Remote
 ;;; ============================================================================
