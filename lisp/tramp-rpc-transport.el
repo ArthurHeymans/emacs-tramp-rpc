@@ -1722,8 +1722,11 @@ Returns the request ID."
       (unwind-protect
           (prog1
               (progn
-                ;; Send request (binary data with length prefix, no newline)
-                (process-send-string process request)
+                ;; Send request (binary data with length prefix, no newline).
+                ;; Like the synchronous paths, a quit inside the write
+                ;; leaves framing ambiguous and must retire the generation.
+                (tramp-rpc--send-request-frame
+                 conn vec request "Async RPC interrupted while sending\n")
                 id)
             (setq sent t))
         ;; Cover errors, user quits, and any other non-local exit.

@@ -254,6 +254,31 @@ SPEC is (PROCESS BUFFER [CONNECTION]); CONNECTION defaults to `connection'."
       (should-not (tramp-rpc--get-connection vec))
       (should-not (tramp-rpc-connection-pending-ids connection)))))
 
+(ert-deftest tramp-rpc-mock-test-request-async-send-quit-retires-generation ()
+  "Quit inside an async frame write retires its generation and callback."
+  (tramp-rpc-mock-test-request--with-connection (process buffer)
+    (let* ((vec (tramp-rpc-mock-test-request--vec))
+           (connection connection)
+           (tramp-rpc--connections (make-hash-table :test 'equal)))
+      (puthash (tramp-rpc--connection-key vec) connection tramp-rpc--connections)
+      (cl-letf (((symbol-function 'tramp-rpc--ensure-connection)
+                   (lambda (_vec) connection))
+                ((symbol-function 'tramp-rpc-protocol-encode-request-with-id)
+                 (lambda (&rest _) '(301 . "request")))
+                ((symbol-function 'process-send-string)
+                 (lambda (&rest _) (signal 'quit nil)))
+                ((symbol-function 'tramp-rpc--cleanup-controlmaster-unlocked) #'ignore))
+        (should
+         (eq 'quit
+             (condition-case nil
+                 (progn
+                   (tramp-rpc--call-async vec "test" nil #'ignore)
+                   'returned)
+               (quit 'quit)))))
+      (should-not (process-live-p process))
+      (should-not (tramp-rpc--get-connection vec))
+      (should-not (gethash 301 (tramp-rpc-connection-async-callbacks connection))))))
+
 (ert-deftest tramp-rpc-mock-test-request-pipeline-encode-error-preserves-generation ()
   "Failure before a pipelined transport write leaves the generation reusable."
   (tramp-rpc-mock-test-request--with-connection (process buffer)
