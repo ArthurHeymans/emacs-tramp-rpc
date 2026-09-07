@@ -463,6 +463,13 @@ verified mismatch remains an explicit error.
   block for up to the RPC timeout when the remote program stops reading.
   Pipe writes remain queued by default; set
   ~tramp-rpc-synchronous-pipe-writes~ non-nil to make them synchronous too.
+- ~C-g~ while waiting for a synchronous, batch, or pipelined RPC response
+  abandons only that wait.  The connection, its other pending requests, and its
+  remote processes stay alive, and a late reply for the abandoned request is
+  discarded by its ID.  The remote operation itself may still run to
+  completion.  A quit inside a request write still retires the connection
+  because the frame may be incomplete, and RPC timeouts and transport failures
+  keep tearing the connection down.
 
 * Troubleshooting
 

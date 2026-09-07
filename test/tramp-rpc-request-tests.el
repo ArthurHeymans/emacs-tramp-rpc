@@ -78,36 +78,142 @@ SPEC is (PROCESS BUFFER [CONNECTION]); CONNECTION defaults to `connection'."
         (should (zerop (hash-table-count
                         (tramp-rpc-connection-pending-responses connection))))))))
 
-(ert-deftest tramp-rpc-mock-test-request-user-quit-retires-generation ()
-  "User quit detaches and closes the synchronous request generation."
+(defun tramp-rpc-mock-test-request--check-wait-quit (kind)
+  "Abandon a KIND wait without disrupting other users of its transport."
   (tramp-rpc-mock-test-request--with-connection (process buffer)
     (let* ((vec (tramp-rpc-mock-test-request--vec))
-           (connection connection)
-           (tramp-rpc--connections (make-hash-table :test 'equal)))
-      (puthash (tramp-rpc--connection-key vec) connection tramp-rpc--connections)
-      (cl-letf (((symbol-function 'tramp-rpc--ensure-connection)
-                 (lambda (_vec) connection))
-                ((symbol-function 'tramp-rpc-protocol-encode-request-with-id)
-                 (lambda (&rest _) '(102 . "request")))
-                ((symbol-function 'process-send-string) (lambda (&rest _) nil))
-                ((symbol-function 'accept-process-output)
-                 (lambda (&rest _) (signal 'quit nil)))
-                ((symbol-function 'tramp-rpc--cleanup-async-processes) #'ignore)
-                ((symbol-function 'tramp-rpc--cleanup-pty-processes) #'ignore)
-                ((symbol-function 'tramp-rpc--cleanup-watches-for-connection) #'ignore)
-                ((symbol-function 'tramp-rpc--cleanup-file-notify-for-connection) #'ignore)
-                ((symbol-function 'tramp-rpc--clear-direnv-cache) #'ignore)
-                ((symbol-function 'tramp-rpc--clear-file-caches-for-connection) #'ignore)
-                ((symbol-function 'tramp-rpc-magit--clear-status-cache-for-connection) #'ignore)
+           (tramp-rpc--connections (make-hash-table :test 'equal))
+           (tramp-rpc--async-processes (make-hash-table :test 'eq))
+           (relay (make-pipe-process :name "request-quit-relay" :noquery t))
+           (pending (tramp-rpc-connection-pending-responses connection))
+           callback-response)
+      (unwind-protect
+          (progn
+            (puthash (tramp-rpc--connection-key vec) connection tramp-rpc--connections)
+            (puthash relay (list :vec vec :pid 42 :connection-process process)
+                     tramp-rpc--async-processes)
+            ;; A different synchronous waiter and an async reader share this
+            ;; transport.  Cancelling our request must not release either.
+            (tramp-rpc--track-pending-request connection 900)
+            (puthash 901 (lambda (response) (setq callback-response response))
+                     (tramp-rpc-connection-async-callbacks connection))
+            (cl-letf (((symbol-function 'tramp-rpc--ensure-connection)
+                       (lambda (_vec) connection))
+                      ((symbol-function 'tramp-rpc-protocol-encode-request-with-id)
+                       (lambda (&rest _) '(102 . "request")))
+                      ((symbol-function 'tramp-rpc-protocol-encode-batch-request-with-id)
+                       (lambda (&rest _) '(102 . "batch")))
+                      ((symbol-function 'process-send-string) #'ignore)
+                      ((symbol-function 'accept-process-output)
+                       (lambda (&rest _) (signal 'quit nil)))
+                      ;; A regression must never attempt SSH cleanup in tests.
+                      ((symbol-function 'tramp-rpc--cleanup-controlmaster-unlocked) #'ignore))
+              (should
+               (eq 'quit
+                   (condition-case nil
+                       (progn
+                         (pcase kind
+                           ('sync (tramp-rpc--call-with-timeout vec "test" nil 1 0))
+                           ('batch (tramp-rpc--call-batch vec '(("test"))))
+                           ('pipeline
+                            (tramp-rpc--track-pending-request connection 102)
+                            (tramp-rpc--track-pending-request connection 103)
+                            (puthash 102 '(:id 102 :result completed) pending)
+                            (tramp-rpc--receive-responses vec '(102 103) 1 connection)))
+                         'returned)
+                     (quit 'quit)))))
+            (should (process-live-p process))
+            (should (eq connection (tramp-rpc--get-connection vec)))
+            (should (process-live-p relay))
+            (should (gethash relay tramp-rpc--async-processes))
+            (should (equal '(900) (tramp-rpc-connection-pending-ids connection)))
+            (should (zerop (hash-table-count pending)))
+            ;; Deliver late and unrelated replies together through the filter.
+            (let ((messages (list '(:id 102 :result abandoned)
+                                  '(:id 103 :result abandoned)
+                                  '(:id 900 :result other-waiter)
+                                  '(:id 901 :result async-output))))
+              (cl-letf (((symbol-function 'tramp-rpc-protocol-try-read-message)
+                         (lambda (_buffer)
+                           (set-marker (mark-marker) (point-max))
+                           (pop messages))))
+                (tramp-rpc--connection-filter process "responses")))
+            (should (= 1 (hash-table-count pending)))
+            (should (equal '(:id 900 :result other-waiter) (gethash 900 pending)))
+            (should (equal '(:id 901 :result async-output) callback-response))
+            ;; A new call must still complete on this exact connection.
+            (cl-letf (((symbol-function 'tramp-rpc--ensure-connection)
+                       (lambda (_vec) (tramp-rpc--get-connection vec)))
+                      ((symbol-function 'tramp-rpc-protocol-encode-request-with-id)
+                       (lambda (&rest _) '(104 . "next")))
+                      ((symbol-function 'process-send-string)
+                       (lambda (target _bytes)
+                         (should (eq process target))
+                         (puthash 104 '(:id 104 :result next-result) pending))))
+              (should (eq 'next-result
+                          (tramp-rpc--call-with-timeout vec "next" nil 1 0)))))
+        (remhash relay tramp-rpc--async-processes)
+        (when (process-live-p relay) (delete-process relay))))))
+
+(ert-deftest tramp-rpc-mock-test-request-sync-wait-quit-preserves-generation ()
+  "Quitting a synchronous wait preserves unrelated work and late reply routing."
+  (tramp-rpc-mock-test-request--check-wait-quit 'sync))
+
+(ert-deftest tramp-rpc-mock-test-request-batch-wait-quit-preserves-generation ()
+  "Quitting a batch wait preserves unrelated work and late reply routing."
+  (tramp-rpc-mock-test-request--check-wait-quit 'batch))
+
+(ert-deftest tramp-rpc-mock-test-request-pipeline-wait-quit-preserves-generation ()
+  "Quitting a partially completed pipeline preserves other transport users."
+  (tramp-rpc-mock-test-request--check-wait-quit 'pipeline))
+
+(ert-deftest tramp-rpc-mock-test-request-send-quit-retires-generation ()
+  "An interrupted single or batch frame write still retires its transport."
+  (dolist (kind '(sync batch))
+    (tramp-rpc-mock-test-request--with-connection (process buffer)
+      (let* ((vec (tramp-rpc-mock-test-request--vec))
+             (tramp-rpc--connections (make-hash-table :test 'equal)))
+        (puthash (tramp-rpc--connection-key vec) connection tramp-rpc--connections)
+        (cl-letf (((symbol-function 'tramp-rpc--ensure-connection)
+                   (lambda (_vec) connection))
+                  ((symbol-function 'process-send-string)
+                   (lambda (&rest _) (signal 'quit nil)))
+                  ((symbol-function 'tramp-rpc--cleanup-controlmaster-unlocked) #'ignore))
+          (should
+           (eq 'quit
+               (condition-case nil
+                   (progn
+                     (if (eq kind 'sync)
+                         (tramp-rpc--call-with-timeout vec "test" nil 1 0)
+                       (tramp-rpc--call-batch vec '(("test"))))
+                     'returned)
+                 (quit 'quit)))))
+        (should-not (process-live-p process))
+        (should-not (tramp-rpc--get-connection vec))
+        (should-not (tramp-rpc-connection-pending-ids connection))))))
+
+(ert-deftest tramp-rpc-mock-test-request-between-pipeline-frames-quit-preserves-generation ()
+  "Quit while encoding a later request leaves earlier complete frames safe."
+  (tramp-rpc-mock-test-request--with-connection (process buffer)
+    (let ((vec (tramp-rpc-mock-test-request--vec))
+          (encodes 0)
+          (sends 0))
+      (cl-letf (((symbol-function 'tramp-rpc-protocol-encode-request-with-id)
+                 (lambda (&rest _)
+                   (if (= (cl-incf encodes) 2)
+                       (signal 'quit nil)
+                     '(201 . "request"))))
+                ((symbol-function 'process-send-string)
+                 (lambda (&rest _) (cl-incf sends)))
                 ((symbol-function 'tramp-rpc--cleanup-controlmaster-unlocked) #'ignore))
-        (should (eq (condition-case nil
-                        (progn
-                          (tramp-rpc--call-with-timeout vec "test" nil 1 0)
-                          nil)
-                      (quit 'quit))
-                    'quit)))
-      (should-not (process-live-p process))
-      (should-not (tramp-rpc--get-connection vec))
+        (should
+         (eq 'quit
+             (condition-case nil
+                 (progn (tramp-rpc--send-requests vec '(("one") ("two")) connection)
+                        'returned)
+               (quit 'quit)))))
+      (should (= sends 1))
+      (should (process-live-p process))
       (should-not (tramp-rpc-connection-pending-ids connection)))))
 
 (ert-deftest tramp-rpc-mock-test-request-partial-pipeline-send-quit-retires-generation ()
@@ -147,6 +253,31 @@ SPEC is (PROCESS BUFFER [CONNECTION]); CONNECTION defaults to `connection'."
       (should-not (process-live-p process))
       (should-not (tramp-rpc--get-connection vec))
       (should-not (tramp-rpc-connection-pending-ids connection)))))
+
+(ert-deftest tramp-rpc-mock-test-request-async-send-quit-retires-generation ()
+  "Quit inside an async frame write retires its generation and callback."
+  (tramp-rpc-mock-test-request--with-connection (process buffer)
+    (let* ((vec (tramp-rpc-mock-test-request--vec))
+           (connection connection)
+           (tramp-rpc--connections (make-hash-table :test 'equal)))
+      (puthash (tramp-rpc--connection-key vec) connection tramp-rpc--connections)
+      (cl-letf (((symbol-function 'tramp-rpc--ensure-connection)
+                   (lambda (_vec) connection))
+                ((symbol-function 'tramp-rpc-protocol-encode-request-with-id)
+                 (lambda (&rest _) '(301 . "request")))
+                ((symbol-function 'process-send-string)
+                 (lambda (&rest _) (signal 'quit nil)))
+                ((symbol-function 'tramp-rpc--cleanup-controlmaster-unlocked) #'ignore))
+        (should
+         (eq 'quit
+             (condition-case nil
+                 (progn
+                   (tramp-rpc--call-async vec "test" nil #'ignore)
+                   'returned)
+               (quit 'quit)))))
+      (should-not (process-live-p process))
+      (should-not (tramp-rpc--get-connection vec))
+      (should-not (gethash 301 (tramp-rpc-connection-async-callbacks connection))))))
 
 (ert-deftest tramp-rpc-mock-test-request-pipeline-encode-error-preserves-generation ()
   "Failure before a pipelined transport write leaves the generation reusable."
