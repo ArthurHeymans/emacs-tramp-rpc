@@ -222,6 +222,7 @@ fn test_nofollow_symlink_watch_reports_link_attribute_change() {
     assert!(found, "symlink metadata changes should be reported");
 }
 
+#[cfg(target_os = "linux")]
 #[test]
 fn test_unwatch_removes_nofollow_and_regular_registrations() {
     let manager = test_manager();

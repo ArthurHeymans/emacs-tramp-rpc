@@ -151,20 +151,27 @@ before exiting.  Do not use `kill-emacs-hook' for this: upstream
       (user-error "This function is only for use in batch mode"))
   (let ((exit-code 2))
     (unwind-protect
-        (let* ((tests (ert-select-tests selector t))
-               (selected (length tests)))
-          (unless (> selected 0)
-            (error "ERT selector %S selected zero tests" selector))
-          (let* ((stats (ert-run-tests-batch selector))
-                 (skipped (ert-stats-skipped stats))
-                 (executed (- (ert-stats-completed stats) skipped)))
-            (message "ERT counts: selected=%d executed=%d skipped=%d"
-                     selected executed skipped)
-            (when (= executed 0)
-              (error "ERT selector %S executed zero tests (all %d selected tests skipped)"
-                     selector skipped))
-            (setq exit-code
-                  (if (zerop (ert-stats-completed-unexpected stats)) 0 1))))
+        ;; Catch guard failures so their diagnostic is logged before
+        ;; `kill-emacs' runs; otherwise batch mode exits with code 2 and the
+        ;; reason is lost.
+        (condition-case err
+            (let* ((tests (ert-select-tests selector t))
+                   (selected (length tests)))
+              (unless (> selected 0)
+                (error "ERT selector %S selected zero tests" selector))
+              (let* ((stats (ert-run-tests-batch selector))
+                     (skipped (ert-stats-skipped stats))
+                     (executed (- (ert-stats-completed stats) skipped)))
+                (message "ERT counts: selected=%d executed=%d skipped=%d"
+                         selected executed skipped)
+                (when (= executed 0)
+                  (error "ERT selector %S executed zero tests (all %d selected tests skipped)"
+                         selector skipped))
+                (setq exit-code
+                      (if (zerop (ert-stats-completed-unexpected stats)) 0 1))))
+          (error
+           (message "ERT run failed: %s" (error-message-string err))
+           (setq exit-code 2)))
       (tramp-rpc-test--write-debug-buffers)
       (kill-emacs exit-code))))
 

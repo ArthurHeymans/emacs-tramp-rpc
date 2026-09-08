@@ -1107,11 +1107,22 @@ pub(super) async fn terminate_pipe_process(
         require_process_group_signal(signal_process_group(os_pid, libc::SIGKILL), "send SIGKILL")?;
     }
     if reap.is_none() && escalate {
-        reap = tokio::time::timeout(MANAGED_CHILD_WAIT, wait_pipe_child(pid))
-            .await
-            .map_err(|_| {
-                RpcError::process_error(format!("Timed out reaping process {pid} after SIGKILL"))
-            })??;
+        // The escalation reap is the last chance to observe the child.  Retire
+        // it on failure too, so the background reaper owns an unreaped child
+        // instead of leaving the entry registered forever.
+        reap = match tokio::time::timeout(MANAGED_CHILD_WAIT, wait_pipe_child(pid)).await {
+            Ok(Ok(status)) => status,
+            Ok(Err(error)) => {
+                retire_pipe_process(pid).await;
+                return Err(error);
+            }
+            Err(_) => {
+                retire_pipe_process(pid).await;
+                return Err(RpcError::process_error(format!(
+                    "Timed out reaping process {pid} after SIGKILL"
+                )));
+            }
+        };
     }
     if let Some(exit_status) = reap {
         // Publish before any destructive cleanup so a read which captured the

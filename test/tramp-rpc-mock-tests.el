@@ -2615,10 +2615,10 @@ status to be consulted, which is why a direct property test would miss it."
          (emacs (or (executable-find "emacs")
                     (error "Cannot find Emacs executable")))
          (wrapper (expand-file-name "emacs-wrapper" runner-temp-directory))
-         (supported-source (getenv "TRAMP_SOURCE"))
          (skipped (expand-file-name "skipped.el" runner-temp-directory))
          (empty (expand-file-name "empty.el" runner-temp-directory))
-         (unsupported (expand-file-name "unsupported" runner-temp-directory)))
+         (unsupported (expand-file-name "unsupported" runner-temp-directory))
+         (supported (expand-file-name "supported" runner-temp-directory)))
     (unwind-protect
         (progn
           (with-temp-file wrapper
@@ -2636,6 +2636,11 @@ status to be consulted, which is why a direct property test would miss it."
           (make-directory (expand-file-name "lisp" unsupported) t)
           (with-temp-file (expand-file-name "lisp/tramp.el" unsupported)
             (insert "(defvar tramp-version \"0\")\n(provide 'tramp)\n"))
+          ;; A fake supported Tramp keeps the guard checks independent of the
+          ;; bundled Tramp version, which is older than the minimum on Emacs 30.
+          (make-directory (expand-file-name "lisp" supported) t)
+          (with-temp-file (expand-file-name "lisp/tramp.el" supported)
+            (insert "(defvar tramp-version \"99.0\")\n(provide 'tramp)\n"))
           (cl-labels
               ((run (test-file &optional tramp-source)
                  (with-temp-buffer
@@ -2654,11 +2659,11 @@ status to be consulted, which is why a direct property test would miss it."
                                    process-environment))))
                      (list (call-process runner nil t nil "--protocol")
                            (buffer-string))))))
-            (pcase-let ((`(,status ,output) (run skipped supported-source)))
+            (pcase-let ((`(,status ,output) (run skipped supported)))
               (should (/= status 0))
               (should (string-match-p
                        "ERT counts: selected=2 executed=0 skipped=2" output)))
-            (pcase-let ((`(,status ,output) (run empty supported-source)))
+            (pcase-let ((`(,status ,output) (run empty supported)))
               (should (/= status 0))
               (should (string-match-p "selected zero tests" output)))
             (pcase-let ((`(,status ,output) (run skipped unsupported)))
@@ -5729,6 +5734,26 @@ issue #268 (0.13 fails to download prebuilt binary)."
               (should (equal (tramp-rpc-deploy--ensure-local-binary arch) cache)))))
       (delete-directory dir t)))))
 
+(ert-deftest tramp-rpc-mock-test-deploy-build-rejects-source-changed-during-build ()
+  "A source change during the build must not be cached under a later id."
+  :tags '(:deploy)
+  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
+  (let ((dir (make-temp-file "tramp-rpc-build-source" t))
+        built)
+    (unwind-protect
+        (let ((tramp-rpc-deploy-source-directory dir))
+          (cl-letf (((symbol-function 'tramp-rpc-deploy--source-binary-id)
+                     (lambda () (if built "git-changed" "git-same")))
+                    ((symbol-function 'tramp-rpc-deploy--cargo-available-p)
+                     (lambda () t))
+                    ((symbol-function 'tramp-rpc-deploy--can-build-for-arch-p)
+                     (lambda (_arch) t))
+                    ((symbol-function 'call-process)
+                     (lambda (&rest _args) (setq built t) 0)))
+            (should-error (tramp-rpc-deploy--build-binary "x86_64-linux")
+                          :type 'remote-file-error)))
+      (delete-directory dir t))))
+
 (ert-deftest tramp-rpc-mock-test-deploy-modified-source-cache-is-invalidated ()
   "A modified source-built cache binary is removed rather than reused."
   :tags '(:deploy)
@@ -7051,8 +7076,10 @@ background, which can precede the socket becoming visible."
           (process-put proc :tramp-rpc-exited t)
           (cl-letf (((symbol-function 'tramp-run-real-handler)
                      (lambda (&rest _) (error "Unexpected process state"))))
+            ;; Pass PROC explicitly so the check does not depend on
+            ;; `get-buffer-process' picking the relay out of the buffer.
             (tramp-rpc-handle-vc-exec-after
-             (lambda () (setq ran t))))
+             (lambda () (setq ran t)) nil proc))
           (should ran))
       (when (process-live-p proc)
         (delete-process proc))

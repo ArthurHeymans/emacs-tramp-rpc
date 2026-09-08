@@ -876,7 +876,11 @@ Returns the path to the binary on success, nil on failure."
                         (format "target/%s/release/%s"
                                 target tramp-rpc-deploy-binary-name)
                         tramp-rpc-deploy-source-directory))
-         (build-buffer (get-buffer-create "*tramp-rpc-build*")))
+         (build-buffer (get-buffer-create "*tramp-rpc-build*"))
+         ;; Capture the identity of the build inputs before `cargo build' runs.
+         ;; A change during the build would make a later id describe a source
+         ;; state the artifact was not built from.
+         (source-id-before (tramp-rpc-deploy--source-binary-id)))
 
     (message "Building tramp-rpc-server for %s (this may take a minute)..." arch)
 
@@ -891,6 +895,11 @@ Returns the path to the binary on success, nil on failure."
                          (expand-file-name "Cargo.toml" tramp-rpc-deploy-source-directory))))
       (if (zerop exit-code)
           (progn
+            (unless (equal source-id-before
+                           (tramp-rpc-deploy--source-binary-id))
+              (signal
+               'remote-file-error
+               (list "Source tree changed during the build; refusing to cache the artifact")))
             ;; Record the source id this artifact was built from before any
             ;; reuse decision can consult it.
             (tramp-rpc-deploy--record-source-build-id build-output)

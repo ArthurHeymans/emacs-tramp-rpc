@@ -41,6 +41,8 @@
 
 ;; Emitted inside the autoload form in tramp-rpc.el.
 (declare-function tramp-rpc-file-name-p "tramp-rpc")
+(declare-function tramp-rpc-protocol-signal-description "tramp-rpc-protocol"
+                  (signal))
 
 ;; ============================================================================
 ;; Process tracking state

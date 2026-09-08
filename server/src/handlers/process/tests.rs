@@ -224,6 +224,36 @@ async fn removed_unreaped_pipe_process_is_reaped_in_background() {
     panic!("removed child was not reaped in the background");
 }
 
+#[test]
+fn pty_exit_reports_the_terminating_signal() {
+    use nix::sys::signal::Signal;
+    use nix::sys::wait::WaitStatus;
+
+    let pid = Pid::from_raw(1);
+    assert_eq!(
+        PtyExit::from_wait_status(WaitStatus::Signaled(pid, Signal::SIGKILL, false)),
+        Some(PtyExit {
+            code: 137,
+            signal: Some(9)
+        })
+    );
+    assert_eq!(
+        PtyExit::from_wait_status(WaitStatus::Exited(pid, 42)),
+        Some(PtyExit {
+            code: 42,
+            signal: None
+        })
+    );
+    assert_eq!(
+        PtyExit::from_signal(libc::SIGTERM),
+        PtyExit {
+            code: 143,
+            signal: Some(15)
+        }
+    );
+}
+
+#[cfg(not(target_os = "macos"))]
 #[tokio::test]
 async fn failed_pty_signal_leaves_io_usable() {
     let _test_lock = test_process_map_lock().await;

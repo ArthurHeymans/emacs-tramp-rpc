@@ -7,6 +7,12 @@
 
 (declare-function tramp-rpc--invalidate-timed-out-connection "tramp-rpc-transport"
                   (process vec event))
+(declare-function tramp-rpc--track-pending-request "tramp-rpc-transport"
+                  (conn id))
+(declare-function tramp-rpc--connection-filter "tramp-rpc-transport"
+                  (process output))
+(declare-function tramp-rpc--drain-connection-stderr "tramp-rpc-transport"
+                  (conn))
 (declare-function tramp-rpc-mock-test--wait-for "tramp-rpc-mock-tests"
                   (predicate description &optional process))
 
