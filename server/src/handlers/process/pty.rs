@@ -33,9 +33,8 @@ use super::push::{OutputPush, new_pty_push, send_exit_notification, stop_output_
 #[cfg(target_os = "macos")]
 use super::signal_process;
 use super::{
-    MANAGED_CHILD_WAIT, MANAGED_PTY_CHILD_WAIT, SignalCode, dup_cloexec,
-    require_process_group_signal, set_fd_cloexec, set_fd_nonblocking, signal_process_group,
-    wait_for_process_group_exit,
+    MANAGED_PTY_CHILD_WAIT, SignalCode, dup_cloexec, require_process_group_signal, set_fd_cloexec,
+    set_fd_nonblocking, signal_process_group, wait_for_process_group_exit,
 };
 
 pub(super) static PTY_PROCESS_MAP: OnceLock<Mutex<HashMap<u32, ManagedPtyProcess>>> =
@@ -632,7 +631,7 @@ pub(super) async fn read_pty_now(pid: u32, max_bytes: usize) -> Result<PtyReadRe
 }
 
 /// Convert a terminal nix wait status into a std exit status.
-fn exit_status_from_wait_status(status: WaitStatus) -> ExitStatus {
+pub(super) fn exit_status_from_wait_status(status: WaitStatus) -> ExitStatus {
     match status {
         WaitStatus::Exited(_, code) => ExitStatus::from_raw(code << 8),
         WaitStatus::Signaled(_, signal, core_dumped) => {
@@ -931,17 +930,30 @@ pub(super) async fn terminate_pty_process(
         signal_pty_process_group(os_pid, libc::SIGKILL, "send SIGKILL")?;
     }
     if reap.is_none() && escalate {
-        reap = tokio::time::timeout(
-            MANAGED_CHILD_WAIT,
+        // The escalation reap is the last chance to observe the child.  Use the
+        // PTY budget for it as well, and retire the entry on failure so a
+        // single unreaped child cannot poison the shared registry for every
+        // later test or connection.
+        reap = match tokio::time::timeout(
+            MANAGED_PTY_CHILD_WAIT,
             wait_pty_pid(Pid::from_raw(os_pid as i32)),
         )
         .await
-        .map_err(|_| {
-            RpcError::process_error(format!("Timed out reaping PTY process {pid} after SIGKILL"))
-        })?
-        .map_err(|error| {
-            RpcError::process_error(format!("Failed to reap PTY process {pid}: {error}"))
-        })?;
+        {
+            Ok(Ok(status)) => status,
+            Ok(Err(error)) => {
+                retire_pty_process(pid, os_pid).await;
+                return Err(RpcError::process_error(format!(
+                    "Failed to reap PTY process {pid}: {error}"
+                )));
+            }
+            Err(_) => {
+                retire_pty_process(pid, os_pid).await;
+                return Err(RpcError::process_error(format!(
+                    "Timed out reaping PTY process {pid} after SIGKILL"
+                )));
+            }
+        };
     }
     if let Some(exit_code) = reap {
         // Reaping confirms terminal death, so no further PTY input can be
@@ -972,14 +984,14 @@ pub(super) async fn terminate_pty_process(
         // SIGKILL was delivered but the bounded reap did not observe a status
         // (for example, another waiter consumed it).  The explicit kill still
         // has deterministic abnormal process semantics for an in-flight read.
-        let exit_code = {
+        let exit = {
             let mut status = shared_exit_status
                 .lock()
                 .expect("shared PTY exit status lock");
             *status.get_or_insert(ExitStatus::from_raw(libc::SIGKILL))
         };
         if retain_removed_status {
-            record_terminated_pty_status(pid, exit_code);
+            record_terminated_pty_status(pid, exit);
         }
         retire_pty_process(pid, os_pid).await;
         return Ok(true);

@@ -2617,10 +2617,10 @@ direct property test would miss it."
          (emacs (or (executable-find "emacs")
                     (error "Cannot find Emacs executable")))
          (wrapper (expand-file-name "emacs-wrapper" runner-temp-directory))
-         (supported-source (getenv "TRAMP_SOURCE"))
          (skipped (expand-file-name "skipped.el" runner-temp-directory))
          (empty (expand-file-name "empty.el" runner-temp-directory))
-         (unsupported (expand-file-name "unsupported" runner-temp-directory)))
+         (unsupported (expand-file-name "unsupported" runner-temp-directory))
+         (supported (expand-file-name "supported" runner-temp-directory)))
     (unwind-protect
         (progn
           (with-temp-file wrapper
@@ -2638,6 +2638,11 @@ direct property test would miss it."
           (make-directory (expand-file-name "lisp" unsupported) t)
           (with-temp-file (expand-file-name "lisp/tramp.el" unsupported)
             (insert "(defvar tramp-version \"0\")\n(provide 'tramp)\n"))
+          ;; A fake supported Tramp keeps the guard checks independent of the
+          ;; bundled Tramp version, which is older than the minimum on Emacs 30.
+          (make-directory (expand-file-name "lisp" supported) t)
+          (with-temp-file (expand-file-name "lisp/tramp.el" supported)
+            (insert "(defvar tramp-version \"99.0\")\n(provide 'tramp)\n"))
           (cl-labels
               ((run (test-file &optional tramp-source)
                  (with-temp-buffer
@@ -2656,11 +2661,11 @@ direct property test would miss it."
                                    process-environment))))
                      (list (call-process runner nil t nil "--protocol")
                            (buffer-string))))))
-            (pcase-let ((`(,status ,output) (run skipped supported-source)))
+            (pcase-let ((`(,status ,output) (run skipped supported)))
               (should (/= status 0))
               (should (string-match-p
                        "ERT counts: selected=2 executed=0 skipped=2" output)))
-            (pcase-let ((`(,status ,output) (run empty supported-source)))
+            (pcase-let ((`(,status ,output) (run empty supported)))
               (should (/= status 0))
               (should (string-match-p "selected zero tests" output)))
             (pcase-let ((`(,status ,output) (run skipped unsupported)))
@@ -7210,8 +7215,10 @@ Other operations, such as a pending sentinel of an earlier test asking for
           (process-put proc :tramp-rpc-exited t)
           (cl-letf (((symbol-function 'tramp-run-real-handler)
                      (tramp-rpc-mock-test--reject-real-vc-exec-after)))
+            ;; Pass PROC explicitly so the check does not depend on
+            ;; `get-buffer-process' picking the relay out of the buffer.
             (tramp-rpc-handle-vc-exec-after
-             (lambda () (setq ran t))))
+             (lambda () (setq ran t)) nil proc))
           (should ran))
       (set-process-sentinel proc #'ignore)
       (when (process-live-p proc)

@@ -251,6 +251,8 @@ This is called from `tramp-multi-hop-p-hook'."
 ;; autoload-owned functions used by the full implementation below.
 (declare-function tramp-rpc--sudo-file-name-p "tramp-rpc")
 (declare-function tramp-rpc-multi-hop-p "tramp-rpc")
+(declare-function tramp-rpc-protocol-signal-description "tramp-rpc-protocol"
+                  (signal))
 
 
 ;; Helper modules register internal lifecycle callbacks when loaded.
