@@ -423,6 +423,7 @@ pub(crate) async fn run_child(
     // Return binary data directly (no encoding needed!)
     Ok(ProcessResult {
         exit_code: crate::protocol::exit_code_from_status(status),
+        signal: crate::protocol::exit_signal_from_status(status),
         stdout,
         stderr,
     })
@@ -797,12 +798,21 @@ pub async fn read(params: Value) -> HandlerResult {
     } else {
         Value::Nil
     };
+    let exit_signal = if exited {
+        exit_status
+            .and_then(crate::protocol::exit_signal_from_status)
+            .map(|signal| Value::Integer(signal.into()))
+            .unwrap_or(Value::Nil)
+    } else {
+        Value::Nil
+    };
 
     Ok(msgpack_map! {
         "stdout" => stdout_val,
         "stderr" => stderr_val,
         "exited" => exited,
-        "exit_code" => exit_code
+        "exit_code" => exit_code,
+        "signal" => exit_signal
     })
 }
 
@@ -1188,7 +1198,8 @@ pub async fn status(params: Value) -> HandlerResult {
 
     Ok(msgpack_map! {
         "exited" => exit_status.is_some(),
-        "exit_code" => exit_status.map(crate::protocol::exit_code_from_status).map(|c| Value::Integer(c.into())).unwrap_or(Value::Nil)
+        "exit_code" => exit_status.map(crate::protocol::exit_code_from_status).map(|c| Value::Integer(c.into())).unwrap_or(Value::Nil),
+        "signal" => exit_status.and_then(crate::protocol::exit_signal_from_status).map(|s| Value::Integer(s.into())).unwrap_or(Value::Nil)
     })
 }
 
@@ -1215,7 +1226,8 @@ pub async fn list(_params: Value) -> HandlerResult {
             "os_pid" => Value::Integer((managed.child_pid as i64).into()),
             "cmd" => managed.cmd.clone(),
             "exited" => exited.is_some(),
-            "exit_code" => exited.map(crate::protocol::exit_code_from_status).map(|c| Value::Integer(c.into())).unwrap_or(Value::Nil)
+            "exit_code" => exited.map(crate::protocol::exit_code_from_status).map(|c| Value::Integer(c.into())).unwrap_or(Value::Nil),
+            "signal" => exited.and_then(crate::protocol::exit_signal_from_status).map(|s| Value::Integer(s.into())).unwrap_or(Value::Nil)
         });
     }
 

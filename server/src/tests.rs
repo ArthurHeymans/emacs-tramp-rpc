@@ -1240,6 +1240,15 @@ async fn test_process_run_signal_exit_code() {
         })
         .expect("should have exit_code");
     assert_eq!(exit_code, 130, "SIGINT should produce exit code 128+2=130");
+    let signal = result
+        .as_map()
+        .and_then(|m| {
+            m.iter()
+                .find(|(k, _)| k.as_str() == Some("signal"))
+                .map(|(_, v)| v.as_i64())
+        })
+        .expect("should have signal");
+    assert_eq!(signal, Some(2), "SIGINT must be reported as a signal");
 }
 
 /// Test that process.run returns 128+signal for SIGKILL.
@@ -1271,6 +1280,15 @@ async fn test_process_run_sigkill_exit_code() {
         })
         .expect("should have exit_code");
     assert_eq!(exit_code, 137, "SIGKILL should produce exit code 128+9=137");
+    let signal = result
+        .as_map()
+        .and_then(|m| {
+            m.iter()
+                .find(|(k, _)| k.as_str() == Some("signal"))
+                .map(|(_, v)| v.as_i64())
+        })
+        .expect("should have signal");
+    assert_eq!(signal, Some(9), "SIGKILL must be reported as a signal");
 }
 
 /// Test that process.run returns the correct exit code for normal exit.

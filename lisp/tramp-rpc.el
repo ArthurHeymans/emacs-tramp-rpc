@@ -2165,21 +2165,32 @@ signal numbers to human-readable strings like \"Interrupt\" or
       ;; Sanity: remove duplicate leading "0" entry if kill -l included one
       (when (and (stringp (cadr signals)) (string-equal (cadr signals) "0"))
         (setcdr signals (cddr signals)))
-      ;; Map signal names to human-readable strings
+      ;; Map signal names to human-readable strings matching local Emacs.
       (dotimes (i 128)
         (let ((sig (nth i signals)))
           (aset vec-strings i
                 (cond
                  ((zerop i) 0)
-                 ((null sig) (format "Signal %d" i))
+                 ((null sig) (tramp-rpc-protocol-signal-description i))
                  ((string-equal sig "HUP") "Hangup")
                  ((string-equal sig "INT") "Interrupt")
                  ((string-equal sig "QUIT") "Quit")
+                 ((string-equal sig "ILL") "Illegal instruction")
+                 ((string-equal sig "TRAP") "Trace/breakpoint trap")
+                 ((string-equal sig "ABRT") "Aborted")
+                 ((string-equal sig "IOT") "Aborted")
+                 ((string-equal sig "BUS") "Bus error")
+                 ((string-equal sig "FPE") "Floating point exception")
+                 ((string-equal sig "KILL") "Killed")
+                 ((string-equal sig "SEGV") "Segmentation fault")
+                 ((string-equal sig "PIPE") "Broken pipe")
+                 ((string-equal sig "ALRM") "Alarm clock")
+                 ((string-equal sig "TERM") "Terminated")
                  ((string-equal sig "STOP") "Stopped (signal)")
                  ((string-equal sig "TSTP") "Stopped")
                  ((string-equal sig "TTIN") "Stopped (tty input)")
                  ((string-equal sig "TTOU") "Stopped (tty output)")
-                 (t (format "Signal %d" i))))))
+                 (t (tramp-rpc-protocol-signal-description i))))))
       vec-strings)))
 
 (defun tramp-rpc-handle-process-file
@@ -2250,6 +2261,7 @@ ARGS contains the original function arguments."
                     127
                   (if result
                       (let ((exit-code (alist-get 'exit_code result))
+                            (exit-signal (alist-get 'signal result))
                             (stdout (tramp-rpc--decode-output
                                      (alist-get 'stdout result)))
                             (stderr (tramp-rpc--decode-output
@@ -2282,14 +2294,21 @@ ARGS contains the original function arguments."
                         (tramp-rpc--route-process-file-output
                          destination stdout stderr)
 
-                        ;; Handle signal strings when requested by Emacs.
-                        (if (and
-                             (bound-and-true-p
-                              process-file-return-signal-string)
-                             (natnump exit-code) (>= exit-code 128))
-                            (let ((strings (tramp-rpc--get-signal-strings v)))
-                              (aref strings (- exit-code 128)))
-                          exit-code))
+                        ;; `process-file' returns the raw exit code unless the
+                        ;; caller opts into signal descriptions via
+                        ;; `process-file-return-signal-string'.  This matches
+                        ;; tramp-sh and upstream `tramp-test28-process-file',
+                        ;; which requires the integer 128 + signal by default.
+                        (cond
+                         ((not (bound-and-true-p
+                                process-file-return-signal-string))
+                          exit-code)
+                         ((and (integerp exit-signal) (>= exit-signal 0))
+                          (aref (tramp-rpc--get-signal-strings v) exit-signal))
+                         ((and (natnump exit-code) (> exit-code 128))
+                          (aref (tramp-rpc--get-signal-strings v)
+                                (- exit-code 128)))
+                         (t exit-code)))
                     ;; A successful RPC result is always non-nil.
                     (signal 'remote-file-error
                             (list "Empty process.run response")))))

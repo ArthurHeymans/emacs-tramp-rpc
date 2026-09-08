@@ -371,6 +371,12 @@ impl DirEntry {
 #[derive(Debug, Serialize, Deserialize)]
 pub struct ProcessResult {
     pub exit_code: i32,
+    /// Signal number that terminated the process, when it was not a normal
+    /// exit.  `exit_code' keeps the historical 128 + signal value, but the
+    /// client needs the signal itself to report `process-status' as `signal'
+    /// and to distinguish a real exit of 137 from SIGKILL.
+    #[serde(default)]
+    pub signal: Option<i32>,
     /// stdout content as raw bytes
     #[serde(with = "serde_bytes")]
     pub stdout: Vec<u8>,
@@ -386,6 +392,12 @@ impl ProcessResult {
             (
                 Value::String("exit_code".into()),
                 Value::Integer(self.exit_code.into()),
+            ),
+            (
+                Value::String("signal".into()),
+                self.signal
+                    .map(|signal| Value::Integer(signal.into()))
+                    .unwrap_or(Value::Nil),
             ),
             (
                 Value::String("stdout".into()),
@@ -455,6 +467,29 @@ impl IntoValue for Value {
     fn into_value(self) -> Value {
         self
     }
+}
+
+/// Return the signal number that terminated STATUS, or nil for a normal exit.
+///
+/// Kept separate from `exit_code_from_status' because the 128 + signal
+/// convention cannot distinguish a process killed by SIGKILL from one that
+/// genuinely exited with code 137.
+pub fn exit_signal_from_status(status: std::process::ExitStatus) -> Option<i32> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::ExitStatusExt;
+
+        if let Some(sig) = status.signal() {
+            return Some(sig);
+        }
+        let raw = status.into_raw();
+        let termsig = raw & 0x7f;
+        if termsig != 0 && termsig != 0x7f {
+            return Some(termsig);
+        }
+    }
+    let _ = status;
+    None
 }
 
 /// Extract an exit code from a `std::process::ExitStatus`.

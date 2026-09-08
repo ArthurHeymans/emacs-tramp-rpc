@@ -1993,6 +1993,76 @@ async callbacks and local relays leaked."
       (remhash process tramp-rpc--pty-processes)
       (when (process-live-p process) (delete-process process)))))
 
+(ert-deftest tramp-rpc-mock-test-process-signal-status-and-exit-status ()
+  "A signal-killed remote process reports `signal' and its signal number.
+Local processes report `signal'/9 for SIGKILL; callers such as LSP and
+compile branch on that, so the 128 + signal exit code alone is not enough."
+  (let ((process (start-process "tramp-rpc-signal-status" nil "cat")))
+    (unwind-protect
+        (progn
+          (process-put process :tramp-rpc-pid 42)
+          (process-put process :tramp-rpc-exit-code 137)
+          (process-put process :tramp-rpc-exit-signal 9)
+          (process-put process :tramp-rpc-exited t)
+          (should (eq (tramp-rpc-handle-process-status process) 'signal))
+          (should (= (tramp-rpc-handle-process-exit-status process) 9)))
+      (when (process-live-p process) (delete-process process)))))
+
+(ert-deftest tramp-rpc-mock-test-signal-description-matches-emacs ()
+  "Signal descriptions match the strings local Emacs uses."
+  (should (equal (tramp-rpc-protocol-signal-description 9) "Killed"))
+  (should (equal (tramp-rpc-protocol-signal-description 15) "Terminated"))
+  (should (equal (tramp-rpc-protocol-signal-description 11) "Segmentation fault"))
+  (should (equal (tramp-rpc-protocol-signal-description 99) "Signal 99")))
+
+(ert-deftest tramp-rpc-mock-test-signal-exit-still-sends-relay-eof ()
+  "A signal-killed process must still send EOF to its local relay.
+`tramp-rpc--handle-process-exit' marks the process terminal, and the advised
+`process-status' then reports `signal', so setting the signal before the EOF
+would make `process-live-p' false and leave the relay (and its sentinel)
+alive forever.  The `tramp-vector' property is required for the advised
+status to be consulted, which is why a direct property test would miss it."
+  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
+  (let* ((vec (tramp-dissect-file-name "/rpc:user@host:/tmp/"))
+         (process (start-process "tramp-rpc-signal-eof" nil "cat"))
+         (tramp-rpc--async-processes (make-hash-table :test 'eq))
+         (tramp-rpc--process-write-queues (make-hash-table :test 'equal))
+         eof-sent)
+    (unwind-protect
+        (progn
+          (process-put process 'tramp-vector vec)
+          (process-put process :tramp-rpc-pid 42)
+          (puthash process (list :vec vec :pid 42 :connection-process nil)
+                   tramp-rpc--async-processes)
+          (cl-letf (((symbol-function 'process-send-eof)
+                     (lambda (proc) (setq eof-sent proc))))
+            (tramp-rpc--handle-process-exit process 137 9))
+          (should (eq eof-sent process))
+          (should (eq (process-get process :tramp-rpc-exit-signal) 9))
+          (should (process-get process :tramp-rpc-exited)))
+      (when (processp process) (ignore-errors (delete-process process))))))
+
+(ert-deftest tramp-rpc-mock-test-pty-signal-exit-still-sends-relay-eof ()
+  "A signal-killed PTY process must still send EOF to its local relay."
+  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
+  (let* ((vec (tramp-dissect-file-name "/rpc:user@host:/tmp/"))
+         (process (start-process "tramp-rpc-pty-signal-eof" nil "cat"))
+         (tramp-rpc--pty-processes (make-hash-table :test 'eq))
+         eof-sent)
+    (unwind-protect
+        (progn
+          (process-put process 'tramp-vector vec)
+          (process-put process :tramp-rpc-pid 42)
+          (process-put process :tramp-rpc-pty t)
+          (puthash process '(:poll-timer nil) tramp-rpc--pty-processes)
+          (cl-letf (((symbol-function 'process-send-eof)
+                     (lambda (proc) (setq eof-sent proc))))
+            (tramp-rpc--handle-pty-exit process 137 9))
+          (should (eq eof-sent process))
+          (should (eq (process-get process :tramp-rpc-exit-signal) 9))
+          (should (process-get process :tramp-rpc-exited)))
+      (when (processp process) (ignore-errors (delete-process process))))))
+
 (ert-deftest tramp-rpc-mock-test-pty-terminal-read-error-calls-user-sentinel-once ()
   "A terminal PTY read error invokes the real user sentinel exactly once."
   (let* ((process (start-process "tramp-rpc-pty-terminal-error" nil "cat"))
@@ -7665,6 +7735,52 @@ discard it for being unreadable."
               (insert-file-contents stderr-file)
               (should (string-match-p "missing executable" (buffer-string))))))
       (ignore-errors (delete-file stderr-file)))))
+
+(ert-deftest tramp-rpc-mock-test-process-file-signal-and-exit-codes ()
+  "`process-file' returns the raw exit code unless signal strings are opted in.
+This matches tramp-sh and upstream `tramp-test28-process-file', which requires
+128 + signal by default and a description only when
+`process-file-return-signal-string' is set."
+  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
+  (let ((default-directory "/rpc:user@host:/work/")
+        (process-file-side-effects nil)
+        (result '((exit_code . 0) (stdout . "") (stderr . ""))))
+    (cl-letf (((symbol-function 'tramp-rpc--cached-remote-path)
+               (lambda (_vec) '("/usr/bin")))
+              ((symbol-function 'tramp-rpc--get-direnv-environment)
+               (lambda (&rest _) nil))
+              ((symbol-function 'tramp-rpc--caller-environment)
+               (lambda () nil))
+              ((symbol-function 'tramp-rpc-magit--process-cache-lookup)
+               (lambda (&rest _) nil))
+              ((symbol-function 'tramp-rpc-magit--process-cache-store)
+               (lambda (&rest _) nil))
+              ((symbol-function 'tramp-rpc--get-signal-strings)
+               (lambda (_vec)
+                 (vector 0 "Hangup" "Interrupt" nil nil nil nil nil nil
+                         "Killed" nil "Segmentation fault" nil nil nil
+                         "Terminated")))
+              ((symbol-function 'tramp-rpc--call)
+               (lambda (&rest _) (copy-tree result))))
+      ;; A real signal stays an integer by default, exactly as tramp-sh does.
+      (setq result '((exit_code . 137) (signal . 9)
+                     (stdout . "") (stderr . "")))
+      (should (= (tramp-rpc-handle-process-file "cmd" nil nil nil) 137))
+      ;; Opting in produces the description from the real signal.
+      (let ((process-file-return-signal-string t))
+        (should (equal (tramp-rpc-handle-process-file "cmd" nil nil nil)
+                       "Killed")))
+      ;; A plain exit above 128 stays an integer by default and is described
+      ;; under the legacy interpretation only when opted in.
+      (setq result '((exit_code . 137) (stdout . "") (stderr . "")))
+      (should (= (tramp-rpc-handle-process-file "cmd" nil nil nil) 137))
+      (let ((process-file-return-signal-string t))
+        (should (equal (tramp-rpc-handle-process-file "cmd" nil nil nil)
+                       "Killed")))
+      ;; Exit 128 is not a signal, even when opted in.
+      (setq result '((exit_code . 128) (stdout . "") (stderr . "")))
+      (let ((process-file-return-signal-string t))
+        (should (= (tramp-rpc-handle-process-file "cmd" nil nil nil) 128))))))
 
 (ert-deftest tramp-rpc-mock-test-process-file-preserves-other-rpc-errors ()
   "A process cwd ENOENT remains a remote-file-error, not status 127."

@@ -557,14 +557,20 @@ EVENT is the process event string."
       (when-let* ((stderr-process (plist-get info :stderr-process)))
         (when (process-live-p stderr-process)
           (tramp-rpc--best-effort (delete-process stderr-process))))
-      (let ((remote-exit (process-get proc :tramp-rpc-exit-code)))
+      (let ((remote-exit (process-get proc :tramp-rpc-exit-code))
+            (remote-signal (process-get proc :tramp-rpc-exit-signal)))
         (tramp-rpc--call-user-sentinel-once
          proc user-sentinel
-         (if remote-exit
-             (if (= remote-exit 0)
-                 "finished\n"
-               (format "exited abnormally with code %d\n" remote-exit))
-           event)))
+         (cond
+          ((integerp remote-signal)
+           (format "%s\n"
+                   (downcase (tramp-rpc-protocol-signal-description
+                              remote-signal))))
+          (remote-exit
+           (if (= remote-exit 0)
+               "finished\n"
+             (format "exited abnormally with code %d\n" remote-exit)))
+          (t event))))
       (remhash proc tramp-rpc--async-processes))))
 
 (defun tramp-rpc--handle-async-read-response (local-process response)
@@ -589,7 +595,8 @@ RESPONSE is the decoded RPC response plist."
                  (stderr (when-let* ((s (alist-get 'stderr result)))
                            (tramp-rpc--binary-bytes s)))
                  (exited (alist-get 'exited result))
-                 (exit-code (alist-get 'exit_code result)))
+                 (exit-code (alist-get 'exit_code result))
+                 (exit-signal (alist-get 'signal result)))
 
             (tramp-rpc--debug "ASYNC-READ response: stdout=%s stderr=%s exited=%s"
                              (if stdout (length stdout) "nil")
@@ -620,7 +627,8 @@ RESPONSE is the decoded RPC response plist."
                 ;; Deferring this via `run-at-time 0' leaves a small window where
                 ;; loops that poll `process-live-p' can observe a stale live
                 ;; process and run one extra iteration.
-                (tramp-rpc--handle-process-exit local-process exit-code)
+                (tramp-rpc--handle-process-exit local-process exit-code
+                                               exit-signal)
               ;; Chain another read - use run-at-time to avoid stack overflow
               (tramp-rpc--schedule-process-timer
                tramp-rpc--async-processes local-process :poll-timer
@@ -632,9 +640,10 @@ RESPONSE is the decoded RPC response plist."
           tramp-rpc--async-processes local-process :poll-timer
           #'tramp-rpc--handle-process-exit local-process -1))))))
 
-(defun tramp-rpc--handle-process-exit (local-process exit-code)
+(defun tramp-rpc--handle-process-exit (local-process exit-code &optional exit-signal)
   "Handle exit of remote process associated with LOCAL-PROCESS.
-Stores the remote exit code and sends EOF to the local cat relay so
+Stores the remote exit code and, when EXIT-SIGNAL is a signal number,
+the signal that terminated it.  Sends EOF to the local cat relay so
 it flushes remaining output and exits naturally.  The process sentinel
 \(`tramp-rpc--pipe-process-sentinel') fires when cat exits, handles
 cleanup, and calls the user's sentinel with the correct event string.
@@ -675,7 +684,13 @@ EXIT-CODE is the process exit status."
       (when (process-live-p local-process)
         (let ((tramp-rpc--closing-local-relay t))
           (tramp-rpc--best-effort (process-send-eof local-process))))
-      ;; Now mark as exited so process-status handler returns 'exit.
+      ;; Mark the process terminal only after the relay EOF.  Both
+      ;; `:tramp-rpc-exit-signal' and `:tramp-rpc-exited' make the advised
+      ;; `process-status' non-live, which would skip the EOF above and leave
+      ;; the relay (and its sentinel) alive forever.
+      (process-put local-process :tramp-rpc-exit-signal
+                   (and (integerp exit-signal) (>= exit-signal 0)
+                        exit-signal))
       (process-put local-process :tramp-rpc-exited t))))
 
 ;; ============================================================================
@@ -1330,7 +1345,8 @@ RESPONSE is the decoded RPC response plist."
                    (output (when-let* ((o (alist-get 'output result)))
                              (tramp-rpc--binary-bytes o)))
                    (exited (alist-get 'exited result))
-                   (exit-code (alist-get 'exit_code result)))
+                   (exit-code (alist-get 'exit_code result))
+                   (exit-signal (alist-get 'signal result)))
 
               ;; Feed raw bytes to the relay.  Its read-side decoder is
             ;; incremental, so a character split across RPC responses is kept
@@ -1341,7 +1357,8 @@ RESPONSE is the decoded RPC response plist."
 
             ;; Handle process exit or chain next read
             (if exited
-                (tramp-rpc--handle-pty-exit local-process exit-code)
+                (tramp-rpc--handle-pty-exit local-process exit-code
+                                            exit-signal)
               ;; Chain via a tracked timer so cleanup can cancel it.
               (tramp-rpc--schedule-process-timer
                tramp-rpc--pty-processes local-process :poll-timer
@@ -1351,9 +1368,10 @@ RESPONSE is the decoded RPC response plist."
        (tramp-rpc--debug "PTY read response error: %S" err)
        (tramp-rpc--handle-pty-exit local-process -1)))))
 
-(defun tramp-rpc--handle-pty-exit (local-process exit-code)
+(defun tramp-rpc--handle-pty-exit (local-process exit-code &optional exit-signal)
   "Handle exit of PTY process associated with LOCAL-PROCESS.
-EXIT-CODE is the process exit status."
+EXIT-CODE is the process exit status.  EXIT-SIGNAL, when non-nil, is the
+signal number that terminated the remote process."
   (when (gethash local-process tramp-rpc--pty-processes)
     (tramp-rpc--cancel-process-timers tramp-rpc--pty-processes local-process)
     ;; Close the remote PTY while the transport is still available.  Keep the
@@ -1367,14 +1385,20 @@ EXIT-CODE is the process exit status."
     ;; particular, do not translate a killed remote PTY into local success.
     (process-put local-process :tramp-rpc-exit-code
                  (if (integerp exit-code) exit-code -1))
-    (process-put local-process :tramp-rpc-exited t)
     ;; Close the relay's local stdin and let cat flush the final PTY bytes
     ;; before exiting naturally.  A zero-timeout `accept-process-output' after
     ;; `process-send-string' does not wait for the relay round trip, while
     ;; deleting it here discards the final output returned with EXITED.
     (when (process-live-p local-process)
       (let ((tramp-rpc--closing-local-relay t))
-        (tramp-rpc--best-effort (process-send-eof local-process))))))
+        (tramp-rpc--best-effort (process-send-eof local-process))))
+    ;; Mark the process terminal only after the relay EOF, for the same reason
+    ;; as the pipe path: either flag makes the advised `process-status'
+    ;; non-live and would skip the EOF, leaving the relay alive.
+    (process-put local-process :tramp-rpc-exit-signal
+                 (and (integerp exit-signal) (>= exit-signal 0)
+                      exit-signal))
+    (process-put local-process :tramp-rpc-exited t)))
 
 (defun tramp-rpc--pty-sentinel (process event)
   "Sentinel for PTY relay PROCESS, preserving its user sentinel once.
@@ -1393,14 +1417,20 @@ EVENT is the process event string."
             (tramp-rpc--call vec "process.kill_pty"
                              `((pid . ,pid) (signal . 9))
                              (process-get process :tramp-rpc-connection)))))
-      (let ((exit-code (process-get process :tramp-rpc-exit-code)))
+      (let ((exit-code (process-get process :tramp-rpc-exit-code))
+            (exit-signal (process-get process :tramp-rpc-exit-signal)))
         (tramp-rpc--call-user-sentinel-once
          process (process-get process :tramp-rpc-user-sentinel)
-         (if exit-code
-             (if (= exit-code 0)
-                 "finished\n"
-               (format "exited abnormally with code %d\n" exit-code))
-           event)))
+         (cond
+          ((integerp exit-signal)
+           (format "%s\n"
+                   (downcase (tramp-rpc-protocol-signal-description
+                              exit-signal))))
+          (exit-code
+           (if (= exit-code 0)
+               "finished\n"
+             (format "exited abnormally with code %d\n" exit-code)))
+          (t event))))
       ;; Run after the wrapped/user sentinel has observed the exit.
       (remhash process tramp-rpc--pty-processes))))
 
