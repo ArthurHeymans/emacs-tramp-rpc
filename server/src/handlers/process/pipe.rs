@@ -5,8 +5,6 @@
 
 use crate::msgpack_map;
 use crate::protocol::{ProcessResult, RpcError, from_value};
-use nix::sys::wait::{WaitPidFlag, WaitStatus, waitpid};
-use nix::unistd::Pid;
 use rmpv::Value;
 use rustix::io::fcntl_dupfd_cloexec;
 #[cfg(target_vendor = "apple")]
@@ -17,7 +15,6 @@ use serde::Deserialize;
 use std::collections::HashMap;
 use std::io::ErrorKind;
 use std::os::fd::OwnedFd;
-use std::os::unix::process::ExitStatusExt;
 use std::path::{Path, PathBuf};
 use std::process::{ExitStatus, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -944,33 +941,28 @@ pub async fn close_stdin(params: Value) -> HandlerResult {
     Ok(Value::Boolean(true))
 }
 
-pub(super) async fn wait_pipe_child(os_pid: u32) -> Result<Option<ExitStatus>, nix::errno::Errno> {
+/// Wait until the managed child behind registry PID is reaped.
+///
+/// This polls tokio's own `try_wait' so the child's `kill_on_drop' state stays
+/// consistent.  Reaping the same child with a second reaper (nix `waitpid')
+/// hides the reap from tokio, which then still believes the process is running
+/// and can send `SIGKILL' to an already-reaped, potentially recycled PID when
+/// the registry entry is dropped.
+pub(super) async fn wait_pipe_child(pid: u32) -> Result<Option<ExitStatus>, RpcError> {
     loop {
-        match waitpid(Pid::from_raw(os_pid as i32), Some(WaitPidFlag::WNOHANG)) {
-            Ok(status @ (WaitStatus::Exited(_, _) | WaitStatus::Signaled(_, _, _))) => {
-                return Ok(Some(exit_status_from_wait_status(status)));
+        {
+            let mut processes = get_process_map().lock().await;
+            let Some(managed) = processes.get_mut(&pid) else {
+                // Another poll consumed the status and removed the entry.
+                return Ok(None);
+            };
+            if let Some(status) = poll_exit_status(managed).map_err(|error| {
+                RpcError::process_error(format!("Failed to reap process {pid}: {error}"))
+            })? {
+                return Ok(Some(status));
             }
-            Ok(WaitStatus::StillAlive) => {
-                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
-            }
-            // Another status poll can only have consumed the status while the
-            // lifecycle lock is not held.  The map entry remains until its
-            // streams reach EOF, even in that case.
-            Err(nix::errno::Errno::ECHILD) => return Ok(None),
-            Err(nix::errno::Errno::EINTR) => continue,
-            Err(error) => return Err(error),
-            Ok(_) => return Err(nix::errno::Errno::EINVAL),
         }
-    }
-}
-
-pub(super) fn exit_status_from_wait_status(status: WaitStatus) -> ExitStatus {
-    match status {
-        WaitStatus::Exited(_, code) => ExitStatus::from_raw(code << 8),
-        WaitStatus::Signaled(_, signal, core_dumped) => {
-            ExitStatus::from_raw(signal as i32 | if core_dumped { 0x80 } else { 0 })
-        }
-        _ => ExitStatus::from_raw(0),
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
     }
 }
 
@@ -1029,7 +1021,7 @@ pub(super) async fn terminate_pipe_process(
     let mut reap = if cached.is_some() {
         cached
     } else {
-        tokio::time::timeout(MANAGED_CHILD_WAIT, wait_pipe_child(os_pid))
+        tokio::time::timeout(MANAGED_CHILD_WAIT, wait_pipe_child(pid))
             .await
             .ok()
             .and_then(Result::ok)
@@ -1048,14 +1040,11 @@ pub(super) async fn terminate_pipe_process(
         require_process_group_signal(signal_process_group(os_pid, libc::SIGKILL), "send SIGKILL")?;
     }
     if reap.is_none() && escalate {
-        reap = tokio::time::timeout(MANAGED_CHILD_WAIT, wait_pipe_child(os_pid))
+        reap = tokio::time::timeout(MANAGED_CHILD_WAIT, wait_pipe_child(pid))
             .await
             .map_err(|_| {
                 RpcError::process_error(format!("Timed out reaping process {pid} after SIGKILL"))
-            })?
-            .map_err(|error| {
-                RpcError::process_error(format!("Failed to reap process {pid}: {error}"))
-            })?;
+            })??;
     }
     if let Some(exit_status) = reap {
         // Publish before any destructive cleanup so a read which captured the

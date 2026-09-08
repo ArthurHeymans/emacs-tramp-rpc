@@ -1712,6 +1712,26 @@ async fn pipe_sigkill_discards_unread_output_after_reaping_direct_child() {
 }
 
 #[tokio::test]
+async fn wait_pipe_child_reaps_through_tokio() {
+    let _test_lock = test_process_map_lock().await;
+    let pid = start_pipe_process("exit 0").await;
+
+    let status = wait_pipe_child(pid).await.expect("reap managed child");
+    assert!(status.is_some(), "exited child must report a status");
+
+    // Reaping must go through tokio's own `try_wait' so the child's
+    // `kill_on_drop' state is cleared.  A second reaper hides the reap from
+    // tokio, which then still believes the process is alive and can SIGKILL
+    // an already-reaped, possibly recycled PID when the entry is dropped.
+    let mut processes = get_process_map().lock().await;
+    let managed = processes.get_mut(&pid).expect("managed child");
+    assert!(
+        managed.child.try_wait().expect("tokio try_wait").is_some(),
+        "tokio must consider the child reaped"
+    );
+}
+
+#[tokio::test]
 async fn pty_kill_preserves_output_until_terminal_eof() {
     let _test_lock = test_process_map_lock().await;
     let temp = tempfile::tempdir().expect("temporary marker directory");
