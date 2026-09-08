@@ -32,16 +32,6 @@
 (require 'tramp-sh)
 (require 'url)
 
-;; Functions from tramp-rpc.el.  `tramp-rpc-deploy' is loaded by
-;; tramp-rpc.el after these helpers have been defined.
-(declare-function tramp-send-command
-                  "tramp-sh" (vec command &optional neveropen nooutput))
-(declare-function tramp-send-command-and-check
-                  "tramp-sh"
-                  (vec command &optional subshell dont-suppress-err exit-status))
-(declare-function tramp-send-command-and-read
-                  "tramp-sh" (vec command &optional noerror marker))
-
 ;; ============================================================================
 ;;; Customization
 ;; ============================================================================

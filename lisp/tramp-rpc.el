@@ -226,10 +226,13 @@ This is called from `tramp-multi-hop-p-hook'."
 
 ;; Now the actual implementation
 (require 'cl-lib)
+(require 'cl-extra)
 (require 'json)
 (require 'seq)
 (require 'tramp)
 (require 'tramp-sh)
+(require 'tramp-cache)
+(require 'tramp-compat)
 (require 'tramp-rpc-protocol)
 (require 'tramp-rpc-connection)
 (require 'tramp-rpc-transport)
@@ -248,13 +251,10 @@ This is called from `tramp-multi-hop-p-hook'."
 ;; autoload-owned functions used by the full implementation below.
 (declare-function tramp-rpc--sudo-file-name-p "tramp-rpc")
 (declare-function tramp-rpc-multi-hop-p "tramp-rpc")
-(declare-function tramp-sh-handle-copy-file "tramp-sh"
-                  (filename newname &optional ok-if-already-exists keep-date
-                            preserve-uid-gid preserve-extended-attributes))
 
 
-;; Helper modules only define functions while the main package is loading.
-;; Runtime integration is installed explicitly after `tramp-rpc' is provided.
+;; Helper modules register internal lifecycle callbacks when loaded.
+;; Editor integrations are installed after `tramp-rpc' is provided.
 (require 'tramp-rpc-deploy)
 (require 'tramp-rpc-process)
 (require 'tramp-rpc-advice)
@@ -3197,6 +3197,8 @@ VEC-OR-FILENAME can be either a tramp-file-name struct or a filename string."
 ;; Connection cleanup support
 ;; ============================================================================
 
+;; Internal transport teardown must always release file-notify watches.
+;; This is backend lifecycle wiring, not an opt-in editor integration.
 (add-hook 'tramp-rpc-transport-cleanup-functions
           #'tramp-rpc--cleanup-file-notify-for-connection t)
 
@@ -3303,7 +3305,7 @@ cleanup of all connections has run."
   "Remove malformed native-comp entries that prevent unloading.
 
 Native compilation can record anonymous compiled functions as
-`(defun . --anonymous-lambda)' in `load-history'.  Emacs bug#80446
+entries for `--anonymous-lambda' in `load-history'.  Emacs bug#80446
 causes `unload-feature' to reject those entries.  Remove them from all
 TRAMP-RPC modules before any of the modules are unloaded."
   (dolist (entry load-history)

@@ -2239,7 +2239,7 @@ actual PATH line, matching the robustness of upstream TRAMP."
 (defconst tramp-rpc--system-info-property "tramp-rpc-system-info"
   "TRAMP connection property storing the cached system.info response.")
 
-(defcustom tramp-rpc--watcher-unavailable-ttl 30
+(defcustom tramp-rpc-watcher-unavailable-ttl 30
   "TTL cap in seconds for caches when push notifications are unavailable.
 When the server reports `watcher_available' as false, `fs.events'
 notifications are not running and caches are TTL-only.  Capping to a short
@@ -2251,7 +2251,7 @@ seconds of stale metadata."
 (defvar tramp-rpc--watcher-degraded nil
   "Non-nil when any known connection lacks push notifications.
 Set from `system.info' `watcher_available'.  Once set, metadata and Magit
-process caches use `tramp-rpc--watcher-unavailable-ttl' as a cap.  This is
+process caches use `tramp-rpc-watcher-unavailable-ttl' as a cap.  This is
 global and conservative, one degraded host shortens TTLs for all, because
 cache validity checks do not carry connection context.")
 
