@@ -777,12 +777,18 @@ impl WatchManager {
     ///
     /// Lock ordering: watcher -> watched_paths (same as watch()).
     pub fn unwatch(&self, path: &Path) -> Result<(), notify::Error> {
+        // A path can be registered in both watchers: the nofollow watcher
+        // tracks the symlink itself and the regular watcher tracks its
+        // canonical target.  Remove both, otherwise a single watch.remove
+        // leaves the other registration alive for the life of the server.
+        let mut removed_nofollow = false;
         {
             let mut symlink_watcher = lock_or_recover(&self.symlink_watcher);
             if let Some(watcher) = symlink_watcher.as_mut()
                 && watcher.contains(path)
             {
-                return watcher.unwatch(path);
+                watcher.unwatch(path)?;
+                removed_nofollow = true;
             }
         }
 
@@ -795,6 +801,9 @@ impl WatchManager {
 
         // Find the matching stored path using exact canonical path matching only.
         if !paths.contains_key(&canonical) {
+            if removed_nofollow {
+                return Ok(());
+            }
             return Err(notify::Error::generic(&format!(
                 "Path not being watched (canonical: {}): {}",
                 canonical.display(),
