@@ -32,8 +32,14 @@
 (require 'tramp-sh)
 (require 'url)
 
-;; Functions from tramp-rpc.el.  `tramp-rpc-deploy' is loaded by
-;; tramp-rpc.el after these helpers have been defined.
+;; Silence byte-compiler warnings for functions defined in tramp-sh.
+(declare-function tramp-get-remote-path "tramp-sh")
+(declare-function tramp-get-connection-process "tramp")
+(declare-function tramp-check-for-regexp "tramp")
+(declare-function tramp-get-remote-null-device "tramp")
+
+;; Functions from sibling modules.  `tramp-rpc-deploy' is loaded by
+;; tramp-rpc-transport.el before the complete backend is initialized.
 (declare-function tramp-send-command
                   "tramp-sh" (vec command &optional neveropen nooutput))
 (declare-function tramp-send-command-and-check
@@ -41,6 +47,10 @@
                   (vec command &optional subshell dont-suppress-err exit-status))
 (declare-function tramp-send-command-and-read
                   "tramp-sh" (vec command &optional noerror marker))
+(declare-function tramp-rpc--proxy-hop-string "tramp-rpc-hops" (vec))
+(declare-function tramp-rpc--sudo-rpc-hop-vec "tramp-rpc-hops" (vec))
+(declare-function tramp-rpc--clear-connection-failure
+                  "tramp-rpc-transport" (vec))
 
 ;; ============================================================================
 ;;; Customization
@@ -67,10 +77,21 @@ straight/build..., while the adjacent .el symlink points back to
 straight/repos...."
   (when-let* ((file (tramp-rpc-deploy--load-source-file-name))
               (directory (file-name-directory file)))
-    (if (and (file-exists-p (expand-file-name "Cargo.toml" directory))
+    (let ((parent (expand-file-name ".." directory)))
+      (cond
+       ((and (file-exists-p (expand-file-name "Cargo.toml" directory))
              (file-directory-p (expand-file-name "server" directory)))
-        directory
-      (expand-file-name ".." directory))))
+        directory)
+       ((and (file-exists-p (expand-file-name "Cargo.toml" parent))
+             (file-directory-p (expand-file-name "server" parent)))
+        parent)
+       ((string= (file-name-nondirectory (directory-file-name directory))
+                 "lisp")
+        parent)
+       ;; Archive/package installs commonly flatten the selected Elisp files
+       ;; into the package directory.  Keep that directory as the anchor for
+       ;; the release-source fallback instead of pointing at its parent.
+       (t directory)))))
 
 (defgroup tramp-rpc-deploy nil
   "Deployment settings for TRAMP-RPC."
@@ -78,6 +99,13 @@ straight/repos...."
 
 (defconst tramp-rpc-deploy-version "0.13.1"
   "Current version of tramp-rpc-server.")
+
+;; Refer to .github/workflows/release.yml for supported architectures
+(defconst tramp-rpc-deploy-release-architectures
+  '("x86_64-linux" "aarch64-linux" "i686-linux"
+    "armv7-linux" "armv5te-linux" "armv6-linux"
+    "x86_64-darwin" "aarch64-darwin")
+  "Architecture names for which release artifacts are published.")
 
 (defconst tramp-rpc-deploy-binary-name "tramp-rpc-server"
   "Name of the server binary.")
@@ -95,6 +123,13 @@ Arguments: repo, version, filename."
   :type 'string
   :group 'tramp-rpc-deploy)
 
+(defcustom tramp-rpc-deploy-source-url-format
+  "https://github.com/%s/archive/refs/tags/v%s.tar.gz"
+  "URL format for downloading a tagged source archive.
+Arguments: repo and version."
+  :type 'string
+  :group 'tramp-rpc-deploy)
+
 (defcustom tramp-rpc-deploy-local-cache-directory
   (expand-file-name "tramp-rpc" user-emacs-directory)
   "Local directory for caching downloaded/built binaries.
@@ -104,8 +139,10 @@ Binaries are stored as CACHE-DIR/VERSION/ARCH/tramp-rpc-server."
 
 (defcustom tramp-rpc-deploy-source-directory
   (tramp-rpc-deploy--default-source-directory)
-  "Directory containing the tramp-rpc source code.
-Used for building from source.  Set to nil to disable source builds."
+  "Directory containing the tramp-rpc source code, when available.
+For archive/package installs this is an automatically inferred package
+directory used as the anchor for downloading the matching release source
+archive.  Set to nil to disable all source builds."
   :type '(choice directory (const nil))
   :group 'tramp-rpc-deploy)
 
@@ -184,8 +221,9 @@ git checkout that contains the Rust server sources.
 `auto' means use release binaries for release/package installs.  For git
 checkouts, existing source builds and caches are reused; when a binary must
 be obtained, `tramp-rpc-deploy-install-binary' asks whether to download a
-release binary, build from source, or stop.  Automatic file operations never
-prompt; they report how to run that command instead.
+release binary, build locally, build remotely when supported, or stop.  An
+interactive automatic deployment asks whether to download or build remotely
+when the remote platform is supported and has a usable Rust toolchain.
 
 `release' always uses the release-oriented versioned binary id and obtain
 order, preserving the historical behavior.
@@ -282,6 +320,11 @@ an additional log file; otherwise TRAMP_RPC_DEBUG_DIR writes
 tramp-rpc-deploy-live.log in that directory."
   :type 'boolean
   :group 'tramp-rpc-deploy)
+
+(defvar tramp-rpc-deploy--remote-rust-toolchain-diagnostic nil
+  "Diagnostic from the most recent remote Rust toolchain probe.
+This is nil after a successful probe and a user-facing explanation when the
+probe found no usable toolchain or could not be completed.")
 
 (defun tramp-rpc-deploy--log (format-string &rest args)
   "Log a debug message if `tramp-rpc-deploy-debug' is non-nil.
@@ -386,6 +429,12 @@ standard TRAMP can traverse them."
   "Return supported release artifact architecture names."
   (mapcar #'car tramp-rpc-deploy--artifact-targets))
 
+(defun tramp-rpc-deploy--rust-target-for-arch (arch)
+  "Return the release Rust target triple for ARCH, or nil.
+Accept the historical `armv6-linux' spelling as an alias for `arm-linux'."
+  (cdr (assoc (if (string= arch "armv6-linux") "arm-linux" arch)
+              tramp-rpc-deploy--artifact-targets)))
+
 (defun tramp-rpc-deploy--detect-remote-arch (vec)
   "Detect the architecture of remote host specified by VEC.
 Returns a string like \"x86_64-linux\" or \"aarch64-darwin\"."
@@ -414,17 +463,22 @@ Returns a string like \"x86_64-linux\" or \"aarch64-darwin\"."
   "Convert ARCH string to Rust target triple.
 E.g., \"x86_64-linux\" -> \"x86_64-unknown-linux-musl\".
 Linux targets use musl for fully static binaries."
-  (or (cdr (assoc arch tramp-rpc-deploy--artifact-targets))
+  (or (tramp-rpc-deploy--rust-target-for-arch arch)
       (signal 'remote-file-error (list "Unknown architecture" arch))))
+
+(defun tramp-rpc-deploy--platform-supported-p (arch)
+  "Return non-nil when ARCH has an official release artifact."
+  (and (tramp-rpc-deploy--rust-target-for-arch arch) t))
 
 (defun tramp-rpc-deploy--source-root ()
   "Return the configured source root as a directory name, or nil."
   (when tramp-rpc-deploy-source-directory
     (file-name-as-directory (expand-file-name tramp-rpc-deploy-source-directory))))
 
-(defun tramp-rpc-deploy--source-has-server-p ()
-  "Return non-nil if the configured source directory has Rust server sources."
-  (let ((root (tramp-rpc-deploy--source-root)))
+(defun tramp-rpc-deploy--source-has-server-p (&optional source-root)
+  "Return non-nil if SOURCE-ROOT has the Rust server sources.
+When SOURCE-ROOT is nil, inspect `tramp-rpc-deploy-source-directory'."
+  (let ((root (or source-root (tramp-rpc-deploy--source-root))))
     (and root
          (file-exists-p (expand-file-name "Cargo.toml" root))
          (file-directory-p (expand-file-name "server" root)))))
@@ -434,9 +488,10 @@ Linux targets use musl for fully static binaries."
   (let ((root (tramp-rpc-deploy--source-root)))
     (and root (locate-dominating-file root ".git"))))
 
-(defun tramp-rpc-deploy--source-file-list ()
-  "Return files that affect the server build, relative to source root."
-  (let* ((root (tramp-rpc-deploy--source-root))
+(defun tramp-rpc-deploy--source-file-list (&optional source-root)
+  "Return files that affect the server build, relative to SOURCE-ROOT.
+When SOURCE-ROOT is nil, inspect `tramp-rpc-deploy-source-directory'."
+  (let* ((root (or source-root (tramp-rpc-deploy--source-root)))
          (files nil))
     (when root
       (dolist (name '("Cargo.toml" "Cargo.lock"))
@@ -497,7 +552,7 @@ preserve timestamps."
   (when (and (memq tramp-rpc-deploy-git-build-policy '(auto build))
              tramp-rpc-deploy-source-directory
              (not (tramp-rpc-deploy--source-has-server-p)))
-    (format "Source directory %s does not contain Cargo.toml and server/; using release binary id %s.  Set `tramp-rpc-deploy-source-directory' to the package checkout if this is a git install."
+    (format "Source directory %s does not contain Cargo.toml and server/; using release binary id %s.  Release source archives will be used for remote builds.  Set `tramp-rpc-deploy-source-directory' to the package checkout if this is a git install."
             (abbreviate-file-name (tramp-rpc-deploy--source-root))
             tramp-rpc-deploy-version)))
 
@@ -559,15 +614,23 @@ TARGET/release without requiring a rebuild, while skipping obviously stale
 outputs whose mtime predates the source files."
   (when (and (tramp-rpc-deploy--source-root)
              (tramp-rpc-deploy--source-has-server-p))
-    (let* ((target (tramp-rpc-deploy--arch-to-rust-target arch))
-           (path (expand-file-name
-                  (format "target/%s/release/%s"
-                          target tramp-rpc-deploy-binary-name)
-                  (tramp-rpc-deploy--source-root))))
-      (when (and (file-exists-p path)
-                 (file-executable-p path)
-                 (tramp-rpc-deploy--newer-than-source-p path))
-        path))))
+    (let* ((target (tramp-rpc-deploy--rust-target-for-arch arch))
+           (output-directory
+            (cond
+             (target (format "target/%s/release" target))
+             ;; An unqualified target/release is only native to the local
+             ;; host.  Never reuse it for an unknown remote architecture.
+             ((string= arch (tramp-rpc-deploy--detect-local-arch))
+              "target/release"))))
+      (when output-directory
+        (let* ((root (tramp-rpc-deploy--source-root))
+               (path (expand-file-name
+                      tramp-rpc-deploy-binary-name
+                      (expand-file-name output-directory root))))
+          (when (and (file-exists-p path)
+                     (file-executable-p path)
+                     (tramp-rpc-deploy--newer-than-source-p path))
+            path))))))
 
 (defun tramp-rpc-deploy--remote-binary-path (vec)
   "Return the remote path where the binary should be installed for VEC."
@@ -597,6 +660,12 @@ outputs whose mtime predates the source files."
           tramp-rpc-deploy-github-repo
           tramp-rpc-deploy-version
           (tramp-rpc-deploy--release-asset-name arch)))
+
+(defun tramp-rpc-deploy--source-download-url ()
+  "Return the URL for the source archive matching the package version."
+  (format tramp-rpc-deploy-source-url-format
+          tramp-rpc-deploy-github-repo
+          tramp-rpc-deploy-version))
 
 (defun tramp-rpc-deploy--checksum-url (arch)
   "Return the checksum file URL for binary of ARCH."
@@ -817,7 +886,64 @@ release artifact into the cache."
           (delete-directory temp-dir t)
         (file-missing nil)))))
 
-;; ============================================================================
+(defun tramp-rpc-deploy--safe-source-archive-member-p (member)
+  "Return non-nil when MEMBER cannot escape an extraction directory."
+  (and (not (file-name-absolute-p member))
+       (not (string-match-p
+             "\\(?:\\`\\|/\\)\\.\\.\\(?:/\\|\\'\\)" member))))
+
+(defun tramp-rpc-deploy--extract-source-tarball (tarball dest-dir)
+  "Extract a tagged source TARBALL below DEST-DIR and return its root.
+The source archive is expected to contain one top-level directory with the
+workspace Cargo.toml and server directory.  Reject archive members with
+paths that could escape DEST-DIR."
+  (make-directory dest-dir t)
+  (with-temp-buffer
+    (unless (and (zerop (call-process "tar" nil t nil "-tzf" tarball))
+                 (cl-every #'tramp-rpc-deploy--safe-source-archive-member-p
+                           (split-string (buffer-string) "[\r\n]+" t)))
+      (signal 'remote-file-error
+              (list "Release source archive has invalid archive entries"))))
+  (unless (zerop (call-process "tar" nil nil nil "-xzf" tarball
+                               "-C" dest-dir))
+    (signal 'remote-file-error
+            (list "Failed to extract release source archive")))
+  (let ((roots (cl-remove-if-not #'file-directory-p
+                                 (directory-files dest-dir t "\\`[^.]"))))
+    (when (and (= (length roots) 1)
+               (tramp-rpc-deploy--source-has-server-p (car roots)))
+      (file-name-as-directory (car roots)))))
+
+(defun tramp-rpc-deploy--with-release-source-directory (function)
+  "Call FUNCTION with the matching release source directory configured.
+The downloaded archive and extracted source are removed after FUNCTION
+returns or signals."
+  (unless tramp-rpc-deploy-source-directory
+    (signal 'remote-file-error
+            (list "Source builds are disabled by `tramp-rpc-deploy-source-directory'")))
+  (let* ((temp-dir (make-temp-file "tramp-rpc-source-" t))
+         (tarball (expand-file-name "source.tar.gz" temp-dir))
+         (extract-dir (expand-file-name "extract" temp-dir)))
+    (unwind-protect
+        (progn
+          (message "Downloading tramp-rpc source archive for v%s..."
+                   tramp-rpc-deploy-version)
+          (unless (tramp-rpc-deploy--download-file
+                   (tramp-rpc-deploy--source-download-url) tarball)
+            (signal 'remote-file-error
+                    (list "Release source archive download failed"
+                          (tramp-rpc-deploy--source-download-url))))
+          (let ((source-root
+                 (tramp-rpc-deploy--extract-source-tarball
+                  tarball extract-dir)))
+            (unless source-root
+              (signal 'remote-file-error
+                      (list "Release source archive has no usable Rust workspace")))
+            (let ((tramp-rpc-deploy-source-directory source-root))
+              (funcall function))))
+      (ignore-errors (delete-directory temp-dir t)))))
+
+;;; ============================================================================
 ;;; Build from source
 ;; ============================================================================
 
@@ -825,44 +951,98 @@ release artifact into the cache."
   "Check if cargo (Rust) is available."
   (executable-find "cargo"))
 
+(defun tramp-rpc-deploy--rust-version-from-output (output)
+  "Return the Rust version from rustc OUTPUT, or \"unknown\"."
+  (if (string-match "\\brustc \\([0-9]+\\(?:\\.[0-9]+\\)*\\)" output)
+      (match-string 1 output)
+    "unknown"))
+
+(defun tramp-rpc-deploy--local-rust-toolchain-version ()
+  "Return the local rustc version when a usable Rust toolchain exists.
+Both Cargo and rustc must be executable.  A successful toolchain command with
+an unexpected version format is still usable and is reported as \"unknown\"."
+  (when (and (tramp-rpc-deploy--cargo-available-p)
+             (executable-find "rustc"))
+    (with-temp-buffer
+      (let ((cargo-status (call-process "cargo" nil t nil "--version"))
+            (rustc-status (call-process "rustc" nil t nil "--version")))
+        (when (and (integerp cargo-status)
+                   (zerop cargo-status)
+                   (integerp rustc-status)
+                   (zerop rustc-status))
+          (tramp-rpc-deploy--rust-version-from-output (buffer-string)))))))
+
 (defun tramp-rpc-deploy--can-build-for-arch-p (arch)
   "Check if we can build for ARCH on this system.
-Cross-compilation requires additional setup, so we only build natively."
+Local builds are deliberately native; a different target is handled by the
+remote source-build fallback instead of requiring cross-compilation setup."
   (string= arch (tramp-rpc-deploy--detect-local-arch)))
+
+(defun tramp-rpc-deploy--confirm-source-build (arch toolchain location)
+  "Confirm a source build for ARCH using TOOLCHAIN at LOCATION.
+Explicit installations ask before building an unknown platform.  Automatic
+deployment proceeds and lets Cargo report whether the platform is usable."
+  (let ((version (or toolchain "unknown")))
+    (if (tramp-rpc-deploy--platform-supported-p arch)
+        (progn
+          (message "Building tramp-rpc-server for %s on %s using Rust toolchain %s"
+                   arch location version)
+          t)
+      (if tramp-rpc-deploy--allow-prompt
+          (if (y-or-n-p
+               (format
+                "Platform %s might not be supported.  Build tramp-rpc-server on %s using Rust toolchain %s? "
+                arch location version))
+              t
+            (signal
+             'remote-file-error
+             (list (format "Source build for platform %s was not confirmed"
+                           arch))))
+        (message
+         "Building tramp-rpc-server for %s on %s using Rust toolchain %s"
+         arch location version)
+        t))))
 
 (defun tramp-rpc-deploy--build-binary (arch)
   "Build the binary for ARCH from source.
 Returns the path to the binary on success, nil on failure."
-  (unless tramp-rpc-deploy-source-directory
-    (signal 'remote-file-error (list "Source directory not configured")))
+  (unless (tramp-rpc-deploy--source-has-server-p)
+    (signal 'remote-file-error
+            (list "Source directory does not contain the Rust server sources")))
   (unless (tramp-rpc-deploy--cargo-available-p)
     (signal 'remote-file-error (list "Rust toolchain (cargo) not found")))
   (unless (tramp-rpc-deploy--can-build-for-arch-p arch)
     (signal
      'remote-file-error
      (list "Cannot cross-compile for" arch "on"
-	   (tramp-rpc-deploy--detect-local-arch))))
+           (tramp-rpc-deploy--detect-local-arch))))
 
-  (let* ((default-directory tramp-rpc-deploy-source-directory)
-         (target (tramp-rpc-deploy--arch-to-rust-target arch))
+  (let* ((toolchain (tramp-rpc-deploy--local-rust-toolchain-version))
+         (default-directory tramp-rpc-deploy-source-directory)
+         (target (tramp-rpc-deploy--rust-target-for-arch arch))
          (cache-path (tramp-rpc-deploy--local-cache-path arch))
+         (output-directory
+          (if target
+              (format "target/%s/release" target)
+            "target/release"))
          (build-output (expand-file-name
-                        (format "target/%s/release/%s"
-                                target tramp-rpc-deploy-binary-name)
+                        (expand-file-name tramp-rpc-deploy-binary-name
+                                           output-directory)
                         tramp-rpc-deploy-source-directory))
          (build-buffer (get-buffer-create "*tramp-rpc-build*")))
 
+    (tramp-rpc-deploy--confirm-source-build arch toolchain "the local host")
     (message "Building tramp-rpc-server for %s (this may take a minute)..." arch)
 
     (with-current-buffer build-buffer
       (erase-buffer))
 
-    (let ((exit-code
-           (call-process "cargo" nil build-buffer nil
-                         "build" "--release"
-                         "--target" target
-                         "--manifest-path"
-                         (expand-file-name "Cargo.toml" tramp-rpc-deploy-source-directory))))
+    (let* ((args (append '("build" "--release")
+                         (when target (list "--target" target))
+                         (list "--manifest-path"
+                               (expand-file-name
+                                "Cargo.toml" tramp-rpc-deploy-source-directory))))
+           (exit-code (apply #'call-process "cargo" nil build-buffer nil args)))
       (if (zerop exit-code)
           (progn
             ;; Promote only a complete binary with its recorded digest.
@@ -875,29 +1055,443 @@ Returns the path to the binary on success, nil on failure."
 	   'remote-file-error
 	   (list (format "Build failed (exit %d):\n%s" exit-code (buffer-string)))))))))
 
-;; ============================================================================
+(defun tramp-rpc-deploy--remote-path-prefix (vec)
+  "Return a shell prefix exporting TRAMP's resolved remote PATH for VEC.
+`tramp-get-remote-path' resolves `tramp-remote-path', including the login
+shell environment represented by `tramp-own-remote-path'.  Commands sent
+through the existing bootstrap shell do not automatically inherit that
+resolved value, so export it explicitly for the source build."
+  (when-let* ((remote-path
+              (condition-case nil
+                  (tramp-get-remote-path vec)
+                (error nil)))
+              (path (mapconcat #'identity remote-path ":")))
+    (format "PATH=%s:$PATH; export PATH; "
+            (tramp-shell-quote-argument path))))
+
+(defun tramp-rpc-deploy--remote-rust-toolchain-version (vec)
+  "Return the remote rustc version for VEC, or nil if Cargo is unusable."
+  (setq tramp-rpc-deploy--remote-rust-toolchain-diagnostic nil)
+  (let ((inhibit-message nil))
+    (message "Checking for Cargo and rustc on %s..."
+             (tramp-file-name-host vec)))
+  (condition-case err
+      (let ((command
+             (concat (or (tramp-rpc-deploy--remote-path-prefix vec) "")
+                     "if command -v cargo >/dev/null 2>&1 && "
+                     "command -v rustc >/dev/null 2>&1; then "
+                     "cargo --version && rustc --version; fi")))
+        ;; `tramp-send-command-and-read' is only for commands which print a
+        ;; Lisp expression.  Version commands print ordinary shell text, so
+        ;; use the status-checking API and read its raw connection buffer.
+        (if (tramp-send-command-and-check vec command)
+            (with-current-buffer (tramp-get-connection-buffer vec)
+              (let ((output (buffer-string)))
+                (if (string-match
+                     "\\brustc \\([0-9]+\\(?:\\.[0-9]+\\)*\\)"
+                     output)
+                    (tramp-rpc-deploy--rust-version-from-output output)
+                  (setq tramp-rpc-deploy--remote-rust-toolchain-diagnostic
+                        (if (string-empty-p (string-trim output))
+                            "cargo and rustc were not both found on the remote PATH"
+                          "cargo and rustc did not return a usable rustc version"))
+                  nil)))
+          (setq tramp-rpc-deploy--remote-rust-toolchain-diagnostic
+                "the remote Cargo/rustc probe command failed")
+          nil))
+    (error
+     (setq tramp-rpc-deploy--remote-rust-toolchain-diagnostic
+           (format "the remote Cargo/rustc probe failed: %s"
+                   (error-message-string err)))
+     (tramp-rpc-deploy--log "Rust toolchain probe failed on %s: %s"
+                            (tramp-file-name-host vec)
+                            tramp-rpc-deploy--remote-rust-toolchain-diagnostic)
+     nil)))
+
+(defun tramp-rpc-deploy--remote-source-directories (files root)
+  "Return remote source directories needed for FILES below ROOT."
+  (delete-dups
+   (delq nil
+         (mapcar
+          (lambda (file)
+            (let ((directory
+                   (file-name-directory (file-relative-name file root))))
+              (when directory
+                (directory-file-name directory))))
+          files))))
+
+(defun tramp-rpc-deploy--copy-source-files-to-remote (vec remote-root root files)
+  "Copy FILES from ROOT below REMOTE-ROOT on VEC, one file at a time.
+This is the compatibility path for hosts without a usable local or remote
+tar command."
+  (let ((directories (tramp-rpc-deploy--remote-source-directories files root)))
+    (let ((directory-arguments
+           (mapconcat
+            (lambda (directory)
+              (tramp-shell-quote-argument
+               (expand-file-name directory remote-root)))
+            directories " ")))
+      (unless (tramp-send-command-and-check
+               vec
+               (format "mkdir -p %s"
+                       (tramp-shell-quote-argument remote-root)))
+        (signal 'remote-file-error (list "Could not create remote source directory")))
+      (when (and directories
+                 (not (tramp-send-command-and-check
+                       vec (format "mkdir -p %s" directory-arguments))))
+        (signal 'remote-file-error
+                (list "Could not create remote source subdirectories"))))
+    (dolist (file files)
+      (let* ((relative (file-relative-name file root))
+             (remote-file (expand-file-name relative remote-root))
+             (remote-path (tramp-make-tramp-file-name vec remote-file)))
+        ;; Tramp normally suspends timers while it owns the connection.  The
+        ;; source-copy reporter only updates the minibuffer, so keep its timer
+        ;; live without allowing another Tramp progress reporter to re-enter.
+        (let ((tramp-dont-suspend-timers t)
+              (tramp-inhibit-progress-reporter t))
+          (copy-file file remote-path t))))))
+
+(defun tramp-rpc-deploy--make-source-archive (root files)
+  "Create a tar archive containing FILES below ROOT.
+Return the temporary archive path, or signal when the archive cannot be
+created.  The archive is deliberately uncompressed: eliminating the
+per-file SSH handshakes dominates this transfer, and remote source-build
+hosts are only assumed to provide the basic tar extractor."
+  (unless (executable-find "tar")
+    (signal 'remote-file-error
+            (list "Local tar command is unavailable for source transfer")))
+  (let* ((archive (make-temp-file "tramp-rpc-source-" nil ".tar"))
+         (output (generate-new-buffer " *tramp-rpc-source-archive*"))
+         (relative-files (mapcar (lambda (file)
+                                   (file-relative-name file root))
+                                 files))
+         (success nil))
+    (unwind-protect
+        (let ((exit-code
+               (apply #'call-process
+                      "tar" nil output nil
+                      (append (list "-cf" archive "-C" root "--")
+                              relative-files))))
+          (if (and (integerp exit-code) (zerop exit-code))
+              (progn
+                (setq success t)
+                archive)
+            (let ((details (with-current-buffer output
+                             (string-trim (buffer-string)))))
+              (signal
+               'remote-file-error
+               (list (format "Could not create source archive%s"
+                             (if (string-empty-p details)
+                                 ""
+                               (concat ": " details))))))))
+      (unless success
+        (ignore-errors (delete-file archive)))
+      (when (buffer-live-p output)
+        (kill-buffer output)))))
+
+(defun tramp-rpc-deploy--copy-source-to-remote (vec remote-root)
+  "Copy the build-relevant source tree below REMOTE-ROOT on VEC.
+Use one tar transfer followed by one remote extraction so high-latency SSH
+connections do not pay a connection setup for every source file.  Fall back
+to the original per-file transfer when tar is unavailable on either side."
+  (let* ((root (tramp-rpc-deploy--source-root))
+         (files (tramp-rpc-deploy--source-file-list))
+         (archive nil)
+         (remote-archive (expand-file-name ".tramp-rpc-source.tar" remote-root)))
+    (unless (and root files)
+      (signal 'remote-file-error
+              (list "Source directory is unavailable or contains no server sources")))
+    (condition-case archive-error
+        (setq archive (tramp-rpc-deploy--make-source-archive root files))
+      (remote-file-error
+       (tramp-rpc-deploy--log "Source archive unavailable; using serial copy: %s"
+                              (error-message-string archive-error))))
+    (if (not archive)
+        (tramp-rpc-deploy--copy-source-files-to-remote vec remote-root root files)
+      (unwind-protect
+          (progn
+            (let ((tramp-dont-suspend-timers t)
+                  (tramp-inhibit-progress-reporter t))
+              (copy-file archive
+                         (tramp-make-tramp-file-name vec remote-archive)
+                         t))
+            (if (tramp-send-command-and-check
+                 vec
+                 (format "tar -xf %s -C %s"
+                         (tramp-shell-quote-argument remote-archive)
+                         (tramp-shell-quote-argument remote-root)))
+                t
+              (tramp-rpc-deploy--log
+               "Remote tar extraction unavailable; using serial source copy")
+              (tramp-rpc-deploy--copy-source-files-to-remote
+               vec remote-root root files)))
+        (delete-file archive)))))
+
+(defun tramp-rpc-deploy--run-with-progress-reporter
+    (vec arch function &optional progress-message)
+  "Call FUNCTION while reporting a remote build for ARCH on VEC.
+This uses a local reporter instead of `with-tramp-progress-reporter'.
+Deployment is invoked from inside a TRAMP file operation, where TRAMP can
+intentionally suppress its nested progress reporters and messages.  The
+operation is synchronous, so FUNCTION receives a tick function which it should
+call while waiting for the remote command.  PROGRESS-MESSAGE overrides the
+default build message and is used for source transfer progress."
+  (if noninteractive
+      (funcall function nil)
+    (let* ((text (or progress-message
+                     (format "Building tramp-rpc-server remotely for %s on %s"
+                             arch (tramp-file-name-host vec))))
+           (reporter
+            ;; This status is specifically the long-running operation the
+            ;; user initiated.  Do not inherit TRAMP's message suppression.
+            (let ((inhibit-message nil))
+              (make-progress-reporter text nil nil nil nil 0.2)))
+           (last-update nil))
+      (cl-labels
+          ((tick ()
+             (let ((now (float-time)))
+               (when (or (null last-update)
+                         (>= (- now last-update) 0.5))
+                 (setq last-update now)
+                 (let ((inhibit-message nil))
+                   (progress-reporter-force-update reporter))
+                 ;; The caller may currently be in a minibuffer.  TRAMP's
+                 ;; normal wait loop uses `nodisp', so redisplay explicitly.
+                 (redisplay t)))))
+        (let ((timer (run-at-time 0.2 0.2 #'tick)))
+          (unwind-protect
+              (progn
+                (tick)
+                (funcall function #'tick))
+            (cancel-timer timer)
+            (let ((inhibit-message nil)
+                  (message-log-max nil))
+              (progress-reporter-done reporter))))))))
+
+(defun tramp-rpc-deploy--send-command-and-check-with-progress
+    (vec command tick)
+  "Send COMMAND on VEC and call TICK while waiting for its exit status.
+Unlike `tramp-send-command-and-check', this wait does not use
+`tramp-accept-process-output', whose timer suspension prevents a progress
+reporter from moving during a long remote build.  It is intentionally limited
+to the Cargo build command; the regular TRAMP command path remains unchanged."
+  (let* ((process (tramp-get-connection-process vec))
+         (buffer (tramp-get-connection-buffer vec))
+         (status-regexp "tramp_rpc_build_exit_status \\([0-9]+\\)")
+         status)
+    ;; Start the command without waiting for the shell prompt.  Preserve
+    ;; Cargo's stderr in the connection buffer so a failed build can report
+    ;; the compiler diagnostics to the user.
+    (tramp-send-command
+     vec
+     (concat command
+             "; printf '\\ntramp_rpc_build_exit_status %s\\n' $?")
+     nil t)
+    (with-current-buffer buffer
+      (while (and (null status) (process-live-p process))
+        (when (tramp-check-for-regexp process status-regexp)
+          (let ((status-start (match-beginning 0)))
+            (setq status (string-to-number (match-string-no-properties 1)))
+            ;; Keep build diagnostics in the connection buffer, but remove
+            ;; the private status marker and the shell prompt that follows it.
+            (goto-char status-start)
+            (delete-region status-start (point-max))))
+        (unless status
+          (funcall tick)
+          (with-local-quit
+            ;; A short timeout gives the reporter a chance to move even when
+            ;; Cargo produces no output for a while.  `with-local-quit' keeps
+            ;; C-g responsive and propagates the quit to the caller.
+            (accept-process-output process 0.1 nil t))))
+      (unless status
+        (signal 'remote-file-error
+                (list "Remote Cargo build process exited before reporting status")))
+      (zerop status))))
+
+(defun tramp-rpc-deploy--build-binary-on-remote (vec arch)
+  "Build and install the server for ARCH using VEC's native Rust toolchain.
+The source is copied to a private temporary directory on the remote host and
+removed after installation, leaving only the versioned deployed binary."
+  (unless (tramp-rpc-deploy--source-has-server-p)
+    (signal 'remote-file-error (list "Source directory not configured")))
+  (let* ((toolchain (tramp-rpc-deploy--remote-rust-toolchain-version vec))
+         (diagnostic
+          (or tramp-rpc-deploy--remote-rust-toolchain-diagnostic
+              "cargo and rustc were not both found on the remote PATH"))
+         (host (tramp-file-name-host vec)))
+    (unless toolchain
+      (let ((inhibit-message nil))
+        (message "Remote source build unavailable on %s: %s" host diagnostic))
+      (signal 'remote-file-error
+              (list (format "No usable remote Rust toolchain on %s: %s"
+                            host diagnostic))))
+    (tramp-rpc-deploy--confirm-source-build arch toolchain "the remote host")
+    (let* ((remote-path (tramp-rpc-deploy--remote-binary-path vec))
+           (remote-local (tramp-file-local-name remote-path))
+           (directory nil)
+           (build-output nil))
+      (unwind-protect
+          (progn
+            (setq directory
+                  (progn
+                    (unless
+                        (tramp-send-command-and-check
+                         vec "umask 077 && mktemp -d /tmp/tramp-rpc-build.XXXXXXXXXX")
+                      (signal 'remote-file-error
+                              (list "Could not create remote source-build directory")))
+                    (with-current-buffer (tramp-get-connection-buffer vec)
+                      (string-trim (buffer-string)))))
+            (unless (and (file-name-absolute-p directory)
+                         (string-match-p
+                          "\\`/tmp/tramp-rpc-build\\.[^/[:space:]]+\\'"
+                          directory))
+              (signal 'remote-file-error
+                      (list "Could not create remote source-build directory")))
+            (tramp-rpc-deploy--run-with-progress-reporter
+             vec arch
+             (lambda (_tick)
+               (tramp-rpc-deploy--copy-source-to-remote vec directory))
+             (format "Copying tramp-rpc-server sources to %s"
+                     (tramp-file-name-host vec)))
+            (setq build-output
+                  (expand-file-name
+                   (format "target/release/%s" tramp-rpc-deploy-binary-name)
+                   directory))
+            (let* ((manifest (tramp-shell-quote-argument
+                              (expand-file-name "Cargo.toml" directory)))
+                   (root (tramp-shell-quote-argument directory))
+                   (output (tramp-shell-quote-argument build-output))
+                   (destination (tramp-shell-quote-argument remote-local))
+                   (parent (tramp-shell-quote-argument
+                            (file-name-directory remote-local)))
+                   (path-prefix (or (tramp-rpc-deploy--remote-path-prefix vec)
+                                    ""))
+                   (command
+                    (format
+                     (concat "%s"
+                             "cd %s && cargo build --release --manifest-path %s && "
+                             "test -f %s && ! test -L %s && mkdir -p %s && "
+                             "chmod +x %s && "
+                             "if test ! -e %s && ! test -L %s; then "
+                             "mv -f %s %s; fi && "
+                             "test -f %s && ! test -L %s && test -x %s")
+                     path-prefix root manifest output output parent output
+                     destination destination output destination
+                     destination destination destination)))
+              (unless
+                  (tramp-rpc-deploy--run-with-progress-reporter
+                   vec arch
+                   (lambda (tick)
+                     (tramp-rpc-deploy--send-command-and-check-with-progress
+                      vec command tick)))
+                (let ((details
+                       (with-current-buffer (tramp-get-connection-buffer vec)
+                         (string-trim (buffer-string)))))
+                  (signal
+                   'remote-file-error
+                   (list (format "Remote source build failed%s"
+                                 (if (string-empty-p details)
+                                     ""
+                                   (concat ":\n" details))))))))
+            (message "Built and installed tramp-rpc-server for %s on %s"
+                     arch (tramp-file-name-host vec))
+            remote-path)
+        (when directory
+          (ignore-errors
+            (tramp-rpc-deploy--remove-remote-staging-directory vec directory)))))))
+
+(defun tramp-rpc-deploy--remote-source-build-available-p ()
+  "Return non-nil when a remote source build may be attempted.
+A configured source checkout is used directly.  For an archive/package
+installation, the configured default directory acts as the opt-in to obtain
+the matching release source archive.  Setting it to nil disables both forms
+of source build."
+  (and tramp-rpc-deploy-source-directory t))
+
+(defun tramp-rpc-deploy--ask-remote-source-build-action (vec arch)
+  "Ask whether to download or build remotely for supported ARCH on VEC.
+Return `download', `remote-build', or `skip'.  Return nil when the remote
+platform is unsupported, the source is unavailable, the remote toolchain is
+missing, or this is a noninteractive/reentrant deployment."
+  (when (and (not noninteractive)
+             (or tramp-rpc-deploy--allow-prompt
+                 (not tramp-rpc-deploy--explicit-target))
+             (tramp-rpc-deploy--platform-supported-p arch)
+             (tramp-rpc-deploy--remote-source-build-available-p))
+    (let ((toolchain (tramp-rpc-deploy--remote-rust-toolchain-version vec)))
+      (when toolchain
+        (pcase
+            (read-char-choice
+             (concat
+              (format
+               "TRAMP-RPC could not obtain a local server binary for %s.\n\n"
+               arch)
+              "  [d] Download the release binary\n"
+              (when (tramp-rpc-deploy--use-source-binary-id-p)
+                "      Warning: it may not exactly match the checked-out sources\n")
+              (format
+               "  [r] Build the sources remotely with Cargo (Rust toolchain %s)\n"
+               toolchain)
+              "  [s] Skip installation\n\n"
+              "Choice: ")
+             '(?d ?r ?s))
+          (?d 'download)
+          (?r 'remote-build)
+          (?s 'skip))))))
+
+(defun tramp-rpc-deploy--build-binary-on-remote-with-source-fallback
+    (vec arch)
+  "Build ARCH on VEC from a checkout or the matching release source archive."
+  (if (tramp-rpc-deploy--source-has-server-p)
+      (tramp-rpc-deploy--build-binary-on-remote vec arch)
+    (tramp-rpc-deploy--with-release-source-directory
+     (lambda ()
+       (tramp-rpc-deploy--build-binary-on-remote vec arch)))))
+
+;;; ============================================================================
 ;;; Main logic: ensure local binary exists
 ;; ============================================================================
 
-(defun tramp-rpc-deploy--ask-git-install-action (arch)
+(defun tramp-rpc-deploy--ask-git-install-action (arch &optional vec)
   "Ask how to obtain a git-checkout server binary for ARCH.
-Return `download', `build', or nil.  Building is offered only when Cargo is
-available and ARCH can be built natively."
+Return `download', `build', `remote-build', or nil.  A local build is offered
+when Cargo is available and ARCH can be built natively.  When VEC is supplied,
+a remote build is offered if the remote has a usable Rust toolchain."
   (unless tramp-rpc-deploy--allow-prompt
     (signal
      'remote-file-error
      (list
       "TRAMP-RPC needs a server binary for this git checkout.  Run M-x tramp-rpc-deploy-install-binary to choose whether to download or build it, or customize `tramp-rpc-deploy-git-build-policy' to `release' or `build'")))
-  (let* ((can-build (and (tramp-rpc-deploy--cargo-available-p)
+  (let* ((cargo-available (tramp-rpc-deploy--cargo-available-p))
+         (can-build (and cargo-available
                          (tramp-rpc-deploy--can-build-for-arch-p arch)))
-         (choices (if can-build '(?d ?b ?s) '(?d ?s)))
+         (remote-toolchain
+          (when (and vec
+                     (tramp-rpc-deploy--remote-source-build-available-p))
+            (tramp-rpc-deploy--remote-rust-toolchain-version vec)))
+         (can-build-remotely (and remote-toolchain t))
+         (choices (append '(?d)
+                          (when can-build '(?b))
+                          (when can-build-remotely '(?r))
+                          '(?s)))
          (build-line
           (cond
            (can-build "  [b] Build the checked-out sources with Cargo\n")
-           ((not (tramp-rpc-deploy--cargo-available-p))
+           ((not cargo-available)
             "      Build unavailable: Cargo was not found\n")
            (t
             (format "      Build unavailable: cannot build %s natively\n" arch))))
+         (remote-build-line
+          (cond
+           (can-build-remotely
+            (format "  [r] Build the checked-out sources remotely with Cargo for %s (Rust toolchain %s)\n"
+                    arch remote-toolchain))
+           ((and vec (tramp-rpc-deploy--remote-source-build-available-p))
+            (format "      Remote build unavailable on %s: %s\n"
+                    (tramp-file-name-host vec)
+                    (or tramp-rpc-deploy--remote-rust-toolchain-diagnostic
+                        "cargo and rustc were not both found on the remote PATH")))))
          (choice
           (read-char-choice
            (concat
@@ -905,17 +1499,19 @@ available and ARCH can be built natively."
             "  [d] Download the checksum-verified release binary\n"
             "      Warning: it may not exactly match the checked-out sources\n"
             build-line
+            (or remote-build-line "")
             "  [s] Skip and install the server manually\n\n"
             "Choice: ")
            choices)))
     (pcase choice
       (?d 'download)
       (?b 'build)
+      (?r 'remote-build)
       (?s nil))))
 
-(defun tramp-rpc-deploy--git-install-action (arch)
-  "Ask for the action used to obtain a git binary for ARCH."
-  (or (tramp-rpc-deploy--ask-git-install-action arch)
+(defun tramp-rpc-deploy--git-install-action (arch &optional vec)
+  "Ask for the action used to obtain a git binary for ARCH and optionally VEC."
+  (or (tramp-rpc-deploy--ask-git-install-action arch vec)
       (signal
        'remote-file-error
        (list "TRAMP-RPC server installation skipped; install it manually or run M-x tramp-rpc-deploy-install-binary again"))))
@@ -932,13 +1528,15 @@ available and ARCH can be built natively."
    (t
     '(download build))))
 
-(defun tramp-rpc-deploy--ensure-local-binary (arch)
-  "Ensure a local binary exists for ARCH.
+(defun tramp-rpc-deploy--ensure-local-binary (arch &optional install-action)
+  "Ensure a local binary exists for ARCH with optional INSTALL-ACTION.
 Tries in order:
 1. Check bundled binaries (useful for development)
 2. Check source-tree build output for source-build policies
 3. Check local cache
-4. Download from GitHub releases or build from source according to policy
+4. Download from GitHub releases or build from source according to policy.
+
+When INSTALL-ACTION is non-nil, use it as the acquisition method.
 
 Returns the path to the local binary."
   (let ((bundled-path (tramp-rpc-deploy--bundled-binary-path arch))
@@ -976,7 +1574,8 @@ Returns the path to the local binary."
 
      ;; Need to obtain binary
      (t
-      (let ((methods (tramp-rpc-deploy--obtain-methods arch))
+      (let ((methods (or (and install-action (list install-action))
+                         (tramp-rpc-deploy--obtain-methods arch)))
             (result nil)
             (errors nil))
 
@@ -1339,50 +1938,119 @@ an explicit error.  A missing remote binary never uses this fallback."
           ;; The pre-existing remote executable is a usable fallback only when
           ;; local artifact acquisition itself failed.  Once we have a trusted
           ;; artifact, retain strict checksum comparison and replacement.
-          (let* ((artifact
-                  (condition-case err
-                      (let* ((arch
-                              (tramp-rpc-deploy--detect-remote-arch bootstrap-vec))
-                             (local-binary
-                              (tramp-rpc-deploy--ensure-local-binary arch)))
-                        (list :arch arch :local-binary local-binary))
-                    (remote-file-error
-                     (if remote-present
-                         (list :unavailable err)
-                       (signal (car err) (cdr err))))))
-                 (arch (plist-get artifact :arch))
-                 (local-binary (plist-get artifact :local-binary)))
-            (if (eq (car artifact) :unavailable)
-                (progn
-                  (message
-                   "Using existing remote tramp-rpc-server; no trusted local artifact is available: %s"
-                   (error-message-string (cadr artifact)))
-                  remote-local)
-              (cond
-               ((and remote-present
-                     (tramp-rpc-deploy--remote-binary-matches-p
-                      bootstrap-vec local-binary))
-                remote-local)
-               (tramp-rpc-deploy-auto-deploy
-                (when remote-present
-                  (message "Existing remote tramp-rpc-server failed checksum verification; replacing it"))
-                (message "Deploying tramp-rpc-server (%s) to %s..."
-                         arch (tramp-file-name-host vec))
-                (tramp-file-local-name
-                 (tramp-rpc-deploy--transfer-binary bootstrap-vec local-binary)))
-               (remote-present
-                (signal
-                 'remote-file-error
-                 (list "Existing tramp-rpc-server on"
-                       (tramp-file-name-host vec)
-                       "failed checksum verification and auto-deploy is disabled"))))))))))))
+          (let* ((arch (tramp-rpc-deploy--detect-remote-arch bootstrap-vec))
+                 ;; An explicit install is the one place where the user can
+                 ;; choose a remote source build before local artifact lookup.
+                 ;; Automatic deployment retains the existing local-first,
+                 ;; remote-fallback behavior below.
+                 (install-action
+                  (when (and explicit
+                             (tramp-rpc-deploy--use-source-binary-id-p)
+                             (eq tramp-rpc-deploy-git-build-policy 'auto))
+                    (tramp-rpc-deploy--git-install-action
+                     arch bootstrap-vec)))
+                 (artifact
+                  (if (eq install-action 'remote-build)
+                      (list :remote-binary
+                            (tramp-rpc-deploy--build-binary-on-remote-with-source-fallback
+                             bootstrap-vec arch))
+                    (condition-case local-error
+                        (list :local-binary
+                              (if install-action
+                                  (tramp-rpc-deploy--ensure-local-binary
+                                   arch install-action)
+                                (tramp-rpc-deploy--ensure-local-binary arch)))
+                      (remote-file-error
+                       ;; A remote native build is the fallback for unsupported
+                       ;; platforms and for hosts that cannot be cross-compiled
+                       ;; by the local toolchain.  An existing executable is
+                       ;; already a usable fallback, and remote building is
+                       ;; itself a deployment, so only try it for a missing
+                       ;; binary when auto-deploy is enabled.
+                       (if (and (not remote-present)
+                                tramp-rpc-deploy-auto-deploy
+                                (tramp-rpc-deploy--remote-source-build-available-p))
+                           (pcase (tramp-rpc-deploy--ask-remote-source-build-action
+                                   bootstrap-vec arch)
+                             ('download
+                              (condition-case download-error
+                                  (list :local-binary
+                                        (tramp-rpc-deploy--ensure-local-binary
+                                         arch 'download))
+                                (remote-file-error
+                                 (signal
+                                  'remote-file-error
+                                  (list
+                                   (format
+                                    "Local artifact and release download failed for %s.\n\nLocal error: %s\n\nDownload error: %s"
+                                    arch
+                                    (error-message-string local-error)
+                                    (error-message-string download-error)))))))
+                             ('skip
+                              (signal
+                               'remote-file-error
+                               (list
+                                (format
+                                 "Deployment skipped for %s.\n\nLocal artifact error: %s"
+                                 arch
+                                 (error-message-string local-error)))))
+                             (_
+                              (message
+                               "No usable local artifact for %s; trying a native source build on %s"
+                               arch (tramp-file-name-host bootstrap-vec))
+                              (condition-case remote-error
+                                  (list :remote-binary
+                                        (tramp-rpc-deploy--build-binary-on-remote-with-source-fallback
+                                         bootstrap-vec arch))
+                                (remote-file-error
+                                 (if remote-present
+                                     (list :unavailable local-error)
+                                   (signal
+                                    'remote-file-error
+                                    (list
+                                     (format
+                                      "Local artifact and remote source build failed for %s.\n\nLocal error: %s\n\nRemote error: %s"
+                                      arch
+                                      (error-message-string local-error)
+                                      (error-message-string remote-error)))))))))
+                         (if remote-present
+                             (list :unavailable local-error)
+                           (signal (car local-error) (cdr local-error))))))))
+                 (local-binary (plist-get artifact :local-binary))
+                 (remote-binary (plist-get artifact :remote-binary)))
+            (cond
+             ((eq (car artifact) :unavailable)
+              (message
+               "Using existing remote tramp-rpc-server; no trusted local artifact is available: %s"
+               (error-message-string (cadr artifact)))
+              remote-local)
+             (remote-binary
+              (message "Using remotely built tramp-rpc-server for %s" arch)
+              remote-local)
+             ((and remote-present
+                   (tramp-rpc-deploy--remote-binary-matches-p
+                    bootstrap-vec local-binary))
+              remote-local)
+             (tramp-rpc-deploy-auto-deploy
+              (when remote-present
+                (message "Existing remote tramp-rpc-server failed checksum verification; replacing it"))
+              (message "Deploying tramp-rpc-server (%s) to %s..."
+                       arch (tramp-file-name-host vec))
+              (tramp-file-local-name
+               (tramp-rpc-deploy--transfer-binary bootstrap-vec local-binary)))
+             (remote-present
+              (signal
+               'remote-file-error
+               (list "Existing tramp-rpc-server on"
+                     (tramp-file-name-host vec)
+                     "failed checksum verification and auto-deploy is disabled")))))))))))
 
 ;;;###autoload
 (defun tramp-rpc-deploy-install-binary (vec &optional force)
   "Interactively obtain and deploy tramp-rpc-server for remote VEC.
-For git checkouts using the `auto' policy, this is the only entry point that
-may ask whether to download a release binary or build the checked-out sources.
-Automatic file operations never open this prompt.
+For git checkouts using the `auto' policy, this asks whether to download a
+release binary, build the checked-out sources locally or remotely when
+available, or skip installation.
 
 With prefix argument FORCE, replace an existing remote or cached artifact and
 ask again in `auto' mode.  Explicit installation overrides
@@ -1394,6 +2062,12 @@ ask again in `auto' mode.  Explicit installation overrides
          current-prefix-arg))
   (when tramp-rpc-deploy-never-deploy
     (user-error "Deployment is disabled by `tramp-rpc-deploy-never-deploy'"))
+  ;; An explicit installation is the user's request to try again now, even if
+  ;; a preceding completion probe cached a failed connection attempt.  Keep
+  ;; this optional so the autoloaded deployment module remains usable before
+  ;; the main tramp-rpc module has been loaded.
+  (when (fboundp 'tramp-rpc--clear-connection-failure)
+    (tramp-rpc--clear-connection-failure vec))
   (let ((tramp-rpc-deploy--explicit-target (tramp-rpc-deploy--target-key vec))
         (tramp-rpc-deploy--explicit-force force)
         (tramp-rpc-deploy--pre-explicit-auto-deploy tramp-rpc-deploy-auto-deploy))

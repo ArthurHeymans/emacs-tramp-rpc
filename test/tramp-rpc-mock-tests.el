@@ -1208,6 +1208,16 @@ This matches the behavior expected by `tramp-test28-process-file'."
                   "tramp-rpc-deploy" (url dest))
 (declare-function tramp-rpc-deploy--default-source-directory
                   "tramp-rpc-deploy" ())
+(declare-function tramp-rpc-deploy--source-download-url
+                  "tramp-rpc-deploy" ())
+(declare-function tramp-rpc-deploy--source-build-output-path
+                  "tramp-rpc-deploy" (arch))
+(declare-function tramp-rpc-deploy--extract-source-tarball
+                  "tramp-rpc-deploy" (tarball dest-dir))
+(declare-function tramp-rpc-deploy--build-binary-on-remote-with-source-fallback
+                  "tramp-rpc-deploy" (vec arch))
+(declare-function tramp-rpc-deploy--ask-remote-source-build-action
+                  "tramp-rpc-deploy" (vec arch))
 (defconst tramp-rpc-mock-test--tramp-rpc-loaded t
   "The full TRAMP-RPC backend was loaded successfully.")
 
@@ -2499,7 +2509,7 @@ This matches the behavior expected by `tramp-test28-process-file'."
     (unwind-protect
         (progn
           (with-temp-file wrapper
-            (insert "#!/bin/bash\nargs=()\nfor arg in \"$@\"; do\n"
+            (insert "#!/usr/bin/env bash\nargs=()\nfor arg in \"$@\"; do\n"
                     "  if [[ $arg == */test/tramp-rpc-mock-tests.el ]]; then\n"
                     "    args+=(\"$RUNNER_TEST_FILE\")\n  else\n"
                     "    args+=(\"$arg\")\n  fi\ndone\n"
@@ -4897,6 +4907,124 @@ This matches the behavior expected by `tramp-test28-process-file'."
                            (file-name-as-directory dir)))))
       (delete-directory dir t))))
 
+(ert-deftest tramp-rpc-mock-test-deploy-default-source-keeps-archive-package-root ()
+  "Test archive installs keep their package directory as the source anchor."
+  :tags '(:deploy)
+  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
+  (let* ((dir (make-temp-file "tramp-rpc-package" t))
+         (source (expand-file-name "tramp-rpc-deploy.el" dir)))
+    (unwind-protect
+        (progn
+          (with-temp-file source
+            (insert ";; archive package\n"))
+          (let ((load-file-name source))
+            (should (equal (file-name-as-directory
+                            (tramp-rpc-deploy--default-source-directory))
+                           (file-name-as-directory dir)))))
+      (delete-directory dir t))))
+
+(ert-deftest tramp-rpc-mock-test-deploy-release-source-url ()
+  "Test the source archive URL follows the package release version."
+  :tags '(:deploy)
+  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
+  (let ((tramp-rpc-deploy-github-repo "example/tramp-rpc")
+        (tramp-rpc-deploy-version "9.9.9"))
+    (should (equal (tramp-rpc-deploy--source-download-url)
+                   "https://github.com/example/tramp-rpc/archive/refs/tags/v9.9.9.tar.gz"))))
+
+(ert-deftest tramp-rpc-mock-test-deploy-release-source-fallback ()
+  "Test archive installs obtain the matching source for a remote build."
+  :tags '(:deploy)
+  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
+  (let* ((package-dir (make-temp-file "tramp-rpc-package" t))
+         (tramp-rpc-deploy-source-directory package-dir)
+         (tramp-rpc-deploy-github-repo "example/tramp-rpc")
+         (tramp-rpc-deploy-version "9.9.9")
+         downloaded-url
+         extracted-source
+         built-from-source)
+    (unwind-protect
+        (cl-letf (((symbol-function 'tramp-rpc-deploy--download-file)
+                   (lambda (url dest)
+                     (setq downloaded-url url)
+                     (with-temp-file dest
+                       (insert "source archive"))
+                     t))
+                  ((symbol-function 'tramp-rpc-deploy--extract-source-tarball)
+                   (lambda (_tarball dest)
+                     (setq extracted-source
+                           (expand-file-name "emacs-tramp-rpc-9.9.9" dest))
+                     (make-directory (expand-file-name "server" extracted-source) t)
+                     (with-temp-file (expand-file-name "Cargo.toml" extracted-source))
+                     extracted-source))
+                  ((symbol-function 'tramp-rpc-deploy--build-binary-on-remote)
+                   (lambda (_vec _arch)
+                     (setq built-from-source
+                           (list tramp-rpc-deploy-source-directory
+                                 (tramp-rpc-deploy--source-has-server-p)))
+                     "/tmp/tramp-rpc-server")))
+          (should (equal
+                   (tramp-rpc-deploy--build-binary-on-remote-with-source-fallback
+                    'vec "x86_64-freebsd")
+                   "/tmp/tramp-rpc-server"))
+          (should (equal downloaded-url
+                         "https://github.com/example/tramp-rpc/archive/refs/tags/v9.9.9.tar.gz"))
+          (should (equal (car built-from-source) extracted-source))
+          (should (cadr built-from-source)))
+      ;; The temporary source archive is cleaned up after the remote build.
+      (should-not (and extracted-source (file-exists-p extracted-source)))
+      (delete-directory package-dir t))))
+
+(ert-deftest tramp-rpc-mock-test-deploy-unknown-arch-does-not-reuse-native-output ()
+  "Test an unknown remote architecture cannot reuse target/release blindly."
+  :tags '(:deploy)
+  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
+  (let* ((source (make-temp-file "tramp-rpc-source" t))
+         (output (expand-file-name "target/release/tramp-rpc-server" source))
+         (tramp-rpc-deploy-source-directory source))
+    (unwind-protect
+        (progn
+          (make-directory (expand-file-name "server" source) t)
+          (with-temp-file (expand-file-name "Cargo.toml" source))
+          (make-directory (file-name-directory output) t)
+          (with-temp-file output (insert "native binary"))
+          (set-file-modes output #o755)
+          (cl-letf (((symbol-function 'tramp-rpc-deploy--detect-local-arch)
+                     (lambda () "x86_64-freebsd"))
+                    ((symbol-function 'tramp-rpc-deploy--newer-than-source-p)
+                     (lambda (_file) t)))
+            (should-not
+             (tramp-rpc-deploy--source-build-output-path "x86_64-openbsd"))
+            (should (equal
+                     (tramp-rpc-deploy--source-build-output-path "x86_64-freebsd")
+                     output))))
+      (delete-directory source t))))
+
+(ert-deftest tramp-rpc-mock-test-deploy-extracts-release-source-archive ()
+  "Test release source archives extract to a validated workspace root."
+  :tags '(:deploy)
+  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
+  (let* ((dir (make-temp-file "tramp-rpc-source-archive" t))
+         (archive (expand-file-name "source.tar.gz" dir))
+         (root (expand-file-name "emacs-tramp-rpc-9.9.9" dir))
+         (dest (expand-file-name "extract" dir)))
+    (unwind-protect
+        (progn
+          (make-directory (expand-file-name "server" root) t)
+          (with-temp-file (expand-file-name "Cargo.toml" root)
+            (insert "[workspace]\nmembers = [\"server\"]\n"))
+          (should (zerop (call-process
+                          "tar" nil nil nil "-czf" archive
+                          "-C" dir "emacs-tramp-rpc-9.9.9")))
+          (let ((extracted
+                 (tramp-rpc-deploy--extract-source-tarball archive dest)))
+            (should (equal extracted
+                           (file-name-as-directory
+                            (expand-file-name "emacs-tramp-rpc-9.9.9" dest))))
+            (should (file-exists-p (expand-file-name "Cargo.toml" extracted)))
+            (should (file-directory-p (expand-file-name "server" extracted)))))
+      (delete-directory dir t))))
+
 (ert-deftest tramp-rpc-mock-test-deploy-git-install-ask-without-cargo ()
   "Test the git install prompt offers download but not build without Cargo."
   :tags '(:deploy)
@@ -4934,6 +5062,265 @@ This matches the behavior expected by `tramp-test28-process-file'."
                   'build))
       (should (equal choices '(?d ?b ?s))))))
 
+(ert-deftest tramp-rpc-mock-test-deploy-remote-toolchain-probe-reads-shell-output ()
+  "The remote Rust probe reads ordinary command output, not a Lisp expression."
+  :tags '(:deploy)
+  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
+  (let* ((vec (tramp-dissect-file-name "/scp:mock:/tmp/"))
+         (buffer (generate-new-buffer " *tramp-rpc-toolchain-probe*"))
+         command)
+    (unwind-protect
+        (progn
+          (with-current-buffer buffer
+            (insert "cargo 1.98.0 (abc123 2026-01-01)\n"
+                    "rustc 1.98.0 (abc123 2026-01-01)\n"))
+          (cl-letf (((symbol-function 'tramp-send-command-and-check)
+                     (lambda (_vec value)
+                       (setq command value)
+                       t))
+                    ((symbol-function 'tramp-get-connection-buffer)
+                     (lambda (_vec) buffer))
+                    ((symbol-function 'tramp-get-remote-path)
+                     (lambda (_vec) '("/home/mock/.cargo/bin" "/usr/bin"))))
+            (should (equal
+                     (tramp-rpc-deploy--remote-rust-toolchain-version vec)
+                     "1.98.0")))
+          (should (equal command
+                         (concat
+                          "PATH=/home/mock/.cargo/bin\\:/usr/bin:$PATH; export PATH; "
+                          "if command -v cargo >/dev/null 2>&1 && "
+                          "command -v rustc >/dev/null 2>&1; then "
+                          "cargo --version && rustc --version; fi"))))
+      (when (buffer-live-p buffer)
+        (kill-buffer buffer)))))
+
+(ert-deftest tramp-rpc-mock-test-deploy-remote-toolchain-probe-reports-missing ()
+  "A successful probe with no Cargo output reports the missing toolchain."
+  :tags '(:deploy)
+  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
+  (let* ((vec (tramp-dissect-file-name "/scp:openbsd:/tmp/"))
+         (buffer (generate-new-buffer " *tramp-rpc-missing-toolchain*"))
+         (messages nil))
+    (unwind-protect
+        (cl-letf (((symbol-function 'tramp-get-remote-path)
+                   (lambda (_vec) '("/usr/bin")))
+                  ((symbol-function 'tramp-send-command-and-check)
+                   (lambda (&rest _args) t))
+                  ((symbol-function 'tramp-get-connection-buffer)
+                   (lambda (_vec) buffer))
+                  ((symbol-function 'message)
+                   (lambda (format-string &rest args)
+                     (push (apply #'format-message format-string args)
+                           messages))))
+          (let ((tramp-rpc-deploy--remote-rust-toolchain-diagnostic nil))
+            (with-current-buffer buffer
+              (erase-buffer))
+            (should-not (tramp-rpc-deploy--remote-rust-toolchain-version vec))
+            (should (equal tramp-rpc-deploy--remote-rust-toolchain-diagnostic
+                           "cargo and rustc were not both found on the remote PATH"))
+            (should (cl-some
+                     (lambda (text)
+                       (string-match-p "Checking for Cargo and rustc on openbsd"
+                                       text))
+                     messages))))
+      (when (buffer-live-p buffer)
+        (kill-buffer buffer)))))
+
+(ert-deftest tramp-rpc-mock-test-deploy-remote-build-reports-toolchain-error ()
+  "A remote build failure names the host and missing Rust toolchain."
+  :tags '(:deploy)
+  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
+  (let* ((vec (tramp-dissect-file-name "/scp:openbsd:/tmp/"))
+         (messages nil)
+         (tramp-rpc-deploy--remote-rust-toolchain-diagnostic
+          "cargo and rustc were not both found on the remote PATH"))
+    (cl-letf (((symbol-function 'tramp-rpc-deploy--source-has-server-p)
+               (lambda () t))
+              ((symbol-function 'tramp-rpc-deploy--remote-rust-toolchain-version)
+               (lambda (_vec) nil))
+              ((symbol-function 'message)
+               (lambda (format-string &rest args)
+                 (push (apply #'format-message format-string args) messages))))
+      (let ((err (should-error
+                  (tramp-rpc-deploy--build-binary-on-remote
+                   vec "x86_64-openbsd")
+                  :type 'remote-file-error)))
+        (should (string-match-p "No usable remote Rust toolchain on openbsd"
+                                (error-message-string err)))
+        (should (string-match-p "cargo and rustc were not both found"
+                                (error-message-string err)))
+        (should (cl-some
+                 (lambda (text)
+                   (string-match-p "Remote source build unavailable on openbsd"
+                                   text))
+                 messages))))))
+
+(ert-deftest tramp-rpc-mock-test-deploy-missing-remote-toolchain-preserves-context ()
+  "Automatic deployment retains both local and remote failure diagnostics."
+  :tags '(:deploy)
+  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
+  (let* ((vec (tramp-dissect-file-name "/rpc:user@openbsd:/tmp/"))
+         (tramp-rpc-deploy-auto-deploy t)
+         (tramp-rpc-deploy-never-deploy nil))
+    (cl-letf (((symbol-function 'tramp-rpc-deploy--bootstrap-vec)
+               (lambda (value) value))
+              ((symbol-function 'tramp-rpc-deploy--remote-binary-exists-p)
+               (lambda (_vec) nil))
+              ((symbol-function 'tramp-rpc-deploy--remote-binary-path)
+               (lambda (_vec) "/ssh:openbsd:/tmp/tramp-rpc-server"))
+              ((symbol-function 'tramp-rpc-deploy--detect-remote-arch)
+               (lambda (_vec) "x86_64-openbsd"))
+              ((symbol-function 'tramp-rpc-deploy--ensure-local-binary)
+               (lambda (_arch)
+                 (signal 'remote-file-error
+                         '("local artifact unavailable"))))
+              ((symbol-function 'tramp-rpc-deploy--remote-source-build-available-p)
+               (lambda () t))
+              ((symbol-function
+                'tramp-rpc-deploy--build-binary-on-remote-with-source-fallback)
+               (lambda (_vec _arch)
+                 (signal 'remote-file-error
+                         '("No usable remote Rust toolchain on openbsd: cargo and rustc were not both found on the remote PATH")))))
+      (let ((err (should-error (tramp-rpc-deploy-ensure-binary vec)
+                               :type 'remote-file-error)))
+        (should (string-match-p
+                 "Local artifact and remote source build failed for x86_64-openbsd"
+                 (error-message-string err)))
+        (should (string-match-p "local artifact unavailable"
+                                (error-message-string err)))
+        (should (string-match-p
+                 "No usable remote Rust toolchain on openbsd"
+                 (error-message-string err)))))))
+
+(ert-deftest tramp-rpc-mock-test-deploy-git-install-ask-remote-build-available ()
+  "Test the git install prompt offers a remote build for a foreign host."
+  :tags '(:deploy)
+  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
+  (let ((tramp-rpc-deploy--allow-prompt t)
+        (vec (tramp-dissect-file-name "/scp:mock:/tmp/"))
+        choices prompt)
+    (cl-letf (((symbol-function 'tramp-rpc-deploy--cargo-available-p)
+               (lambda () nil))
+              ((symbol-function 'tramp-rpc-deploy--remote-source-build-available-p)
+               (lambda () t))
+              ((symbol-function 'tramp-rpc-deploy--remote-rust-toolchain-version)
+               (lambda (_vec) "1.98.0"))
+              ((symbol-function 'read-char-choice)
+               (lambda (text allowed)
+                 (setq prompt text
+                       choices allowed)
+                 ?r)))
+      (should (eq (tramp-rpc-deploy--ask-git-install-action
+                   "x86_64-freebsd" vec)
+                  'remote-build))
+      (should (equal choices '(?d ?r ?s)))
+      (should (string-match-p "remotely with Cargo" prompt))
+      (should (string-match-p "1.98.0" prompt)))))
+
+(ert-deftest tramp-rpc-mock-test-deploy-remote-choice-for-supported-toolchain ()
+  "Test automatic deployment asks before choosing remote build or download."
+  :tags '(:deploy)
+  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
+  (let* ((vec (tramp-dissect-file-name "/rpc:user@target:/"))
+         (noninteractive nil)
+         (tramp-rpc-deploy--allow-prompt nil)
+         (tramp-rpc-deploy--explicit-target nil)
+         choices prompt probed)
+    (cl-letf (((symbol-function 'tramp-rpc-deploy--platform-supported-p)
+               (lambda (_arch) t))
+              ((symbol-function 'tramp-rpc-deploy--remote-source-build-available-p)
+               (lambda () t))
+              ((symbol-function 'tramp-rpc-deploy--remote-rust-toolchain-version)
+               (lambda (_vec)
+                 (setq probed t)
+                 "1.98.0"))
+              ((symbol-function 'tramp-rpc-deploy--use-source-binary-id-p)
+               (lambda () nil))
+              ((symbol-function 'read-char-choice)
+               (lambda (text allowed)
+                 (setq prompt text
+                       choices allowed)
+                 ?d)))
+      (should (eq (tramp-rpc-deploy--ask-remote-source-build-action
+                   vec "x86_64-linux")
+                  'download))
+      (should probed)
+      (should (equal choices '(?d ?r ?s)))
+      (should (string-match-p "Download the release binary" prompt))
+      (should (string-match-p "remotely with Cargo" prompt))
+      (should (string-match-p "1.98.0" prompt)))))
+
+(ert-deftest tramp-rpc-mock-test-deploy-remote-choice-skips-noninteractive ()
+  "Test batch deployment leaves the remote-build fallback prompt-free."
+  :tags '(:deploy)
+  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
+  (let ((noninteractive t)
+        (tramp-rpc-deploy--allow-prompt nil)
+        (tramp-rpc-deploy--explicit-target nil))
+    (cl-letf (((symbol-function 'tramp-rpc-deploy--platform-supported-p)
+               (lambda (_arch) t))
+              ((symbol-function 'tramp-rpc-deploy--remote-source-build-available-p)
+               (lambda () t))
+              ((symbol-function 'tramp-rpc-deploy--remote-rust-toolchain-version)
+               (lambda (_vec)
+                 (ert-fail "noninteractive deployment unexpectedly probed for a prompt")))
+              ((symbol-function 'read-char-choice)
+               (lambda (&rest _args)
+                 (ert-fail "noninteractive deployment unexpectedly prompted"))))
+      (should-not
+       (tramp-rpc-deploy--ask-remote-source-build-action
+        (tramp-dissect-file-name "/rpc:user@target:/")
+        "x86_64-linux")))))
+
+(ert-deftest tramp-rpc-mock-test-deploy-remote-choice-downloads-after-local-failure ()
+  "Test choosing download retries release acquisition instead of building."
+  :tags '(:deploy)
+  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
+  (let* ((vec (tramp-dissect-file-name "/rpc:user@target:/"))
+         (noninteractive nil)
+         (tramp-rpc-deploy-auto-deploy t)
+         (tramp-rpc-deploy-never-deploy nil)
+         (tramp-rpc-deploy--allow-prompt nil)
+         (tramp-rpc-deploy--explicit-target nil)
+         (local-calls nil)
+         prompt choices)
+    (cl-letf (((symbol-function 'tramp-rpc-deploy--bootstrap-vec)
+               (lambda (value) value))
+              ((symbol-function 'tramp-rpc-deploy--remote-binary-exists-p)
+               (lambda (_vec) nil))
+              ((symbol-function 'tramp-rpc-deploy--remote-binary-path)
+               (lambda (_vec) "/rpc:user@target:/tmp/tramp-rpc-server"))
+              ((symbol-function 'tramp-rpc-deploy--detect-remote-arch)
+               (lambda (_vec) "x86_64-linux"))
+              ((symbol-function 'tramp-rpc-deploy--remote-source-build-available-p)
+               (lambda () t))
+              ((symbol-function 'tramp-rpc-deploy--platform-supported-p)
+               (lambda (_arch) t))
+              ((symbol-function 'tramp-rpc-deploy--remote-rust-toolchain-version)
+               (lambda (_vec) "1.98.0"))
+              ((symbol-function 'tramp-rpc-deploy--use-source-binary-id-p)
+               (lambda () nil))
+              ((symbol-function 'read-char-choice)
+               (lambda (text allowed)
+                 (setq prompt text
+                       choices allowed)
+                 ?d))
+              ((symbol-function 'tramp-rpc-deploy--ensure-local-binary)
+               (lambda (arch &optional action)
+                 (push (list arch action) local-calls)
+                 (if (eq action 'download)
+                     "/tmp/local-server"
+                   (signal 'remote-file-error '("local artifact unavailable")))))
+              ((symbol-function 'tramp-rpc-deploy--transfer-binary)
+               (lambda (_vec _local) "/tmp/tramp-rpc-server")))
+      (should (equal (tramp-rpc-deploy-ensure-binary vec)
+                     "/tmp/tramp-rpc-server"))
+      (should (equal local-calls
+                     '(("x86_64-linux" download)
+                       ("x86_64-linux" nil))))
+      (should (equal choices '(?d ?r ?s)))
+      (should (string-match-p "1.98.0" prompt)))))
+
 (ert-deftest tramp-rpc-mock-test-deploy-git-install-never-prompts-implicitly ()
   "Test automatic deployment reports the explicit install command."
   :tags '(:deploy)
@@ -4944,6 +5331,364 @@ This matches the behavior expected by `tramp-test28-process-file'."
                 :type 'remote-file-error)))
       (should (string-match-p "tramp-rpc-deploy-install-binary"
                               (error-message-string err))))))
+
+(ert-deftest tramp-rpc-mock-test-deploy-local-build-requires-native-toolchain ()
+  "Local source builds are offered only for a matching native toolchain."
+  :tags '(:deploy)
+  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
+  (cl-letf (((symbol-function 'tramp-rpc-deploy--detect-local-arch)
+             (lambda () "x86_64-linux"))
+            ((symbol-function 'tramp-rpc-deploy--local-rust-toolchain-version)
+             (lambda () "1.98.0")))
+    (should (tramp-rpc-deploy--can-build-for-arch-p "x86_64-linux"))
+    (should-not (tramp-rpc-deploy--can-build-for-arch-p "x86_64-freebsd"))))
+
+(ert-deftest tramp-rpc-mock-test-deploy-unknown-platform-has-no-rust-target ()
+  "An unknown platform is left to Cargo instead of being rejected early."
+  :tags '(:deploy)
+  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
+  (should-not (tramp-rpc-deploy--rust-target-for-arch "x86_64-freebsd")))
+
+(ert-deftest tramp-rpc-mock-test-deploy-official-arm-platforms-have-rust-targets ()
+  "Official ARM release platforms retain their release target mappings."
+  :tags '(:deploy)
+  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
+  (should (equal (tramp-rpc-deploy--normalize-machine "armv6l") "arm"))
+  (dolist (arch '("armv7-linux" "armv5te-linux" "armv6-linux"))
+    (should (member arch tramp-rpc-deploy-release-architectures)))
+  (should (equal (tramp-rpc-deploy--rust-target-for-arch "armv7-linux")
+                 "armv7-unknown-linux-musleabihf"))
+  (should (equal (tramp-rpc-deploy--rust-target-for-arch "armv5te-linux")
+                 "armv5te-unknown-linux-musleabi"))
+  (should (equal (tramp-rpc-deploy--rust-target-for-arch "armv6-linux")
+                 "arm-unknown-linux-musleabihf")))
+
+(ert-deftest tramp-rpc-mock-test-deploy-source-build-confirms-unknown-platform ()
+  "An unknown platform confirmation names the Rust toolchain version."
+  :tags '(:deploy)
+  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
+  (let ((tramp-rpc-deploy--allow-prompt t)
+        prompt)
+    (cl-letf (((symbol-function 'y-or-n-p)
+               (lambda (text)
+                 (setq prompt text)
+                 t))
+              ((symbol-function 'tramp-rpc-deploy--platform-supported-p)
+               (lambda (_arch) nil)))
+      (should (tramp-rpc-deploy--confirm-source-build
+               "x86_64-freebsd" "1.98.0" "remote"))
+      (should (string-match-p "might not be supported" prompt))
+      (should (string-match-p "Rust toolchain 1.98.0" prompt)))))
+
+(ert-deftest tramp-rpc-mock-test-deploy-source-build-tries-unknown-platform-automatically ()
+  "Automatic source builds let Cargo report unknown platform support."
+  :tags '(:deploy)
+  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
+  (let ((tramp-rpc-deploy--allow-prompt nil))
+    (cl-letf (((symbol-function 'tramp-rpc-deploy--platform-supported-p)
+               (lambda (_arch) nil))
+              ((symbol-function 'y-or-n-p)
+               (lambda (_text)
+                 (ert-fail "automatic deployment unexpectedly prompted"))))
+      (should (tramp-rpc-deploy--confirm-source-build
+               "x86_64-freebsd" "1.98.0" "remote")))))
+
+(ert-deftest tramp-rpc-mock-test-deploy-remote-source-build-is-fallback ()
+  "A remote source build is used when no local artifact can be obtained."
+  :tags '(:deploy)
+  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
+  (let ((vec (tramp-dissect-file-name "/rpc:user@target:/"))
+        (tramp-rpc-deploy-auto-deploy t)
+        (tramp-rpc-deploy-never-deploy nil)
+        (remote-binary "/tmp/tramp-rpc-server-freebsd"))
+    (cl-letf (((symbol-function 'tramp-rpc-deploy--bootstrap-vec)
+               (lambda (value) value))
+              ((symbol-function 'tramp-rpc-deploy--remote-binary-exists-p)
+               (lambda (_vec) nil))
+              ((symbol-function 'tramp-rpc-deploy--remote-binary-path)
+               (lambda (_vec) "/rpc:user@target:/tmp/tramp-rpc-server-freebsd"))
+              ((symbol-function 'tramp-rpc-deploy--detect-remote-arch)
+               (lambda (_vec) "x86_64-freebsd"))
+              ((symbol-function 'tramp-rpc-deploy--ensure-local-binary)
+               (lambda (_arch)
+                 (signal 'remote-file-error '("local artifact unavailable"))))
+              ((symbol-function 'tramp-rpc-deploy--remote-source-build-available-p)
+               (lambda () t))
+              ((symbol-function
+                'tramp-rpc-deploy--build-binary-on-remote-with-source-fallback)
+               (lambda (_vec _arch) remote-binary))
+              ((symbol-function 'tramp-rpc-deploy--build-binary-on-remote)
+               (lambda (_vec _arch) remote-binary)))
+      (should (equal (tramp-rpc-deploy-ensure-binary vec) remote-binary)))))
+
+(ert-deftest tramp-rpc-mock-test-deploy-explicit-remote-source-build ()
+  "An explicit install can select a usable remote Rust toolchain."
+  :tags '(:deploy)
+  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
+  (let* ((vec (tramp-dissect-file-name "/rpc:user@target:/"))
+         (tramp-rpc-deploy-auto-deploy t)
+         (tramp-rpc-deploy-never-deploy nil)
+         (tramp-rpc-deploy-git-build-policy 'auto)
+         (tramp-rpc-deploy--explicit-target
+          (tramp-rpc-deploy--target-key vec))
+         (tramp-rpc-deploy--explicit-force nil)
+         (tramp-rpc-deploy--pre-explicit-auto-deploy t)
+         (remote-binary "/tmp/tramp-rpc-server")
+         prompt choices)
+    (cl-letf (((symbol-function 'tramp-rpc-deploy--bootstrap-vec)
+               (lambda (value) value))
+              ((symbol-function 'tramp-rpc-deploy--remote-binary-exists-p)
+               (lambda (_vec) nil))
+              ((symbol-function 'tramp-rpc-deploy--remote-binary-path)
+               (lambda (_vec) "/rpc:user@target:/tmp/tramp-rpc-server"))
+              ((symbol-function 'tramp-rpc-deploy--detect-remote-arch)
+               (lambda (_vec) "x86_64-freebsd"))
+              ((symbol-function 'tramp-rpc-deploy--cargo-available-p)
+               (lambda () nil))
+              ((symbol-function 'tramp-rpc-deploy--remote-source-build-available-p)
+               (lambda () t))
+              ((symbol-function 'tramp-rpc-deploy--remote-rust-toolchain-version)
+               (lambda (_vec) "1.98.0"))
+              ((symbol-function 'read-char-choice)
+               (lambda (text allowed)
+                 (setq prompt text
+                       choices allowed)
+                 ?r))
+              ((symbol-function 'tramp-rpc-deploy--ensure-local-binary)
+               (lambda (&rest _args)
+                 (ert-fail "A selected remote build must not build locally")))
+              ((symbol-function 'tramp-rpc-deploy--build-binary-on-remote-with-source-fallback)
+               (lambda (_vec _arch) remote-binary)))
+      (should (equal (tramp-rpc-deploy-ensure-binary vec) remote-binary))
+      (should (equal choices '(?d ?r ?s)))
+      (should (string-match-p "remotely with Cargo" prompt)))))
+
+(ert-deftest tramp-rpc-mock-test-deploy-remote-source-build-reads-mktemp-output ()
+  "Remote source builds read mktemp's shell output without Lisp parsing."
+  :tags '(:deploy)
+  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
+  (let* ((source (make-temp-file "tramp-rpc-remote-source" t))
+         (buffer (generate-new-buffer " *tramp-rpc-remote-build*"))
+         (vec (tramp-dissect-file-name "/scp:mock:/tmp/"))
+         (remote-path (tramp-make-tramp-file-name
+                       vec "/tmp/tramp-rpc-server"))
+         commands)
+    (unwind-protect
+        (progn
+          (make-directory (expand-file-name "server" source) t)
+          (with-temp-file (expand-file-name "Cargo.toml" source)
+            (insert "[workspace]\nmembers = [\"server\"]\n"))
+          (let ((tramp-rpc-deploy-source-directory source))
+            (cl-letf (((symbol-function 'tramp-rpc-deploy--remote-rust-toolchain-version)
+                       (lambda (_vec) "1.98.0"))
+                      ((symbol-function 'tramp-rpc-deploy--remote-binary-path)
+                       (lambda (_vec) remote-path))
+                      ((symbol-function 'tramp-rpc-deploy--copy-source-to-remote)
+                       (lambda (_vec _directory) t))
+                      ((symbol-function 'tramp-rpc-deploy--remove-remote-staging-directory)
+                       (lambda (_vec _directory) t))
+                      ((symbol-function 'tramp-send-command-and-read)
+                       (lambda (&rest _args)
+                         (ert-fail "Remote source builds must not parse shell output as Lisp")))
+                      ((symbol-function 'tramp-send-command-and-check)
+                       (lambda (_vec command)
+                         (push command commands)
+                         (when (string-prefix-p
+                                "umask 077 && mktemp -d /tmp/tramp-rpc-build."
+                                command)
+                           (with-current-buffer buffer
+                             (erase-buffer)
+                             (insert "/tmp/tramp-rpc-build.test\n")))
+                         t))
+                      ((symbol-function
+                        'tramp-rpc-deploy--send-command-and-check-with-progress)
+                       (lambda (_vec command _tick)
+                         (push command commands)
+                         t))
+                      ((symbol-function 'tramp-get-connection-buffer)
+                       (lambda (_vec) buffer))
+                      ((symbol-function 'tramp-get-remote-path)
+                       (lambda (_vec) '("/home/mock/%s/.cargo/bin" "/usr/bin"))))
+              (should (equal (tramp-rpc-deploy--build-binary-on-remote
+                              vec "x86_64-freebsd")
+                             remote-path))
+              (let ((build-command
+                     (seq-find (lambda (command)
+                                 (string-prefix-p "PATH=" command))
+                               commands)))
+                (should build-command)
+                (should (string-match-p
+                         (regexp-quote
+                          "PATH=/home/mock/\\%s/.cargo/bin\\:/usr/bin:$PATH; export PATH; ")
+                         build-command)))
+              (should (member
+                       "umask 077 && mktemp -d /tmp/tramp-rpc-build.XXXXXXXXXX"
+                       commands)))))
+      (when (buffer-live-p buffer)
+        (kill-buffer buffer))
+      (delete-directory source t))))
+
+(ert-deftest tramp-rpc-mock-test-deploy-remote-source-build-reports-progress ()
+  "Remote source builds create a visible reporter inside a TRAMP operation."
+  :tags '(:deploy)
+  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
+  (let* ((vec (tramp-dissect-file-name "/scp:mock:/tmp/"))
+         (noninteractive nil)
+         (inhibit-message t)
+         reporter-made reporter-updates reporter-done redisplayed tick-called)
+    (cl-letf (((symbol-function 'make-progress-reporter)
+               (lambda (text &rest args)
+                 (setq reporter-made (list text args inhibit-message))
+                 'mock-reporter))
+              ((symbol-function 'progress-reporter-force-update)
+               (lambda (reporter &rest _args)
+                 (push (list reporter inhibit-message) reporter-updates)))
+              ((symbol-function 'progress-reporter-done)
+               (lambda (reporter)
+                 (setq reporter-done (list reporter inhibit-message))))
+              ((symbol-function 'redisplay)
+               (lambda (&rest _args)
+                 (setq redisplayed t))))
+      (should (eq
+               (tramp-rpc-deploy--run-with-progress-reporter
+                vec "x86_64-freebsd"
+                (lambda (tick)
+                  (funcall tick)
+                  (setq tick-called t)
+                  'built))
+               'built)))
+    (should (string-match-p
+             "Building tramp-rpc-server remotely for x86_64-freebsd on mock"
+             (car reporter-made)))
+    (should (equal (nth 2 reporter-made) nil))
+    (should (equal reporter-updates '((mock-reporter nil))))
+    (should (equal reporter-done '(mock-reporter nil)))
+    (should tick-called)
+    (should redisplayed)))
+
+(ert-deftest tramp-rpc-mock-test-deploy-remote-source-copy-uses-one-archive ()
+  "Remote source copies transfer one archive instead of one file at a time."
+  :tags '(:deploy)
+  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
+  (let* ((source (make-temp-file "tramp-rpc-source-archive" t))
+         (vec (tramp-dissect-file-name "/scp:mock:/tmp/"))
+         (remote-root "/tmp/tramp-rpc-build.test")
+         copies commands)
+    (unwind-protect
+        (progn
+          (make-directory (expand-file-name "server/src" source) t)
+          (with-temp-file (expand-file-name "Cargo.toml" source)
+            (insert "[workspace]\nmembers = [\"server\"]\n"))
+          (with-temp-file (expand-file-name "server/src/lib.rs" source)
+            (insert "pub fn answer() -> u8 { 42 }\n"))
+          (let ((tramp-rpc-deploy-source-directory source))
+            (cl-letf (((symbol-function 'tramp-send-command-and-check)
+                       (lambda (_vec command)
+                         (push command commands)
+                         t))
+                      ((symbol-function 'copy-file)
+                       (lambda (from to &optional overwrite)
+                         (should tramp-dont-suspend-timers)
+                         (should tramp-inhibit-progress-reporter)
+                         (push (list from to overwrite) copies)))
+                      ((symbol-function 'tramp-make-tramp-file-name)
+                       (lambda (_vec local)
+                         (concat "/scp:mock:" local))))
+              (tramp-rpc-deploy--copy-source-to-remote vec remote-root)))
+          (should (= 1 (length copies)))
+          (should (string-suffix-p ".tar" (car (car copies))))
+          (let ((extract-command (seq-find (lambda (command)
+                                             (string-match-p "tar -xf" command))
+                                           commands)))
+            (should extract-command)
+            (should (string-match-p
+                     (regexp-quote (tramp-shell-quote-argument remote-root))
+                     extract-command))))
+      (delete-directory source t))))
+
+(ert-deftest tramp-rpc-mock-test-deploy-remote-source-copy-reports-progress ()
+  "Remote source copies create a visible spinning reporter."
+  :tags '(:deploy)
+  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
+  (let* ((vec (tramp-dissect-file-name "/scp:mock:/tmp/"))
+         (noninteractive nil)
+         (inhibit-message t)
+         reporter-made reporter-done timer-function timer-cancelled)
+    (cl-letf (((symbol-function 'make-progress-reporter)
+               (lambda (text &rest args)
+                 (setq reporter-made (list text args inhibit-message))
+                 'mock-reporter))
+              ((symbol-function 'progress-reporter-force-update)
+               (lambda (&rest _args) t))
+              ((symbol-function 'progress-reporter-done)
+               (lambda (reporter)
+                 (setq reporter-done (list reporter inhibit-message))))
+              ((symbol-function 'redisplay)
+               (lambda (&rest _args) t))
+              ((symbol-function 'run-at-time)
+               (lambda (_delay _repeat function)
+                 (setq timer-function function)
+                 'mock-timer))
+              ((symbol-function 'cancel-timer)
+               (lambda (timer)
+                 (setq timer-cancelled timer))))
+      (should (eq
+               (tramp-rpc-deploy--run-with-progress-reporter
+                vec "x86_64-freebsd"
+                (lambda (_tick) 'copied)
+                "Copying tramp-rpc-server sources to mock")
+               'copied)))
+    (should (string-match-p
+             "Copying tramp-rpc-server sources to mock"
+             (car reporter-made)))
+    (should (equal (nth 2 reporter-made) nil))
+    (should (functionp timer-function))
+    (should (equal reporter-done '(mock-reporter nil)))
+    (should (eq timer-cancelled 'mock-timer))))
+
+(ert-deftest tramp-rpc-mock-test-deploy-remote-build-wait-polls-with-progress ()
+  "The remote build wait loop polls output instead of suspending redisplay."
+  :tags '(:deploy)
+  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
+  (let* ((vec (tramp-dissect-file-name "/scp:mock:/tmp/"))
+         (buffer (generate-new-buffer " *tramp-rpc-remote-build-wait*"))
+         (process 'mock-process)
+         (checks 0)
+         (accepts 0)
+         sent-command tick-called)
+    (unwind-protect
+        (cl-letf (((symbol-function 'tramp-get-connection-process)
+                   (lambda (_vec) process))
+                  ((symbol-function 'tramp-get-connection-buffer)
+                   (lambda (_vec) buffer))
+                  ((symbol-function 'tramp-get-remote-null-device)
+                   (lambda (_vec) "/dev/null"))
+                  ((symbol-function 'tramp-send-command)
+                   (lambda (_vec command &optional _neveropen _nooutput)
+                     (setq sent-command command)))
+                  ((symbol-function 'process-live-p)
+                   (lambda (value) (eq value process)))
+                  ((symbol-function 'tramp-check-for-regexp)
+                   (lambda (_process regexp)
+                     (setq checks (1+ checks))
+                     (when (= checks 2)
+                       (insert "cargo output\ntramp_rpc_build_exit_status 0\n#$ ")
+                       (goto-char (point-min))
+                       (re-search-forward regexp nil t))))
+                  ((symbol-function 'accept-process-output)
+                   (lambda (_process _timeout &rest _args)
+                     (setq accepts (1+ accepts)))))
+          (should
+           (tramp-rpc-deploy--send-command-and-check-with-progress
+            vec "cargo build" (lambda () (setq tick-called t))))
+          (should tick-called)
+          (should (= accepts 1))
+          (should (string-match-p "tramp_rpc_build_exit_status" sent-command))
+          (should-not (string-match-p "2>/dev/null" sent-command))
+          (should (equal (with-current-buffer buffer (buffer-string))
+                         "cargo output\n")))
+      (when (buffer-live-p buffer)
+        (kill-buffer buffer)))))
 
 (defmacro tramp-rpc-mock-test--with-deploy-stubs (record &rest body)
   "Run BODY with deploy stubs recording per-deploy flags into RECORD.
@@ -4956,6 +5701,8 @@ Each entry is (HOST ALLOW-PROMPT FORCE-OBTAIN AUTO-DEPLOY)."
              ((symbol-function 'tramp-rpc-deploy--remote-binary-path)
               (lambda (vec)
                 (tramp-make-tramp-file-name vec "/tmp/tramp-rpc-server")))
+             ((symbol-function 'tramp-rpc-deploy--use-source-binary-id-p)
+              (lambda () nil))
              ((symbol-function 'tramp-rpc-deploy--remote-binary-matches-p)
               (lambda (vec _binary)
                 (push (list (tramp-file-name-host vec)
@@ -5039,8 +5786,27 @@ Each entry is (HOST ALLOW-PROMPT FORCE-OBTAIN AUTO-DEPLOY)."
   (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
   (let ((tramp-rpc-deploy-never-deploy t))
     (should-error (tramp-rpc-deploy-install-binary
-                   (tramp-dissect-file-name "/rpc:user@target:/"))
+                  (tramp-dissect-file-name "/rpc:user@target:/"))
                   :type 'user-error)))
+
+(ert-deftest tramp-rpc-mock-test-deploy-install-autoloads-without-core-module ()
+  "Test explicit deployment remains usable before tramp-rpc.el is loaded."
+  :tags '(:deploy)
+  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
+  (let* ((vec (tramp-dissect-file-name "/rpc:user@target:/"))
+         (original (symbol-function 'tramp-rpc--clear-connection-failure))
+         called)
+    (unwind-protect
+        (progn
+          (fmakunbound 'tramp-rpc--clear-connection-failure)
+          (cl-letf (((symbol-function 'tramp-rpc-deploy-ensure-binary)
+                     (lambda (value)
+                       (setq called value)
+                       value)))
+            (should (equal (tramp-rpc-deploy-install-binary vec)
+                           vec)))
+          (should (equal called vec)))
+      (fset 'tramp-rpc--clear-connection-failure original))))
 
 (ert-deftest tramp-rpc-mock-test-deploy-force-replaces-cached-binary ()
   "Test a forced install obtains a new artifact instead of reusing cache."
@@ -5440,7 +6206,10 @@ issue #268 (0.13 fails to download prebuilt binary)."
               ((symbol-function 'tramp-rpc-deploy--detect-remote-arch)
                (lambda (_vec) "x86_64-linux"))
               ((symbol-function 'tramp-rpc-deploy--ensure-local-binary)
-               (lambda (_arch) (signal 'remote-file-error '("artifact unavailable")))))
+               (lambda (_arch) (signal 'remote-file-error '("artifact unavailable"))))
+              ((symbol-function 'tramp-rpc-deploy--build-binary-on-remote)
+               (lambda (&rest _args)
+                 (signal 'remote-file-error '("remote build unavailable")))))
       (should-error (tramp-rpc-deploy-ensure-binary vec)
                     :type 'remote-file-error))))
 
@@ -5540,6 +6309,9 @@ issue #268 (0.13 fails to download prebuilt binary)."
                   source)))
     (unwind-protect
         (progn
+          (make-directory (expand-file-name "server" source) t)
+          (with-temp-file (expand-file-name "Cargo.toml" source)
+            (insert "[workspace]\nmembers = [\"server\"]\n"))
           (make-directory (file-name-directory output) t)
           (with-temp-file output (insert "source build"))
           (let ((tramp-rpc-deploy-source-directory source)
@@ -6665,6 +7437,184 @@ retry must still happen in that case."
           (should (= establish-calls 2)))
       (delete-directory controlmaster-dir t))))
 
+(ert-deftest tramp-rpc-mock-test-connect-reports-status-before-server-probe ()
+  "Connection setup reports progress before the synchronous server probe."
+  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
+  (let* ((vec (tramp-dissect-file-name "/rpc:mock:/"))
+         (tramp-rpc-use-controlmaster nil)
+         events)
+    (cl-letf (((symbol-function 'tramp-rpc--report-status)
+               (lambda (&rest _)
+                 (setq events (append events '(status)))))
+              ((symbol-function 'tramp-rpc--detect-sudo-elevation)
+               (lambda (_vec) nil))
+              ((symbol-function 'tramp-rpc-deploy-expected-binary-localname)
+               (lambda () "/tmp/tramp-rpc-server"))
+              ((symbol-function 'tramp-rpc--start-server-process)
+               (lambda (&rest _)
+                 (setq events (append events '(server)))
+                 t))
+              ((symbol-function 'tramp-rpc--clear-status)
+               (lambda ()
+                 (setq events (append events '(clear))))))
+      (should (tramp-rpc--connect vec))
+      (should (equal events '(status status server clear))))))
+
+(ert-deftest tramp-rpc-mock-test-connect-reports-deployment-failure ()
+  "A deployment failure leaves a visible local connection diagnostic."
+  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
+  (let* ((vec (tramp-dissect-file-name "/rpc:mock:/"))
+         (tramp-rpc-use-controlmaster nil)
+         messages)
+    (unwind-protect
+        (cl-letf (((symbol-function 'tramp-rpc--report-status)
+                   (lambda (format-string &rest args)
+                     (push (apply #'format format-string args) messages)))
+                  ((symbol-function 'tramp-rpc--detect-sudo-elevation)
+                   (lambda (_vec) nil))
+                  ((symbol-function 'tramp-rpc-deploy-expected-binary-localname)
+                   (lambda () "/tmp/tramp-rpc-server"))
+                  ((symbol-function 'tramp-rpc--start-server-process)
+                   (lambda (&rest _)
+                     (signal 'tramp-rpc-server-unavailable '("missing"))))
+                  ((symbol-function 'tramp-rpc-deploy-ensure-binary)
+                   (lambda (_vec)
+                     (signal 'remote-file-error '("no Rust toolchain")))))
+          (should-error (tramp-rpc--connect vec) :type 'remote-file-error)
+          (should (seq-some (lambda (message)
+                              (string-match-p "deployment on mock failed" message))
+                            messages))
+          (should (tramp-rpc--recent-connection-failure vec)))
+      (tramp-rpc--clear-connection-failure vec))))
+
+(ert-deftest tramp-rpc-mock-test-report-status-avoids-minibuffer-display ()
+  "Connection status does not invoke the potentially blocking minibuffer API."
+  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
+  (let ((buffer (generate-new-buffer " *tramp-rpc-minibuffer-status*"))
+        minibuffer-called
+        redisplay-called)
+    (unwind-protect
+        (cl-letf (((symbol-function 'message) (lambda (&rest _) nil))
+                  ((symbol-function 'active-minibuffer-window)
+                   (lambda () t))
+                  ((symbol-function 'window-buffer)
+                   (lambda (_window) buffer))
+                  ((symbol-function 'minibuffer-message)
+                   (lambda (&rest _)
+                     (setq minibuffer-called t)))
+                  ((symbol-function 'redisplay)
+                   (lambda (&rest _)
+                     (setq redisplay-called t))))
+          (tramp-rpc--report-status "Toolchain unavailable on %s" "openbsd")
+          (should-not minibuffer-called)
+          (should-not redisplay-called))
+      (kill-buffer buffer))))
+
+(ert-deftest tramp-rpc-mock-test-clear-status-clears-suppressed-message ()
+  "Connection status clearing reaches the echo area despite message suppression."
+  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
+  (let ((inhibit-message t)
+        calls)
+    (cl-letf (((symbol-function 'message)
+               (lambda (&rest args)
+                 (push (list args inhibit-message) calls))))
+      (tramp-rpc--clear-status))
+    (should (equal calls '(((nil) nil))))))
+
+(ert-deftest tramp-rpc-mock-test-connect-failure-backoff-reuses-error ()
+  "Repeated completion probes reuse a recent connection failure."
+  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
+  (let* ((vec (tramp-dissect-file-name "/rpc:mock:/"))
+         (tramp-rpc-connection-failure-cache-timeout 30)
+         (attempts 0))
+    (unwind-protect
+        (cl-letf (((symbol-function 'tramp-rpc--connect-uncached)
+                   (lambda (_vec)
+                     (setq attempts (1+ attempts))
+                     (signal 'tramp-rpc-server-unavailable '("server unavailable"))))
+                  ((symbol-function 'tramp-rpc--report-status)
+                   (lambda (&rest _) nil)))
+          (should-error (tramp-rpc--connect vec) :type 'tramp-rpc-server-unavailable)
+          (should-error (tramp-rpc--connect vec) :type 'tramp-rpc-server-unavailable)
+          (should (= attempts 1)))
+      (tramp-rpc--clear-connection-failure vec))))
+
+(ert-deftest tramp-rpc-mock-test-connect-retry-propagates-retry-error ()
+  "A failed ControlMaster retry reports the retry's condition."
+  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
+  (let* ((vec (tramp-dissect-file-name "/rpc:mock:/"))
+         (establish-calls 0)
+         (messages nil))
+    (cl-letf (((symbol-function 'tramp-rpc--establish-controlmaster)
+               (lambda (_vec)
+                 (setq establish-calls (1+ establish-calls))
+                 (if (= establish-calls 1)
+                     (signal 'file-error '("initial failure"))
+                   (signal 'remote-file-error '("retry failure")))))
+              ((symbol-function 'tramp-rpc--controlmaster-active-p)
+               (lambda (_vec) nil))
+              ((symbol-function 'tramp-rpc--controlmaster-socket-path)
+               (lambda (_vec) "/tmp/tramp-rpc-test-socket"))
+              ((symbol-function 'delete-file) #'ignore)
+              ((symbol-function 'sleep-for) #'ignore)
+              ((symbol-function 'tramp-rpc--report-status)
+               (lambda (format-string &rest args)
+                 (push (apply #'format format-string args) messages)))
+              ((symbol-function 'tramp-rpc--detect-sudo-elevation)
+               (lambda (_vec) nil)))
+      (let ((err (should-error (tramp-rpc--connect vec)
+                               :type 'remote-file-error)))
+        (should (string-match-p "retry failure" (error-message-string err)))
+        (should (= establish-calls 2))
+        (should (seq-some (lambda (message)
+                            (string-match-p "retry failure" message))
+                          messages))))))
+
+(ert-deftest tramp-rpc-mock-test-connect-retry-preserves-socket-delete-error ()
+  "A ControlMaster socket deletion error prevents a retry."
+  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
+  (let* ((vec (tramp-dissect-file-name "/rpc:mock:/"))
+         (establish-calls 0))
+    (cl-letf (((symbol-function 'tramp-rpc--establish-controlmaster)
+               (lambda (_vec)
+                 (setq establish-calls (1+ establish-calls))
+                 (signal 'file-error '("initial failure"))))
+              ((symbol-function 'tramp-rpc--controlmaster-active-p)
+               (lambda (_vec) nil))
+              ((symbol-function 'tramp-rpc--controlmaster-socket-path)
+               (lambda (_vec) "/tmp/tramp-rpc-test-socket"))
+              ((symbol-function 'delete-file)
+               (lambda (_path)
+                 (signal 'file-error '("socket deletion failure"))))
+              ((symbol-function 'tramp-rpc--detect-sudo-elevation)
+               (lambda (_vec) nil)))
+      (let ((err (should-error (tramp-rpc--connect vec) :type 'file-error)))
+        (should (string-match-p "socket deletion failure"
+                                (error-message-string err)))
+        (should (= establish-calls 1))))))
+
+(ert-deftest tramp-rpc-mock-test-connect-failure-cache-classifies-errors ()
+  "Only deployment failures and server unavailability enter the cache."
+  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
+  (let* ((vec (tramp-dissect-file-name "/rpc:mock:/"))
+         (tramp-rpc-connection-failure-cache-timeout 30))
+    (unwind-protect
+        (progn
+          (tramp-rpc--remember-connection-failure
+           vec '(remote-file-error "SSH connection failure"))
+          (should-not (tramp-rpc--recent-connection-failure vec))
+          (tramp-rpc--remember-connection-failure
+           vec '(tramp-rpc-sudo-auth-rejected "bad password") t)
+          (should-not (tramp-rpc--recent-connection-failure vec))
+          (tramp-rpc--remember-connection-failure
+           vec '(remote-file-error "deployment failure") t)
+          (should (tramp-rpc--recent-connection-failure vec))
+          (tramp-rpc--clear-connection-failure vec)
+          (tramp-rpc--remember-connection-failure
+           vec '(tramp-rpc-server-unavailable "missing server"))
+          (should (tramp-rpc--recent-connection-failure vec)))
+      (tramp-rpc--clear-connection-failure vec))))
+
 (ert-deftest tramp-rpc-mock-test-establish-controlmaster-argv-and-connection-type ()
 "The establish command must keep a local PTY but never ask for a remote tty.
 OpenSSH prompts on the controlling terminal, so the establish process needs
@@ -7067,6 +8017,34 @@ It should attempt to connect (and fail), not silently bail."
       (should-error
        (tramp-rpc--ensure-connection vec)
        :type 'remote-file-error))))
+
+(ert-deftest tramp-rpc-mock-test-ensure-connection-cached-failure-respects-essentiality ()
+  "Use the non-essential fallback instead of replaying a cached failure."
+  :tags '(:non-essential)
+  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
+  (let* ((vec (make-tramp-file-name :method "rpc"
+                                    :host "cached-failure-test-host"
+                                    :localname "/tmp"))
+         (tramp-rpc-connection-failure-cache-timeout 30)
+         (failure '(tramp-rpc-server-unavailable "cached connection failure"))
+         connectable-called)
+    (unwind-protect
+        (progn
+          (tramp-rpc--remember-connection-failure vec failure)
+          (let ((non-essential t))
+            (should (eq 'non-essential
+                        (catch 'non-essential
+                          (cl-letf (((symbol-function 'tramp-connectable-p)
+                                     (lambda (_filename)
+                                       (setq connectable-called t)
+                                       nil)))
+                            (tramp-rpc--ensure-connection vec))
+                          'did-not-throw)))
+            (should connectable-called))
+          (let ((non-essential nil))
+            (should-error (tramp-rpc--ensure-connection vec)
+                          :type 'remote-file-error)))
+      (tramp-rpc--clear-connection-failure vec))))
 
 (ert-deftest tramp-rpc-mock-test-handler-catches-non-essential ()
   "Test that `tramp-rpc-file-name-handler' falls back for non-essential ops.
