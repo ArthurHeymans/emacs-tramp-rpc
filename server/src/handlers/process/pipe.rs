@@ -21,7 +21,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex as StdMutex, OnceLock};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 use tokio::process::{Child, ChildStderr, ChildStdin, ChildStdout, Command};
-use tokio::sync::{Mutex, Semaphore};
+use tokio::sync::{Mutex, Notify, Semaphore};
 
 use super::super::HandlerResult;
 use super::super::system::expand_tilde;
@@ -225,6 +225,9 @@ pub(super) struct ManagedProcess {
     pub(super) exit_status: Option<ExitStatus>,
     pub(super) shared_exit_status: Arc<StdMutex<Option<ExitStatus>>>,
     pub(super) stdin: Arc<Mutex<Option<ChildStdin>>>,
+    /// Wakes a `process.write' blocked on a full pipe when stdin is closed.
+    pub(super) stdin_close: Arc<Notify>,
+    pub(super) stdin_close_requested: Arc<AtomicBool>,
     pub(super) stdout: Arc<Mutex<Option<ChildStdout>>>,
     pub(super) stderr: Arc<Mutex<Option<ChildStderr>>>,
     pub(super) cmd: String,
@@ -567,6 +570,8 @@ pub async fn start(params: Value) -> HandlerResult {
         exit_status: None,
         shared_exit_status: Arc::new(StdMutex::new(None)),
         stdin: Arc::new(Mutex::new(child.stdin.take())),
+        stdin_close: Arc::new(Notify::new()),
+        stdin_close_requested: Arc::new(AtomicBool::new(false)),
         stdout: Arc::new(Mutex::new(child.stdout.take())),
         stderr: Arc::new(Mutex::new(child.stderr.take())),
         child,
@@ -599,7 +604,7 @@ pub async fn write(params: Value) -> HandlerResult {
     // Data is already binary, no decoding needed!
     let data = params.data;
 
-    let stdin = {
+    let (stdin, stdin_close, stdin_close_requested) = {
         let processes = get_process_map().lock().await;
         processes
             .get(&params.pid)
@@ -608,9 +613,14 @@ pub async fn write(params: Value) -> HandlerResult {
                     format!("Process not found: {}", params.pid),
                     "not_found",
                 )
+            })
+            .map(|managed| {
+                (
+                    Arc::clone(&managed.stdin),
+                    Arc::clone(&managed.stdin_close),
+                    Arc::clone(&managed.stdin_close_requested),
+                )
             })?
-            .stdin
-            .clone()
     };
 
     let mut stdin_guard = stdin.lock().await;
@@ -620,10 +630,29 @@ pub async fn write(params: Value) -> HandlerResult {
             "stdin_closed",
         ));
     };
-    stdin
-        .write_all(&data)
-        .await
-        .map_err(|e| RpcError::process_error(format!("Failed to write to stdin: {e}")))?;
+    // A close that raced the lock acquisition stores a `notify_one' permit,
+    // so the select below returns immediately even if the write has not
+    // started yet.
+    if stdin_close_requested.load(Ordering::SeqCst) {
+        return Err(RpcError::process_error_with_kind(
+            format!("Process stdin is closed: {}", params.pid),
+            "stdin_closed",
+        ));
+    }
+    tokio::select! {
+        result = stdin.write_all(&data) => result
+            .map_err(|e| RpcError::process_error(format!("Failed to write to stdin: {e}")))?,
+        // `close_stdin' cannot take the handle while this task holds the lock,
+        // so it cancels the blocked write first.  Without this a full pipe
+        // wedges `close_stdin' and the client's close times out, tearing down
+        // the whole connection.
+        _ = stdin_close.notified() => {
+            return Err(RpcError::process_error_with_kind(
+                format!("Process stdin is closed: {}", params.pid),
+                "stdin_closed",
+            ));
+        }
+    }
 
     Ok(msgpack_map! {
         "written" => data.len()
@@ -914,7 +943,7 @@ pub async fn close_stdin(params: Value) -> HandlerResult {
 
     let params: Params = from_value(params).map_err(|e| RpcError::invalid_params(e.to_string()))?;
 
-    let stdin = {
+    let (stdin, stdin_close, stdin_close_requested) = {
         let processes = get_process_map().lock().await;
         processes
             .get(&params.pid)
@@ -923,10 +952,21 @@ pub async fn close_stdin(params: Value) -> HandlerResult {
                     format!("Process not found: {}", params.pid),
                     "not_found",
                 )
+            })
+            .map(|managed| {
+                (
+                    Arc::clone(&managed.stdin),
+                    Arc::clone(&managed.stdin_close),
+                    Arc::clone(&managed.stdin_close_requested),
+                )
             })?
-            .stdin
-            .clone()
     };
+
+    // Cancel any `process.write' blocked on a full pipe before waiting for the
+    // lock it holds.  `notify_one' leaves a permit when no writer is waiting,
+    // and the flag covers a writer that has not reached its select yet.
+    stdin_close_requested.store(true, Ordering::SeqCst);
+    stdin_close.notify_one();
 
     // Flush any buffered data before closing stdin, then drop to close the pipe.
     // This is a defensive measure: the client should drain its write queue before

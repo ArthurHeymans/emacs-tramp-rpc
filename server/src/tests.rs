@@ -257,9 +257,10 @@ fn test_blocked_pty_writes_use_dedicated_admission() {
         .try_acquire_many(TaskClass::General, GENERAL_TASK_LIMIT)
         .expect("reserve every general permit");
 
-    assert_eq!(task_class("process.write_pty"), TaskClass::PtyWrite);
+    assert_eq!(task_class("process.write_pty"), TaskClass::Write);
+    assert_eq!(task_class("process.write"), TaskClass::Write);
     assert_eq!(task_class("process.signal"), TaskClass::Control);
-    assert!(admissions.try_acquire(TaskClass::PtyWrite).is_some());
+    assert!(admissions.try_acquire(TaskClass::Write).is_some());
     assert!(admissions.try_acquire(TaskClass::Control).is_some());
 }
 
@@ -1121,6 +1122,84 @@ async fn test_process_write_not_blocked_by_long_poll_read() {
     );
 
     let _ = read_task.await;
+    let kill_payload = make_request(
+        "process.kill",
+        Value::Map(vec![
+            (Value::String("pid".into()), Value::Integer(pid.into())),
+            (Value::String("signal".into()), Value::Integer(9.into())),
+        ]),
+    );
+    let _ = process_request(&kill_payload).await;
+}
+
+/// `close_stdin' must be able to rescue a write blocked on a full pipe.
+///
+/// The writer holds the stdin mutex for the whole `write_all', so without a
+/// cancellation signal `close_stdin' waits forever, its control slot is
+/// consumed, and the client's close times out and tears down the connection.
+#[tokio::test]
+async fn test_close_stdin_cancels_blocked_write() {
+    let _test_lock = handlers::process::test_process_map_lock().await;
+    let start_response = process_request(&make_request(
+        "process.start",
+        Value::Map(vec![
+            (Value::String("cmd".into()), Value::String("/bin/sh".into())),
+            (
+                Value::String("args".into()),
+                Value::Array(vec![
+                    Value::String("-c".into()),
+                    Value::String("sleep 30".into()),
+                ]),
+            ),
+        ]),
+    ))
+    .await;
+    let pid = map_get(start_response.result.as_ref().expect("start result"), "pid")
+        .and_then(Value::as_u64)
+        .expect("process.start should return pid") as u32;
+
+    // Far larger than the pipe buffer, and the child never reads it.
+    let write_payload = make_request(
+        "process.write",
+        Value::Map(vec![
+            (Value::String("pid".into()), Value::Integer(pid.into())),
+            (
+                Value::String("data".into()),
+                Value::Binary(vec![0u8; 4 * 1024 * 1024]),
+            ),
+        ]),
+    );
+    let write_task = tokio::spawn(async move { process_request(&write_payload).await });
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+    let close_payload = make_request(
+        "process.close_stdin",
+        Value::Map(vec![(
+            Value::String("pid".into()),
+            Value::Integer(pid.into()),
+        )]),
+    );
+    let close_response = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        process_request(&close_payload),
+    )
+    .await
+    .expect("close_stdin must not block behind a blocked write");
+    assert!(
+        close_response.error.is_none(),
+        "close_stdin should succeed: {:?}",
+        close_response.error
+    );
+
+    let write_response = tokio::time::timeout(std::time::Duration::from_secs(5), write_task)
+        .await
+        .expect("cancelled write must finish")
+        .expect("write task should join");
+    assert!(
+        write_response.error.is_some(),
+        "a write cancelled by close_stdin must report an error"
+    );
+
     let kill_payload = make_request(
         "process.kill",
         Value::Map(vec![
