@@ -101,6 +101,27 @@ tear down the connection."
     (should-not (gethash 101 (tramp-rpc-connection-pending-responses
                               connection)))))
 
+(ert-deftest tramp-rpc-mock-test-stderr-buffer-is-bounded ()
+  "Long-lived SSH stderr output must not grow without bound."
+  (tramp-rpc-mock-test-request--with-connection (process buffer)
+    (let ((stderr-buffer (generate-new-buffer " *tramp-rpc-stderr-test*"))
+          (stderr-process nil))
+      (unwind-protect
+          (progn
+            (setq stderr-process
+                  (make-pipe-process :name "tramp-rpc-stderr-test"
+                                     :buffer stderr-buffer :noquery t))
+            (setf (tramp-rpc-connection-stderr-buffer connection) stderr-buffer)
+            (with-current-buffer stderr-buffer
+              (insert (make-string (* 2 tramp-rpc-stderr-buffer-limit) ?x))
+              (insert "TAIL-MARKER"))
+            (tramp-rpc--drain-connection-stderr connection)
+            (with-current-buffer stderr-buffer
+              (should (= (buffer-size) tramp-rpc-stderr-buffer-limit))
+              (should (string-suffix-p "TAIL-MARKER" (buffer-string)))))
+        (when (process-live-p stderr-process) (delete-process stderr-process))
+        (when (buffer-live-p stderr-buffer) (kill-buffer stderr-buffer))))))
+
 (defun tramp-rpc-mock-test-request--check-wait-quit (kind)
   "Abandon a KIND wait without disrupting other users of its transport."
   (tramp-rpc-mock-test-request--with-connection (process buffer)

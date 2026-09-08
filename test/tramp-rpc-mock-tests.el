@@ -3937,7 +3937,11 @@ status to be consulted, which is why a direct property test would miss it."
           (should (string-match-p
                    "DONE"
                    (with-current-buffer stdout-buffer (buffer-string))))
-          (should (> (with-current-buffer stderr-buffer (buffer-size)) 100000)))
+          ;; A full 200000-byte stderr stream must have been drained (or the
+          ;; child would still be blocked on a full pipe), and the retained
+          ;; buffer is bounded to its configured tail.
+          (should (= (with-current-buffer stderr-buffer (buffer-size))
+                     tramp-rpc-stderr-buffer-limit)))
       (when (process-live-p process)
         (delete-process process))
       (ignore-errors

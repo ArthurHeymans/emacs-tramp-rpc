@@ -1796,6 +1796,12 @@ Returns nil if the process is locked to a different thread."
     (or (null locked-thread)
         (eq locked-thread (current-thread)))))
 
+(defconst tramp-rpc-stderr-buffer-limit 65536
+  "Maximum bytes retained in a connection's SSH stderr buffer.
+Only the tail is used for diagnostics, so the buffer is truncated to this
+many bytes after draining to bound growth over a long-lived connection
+with `-v' or a chatty ProxyJump.")
+
 (defun tramp-rpc--drain-connection-stderr (conn)
   "Drain pending stderr output for CONN's SSH process.
 `make-process' with `:stderr' creates a separate stderr process.  The RPC
@@ -1806,7 +1812,14 @@ and blocking SSH or the remote server."
               ((buffer-live-p stderr-buffer))
               (stderr-process (get-buffer-process stderr-buffer))
               ((tramp-rpc--process-accessible-p stderr-process)))
-    (while (accept-process-output stderr-process 0 nil t))))
+    (while (accept-process-output stderr-process 0 nil t))
+    ;; Keep the diagnostic tail only; an unbounded stderr buffer grows for the
+    ;; whole lifetime of the connection.  Deleting before the process mark
+    ;; leaves the mark at the end, so later appends stay in order.
+    (with-current-buffer stderr-buffer
+      (when (> (buffer-size) tramp-rpc-stderr-buffer-limit)
+        (delete-region (point-min)
+                       (- (point-max) tramp-rpc-stderr-buffer-limit))))))
 
 (defun tramp-rpc--connection-stderr-tail (conn &optional max-bytes)
   "Return a diagnostic tail from CONN's stderr buffer, or nil.
