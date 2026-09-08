@@ -1016,6 +1016,23 @@ pub(super) async fn wait_pipe_child(pid: u32) -> Result<Option<ExitStatus>, RpcE
     }
 }
 
+/// Remove PID from the registry, reaping the direct child in the background
+/// when it was not confirmed dead.
+///
+/// Dropping an unreaped tokio `Child' leaves a zombie and keeps
+/// `kill_on_drop' armed, so a bounded-wait timeout (for example, a child in
+/// uninterruptible sleep) must not simply discard the entry.
+pub(super) async fn retire_pipe_process(pid: u32) {
+    let removed = get_process_map().lock().await.remove(&pid);
+    if let Some(mut managed) = removed
+        && managed.exit_status.is_none()
+    {
+        tokio::spawn(async move {
+            let _ = managed.child.wait().await;
+        });
+    }
+}
+
 pub(super) async fn terminate_pipe_process(
     pid: u32,
     signal: i32,
@@ -1053,7 +1070,7 @@ pub(super) async fn terminate_pipe_process(
             *shared_exit_status
                 .lock()
                 .expect("shared pipe exit status lock") = cached;
-            get_process_map().lock().await.remove(&pid);
+            retire_pipe_process(pid).await;
         }
         return Ok(true);
     }
@@ -1107,7 +1124,7 @@ pub(super) async fn terminate_pipe_process(
         }
         if signal == libc::SIGKILL {
             // Explicit SIGKILL is the caller's opt-out from output draining.
-            get_process_map().lock().await.remove(&pid);
+            retire_pipe_process(pid).await;
         }
         return Ok(true);
     }
@@ -1115,7 +1132,7 @@ pub(super) async fn terminate_pipe_process(
         // Explicit SIGKILL is the caller's opt-out from drain-preserving
         // ownership.  Always remove it, whether status() won the reap race or
         // this call did; already in-flight reads retain the shared state.
-        get_process_map().lock().await.remove(&pid);
+        retire_pipe_process(pid).await;
     }
 
     // Signal delivery is the success criterion, matching local

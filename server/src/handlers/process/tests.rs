@@ -200,6 +200,31 @@ async fn cleanup_reports_signal_failure_and_retains_managed_process() {
 }
 
 #[tokio::test]
+async fn removed_unreaped_pipe_process_is_reaped_in_background() {
+    let _test_lock = test_process_map_lock().await;
+    let pid = start_pipe_process("sleep 30").await;
+    let os_pid = pipe_os_pid(pid).await;
+
+    // Remove before the child is reaped, which is what an explicit SIGKILL
+    // whose bounded wait times out does.  The background reaper must wait the
+    // child so it does not become a zombie.
+    retire_pipe_process(pid).await;
+    assert!(!get_process_map().lock().await.contains_key(&pid));
+
+    signal_process_group(os_pid as u32, libc::SIGKILL).expect("kill process group");
+
+    for _ in 0..200 {
+        if waitpid(Pid::from_raw(os_pid as i32), Some(WaitPidFlag::WNOHANG))
+            == Err(nix::errno::Errno::ECHILD)
+        {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+    panic!("removed child was not reaped in the background");
+}
+
+#[tokio::test]
 async fn failed_pty_signal_leaves_io_usable() {
     let _test_lock = test_process_map_lock().await;
     let start_result = start_pty(Value::Map(vec![

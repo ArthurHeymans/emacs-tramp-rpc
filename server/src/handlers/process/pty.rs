@@ -804,6 +804,22 @@ pub(super) async fn wait_pty_pid(child_pid: Pid) -> Result<Option<i32>, nix::err
     }
 }
 
+/// Remove PID from the PTY registry, reaping the direct child in the
+/// background when it was not confirmed dead.
+///
+/// Dropping the entry closes the PTY master (which sends SIGHUP), but an
+/// unreaped child would still remain a zombie for the life of the server.
+pub(super) async fn retire_pty_process(pid: u32, os_pid: u32) {
+    let removed = get_pty_process_map().lock().await.remove(&pid);
+    if let Some(managed) = removed
+        && managed.exit_status.is_none()
+    {
+        tokio::spawn(async move {
+            let _ = wait_pty_pid(Pid::from_raw(os_pid as i32)).await;
+        });
+    }
+}
+
 pub(super) async fn terminate_pty_process(
     pid: u32,
     signal: i32,
@@ -961,7 +977,7 @@ pub(super) async fn terminate_pty_process(
         if retain_removed_status {
             record_terminated_pty_status(pid, exit_code);
         }
-        get_pty_process_map().lock().await.remove(&pid);
+        retire_pty_process(pid, os_pid).await;
         return Ok(true);
     }
 
