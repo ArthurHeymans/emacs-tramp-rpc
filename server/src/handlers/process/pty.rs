@@ -29,7 +29,7 @@ use super::super::system::expand_tilde;
 #[cfg(test)]
 use super::MAX_PROCESS_READ_BYTES;
 use super::pipe::get_next_pid;
-use super::push::{OutputPush, send_exit_notification, stop_output_push};
+use super::push::{OutputPush, new_pty_push, send_exit_notification, stop_output_push};
 #[cfg(target_os = "macos")]
 use super::signal_process;
 use super::{
@@ -99,6 +99,14 @@ impl PtyIoState {
 
     pub(super) fn is_closed(&self) -> bool {
         self.closed.load(Ordering::Acquire)
+    }
+
+    /// Withdraw a cancellation whose motivating signal was not delivered.
+    /// A writer already woken by `cancel' may still observe the error once;
+    /// the `is_closed' re-check in `write_pty' lets later writes proceed.
+    pub(super) fn reopen(&self) {
+        let _syscall_guard = self.syscall_lock.lock().expect("PTY syscall lock");
+        self.closed.store(false, Ordering::Release);
     }
 }
 
@@ -746,9 +754,14 @@ pub async fn write_pty(params: Value) -> HandlerResult {
             result = async_fd.ready(Interest::WRITABLE) => result
                 .map_err(|e| RpcError::process_error(format!("Failed to wait for writable: {e}")))?,
             _ = cancelled => {
-                return Err(RpcError::process_error(format!(
-                    "PTY write cancelled: {}", params.pid
-                )));
+                if io.is_closed() {
+                    return Err(RpcError::process_error(format!(
+                        "PTY write cancelled: {}", params.pid
+                    )));
+                }
+                // The cancellation was withdrawn (a signal that motivated it
+                // failed); ignore the stale notification and retry.
+                continue;
             }
         };
 
@@ -822,14 +835,25 @@ pub(super) async fn terminate_pty_process(
         };
     };
     // Explicit teardown and SIGKILL must wake a writer blocked on readiness
-    // immediately.  Other forwarded signals (notably SIGINT) are survivable
-    // for an interactive shell, so leave the PTY I/O state usable until a
-    // terminal exit has actually been confirmed.
-    if remove || signal == libc::SIGKILL {
+    // immediately, before waiting for the lifecycle lock, so a reader or
+    // writer can be released while the signal is still being delivered.
+    // Other forwarded signals (notably SIGINT) are survivable for an
+    // interactive shell, so leave the PTY I/O state usable until a terminal
+    // exit has actually been confirmed.
+    let cancelled_early = remove || signal == libc::SIGKILL;
+    if cancelled_early {
         io.cancel();
     }
     let _lifecycle_guard = lifecycle.lock().await;
-    signal_pty_process_group(os_pid, signal, "send signal")?;
+    if let Err(error) = signal_pty_process_group(os_pid, signal, "send signal") {
+        // A failed signal (EPERM from a surviving credential-changing
+        // descendant) must leave the PTY usable; otherwise the entry stays
+        // registered with every later write rejected.
+        if cancelled_early {
+            io.reopen();
+        }
+        return Err(error);
+    }
 
     if matches!(signal, 0 | libc::SIGSTOP | libc::SIGCONT) {
         return Ok(true);
@@ -987,6 +1011,7 @@ pub async fn kill_pty(params: Value) -> HandlerResult {
             (None, None)
         }
     };
+    let pushing = push.is_some();
     if let Some(push) = push {
         stop_output_push(push).await;
     }
@@ -1003,7 +1028,7 @@ pub async fn kill_pty(params: Value) -> HandlerResult {
     )
     .await
     {
-        allow_pty_termination_retry(params.pid).await;
+        allow_pty_termination_retry(params.pid, pushing).await;
         return Err(error);
     }
     // SIGKILL removed the entry, so no push task can report this exit.  Also
@@ -1018,11 +1043,14 @@ pub async fn kill_pty(params: Value) -> HandlerResult {
     Ok(Value::Boolean(true))
 }
 
-/// Let a later kill or close retry after a failed termination.  PTY input
-/// stays cancelled (irreversibly) and no output is pushed any more.
-async fn allow_pty_termination_retry(pid: u32) {
+/// Let a later kill or close retry after a failed termination, and resume
+/// pushing output when PUSHING was stopped for it: the process may live on.
+async fn allow_pty_termination_retry(pid: u32, pushing: bool) {
     if let Some(managed) = get_pty_process_map().lock().await.get_mut(&pid) {
         managed.terminating = false;
+        if pushing && managed.output_push.is_none() {
+            managed.output_push = Some(new_pty_push(pid));
+        }
     }
 }
 
@@ -1050,12 +1078,13 @@ pub async fn close_pty(params: Value) -> HandlerResult {
             None => None,
         }
     };
+    let pushing = push.is_some();
     if let Some(push) = push {
         stop_output_push(push).await;
     }
     // Explicit close is the opt-out from kill's drain-preserving ownership.
     if let Err(error) = terminate_pty_process(params.pid, libc::SIGKILL, true, true, false).await {
-        allow_pty_termination_retry(params.pid).await;
+        allow_pty_termination_retry(params.pid, pushing).await;
         return Err(error);
     }
     discard_terminated_pty_status(params.pid);
