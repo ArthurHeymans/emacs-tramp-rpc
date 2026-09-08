@@ -154,6 +154,19 @@ jobs:
             sleep 10
           done
 
+      - name: Byte-compile each module in isolation
+        run: |
+          # package-initialize loads dependency autoloads, and compiling modules
+          # together carries definitions into later files.  Neither should hide
+          # a missing require in the module under test.
+          for file in lisp/*.el; do
+            rm -f lisp/*.elc
+            emacs -Q --batch \
+              --eval '(let ((dir (expand-file-name "elpa" user-emacs-directory))) (dolist (entry (directory-files dir t "^[^.]")) (when (file-directory-p entry) (push entry load-path))))' \
+              --eval '(setq byte-compile-error-on-warn t byte-compile-warnings t load-prefer-newer t)' \
+              -L lisp -f batch-byte-compile "$file"
+          done
+
       - name: Byte-compile
         run: |
           rm -f lisp/*.elc

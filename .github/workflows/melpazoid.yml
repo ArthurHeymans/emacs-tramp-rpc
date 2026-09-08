@@ -33,4 +33,6 @@ jobs:
              :files (:defaults "Cargo.toml" "Cargo.lock" "server" ".cargo"))
           WARN_IS_ERROR: true
           EXIST_OK: false
+        # Melpazoid's experimental style findings remain advisory.  The elisp
+        # job in ci.yml independently enforces compiler and package-lint warnings.
         run: make -C ~/melpazoid
