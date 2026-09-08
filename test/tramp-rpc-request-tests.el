@@ -78,6 +78,29 @@ SPEC is (PROCESS BUFFER [CONNECTION]); CONNECTION defaults to `connection'."
         (should (zerop (hash-table-count
                         (tramp-rpc-connection-pending-responses connection))))))))
 
+(ert-deftest tramp-rpc-mock-test-request-id-less-error-reaches-oldest-waiter ()
+  "An id-less protocol error must wake the oldest synchronous waiter.
+The server answers an oversized or malformed frame with an error that has no
+id.  Discarding it leaves that waiter to burn the whole call timeout and
+tear down the connection."
+  (tramp-rpc-mock-test-request--with-connection (process buffer)
+    ;; Track order is newest-first, so 202 is the oldest waiter.
+    (tramp-rpc--track-pending-request connection 202)
+    (tramp-rpc--track-pending-request connection 101)
+    (let ((messages (list '(:id nil :error (:code -32600
+                                            :message "frame too large")))))
+      (cl-letf (((symbol-function 'tramp-rpc-protocol-try-read-message)
+                 (lambda (_buffer)
+                   (set-marker (mark-marker) (point-max))
+                   (pop messages))))
+        (tramp-rpc--connection-filter process "error")))
+    (should (equal (plist-get (gethash 202 (tramp-rpc-connection-pending-responses
+                                            connection))
+                              :error)
+                   '(:code -32600 :message "frame too large")))
+    (should-not (gethash 101 (tramp-rpc-connection-pending-responses
+                              connection)))))
+
 (defun tramp-rpc-mock-test-request--check-wait-quit (kind)
   "Abandon a KIND wait without disrupting other users of its transport."
   (tramp-rpc-mock-test-request--with-connection (process buffer)

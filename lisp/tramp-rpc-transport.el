@@ -1705,12 +1705,33 @@ Uses length-prefixed binary framing: <4-byte BE length><msgpack payload>."
                         ;; Store only responses for this generation's live
                         ;; waiters.  Late responses from an abandoned
                         ;; generation are discarded.
-                        (when (memql id (tramp-rpc-connection-pending-ids conn))
+                        (cond
+                         ((memql id (tramp-rpc-connection-pending-ids conn))
                           (tramp-rpc--debug
                            "FILTER storing sync response id=%s" id)
                           (puthash id response
                                    (tramp-rpc-connection-pending-responses
-                                    conn)))))))))))))
+                                    conn)))
+                         ;; The server answers oversized frames and parse
+                         ;; errors with an id-less error response.  Deliver it
+                         ;; to the oldest waiter instead of discarding it:
+                         ;; otherwise that waiter burns the full call timeout
+                         ;; and tears the connection down with no diagnosis.
+                         ((and (null id) (plist-get response :error))
+                          (when-let* ((oldest
+                                       (car (last
+                                             (tramp-rpc-connection-pending-ids
+                                              conn)))))
+                            (tramp-rpc--debug
+                             "FILTER delivering id-less error to id=%s: %S"
+                             oldest (plist-get response :error))
+                            (puthash oldest response
+                                     (tramp-rpc-connection-pending-responses
+                                      conn))))
+                         ((plist-get response :error)
+                          (tramp-rpc--debug
+                           "FILTER dropping unmatched error response: %S"
+                           response)))))))))))))
 
 (defun tramp-rpc--call-async (vec method params callback &optional connection)
   "Call METHOD with PARAMS asynchronously on the RPC server for VEC.
