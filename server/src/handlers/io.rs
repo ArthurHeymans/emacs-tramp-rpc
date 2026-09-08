@@ -285,18 +285,12 @@ pub async fn copy(params: Value) -> HandlerResult {
             .await
             .map_err(|e| map_io_error(e, &src_str))?
     } else {
-        // Copy regular file (or symlink target)
-        prepare_regular_destination(&dest_path, options.overwrite)
+        // Copy regular file (or symlink target) atomically: a plain
+        // `fs::copy' would open the destination with create+truncate and could
+        // clobber a file created after the overwrite check.
+        copy_file_atomically(&src_path, &dest_path, options)
             .await
-            .map_err(|e| map_io_error(e, &src_str))?;
-        let n = fs::copy(&src_path, &dest_path)
-            .await
-            .map_err(|e| map_io_error(e, &src_str))?;
-
-        apply_copied_metadata(&src_metadata, &dest_path, options)
-            .await
-            .map_err(|e| map_io_error(e, &src_str))?;
-        n
+            .map_err(|e| map_io_error(e, &src_str))?
     };
 
     Ok(msgpack_map! {
@@ -347,12 +341,7 @@ async fn copy_dir_recursive(
             prepare_symlink_destination(&dest_child, options.overwrite).await?;
             tokio::fs::symlink(&link_target, &dest_child).await?;
         } else {
-            prepare_regular_destination(&dest_child, options.overwrite).await?;
-            let n = fs::copy(&entry_path, &dest_child).await?;
-            total += n;
-
-            let meta = fs::metadata(&entry_path).await?;
-            apply_copied_metadata(&meta, &dest_child, options).await?;
+            total += copy_file_atomically(&entry_path, &dest_child, options).await?;
         }
     }
 
@@ -421,16 +410,64 @@ async fn canonicalize_existing_ancestor(path: &Path) -> std::io::Result<PathBuf>
     }
 }
 
-async fn prepare_regular_destination(path: &Path, overwrite: bool) -> std::io::Result<()> {
-    if overwrite {
-        return Ok(());
+/// Copy SRC to DEST through a temporary file in DEST's directory.
+///
+/// `fs::copy' opens the destination with create+truncate, so checking the
+/// destination first and then copying is a TOCTOU: a file created in between
+/// is silently clobbered even when the caller asked not to overwrite.  Copy
+/// to a sibling temp file, apply metadata there, then rename it into place
+/// (atomically replacing or atomically refusing, depending on OVERWRITE).
+///
+/// Overwriting deliberately keeps `fs::copy' semantics: it follows a
+/// destination symlink and truncates the link target, matching Emacs
+/// `copy-file' and the previous server behavior.  There is no refusal
+/// decision to race in that case.  Only the no-overwrite path needs the
+/// staged rename, because a destination created after the caller's check
+/// must not be truncated.
+async fn copy_file_atomically(
+    src: &Path,
+    dest: &Path,
+    options: CopyOptions,
+) -> std::io::Result<u64> {
+    if options.overwrite {
+        let copied = fs::copy(src, dest).await?;
+        let metadata = fs::metadata(src).await?;
+        apply_copied_metadata(&metadata, dest, options).await?;
+        return Ok(copied);
     }
 
-    match fs::symlink_metadata(path).await {
-        Ok(_) => Err(already_exists(path)),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(e) => Err(e),
+    let parent = dest
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let temp = temporary_copy_path(parent, dest);
+    let result = async {
+        let copied = fs::copy(src, &temp).await?;
+        let metadata = fs::metadata(src).await?;
+        apply_copied_metadata(&metadata, &temp, options).await?;
+        rename_no_overwrite(&temp, dest).await?;
+        Ok(copied)
     }
+    .await;
+    if result.is_err() {
+        let _ = fs::remove_file(&temp).await;
+    }
+    result
+}
+
+fn temporary_copy_path(parent: &Path, dest: &Path) -> PathBuf {
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let name = dest
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "copy".to_string());
+    parent.join(format!(
+        ".{name}.tramp-rpc-copy-{}-{}",
+        std::process::id(),
+        COUNTER.fetch_add(1, Ordering::Relaxed)
+    ))
 }
 
 async fn prepare_symlink_destination(path: &Path, overwrite: bool) -> std::io::Result<()> {
@@ -1220,6 +1257,75 @@ mod tests {
 
         assert!(err.message.contains("exists"));
         assert_eq!(fs::read(&dest).await.unwrap(), b"old");
+    }
+
+    #[tokio::test]
+    async fn copy_overwrite_follows_destination_symlink() {
+        let tmp = tempfile::tempdir().expect("create tempdir");
+        let src = tmp.path().join("src.txt");
+        let target = tmp.path().join("target.txt");
+        let dest = tmp.path().join("dest-link");
+        fs::write(&src, b"new").await.unwrap();
+        fs::write(&target, b"old").await.unwrap();
+        tokio::fs::symlink(&target, &dest).await.unwrap();
+
+        // Emacs `copy-file' with overwrite follows an existing destination
+        // symlink and writes through it; the atomic no-overwrite path must not
+        // change that, so overwriting keeps `fs::copy' semantics.
+        copy(msgpack_map! {
+            "src" => path_value(&src),
+            "dest" => path_value(&dest),
+            "overwrite" => true,
+        })
+        .await
+        .expect("overwrite copy should succeed");
+
+        assert!(
+            fs::symlink_metadata(&dest)
+                .await
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "the destination symlink must be preserved"
+        );
+        assert_eq!(fs::read(&target).await.unwrap(), b"new");
+    }
+
+    #[tokio::test]
+    async fn atomic_copy_never_truncates_a_rejected_destination() {
+        let tmp = tempfile::tempdir().expect("create tempdir");
+        let src = tmp.path().join("src.txt");
+        let dest = tmp.path().join("dest.txt");
+        fs::write(&src, b"new").await.unwrap();
+        fs::write(&dest, b"old").await.unwrap();
+
+        let options = CopyOptions {
+            preserve_permissions: false,
+            preserve_times: false,
+            overwrite: false,
+            merge_existing_directories: false,
+        };
+        let error = copy_file_atomically(&src, &dest, options)
+            .await
+            .expect_err("an existing destination must be refused");
+        assert_eq!(error.kind(), std::io::ErrorKind::AlreadyExists);
+        // The refusal must not have truncated the destination first.
+        assert_eq!(fs::read(&dest).await.unwrap(), b"old");
+
+        let options = CopyOptions {
+            overwrite: true,
+            ..options
+        };
+        assert_eq!(copy_file_atomically(&src, &dest, options).await.unwrap(), 3);
+        assert_eq!(fs::read(&dest).await.unwrap(), b"new");
+
+        let leftovers: Vec<String> = std::fs::read_dir(tmp.path())
+            .unwrap()
+            .filter_map(Result::ok)
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .filter(|name| name.contains("tramp-rpc-copy"))
+            .collect();
+        assert!(leftovers.is_empty(), "leftover temp files: {leftovers:?}");
     }
 
     #[tokio::test]
