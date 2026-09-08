@@ -23,7 +23,7 @@ jobs:
         uses: actions/checkout@v5
 
       - name: Install Nix
-        uses: DeterminateSystems/nix-installer-action@main
+        uses: DeterminateSystems/nix-installer-action@v22
 
       - name: Cache Nix store
         uses: nix-community/cache-nix-action@v7
