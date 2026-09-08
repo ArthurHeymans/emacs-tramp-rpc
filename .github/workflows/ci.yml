@@ -536,6 +536,7 @@ jobs:
             --eval "(setq debug-on-error t)" \
             --eval "(setq tramp-verbose 0)" \
             -l test/tramp-rpc-tests.el \
+            --eval "(setq tramp-rpc-deploy-git-build-policy 'release)" \
             --eval "(tramp-rpc-test--run-guarded \"^tramp-rpc-test\")"
 
   test-upstream-tramp:

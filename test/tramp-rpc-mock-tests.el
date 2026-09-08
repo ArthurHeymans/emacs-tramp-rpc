@@ -5274,6 +5274,43 @@ issue #268 (0.13 fails to download prebuilt binary)."
                              built)))))
       (delete-directory dir t))))
 
+(ert-deftest tramp-rpc-mock-test-deploy-source-build-output-requires-provenance ()
+  "Source-id mode trusts a target artifact only with a matching sidecar."
+  :tags '(:deploy)
+  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
+  (let* ((dir (make-temp-file "tramp-rpc-source" t))
+         (target (expand-file-name
+                  "target/x86_64-unknown-linux-musl/release/tramp-rpc-server"
+                  dir)))
+    (unwind-protect
+        (progn
+          (make-directory (expand-file-name ".git" dir))
+          (make-directory (expand-file-name "server/src" dir) t)
+          (with-temp-file (expand-file-name "Cargo.toml" dir)
+            (insert "[workspace]\nmembers = [\"server\"]\n"))
+          (with-temp-file (expand-file-name "server/src/main.rs" dir)
+            (insert "fn main() {}\n"))
+          (make-directory (file-name-directory target) t)
+          (with-temp-file target (insert "binary\n"))
+          (set-file-modes target #o755)
+          (let ((tramp-rpc-deploy-source-directory dir)
+                (tramp-rpc-deploy-git-build-policy 'auto))
+            (cl-letf (((symbol-function 'tramp-rpc-deploy--git-revision)
+                       (lambda () "abcdef123456")))
+              ;; The artifact is newer than the sources, but without recorded
+              ;; provenance the mtime heuristic must not authorize it.
+              (should-not (tramp-rpc-deploy--source-build-output-path
+                           "x86_64-linux"))
+              (let ((sidecar (tramp-rpc-deploy--source-build-id-path target)))
+                (with-temp-file sidecar (insert "git-other\n"))
+                (should-not (tramp-rpc-deploy--source-build-output-path
+                             "x86_64-linux"))
+                (tramp-rpc-deploy--record-source-build-id target)
+                (should (equal (tramp-rpc-deploy--source-build-output-path
+                                "x86_64-linux")
+                               target))))))
+      (delete-directory dir t))))
+
 (ert-deftest tramp-rpc-mock-test-deploy-binary-id-source-hash ()
   "Test that git checkouts key binary ids by server source content."
   :tags '(:deploy)

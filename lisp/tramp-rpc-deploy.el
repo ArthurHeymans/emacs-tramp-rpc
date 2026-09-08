@@ -542,11 +542,41 @@ This is useful for development - run scripts/build-all.sh to populate."
                           (file-attribute-modification-time
                            (file-attributes source)))))))
 
+(defun tramp-rpc-deploy--source-build-id-path (build-output)
+  "Return the provenance sidecar path for BUILD-OUTPUT."
+  (concat build-output ".source-id"))
+
+(defun tramp-rpc-deploy--record-source-build-id (build-output)
+  "Record the current source id beside BUILD-OUTPUT.
+Returns the recorded id, or nil when this is not a source-id build.  The
+sidecar lets `tramp-rpc-deploy--source-build-output-path' accept a target
+artifact only when it was produced from the current checkout, instead of
+trusting file modification times that any tool can set."
+  (when-let* ((id (and (tramp-rpc-deploy--use-source-binary-id-p)
+                       (tramp-rpc-deploy--source-binary-id))))
+    (condition-case nil
+        (tramp-rpc-deploy--write-file-atomically
+         (tramp-rpc-deploy--source-build-id-path build-output)
+         (concat id "\n"))
+      (error nil))
+    id))
+
+(defun tramp-rpc-deploy--recorded-source-build-id (build-output)
+  "Return the source id recorded beside BUILD-OUTPUT, or nil."
+  (let ((sidecar (tramp-rpc-deploy--source-build-id-path build-output)))
+    (when (file-exists-p sidecar)
+      (with-temp-buffer
+        (insert-file-contents-literally sidecar)
+        (string-trim (buffer-string))))))
+
 (defun tramp-rpc-deploy--source-build-output-path (arch)
   "Return an existing source-tree build output for ARCH, or nil.
 This lets CI and developers reuse an already-built/downloaded artifact in
-TARGET/release without requiring a rebuild, while skipping obviously stale
-outputs whose mtime predates the source files."
+TARGET/release without requiring a rebuild.  In source-id mode the artifact
+is trusted only when a provenance sidecar records the current source id:
+mtime alone cannot distinguish a current build from a stale artifact whose
+timestamps were preserved or forged.  Outside source-id mode the mtime
+heuristic remains, because there is no source id to compare against."
   (when (and (tramp-rpc-deploy--source-root)
              (tramp-rpc-deploy--source-has-server-p))
     (let* ((target (tramp-rpc-deploy--arch-to-rust-target arch))
@@ -555,9 +585,15 @@ outputs whose mtime predates the source files."
                           target tramp-rpc-deploy-binary-name)
                   (tramp-rpc-deploy--source-root))))
       (when (and (file-exists-p path)
-                 (file-executable-p path)
-                 (tramp-rpc-deploy--newer-than-source-p path))
-        path))))
+                 (file-executable-p path))
+        (let ((expected (and (tramp-rpc-deploy--use-source-binary-id-p)
+                             (tramp-rpc-deploy--source-binary-id))))
+          (cond
+           (expected
+            (when (equal (tramp-rpc-deploy--recorded-source-build-id path)
+                         expected)
+              path))
+           ((tramp-rpc-deploy--newer-than-source-p path) path)))))))
 
 (defun tramp-rpc-deploy--remote-binary-path (vec)
   "Return the remote path where the binary should be installed for VEC."
@@ -855,6 +891,9 @@ Returns the path to the binary on success, nil on failure."
                          (expand-file-name "Cargo.toml" tramp-rpc-deploy-source-directory))))
       (if (zerop exit-code)
           (progn
+            ;; Record the source id this artifact was built from before any
+            ;; reuse decision can consult it.
+            (tramp-rpc-deploy--record-source-build-id build-output)
             ;; Promote only a complete binary with its recorded digest.
             (tramp-rpc-deploy--promote-cached-binary
              build-output cache-path "source-build")
