@@ -249,6 +249,9 @@ PROCESS is a PID."
 PROCESS is the process being handled."
   (if (and (processp process) (process-get process :tramp-rpc-pid))
       (cond
+       ;; A remote signal death is reported as `signal', matching local
+       ;; processes.  Callers such as LSP and compile branch on this.
+       ((integerp (process-get process :tramp-rpc-exit-signal)) 'signal)
        ((process-get process :tramp-rpc-exited) 'exit)
        ;; Use the real handler to check local relay liveness, not
        ;; `process-live-p' (which would recurse).  Do not perform synchronous
@@ -265,7 +268,9 @@ PROCESS is the process being handled."
   "Handler for `process-exit-status' for TRAMP-RPC processes.
 PROCESS is the process being handled."
   (if (and (processp process) (process-get process :tramp-rpc-pid))
-      (or (process-get process :tramp-rpc-exit-code) 0)
+      (or (process-get process :tramp-rpc-exit-signal)
+          (process-get process :tramp-rpc-exit-code)
+          0)
     (tramp-run-real-handler #'process-exit-status (list process))))
 
 (defun tramp-rpc-handle-process-command (process)

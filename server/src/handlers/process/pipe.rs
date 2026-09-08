@@ -5,8 +5,6 @@
 
 use crate::msgpack_map;
 use crate::protocol::{ProcessResult, RpcError, from_value};
-use nix::sys::wait::{WaitPidFlag, WaitStatus, waitpid};
-use nix::unistd::Pid;
 use rmpv::Value;
 use rustix::io::fcntl_dupfd_cloexec;
 #[cfg(target_vendor = "apple")]
@@ -17,14 +15,13 @@ use serde::Deserialize;
 use std::collections::HashMap;
 use std::io::ErrorKind;
 use std::os::fd::OwnedFd;
-use std::os::unix::process::ExitStatusExt;
 use std::path::{Path, PathBuf};
 use std::process::{ExitStatus, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex as StdMutex, OnceLock};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 use tokio::process::{Child, ChildStderr, ChildStdin, ChildStdout, Command};
-use tokio::sync::{Mutex, Semaphore};
+use tokio::sync::{Mutex, Notify, Semaphore};
 
 use super::super::HandlerResult;
 use super::super::system::expand_tilde;
@@ -228,6 +225,9 @@ pub(super) struct ManagedProcess {
     pub(super) exit_status: Option<ExitStatus>,
     pub(super) shared_exit_status: Arc<StdMutex<Option<ExitStatus>>>,
     pub(super) stdin: Arc<Mutex<Option<ChildStdin>>>,
+    /// Wakes a `process.write' blocked on a full pipe when stdin is closed.
+    pub(super) stdin_close: Arc<Notify>,
+    pub(super) stdin_close_requested: Arc<AtomicBool>,
     pub(super) stdout: Arc<Mutex<Option<ChildStdout>>>,
     pub(super) stderr: Arc<Mutex<Option<ChildStderr>>>,
     pub(super) cmd: String,
@@ -423,6 +423,7 @@ pub(crate) async fn run_child(
     // Return binary data directly (no encoding needed!)
     Ok(ProcessResult {
         exit_code: crate::protocol::exit_code_from_status(status),
+        signal: crate::protocol::exit_signal_from_status(status),
         stdout,
         stderr,
     })
@@ -570,6 +571,8 @@ pub async fn start(params: Value) -> HandlerResult {
         exit_status: None,
         shared_exit_status: Arc::new(StdMutex::new(None)),
         stdin: Arc::new(Mutex::new(child.stdin.take())),
+        stdin_close: Arc::new(Notify::new()),
+        stdin_close_requested: Arc::new(AtomicBool::new(false)),
         stdout: Arc::new(Mutex::new(child.stdout.take())),
         stderr: Arc::new(Mutex::new(child.stderr.take())),
         child,
@@ -602,7 +605,7 @@ pub async fn write(params: Value) -> HandlerResult {
     // Data is already binary, no decoding needed!
     let data = params.data;
 
-    let stdin = {
+    let (stdin, stdin_close, stdin_close_requested) = {
         let processes = get_process_map().lock().await;
         processes
             .get(&params.pid)
@@ -611,9 +614,14 @@ pub async fn write(params: Value) -> HandlerResult {
                     format!("Process not found: {}", params.pid),
                     "not_found",
                 )
+            })
+            .map(|managed| {
+                (
+                    Arc::clone(&managed.stdin),
+                    Arc::clone(&managed.stdin_close),
+                    Arc::clone(&managed.stdin_close_requested),
+                )
             })?
-            .stdin
-            .clone()
     };
 
     let mut stdin_guard = stdin.lock().await;
@@ -623,10 +631,29 @@ pub async fn write(params: Value) -> HandlerResult {
             "stdin_closed",
         ));
     };
-    stdin
-        .write_all(&data)
-        .await
-        .map_err(|e| RpcError::process_error(format!("Failed to write to stdin: {e}")))?;
+    // A close that raced the lock acquisition stores a `notify_one' permit,
+    // so the select below returns immediately even if the write has not
+    // started yet.
+    if stdin_close_requested.load(Ordering::SeqCst) {
+        return Err(RpcError::process_error_with_kind(
+            format!("Process stdin is closed: {}", params.pid),
+            "stdin_closed",
+        ));
+    }
+    tokio::select! {
+        result = stdin.write_all(&data) => result
+            .map_err(|e| RpcError::process_error(format!("Failed to write to stdin: {e}")))?,
+        // `close_stdin' cannot take the handle while this task holds the lock,
+        // so it cancels the blocked write first.  Without this a full pipe
+        // wedges `close_stdin' and the client's close times out, tearing down
+        // the whole connection.
+        _ = stdin_close.notified() => {
+            return Err(RpcError::process_error_with_kind(
+                format!("Process stdin is closed: {}", params.pid),
+                "stdin_closed",
+            ));
+        }
+    }
 
     Ok(msgpack_map! {
         "written" => data.len()
@@ -771,12 +798,21 @@ pub async fn read(params: Value) -> HandlerResult {
     } else {
         Value::Nil
     };
+    let exit_signal = if exited {
+        exit_status
+            .and_then(crate::protocol::exit_signal_from_status)
+            .map(|signal| Value::Integer(signal.into()))
+            .unwrap_or(Value::Nil)
+    } else {
+        Value::Nil
+    };
 
     Ok(msgpack_map! {
         "stdout" => stdout_val,
         "stderr" => stderr_val,
         "exited" => exited,
-        "exit_code" => exit_code
+        "exit_code" => exit_code,
+        "signal" => exit_signal
     })
 }
 
@@ -917,7 +953,7 @@ pub async fn close_stdin(params: Value) -> HandlerResult {
 
     let params: Params = from_value(params).map_err(|e| RpcError::invalid_params(e.to_string()))?;
 
-    let stdin = {
+    let (stdin, stdin_close, stdin_close_requested) = {
         let processes = get_process_map().lock().await;
         processes
             .get(&params.pid)
@@ -926,10 +962,21 @@ pub async fn close_stdin(params: Value) -> HandlerResult {
                     format!("Process not found: {}", params.pid),
                     "not_found",
                 )
+            })
+            .map(|managed| {
+                (
+                    Arc::clone(&managed.stdin),
+                    Arc::clone(&managed.stdin_close),
+                    Arc::clone(&managed.stdin_close_requested),
+                )
             })?
-            .stdin
-            .clone()
     };
+
+    // Cancel any `process.write' blocked on a full pipe before waiting for the
+    // lock it holds.  `notify_one' leaves a permit when no writer is waiting,
+    // and the flag covers a writer that has not reached its select yet.
+    stdin_close_requested.store(true, Ordering::SeqCst);
+    stdin_close.notify_one();
 
     // Flush any buffered data before closing stdin, then drop to close the pipe.
     // This is a defensive measure: the client should drain its write queue before
@@ -944,33 +991,45 @@ pub async fn close_stdin(params: Value) -> HandlerResult {
     Ok(Value::Boolean(true))
 }
 
-pub(super) async fn wait_pipe_child(os_pid: u32) -> Result<Option<ExitStatus>, nix::errno::Errno> {
+/// Wait until the managed child behind registry PID is reaped.
+///
+/// This polls tokio's own `try_wait' so the child's `kill_on_drop' state stays
+/// consistent.  Reaping the same child with a second reaper (nix `waitpid')
+/// hides the reap from tokio, which then still believes the process is running
+/// and can send `SIGKILL' to an already-reaped, potentially recycled PID when
+/// the registry entry is dropped.
+pub(super) async fn wait_pipe_child(pid: u32) -> Result<Option<ExitStatus>, RpcError> {
     loop {
-        match waitpid(Pid::from_raw(os_pid as i32), Some(WaitPidFlag::WNOHANG)) {
-            Ok(status @ (WaitStatus::Exited(_, _) | WaitStatus::Signaled(_, _, _))) => {
-                return Ok(Some(exit_status_from_wait_status(status)));
+        {
+            let mut processes = get_process_map().lock().await;
+            let Some(managed) = processes.get_mut(&pid) else {
+                // Another poll consumed the status and removed the entry.
+                return Ok(None);
+            };
+            if let Some(status) = poll_exit_status(managed).map_err(|error| {
+                RpcError::process_error(format!("Failed to reap process {pid}: {error}"))
+            })? {
+                return Ok(Some(status));
             }
-            Ok(WaitStatus::StillAlive) => {
-                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
-            }
-            // Another status poll can only have consumed the status while the
-            // lifecycle lock is not held.  The map entry remains until its
-            // streams reach EOF, even in that case.
-            Err(nix::errno::Errno::ECHILD) => return Ok(None),
-            Err(nix::errno::Errno::EINTR) => continue,
-            Err(error) => return Err(error),
-            Ok(_) => return Err(nix::errno::Errno::EINVAL),
         }
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
     }
 }
 
-pub(super) fn exit_status_from_wait_status(status: WaitStatus) -> ExitStatus {
-    match status {
-        WaitStatus::Exited(_, code) => ExitStatus::from_raw(code << 8),
-        WaitStatus::Signaled(_, signal, core_dumped) => {
-            ExitStatus::from_raw(signal as i32 | if core_dumped { 0x80 } else { 0 })
-        }
-        _ => ExitStatus::from_raw(0),
+/// Remove PID from the registry, reaping the direct child in the background
+/// when it was not confirmed dead.
+///
+/// Dropping an unreaped tokio `Child' leaves a zombie and keeps
+/// `kill_on_drop' armed, so a bounded-wait timeout (for example, a child in
+/// uninterruptible sleep) must not simply discard the entry.
+pub(super) async fn retire_pipe_process(pid: u32) {
+    let removed = get_process_map().lock().await.remove(&pid);
+    if let Some(mut managed) = removed
+        && managed.exit_status.is_none()
+    {
+        tokio::spawn(async move {
+            let _ = managed.child.wait().await;
+        });
     }
 }
 
@@ -1011,7 +1070,7 @@ pub(super) async fn terminate_pipe_process(
             *shared_exit_status
                 .lock()
                 .expect("shared pipe exit status lock") = cached;
-            get_process_map().lock().await.remove(&pid);
+            retire_pipe_process(pid).await;
         }
         return Ok(true);
     }
@@ -1029,7 +1088,7 @@ pub(super) async fn terminate_pipe_process(
     let mut reap = if cached.is_some() {
         cached
     } else {
-        tokio::time::timeout(MANAGED_CHILD_WAIT, wait_pipe_child(os_pid))
+        tokio::time::timeout(MANAGED_CHILD_WAIT, wait_pipe_child(pid))
             .await
             .ok()
             .and_then(Result::ok)
@@ -1048,14 +1107,22 @@ pub(super) async fn terminate_pipe_process(
         require_process_group_signal(signal_process_group(os_pid, libc::SIGKILL), "send SIGKILL")?;
     }
     if reap.is_none() && escalate {
-        reap = tokio::time::timeout(MANAGED_CHILD_WAIT, wait_pipe_child(os_pid))
-            .await
-            .map_err(|_| {
-                RpcError::process_error(format!("Timed out reaping process {pid} after SIGKILL"))
-            })?
-            .map_err(|error| {
-                RpcError::process_error(format!("Failed to reap process {pid}: {error}"))
-            })?;
+        // The escalation reap is the last chance to observe the child.  Retire
+        // it on failure too, so the background reaper owns an unreaped child
+        // instead of leaving the entry registered forever.
+        reap = match tokio::time::timeout(MANAGED_CHILD_WAIT, wait_pipe_child(pid)).await {
+            Ok(Ok(status)) => status,
+            Ok(Err(error)) => {
+                retire_pipe_process(pid).await;
+                return Err(error);
+            }
+            Err(_) => {
+                retire_pipe_process(pid).await;
+                return Err(RpcError::process_error(format!(
+                    "Timed out reaping process {pid} after SIGKILL"
+                )));
+            }
+        };
     }
     if let Some(exit_status) = reap {
         // Publish before any destructive cleanup so a read which captured the
@@ -1068,7 +1135,7 @@ pub(super) async fn terminate_pipe_process(
         }
         if signal == libc::SIGKILL {
             // Explicit SIGKILL is the caller's opt-out from output draining.
-            get_process_map().lock().await.remove(&pid);
+            retire_pipe_process(pid).await;
         }
         return Ok(true);
     }
@@ -1076,7 +1143,7 @@ pub(super) async fn terminate_pipe_process(
         // Explicit SIGKILL is the caller's opt-out from drain-preserving
         // ownership.  Always remove it, whether status() won the reap race or
         // this call did; already in-flight reads retain the shared state.
-        get_process_map().lock().await.remove(&pid);
+        retire_pipe_process(pid).await;
     }
 
     // Signal delivery is the success criterion, matching local
@@ -1159,7 +1226,8 @@ pub async fn status(params: Value) -> HandlerResult {
 
     Ok(msgpack_map! {
         "exited" => exit_status.is_some(),
-        "exit_code" => exit_status.map(crate::protocol::exit_code_from_status).map(|c| Value::Integer(c.into())).unwrap_or(Value::Nil)
+        "exit_code" => exit_status.map(crate::protocol::exit_code_from_status).map(|c| Value::Integer(c.into())).unwrap_or(Value::Nil),
+        "signal" => exit_status.and_then(crate::protocol::exit_signal_from_status).map(|s| Value::Integer(s.into())).unwrap_or(Value::Nil)
     })
 }
 
@@ -1186,7 +1254,8 @@ pub async fn list(_params: Value) -> HandlerResult {
             "os_pid" => Value::Integer((managed.child_pid as i64).into()),
             "cmd" => managed.cmd.clone(),
             "exited" => exited.is_some(),
-            "exit_code" => exited.map(crate::protocol::exit_code_from_status).map(|c| Value::Integer(c.into())).unwrap_or(Value::Nil)
+            "exit_code" => exited.map(crate::protocol::exit_code_from_status).map(|c| Value::Integer(c.into())).unwrap_or(Value::Nil),
+            "signal" => exited.and_then(crate::protocol::exit_signal_from_status).map(|s| Value::Integer(s.into())).unwrap_or(Value::Nil)
         });
     }
 

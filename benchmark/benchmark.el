@@ -382,10 +382,13 @@ Same operations as batch-mixed-ops but done one at a time."
     ("batch-mixed-ops"    . tramp-rpc-benchmark--batch-mixed-ops))
   "Alist of RPC-only benchmark tests for batch operations.")
 
-(defun tramp-rpc-benchmark--resolve-test-selection (selected tests)
+(defun tramp-rpc-benchmark--resolve-test-selection (selected tests &optional allow-missing)
   "Resolve SELECTED benchmark names from TESTS.
 SELECTED accepts nil (all), :all, or a list of strings/symbols.
-Return filtered tests as an alist in the same shape as TESTS."
+Return filtered tests as an alist in the same shape as TESTS.
+When ALLOW-MISSING is non-nil, names that are not in TESTS are ignored
+instead of signalling; callers use this to combine the regular and
+RPC-only test tables."
   (cond
    ((or (null selected) (eq selected :all))
     tests)
@@ -399,9 +402,10 @@ Return filtered tests as an alist in the same shape as TESTS."
            (missing (seq-remove (lambda (name)
                                   (assoc name tests))
                                 names)))
-      (when missing
-        (error "Unknown benchmark(s): %s"
-               (mapconcat #'identity missing ", ")))
+      (unless allow-missing
+        (when missing
+          (error "Unknown benchmark(s): %s"
+                 (mapconcat #'identity missing ", "))))
       filtered))
    (t
     (error "SELECTED benchmarks must be nil, :all, or a list"))))
@@ -569,11 +573,20 @@ Batch mode example:
     --eval '(setq tramp-rpc-benchmark-host \"server\" tramp-rpc-benchmark-iterations 5)' \\
     --eval '(tramp-rpc-benchmark-run-subset (quote (\"file-exists\" \"file-read\")) (quote (\"rpc\")))'"
   (interactive)
-  (let* ((selected-tests
-          (tramp-rpc-benchmark--resolve-test-selection
-           benchmark-names tramp-rpc-benchmark--tests))
-         (selected-methods
-          (tramp-rpc-benchmark--resolve-method-selection methods)))
+  (let* ((selected-methods
+          (tramp-rpc-benchmark--resolve-method-selection methods))
+         ;; The RPC-only batch tests do not take a method argument and only
+         ;; make sense for the rpc method, but they must be resolvable by name
+         ;; and included in the rpc run.  Resolve against the combined table so
+         ;; an unknown name is still an error.
+         (all-tests (append tramp-rpc-benchmark--tests
+                            tramp-rpc-benchmark--rpc-only-tests))
+         (selected-tests
+          (tramp-rpc-benchmark--resolve-test-selection benchmark-names all-tests))
+         (regular-names (mapcar #'car tramp-rpc-benchmark--tests))
+         (regular-tests (seq-filter (lambda (test)
+                                      (member (car test) regular-names))
+                                    selected-tests)))
     (when (null selected-tests)
       (error "No benchmarks selected"))
     (setq tramp-rpc-benchmark-results nil)
@@ -582,11 +595,15 @@ Batch mode example:
     (message "Tests: %s" (mapconcat #'car selected-tests ", "))
     (message "This may take a few minutes...\n")
     (dolist (method selected-methods)
-      (message "\n=== Benchmarking %s ===\n" method)
-      (condition-case err
-          (tramp-rpc-benchmark--run-method method selected-tests)
-        (error
-         (message "Error running benchmarks for %s: %s" method err))))
+      (let ((tests (if (string= method "rpc")
+                       selected-tests
+                     regular-tests)))
+        (when tests
+          (message "\n=== Benchmarking %s ===\n" method)
+          (condition-case err
+              (tramp-rpc-benchmark--run-method method tests)
+            (error
+             (message "Error running benchmarks for %s: %s" method err))))))
     (tramp-rpc-benchmark--report)
     (message "\nBenchmarks complete! See *TRAMP Benchmark Results* buffer.")))
 

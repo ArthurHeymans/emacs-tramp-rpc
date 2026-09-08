@@ -223,6 +223,40 @@ fn test_nofollow_symlink_watch_reports_link_attribute_change() {
 }
 
 #[cfg(target_os = "linux")]
+#[test]
+fn test_unwatch_removes_nofollow_and_regular_registrations() {
+    let manager = test_manager();
+    if lock_or_recover(&manager.symlink_watcher).is_none() {
+        return;
+    }
+    let temp = tempfile::tempdir().unwrap();
+    let target = temp.path().join("target");
+    let link = temp.path().join("link");
+    fs::create_dir(&target).unwrap();
+    std::os::unix::fs::symlink(&target, &link).unwrap();
+
+    manager
+        .watch_with_options(&link, false, true)
+        .expect("nofollow watch");
+    manager
+        .watch_with_options(&link, false, false)
+        .expect("regular watch");
+    assert!(!manager.list().is_empty());
+
+    // A single watch.remove must drop both registrations; returning after the
+    // nofollow one would leave the regular watch alive forever.
+    manager.unwatch(&link).expect("unwatch both registrations");
+    assert!(manager.list().is_empty());
+    assert!(
+        !lock_or_recover(&manager.symlink_watcher)
+            .as_mut()
+            .expect("symlink watcher")
+            .contains(&link),
+        "nofollow registration must be removed as well"
+    );
+}
+
+#[cfg(target_os = "linux")]
 fn set_symlink_mtime(path: &Path, seconds: i64) {
     use rustix::fs::{AtFlags, CWD, Timespec, Timestamps};
 

@@ -7,6 +7,12 @@
 
 (declare-function tramp-rpc--invalidate-timed-out-connection "tramp-rpc-transport"
                   (process vec event))
+(declare-function tramp-rpc--track-pending-request "tramp-rpc-transport"
+                  (conn id))
+(declare-function tramp-rpc--connection-filter "tramp-rpc-transport"
+                  (process output))
+(declare-function tramp-rpc--drain-connection-stderr "tramp-rpc-transport"
+                  (conn))
 (declare-function tramp-rpc-mock-test--wait-for "tramp-rpc-mock-tests"
                   (predicate description &optional process))
 
@@ -77,6 +83,50 @@ SPEC is (PROCESS BUFFER [CONNECTION]); CONNECTION defaults to `connection'."
             (tramp-rpc--connection-filter process "late")))
         (should (zerop (hash-table-count
                         (tramp-rpc-connection-pending-responses connection))))))))
+
+(ert-deftest tramp-rpc-mock-test-request-id-less-error-reaches-oldest-waiter ()
+  "An id-less protocol error must wake the oldest synchronous waiter.
+The server answers an oversized or malformed frame with an error that has no
+id.  Discarding it leaves that waiter to burn the whole call timeout and
+tear down the connection."
+  (tramp-rpc-mock-test-request--with-connection (process buffer)
+    ;; Track order is newest-first, so 202 is the oldest waiter.
+    (tramp-rpc--track-pending-request connection 202)
+    (tramp-rpc--track-pending-request connection 101)
+    (let ((messages (list '(:id nil :error (:code -32600
+                                            :message "frame too large")))))
+      (cl-letf (((symbol-function 'tramp-rpc-protocol-try-read-message)
+                 (lambda (_buffer)
+                   (set-marker (mark-marker) (point-max))
+                   (pop messages))))
+        (tramp-rpc--connection-filter process "error")))
+    (should (equal (plist-get (gethash 202 (tramp-rpc-connection-pending-responses
+                                            connection))
+                              :error)
+                   '(:code -32600 :message "frame too large")))
+    (should-not (gethash 101 (tramp-rpc-connection-pending-responses
+                              connection)))))
+
+(ert-deftest tramp-rpc-mock-test-stderr-buffer-is-bounded ()
+  "Long-lived SSH stderr output must not grow without bound."
+  (tramp-rpc-mock-test-request--with-connection (process buffer)
+    (let ((stderr-buffer (generate-new-buffer " *tramp-rpc-stderr-test*"))
+          (stderr-process nil))
+      (unwind-protect
+          (progn
+            (setq stderr-process
+                  (make-pipe-process :name "tramp-rpc-stderr-test"
+                                     :buffer stderr-buffer :noquery t))
+            (setf (tramp-rpc-connection-stderr-buffer connection) stderr-buffer)
+            (with-current-buffer stderr-buffer
+              (insert (make-string (* 2 tramp-rpc-stderr-buffer-limit) ?x))
+              (insert "TAIL-MARKER"))
+            (tramp-rpc--drain-connection-stderr connection)
+            (with-current-buffer stderr-buffer
+              (should (= (buffer-size) tramp-rpc-stderr-buffer-limit))
+              (should (string-suffix-p "TAIL-MARKER" (buffer-string)))))
+        (when (process-live-p stderr-process) (delete-process stderr-process))
+        (when (buffer-live-p stderr-buffer) (kill-buffer stderr-buffer))))))
 
 (defun tramp-rpc-mock-test-request--check-wait-quit (kind)
   "Abandon a KIND wait without disrupting other users of its transport."

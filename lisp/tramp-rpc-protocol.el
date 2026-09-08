@@ -115,6 +115,41 @@ Each value is a cons cell containing the target connection and request.")
   "Return non-nil when METHOD is a long-polling process read method."
   (member method '("process.read" "process.read_pty")))
 
+(defconst tramp-rpc-protocol--signal-descriptions
+  '((1 . "Hangup")
+    (2 . "Interrupt")
+    (3 . "Quit")
+    (4 . "Illegal instruction")
+    (5 . "Trace/breakpoint trap")
+    (6 . "Aborted")
+    (7 . "Bus error")
+    (8 . "Floating point exception")
+    (9 . "Killed")
+    (10 . "User defined signal 1")
+    (11 . "Segmentation fault")
+    (12 . "User defined signal 2")
+    (13 . "Broken pipe")
+    (14 . "Alarm clock")
+    (15 . "Terminated")
+    (24 . "CPU time limit exceeded")
+    (25 . "File size limit exceeded")
+    (26 . "Virtual timer expired")
+    (27 . "Profiling timer expired")
+    (28 . "Window changed")
+    (29 . "I/O possible")
+    (30 . "Power failure")
+    (31 . "Bad system call"))
+  "Signal descriptions matching local Emacs strings for the common signals.")
+
+(defun tramp-rpc-protocol-signal-description (signal)
+  "Return the human-readable description of SIGNAL number.
+Used where no connection is available for the remote `kill -l' mapping,
+such as a process sentinel."
+  (if (integerp signal)
+      (or (alist-get signal tramp-rpc-protocol--signal-descriptions)
+          (format "Signal %d" signal))
+    "Unknown signal"))
+
 (defun tramp-rpc-protocol--empty-poll-response-p (method response)
   "Return non-nil when RESPONSE is an uneventful poll for METHOD."
   (let ((result (plist-get response :result)))

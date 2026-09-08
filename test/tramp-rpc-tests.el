@@ -315,6 +315,25 @@ Returns non-nil if tests can run."
                   (error nil)))))
   (cdr tramp-rpc-test-enabled-checked))
 
+(defun tramp-rpc-test--run-guarded (selector)
+  "Run SELECTOR with ERT, failing when it selects or executes nothing.
+This suite skips most tests when the remote host is unreachable, and ERT
+reports skips as expected results, so a bare batch run would exit 0 after
+exercising almost nothing."
+  (let* ((tests (ert-select-tests selector t))
+         (selected (length tests)))
+    (unless (> selected 0)
+      (error "ERT selector %S selected zero tests" selector))
+    (let* ((stats (ert-run-tests-batch selector))
+           (skipped (ert-stats-skipped stats))
+           (executed (- (ert-stats-completed stats) skipped)))
+      (message "ERT counts: selected=%d executed=%d skipped=%d"
+               selected executed skipped)
+      (when (= executed 0)
+        (error "ERT selector %S executed zero tests (all %d selected tests skipped)"
+               selector skipped))
+      (kill-emacs (if (> (ert-stats-completed-unexpected stats) 0) 1 0)))))
+
 (defun tramp-rpc-test--make-remote-path-2 (filename)
   "Make a full TRAMP RPC path on the second host for FILENAME."
   (format "/rpc:%s:%s/%s"

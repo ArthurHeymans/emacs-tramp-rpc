@@ -746,9 +746,15 @@ instead of invoking the callbacks.  EVENT is the process event string."
         callbacks)
     ;; Kill acknowledgements must still be accepted by the live transport.
     ;; Mark it dead only after these captured-generation calls complete.
+    ;; Teardown is best effort: the hooks issue synchronous RPCs, so a hook
+    ;; error or user quit here must not leave the generation half-cleaned and
+    ;; permanently unclaimable (`cleanup-started' was already set).
     (when (and remote-cleanup (process-live-p process))
-      (run-hook-with-args 'tramp-rpc-transport-terminate-functions
-                          vec process conn))
+      (condition-case hook-error
+          (run-hook-with-args 'tramp-rpc-transport-terminate-functions
+                              vec process conn)
+        ((error quit)
+         (tramp-rpc--debug "transport terminate hook failed: %S" hook-error))))
     (setf (tramp-rpc-connection-transport-cleaned conn) t
           (tramp-rpc-connection-transport-dead conn) t)
     ;; Wake synchronous callers after remote cleanup.  The injected errors
@@ -761,13 +767,18 @@ instead of invoking the callbacks.  EVENT is the process event string."
     (clrhash callback-table)
     ;; Cleanup functions keep local relays tracked through delete-process so
     ;; their wrapped sentinels can preserve the user's sentinel.  Remote
-    ;; termination was completed above using the captured connection.
-    (run-hook-with-args 'tramp-rpc-transport-cleanup-functions vec process)
+    ;; termination was completed above using the captured connection.  The
+    ;; dead/cleaned flags and the transport deletion below must still run when
+    ;; one hook fails, otherwise local relays leak for the session.
+    (condition-case hook-error
+        (run-hook-with-args 'tramp-rpc-transport-cleanup-functions vec process)
+      ((error quit)
+       (tramp-rpc--debug "transport cleanup hook failed: %S" hook-error)))
     (unless defer-callbacks
       (dolist (callback callbacks)
         (condition-case callback-error
             (funcall callback error-response)
-          (error
+          ((error quit)
            (tramp-rpc--debug "transport cleanup callback failed: %S"
                              callback-error)))))
     ;; Explicit disconnect owns transport deletion; unexpected death is
@@ -1694,12 +1705,33 @@ Uses length-prefixed binary framing: <4-byte BE length><msgpack payload>."
                         ;; Store only responses for this generation's live
                         ;; waiters.  Late responses from an abandoned
                         ;; generation are discarded.
-                        (when (memql id (tramp-rpc-connection-pending-ids conn))
+                        (cond
+                         ((memql id (tramp-rpc-connection-pending-ids conn))
                           (tramp-rpc--debug
                            "FILTER storing sync response id=%s" id)
                           (puthash id response
                                    (tramp-rpc-connection-pending-responses
-                                    conn)))))))))))))
+                                    conn)))
+                         ;; The server answers oversized frames and parse
+                         ;; errors with an id-less error response.  Deliver it
+                         ;; to the oldest waiter instead of discarding it:
+                         ;; otherwise that waiter burns the full call timeout
+                         ;; and tears the connection down with no diagnosis.
+                         ((and (null id) (plist-get response :error))
+                          (when-let* ((oldest
+                                       (car (last
+                                             (tramp-rpc-connection-pending-ids
+                                              conn)))))
+                            (tramp-rpc--debug
+                             "FILTER delivering id-less error to id=%s: %S"
+                             oldest (plist-get response :error))
+                            (puthash oldest response
+                                     (tramp-rpc-connection-pending-responses
+                                      conn))))
+                         ((plist-get response :error)
+                          (tramp-rpc--debug
+                           "FILTER dropping unmatched error response: %S"
+                           response)))))))))))))
 
 (defun tramp-rpc--call-async (vec method params callback &optional connection)
   "Call METHOD with PARAMS asynchronously on the RPC server for VEC.
@@ -1764,6 +1796,12 @@ Returns nil if the process is locked to a different thread."
     (or (null locked-thread)
         (eq locked-thread (current-thread)))))
 
+(defconst tramp-rpc-stderr-buffer-limit 65536
+  "Maximum bytes retained in a connection's SSH stderr buffer.
+Only the tail is used for diagnostics, so the buffer is truncated to this
+many bytes after draining to bound growth over a long-lived connection
+with `-v' or a chatty ProxyJump.")
+
 (defun tramp-rpc--drain-connection-stderr (conn)
   "Drain pending stderr output for CONN's SSH process.
 `make-process' with `:stderr' creates a separate stderr process.  The RPC
@@ -1774,7 +1812,14 @@ and blocking SSH or the remote server."
               ((buffer-live-p stderr-buffer))
               (stderr-process (get-buffer-process stderr-buffer))
               ((tramp-rpc--process-accessible-p stderr-process)))
-    (while (accept-process-output stderr-process 0 nil t))))
+    (while (accept-process-output stderr-process 0 nil t))
+    ;; Keep the diagnostic tail only; an unbounded stderr buffer grows for the
+    ;; whole lifetime of the connection.  Deleting before the process mark
+    ;; leaves the mark at the end, so later appends stay in order.
+    (with-current-buffer stderr-buffer
+      (when (> (buffer-size) tramp-rpc-stderr-buffer-limit)
+        (delete-region (point-min)
+                       (- (point-max) tramp-rpc-stderr-buffer-limit))))))
 
 (defun tramp-rpc--connection-stderr-tail (conn &optional max-bytes)
   "Return a diagnostic tail from CONN's stderr buffer, or nil.

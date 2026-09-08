@@ -200,6 +200,106 @@ async fn cleanup_reports_signal_failure_and_retains_managed_process() {
 }
 
 #[tokio::test]
+async fn removed_unreaped_pipe_process_is_reaped_in_background() {
+    let _test_lock = test_process_map_lock().await;
+    let pid = start_pipe_process("sleep 30").await;
+    let os_pid = pipe_os_pid(pid).await;
+
+    // Remove before the child is reaped, which is what an explicit SIGKILL
+    // whose bounded wait times out does.  The background reaper must wait the
+    // child so it does not become a zombie.
+    retire_pipe_process(pid).await;
+    assert!(!get_process_map().lock().await.contains_key(&pid));
+
+    signal_process_group(os_pid as u32, libc::SIGKILL).expect("kill process group");
+
+    for _ in 0..200 {
+        if waitpid(Pid::from_raw(os_pid as i32), Some(WaitPidFlag::WNOHANG))
+            == Err(nix::errno::Errno::ECHILD)
+        {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+    panic!("removed child was not reaped in the background");
+}
+
+#[test]
+fn pty_exit_reports_the_terminating_signal() {
+    use nix::sys::signal::Signal;
+    use nix::sys::wait::WaitStatus;
+
+    let pid = Pid::from_raw(1);
+    assert_eq!(
+        PtyExit::from_wait_status(WaitStatus::Signaled(pid, Signal::SIGKILL, false)),
+        Some(PtyExit {
+            code: 137,
+            signal: Some(9)
+        })
+    );
+    assert_eq!(
+        PtyExit::from_wait_status(WaitStatus::Exited(pid, 42)),
+        Some(PtyExit {
+            code: 42,
+            signal: None
+        })
+    );
+    assert_eq!(
+        PtyExit::from_signal(libc::SIGTERM),
+        PtyExit {
+            code: 143,
+            signal: Some(15)
+        }
+    );
+}
+
+#[cfg(not(target_os = "macos"))]
+#[tokio::test]
+async fn failed_pty_signal_leaves_io_usable() {
+    let _test_lock = test_process_map_lock().await;
+    let start_result = start_pty(Value::Map(vec![
+        (Value::String("cmd".into()), Value::String("/bin/sh".into())),
+        (
+            Value::String("args".into()),
+            Value::Array(vec![
+                Value::String("-c".into()),
+                Value::String("sleep 30".into()),
+            ]),
+        ),
+    ]))
+    .await
+    .expect("start PTY");
+    let pid = map_get(&start_result, "pid")
+        .and_then(Value::as_u64)
+        .expect("PTY pid") as u32;
+
+    set_test_process_group_signal_error(Some(libc::EPERM));
+    let result = kill_pty(Value::Map(vec![
+        (Value::String("pid".into()), Value::Integer(pid.into())),
+        (Value::String("signal".into()), Value::Integer(9.into())),
+    ]))
+    .await;
+    set_test_process_group_signal_error(None);
+
+    assert!(result.is_err(), "EPERM must be reported");
+    // Cancelling before a signal that can fail would permanently disable PTY
+    // writes while leaving the entry registered.  The client must still be
+    // able to write or close the terminal after a failed signal.
+    let write = write_pty(Value::Map(vec![
+        (Value::String("pid".into()), Value::Integer(pid.into())),
+        (Value::String("data".into()), Value::Binary(b"x".to_vec())),
+    ]))
+    .await;
+    assert!(
+        write.is_ok(),
+        "PTY must remain writable after a failed signal: {:?}",
+        write.err()
+    );
+
+    cleanup_managed_processes().await.expect("cleanup PTY");
+}
+
+#[tokio::test]
 async fn synchronous_output_reader_enforces_shared_limit() {
     let budget = Arc::new(RetainedOutputBudget::new(Arc::new(Semaphore::new(4))));
     let error = read_sync_output(&b"oversized"[..], budget, 4)
@@ -1709,6 +1809,26 @@ async fn pipe_sigkill_discards_unread_output_after_reaping_direct_child() {
 
     assert_reaped(os_pid);
     assert!(!get_process_map().lock().await.contains_key(&pid));
+}
+
+#[tokio::test]
+async fn wait_pipe_child_reaps_through_tokio() {
+    let _test_lock = test_process_map_lock().await;
+    let pid = start_pipe_process("exit 0").await;
+
+    let status = wait_pipe_child(pid).await.expect("reap managed child");
+    assert!(status.is_some(), "exited child must report a status");
+
+    // Reaping must go through tokio's own `try_wait' so the child's
+    // `kill_on_drop' state is cleared.  A second reaper hides the reap from
+    // tokio, which then still believes the process is alive and can SIGKILL
+    // an already-reaped, possibly recycled PID when the entry is dropped.
+    let mut processes = get_process_map().lock().await;
+    let managed = processes.get_mut(&pid).expect("managed child");
+    assert!(
+        managed.child.try_wait().expect("tokio try_wait").is_some(),
+        "tokio must consider the child reaped"
+    );
 }
 
 #[tokio::test]

@@ -46,7 +46,7 @@ pub(crate) const MAX_RESPONSE_OUTPUT_BYTES: usize = MAX_FRAME_SIZE - 1024 * 1024
 const FRAME_CHANNEL_SIZE: usize = 2;
 const GENERAL_TASK_LIMIT: usize = 16;
 const CONTROL_TASK_LIMIT: usize = 4;
-const PTY_WRITE_TASK_LIMIT: usize = 16;
+const WRITE_TASK_LIMIT: usize = 16;
 /// How many decoded-but-not-yet-started requests are buffered before the
 /// connection stops reading frames.  Past this point the bounded frame
 /// channel and the OS pipe throttle the client, which is the only
@@ -67,8 +67,10 @@ const DEFERRED_REQUEST_LIMIT: usize = 64;
 /// below the unbounded 6.4GiB.  Active params are separately bounded by
 /// ACTIVE_PARAM_BYTES (128MiB); active response buffers remain per-request
 /// bounded (MAX_RESPONSE_OUTPUT_BYTES each, 16 max) and require the trusted
-/// client to request 16 concurrent large outputs — mitigated by per-command
-/// timeouts and the per-batch shared output budget.
+/// client to request 16 concurrent large outputs — mitigated by the
+/// per-command deadline of `commands.run_parallel', the per-batch shared
+/// output budget, and the client's own call timeout for `process.run' (which
+/// has no server-side deadline).
 const DEFERRED_BYTE_LIMIT: usize = 32 * 1024 * 1024;
 const ERROR_RESPONSE_CHANNEL_SIZE: usize = 16;
 const EOF_TASK_JOIN_WAIT: std::time::Duration = std::time::Duration::from_millis(500);
@@ -139,13 +141,13 @@ async fn read_frames<R>(
 enum TaskClass {
     General,
     Control,
-    PtyWrite,
+    Write,
 }
 
 struct Admissions {
     general: Arc<Semaphore>,
     control: Arc<Semaphore>,
-    pty_write: Arc<Semaphore>,
+    write: Arc<Semaphore>,
 }
 
 impl Admissions {
@@ -158,7 +160,7 @@ impl Admissions {
         match class {
             TaskClass::General => &self.general,
             TaskClass::Control => &self.control,
-            TaskClass::PtyWrite => &self.pty_write,
+            TaskClass::Write => &self.write,
         }
     }
 
@@ -178,7 +180,7 @@ impl Default for Admissions {
         Self {
             general: Arc::new(Semaphore::new(GENERAL_TASK_LIMIT)),
             control: Arc::new(Semaphore::new(CONTROL_TASK_LIMIT)),
-            pty_write: Arc::new(Semaphore::new(PTY_WRITE_TASK_LIMIT)),
+            write: Arc::new(Semaphore::new(WRITE_TASK_LIMIT)),
         }
     }
 }
@@ -192,10 +194,11 @@ fn task_class(method: &str) -> TaskClass {
         | "process.close_stdin"
         | "process.kill_pty"
         | "process.close_pty" => TaskClass::Control,
-        // PTY writes can remain blocked until the remote program reads input.
-        // Isolate them so they cannot consume every general request permit;
-        // lifecycle operations retain their separately reserved control slots.
-        "process.write_pty" => TaskClass::PtyWrite,
+        // Pipe and PTY writes can remain blocked until the remote program
+        // reads input.  Isolate them so they cannot consume every general
+        // request permit; lifecycle operations retain their separately
+        // reserved control slots.
+        "process.write" | "process.write_pty" => TaskClass::Write,
         _ => TaskClass::General,
     }
 }
@@ -432,7 +435,7 @@ async fn drain_tasks_for(tasks: &mut JoinSet<()>, wait: std::time::Duration) {
 struct AdmissionPass {
     general_waiting: bool,
     control_blocked: bool,
-    pty_write_blocked: bool,
+    write_blocked: bool,
 }
 
 impl AdmissionPass {
@@ -441,7 +444,7 @@ impl AdmissionPass {
         match class {
             TaskClass::General => false,
             TaskClass::Control => self.control_blocked,
-            TaskClass::PtyWrite => self.pty_write_blocked,
+            TaskClass::Write => self.write_blocked,
         }
     }
 
@@ -464,7 +467,7 @@ impl AdmissionPass {
                 self.general_waiting = true;
             }
             TaskClass::Control => self.control_blocked = true,
-            TaskClass::PtyWrite => self.pty_write_blocked = true,
+            TaskClass::Write => self.write_blocked = true,
         }
     }
 }

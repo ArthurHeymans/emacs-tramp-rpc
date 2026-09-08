@@ -29,29 +29,58 @@ use super::super::system::expand_tilde;
 #[cfg(target_os = "macos")]
 use super::signal_process;
 use super::{
-    MANAGED_CHILD_WAIT, MANAGED_PTY_CHILD_WAIT, MAX_PROCESS_READ_BYTES, SignalCode, dup_cloexec,
+    MANAGED_PTY_CHILD_WAIT, MAX_PROCESS_READ_BYTES, SignalCode, dup_cloexec,
     require_process_group_signal, set_fd_cloexec, set_fd_nonblocking, signal_process_group,
     wait_for_process_group_exit,
 };
 
 pub(super) static PTY_PROCESS_MAP: OnceLock<Mutex<HashMap<u32, ManagedPtyProcess>>> =
     OnceLock::new();
-pub(super) static TERMINATED_PTY_STATUSES: OnceLock<StdMutex<HashMap<u32, i32>>> = OnceLock::new();
+/// Terminal status of a PTY child: the historical 128 + signal code plus the
+/// signal itself when the child was killed by one.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct PtyExit {
+    pub code: i32,
+    pub signal: Option<i32>,
+}
+
+impl PtyExit {
+    pub(super) fn from_wait_status(status: WaitStatus) -> Option<Self> {
+        match status {
+            WaitStatus::Exited(_, code) => Some(Self { code, signal: None }),
+            WaitStatus::Signaled(_, signal, _) => Some(Self {
+                code: 128 + signal as i32,
+                signal: Some(signal as i32),
+            }),
+            _ => None,
+        }
+    }
+
+    pub(super) fn from_signal(signal: i32) -> Self {
+        Self {
+            code: 128 + signal,
+            signal: Some(signal),
+        }
+    }
+}
+
+pub(super) static TERMINATED_PTY_STATUSES: OnceLock<StdMutex<HashMap<u32, PtyExit>>> =
+    OnceLock::new();
 pub(super) static PTY_PID_COUNTER: OnceLock<Mutex<u32>> = OnceLock::new();
 
 pub(super) fn get_pty_process_map() -> &'static Mutex<HashMap<u32, ManagedPtyProcess>> {
     PTY_PROCESS_MAP.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-pub(super) fn record_terminated_pty_status(pid: u32, exit_code: i32) {
+pub(super) fn record_terminated_pty_status(pid: u32, exit: PtyExit) {
     TERMINATED_PTY_STATUSES
         .get_or_init(|| StdMutex::new(HashMap::new()))
         .lock()
         .expect("terminated PTY status lock")
-        .insert(pid, exit_code);
+        .insert(pid, exit);
 }
 
-pub(super) fn take_terminated_pty_status(pid: u32) -> Option<i32> {
+pub(super) fn take_terminated_pty_status(pid: u32) -> Option<PtyExit> {
     TERMINATED_PTY_STATUSES
         .get_or_init(|| StdMutex::new(HashMap::new()))
         .lock()
@@ -104,6 +133,14 @@ impl PtyIoState {
     pub(super) fn is_closed(&self) -> bool {
         self.closed.load(Ordering::Acquire)
     }
+
+    /// Withdraw a cancellation whose motivating signal was not delivered.
+    /// A writer already woken by `cancel' may still observe the error once;
+    /// the `is_closed' re-check in `write_pty' lets later writes proceed.
+    pub(super) fn reopen(&self) {
+        let _syscall_guard = self.syscall_lock.lock().expect("PTY syscall lock");
+        self.closed.store(false, Ordering::Release);
+    }
 }
 
 pub(super) struct ManagedPtyProcess {
@@ -112,10 +149,10 @@ pub(super) struct ManagedPtyProcess {
     pub(super) io: Arc<PtyIoState>,
     pub(super) child_pid: Pid,
     pub(super) cmd: String,
-    pub(super) exit_status: Option<i32>,
+    pub(super) exit_status: Option<PtyExit>,
     // Retain an observed terminal status for a read that captured the PTY
     // before explicit SIGKILL removes its registry entry.
-    pub(super) shared_exit_status: Arc<StdMutex<Option<i32>>>,
+    pub(super) shared_exit_status: Arc<StdMutex<Option<PtyExit>>>,
     pub(super) output_eof: bool,
 }
 
@@ -518,7 +555,8 @@ pub async fn read_pty(params: Value) -> HandlerResult {
     Ok(msgpack_map! {
         "output" => output,
         "exited" => result.exited,
-        "exit_code" => result.exit_code.map(|c| Value::Integer(c.into())).unwrap_or(Value::Nil)
+        "exit_code" => result.exit.map(|exit| Value::Integer(exit.code.into())).unwrap_or(Value::Nil),
+        "signal" => result.exit.and_then(|exit| exit.signal).map(|signal| Value::Integer(signal.into())).unwrap_or(Value::Nil)
     })
 }
 
@@ -526,7 +564,7 @@ pub(super) struct PtyReadResult {
     pub(super) output: Vec<u8>,
     pub(super) pending: bool,
     pub(super) exited: bool,
-    pub(super) exit_code: Option<i32>,
+    pub(super) exit: Option<PtyExit>,
 }
 
 pub(super) async fn read_pty_now(pid: u32, max_bytes: usize) -> Result<PtyReadResult, RpcError> {
@@ -541,7 +579,7 @@ pub(super) async fn read_pty_now(pid: u32, max_bytes: usize) -> Result<PtyReadRe
                 output: Vec::new(),
                 pending: false,
                 exited: true,
-                exit_code: take_terminated_pty_status(pid),
+                exit: take_terminated_pty_status(pid),
             });
         };
         let fd = dup_cloexec(managed.async_fd.get_ref())
@@ -568,7 +606,7 @@ pub(super) async fn read_pty_now(pid: u32, max_bytes: usize) -> Result<PtyReadRe
             output: Vec::new(),
             pending: false,
             exited: true,
-            exit_code: shared_status.or(retained_status),
+            exit: shared_status.or(retained_status),
         });
     };
 
@@ -602,7 +640,7 @@ pub(super) async fn read_pty_now(pid: u32, max_bytes: usize) -> Result<PtyReadRe
         managed.output_eof = true;
     }
 
-    let (child_exited, exit_code) = check_exit_status(managed);
+    let (child_exited, exit) = check_exit_status(managed);
     let exited = child_exited && managed.output_eof;
     drop(processes);
     if exited {
@@ -616,35 +654,26 @@ pub(super) async fn read_pty_now(pid: u32, max_bytes: usize) -> Result<PtyReadRe
         output,
         pending,
         exited,
-        exit_code: exited.then_some(exit_code).flatten(),
+        exit: exited.then_some(exit).flatten(),
     })
 }
 
-pub(super) fn check_exit_status(managed: &mut ManagedPtyProcess) -> (bool, Option<i32>) {
+pub(super) fn check_exit_status(managed: &mut ManagedPtyProcess) -> (bool, Option<PtyExit>) {
     if managed.exit_status.is_some() {
         (true, managed.exit_status)
     } else {
-        match waitpid(managed.child_pid, Some(WaitPidFlag::WNOHANG)) {
-            Ok(WaitStatus::Exited(_, code)) => {
-                managed.exit_status = Some(code);
-                *managed
-                    .shared_exit_status
-                    .lock()
-                    .expect("shared PTY exit status lock") = Some(code);
-                (true, Some(code))
-            }
-            Ok(WaitStatus::Signaled(_, signal, _)) => {
-                let code = 128 + signal as i32;
-                managed.exit_status = Some(code);
-                *managed
-                    .shared_exit_status
-                    .lock()
-                    .expect("shared PTY exit status lock") = Some(code);
-                (true, Some(code))
-            }
-            Ok(WaitStatus::StillAlive) => (false, None),
-            _ => (false, None),
+        let exit = match waitpid(managed.child_pid, Some(WaitPidFlag::WNOHANG)) {
+            Ok(status) => PtyExit::from_wait_status(status),
+            Err(_) => None,
+        };
+        if let Some(exit) = exit {
+            managed.exit_status = Some(exit);
+            *managed
+                .shared_exit_status
+                .lock()
+                .expect("shared PTY exit status lock") = Some(exit);
         }
+        (managed.exit_status.is_some(), managed.exit_status)
     }
 }
 
@@ -743,9 +772,14 @@ pub async fn write_pty(params: Value) -> HandlerResult {
             result = async_fd.ready(Interest::WRITABLE) => result
                 .map_err(|e| RpcError::process_error(format!("Failed to wait for writable: {e}")))?,
             _ = cancelled => {
-                return Err(RpcError::process_error(format!(
-                    "PTY write cancelled: {}", params.pid
-                )));
+                if io.is_closed() {
+                    return Err(RpcError::process_error(format!(
+                        "PTY write cancelled: {}", params.pid
+                    )));
+                }
+                // The cancellation was withdrawn (a signal that motivated it
+                // failed); ignore the stale notification and retry.
+                continue;
             }
         };
 
@@ -775,11 +809,12 @@ pub async fn write_pty(params: Value) -> HandlerResult {
     })
 }
 
-pub(super) async fn wait_pty_pid(child_pid: Pid) -> Result<Option<i32>, nix::errno::Errno> {
+pub(super) async fn wait_pty_pid(child_pid: Pid) -> Result<Option<PtyExit>, nix::errno::Errno> {
     loop {
         match waitpid(child_pid, Some(WaitPidFlag::WNOHANG)) {
-            Ok(WaitStatus::Exited(_, code)) => return Ok(Some(code)),
-            Ok(WaitStatus::Signaled(_, signal, _)) => return Ok(Some(128 + signal as i32)),
+            Ok(status @ (WaitStatus::Exited(_, _) | WaitStatus::Signaled(_, _, _))) => {
+                return Ok(PtyExit::from_wait_status(status));
+            }
             Ok(WaitStatus::StillAlive) => {
                 tokio::time::sleep(std::time::Duration::from_millis(5)).await;
             }
@@ -788,6 +823,22 @@ pub(super) async fn wait_pty_pid(child_pid: Pid) -> Result<Option<i32>, nix::err
             Err(error) => return Err(error),
             Ok(_) => return Err(nix::errno::Errno::EINVAL),
         }
+    }
+}
+
+/// Remove PID from the PTY registry, reaping the direct child in the
+/// background when it was not confirmed dead.
+///
+/// Dropping the entry closes the PTY master (which sends SIGHUP), but an
+/// unreaped child would still remain a zombie for the life of the server.
+pub(super) async fn retire_pty_process(pid: u32, os_pid: u32) {
+    let removed = get_pty_process_map().lock().await.remove(&pid);
+    if let Some(managed) = removed
+        && managed.exit_status.is_none()
+    {
+        tokio::spawn(async move {
+            let _ = wait_pty_pid(Pid::from_raw(os_pid as i32)).await;
+        });
     }
 }
 
@@ -818,14 +869,25 @@ pub(super) async fn terminate_pty_process(
         };
     };
     // Explicit teardown and SIGKILL must wake a writer blocked on readiness
-    // immediately.  Other forwarded signals (notably SIGINT) are survivable
-    // for an interactive shell, so leave the PTY I/O state usable until a
-    // terminal exit has actually been confirmed.
-    if remove || signal == libc::SIGKILL {
+    // immediately, before waiting for the lifecycle lock, so a reader or
+    // writer can be released while the signal is still being delivered.
+    // Other forwarded signals (notably SIGINT) are survivable for an
+    // interactive shell, so leave the PTY I/O state usable until a terminal
+    // exit has actually been confirmed.
+    let cancelled_early = remove || signal == libc::SIGKILL;
+    if cancelled_early {
         io.cancel();
     }
     let _lifecycle_guard = lifecycle.lock().await;
-    signal_pty_process_group(os_pid, signal, "send signal")?;
+    if let Err(error) = signal_pty_process_group(os_pid, signal, "send signal") {
+        // A failed signal (EPERM from a surviving credential-changing
+        // descendant) must leave the PTY usable; otherwise the entry stays
+        // registered with every later write rejected.
+        if cancelled_early {
+            io.reopen();
+        }
+        return Err(error);
+    }
 
     if matches!(signal, 0 | libc::SIGSTOP | libc::SIGCONT) {
         return Ok(true);
@@ -887,17 +949,30 @@ pub(super) async fn terminate_pty_process(
         signal_pty_process_group(os_pid, libc::SIGKILL, "send SIGKILL")?;
     }
     if reap.is_none() && escalate {
-        reap = tokio::time::timeout(
-            MANAGED_CHILD_WAIT,
+        // The escalation reap is the last chance to observe the child.  Use the
+        // PTY budget for it as well, and retire the entry on failure so a
+        // single unreaped child cannot poison the shared registry for every
+        // later test or connection.
+        reap = match tokio::time::timeout(
+            MANAGED_PTY_CHILD_WAIT,
             wait_pty_pid(Pid::from_raw(os_pid as i32)),
         )
         .await
-        .map_err(|_| {
-            RpcError::process_error(format!("Timed out reaping PTY process {pid} after SIGKILL"))
-        })?
-        .map_err(|error| {
-            RpcError::process_error(format!("Failed to reap PTY process {pid}: {error}"))
-        })?;
+        {
+            Ok(Ok(status)) => status,
+            Ok(Err(error)) => {
+                retire_pty_process(pid, os_pid).await;
+                return Err(RpcError::process_error(format!(
+                    "Failed to reap PTY process {pid}: {error}"
+                )));
+            }
+            Err(_) => {
+                retire_pty_process(pid, os_pid).await;
+                return Err(RpcError::process_error(format!(
+                    "Timed out reaping PTY process {pid} after SIGKILL"
+                )));
+            }
+        };
     }
     if let Some(exit_code) = reap {
         // Reaping confirms terminal death, so no further PTY input can be
@@ -928,16 +1003,16 @@ pub(super) async fn terminate_pty_process(
         // SIGKILL was delivered but the bounded reap did not observe a status
         // (for example, another waiter consumed it).  The explicit kill still
         // has deterministic abnormal process semantics for an in-flight read.
-        let exit_code = {
+        let exit = {
             let mut status = shared_exit_status
                 .lock()
                 .expect("shared PTY exit status lock");
-            *status.get_or_insert(128 + libc::SIGKILL)
+            *status.get_or_insert(PtyExit::from_signal(libc::SIGKILL))
         };
         if retain_removed_status {
-            record_terminated_pty_status(pid, exit_code);
+            record_terminated_pty_status(pid, exit);
         }
-        get_pty_process_map().lock().await.remove(&pid);
+        retire_pty_process(pid, os_pid).await;
         return Ok(true);
     }
 
@@ -1015,13 +1090,14 @@ pub async fn list_pty(_params: Value) -> HandlerResult {
         let Some(managed) = processes.get_mut(&pid) else {
             continue;
         };
-        let (exited, exit_code) = check_exit_status(managed);
+        let (exited, exit) = check_exit_status(managed);
         list.push(msgpack_map! {
             "pid" => pid,
             "os_pid" => managed.child_pid.as_raw(),
             "cmd" => managed.cmd.clone(),
             "exited" => exited,
-            "exit_code" => exit_code.map(|c| Value::Integer(c.into())).unwrap_or(Value::Nil)
+            "exit_code" => exit.map(|exit| Value::Integer(exit.code.into())).unwrap_or(Value::Nil),
+            "signal" => exit.and_then(|exit| exit.signal).map(|signal| Value::Integer(signal.into())).unwrap_or(Value::Nil)
         });
     }
 

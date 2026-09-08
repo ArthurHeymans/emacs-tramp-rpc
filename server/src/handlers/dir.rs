@@ -21,6 +21,20 @@ use super::file::{bytes_to_path, file_type_from_metadata_ft, map_io_error};
 
 use crate::protocol::path_or_bytes;
 
+/// Upper bound on one `dir.list` payload.  The response is checked against the
+/// frame limit only after it is fully serialized, so an unbounded entry list
+/// could allocate far more than the transport can send.  Failing at a
+/// deterministic byte budget keeps the peak bounded and reports a clear error
+/// instead of an opaque oversized-frame rejection.
+const MAX_DIR_LISTING_BYTES: usize = 64 * 1024 * 1024;
+/// Per-entry accounting overhead.  Attribute maps dominate the payload; names
+/// and link targets are added separately.
+const DIR_ENTRY_BUDGET_BYTES: usize = 256;
+/// Overhead for a completion listing, whose entries carry only a name and a
+/// type.  Using the attribute estimate here would reject large flat
+/// directories whose real payload is far smaller than the budget.
+const DIR_ENTRY_BUDGET_BYTES_NO_ATTRS: usize = 32;
+
 /// Extract time and mode fields from `stat` in a cross-platform way
 /// Returns (atime, mtime, ctime, mode)
 /// - On Linux: st_mode is u32; time fields are i32 on 32-bit, i64 on 64-bit
@@ -165,22 +179,27 @@ pub async fn list(params: Value) -> HandlerResult {
     let include_hidden = params.include_hidden;
 
     // Do all I/O in a single blocking task for efficiency
-    let results =
-        tokio::task::spawn_blocking(move || list_dir_sync(&path, include_attrs, include_hidden))
-            .await
-            .map_err(|e| RpcError::internal_error(format!("Task join error: {e}")))?
-            .map_err(|e| map_io_error(e, &path_str))?;
+    let results = tokio::task::spawn_blocking(move || {
+        list_dir_sync(&path, include_attrs, include_hidden, MAX_DIR_LISTING_BYTES)
+    })
+    .await
+    .map_err(|e| RpcError::internal_error(format!("Task join error: {e}")))?
+    .map_err(|e| map_io_error(e, &path_str))?;
 
     // Convert to array of map values with named fields
     let values: Vec<Value> = results.iter().map(|e| e.to_value()).collect();
     Ok(Value::Array(values))
 }
 
-/// Synchronous directory listing with d_type and fstatat optimizations
+/// Synchronous directory listing with d_type and fstatat optimizations.
+///
+/// BUDGET_BYTES bounds the accounted payload so a directory with millions of
+/// entries cannot allocate unbounded memory before the frame-size check.
 fn list_dir_sync(
     path: &Path,
     include_attrs: bool,
     include_hidden: bool,
+    budget_bytes: usize,
 ) -> Result<Vec<DirEntry>, std::io::Error> {
     // Open directory fd for fstatat.  The `OwnedFd` closes it on all exit paths.
     let dir_handle: Option<OwnedFd> = if include_attrs {
@@ -195,6 +214,7 @@ fn list_dir_sync(
     let dir_fd = dir_handle.as_ref().map(AsFd::as_fd);
 
     let mut results: Vec<DirEntry> = Vec::new();
+    let mut budget_used: usize = 0;
 
     // Add . and .. entries
     if include_hidden {
@@ -249,6 +269,24 @@ fn list_dir_sync(
         } else {
             None
         };
+
+        let per_entry_bytes = if include_attrs {
+            DIR_ENTRY_BUDGET_BYTES
+        } else {
+            DIR_ENTRY_BUDGET_BYTES_NO_ATTRS
+        };
+        budget_used += per_entry_bytes
+            + name_bytes.len()
+            + attrs
+                .as_ref()
+                .and_then(|attrs| attrs.link_target.as_ref())
+                .map_or(0, Vec::len);
+        if budget_used > budget_bytes {
+            return Err(std::io::Error::other(format!(
+                "Directory listing for {} exceeds {budget_bytes} bytes",
+                path.display()
+            )));
+        }
 
         results.push(DirEntry {
             name: name_bytes,
@@ -391,4 +429,28 @@ pub async fn remove(params: Value) -> HandlerResult {
     result.map_err(|e| map_io_error(e, &path_str))?;
 
     Ok(Value::Boolean(true))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn listing_over_budget_is_rejected_instead_of_allocated() {
+        let tmp = tempfile::tempdir().expect("create tempdir");
+        for index in 0..8 {
+            std::fs::write(tmp.path().join(format!("entry-{index}")), b"x").unwrap();
+        }
+
+        let error = list_dir_sync(tmp.path(), false, true, 64)
+            .expect_err("a tiny budget must stop the listing");
+        assert!(
+            error.to_string().contains("exceeds 64 bytes"),
+            "unexpected error: {error}"
+        );
+
+        let listed = list_dir_sync(tmp.path(), false, true, 64 * 1024)
+            .expect("a normal budget lists the directory");
+        assert!(listed.len() >= 8);
+    }
 }
