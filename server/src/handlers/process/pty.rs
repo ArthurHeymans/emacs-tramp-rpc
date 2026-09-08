@@ -28,7 +28,7 @@ use super::super::HandlerResult;
 use super::super::system::expand_tilde;
 #[cfg(test)]
 use super::MAX_PROCESS_READ_BYTES;
-use super::pipe::{exit_status_from_wait_status, get_next_pid};
+use super::pipe::get_next_pid;
 use super::push::{OutputPush, send_exit_notification, stop_output_push};
 #[cfg(target_os = "macos")]
 use super::signal_process;
@@ -621,6 +621,17 @@ pub(super) async fn read_pty_now(pid: u32, max_bytes: usize) -> Result<PtyReadRe
         exited,
         exit: exited.then_some(exit_status).flatten(),
     })
+}
+
+/// Convert a terminal nix wait status into a std exit status.
+fn exit_status_from_wait_status(status: WaitStatus) -> ExitStatus {
+    match status {
+        WaitStatus::Exited(_, code) => ExitStatus::from_raw(code << 8),
+        WaitStatus::Signaled(_, signal, core_dumped) => {
+            ExitStatus::from_raw(signal as i32 | if core_dumped { 0x80 } else { 0 })
+        }
+        _ => ExitStatus::from_raw(0),
+    }
 }
 
 pub(super) fn check_exit_status(managed: &mut ManagedPtyProcess) -> (bool, Option<ExitStatus>) {
