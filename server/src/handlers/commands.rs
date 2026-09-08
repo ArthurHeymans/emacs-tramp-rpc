@@ -317,10 +317,12 @@ fn as_search_dir(path: &Path) -> Option<PathBuf> {
 
 const MAX_DOMINATING_DEPTH: usize = 100;
 
-fn find_dominating_dir(
-    start_dir: &Path,
-    names: &[String],
-) -> Result<Option<(PathBuf, Vec<String>)>, RpcError> {
+/// Walk upward from START_DIR looking for any of NAMES.
+///
+/// The depth bound protects against pathological paths, but hitting it means
+/// "not found": a deep path must degrade like a missing marker rather than
+/// make `locate-dominating-file' and dir-locals signal a remote error.
+fn find_dominating_dir(start_dir: &Path, names: &[String]) -> Option<(PathBuf, Vec<String>)> {
     let mut current = start_dir.to_path_buf();
     let mut depth = 0usize;
     loop {
@@ -331,20 +333,15 @@ fn find_dominating_dir(
             .collect();
 
         if !found.is_empty() {
-            return Ok(Some((current, found)));
+            return Some((current, found));
         }
 
         match current.parent() {
-            Some(parent) if parent != current => {
-                if depth >= MAX_DOMINATING_DEPTH {
-                    return Err(RpcError::invalid_params(format!(
-                        "Maximum ancestor traversal depth ({MAX_DOMINATING_DEPTH}) exceeded"
-                    )));
-                }
+            Some(parent) if parent != current && depth < MAX_DOMINATING_DEPTH => {
                 current = parent.to_path_buf();
                 depth += 1;
             }
-            _ => return Ok(None),
+            _ => return None,
         }
     }
 }
@@ -421,7 +418,7 @@ pub async fn highlevel_locate_dominating_file_multi(params: Value) -> HandlerRes
             return Ok(Value::Array(vec![]));
         };
 
-        let Some((dir, found_names)) = find_dominating_dir(&start_dir, &params.names)? else {
+        let Some((dir, found_names)) = find_dominating_dir(&start_dir, &params.names) else {
             return Ok(Value::Array(vec![]));
         };
 
@@ -469,7 +466,7 @@ pub async fn highlevel_dir_locals_find_file_cache_update(params: Value) -> Handl
         };
 
         let locals_value =
-            if let Some((locals_dir, _)) = find_dominating_dir(&start_dir, &params.names)? {
+            if let Some((locals_dir, _)) = find_dominating_dir(&start_dir, &params.names) {
                 let locals_dir = remap_to_lexical_ancestor(&start_dir, &locals_dir);
                 let local_files: Vec<Value> = params
                     .names
@@ -549,6 +546,21 @@ pub async fn highlevel_dir_locals_find_file_cache_update(params: Value) -> Handl
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn dominating_search_depth_limit_is_not_found() {
+        let tmp = tempfile::tempdir().expect("create tempdir");
+        let mut deep = tmp.path().to_path_buf();
+        for index in 0..MAX_DOMINATING_DEPTH + 10 {
+            deep.push(format!("d{index:03}"));
+        }
+        std::fs::create_dir_all(&deep).expect("create deep tree");
+
+        // The marker sits above the bound, so the walk must report not-found
+        // instead of making dir-locals signal a remote error.
+        std::fs::write(tmp.path().join(".git"), b"").expect("write marker");
+        assert!(find_dominating_dir(&deep, &[".git".to_string()]).is_none());
+    }
 
     #[test]
     fn ancestor_paths_use_text_when_compatible_and_binary_when_required() {

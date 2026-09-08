@@ -982,7 +982,7 @@ literally finds nothing."
     (tramp-rpc-mock-test--stop-server)))
 
 (ert-deftest tramp-rpc-mock-test-server-highlevel-locate-dominating-file-depth-limit ()
-  "Ensure dominating-file helper errors after 100 ancestor levels."
+  "Ensure dominating-file helper reports not-found after 100 ancestor levels."
   :tags '(:server)
   (skip-unless tramp-rpc-mock-test--msgpack-available)
   (skip-unless (tramp-rpc-mock-test--find-server))
@@ -1001,10 +1001,8 @@ literally finds nothing."
                          "highlevel.locate_dominating_file_multi"
                          `((file . ,(encode-coding-string file 'utf-8))
                            (names . [".git"])))))
-            (should (stringp (plist-get result :error)))
-            (should (string-match-p
-                     "Maximum ancestor traversal depth (100) exceeded"
-                     (plist-get result :error))))))
+            ;; Hitting the bound is "not found", not a remote error.
+            (should (zerop (length result))))))
     (tramp-rpc-mock-test--stop-server)))
 
 (ert-deftest tramp-rpc-mock-test-server-highlevel-test-files-in-dir ()
@@ -1086,7 +1084,7 @@ literally finds nothing."
     (tramp-rpc-mock-test--stop-server)))
 
 (ert-deftest tramp-rpc-mock-test-server-highlevel-dir-locals-cache-update-depth-limit ()
-  "Ensure dir-locals cache helper errors after 100 ancestor levels."
+  "Ensure dir-locals cache helper reports not-found after 100 ancestor levels."
   :tags '(:server)
   (skip-unless tramp-rpc-mock-test--msgpack-available)
   (skip-unless (tramp-rpc-mock-test--find-server))
@@ -1105,10 +1103,11 @@ literally finds nothing."
                          `((file . ,(encode-coding-string file 'utf-8))
                            (names . [".dir-locals.el"])
                            (cache_dirs . [])))))
-            (should (stringp (plist-get result :error)))
-            (should (string-match-p
-                     "Maximum ancestor traversal depth (100) exceeded"
-                     (plist-get result :error))))))
+            ;; Hitting the bound is "not found", not a remote error.
+            (should-not (plist-get result :error))
+            (should (alist-get 'file result))
+            (should-not (alist-get 'locals result))
+            (should-not (alist-get 'cache result)))))
     (tramp-rpc-mock-test--stop-server)))
 
 (ert-deftest tramp-rpc-mock-test-server-process-run ()
