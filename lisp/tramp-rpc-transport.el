@@ -746,9 +746,15 @@ instead of invoking the callbacks.  EVENT is the process event string."
         callbacks)
     ;; Kill acknowledgements must still be accepted by the live transport.
     ;; Mark it dead only after these captured-generation calls complete.
+    ;; Teardown is best effort: the hooks issue synchronous RPCs, so a hook
+    ;; error or user quit here must not leave the generation half-cleaned and
+    ;; permanently unclaimable (`cleanup-started' was already set).
     (when (and remote-cleanup (process-live-p process))
-      (run-hook-with-args 'tramp-rpc-transport-terminate-functions
-                          vec process conn))
+      (condition-case hook-error
+          (run-hook-with-args 'tramp-rpc-transport-terminate-functions
+                              vec process conn)
+        ((error quit)
+         (tramp-rpc--debug "transport terminate hook failed: %S" hook-error))))
     (setf (tramp-rpc-connection-transport-cleaned conn) t
           (tramp-rpc-connection-transport-dead conn) t)
     ;; Wake synchronous callers after remote cleanup.  The injected errors
@@ -761,13 +767,18 @@ instead of invoking the callbacks.  EVENT is the process event string."
     (clrhash callback-table)
     ;; Cleanup functions keep local relays tracked through delete-process so
     ;; their wrapped sentinels can preserve the user's sentinel.  Remote
-    ;; termination was completed above using the captured connection.
-    (run-hook-with-args 'tramp-rpc-transport-cleanup-functions vec process)
+    ;; termination was completed above using the captured connection.  The
+    ;; dead/cleaned flags and the transport deletion below must still run when
+    ;; one hook fails, otherwise local relays leak for the session.
+    (condition-case hook-error
+        (run-hook-with-args 'tramp-rpc-transport-cleanup-functions vec process)
+      ((error quit)
+       (tramp-rpc--debug "transport cleanup hook failed: %S" hook-error)))
     (unless defer-callbacks
       (dolist (callback callbacks)
         (condition-case callback-error
             (funcall callback error-response)
-          (error
+          ((error quit)
            (tramp-rpc--debug "transport cleanup callback failed: %S"
                              callback-error)))))
     ;; Explicit disconnect owns transport deletion; unexpected death is
