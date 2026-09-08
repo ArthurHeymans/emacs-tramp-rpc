@@ -1891,6 +1891,41 @@ This matches the behavior expected by `tramp-test28-process-file'."
       (remhash process tramp-rpc--pty-processes)
       (when (process-live-p process) (delete-process process)))))
 
+(ert-deftest tramp-rpc-mock-test-generation-cleanup-survives-failing-hooks ()
+  "A failing terminate or cleanup hook must not strand a generation.
+`cleanup-started' is claimed before the hooks run, so an error or quit in
+them would otherwise leave the generation permanently un-cleanable with its
+async callbacks and local relays leaked."
+  (let* ((vec (tramp-dissect-file-name "/rpc:cleanup-hook:/tmp/"))
+         (buffer (generate-new-buffer " *tramp-rpc-cleanup-hook*"))
+         (connection (start-process "tramp-rpc-cleanup-hook" buffer "sleep" "10"))
+         (conn (tramp-rpc--make-connection :process connection :buffer buffer
+                                           :vec vec))
+         (tramp-rpc--connections (make-hash-table :test 'equal))
+         (tramp-rpc--async-processes (make-hash-table :test 'eq))
+         (tramp-rpc--pty-processes (make-hash-table :test 'eq))
+         (tramp-rpc--process-write-queues (make-hash-table :test 'equal))
+         (tramp-rpc-transport-terminate-functions
+          (list (lambda (&rest _) (error "terminate hook failed"))))
+         (tramp-rpc-transport-cleanup-functions
+          (list (lambda (&rest _) (error "cleanup hook failed"))))
+         (callbacks 0))
+    (unwind-protect
+        (progn
+          (puthash (tramp-rpc--connection-key vec) conn tramp-rpc--connections)
+          (tramp-rpc--attach-connection conn)
+          (puthash 7 (lambda (_response) (setq callbacks (1+ callbacks)))
+                   (tramp-rpc-connection-async-callbacks conn))
+          (tramp-rpc--cleanup-connection-generation
+           connection vec "hook failure\n" :explicit-disconnect t)
+          (should (tramp-rpc-connection-transport-dead conn))
+          (should (tramp-rpc-connection-transport-cleaned conn))
+          (should (= callbacks 1))
+          (should-not (process-live-p connection)))
+      (when (process-live-p connection) (delete-process connection))
+      (when (buffer-live-p buffer) (kill-buffer buffer)))))
+
+
 (ert-deftest tramp-rpc-mock-test-pty-sigkill-status-reaches-sentinel-and-exit-status ()
   "A terminal SIGKILL result remains abnormal through the local PTY relay."
   (let* ((process (start-process "tramp-rpc-pty-sigkill-status" nil "cat"))
