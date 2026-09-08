@@ -72,7 +72,7 @@ jobs:
 
       - name: Install Nix
         if: ${{ steps.cache-binary.outputs.cache-hit != 'true' && !contains(inputs.target, 'apple-darwin') }}
-        uses: DeterminateSystems/nix-installer-action@main
+        uses: DeterminateSystems/nix-installer-action@v22
 
       - name: Cache Nix store
         if: ${{ steps.cache-binary.outputs.cache-hit != 'true' && !contains(inputs.target, 'apple-darwin') }}
