@@ -113,6 +113,19 @@ jobs:
       - name: Check formatting
         run: cargo fmt --all --check
 
+      - name: Check version consistency
+        run: |
+          CARGO_VERSION=$(grep -oP '^version = "\K[^"]+' Cargo.toml)
+          ELISP_VERSION=$(grep -oP '^;; Version: \K.*' lisp/tramp-rpc.el)
+          DEPLOY_VERSION=$(grep -oP 'tramp-rpc-deploy-version "\K[^"]+' lisp/tramp-rpc-deploy.el)
+          echo "Cargo.toml:           $CARGO_VERSION"
+          echo "lisp/tramp-rpc.el:    $ELISP_VERSION"
+          echo "tramp-rpc-deploy.el:  $DEPLOY_VERSION"
+          if [ "$CARGO_VERSION" != "$ELISP_VERSION" ] || [ "$CARGO_VERSION" != "$DEPLOY_VERSION" ]; then
+            echo "::error::Version mismatch between Cargo.toml, lisp/tramp-rpc.el and lisp/tramp-rpc-deploy.el"
+            exit 1
+          fi
+
   elisp:
     name: Emacs Lisp (${{ matrix.emacs_label }})
     runs-on: ubuntu-latest
@@ -708,6 +721,7 @@ jobs:
         rust-linux,
         rust-macos,
         rust-extra,
+        format,
         elisp,
         test-autoload,
         test-mock,
@@ -725,6 +739,7 @@ jobs:
           echo "Rust Linux: ${{ needs.rust-linux.result }}"
           echo "Rust macOS: ${{ needs.rust-macos.result }}"
           echo "Rust Extra: ${{ needs.rust-extra.result }}"
+          echo "Rust Format: ${{ needs.format.result }}"
           echo "Elisp: ${{ needs.elisp.result }}"
           echo "Autoload Tests: ${{ needs.test-autoload.result }}"
           echo "Mock Tests: ${{ needs.test-mock.result }}"
@@ -736,6 +751,7 @@ jobs:
           if [[ "${{ needs.rust-linux.result }}" != "success" ]] || \
              [[ "${{ needs.rust-macos.result }}" != "success" ]] || \
              [[ "${{ needs.rust-extra.result }}" != "success" ]] || \
+             [[ "${{ needs.format.result }}" != "success" ]] || \
              [[ "${{ needs.elisp.result }}" != "success" ]] || \
              [[ "${{ needs.test-autoload.result }}" != "success" ]] || \
              [[ "${{ needs.test-mock.result }}" != "success" ]] || \
