@@ -200,6 +200,51 @@ async fn cleanup_reports_signal_failure_and_retains_managed_process() {
 }
 
 #[tokio::test]
+async fn failed_pty_signal_leaves_io_usable() {
+    let _test_lock = test_process_map_lock().await;
+    let start_result = start_pty(Value::Map(vec![
+        (Value::String("cmd".into()), Value::String("/bin/sh".into())),
+        (
+            Value::String("args".into()),
+            Value::Array(vec![
+                Value::String("-c".into()),
+                Value::String("sleep 30".into()),
+            ]),
+        ),
+    ]))
+    .await
+    .expect("start PTY");
+    let pid = map_get(&start_result, "pid")
+        .and_then(Value::as_u64)
+        .expect("PTY pid") as u32;
+
+    set_test_process_group_signal_error(Some(libc::EPERM));
+    let result = kill_pty(Value::Map(vec![
+        (Value::String("pid".into()), Value::Integer(pid.into())),
+        (Value::String("signal".into()), Value::Integer(9.into())),
+    ]))
+    .await;
+    set_test_process_group_signal_error(None);
+
+    assert!(result.is_err(), "EPERM must be reported");
+    // Cancelling before a signal that can fail would permanently disable PTY
+    // writes while leaving the entry registered.  The client must still be
+    // able to write or close the terminal after a failed signal.
+    let write = write_pty(Value::Map(vec![
+        (Value::String("pid".into()), Value::Integer(pid.into())),
+        (Value::String("data".into()), Value::Binary(b"x".to_vec())),
+    ]))
+    .await;
+    assert!(
+        write.is_ok(),
+        "PTY must remain writable after a failed signal: {:?}",
+        write.err()
+    );
+
+    cleanup_managed_processes().await.expect("cleanup PTY");
+}
+
+#[tokio::test]
 async fn synchronous_output_reader_enforces_shared_limit() {
     let budget = Arc::new(RetainedOutputBudget::new(Arc::new(Semaphore::new(4))));
     let error = read_sync_output(&b"oversized"[..], budget, 4)

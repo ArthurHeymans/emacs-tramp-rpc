@@ -104,6 +104,14 @@ impl PtyIoState {
     pub(super) fn is_closed(&self) -> bool {
         self.closed.load(Ordering::Acquire)
     }
+
+    /// Withdraw a cancellation whose motivating signal was not delivered.
+    /// A writer already woken by `cancel' may still observe the error once;
+    /// the `is_closed' re-check in `write_pty' lets later writes proceed.
+    pub(super) fn reopen(&self) {
+        let _syscall_guard = self.syscall_lock.lock().expect("PTY syscall lock");
+        self.closed.store(false, Ordering::Release);
+    }
 }
 
 pub(super) struct ManagedPtyProcess {
@@ -743,9 +751,14 @@ pub async fn write_pty(params: Value) -> HandlerResult {
             result = async_fd.ready(Interest::WRITABLE) => result
                 .map_err(|e| RpcError::process_error(format!("Failed to wait for writable: {e}")))?,
             _ = cancelled => {
-                return Err(RpcError::process_error(format!(
-                    "PTY write cancelled: {}", params.pid
-                )));
+                if io.is_closed() {
+                    return Err(RpcError::process_error(format!(
+                        "PTY write cancelled: {}", params.pid
+                    )));
+                }
+                // The cancellation was withdrawn (a signal that motivated it
+                // failed); ignore the stale notification and retry.
+                continue;
             }
         };
 
@@ -818,14 +831,25 @@ pub(super) async fn terminate_pty_process(
         };
     };
     // Explicit teardown and SIGKILL must wake a writer blocked on readiness
-    // immediately.  Other forwarded signals (notably SIGINT) are survivable
-    // for an interactive shell, so leave the PTY I/O state usable until a
-    // terminal exit has actually been confirmed.
-    if remove || signal == libc::SIGKILL {
+    // immediately, before waiting for the lifecycle lock, so a reader or
+    // writer can be released while the signal is still being delivered.
+    // Other forwarded signals (notably SIGINT) are survivable for an
+    // interactive shell, so leave the PTY I/O state usable until a terminal
+    // exit has actually been confirmed.
+    let cancelled_early = remove || signal == libc::SIGKILL;
+    if cancelled_early {
         io.cancel();
     }
     let _lifecycle_guard = lifecycle.lock().await;
-    signal_pty_process_group(os_pid, signal, "send signal")?;
+    if let Err(error) = signal_pty_process_group(os_pid, signal, "send signal") {
+        // A failed signal (EPERM from a surviving credential-changing
+        // descendant) must leave the PTY usable; otherwise the entry stays
+        // registered with every later write rejected.
+        if cancelled_early {
+            io.reopen();
+        }
+        return Err(error);
+    }
 
     if matches!(signal, 0 | libc::SIGSTOP | libc::SIGCONT) {
         return Ok(true);
