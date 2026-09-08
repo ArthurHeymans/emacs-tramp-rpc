@@ -142,6 +142,26 @@
       (msgpack-bin-string data)
     data))
 
+(defun tramp-rpc-mock-test--run-guarded (selector)
+  "Run SELECTOR with ERT, failing when it selects or executes nothing.
+CI uses this instead of a bare `ert-run-tests-batch-and-exit' so a renamed
+tag, a load error, or a broken environment cannot turn a job green while
+it exercised no tests.  Skipped tests count as expected results in ERT, so
+the executed count excludes them."
+  (let* ((tests (ert-select-tests selector t))
+         (selected (length tests)))
+    (unless (> selected 0)
+      (error "ERT selector %S selected zero tests" selector))
+    (let* ((stats (ert-run-tests-batch selector))
+           (skipped (ert-stats-skipped stats))
+           (executed (- (ert-stats-completed stats) skipped)))
+      (message "ERT counts: selected=%d executed=%d skipped=%d"
+               selected executed skipped)
+      (when (= executed 0)
+        (error "ERT selector %S executed zero tests (all %d selected tests skipped)"
+               selector skipped))
+      (kill-emacs (if (> (ert-stats-completed-unexpected stats) 0) 1 0)))))
+
 (defun tramp-rpc-mock-test--wait-for (predicate description &optional process)
   "Run the event loop until PREDICATE succeeds or report DESCRIPTION."
   (let ((deadline (+ (float-time) 1.0)))

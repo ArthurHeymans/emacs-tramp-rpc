@@ -279,8 +279,8 @@ jobs:
       - name: Run autoload tests
         run: ./test/run-autoload-tests.sh
 
-  test-protocol:
-    name: Protocol Tests (${{ matrix.emacs_label }})
+  test-mock:
+    name: Mock Tests (${{ matrix.emacs_label }})
     runs-on: ubuntu-latest
     needs: elisp
     strategy:
@@ -320,7 +320,7 @@ jobs:
             sleep 10
           done
 
-      - name: Run protocol tests
+      - name: Run mock tests
         run: |
           emacs -Q --batch \
             --eval "(require 'package)" \
@@ -328,17 +328,7 @@ jobs:
             --eval "(package-initialize)" \
             --eval "(setq debug-on-error t)" \
             -l test/tramp-rpc-mock-tests.el \
-            --eval "(ert-run-tests-batch-and-exit \"^tramp-rpc-mock-test-protocol\")"
-
-      - name: Run request lifecycle tests
-        run: |
-          emacs -Q --batch \
-            --eval "(require 'package)" \
-            --eval "(add-to-list 'package-archives '(\"melpa\" . \"https://melpa.org/packages/\") t)" \
-            --eval "(package-initialize)" \
-            --eval "(setq debug-on-error t)" \
-            -l test/tramp-rpc-mock-tests.el \
-            --eval "(ert-run-tests-batch-and-exit \"^tramp-rpc-mock-test-request\")"
+            --eval "(tramp-rpc-mock-test--run-guarded '(and \"^tramp-rpc-mock-test\" (not (tag :multi-hop)) (not (tag :server))))"
 
   test-multi-hop:
     name: Multi-Hop Tests (${{ matrix.emacs_label }})
@@ -396,7 +386,7 @@ jobs:
             --eval "(package-initialize)" \
             --eval "(setq debug-on-error t)" \
             -l test/tramp-rpc-mock-tests.el \
-            --eval "(ert-run-tests-batch-and-exit '(tag :multi-hop))"
+            --eval "(tramp-rpc-mock-test--run-guarded '(tag :multi-hop))"
 
   test-server:
     name: Server Integration Tests (${{ matrix.emacs_label }})
@@ -456,7 +446,7 @@ jobs:
             --eval "(package-initialize)" \
             --eval "(setq debug-on-error t)" \
             -l test/tramp-rpc-mock-tests.el \
-            --eval "(ert-run-tests-batch-and-exit '(tag :server))"
+            --eval "(tramp-rpc-mock-test--run-guarded '(tag :server))"
 
   test-full-suite:
     name: Full Test Suite (with SSH) (${{ matrix.emacs_label }})
@@ -546,7 +536,7 @@ jobs:
             --eval "(setq debug-on-error t)" \
             --eval "(setq tramp-verbose 0)" \
             -l test/tramp-rpc-tests.el \
-            --eval "(ert-run-tests-batch-and-exit \"^tramp-rpc-test\")"
+            --eval "(tramp-rpc-test--run-guarded \"^tramp-rpc-test\")"
 
   test-upstream-tramp:
     name: Upstream Tramp Tests (${{ matrix.emacs_label }})
@@ -719,7 +709,7 @@ jobs:
         rust-extra,
         elisp,
         test-autoload,
-        test-protocol,
+        test-mock,
         test-multi-hop,
         test-server,
         test-full-suite,
@@ -736,7 +726,7 @@ jobs:
           echo "Rust Extra: ${{ needs.rust-extra.result }}"
           echo "Elisp: ${{ needs.elisp.result }}"
           echo "Autoload Tests: ${{ needs.test-autoload.result }}"
-          echo "Protocol Tests: ${{ needs.test-protocol.result }}"
+          echo "Mock Tests: ${{ needs.test-mock.result }}"
           echo "Multi-Hop Tests: ${{ needs.test-multi-hop.result }}"
           echo "Server Tests: ${{ needs.test-server.result }}"
           echo "Full Test Suite: ${{ needs.test-full-suite.result }}"
@@ -747,7 +737,7 @@ jobs:
              [[ "${{ needs.rust-extra.result }}" != "success" ]] || \
              [[ "${{ needs.elisp.result }}" != "success" ]] || \
              [[ "${{ needs.test-autoload.result }}" != "success" ]] || \
-             [[ "${{ needs.test-protocol.result }}" != "success" ]] || \
+             [[ "${{ needs.test-mock.result }}" != "success" ]] || \
              [[ "${{ needs.test-multi-hop.result }}" != "success" ]] || \
              [[ "${{ needs.test-server.result }}" != "success" ]] || \
              [[ "${{ needs.test-full-suite.result }}" != "success" ]] || \
