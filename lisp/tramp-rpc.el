@@ -1980,15 +1980,17 @@ VEC is the TRAMP connection vector."
 
 (defun tramp-rpc--cached-capability-probe (vec property command args)
   "Return cached capability PROPERTY for VEC, probing COMMAND with ARGS.
-PROPERTY must start with a space so TRAMP keeps it ephemeral.  Successful
-probes cache both enabled and disabled results.  Transport and RPC errors
-return nil without caching so a later operation can retry."
+PROPERTY must start with a space so TRAMP keeps it ephemeral.  A probe that
+runs caches its answer, and so does one that fails because COMMAND does not
+exist on the host: both are settled facts about the host.  Any other
+transport or RPC error may be transient, so it returns nil without caching
+and a later operation retries."
   (let* ((missing (make-symbol "missing"))
          (cached (tramp-rpc--get-route-connection-property
                   vec property missing)))
     (if (not (eq cached missing))
         cached
-      (condition-case nil
+      (condition-case err
           (let* ((result (tramp-rpc--call vec "process.run"
                                           `((cmd . ,command)
                                             (args . ,args)
@@ -1996,11 +1998,14 @@ return nil without caching so a later operation can retry."
                  (enabled (zerop (alist-get 'exit_code result))))
             (tramp-rpc--set-route-connection-property vec property enabled)
             enabled)
-        (error nil)))))
+        (error
+         (when (tramp-rpc--spawn-not-found-error-p err)
+           (tramp-rpc--set-route-connection-property vec property nil))
+         nil)))))
 
 (defun tramp-rpc--acl-enabled-p (vec)
   "Check if ACL is available on the remote host VEC.
-Cache successful probe results for the connection lifetime."
+Cache the answer for the connection lifetime."
   (tramp-rpc--cached-capability-probe
    vec " rpc-acl-enabled" "getfacl" ["--version"]))
 
@@ -2045,7 +2050,7 @@ Returns t on success, nil on failure."
 
 (defun tramp-rpc--selinux-enabled-p (vec)
   "Check if SELinux is enabled on the remote host VEC.
-Cache successful probe results for the connection lifetime."
+Cache the answer for the connection lifetime."
   (tramp-rpc--cached-capability-probe
    vec " rpc-selinux-enabled" "selinuxenabled" []))
 

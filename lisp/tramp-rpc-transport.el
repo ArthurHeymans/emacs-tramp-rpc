@@ -1596,6 +1596,17 @@ MESSAGE describes the error."
     (signal 'remote-file-error
             (tramp-rpc--error-args operation nil message filename data)))))
 
+(defun tramp-rpc--spawn-not-found-error-p (err)
+  "Return non-nil when ERR reports that a command's executable was missing.
+ERR is a signalled error object.  `tramp-rpc--signal-rpc-error' appends the
+server's structured data as the last element of the error data, and the
+server sets `spawn_not_found' only when the executable itself could not be
+found -- not when the cwd is missing or the command ran and failed."
+  (seq-some (lambda (datum)
+              (and (consp datum)
+                   (eq (cdr (assq 'spawn_not_found datum)) t)))
+            (cdr err)))
+
 (defun tramp-rpc--signal-batch-failure (operation filename error)
   "Signal ERROR returned by a batched RPC for OPERATION on FILENAME."
   (tramp-rpc--signal-rpc-error

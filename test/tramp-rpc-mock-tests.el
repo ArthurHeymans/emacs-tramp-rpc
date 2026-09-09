@@ -6846,6 +6846,50 @@ background, which can precede the socket becoming visible."
                       nil)))
       (tramp-flush-connection-properties vec))))
 
+(ert-deftest tramp-rpc-mock-test-capability-probe-caches-only-missing-command ()
+  "A probe caches an absent command but still retries other ENOENT errors."
+  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
+  (let ((absent (tramp-dissect-file-name "/rpc:absent-command:/"))
+        (unreadable (tramp-dissect-file-name "/rpc:unreadable-cwd:/"))
+        (absent-calls 0)
+        (unreadable-calls 0))
+    (unwind-protect
+        (cl-letf (((symbol-function 'tramp-rpc--call)
+                   (lambda (vec method params)
+                     (should (equal method "process.run"))
+                     (should (equal (alist-get 'cmd params) "selinuxenabled"))
+                     ;; The server marks a failed spawn of the executable
+                     ;; itself; the same errno without that marker can mean
+                     ;; the cwd went away, which may not be permanent.
+                     (if (equal (tramp-file-name-host vec) "absent-command")
+                         (progn
+                           (setq absent-calls (1+ absent-calls))
+                           (signal 'file-missing
+                                   (list "RPC" "No such file"
+                                         "Failed to spawn process"
+                                         '((os_errno . 2)
+                                           (spawn_not_found . t)))))
+                       (setq unreadable-calls (1+ unreadable-calls))
+                       (signal 'file-missing
+                               (list "RPC" "No such file"
+                                     "Failed to spawn process"
+                                     '((os_errno . 2))))))))
+          (should-not (tramp-rpc--selinux-enabled-p absent))
+          (should-not (tramp-rpc--selinux-enabled-p absent))
+          (should-not (tramp-rpc--selinux-enabled-p absent))
+          (should (= absent-calls 1))
+          (should (eq (tramp-rpc--get-route-connection-property
+                       absent " rpc-selinux-enabled" t)
+                      nil))
+          (should-not (tramp-rpc--selinux-enabled-p unreadable))
+          (should-not (tramp-rpc--selinux-enabled-p unreadable))
+          (should (= unreadable-calls 2))
+          (should (eq (tramp-rpc--get-route-connection-property
+                       unreadable " rpc-selinux-enabled" 'missing)
+                      'missing)))
+      (tramp-flush-connection-properties absent)
+      (tramp-flush-connection-properties unreadable))))
+
 (ert-deftest tramp-rpc-mock-test-password-string-unwraps-auth-source-entry ()
   "Normalize auth-source plist secrets before sending them to sudo -S."
   :tags '(:sudo)
