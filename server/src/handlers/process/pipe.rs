@@ -30,6 +30,9 @@ use super::super::HandlerResult;
 use super::super::system::expand_tilde;
 #[cfg(target_vendor = "apple")]
 use super::set_fd_cloexec;
+use super::subscription::{
+    PushSubscription, new_pipe_subscription, send_process_notification, stop_push_subscription,
+};
 use super::{
     MANAGED_CHILD_WAIT, MAX_PROCESS_READ_BYTES, ProcessGroupGuard, SignalCode,
     configure_process_group, is_benign_stdin_error, require_process_group_signal, signal_process,
@@ -231,6 +234,9 @@ pub(super) struct ManagedProcess {
     pub(super) stdout: Arc<Mutex<Option<ChildStdout>>>,
     pub(super) stderr: Arc<Mutex<Option<ChildStderr>>>,
     pub(super) cmd: String,
+    pub(super) push_subscription: Option<PushSubscription>,
+    pub(super) subscription_requested: bool,
+    pub(super) terminating: bool,
 }
 
 // ============================================================================
@@ -575,6 +581,9 @@ pub async fn start(params: Value) -> HandlerResult {
         child,
         child_pid,
         cmd: params.cmd.clone(),
+        push_subscription: None,
+        subscription_requested: false,
+        terminating: false,
     };
 
     get_process_map().lock().await.insert(pid, managed);
@@ -1103,15 +1112,55 @@ pub async fn kill(params: Value) -> HandlerResult {
 
     let params: Params = from_value(params).map_err(|e| RpcError::invalid_params(e.to_string()))?;
     let signal = params.signal.resolve()?;
-    // Signaling an unknown pid is an error; internal cleanup paths call
-    // terminate_pipe_process directly and tolerate vanished entries.
-    if !get_process_map().lock().await.contains_key(&params.pid) {
-        return Err(RpcError::process_error(format!(
-            "Process not found: {}",
-            params.pid
-        )));
+    // A subscription owns the output read loop.  Stop it before destructive
+    // SIGKILL so it cannot race registry removal or consume final output.
+    let (subscription, shared_exit_status) = {
+        let mut processes = get_process_map().lock().await;
+        let managed = processes
+            .get_mut(&params.pid)
+            .ok_or_else(|| RpcError::process_error(format!("Process not found: {}", params.pid)))?;
+        if managed.terminating {
+            return Err(RpcError::process_error(format!(
+                "Process is already terminating: {}",
+                params.pid
+            )));
+        }
+        if signal == libc::SIGKILL {
+            managed.terminating = true;
+            (
+                managed.push_subscription.take(),
+                Some(Arc::clone(&managed.shared_exit_status)),
+            )
+        } else {
+            (None, None)
+        }
+    };
+    let subscribed = subscription.is_some();
+    if let Some(subscription) = subscription {
+        stop_push_subscription(subscription).await;
     }
-    terminate_pipe_process(params.pid, signal, false).await?;
+    if let Err(error) = terminate_pipe_process(params.pid, signal, false).await {
+        if let Some(managed) = get_process_map().lock().await.get_mut(&params.pid) {
+            managed.terminating = false;
+            if managed.subscription_requested && managed.push_subscription.is_none() {
+                managed.push_subscription = Some(new_pipe_subscription(params.pid));
+            }
+        }
+        return Err(error);
+    }
+    if signal == libc::SIGKILL && subscribed {
+        let exit_code = shared_exit_status
+            .as_ref()
+            .and_then(|status| *status.lock().expect("shared pipe exit status lock"))
+            .map(crate::protocol::exit_code_from_status)
+            .map(i64::from)
+            .unwrap_or_else(|| i64::from(128 + signal));
+        let _ = send_process_notification(
+            "process.exit",
+            msgpack_map! { "pid" => params.pid, "exit_code" => exit_code },
+        )
+        .await;
+    }
     Ok(Value::Boolean(true))
 }
 
