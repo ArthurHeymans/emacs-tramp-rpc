@@ -644,7 +644,7 @@ jobs:
         run: |
           # Exclude known unfixable tests:
           #   :unstable: not recommended by upstream Tramp
-          #   tramp-test45-asynchronous-requests: upstream stress test is
+          #   tramp-test46-asynchronous-requests: upstream stress test is
           #     timing-sensitive with tramp-rpc's RPC process relay in CI.
           emacs -Q --batch \
             -L lisp \
@@ -652,7 +652,7 @@ jobs:
             --eval "(add-to-list 'package-archives '(\"melpa\" . \"https://melpa.org/packages/\") t)" \
             --eval "(package-initialize)" \
             -l test/run-tramp-tests.el \
-            --eval "(tramp-rpc-test-run-tests-batch-and-exit '(and (not (tag :unstable)) (not tramp-test45-asynchronous-requests)))"
+            --eval "(tramp-rpc-test-run-tests-batch-and-exit '(and (not (tag :unstable)) (not tramp-test46-asynchronous-requests)) t)"
 
       - name: Clone Emacs 31 tests
         if: matrix.emacs_version == 'release-snapshot'
