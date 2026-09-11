@@ -481,13 +481,15 @@ server side."
     merged))
 
 (defun tramp-rpc--cached-remote-path (vec)
-  "Return cached remote PATH directories for VEC, computing them if needed."
+  "Return cached remote PATH directories for VEC, computing them if needed.
+Return incomplete results without caching them."
   (let* ((key (tramp-rpc--connection-key vec))
          (cached (gethash key tramp-rpc--exec-path-cache)))
     (or cached
-        (let ((path (tramp-rpc--compute-remote-path vec)))
-          (puthash key path tramp-rpc--exec-path-cache)
-          path))))
+        (let ((computed (tramp-rpc--compute-remote-path vec)))
+          (when (cdr computed)
+            (puthash key (car computed) tramp-rpc--exec-path-cache))
+          (car computed)))))
 
 (defun tramp-rpc--remote-path-environment (vec)
   "Return the configured PATH environment entry for VEC.
@@ -498,9 +500,12 @@ Uses `tramp-remote-path' by default.  A non-nil deprecated
       `(("PATH" . ,(mapconcat #'identity remote-path ":"))))))
 
 (defun tramp-rpc--cached-login-path (vec)
-  "Return the login shell PATH directories for VEC, caching the result."
-  (tramp-rpc--with-route-connection-property vec "tramp-rpc-login-path"
-    (or (tramp-rpc--fetch-remote-exec-path vec) '())))
+  "Return the login shell PATH directories for VEC, caching the result.
+A failed fetch is not cached."
+  (condition-case nil
+      (tramp-rpc--with-route-connection-property vec "tramp-rpc-login-path"
+        (or (tramp-rpc--fetch-remote-exec-path vec) '()))
+    (error '())))
 
 (defun tramp-rpc--process-path-environment (vec)
   "Return the PATH entry used for shell child processes on VEC.
@@ -2114,19 +2119,18 @@ Connection-local values are honored, matching `tramp-get-remote-path'."
     entry))
 
 (defun tramp-rpc--fetch-default-remote-path (vec)
-  "Fetch the POSIX default PATH for VEC, falling back to /bin:/usr/bin."
-  (condition-case nil
-      (let* ((result (tramp-rpc--call vec "process.run"
-                                      `((cmd . "/bin/sh")
-                                        (args . ["-c" "getconf PATH 2>/dev/null"])
-                                        (cwd . "/"))))
-             (exit-code (alist-get 'exit_code result))
-             (stdout (tramp-rpc--decode-output
-                      (alist-get 'stdout result))))
-        (if (and (eq exit-code 0) (> (length stdout) 0))
-            (split-string (string-trim stdout) ":" t)
-          '("/bin" "/usr/bin")))
-    (error '("/bin" "/usr/bin"))))
+  "Fetch the POSIX default PATH for VEC, falling back to /bin:/usr/bin.
+Signals when VEC cannot be reached."
+  (let* ((result (tramp-rpc--call vec "process.run"
+                                  `((cmd . "/bin/sh")
+                                    (args . ["-c" "getconf PATH 2>/dev/null"])
+                                    (cwd . "/"))))
+         (exit-code (alist-get 'exit_code result))
+         (stdout (tramp-rpc--decode-output
+                  (alist-get 'stdout result))))
+    (if (and (eq exit-code 0) (> (length stdout) 0))
+        (split-string (string-trim stdout) ":" t)
+      '("/bin" "/usr/bin"))))
 
 (defun tramp-rpc--compute-remote-path (vec)
   "Compute remote variable `exec-path' for VEC from `tramp-remote-path'.
@@ -2135,32 +2139,42 @@ A non-nil deprecated `tramp-rpc-remote-path' overrides
 `tramp-default-remote-path' and `tramp-own-remote-path'.  The old
 `tramp-rpc-own-remote-path' placeholder is treated like
 `tramp-own-remote-path'.  Duplicate, unsupported, and nonexistent
-entries are removed."
+entries are removed.
+Return (DIRECTORIES . COMPLETE), with COMPLETE non-nil if every fetch
+succeeds."
   (let ((own-path nil)
         (default-path nil)
+        (complete t)
         (result nil))
     (dolist (entry (tramp-rpc--effective-remote-path-spec vec))
       (setq entry (tramp-rpc--expand-remote-path-entry vec entry))
       (cond
        ((eq entry 'tramp-default-remote-path)
         (unless default-path
-          (setq default-path (tramp-rpc--fetch-default-remote-path vec)))
+          (setq default-path
+                (condition-case nil
+                    (tramp-rpc--fetch-default-remote-path vec)
+                  (error (setq complete nil) '("/bin" "/usr/bin")))))
         (setq result (tramp-rpc--append-path-entries default-path result)))
        ((memq entry '(tramp-own-remote-path tramp-rpc-own-remote-path))
         (unless own-path
-          (setq own-path (or (tramp-rpc--fetch-remote-exec-path vec) '())))
+          (setq own-path
+                (condition-case nil
+                    (or (tramp-rpc--fetch-remote-exec-path vec) '())
+                  (error (setq complete nil) '()))))
         (setq result (tramp-rpc--append-path-entries own-path result)))
        ((stringp entry)
         (setq result (tramp-rpc--append-path-entries (list entry) result)))
        (t
         (tramp-rpc--debug "Ignoring unsupported remote PATH entry: %S" entry))))
     ;; Remove non-existing directories (matches tramp-sh behavior).
-    (delq nil (mapcar (lambda (x)
-                        (and (stringp x)
-                             (file-directory-p
-                              (tramp-make-tramp-file-name vec x))
-                             x))
-                      result))))
+    (cons (delq nil (mapcar (lambda (x)
+                              (and (stringp x)
+                                   (file-directory-p
+                                    (tramp-make-tramp-file-name vec x))
+                                   x))
+                            result))
+          complete)))
 
 (defun tramp-rpc--get-remote-login-shell (vec)
   "Return the login shell for the remote user on VEC.
@@ -2213,24 +2227,23 @@ Returns \"/bin/sh\" if the lookup fails."
   "Fetch the remote PATH from VEC using the user's login shell.
 Invokes the login shell with `-l' to source shell configuration files.
 A marker separates shell startup output, MOTD text, or banners from the
-actual PATH line, matching the robustness of upstream TRAMP."
-  (condition-case nil
-      (let* ((marker (md5 (format "tramp-rpc-path-%s" (float-time))))
-             (shell (tramp-rpc--get-remote-login-shell vec))
-             (result (tramp-rpc--call vec "process.run"
-                                       `((cmd . ,shell)
-                                         (args . ["-l" "-c"
-                                                  ,(format "echo %s; printenv PATH" marker)])
-                                         (cwd . "/"))))
-             (exit-code (alist-get 'exit_code result))
-             (stdout (tramp-rpc--decode-output
-                      (alist-get 'stdout result))))
-        (when (and (eq exit-code 0) (> (length stdout) 0)
-                   (string-match
-                    (concat (regexp-quote marker) "\r?\n\\([^\r\n]+\\)")
-                    stdout))
-          (split-string (string-trim (match-string 1 stdout)) ":" t)))
-    (error nil)))
+actual PATH line, matching the robustness of upstream TRAMP.
+Signals when VEC cannot be reached."
+  (let* ((marker (md5 (format "tramp-rpc-path-%s" (float-time))))
+         (shell (tramp-rpc--get-remote-login-shell vec))
+         (result (tramp-rpc--call vec "process.run"
+                                  `((cmd . ,shell)
+                                    (args . ["-l" "-c"
+                                             ,(format "echo %s; printenv PATH" marker)])
+                                    (cwd . "/"))))
+         (exit-code (alist-get 'exit_code result))
+         (stdout (tramp-rpc--decode-output
+                  (alist-get 'stdout result))))
+    (when (and (eq exit-code 0) (> (length stdout) 0)
+               (string-match
+                (concat (regexp-quote marker) "\r?\n\\([^\r\n]+\\)")
+                stdout))
+      (split-string (string-trim (match-string 1 stdout)) ":" t))))
 
 ;; ============================================================================
 ;; system.info
