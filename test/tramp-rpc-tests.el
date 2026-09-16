@@ -2129,6 +2129,52 @@ This matches the upstream `tramp-test28-process-file' test."
       (when (processp process)
         (ignore-errors (delete-process process))))))
 
+(ert-deftest tramp-rpc-test13h-relay-delivery-keeps-reentrant-writes-remote ()
+  "A write issued while relay output is delivered still reaches the remote.
+`process-send-string' runs pending filters while it waits for pipe capacity,
+so a filter that answers what it reads writes to the relay mid-delivery.
+That write belongs to the remote process: delivered locally it reappears in
+the relay\='s own output and corrupts the stream the filter is parsing."
+  (let* ((process-connection-type nil)
+         (relay (start-process "tramp-rpc-reentrant-relay" nil "cat"))
+         (vec (tramp-dissect-file-name "/rpc:host:/path"))
+         (reply "REENTRANT-WRITE\n")
+         (payload (make-string 65536 ?x))
+         (output "")
+         (remote-writes nil)
+         (replied nil))
+    (unwind-protect
+        (progn
+          (tramp-rpc-test--wait-for (lambda () (process-live-p relay))
+                                    "reentrant relay process" relay)
+          (process-put relay :tramp-rpc-pid 42)
+          (process-put relay :tramp-rpc-vec vec)
+          ;; What `tramp-file-name-for-operation' reads to route a write.
+          (process-put relay 'tramp-vector vec)
+          (set-process-filter
+           relay
+           (lambda (_process string)
+             (setq output (concat output string))
+             (unless replied
+               (setq replied t)
+               (process-send-string relay reply))))
+          (cl-letf (((symbol-function 'tramp-rpc--write-remote-process)
+                     (lambda (_vec _pid data &optional _owner)
+                       (push data remote-writes))))
+            ;; Two pipe buffers\=' worth, so a write blocks and runs the filter
+            ;; before it returns.
+            (tramp-rpc--deliver-process-output relay payload nil nil)
+            (tramp-rpc--deliver-process-output relay payload nil nil)
+            (tramp-rpc-test--wait-for
+             (lambda () (>= (length output) (* 2 (length payload))))
+             "both delivered relay payloads" relay))
+          (should replied)
+          (should (equal remote-writes (list reply)))
+          (should-not (string-match-p (regexp-quote reply) output))
+          (should (equal (length output) (* 2 (length payload)))))
+      (when (process-live-p relay)
+        (ignore-errors (delete-process relay))))))
+
 (ert-deftest tramp-rpc-test13d-async-read-rpc-error-exits-process ()
   "Test async read RPC errors terminate the local process state."
   (let ((proc (make-pipe-process

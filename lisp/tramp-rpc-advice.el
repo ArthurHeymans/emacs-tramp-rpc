@@ -135,8 +135,7 @@ Return `not-managed' when PROCESS must use the native handler."
 (defun tramp-rpc--managed-send-process (process)
   "Return PROCESS's RPC-managed process, or nil when native delivery is needed."
   (when-let* ((proc (tramp-rpc--resolve-process process)))
-    (and (not tramp-rpc--delivering-output)
-         (not (process-get proc :tramp-rpc-direct-ssh))
+    (and (not (process-get proc :tramp-rpc-direct-ssh))
          (process-get proc :tramp-rpc-pid)
          (process-get proc :tramp-rpc-vec)
          proc)))
@@ -522,6 +521,9 @@ exited (remote side finished), delete it so the refresh can proceed."
 
 (defun tramp-rpc-handler-install ()
   "Install all process handler for tramp-rpc."
+  ;; Before the first `tramp-rpc--add-external-operation' below, which is what
+  ;; puts Tramp's routing advice on `process-send-string'.
+  (tramp-rpc--capture-native-process-send-string)
   (unless (advice-member-p #'tramp-rpc--set-process-coding-system-advice
                            'set-process-coding-system)
     (advice-add 'set-process-coding-system :around
