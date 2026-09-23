@@ -463,6 +463,16 @@ jobs:
             -l test/tramp-rpc-mock-tests.el \
             --eval "(tramp-rpc-mock-test--run-guarded '(tag :server))"
 
+      - name: Run pushed-output stress tests
+        run: |
+          emacs -Q --batch \
+            --eval "(require 'package)" \
+            --eval "(add-to-list 'package-archives '(\"melpa\" . \"https://melpa.org/packages/\") t)" \
+            --eval "(package-initialize)" \
+            -l test/tramp-rpc-mock-tests.el \
+            -l test/tramp-rpc-stress-tests.el \
+            --eval "(tramp-rpc-mock-test--run-guarded \"^tramp-rpc-stress-test-\")"
+
   test-full-suite:
     name: Full Test Suite (with SSH) (${{ matrix.emacs_label }})
     runs-on: ubuntu-latest
