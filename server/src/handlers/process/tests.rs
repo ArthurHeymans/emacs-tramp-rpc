@@ -397,13 +397,14 @@ async fn read_pipe_process(pid: u32, max_bytes: usize, timeout_ms: u64) -> Value
 
 async fn child_has_exited(pid: u32) -> bool {
     for _ in 0..100 {
-        let result = status(Value::Map(vec![(
-            Value::String("pid".into()),
-            Value::Integer(pid.into()),
-        )]))
-        .await
-        .expect("query pipe process status");
-        if map_get(&result, "exited").and_then(Value::as_bool) == Some(true) {
+        let exited = {
+            let mut processes = get_process_map().lock().await;
+            let managed = processes.get_mut(&pid).expect("pipe process");
+            poll_exit_status(managed)
+                .expect("query pipe process status")
+                .is_some()
+        };
+        if exited {
             return true;
         }
         tokio::time::sleep(std::time::Duration::from_millis(5)).await;
@@ -1012,34 +1013,6 @@ async fn kill_rejects_unknown_pid_and_signal_zero_returns_promptly() {
     .expect("cleanup process");
 }
 
-#[tokio::test]
-async fn status_and_list_serialize_with_kill_reaping() {
-    let _test_lock = test_process_map_lock().await;
-    for _ in 0..25 {
-        let pid = start_pipe_process("sleep 30").await;
-        let kill_params = Value::Map(vec![
-            (Value::String("pid".into()), Value::Integer(pid.into())),
-            (
-                Value::String("signal".into()),
-                Value::Integer((libc::SIGTERM as i64).into()),
-            ),
-        ]);
-        let status_params = Value::Map(vec![(
-            Value::String("pid".into()),
-            Value::Integer(pid.into()),
-        )]);
-        let (kill_result, status_result, list_result) = tokio::join!(
-            kill(kill_params),
-            status(status_params),
-            list(Value::Map(vec![]))
-        );
-        kill_result.expect("kill process");
-        status_result.expect("status must not race with reaping");
-        list_result.expect("list must not race with reaping");
-        let _ = collect_pipe_output(pid, 65_536).await;
-    }
-}
-
 async fn wait_for_marker(path: &std::path::Path) {
     // Generous failure-only ceiling: interpreter cold starts on loaded CI
     // runners can take well over a second.
@@ -1502,38 +1475,6 @@ async fn pty_kill_ignored_sigterm_then_sigkill_reaps_child() {
     .await
     .expect_err("unknown PTY PID must fail");
     assert_eq!(unknown.code, RpcError::PROCESS_ERROR);
-}
-
-#[tokio::test]
-async fn pty_list_serializes_with_kill_reaping() {
-    let _test_lock = test_process_map_lock().await;
-    for _ in 0..25 {
-        let start = start_pty(Value::Map(vec![
-            (Value::String("cmd".into()), Value::String("sleep".into())),
-            (
-                Value::String("args".into()),
-                Value::Array(vec![Value::String("30".into())]),
-            ),
-        ]))
-        .await
-        .expect("start PTY");
-        let pid = map_get(&start, "pid").and_then(Value::as_u64).unwrap() as u32;
-        let (kill_result, list_result) = tokio::join!(
-            kill_pty(Value::Map(vec![(
-                Value::String("pid".into()),
-                Value::Integer(pid.into()),
-            )])),
-            list_pty(Value::Map(vec![]))
-        );
-        kill_result.expect("kill PTY");
-        list_result.expect("PTY list must not race with reaping");
-        close_pty(Value::Map(vec![(
-            Value::String("pid".into()),
-            Value::Integer(pid.into()),
-        )]))
-        .await
-        .expect("close PTY");
-    }
 }
 
 #[tokio::test]
@@ -2212,7 +2153,6 @@ async fn pty_read_close_race_does_not_leak_duplicated_fds() {
                     cancelled: Notify::new(),
                 }),
                 child_pid: Pid::from_raw(-1),
-                cmd: String::new(),
                 exit_status: None,
                 shared_exit_status: Arc::new(StdMutex::new(None)),
                 output_eof: false,

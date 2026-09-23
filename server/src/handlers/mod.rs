@@ -195,11 +195,9 @@ async fn route(method: String, params: Value) -> HandlerResult {
         "process.subscribe" => process::subscribe(params).await,
         "process.unsubscribe" => process::unsubscribe(params).await,
         "process.write" => process::write(params).await,
-        "process.status" => process::status(params).await,
         "process.close_stdin" => process::close_stdin(params).await,
         "process.kill" => process::kill(params).await,
         "process.signal" => process::signal_pid(params).await,
-        "process.list" => process::list(params).await,
 
         // PTY (pseudo-terminal) process operations
         "process.start_pty" => process::start_pty(params).await,
@@ -209,12 +207,9 @@ async fn route(method: String, params: Value) -> HandlerResult {
         "process.resize_pty" => process::resize_pty(params).await,
         "process.kill_pty" => process::kill_pty(params).await,
         "process.close_pty" => process::close_pty(params).await,
-        "process.list_pty" => process::list_pty(params).await,
 
         // System info
         "system.info" => system::system_info().await,
-        "system.getenv" => system::system_getenv(params),
-        "system.expand_path" => system::system_expand_path(params).await,
         "system.statvfs" => system::system_statvfs(params).await,
         "system.groups" => system::system_groups().await,
 
@@ -232,7 +227,6 @@ async fn route(method: String, params: Value) -> HandlerResult {
         // Filesystem watch operations (for cache invalidation)
         "watch.add" => crate::watcher::handle_add(params).await,
         "watch.remove" => crate::watcher::handle_remove(params).await,
-        "watch.list" => crate::watcher::handle_list(params),
 
         // Note: "batch" is NOT allowed in batch (no recursion)
         _ => Err(RpcError::method_not_found(&method)),
@@ -252,13 +246,18 @@ mod tests {
 
     #[tokio::test]
     async fn batch_accepts_max_entries_in_order() {
+        let tmp = tempfile::tempdir().expect("create tempdir");
+        let dir = tmp.path().canonicalize().expect("canonical tempdir");
+        for index in 0..MAX_BATCH_ENTRIES {
+            std::fs::write(dir.join(format!("batch-order-{index}")), b"").unwrap();
+        }
         let result = batch_execute(msgpack_map! {
             "requests" => Value::Array(
                 (0..MAX_BATCH_ENTRIES)
                     .map(|index| msgpack_map! {
-                        "method" => "system.expand_path",
+                        "method" => "file.truename",
                         "params" => msgpack_map! {
-                            "path" => format!("/batch-order-{index}"),
+                            "path" => dir.join(format!("batch-order-{index}")).to_str().unwrap(),
                         },
                     })
                     .collect(),
@@ -277,9 +276,9 @@ mod tests {
             let value = entry
                 .as_map()
                 .and_then(|map| map.iter().find(|(key, _)| key.as_str() == Some("result")))
-                .and_then(|(_, value)| value.as_str())
+                .and_then(|(_, value)| value.as_slice())
                 .expect("ordered batch result");
-            assert_eq!(value, format!("/batch-order-{index}"));
+            assert!(value.ends_with(format!("/batch-order-{index}").as_bytes()));
         }
     }
 

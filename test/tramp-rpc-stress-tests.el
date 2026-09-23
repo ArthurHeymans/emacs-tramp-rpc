@@ -428,22 +428,21 @@ Returns a plist:
       (tramp-rpc-stress-test--rpc-call
        "process.kill"
        `((pid . ,pid) (signal . 9)))
-      ;; Wait for the killed process to actually disappear from process.list.
+      ;; Wait for the killed process to disappear from the server registry;
+      ;; stdin requests then report it as not found.
       (let ((deadline (+ (float-time) 5.0))
-            still-listed)
+            still-registered)
         (while (and (> deadline (float-time))
-                    (progn
-                      (setq still-listed
-                            (let ((list-result
-                                   (tramp-rpc-stress-test--rpc-call
-                                    "process.list" nil)))
-                              (cl-some (lambda (entry)
-                                         (eql (alist-get 'pid entry) pid))
-                                       list-result)))
-                      still-listed))
+                    (setq still-registered
+                          (condition-case nil
+                              (progn
+                                (tramp-rpc-stress-test--rpc-call
+                                 "process.close_stdin" `((pid . ,pid)))
+                                t)
+                            (error nil))))
           (sleep-for 0.05))
-        ;; The process must have exited and been removed from the server list.
-        (should-not still-listed)))))
+        ;; The process must have exited and been removed from the server.
+        (should-not still-registered)))))
 
 (ert-deftest tramp-rpc-stress-test-subscribe-write-then-exit ()
   "Write to stdin of a subscribed process; all stdout bytes arrive."

@@ -234,7 +234,6 @@ pub(super) struct ManagedProcess {
     pub(super) stdin: Arc<Mutex<Option<ChildStdin>>>,
     pub(super) stdout: Arc<Mutex<Option<ChildStdout>>>,
     pub(super) stderr: Arc<Mutex<Option<ChildStderr>>>,
-    pub(super) cmd: String,
     pub(super) push_subscription: Option<PushSubscription>,
     pub(super) subscription_requested: bool,
     pub(super) terminating: bool,
@@ -580,7 +579,6 @@ pub async fn start(params: Value) -> HandlerResult {
         stderr: Arc::new(Mutex::new(child.stderr.take())),
         child,
         child_pid,
-        cmd: params.cmd.clone(),
         push_subscription: None,
         subscription_requested: false,
         terminating: false,
@@ -1177,66 +1175,4 @@ pub async fn signal_pid(params: Value) -> HandlerResult {
     signal_process(params.pid, signal)
         .map_err(|error| RpcError::process_error(format!("Failed to signal process: {error}")))?;
     Ok(Value::Boolean(true))
-}
-
-/// Return status of an async process without consuming stdout/stderr.
-pub async fn status(params: Value) -> HandlerResult {
-    #[derive(Deserialize)]
-    struct Params {
-        pid: u32,
-    }
-
-    let params: Params = from_value(params).map_err(|e| RpcError::invalid_params(e.to_string()))?;
-
-    let lifecycle = {
-        let processes = get_process_map().lock().await;
-        processes
-            .get(&params.pid)
-            .map(|managed| managed.lifecycle.clone())
-            .ok_or_else(|| RpcError::process_error(format!("Process not found: {}", params.pid)))?
-    };
-    let _lifecycle_guard = lifecycle.lock().await;
-    let mut processes = get_process_map().lock().await;
-    let managed = processes
-        .get_mut(&params.pid)
-        .ok_or_else(|| RpcError::process_error(format!("Process not found: {}", params.pid)))?;
-    let exit_status = poll_exit_status(managed)
-        .map_err(|e| RpcError::process_error(format!("Failed to query process status: {e}")))?;
-
-    let mut pairs = vec![(
-        Value::String("exited".into()),
-        Value::Boolean(exit_status.is_some()),
-    )];
-    pairs.extend(crate::protocol::exit_fields(exit_status));
-    Ok(Value::Map(pairs))
-}
-
-/// List all managed async processes
-pub async fn list(_params: Value) -> HandlerResult {
-    let entries: Vec<(u32, Arc<Mutex<()>>)> = {
-        let processes = get_process_map().lock().await;
-        processes
-            .iter()
-            .map(|(pid, managed)| (*pid, managed.lifecycle.clone()))
-            .collect()
-    };
-    let mut list = Vec::with_capacity(entries.len());
-    for (pid, lifecycle) in entries {
-        let _lifecycle_guard = lifecycle.lock().await;
-        let mut processes = get_process_map().lock().await;
-        let Some(managed) = processes.get_mut(&pid) else {
-            continue;
-        };
-        let exited = poll_exit_status(managed)
-            .map_err(|e| RpcError::process_error(format!("Failed to query process status: {e}")))?;
-        list.push(msgpack_map! {
-            "pid" => pid,
-            "os_pid" => Value::Integer((managed.child_pid as i64).into()),
-            "cmd" => managed.cmd.clone(),
-            "exited" => exited.is_some(),
-            "exit_code" => exited.map(crate::protocol::exit_code_from_status).map(|c| Value::Integer(c.into())).unwrap_or(Value::Nil)
-        });
-    }
-
-    Ok(Value::Array(list))
 }

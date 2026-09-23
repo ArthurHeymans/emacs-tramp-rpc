@@ -116,7 +116,6 @@ pub(super) struct ManagedPtyProcess {
     pub(super) lifecycle: Arc<Mutex<()>>,
     pub(super) io: Arc<PtyIoState>,
     pub(super) child_pid: Pid,
-    pub(super) cmd: String,
     pub(super) exit_status: Option<ExitStatus>,
     // Retain an observed terminal status for a read that captured the PTY
     // before explicit SIGKILL removes its registry entry.
@@ -413,7 +412,6 @@ pub async fn start_pty(params: Value) -> HandlerResult {
             cancelled: Notify::new(),
         }),
         child_pid,
-        cmd: params.cmd.clone(),
         exit_status: None,
         shared_exit_status: Arc::new(StdMutex::new(None)),
         output_eof: false,
@@ -1065,40 +1063,4 @@ pub async fn close_pty(params: Value) -> HandlerResult {
     }
     discard_terminated_pty_status(params.pid);
     Ok(Value::Boolean(true))
-}
-
-/// List all PTY processes
-pub async fn list_pty(_params: Value) -> HandlerResult {
-    let entries: Vec<(u32, Arc<Mutex<()>>)> = {
-        let processes = get_pty_process_map().lock().await;
-        processes
-            .iter()
-            .map(|(pid, managed)| (*pid, managed.lifecycle.clone()))
-            .collect()
-    };
-    let mut list = Vec::with_capacity(entries.len());
-    for (pid, lifecycle) in entries {
-        let _lifecycle_guard = lifecycle.lock().await;
-        let mut processes = get_pty_process_map().lock().await;
-        let Some(managed) = processes.get_mut(&pid) else {
-            continue;
-        };
-        let (exited, exit_status) = check_exit_status(managed);
-        let mut entry = vec![
-            (Value::String("pid".into()), Value::from(pid)),
-            (
-                Value::String("os_pid".into()),
-                Value::from(managed.child_pid.as_raw()),
-            ),
-            (
-                Value::String("cmd".into()),
-                Value::from(managed.cmd.clone()),
-            ),
-            (Value::String("exited".into()), Value::Boolean(exited)),
-        ];
-        entry.extend(crate::protocol::exit_fields(exit_status));
-        list.push(Value::Map(entry));
-    }
-
-    Ok(Value::Array(list))
 }

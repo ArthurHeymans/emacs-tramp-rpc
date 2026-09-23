@@ -152,25 +152,25 @@ async fn test_blocked_batch_uses_idle_permits_without_unbounded_bypass() {
         DeferredRequest::for_test(Request {
             version: "2.0".into(),
             id: RequestId::Number(2),
-            method: "process.status".into(),
+            method: "system.info".into(),
             params: Value::Nil,
         }),
         DeferredRequest::for_test(Request {
             version: "2.0".into(),
             id: RequestId::Number(3),
-            method: "process.status".into(),
+            method: "system.info".into(),
             params: Value::Nil,
         }),
         DeferredRequest::for_test(Request {
             version: "2.0".into(),
             id: RequestId::Number(4),
-            method: "process.status".into(),
+            method: "system.info".into(),
             params: Value::Nil,
         }),
         DeferredRequest::for_test(Request {
             version: "2.0".into(),
             id: RequestId::Number(5),
-            method: "process.status".into(),
+            method: "system.info".into(),
             params: Value::Nil,
         }),
     ]);
@@ -225,7 +225,7 @@ async fn test_new_general_requests_share_bounded_batch_bypass_budget() {
 
     for id in 2..=5 {
         accept_frame(
-            make_request_with_id(id, "process.status", Value::Nil),
+            make_request_with_id(id, "system.info", Value::Nil),
             &mut deferred,
             &admissions,
             &mut tasks,

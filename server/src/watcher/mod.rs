@@ -809,6 +809,7 @@ impl WatchManager {
     }
 
     /// List currently watched paths and whether they are recursive.
+    #[cfg(test)]
     pub fn list(&self) -> Vec<(PathBuf, bool)> {
         let paths = lock_or_recover(&self.watched_paths);
         paths
@@ -1344,26 +1345,6 @@ pub async fn handle_remove(params: Value) -> HandlerResult {
         .map_err(|e| RpcError::internal_error(format!("Failed to unwatch: {e}")))?;
 
     Ok(Value::Boolean(true))
-}
-
-/// Handle `watch.list` - list currently watched paths.
-///
-/// Params: {} (none)
-pub fn handle_list(_params: Value) -> HandlerResult {
-    let manager = get().ok_or_else(|| RpcError::internal_error("File watcher not available"))?;
-
-    let watches: Vec<Value> = manager
-        .list()
-        .into_iter()
-        .map(|(path, recursive)| {
-            msgpack_map! {
-                "path" => path_to_value(&path),
-                "recursive" => Value::Boolean(recursive)
-            }
-        })
-        .collect();
-
-    Ok(Value::Array(watches))
 }
 
 #[cfg(test)]

@@ -14,8 +14,8 @@ mod subscription;
 mod tests;
 
 pub(crate) use pipe::{ChildError, ChildSpec, run_child};
-pub use pipe::{close_stdin, kill, list, run, signal_pid, start, status, write};
-pub use pty::{close_pty, kill_pty, list_pty, resize_pty, start_pty, write_pty};
+pub use pipe::{close_stdin, kill, run, signal_pid, start, write};
+pub use pty::{close_pty, kill_pty, resize_pty, start_pty, write_pty};
 pub use subscription::{
     init_notification_writer, subscribe, subscribe_pty, unsubscribe, unsubscribe_pty,
 };
