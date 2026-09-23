@@ -8025,6 +8025,52 @@ discard it for being unreadable."
       (when (buffer-live-p buffer)
         (kill-buffer buffer)))))
 
+;; Emacs can report a relay as dead before it has run the relay's sentinel.
+;; Simulate that window by reporting the live relay as exited.
+(ert-deftest tramp-rpc-mock-test-process-cleanup-before-exit-notification ()
+  "Cleanup installed before a pending exit notification still runs the sentinel."
+  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
+  (let* ((buffer (generate-new-buffer " *tramp-rpc-cleanup-pending-test*"))
+         (proc (let ((process-connection-type nil))
+                 (start-process "tramp-rpc-cleanup-pending-test" buffer "cat")))
+         (user-events nil)
+         (own (lambda (process event)
+                (tramp-rpc--pipe-process-sentinel
+                 process event (process-get process :tramp-rpc-user-sentinel)))))
+    (unwind-protect
+        (progn
+          (puthash proc '(:pid 4242) tramp-rpc--async-processes)
+          (process-put proc :tramp-rpc-user-sentinel
+                       (lambda (_process event) (push event user-events)))
+          (process-put proc :tramp-rpc-own-sentinel own)
+          (process-put proc :tramp-rpc-remote-exited t)
+          (process-put proc :tramp-rpc-exit-code 3)
+          (set-process-sentinel proc own)
+          (let ((real-live-p (symbol-function 'process-live-p))
+                (real-status (symbol-function 'process-status)))
+            (cl-letf (((symbol-function 'process-live-p)
+                       (lambda (process)
+                         (and (not (eq process proc))
+                              (funcall real-live-p process))))
+                      ((symbol-function 'process-status)
+                       (lambda (process)
+                         (if (eq process proc)
+                             'exit
+                           (funcall real-status process)))))
+              (tramp-rpc--install-process-cleanup proc)))
+          (should (equal user-events '("exited abnormally with code 3\n")))
+          (process-send-eof proc)
+          (while (process-live-p proc)
+            (accept-process-output proc 0.01 nil t))
+          (accept-process-output nil 0.05)
+          (should (equal user-events '("exited abnormally with code 3\n")))
+          (should-not (gethash proc tramp-rpc--async-processes)))
+      (when (processp proc)
+        (ignore-errors (delete-process proc)))
+      (remhash proc tramp-rpc--async-processes)
+      (when (buffer-live-p buffer)
+        (kill-buffer buffer)))))
+
 (ert-deftest tramp-rpc-mock-test-process-cleanup-does-not-count-stop-as-exit ()
   "A relay stop event must not consume its user's exit notification."
   (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)

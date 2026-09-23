@@ -750,8 +750,17 @@ update is still running."
                ;; Defer deletion so the full sentinel chain completes first.
                (cleanup proc)))))))
      ((processp process)
-      ;; The relay can finish before the deferred installer runs.  Its original
-      ;; sentinel has already fired in that case, so just remove stale tracking.
+      ;; The relay can finish before the deferred installer runs.  A dead
+      ;; relay does not imply that its sentinel already ran: Emacs may still
+      ;; deliver the exit notification later, after `cleanup' removed the
+      ;; tracking the sentinel needs.  While our own wrapper is still in place,
+      ;; finish its exactly-once exit handling now; a later notification is
+      ;; then a no-op.
+      (when (eq (process-sentinel process)
+                (process-get process :tramp-rpc-own-sentinel))
+        (tramp-rpc--pipe-process-sentinel
+         process "finished\n"
+         (process-get process :tramp-rpc-user-sentinel)))
       (cleanup process)))))
 
 ;; ============================================================================
@@ -978,11 +987,12 @@ Resolves program path and loads direnv environment from working directory."
               ;; Keep our wrapper even when the caller supplied no sentinel;
               ;; normal exits must still remove tracking.
               (process-put local-process :tramp-rpc-user-sentinel sentinel)
-              (set-process-sentinel
-               local-process
-               (lambda (proc event)
-                 (tramp-rpc--pipe-process-sentinel
-                  proc event (process-get proc :tramp-rpc-user-sentinel))))
+              (let ((own-sentinel
+                     (lambda (proc event)
+                       (tramp-rpc--pipe-process-sentinel
+                        proc event (process-get proc :tramp-rpc-user-sentinel)))))
+                (process-put local-process :tramp-rpc-own-sentinel own-sentinel)
+                (set-process-sentinel local-process own-sentinel))
 
               ;; Store process info.
               (puthash local-process
