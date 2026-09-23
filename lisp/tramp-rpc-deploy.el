@@ -420,9 +420,15 @@ Linux targets use musl for fully static binaries."
          (file-directory-p (expand-file-name "server" root)))))
 
 (defun tramp-rpc-deploy--git-checkout-p ()
-  "Return non-nil if the source directory is inside a git checkout."
+  "Return non-nil if the source directory is inside a VCS checkout.
+Secondary Jujutsu workspaces have a .jj directory but no .git, and must
+still use source-keyed binaries instead of a stale release binary."
   (let ((root (tramp-rpc-deploy--source-root)))
-    (and root (locate-dominating-file root ".git"))))
+    (and root
+         (locate-dominating-file
+          root (lambda (dir)
+                 (or (file-exists-p (expand-file-name ".git" dir))
+                     (file-directory-p (expand-file-name ".jj" dir))))))))
 
 (defun tramp-rpc-deploy--source-file-list ()
   "Return files that affect the server build, relative to source root."
