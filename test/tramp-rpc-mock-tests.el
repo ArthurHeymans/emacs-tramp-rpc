@@ -7126,6 +7126,16 @@ background, which can precede the socket becoming visible."
 ;;; VC handler tests (No server or SSH required)
 ;;; ============================================================================
 
+(defun tramp-rpc-mock-test--reject-real-vc-exec-after ()
+  "Return a `tramp-run-real-handler' replacement rejecting `vc-exec-after'.
+Other operations, such as a pending sentinel of an earlier test asking for
+`process-status', still reach the real handler."
+  (let ((real (symbol-function 'tramp-run-real-handler)))
+    (lambda (operation &rest args)
+      (if (eq operation 'vc-exec-after)
+          (error "Unexpected process state")
+        (apply real operation args)))))
+
 (ert-deftest tramp-rpc-mock-test-vc-exec-after-logical-exit-runs-code ()
   "Test `vc-exec-after' handler treats exited TRAMP-RPC relays as done."
   :tags '(:vc-handler)
@@ -7141,10 +7151,11 @@ background, which can precede the socket becoming visible."
           (process-put proc :tramp-rpc-pid 123)
           (process-put proc :tramp-rpc-exited t)
           (cl-letf (((symbol-function 'tramp-run-real-handler)
-                     (lambda (&rest _) (error "Unexpected process state"))))
+                     (tramp-rpc-mock-test--reject-real-vc-exec-after)))
             (tramp-rpc-handle-vc-exec-after
              (lambda () (setq ran t))))
           (should ran))
+      (set-process-sentinel proc #'ignore)
       (when (process-live-p proc)
         (delete-process proc))
       (kill-buffer buffer))))
@@ -7167,10 +7178,11 @@ background, which can precede the socket becoming visible."
           (cl-letf (((symbol-function 'process-status)
                      (lambda (_process) 'closed))
                     ((symbol-function 'tramp-run-real-handler)
-                     (lambda (&rest _) (error "Unexpected process state"))))
+                     (tramp-rpc-mock-test--reject-real-vc-exec-after)))
             (tramp-rpc-handle-vc-exec-after
              (lambda () (setq ran t))))
           (should ran))
+      (set-process-sentinel proc #'ignore)
       (when (process-live-p proc)
         (delete-process proc))
       (kill-buffer buffer))))
@@ -7192,13 +7204,14 @@ background, which can precede the socket becoming visible."
           (cl-letf (((symbol-function 'vc--process-sentinel)
                      (lambda (&rest _) (error "vc--process-sentinel called")))
                     ((symbol-function 'tramp-run-real-handler)
-                     (lambda (&rest _) (error "Unexpected process state"))))
+                     (tramp-rpc-mock-test--reject-real-vc-exec-after)))
             (tramp-rpc-handle-vc-exec-after
              (lambda () (setq ran t)))
             (cl-letf (((symbol-function 'process-status) (lambda (_process) 'exit))
                       ((symbol-function 'process-exit-status) (lambda (_process) 0)))
               (funcall (process-sentinel proc) proc "finished")))
           (should ran))
+      (set-process-sentinel proc #'ignore)
       (when (process-live-p proc)
         (delete-process proc))
       (kill-buffer buffer))))
