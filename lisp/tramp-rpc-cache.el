@@ -37,12 +37,12 @@
 (require 'tramp-rpc-connection)
 (require 'tramp-rpc-transport)
 
-;; Functions from tramp-rpc.el
-(declare-function tramp-rpc--canonical-watch-active-p "tramp-rpc")
-(declare-function tramp-rpc--file-notify-alias-paths "tramp-rpc")
-(declare-function tramp-rpc--file-notify-dispatch "tramp-rpc")
-(declare-function tramp-rpc--file-notify-dispatch-rescan "tramp-rpc")
-(declare-function tramp-rpc--watch-entry-canonical-directory "tramp-rpc")
+;; Functions from tramp-rpc-notify.el
+(declare-function tramp-rpc--canonical-watch-active-p "tramp-rpc-notify")
+(declare-function tramp-rpc--file-notify-alias-paths "tramp-rpc-notify")
+(declare-function tramp-rpc--file-notify-dispatch "tramp-rpc-notify")
+(declare-function tramp-rpc--file-notify-dispatch-rescan "tramp-rpc-notify")
+(declare-function tramp-rpc--watch-entry-canonical-directory "tramp-rpc-notify")
 
 ;; ============================================================================
 ;; Hooks into higher layers

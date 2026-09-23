@@ -183,14 +183,15 @@ The modules form a strict layering; each requires only the ones below it.
 Where a lower layer needs to reach up, it runs a hook that the upper layer
 registers on at load time.  The only ~declare-function~ back-references
 left are for functions emitted by the autoload form and for the
-file-notify dispatch callbacks in ~tramp-rpc.el~.
+file-notify dispatch callbacks in ~tramp-rpc-notify.el~.
 
 | Module                     | Purpose                                              |
 |----------------------------+------------------------------------------------------|
-| ~tramp-rpc.el~             | TRAMP file handlers, file-notify, registration       |
+| ~tramp-rpc.el~             | TRAMP file handlers and registration                 |
 | ~tramp-rpc-magit.el~       | Magit/Projectile prefetch and process-file cache     |
 | ~tramp-rpc-advice.el~      | Advice functions for process/VC integration          |
 | ~tramp-rpc-process.el~     | Async process & PTY support                          |
+| ~tramp-rpc-notify.el~      | Public ~file-notify~ descriptors on server watches   |
 | ~tramp-rpc-cache.el~       | Metadata caches & filesystem watch notifications     |
 | ~tramp-rpc-transport.el~   | SSH/ControlMaster, connection generations, RPC calls |
 | ~tramp-rpc-deploy.el~      | Binary deployment & version management               |
@@ -202,8 +203,12 @@ file-notify dispatch callbacks in ~tramp-rpc.el~.
 
 The core module provides:
 - All TRAMP file handler operations (~file-exists-p~, ~file-attributes~, ~insert-file-contents~, etc.)
-- Public ~file-notify~ descriptors on top of server watches
 - File name handler registration, dispatch, and unload
+
+*** Notify Module (~tramp-rpc-notify.el~)
+
+Public ~file-notify~ descriptors (~file-notify-add-watch~ and friends) on
+top of the server watches managed by the cache module.
 
 *** Transport Module (~tramp-rpc-transport.el~)
 
