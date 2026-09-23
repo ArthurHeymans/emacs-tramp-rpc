@@ -1380,7 +1380,9 @@ ask again in `auto' mode.  Explicit installation overrides
 `tramp-rpc-deploy-never-deploy' is non-nil."
   (interactive
    (list (tramp-dissect-file-name
-          (read-file-name "Remote TRAMP-RPC host: " "/rpc:"))
+          ;; /rpc: is the initial input, not the completion directory;
+          ;; completing hosts must not treat user@host as a path under /rpc:.
+          (read-file-name "Remote TRAMP-RPC host: " nil nil nil "/rpc:"))
          current-prefix-arg))
   (when tramp-rpc-deploy-never-deploy
     (user-error "Deployment is disabled by `tramp-rpc-deploy-never-deploy'"))
