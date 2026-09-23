@@ -2753,6 +2753,32 @@ This matches the behavior expected by `tramp-test28-process-file'."
                             "update-index" "--refresh")
                            cache)))))
 
+(ert-deftest tramp-rpc-mock-test-magit-prefetch-after-stale-update-index ()
+  "`update-index --refresh' exiting 1 (stale files) still builds the snapshot."
+  (skip-unless tramp-rpc-mock-test--tramp-rpc-magit-loaded)
+  (dolist (exit-code '(0 1 128))
+    (let ((default-directory "/rpc:user@host:/repo/")
+          (tramp-rpc-magit--allow-process-cache t)
+          (prefetched nil))
+      (cl-letf (((symbol-function 'tramp-rpc--process-environment)
+                 (lambda (&rest _) nil))
+                ((symbol-function 'tramp-rpc-magit--process-cache-lookup)
+                 (lambda (&rest _) nil))
+                ((symbol-function 'tramp-rpc--decode-output)
+                 (lambda (output) output))
+                ((symbol-function 'tramp-rpc--call)
+                 (lambda (&rest _)
+                   `((exit_code . ,exit-code) (stdout . "") (stderr . ""))))
+                ((symbol-function 'tramp-rpc-magit--clear-status-cache-for-connection)
+                 #'ignore)
+                ((symbol-function 'tramp-rpc-magit--prefetch)
+                 (lambda (directory) (setq prefetched directory))))
+        (should (= exit-code
+                   (tramp-rpc-handle-process-file
+                    "git" nil nil nil "update-index" "--refresh")))
+        (should (equal prefetched
+                       (and (< exit-code 2) default-directory)))))))
+
 (ert-deftest tramp-rpc-mock-test-git-process-cache-does-not-reuse-subdir ()
   "A repo-root process cache is not reused for a different cwd."
   (skip-unless tramp-rpc-mock-test--tramp-rpc-magit-loaded)

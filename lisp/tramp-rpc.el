@@ -2267,13 +2267,15 @@ ARGS contains the original function arguments."
 
                         ;; Let the real `update-index --refresh' run, then
                         ;; build the read snapshot used by later Magit calls.
+                        ;; It exits 1 when tracked files need an update, which
+                        ;; is the usual state of a worktree with changes.
                         (when (and
                                (null infile)
                                (bound-and-true-p
                                 tramp-rpc-magit--allow-process-cache)
                                (or (string-suffix-p "/git" program)
                                    (string= "git" program))
-                               (= exit-code 0)
+                               (memql exit-code '(0 1))
                                (tramp-rpc-magit--git-cache-safe-environment-p))
                           (let ((core-args
                                  (tramp-rpc-magit--strip-git-prefix-args args)))
