@@ -710,7 +710,12 @@ ROOT-LOCAL is the local form of the repository root."
             (add-ref-name name)
             (when (and name (not (string-suffix-p "@{upstream}" name)))
               (add-log-range (concat name ".."))
-              (add-log-range (concat ".." name)))))
+              (add-log-range (concat ".." name))))
+          ;; The upstream header line.
+          (when upstream
+            (add-git "log" "--no-walk" "--format=%s"
+                     (concat upstream "^{commit}") "--")
+            (add-git "merge-base" "--is-ancestor" "HEAD" upstream)))
 
         ;; File-section wash commands for files already expanded in status.
         (let* ((status (or (cached "status" "-z" "--porcelain"
