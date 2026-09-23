@@ -1986,10 +1986,15 @@ Returns the result or signals an error."
               (tramp-rpc--signal-rpc-error "RPC" msg code os-errno nil data))
           (plist-get response :result))))))
 
+(defconst tramp-rpc--batch-max-entries 64
+  "Maximum number of requests the server accepts in one batch.")
+
 (defun tramp-rpc--call-batch (vec requests)
   "Execute multiple RPC REQUESTS in a single round-trip for VEC.
 REQUESTS is a list of (METHOD . PARAMS) cons cells.
 Returns a list of results (or error plists) in the same order.
+More than `tramp-rpc--batch-max-entries' requests take one round trip per
+chunk of that size.
 
 Example:
   (tramp-rpc--call-batch vec
@@ -2001,6 +2006,13 @@ Returns:
   (t                          ; file.exists result
    ((type . \"file\") ...)    ; file.stat result
    (:error -32001 :message \"...\"))  ; or error plist"
+  (if (length> requests tramp-rpc--batch-max-entries)
+      (mapcan (lambda (chunk) (tramp-rpc--call-batch vec chunk))
+              (seq-split requests tramp-rpc--batch-max-entries))
+    (tramp-rpc--call-batch-1 vec requests)))
+
+(defun tramp-rpc--call-batch-1 (vec requests)
+  "Send at most `tramp-rpc--batch-max-entries' REQUESTS for VEC in one batch."
   (let* ((timeout (tramp-rpc--configured-call-timeout))
          (poll-interval (tramp-rpc--configured-poll-interval))
          (conn (tramp-rpc--ensure-connection vec))
@@ -2228,14 +2240,24 @@ succeeds."
         (setq result (tramp-rpc--append-path-entries (list entry) result)))
        (t
         (tramp-rpc--debug "Ignoring unsupported remote PATH entry: %S" entry))))
-    ;; Remove non-existing directories (matches tramp-sh behavior).
-    (cons (delq nil (mapcar (lambda (x)
-                              (and (stringp x)
-                                   (file-directory-p
-                                    (tramp-make-tramp-file-name vec x))
-                                   x))
-                            result))
-          complete)))
+    ;; Remove non-existing directories (matches tramp-sh behavior), checking
+    ;; all candidates in one round trip.  If that fails, keep every
+    ;; candidate and report the result as incomplete.
+    (let* ((candidates (seq-filter #'stringp result))
+           (directories
+            (when candidates
+              (condition-case nil
+                  (cl-loop for dir in candidates
+                           for stat in (tramp-rpc--call-batch
+                                        vec (mapcar (lambda (dir)
+                                                      (cons "file.stat"
+                                                            (tramp-rpc--encode-path dir)))
+                                                    candidates))
+                           when (and (not (tramp-rpc--batch-error-p stat))
+                                     (equal (alist-get 'type stat) "directory"))
+                           collect dir)
+                (error (setq complete nil) candidates)))))
+      (cons directories complete))))
 
 (defun tramp-rpc--get-remote-login-shell (vec)
   "Return the login shell for the remote user on VEC.
