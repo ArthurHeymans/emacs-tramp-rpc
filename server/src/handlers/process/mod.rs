@@ -9,16 +9,14 @@
 
 mod pipe;
 mod pty;
-mod subscription;
+mod push;
 #[cfg(test)]
 mod tests;
 
 pub(crate) use pipe::{ChildError, ChildSpec, run_child};
 pub use pipe::{close_stdin, kill, run, signal_pid, start, write};
 pub use pty::{close_pty, kill_pty, resize_pty, start_pty, write_pty};
-pub use subscription::{
-    init_notification_writer, subscribe, subscribe_pty, unsubscribe, unsubscribe_pty,
-};
+pub use push::{init_notification_writer, start_output_push};
 
 use crate::protocol::RpcError;
 use nix::sys::signal::Signal;
@@ -46,7 +44,7 @@ use pipe::{get_process_map, terminate_pipe_process};
 #[cfg(test)]
 use pty::TERMINATED_PTY_STATUSES;
 use pty::{clear_terminated_pty_statuses, get_pty_process_map, terminate_pty_process};
-use subscription::stop_push_subscription;
+use push::stop_output_push;
 
 /// Upper bound for one test-only `read`/`read_pty` request.
 #[cfg(test)]
@@ -382,22 +380,22 @@ fn dup_cloexec<Fd: AsFd>(fd: Fd) -> Result<OwnedFd, std::io::Error> {
 pub async fn cleanup_managed_processes() -> Result<(), RpcError> {
     // The notification transport is already gone.  Stop output consumers before
     // terminating children so no detached task retains stream or descriptor state.
-    let mut subscriptions = Vec::new();
+    let mut pushes = Vec::new();
     {
         let mut processes = get_process_map().lock().await;
         for managed in processes.values_mut() {
             managed.terminating = true;
-            subscriptions.extend(managed.push_subscription.take());
+            pushes.extend(managed.output_push.take());
         }
     }
     {
         let mut processes = get_pty_process_map().lock().await;
         for managed in processes.values_mut() {
             managed.terminating = true;
-            subscriptions.extend(managed.push_subscription.take());
+            pushes.extend(managed.output_push.take());
         }
     }
-    futures::future::join_all(subscriptions.into_iter().map(stop_push_subscription)).await;
+    futures::future::join_all(pushes.into_iter().map(stop_output_push)).await;
 
     let pipe_pids: Vec<(u32, u32)> = {
         let processes = get_process_map().lock().await;

@@ -1120,7 +1120,7 @@ async fn pipe_and_pty_kill_validate_signals_consistently() {
 }
 
 #[tokio::test]
-async fn failed_pty_teardown_does_not_restore_cancelled_subscription() {
+async fn failed_pty_teardown_can_be_retried_without_output_push() {
     let _test_lock = test_process_map_lock().await;
 
     for close in [false, true] {
@@ -1134,12 +1134,7 @@ async fn failed_pty_teardown_does_not_restore_cancelled_subscription() {
         .await
         .expect("start PTY");
         let pid = map_get(&start, "pid").and_then(Value::as_u64).unwrap() as u32;
-        subscribe_pty(Value::Map(vec![(
-            Value::String("pid".into()),
-            Value::Integer(pid.into()),
-        )]))
-        .await
-        .expect("subscribe to PTY");
+        start_output_push(pid).await;
 
         set_test_process_group_signal_error(Some(libc::EIO));
         let result = if close {
@@ -1161,20 +1156,19 @@ async fn failed_pty_teardown_does_not_restore_cancelled_subscription() {
         set_test_process_group_signal_error(None);
         assert!(result.is_err(), "injected signal failure must propagate");
 
-        // The io stays cancelled but terminating is reset so close_pty can retry.
         {
             let processes = get_pty_process_map().lock().await;
             let managed = processes.get(&pid).expect("terminal PTY entry");
-            assert!(!managed.terminating);
+            assert!(!managed.terminating, "a failed teardown can be retried");
             assert!(managed.io.is_closed());
-            assert!(managed.push_subscription.is_none());
+            assert!(managed.output_push.is_none());
         }
         close_pty(Value::Map(vec![(
             Value::String("pid".into()),
             Value::Integer(pid.into()),
         )]))
         .await
-        .expect("clean up terminal PTY");
+        .expect("retry the teardown");
     }
 }
 
@@ -2156,8 +2150,7 @@ async fn pty_read_close_race_does_not_leak_duplicated_fds() {
                 exit_status: None,
                 shared_exit_status: Arc::new(StdMutex::new(None)),
                 output_eof: false,
-                push_subscription: None,
-                subscription_requested: false,
+                output_push: None,
                 terminating: false,
             },
         );

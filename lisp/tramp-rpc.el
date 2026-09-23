@@ -33,7 +33,7 @@
 ;; - VC mode integration works (git, etc.)
 ;;
 ;; HOW ASYNC PROCESSES WORK:
-;; Remote processes are started via RPC and polled periodically for output.
+;; Remote processes are started via RPC and the server pushes their output.
 ;; A local pipe process serves as a relay to provide Emacs process semantics.
 ;; Process filters, sentinels, and signals all work as expected.
 ;;

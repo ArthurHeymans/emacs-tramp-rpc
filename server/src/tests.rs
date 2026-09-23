@@ -886,21 +886,20 @@ async fn test_connection_eof_sigkills_blocked_pipe_and_pty_requests() {
             .await
             .unwrap();
     }
-    let mut pipe_pid = None;
-    let mut pty_pid = None;
+    let mut started = Vec::new();
     for _ in 0..2 {
         let response = read_frame(&mut client_reader).await;
         assert!(map_get(&response, "error").is_none(), "{response:?}");
-        let pid = map_get(&response, "result")
-            .and_then(|result| map_get(result, "pid"))
-            .and_then(Value::as_u64)
-            .expect("start response pid") as i64;
-        match map_get_id(&response) {
-            Some(101) => pipe_pid = Some(pid),
-            Some(102) => pty_pid = Some(pid),
-            id => panic!("unexpected start response id: {id:?}"),
-        }
+        assert!(
+            map_get(&response, "result")
+                .and_then(|result| map_get(result, "pid"))
+                .is_some(),
+            "start response pid"
+        );
+        started.push(map_get_id(&response));
     }
+    started.sort();
+    assert_eq!(started, [Some(101), Some(102)]);
 
     for marker in &markers {
         wait_for_marker(marker).await;
@@ -908,42 +907,8 @@ async fn test_connection_eof_sigkills_blocked_pipe_and_pty_requests() {
 
     let managed_pids = handlers::process::test_managed_os_pids().await;
     assert_eq!(managed_pids.len(), 2);
-    // Subscribe to both processes so the server is actively pushing output.
+    // Both processes push output since their start responses were written.
     // EOF cleanup must still escalate to SIGKILL since the children ignore SIGTERM.
-    client
-        .write_all(&frame(&make_request(
-            "process.subscribe",
-            Value::Map(vec![(
-                Value::String("pid".into()),
-                Value::Integer(pipe_pid.expect("pipe pid").into()),
-            )]),
-        )))
-        .await
-        .unwrap();
-    client
-        .write_all(&frame(&make_request(
-            "process.subscribe_pty",
-            Value::Map(vec![(
-                Value::String("pid".into()),
-                Value::Integer(pty_pid.expect("pty pid").into()),
-            )]),
-        )))
-        .await
-        .unwrap();
-    // Both subscribe acknowledgements must be successful before dropping.
-    for _ in 0..2 {
-        let ack = read_frame(&mut client_reader).await;
-        assert!(
-            map_get(&ack, "error").is_none(),
-            "subscribe failed: {ack:?}"
-        );
-        assert_eq!(
-            map_get(&ack, "result").and_then(Value::as_bool),
-            Some(true),
-            "subscribe ack not true: {ack:?}"
-        );
-    }
-
     // EOF must still finish after cleanup escalates to SIGKILL.
     drop(client);
     drop(client_reader);

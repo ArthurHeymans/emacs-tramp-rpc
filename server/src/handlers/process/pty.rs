@@ -28,10 +28,10 @@ use super::super::HandlerResult;
 use super::super::system::expand_tilde;
 #[cfg(test)]
 use super::MAX_PROCESS_READ_BYTES;
-use super::pipe::exit_status_from_wait_status;
+use super::pipe::{exit_status_from_wait_status, get_next_pid};
+use super::push::{OutputPush, send_exit_notification, stop_output_push};
 #[cfg(target_os = "macos")]
 use super::signal_process;
-use super::subscription::{PushSubscription, send_exit_notification, stop_push_subscription};
 use super::{
     MANAGED_CHILD_WAIT, MANAGED_PTY_CHILD_WAIT, SignalCode, dup_cloexec,
     require_process_group_signal, set_fd_cloexec, set_fd_nonblocking, signal_process_group,
@@ -42,7 +42,6 @@ pub(super) static PTY_PROCESS_MAP: OnceLock<Mutex<HashMap<u32, ManagedPtyProcess
     OnceLock::new();
 pub(super) static TERMINATED_PTY_STATUSES: OnceLock<StdMutex<HashMap<u32, ExitStatus>>> =
     OnceLock::new();
-pub(super) static PTY_PID_COUNTER: OnceLock<Mutex<u32>> = OnceLock::new();
 
 pub(super) fn get_pty_process_map() -> &'static Mutex<HashMap<u32, ManagedPtyProcess>> {
     PTY_PROCESS_MAP.get_or_init(|| Mutex::new(HashMap::new()))
@@ -74,14 +73,6 @@ pub(super) fn clear_terminated_pty_statuses() {
         .lock()
         .expect("terminated PTY status lock")
         .clear();
-}
-
-pub(super) async fn get_next_pty_pid() -> u32 {
-    let counter = PTY_PID_COUNTER.get_or_init(|| Mutex::new(10000));
-    let mut pid = counter.lock().await;
-    let current = *pid;
-    *pid += 1;
-    current
 }
 
 pub(super) struct PtyIoState {
@@ -121,8 +112,7 @@ pub(super) struct ManagedPtyProcess {
     // before explicit SIGKILL removes its registry entry.
     pub(super) shared_exit_status: Arc<StdMutex<Option<ExitStatus>>>,
     pub(super) output_eof: bool,
-    pub(super) push_subscription: Option<PushSubscription>,
-    pub(super) subscription_requested: bool,
+    pub(super) output_push: Option<OutputPush>,
     pub(super) terminating: bool,
 }
 
@@ -396,7 +386,7 @@ pub async fn start_pty(params: Value) -> HandlerResult {
     let async_fd = AsyncFd::new(startup.take_master_fd())
         .map_err(|e| RpcError::process_error(format!("Failed to create AsyncFd: {e}")))?;
 
-    let our_pid = get_next_pty_pid().await;
+    let our_pid = get_next_pid().await;
     let mut processes = get_pty_process_map().lock().await;
     // Disarm only after the final await.  Cancellation anywhere before this
     // point drops STARTUP, closes the PTY, and kills/reaps the unregistered child.
@@ -415,8 +405,7 @@ pub async fn start_pty(params: Value) -> HandlerResult {
         exit_status: None,
         shared_exit_status: Arc::new(StdMutex::new(None)),
         output_eof: false,
-        push_subscription: None,
-        subscription_requested: false,
+        output_push: None,
         terminating: false,
     };
 
@@ -966,7 +955,7 @@ pub async fn kill_pty(params: Value) -> HandlerResult {
 
     let params: Params = from_value(params).map_err(|e| RpcError::invalid_params(e.to_string()))?;
     let signal = params.signal.resolve()?;
-    let (subscription, shared_exit_status) = {
+    let (push, shared_exit_status) = {
         let mut processes = get_pty_process_map().lock().await;
         let managed = processes.get_mut(&params.pid).ok_or_else(|| {
             RpcError::process_error(format!("PTY process not found: {}", params.pid))
@@ -980,16 +969,15 @@ pub async fn kill_pty(params: Value) -> HandlerResult {
         if signal == libc::SIGKILL {
             managed.terminating = true;
             (
-                managed.push_subscription.take(),
+                managed.output_push.take(),
                 Some(Arc::clone(&managed.shared_exit_status)),
             )
         } else {
             (None, None)
         }
     };
-    let subscribed = subscription.is_some();
-    if let Some(subscription) = subscription {
-        stop_push_subscription(subscription).await;
+    if let Some(push) = push {
+        stop_output_push(push).await;
     }
     // Match local signal-process semantics: forward the requested signal
     // without turning a survivable signal such as SIGINT into SIGKILL.
@@ -1004,24 +992,27 @@ pub async fn kill_pty(params: Value) -> HandlerResult {
     )
     .await
     {
-        // SIGKILL delivery failed.  Reset terminating so close_pty can retry;
-        // io cancellation is irreversible but the entry remains reachable.
-        if signal == libc::SIGKILL {
-            let mut processes = get_pty_process_map().lock().await;
-            if let Some(managed) = processes.get_mut(&params.pid) {
-                managed.terminating = false;
-            }
-        }
+        allow_pty_termination_retry(params.pid).await;
         return Err(error);
     }
-    if signal == libc::SIGKILL && subscribed {
+    // SIGKILL removed the entry, so no push task can report this exit.  Also
+    // report it when the push had not started yet.
+    if signal == libc::SIGKILL {
         let status = shared_exit_status
             .as_ref()
             .and_then(|status| *status.lock().expect("shared PTY exit status lock"))
             .unwrap_or_else(|| ExitStatus::from_raw(signal));
-        send_exit_notification("process.pty_exit", params.pid, Some(status)).await;
+        send_exit_notification(params.pid, Some(status)).await;
     }
     Ok(Value::Boolean(true))
+}
+
+/// Let a later kill or close retry after a failed termination.  PTY input
+/// stays cancelled (irreversibly) and no output is pushed any more.
+async fn allow_pty_termination_retry(pid: u32) {
+    if let Some(managed) = get_pty_process_map().lock().await.get_mut(&pid) {
+        managed.terminating = false;
+    }
 }
 
 /// Close a PTY process and discard buffered output.  Repeating close is harmless.
@@ -1032,7 +1023,7 @@ pub async fn close_pty(params: Value) -> HandlerResult {
     }
 
     let params: Params = from_value(params).map_err(|e| RpcError::invalid_params(e.to_string()))?;
-    let subscription = {
+    let push = {
         let mut processes = get_pty_process_map().lock().await;
         match processes.get_mut(&params.pid) {
             Some(managed) if managed.terminating => {
@@ -1043,22 +1034,17 @@ pub async fn close_pty(params: Value) -> HandlerResult {
             }
             Some(managed) => {
                 managed.terminating = true;
-                managed.push_subscription.take()
+                managed.output_push.take()
             }
             None => None,
         }
     };
-    if let Some(subscription) = subscription {
-        stop_push_subscription(subscription).await;
+    if let Some(push) = push {
+        stop_output_push(push).await;
     }
     // Explicit close is the opt-out from kill's drain-preserving ownership.
     if let Err(error) = terminate_pty_process(params.pid, libc::SIGKILL, true, true, false).await {
-        // SIGKILL delivery failed.  Reset terminating so the caller can retry;
-        // io cancellation is irreversible but the entry remains reachable.
-        let mut processes = get_pty_process_map().lock().await;
-        if let Some(managed) = processes.get_mut(&params.pid) {
-            managed.terminating = false;
-        }
+        allow_pty_termination_retry(params.pid).await;
         return Err(error);
     }
     discard_terminated_pty_status(params.pid);

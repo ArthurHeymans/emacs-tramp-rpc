@@ -1953,8 +1953,6 @@ This matches the upstream `tramp-test28-process-file' test."
         proc)
     (cl-letf (((symbol-function 'tramp-rpc--start-remote-process)
                (lambda (&rest _args) 12345))
-              ((symbol-function 'tramp-rpc--start-async-read)
-               (lambda (&rest _args) nil))
               ((symbol-function 'tramp-rpc--kill-remote-process)
                (lambda (&rest _args) nil))
               ((symbol-function 'tramp-rpc--remote-path-environment)

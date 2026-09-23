@@ -1704,7 +1704,6 @@ This matches the behavior expected by `tramp-test28-process-file'."
                    (lambda (_buffer) '(80 . 24)))
                   ((symbol-function 'tramp-rpc--get-connection)
                    (lambda (_vec) current-connection))
-                  ((symbol-function 'tramp-rpc--pty-start-async-read) #'ignore)
                   ((symbol-function 'tramp-rpc--call)
                    (lambda (_vec method _params &optional connection)
                      (if (equal method "process.start_pty")
@@ -1874,8 +1873,8 @@ This matches the behavior expected by `tramp-test28-process-file'."
       (when (buffer-live-p buffer)
         (kill-buffer buffer)))))
 
-(ert-deftest tramp-rpc-mock-test-pty-subscription-error-exits-process ()
-  "A PTY subscription error terminates the process with exit code -1."
+(ert-deftest tramp-rpc-mock-test-pty-read-error-exits-process ()
+  "A PTY exit without a status terminates the process with exit code -1."
   (let ((process (make-pipe-process
                   :name "tramp-rpc-pty-sub-error-mock"
                   :noquery t))
@@ -1928,7 +1927,7 @@ This matches the behavior expected by `tramp-test28-process-file'."
                                  :delivery-timer nil)
                    tramp-rpc--pty-processes)
           (set-process-sentinel process #'tramp-rpc--pty-sentinel)
-          ;; First exit notification (e.g. from subscription error path).
+          ;; First exit notification (e.g. from a server read error).
           (cl-letf (((symbol-function 'tramp-rpc--best-effort) #'ignore))
             (tramp-rpc--handle-pty-exit process -1))
           ;; `delete-process' queues the real sentinel callback.
@@ -2050,8 +2049,7 @@ direct property test would miss it."
                        ("process.start_pty" '((pid . 42) (tty_name . "/dev/pts/42")))
                        (_ (error "Unexpected RPC %s" method)))))
                   ((symbol-function 'tramp-rpc--get-connection)
-                   (lambda (_vec) connection))
-                  ((symbol-function 'tramp-rpc--pty-start-async-read) #'ignore))
+                   (lambda (_vec) connection)))
           (setq local-process
                 (tramp-rpc--make-rpc-pty-process
                  vec "tramp-rpc-pty-generation-mock" nil '("true") nil t
@@ -6312,8 +6310,6 @@ A rejected sudo password must not be reused on the next attempt, otherwise
                  (setq captured (list vec program args cwd))
                  4242))
               ((symbol-function 'tramp-rpc--write-remote-process)
-               (lambda (&rest _) nil))
-              ((symbol-function 'tramp-rpc--start-async-read)
                (lambda (&rest _) nil)))
       (unwind-protect
           (progn
@@ -8012,8 +8008,6 @@ This matches tramp-sh and upstream `tramp-test28-process-file', which requires
                  4242))
               ((symbol-function 'tramp-rpc--write-remote-process)
                (lambda (&rest _) nil))
-              ((symbol-function 'tramp-rpc--start-async-read)
-               (lambda (&rest _) nil))
               ((symbol-function 'tramp-rpc--make-pty-process)
                (lambda (&rest _)
                  (setq pty-called t)
@@ -8048,8 +8042,7 @@ This matches tramp-sh and upstream `tramp-test28-process-file', which requires
               ((symbol-function 'tramp-rpc--start-remote-process)
                (lambda (_vec program args _cwd _env)
                  (setq started (cons program args))
-                 51))
-              ((symbol-function 'tramp-rpc--start-async-read) #'ignore))
+                 51)))
       (unwind-protect
           (progn
             (setq proc (tramp-rpc-handle-make-process
@@ -8123,9 +8116,7 @@ This matches tramp-sh and upstream `tramp-test28-process-file', which requires
                  4242))
               ((symbol-function 'tramp-rpc--write-remote-process)
                (lambda (_vec pid data)
-                 (setq written (list pid data))))
-              ((symbol-function 'tramp-rpc--start-async-read)
-               (lambda (&rest _) nil)))
+                 (setq written (list pid data)))))
       (unwind-protect
           (progn
             (setq proc (tramp-rpc-handle-make-process
@@ -8734,147 +8725,71 @@ This matches tramp-sh and upstream `tramp-test28-process-file', which requires
       (when-let* ((buffer (get-buffer buffer-name)))
         (kill-buffer buffer)))))
 
-(ert-deftest tramp-rpc-mock-test-async-read-subscribes-instead-of-polling ()
-  "Async process startup subscribes on its captured connection."
-  (let* ((process (start-process "tramp-rpc-mock-subscribe" nil "cat"))
-         (connection-process
-          (start-process "tramp-rpc-mock-subscribe-connection" nil "cat"))
-         (connection (list :process connection-process))
-         (vec (tramp-dissect-file-name "/rpc:user@host:/"))
-         (tramp-rpc--async-processes (make-hash-table :test 'eq))
-         method-called connection-called)
-    (unwind-protect
-        (progn
-          (process-put process :tramp-rpc-connection connection)
-          (puthash process
-                   (list :vec vec :pid 42
-                         :connection-process connection-process)
-                   tramp-rpc--async-processes)
-          (cl-letf (((symbol-function 'tramp-rpc--call-async)
-                     (lambda (_vec method _params _callback
-                                   &optional rpc-connection)
-                       (setq method-called method
-                             connection-called rpc-connection))))
-            (tramp-rpc--start-async-read process))
-          (should (equal method-called "process.subscribe"))
-          (should (eq connection-called connection)))
-      (dolist (proc (list process connection-process))
-        (when (process-live-p proc)
-          (delete-process proc))))))
+(defmacro tramp-rpc-mock-test--with-push-relay (spec &rest body)
+  "Run BODY with a pipe relay registered for PID on a transport generation.
+SPEC is (RELAY BUFFER TRANSPORT CONNECTION PID).  RELAY is not yet in
+`tramp-rpc--async-processes'; BODY registers it."
+  (declare (indent 1))
+  (let ((relay (nth 0 spec)) (buffer (nth 1 spec))
+        (transport (nth 2 spec)) (connection (nth 3 spec)) (pid (nth 4 spec)))
+    `(let* ((,buffer (generate-new-buffer " *tramp-rpc-push-output*"))
+            (,relay (let ((process-connection-type nil))
+                      (start-process "tramp-rpc-push-relay" ,buffer "cat")))
+            (,transport (let ((process-connection-type nil))
+                          (start-process "tramp-rpc-push-transport" nil "cat")))
+            (,connection (tramp-rpc--make-connection :process ,transport))
+            (,pid 42)
+            (tramp-rpc--async-processes (make-hash-table :test 'eq))
+            (tramp-rpc--process-starts 0)
+            (tramp-rpc--early-process-notifications nil))
+       (unwind-protect
+           (progn
+             (tramp-rpc--attach-connection ,connection)
+             (set-process-filter
+              ,relay (lambda (_process output)
+                       (with-current-buffer ,buffer
+                         (goto-char (point-max))
+                         (insert output))))
+             (process-put ,relay :tramp-rpc-pid ,pid)
+             (process-put ,relay :tramp-rpc-connection ,connection)
+             (process-put ,relay :tramp-rpc-connection-process ,transport)
+             ,@body)
+         (dolist (proc (list ,relay ,transport))
+           (when (process-live-p proc)
+             (delete-process proc)))
+         (kill-buffer ,buffer)))))
 
-(ert-deftest tramp-rpc-mock-test-rpc-pty-subscribes-instead-of-polling ()
-  "RPC PTY startup subscribes on its captured connection."
-  (let* ((process (start-process "tramp-rpc-mock-pty-subscribe" nil "cat"))
-         (connection-process
-          (start-process "tramp-rpc-mock-pty-connection" nil "cat"))
-         (connection (list :process connection-process))
-         (vec (tramp-dissect-file-name "/rpc:user@host:/"))
-         (tramp-rpc--pty-processes (make-hash-table :test 'eq))
-         method-called connection-called)
-    (unwind-protect
-        (progn
-          (process-put process :tramp-rpc-vec vec)
-          (process-put process :tramp-rpc-pid 42)
-          (process-put process :tramp-rpc-connection connection)
-          (puthash process
-                   (list :vec vec :pid 42 :rpc-pty t
-                         :connection-process connection-process)
-                   tramp-rpc--pty-processes)
-          (cl-letf (((symbol-function 'tramp-rpc--call-async)
-                     (lambda (_vec method _params _callback
-                                   &optional rpc-connection)
-                       (setq method-called method
-                             connection-called rpc-connection))))
-            (tramp-rpc--pty-start-async-read process))
-          (should (equal method-called "process.subscribe_pty"))
-          (should (eq connection-called connection)))
-      (dolist (proc (list process connection-process))
-        (when (process-live-p proc)
-          (delete-process proc))))))
+(defun tramp-rpc-mock-test--register-push-relay (relay transport pid)
+  "Register RELAY for PID on TRANSPORT like `make-process' does."
+  (puthash relay
+           (list :pid pid :connection-process transport
+                 :pending-output nil :pending-exit nil :delivery-timer nil)
+           tramp-rpc--async-processes)
+  (tramp-rpc--register-managed-process relay))
 
-(ert-deftest tramp-rpc-mock-test-async-subscription-retries-before-kill ()
-  "A transient pipe subscription error retries once before killing its child."
-  (let* ((process (start-process "tramp-rpc-subscribe-retry" nil "cat"))
-         (connection-process
-          (start-process "tramp-rpc-subscribe-retry-connection" nil "cat"))
-         (connection (tramp-rpc--make-connection
-                      :process connection-process))
-         (vec (tramp-dissect-file-name "/rpc:subscribe-retry:/tmp/"))
-         (tramp-rpc--async-processes (make-hash-table :test 'eq))
-         callbacks
-         killed)
-    (unwind-protect
-        (progn
-          (process-put process :tramp-rpc-connection connection)
-          (puthash process
-                   (list :vec vec :pid 42
-                         :connection-process connection-process)
-                   tramp-rpc--async-processes)
-          (cl-letf (((symbol-function 'tramp-rpc--call-async)
-                     (lambda (_vec _method _params callback
-                                   &optional _connection)
-                       (push callback callbacks)))
-                    ((symbol-function 'tramp-rpc--kill-remote-process)
-                     (lambda (&rest _) (setq killed t))))
-            (tramp-rpc--start-async-read process)
-            (let ((first-callback (car callbacks)))
-              (funcall first-callback
-                       '(:error (:code -32098 :message "temporary"))))
-            (should (= (length callbacks) 2))
-            (should (process-live-p process))
-            (should-not killed)
-            (funcall (car callbacks)
-                     '(:error (:code -32098 :message "still failing")))
-            (should killed)
-            (should-not (process-live-p process))))
-      (remhash process tramp-rpc--async-processes)
-      (dolist (proc (list process connection-process))
-        (when (process-live-p proc)
-          (delete-process proc))))))
+(ert-deftest tramp-rpc-mock-test-push-output-before-registration-is-kept ()
+  "Output pushed before its start is registered reaches the relay in order."
+  (tramp-rpc-mock-test--with-push-relay (relay buffer transport connection pid)
+    (ignore connection)
+    (setq tramp-rpc--process-starts 1)
+    (tramp-rpc--handle-process-notification
+     transport "process.output" `((pid . ,pid) (stdout . "early-")))
+    (should tramp-rpc--early-process-notifications)
+    (tramp-rpc-mock-test--register-push-relay relay transport pid)
+    (should-not tramp-rpc--early-process-notifications)
+    (tramp-rpc--handle-process-notification
+     transport "process.output" `((pid . ,pid) (stdout . "late")))
+    (tramp-rpc-mock-test--wait-for
+     (lambda ()
+       (with-current-buffer buffer (equal (buffer-string) "early-late")))
+     "early and late push output")))
 
-(ert-deftest tramp-rpc-mock-test-pty-subscription-retries-before-close ()
-  "A transient PTY subscription error retries once before closing its child."
-  (let* ((process (start-process "tramp-rpc-pty-subscribe-retry" nil "cat"))
-         (connection-process
-          (start-process "tramp-rpc-pty-subscribe-retry-connection" nil "cat"))
-         (connection (tramp-rpc--make-connection
-                      :process connection-process))
-         (vec (tramp-dissect-file-name "/rpc:pty-subscribe-retry:/tmp/"))
-         (tramp-rpc--pty-processes (make-hash-table :test 'eq))
-         callbacks
-         closed)
-    (unwind-protect
-        (progn
-          (process-put process :tramp-rpc-vec vec)
-          (process-put process :tramp-rpc-pid 42)
-          (process-put process :tramp-rpc-connection connection)
-          (puthash process
-                   (list :vec vec :pid 42 :rpc-pty t
-                         :connection-process connection-process)
-                   tramp-rpc--pty-processes)
-          (cl-letf (((symbol-function 'tramp-rpc--call-async)
-                     (lambda (_vec _method _params callback
-                                   &optional _connection)
-                       (push callback callbacks)))
-                    ((symbol-function 'tramp-rpc--call)
-                     (lambda (_vec method _params &optional _connection)
-                       (when (equal method "process.close_pty")
-                         (setq closed t)))))
-            (tramp-rpc--pty-start-async-read process)
-            (let ((first-callback (car callbacks)))
-              (funcall first-callback
-                       '(:error (:code -32098 :message "temporary"))))
-            (should (= (length callbacks) 2))
-            (should (process-live-p process))
-            (should-not closed)
-            (funcall (car callbacks)
-                     '(:error (:code -32098 :message "still failing")))
-            (should closed)
-            (should-not (process-live-p process))))
-      (remhash process tramp-rpc--pty-processes)
-      (dolist (proc (list process connection-process))
-        (when (process-live-p proc)
-          (delete-process proc))))))
+(ert-deftest tramp-rpc-mock-test-push-output-for-unknown-pid-is-dropped ()
+  "Without a pending start, notifications for unknown PIDs are discarded."
+  (tramp-rpc-mock-test--with-push-relay (_relay _buffer transport _connection pid)
+    (tramp-rpc--handle-process-notification
+     transport "process.output" `((pid . ,pid) (stdout . "stale")))
+    (should-not tramp-rpc--early-process-notifications)))
 
 (ert-deftest tramp-rpc-mock-test-push-notifications-deliver-ordered-output ()
   "Push notifications deliver each output chunk once and in order."
@@ -8897,10 +8812,10 @@ This matches tramp-sh and upstream `tramp-test28-process-file', which requires
                          :pending-output nil :pending-exit nil
                          :delivery-timer nil)
                    tramp-rpc--async-processes)
-          (tramp-rpc--handle-process-output-notification
-           connection '((pid . 1) (stdout . "chunk-a")))
-          (tramp-rpc--handle-process-output-notification
-           connection '((pid . 1) (stdout . "chunk-b")))
+          (tramp-rpc--handle-process-notification
+           connection "process.output" '((pid . 1) (stdout . "chunk-a")))
+          (tramp-rpc--handle-process-notification
+           connection "process.output" '((pid . 1) (stdout . "chunk-b")))
           (tramp-rpc-mock-test--wait-for
            (lambda ()
              (with-current-buffer buffer

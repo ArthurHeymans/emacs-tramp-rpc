@@ -30,11 +30,9 @@ use super::super::HandlerResult;
 use super::super::system::expand_tilde;
 #[cfg(test)]
 use super::MAX_PROCESS_READ_BYTES;
+use super::push::{OutputPush, new_pipe_push, send_exit_notification, stop_output_push};
 #[cfg(target_vendor = "apple")]
 use super::set_fd_cloexec;
-use super::subscription::{
-    PushSubscription, new_pipe_subscription, send_exit_notification, stop_push_subscription,
-};
 use super::{
     MANAGED_CHILD_WAIT, ProcessGroupGuard, SignalCode, configure_process_group,
     is_benign_stdin_error, require_process_group_signal, signal_process, signal_process_group,
@@ -234,8 +232,7 @@ pub(super) struct ManagedProcess {
     pub(super) stdin: Arc<Mutex<Option<ChildStdin>>>,
     pub(super) stdout: Arc<Mutex<Option<ChildStdout>>>,
     pub(super) stderr: Arc<Mutex<Option<ChildStderr>>>,
-    pub(super) push_subscription: Option<PushSubscription>,
-    pub(super) subscription_requested: bool,
+    pub(super) output_push: Option<OutputPush>,
     pub(super) terminating: bool,
 }
 
@@ -579,8 +576,7 @@ pub async fn start(params: Value) -> HandlerResult {
         stderr: Arc::new(Mutex::new(child.stderr.take())),
         child,
         child_pid,
-        push_subscription: None,
-        subscription_requested: false,
+        output_push: None,
         terminating: false,
     };
 
@@ -1113,9 +1109,9 @@ pub async fn kill(params: Value) -> HandlerResult {
 
     let params: Params = from_value(params).map_err(|e| RpcError::invalid_params(e.to_string()))?;
     let signal = params.signal.resolve()?;
-    // A subscription owns the output read loop.  Stop it before destructive
+    // The output push owns the read loop.  Stop it before destructive
     // SIGKILL so it cannot race registry removal or consume final output.
-    let (subscription, shared_exit_status) = {
+    let (push, shared_exit_status) = {
         let mut processes = get_process_map().lock().await;
         let managed = processes
             .get_mut(&params.pid)
@@ -1129,32 +1125,34 @@ pub async fn kill(params: Value) -> HandlerResult {
         if signal == libc::SIGKILL {
             managed.terminating = true;
             (
-                managed.push_subscription.take(),
+                managed.output_push.take(),
                 Some(Arc::clone(&managed.shared_exit_status)),
             )
         } else {
             (None, None)
         }
     };
-    let subscribed = subscription.is_some();
-    if let Some(subscription) = subscription {
-        stop_push_subscription(subscription).await;
+    let pushing = push.is_some();
+    if let Some(push) = push {
+        stop_output_push(push).await;
     }
     if let Err(error) = terminate_pipe_process(params.pid, signal, false).await {
         if let Some(managed) = get_process_map().lock().await.get_mut(&params.pid) {
             managed.terminating = false;
-            if managed.subscription_requested && managed.push_subscription.is_none() {
-                managed.push_subscription = Some(new_pipe_subscription(params.pid));
+            if pushing && managed.output_push.is_none() {
+                managed.output_push = Some(new_pipe_push(params.pid));
             }
         }
         return Err(error);
     }
-    if signal == libc::SIGKILL && subscribed {
+    // SIGKILL removed the entry, so no push task can report this exit.  Also
+    // report it when the push had not started yet.
+    if signal == libc::SIGKILL {
         let status = shared_exit_status
             .as_ref()
             .and_then(|status| *status.lock().expect("shared pipe exit status lock"))
             .unwrap_or_else(|| ExitStatus::from_raw(signal));
-        send_exit_notification("process.exit", params.pid, Some(status)).await;
+        send_exit_notification(params.pid, Some(status)).await;
     }
     Ok(Value::Boolean(true))
 }

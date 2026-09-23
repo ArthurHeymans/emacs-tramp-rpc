@@ -303,8 +303,10 @@ fn spawn_request<W>(
         let _byte_permit = byte_permit;
         #[cfg(test)]
         let panic_after_response = request.method == "test.panic";
+        let method = request.method.clone();
         let response = handlers::dispatch(request).await;
         write_response(&writer, &response).await;
+        handlers::after_response(&method, &response).await;
         #[cfg(test)]
         if panic_after_response {
             panic!("test request task panic");

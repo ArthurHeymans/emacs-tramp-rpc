@@ -182,19 +182,21 @@ TRAMP-RPC exposes these method categories:
 **** Process Operations
 | Method            | Parameters                   | Returns                    |
 |-------------------+------------------------------+----------------------------|
-| process.run       | cmd, args, cwd, env?, stdin? | {exit_code, stdout, stderr} |
+| process.run       | cmd, args, cwd, env?, stdin? | {exit_code, signal, stdout, stderr} |
 | process.start     | cmd, args, cwd, env?         | {pid}                      |
-| process.read      | pid, timeout_ms?             | {stdout, stderr, exited}   |
 | process.write     | pid, data                    | {written}                  |
 | process.kill      | pid, signal?                 | boolean                    |
 | process.signal    | OS pid permitted by server credentials, signal | boolean         |
 | process.close_stdin | pid                        | boolean                    |
 | process.start_pty | cmd, args, cwd, rows, cols   | {pid, tty_name}            |
-| process.read_pty  | pid, timeout_ms?             | {output, exited}           |
 | process.write_pty | pid, data                    | {written}                  |
 | process.resize_pty| pid, rows, cols              | boolean                    |
 | process.kill_pty  | pid, signal?                 | boolean                    |
 | process.close_pty | pid                          | boolean                    |
+
+A started process pushes ~process.output~ ({pid, stdout, stderr}) and
+finally ~process.exit~ ({pid, exit_code, signal}) notifications, beginning
+once its start response has been written.  PTY output arrives as ~stdout~.
 
 **** System Operations
 | Method              | Parameters | Returns                           |
@@ -367,7 +369,7 @@ Key features:
 
 1. *Foreign File Name Handler*: Registered as a TRAMP foreign handler
 2. *Connection Sharing*: Uses SSH ControlMaster for connection reuse
-3. *Async Process Support*: Full ~make-process~ implementation with polling
+3. *Async Process Support*: Full ~make-process~ implementation with pushed output
 4. *PTY Support*: Terminal emulator integration (vterm, eat)
 5. *Batch/Pipeline Support*: Multiple operations in single round-trip
 

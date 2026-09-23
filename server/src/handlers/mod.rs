@@ -34,6 +34,21 @@ pub async fn dispatch(request: Request) -> Response {
     dispatch_inner(request).await
 }
 
+/// Work that must follow RESPONSE to METHOD on the wire: a started process
+/// only begins pushing notifications after its PID has been announced.
+pub async fn after_response(method: &str, response: &Response) {
+    if matches!(method, "process.start" | "process.start_pty")
+        && let Some(pid) = response
+            .result
+            .as_ref()
+            .and_then(Value::as_map)
+            .and_then(|map| map.iter().find(|(key, _)| key.as_str() == Some("pid")))
+            .and_then(|(_, pid)| pid.as_u64())
+    {
+        process::start_output_push(pid as u32).await;
+    }
+}
+
 /// Signal and reap managed async children before a connection task exits.
 pub async fn cleanup_managed_processes() -> Result<(), RpcError> {
     process::cleanup_managed_processes().await
@@ -103,7 +118,17 @@ async fn batch_execute(params: Value) -> HandlerResult {
         // Batch subrequests have no request id of their own; route them
         // directly to the handlers instead of round-tripping through a
         // synthetic Request/Response pair.
-        let result = match route(req.method, req.params).await {
+        // A started process pushes output only after its top-level
+        // response; inside a batch it would stay silent forever.
+        let routed = if matches!(req.method.as_str(), "process.start" | "process.start_pty") {
+            Err(RpcError::invalid_params(format!(
+                "{} must be sent as its own request",
+                req.method
+            )))
+        } else {
+            route(req.method, req.params).await
+        };
+        let result = match routed {
             Ok(value) => msgpack_map! { "result" => value },
             Err(error) => {
                 let mut error_fields = vec![
@@ -192,8 +217,6 @@ async fn route(method: String, params: Value) -> HandlerResult {
         // Process operations
         "process.run" => process::run(params).await,
         "process.start" => process::start(params).await,
-        "process.subscribe" => process::subscribe(params).await,
-        "process.unsubscribe" => process::unsubscribe(params).await,
         "process.write" => process::write(params).await,
         "process.close_stdin" => process::close_stdin(params).await,
         "process.kill" => process::kill(params).await,
@@ -201,8 +224,6 @@ async fn route(method: String, params: Value) -> HandlerResult {
 
         // PTY (pseudo-terminal) process operations
         "process.start_pty" => process::start_pty(params).await,
-        "process.subscribe_pty" => process::subscribe_pty(params).await,
-        "process.unsubscribe_pty" => process::unsubscribe_pty(params).await,
         "process.write_pty" => process::write_pty(params).await,
         "process.resize_pty" => process::resize_pty(params).await,
         "process.kill_pty" => process::kill_pty(params).await,

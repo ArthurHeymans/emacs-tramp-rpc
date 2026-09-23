@@ -1,4 +1,4 @@
-;;; tramp-rpc-stress-tests.el --- Stress tests for the subscriber model -*- lexical-binding: t -*-
+;;; tramp-rpc-stress-tests.el --- Stress tests for pushed process output -*- lexical-binding: t -*-
 
 ;; Copyright (C) 2026 Arthur Heymans <arthur@aheymans.xyz>
 
@@ -8,14 +8,14 @@
 
 ;;; Commentary:
 
-;; End-to-end stress tests for the process subscriber model.  These tests run
-;; the real server binary and verify that:
+;; End-to-end stress tests for pushed process output.  These tests run the
+;; real server binary and verify that:
 ;;
 ;;   - process.output and process.exit notifications are delivered correctly.
-;;   - No hangs or deadlocks occur under concurrent subscriptions.
-;;   - All bytes arrive when a subscribed process produces large output.
-;;   - Rapid subscribe/unsubscribe cycles do not leave orphaned state.
-;;   - Many concurrently-subscribed processes all receive exit notifications.
+;;   - Notifications for a process never precede its start response.
+;;   - No hangs or deadlocks occur with many concurrent processes.
+;;   - All bytes arrive when a process produces large output.
+;;   - Killed processes report their signal and leave no server state.
 ;;
 ;; The tests communicate with the server through its stdin/stdout pipe using
 ;; the same length-prefixed MessagePack-RPC framing as production connections.
@@ -231,14 +231,6 @@ TIMEOUT defaults to 5 seconds."
                    (args . ["-c" ,script])))))
     (alist-get 'pid result)))
 
-(defun tramp-rpc-stress-test--subscribe (pid)
-  "Subscribe to push notifications for server PID."
-  (tramp-rpc-stress-test--rpc-call "process.subscribe" `((pid . ,pid))))
-
-(defun tramp-rpc-stress-test--unsubscribe (pid)
-  "Stop push notifications for server PID."
-  (tramp-rpc-stress-test--rpc-call "process.unsubscribe" `((pid . ,pid))))
-
 (defun tramp-rpc-stress-test--handle-notification (msg stdout-map exit-map pending)
   "Process one notification MSG; update STDOUT-MAP and EXIT-MAP.
 Returns the updated PENDING pid list."
@@ -272,8 +264,8 @@ Returns a plist:
         (deadline (+ (float-time) timeout-secs)))
     (dolist (pid pids)
       (puthash pid "" stdout-map))
-    ;; Replay notifications stashed during earlier blocking RPC calls so that
-    ;; exit events that raced ahead of the subscribe response are not lost.
+    ;; Replay notifications stashed during earlier blocking RPC calls, which
+    ;; may have arrived while waiting for a later response.
     (dolist (msg (nreverse tramp-rpc-stress-test--pending-notifications))
       (when (plist-get msg :notification)
         (setq pending
@@ -309,12 +301,11 @@ Returns a plist:
 ;; Tests
 ;; ---------------------------------------------------------------------------
 
-(ert-deftest tramp-rpc-stress-test-subscribe-single-exit-notification ()
-  "Subscribe to one process; verify exactly one process.exit notification."
+(ert-deftest tramp-rpc-stress-test-single-exit-notification ()
+  "A started process reports exactly one process.exit notification."
   (skip-unless (tramp-rpc-stress-test--find-server))
   (tramp-rpc-stress-test--with-server
     (let* ((pid (tramp-rpc-stress-test--start-process "exit 0"))
-           (_ (tramp-rpc-stress-test--subscribe pid))
            ;; Drain with an explicit timeout so duplicate exits are visible.
            (exit-count 0)
            (result
@@ -337,32 +328,30 @@ Returns a plist:
         (should exit-notif)
         (should (= 0 (alist-get 'exit_code (plist-get exit-notif :params))))))))
 
-(ert-deftest tramp-rpc-stress-test-subscribe-exit-code-propagated ()
-  "Exit code from a subscribed process is delivered in process.exit."
+(ert-deftest tramp-rpc-stress-test-exit-code-propagated ()
+  "The exit code of a started process is delivered in process.exit."
   (skip-unless (tramp-rpc-stress-test--find-server))
   (tramp-rpc-stress-test--with-server
     (let* ((pid (tramp-rpc-stress-test--start-process "exit 42"))
-           (_ (tramp-rpc-stress-test--subscribe pid))
            (result (tramp-rpc-stress-test--collect-notifications
                     (list pid) 5.0)))
       (should (null (plist-get result :missing)))
       (should (= 42 (gethash pid (plist-get result :exit)))))))
 
-(ert-deftest tramp-rpc-stress-test-subscribe-stdout-delivered ()
-  "Output from a subscribed process arrives as process.output notifications."
+(ert-deftest tramp-rpc-stress-test-stdout-delivered ()
+  "Output of a started process arrives as process.output notifications."
   (skip-unless (tramp-rpc-stress-test--find-server))
   (tramp-rpc-stress-test--with-server
     (let* ((pid (tramp-rpc-stress-test--start-process
                  "printf 'hello-stress'; exit 0"))
-           (_ (tramp-rpc-stress-test--subscribe pid))
            (result (tramp-rpc-stress-test--collect-notifications
                     (list pid) 5.0)))
       (should (null (plist-get result :missing)))
       (should (string-match-p "hello-stress"
                               (gethash pid (plist-get result :stdout)))))))
 
-(ert-deftest tramp-rpc-stress-test-subscribe-many-concurrent-processes ()
-  "Subscribe to 15 concurrent processes; all must receive exit notifications."
+(ert-deftest tramp-rpc-stress-test-many-concurrent-processes ()
+  "15 concurrent processes all deliver exit notifications."
   (skip-unless (tramp-rpc-stress-test--find-server))
   (tramp-rpc-stress-test--with-server
     (let* ((n 15)
@@ -370,9 +359,6 @@ Returns a plist:
                            (tramp-rpc-stress-test--start-process
                             (format "printf 'proc%d'; exit 0" i)))
                          (number-sequence 0 (1- n)))))
-      ;; Subscribe to every process.
-      (dolist (pid pids)
-        (tramp-rpc-stress-test--subscribe pid))
       ;; Collect notifications with a generous timeout.
       (let ((result (tramp-rpc-stress-test--collect-notifications pids 30.0)))
         (should (null (plist-get result :missing))
@@ -381,14 +367,13 @@ Returns a plist:
         (dolist (pid pids)
           (should (= 0 (gethash pid (plist-get result :exit)))))))))
 
-(ert-deftest tramp-rpc-stress-test-subscribe-large-output-arrives-completely ()
-  "A process producing ~256 KiB of output via subscribe delivers all bytes."
+(ert-deftest tramp-rpc-stress-test-large-output-arrives-completely ()
+  "A process producing ~256 KiB of output delivers all bytes."
   (skip-unless (tramp-rpc-stress-test--find-server))
   (tramp-rpc-stress-test--with-server
     ;; 256 * 1024 = 262144 bytes of 'x'.
     (let* ((pid (tramp-rpc-stress-test--start-process
                  "dd if=/dev/zero bs=1024 count=256 2>/dev/null | tr '\\0' 'x'"))
-           (_ (tramp-rpc-stress-test--subscribe pid))
            (result (tramp-rpc-stress-test--collect-notifications
                     (list pid) 30.0)))
       (should (null (plist-get result :missing)))
@@ -396,61 +381,53 @@ Returns a plist:
         (should (= 262144 (length out)))
         (should (string-match-p "^x+$" out))))))
 
-(ert-deftest tramp-rpc-stress-test-unsubscribe-then-resubscribe ()
-  "Unsubscribe and re-subscribe; the second subscription delivers exit notification."
+(ert-deftest tramp-rpc-stress-test-output-never-precedes-start-response ()
+  "A process that writes and exits at once still announces its PID first."
   (skip-unless (tramp-rpc-stress-test--find-server))
   (tramp-rpc-stress-test--with-server
-    ;; Process stays alive for a bit so we can unsubscribe before it exits.
-    (let* ((pid (tramp-rpc-stress-test--start-process
-                 "sleep 2; exit 0")))
-      (tramp-rpc-stress-test--subscribe pid)
-      ;; Unsubscribe immediately – the task should stop.
-      (tramp-rpc-stress-test--unsubscribe pid)
-      ;; Re-subscribe.
-      (tramp-rpc-stress-test--subscribe pid)
-      ;; Now collect; we should still see the exit notification from the
-      ;; second subscription.
-      (let ((result (tramp-rpc-stress-test--collect-notifications
-                     (list pid) 10.0)))
-        (should (null (plist-get result :missing)))
-        (should (= 0 (gethash pid (plist-get result :exit))))))))
+    (dotimes (_ 20)
+      (let* ((stashed-before
+              (length tramp-rpc-stress-test--pending-notifications))
+             (pid (tramp-rpc-stress-test--start-process "printf early")))
+        ;; Notifications read while waiting for the start response were
+        ;; stashed; none of them may belong to the process being started.
+        (should-not
+         (cl-some (lambda (msg)
+                    (eql (alist-get 'pid (plist-get msg :params)) pid))
+                  (butlast tramp-rpc-stress-test--pending-notifications
+                           stashed-before)))
+        (let ((result (tramp-rpc-stress-test--collect-notifications
+                       (list pid) 5.0)))
+          (should (null (plist-get result :missing)))
+          (should (equal "early" (gethash pid (plist-get result :stdout)))))))))
 
-(ert-deftest tramp-rpc-stress-test-rapid-subscribe-unsubscribe-no-hang ()
-  "Rapidly subscribe and unsubscribe 8 times without hanging."
+(ert-deftest tramp-rpc-stress-test-kill-reports-signal-and-cleans-up ()
+  "SIGKILL of a running process reports the signal and removes its state."
   (skip-unless (tramp-rpc-stress-test--find-server))
   (tramp-rpc-stress-test--with-server
     (let* ((pid (tramp-rpc-stress-test--start-process "sleep 30")))
-      (dotimes (_ 8)
-        (tramp-rpc-stress-test--subscribe pid)
-        (tramp-rpc-stress-test--unsubscribe pid))
-      ;; Kill the long-sleeping process and verify it is no longer listed,
-      ;; proving the server is responsive and cleaned up state correctly.
       (tramp-rpc-stress-test--rpc-call
        "process.kill"
        `((pid . ,pid) (signal . 9)))
-      ;; Wait for the killed process to disappear from the server registry;
-      ;; stdin requests then report it as not found.
-      (let ((deadline (+ (float-time) 5.0))
-            still-registered)
-        (while (and (> deadline (float-time))
-                    (setq still-registered
-                          (condition-case nil
-                              (progn
-                                (tramp-rpc-stress-test--rpc-call
-                                 "process.close_stdin" `((pid . ,pid)))
-                                t)
-                            (error nil))))
-          (sleep-for 0.05))
-        ;; The process must have exited and been removed from the server.
-        (should-not still-registered)))))
+      (let* ((drained (tramp-rpc-stress-test--drain-messages 1.0))
+             (exit (cl-find-if
+                    (lambda (m)
+                      (and (equal (plist-get m :method) "process.exit")
+                           (eql (alist-get 'pid (plist-get m :params)) pid)))
+                    (plist-get drained :notifications))))
+        (should exit)
+        (should (eql 9 (alist-get 'signal (plist-get exit :params))))
+        (should (eql 137 (alist-get 'exit_code (plist-get exit :params)))))
+      ;; The server no longer knows the process.
+      (should-error (tramp-rpc-stress-test--rpc-call
+                     "process.close_stdin" `((pid . ,pid)))))))
 
-(ert-deftest tramp-rpc-stress-test-subscribe-write-then-exit ()
-  "Write to stdin of a subscribed process; all stdout bytes arrive."
+(ert-deftest tramp-rpc-stress-test-write-then-exit ()
+  "Write to stdin of a started process; all stdout bytes arrive."
   (skip-unless (tramp-rpc-stress-test--find-server))
   (tramp-rpc-stress-test--with-server
     ;; cat echoes stdin to stdout.
     (let* ((pid (tramp-rpc-stress-test--start-process "cat"))
-           (_ (tramp-rpc-stress-test--subscribe pid))
            (payload (make-string 4096 ?A)))
       (tramp-rpc-stress-test--rpc-call
        "process.write"
@@ -465,7 +442,7 @@ Returns a plist:
         (should (= 4096
                    (length (gethash pid (plist-get result :stdout)))))))))
 
-(ert-deftest tramp-rpc-stress-test-subscribe-many-mixed-exit-codes ()
+(ert-deftest tramp-rpc-stress-test-many-mixed-exit-codes ()
   "N concurrent processes with distinct exit codes all deliver correct codes."
   (skip-unless (tramp-rpc-stress-test--find-server))
   (tramp-rpc-stress-test--with-server
@@ -476,8 +453,6 @@ Returns a plist:
                              (format "exit %d" code))
                             code))
                     codes)))
-      (dolist (entry pid-code-alist)
-        (tramp-rpc-stress-test--subscribe (car entry)))
       (let* ((pids (mapcar #'car pid-code-alist))
              (result (tramp-rpc-stress-test--collect-notifications pids 15.0)))
         (should (null (plist-get result :missing)))

@@ -296,16 +296,12 @@ The dispatcher exposes these public methods:
 | File I/O | ~file.make_hardlink~ | Create a hard link. |
 | File I/O | ~file.chown~ | Change file ownership. |
 | Process | ~process.run~ | Run a command synchronously. |
-| Process | ~process.start~ | Start a managed pipe process. |
-| Process | ~process.subscribe~ | Subscribe to managed process output and exit notifications. |
-| Process | ~process.unsubscribe~ | Stop managed process notifications. |
+| Process | ~process.start~ | Start a managed pipe process; its output is pushed. |
 | Process | ~process.write~ | Write to managed process stdin. |
 | Process | ~process.close_stdin~ | Close managed process stdin. |
 | Process | ~process.kill~ | Signal a managed process. |
 | Process | ~process.signal~ | Signal a positive OS PID permitted by the server's credentials. |
-| PTY | ~process.start_pty~ | Start a pseudo-terminal process. |
-| PTY | ~process.subscribe_pty~ | Subscribe to pseudo-terminal output and exit notifications. |
-| PTY | ~process.unsubscribe_pty~ | Stop pseudo-terminal notifications. |
+| PTY | ~process.start_pty~ | Start a pseudo-terminal process; its output is pushed. |
 | PTY | ~process.write_pty~ | Write pseudo-terminal input. |
 | PTY | ~process.resize_pty~ | Resize a pseudo-terminal. |
 | PTY | ~process.kill_pty~ | Signal a pseudo-terminal process. |
@@ -320,6 +316,13 @@ The dispatcher exposes these public methods:
 | High-level | ~highlevel.dir_locals_find_file_cache_update~ | Update directory-local file cache data. |
 | Watch | ~watch.add~ | Add a filesystem watch. |
 | Watch | ~watch.remove~ | Remove a filesystem watch. |
+
+The server also pushes notifications, which carry no request id:
+- =fs.events= reports changes below watched directories.
+- =process.output= carries =stdout= and =stderr= bytes of a started
+  process (PTY output arrives as =stdout=), and =process.exit= its
+  =exit_code= plus the terminating =signal=, if any.  A process only
+  starts pushing after its start response has been written.
 
 * Binary Deployment
 

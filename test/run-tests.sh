@@ -9,8 +9,8 @@
 #   --server         Run server tests (requires built server)
 #   --remote         Run remote tests (requires SSH to TRAMP_RPC_TEST_HOST)
 #   --upstream       Run upstream tests (requires SSH to TRAMP_RPC_TEST_HOST)
-#   --stress         Run subscriber model stress tests (requires built server)
-#   --stress-remote  Run subscriber model stress tests over real SSH (requires TRAMP_RPC_TEST_HOST)
+#   --stress         Run pushed-output stress tests (requires built server)
+#   --stress-remote  Run pushed-output stress tests over real SSH (requires TRAMP_RPC_TEST_HOST)
 #   --all            Run protocol and server tests (requires SSH to TRAMP_RPC_TEST_HOST)
 #   --help           Show this help
 
@@ -88,8 +88,8 @@ usage() {
     echo "  --server         Run server tests (requires built server)"
     echo "  --remote         Run remote tests (requires SSH to TRAMP_RPC_TEST_HOST)"
     echo "  --upstream       Run upstream tests (requires SSH to TRAMP_RPC_TEST_HOST)"
-    echo "  --stress         Run subscriber model stress tests (requires built server)"
-    echo "  --stress-remote  Run subscriber model stress tests over real SSH (requires TRAMP_RPC_TEST_HOST)"
+    echo "  --stress         Run pushed-output stress tests (requires built server)"
+    echo "  --stress-remote  Run pushed-output stress tests over real SSH (requires TRAMP_RPC_TEST_HOST)"
     echo "  --all            Run protocol and server tests (requires SSH to TRAMP_RPC_TEST_HOST)"
     echo "  --help      Show this help"
     echo ""
@@ -188,7 +188,7 @@ run_upstream_tests() {
 }
 
 run_stress_tests() {
-    echo -e "${YELLOW}Running subscriber model stress tests...${NC}"
+    echo -e "${YELLOW}Running pushed-output stress tests...${NC}"
     if ! server_available; then
         echo -e "${RED}No server found. Build with 'cargo build'.${NC}"
         exit 1
@@ -199,7 +199,7 @@ run_stress_tests() {
 }
 
 run_stress_remote_tests() {
-    echo -e "${YELLOW}Running SSH subscriber stress tests against ${TRAMP_RPC_TEST_HOST:-localhost}...${NC}"
+    echo -e "${YELLOW}Running SSH pushed-output stress tests against ${TRAMP_RPC_TEST_HOST:-localhost}...${NC}"
     require_supported_tramp "${EMACS_LOAD_PATH_ARGS[@]}"
     run_ert_selector "$SCRIPT_DIR/tramp-rpc-stress-remote-tests.el" \
         "\"^tramp-rpc-stress-remote-test-\"" nil "${EMACS_LOAD_PATH_ARGS[@]}"

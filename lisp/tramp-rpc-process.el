@@ -18,11 +18,11 @@
 ;; This file provides async (pipe) and PTY process support for tramp-rpc.
 ;; It handles:
 ;; - Starting remote processes (pipe and PTY modes)
-;; - Async callback-based I/O for pipe processes (used by LSP, compilation)
+;; - Server-pushed output and exit notifications for pipe and RPC PTY
+;;   processes (used by LSP, compilation, terminals)
 ;; - PTY process support via direct SSH or RPC
 ;; - Terminal resize handling for vterm/eat/shell-mode
 ;; - Process write queuing and serialization
-;; - Adaptive poll-based I/O fallback
 
 ;;; Code:
 
@@ -66,20 +66,6 @@ Used by advice functions to bypass interception during output delivery.")
   "Non-nil while sending EOF to a local cat relay process.
 Tells the `process-send-eof' advice to call the original function
 instead of routing to the remote process.")
-
-(defcustom tramp-rpc-async-read-timeout-ms 200
-  "Timeout in milliseconds for async process reads.
-The server will block for this long waiting for data before returning.
-Lower values mean more responsive but higher CPU usage.
-Also controls process exit detection latency."
-  :type 'integer
-  :group 'tramp-rpc)
-
-(defcustom tramp-rpc-process-subscribe-retries 1
-  "Number of times to retry a failed process-output subscription.
-The remote child is terminated only after all retries fail."
-  :type 'natnum
-  :group 'tramp-rpc)
 
 (defcustom tramp-rpc-synchronous-pipe-writes nil
   "Whether pipe process writes wait for remote acknowledgement.
@@ -457,58 +443,40 @@ PID is the remote process ID."
 ;; Server-pushed Process Output (for LSP and interactive processes)
 ;; ============================================================================
 
-(defun tramp-rpc--subscribe-managed-process
-    (local-process table method final-failure &optional attempt)
-  "Subscribe LOCAL-PROCESS in TABLE to METHOD, retrying transient failures.
-FINAL-FAILURE is called with VEC, PID and CONNECTION after retries are
-exhausted.  ATTEMPT is the zero-based retry count."
-  (when (and (processp local-process)
-             (process-live-p local-process))
-    (when-let* ((info (gethash local-process table))
-                (vec (plist-get info :vec))
-                (pid (plist-get info :pid))
-                (connection (process-get local-process
-                                         :tramp-rpc-connection)))
-      (let ((attempt (or attempt 0)))
-        (cl-labels
-            ((failed
-               (message)
-               ;; A cleanup callback from an already-retired generation must
-               ;; not revive retries or terminate a replacement process.
-               (when (and (process-live-p local-process)
-                          (eq info (gethash local-process table))
-                          (eq connection
-                              (process-get local-process
-                                           :tramp-rpc-connection)))
-                 (tramp-rpc--debug
-                  "%s failed pid=%s attempt=%d: %s"
-                  method pid (1+ attempt) message)
-                 (if (< attempt tramp-rpc-process-subscribe-retries)
-                     (tramp-rpc--subscribe-managed-process
-                      local-process table method final-failure (1+ attempt))
-                   (funcall final-failure vec pid connection)))))
-          (condition-case err
-              (tramp-rpc--call-async
-               vec method `((pid . ,pid))
-               (lambda (response)
-                 (when (tramp-rpc-protocol-error-p response)
-                   (failed (tramp-rpc-protocol-error-message response))))
-               connection)
-            (error
-             (failed (error-message-string err)))))))))
+(defvar tramp-rpc--process-starts 0
+  "Number of managed process starts awaiting local registration.")
 
-(defun tramp-rpc--start-async-read (local-process)
-  "Subscribe LOCAL-PROCESS to server-pushed output and exit events."
-  (tramp-rpc--subscribe-managed-process
-   local-process tramp-rpc--async-processes "process.subscribe"
-   (lambda (vec pid connection)
-     (tramp-rpc--best-effort
-       (tramp-rpc--kill-remote-process vec pid 9 connection))
-     (when (process-live-p local-process)
-       (tramp-rpc--best-effort (delete-process local-process))))))
+(defvar tramp-rpc--early-process-notifications nil
+  "Notifications for PIDs whose start is not registered yet, oldest first.
+Entries are (TRANSPORT PID METHOD . PARAMS).")
 
-(defun tramp-rpc--find-async-process-for-notification (connection pid)
-  "Find the local relay for remote PID on exact CONNECTION generation."
+(defmacro tramp-rpc--with-process-start (&rest body)
+  "Run BODY, which starts a managed process and registers its relay.
+The server pushes output as soon as the start response is written, so that
+output can be handled together with the response, before BODY registers the
+relay.  Notifications for unknown PIDs are therefore kept while BODY runs
+and claimed by `tramp-rpc--register-managed-process'."
+  (declare (indent 0) (debug t))
+  `(progn
+     (cl-incf tramp-rpc--process-starts)
+     (unwind-protect
+         (progn ,@body)
+       (when (zerop (cl-decf tramp-rpc--process-starts))
+         (setq tramp-rpc--early-process-notifications nil)))))
+
+(defun tramp-rpc--register-managed-process (local-process)
+  "Deliver notifications that arrived before LOCAL-PROCESS was registered."
+  (let ((transport (process-get local-process :tramp-rpc-connection-process))
+        (pid (process-get local-process :tramp-rpc-pid)))
+    (dolist (entry tramp-rpc--early-process-notifications)
+      (when (and (eq (nth 0 entry) transport) (eql (nth 1 entry) pid))
+        (setq tramp-rpc--early-process-notifications
+              (delq entry tramp-rpc--early-process-notifications))
+        (tramp-rpc--dispatch-process-notification
+         local-process (nth 2 entry) (nthcdr 3 entry))))))
+
+(defun tramp-rpc--find-notification-process (table connection pid)
+  "Find the relay in TABLE for remote PID on exact CONNECTION generation."
   (let (match)
     (when (and (processp connection) (integerp pid))
       (maphash
@@ -518,15 +486,12 @@ exhausted.  ATTEMPT is the zero-based retry count."
                     (= (or (plist-get info :pid) -1) pid)
                     (eq connection (plist-get info :connection-process)))
            (setq match local-process)))
-       tramp-rpc--async-processes))
+       table))
     match))
 
-(defun tramp-rpc--handle-process-output-notification (connection params)
-  "Handle process output PARAMS received on CONNECTION."
-  (when-let* ((pid (alist-get 'pid params))
-              (local-process
-               (tramp-rpc--find-async-process-for-notification connection pid))
-              (info (gethash local-process tramp-rpc--async-processes)))
+(defun tramp-rpc--handle-process-output-notification (local-process params)
+  "Queue output PARAMS for pipe relay LOCAL-PROCESS."
+  (when-let* ((info (gethash local-process tramp-rpc--async-processes)))
     (let ((stdout (when-let* ((value (alist-get 'stdout params)))
                     (tramp-rpc--binary-bytes value)))
           (stderr (when-let* ((value (alist-get 'stderr params)))
@@ -534,14 +499,6 @@ exhausted.  ATTEMPT is the zero-based retry count."
       (when (or stdout stderr)
         (tramp-rpc--queue-process-output
          local-process stdout stderr (plist-get info :stderr-buffer))))))
-
-(defun tramp-rpc--handle-process-exit-notification (connection params)
-  "Handle process exit PARAMS received on CONNECTION."
-  (when-let* ((pid (alist-get 'pid params))
-              (local-process
-               (tramp-rpc--find-async-process-for-notification connection pid)))
-    (tramp-rpc--queue-process-exit
-     local-process (alist-get 'exit_code params) (alist-get 'signal params))))
 
 (defun tramp-rpc--deliver-process-output (local-process stdout stderr stderr-buffer)
   "Deliver STDOUT and STDERR to LOCAL-PROCESS.
@@ -886,7 +843,7 @@ For compatibility, a non-remote string names an Emacs buffer."
 ARGS are keyword arguments as per `make-process'.
 Supports PTY allocation when :connection-type is \='pty or t,
 or when `process-connection-type' is t.
-For pipe mode, uses async polling for long-running processes.
+For pipe mode, the server pushes output as it arrives.
 Resolves program path and loads direnv environment from working directory."
   (let ((args (tramp-rpc--make-process-skeleton-args args)))
     ;; Reuse TRAMP's make-process skeleton for type checks, unique process names,
@@ -953,100 +910,100 @@ Resolves program path and loads direnv environment from working directory."
             ;; not just filter calls.  Leave relative PROGRAM names unresolved so
             ;; the server's process launcher searches the PATH we pass in
             ;; PROCESS-ENV.
-            (let* ((program (car command))
-                   (program-args (cdr command))
-                   (remote-pid (tramp-rpc--start-remote-process
-                                v program program-args localname process-env))
-                   (connection (tramp-rpc--get-connection v))
-                   (stderr-buffer (cond
-                                   ((bufferp stderr) stderr)
-                                   ((stringp stderr) (get-buffer-create stderr))
-                                   (t nil)))
-                   ;; Construct both local relays as one transaction.  If the
-                   ;; second `cat' fails, tear down the first and the remote
-                   ;; process rather than leaving either orphaned.
-                   (relays
-                    (tramp-rpc--start-cat-relays
-                     (or name "tramp-rpc-async") buffer stderr-buffer
-                     (lambda ()
-                       (tramp-rpc--best-effort
-                         (tramp-rpc--kill-remote-process
-                          v remote-pid 9 connection)))))
-                   (local-process (car relays))
-                   (stderr-process (cdr relays)))
+            (tramp-rpc--with-process-start
+              (let* ((program (car command))
+                     (program-args (cdr command))
+                     (remote-pid (tramp-rpc--start-remote-process
+                                  v program program-args localname process-env))
+                     (connection (tramp-rpc--get-connection v))
+                     (stderr-buffer (cond
+                                     ((bufferp stderr) stderr)
+                                     ((stringp stderr) (get-buffer-create stderr))
+                                     (t nil)))
+                     ;; Construct both local relays as one transaction.  If the
+                     ;; second `cat' fails, tear down the first and the remote
+                     ;; process rather than leaving either orphaned.
+                     (relays
+                      (tramp-rpc--start-cat-relays
+                       (or name "tramp-rpc-async") buffer stderr-buffer
+                       (lambda ()
+                         (tramp-rpc--best-effort
+                          (tramp-rpc--kill-remote-process
+                           v remote-pid 9 connection)))))
+                     (local-process (car relays))
+                     (stderr-process (cdr relays)))
 
-              ;; The public pair controls user input encoding.  The local
-              ;; relay itself reads with the requested decoder and writes
-              ;; binary remote bytes without another encoding pass.
-              (tramp-rpc--configure-relay-coding local-process coding)
-              (when stderr-process
-                (tramp-rpc--configure-relay-coding stderr-process coding))
-              (set-process-query-on-exit-flag local-process (not noquery))
+                ;; The public pair controls user input encoding.  The local
+                ;; relay itself reads with the requested decoder and writes
+                ;; binary remote bytes without another encoding pass.
+                (tramp-rpc--configure-relay-coding local-process coding)
+                (when stderr-process
+                  (tramp-rpc--configure-relay-coding stderr-process coding))
+                (set-process-query-on-exit-flag local-process (not noquery))
 
-              ;; Feed sudo's stdin password before exposing the relay to callers;
-              ;; subsequent writes use the same queue and stay ordered after it.
-              (when sudo-password
-                (tramp-rpc--write-remote-process
-                 v remote-pid (tramp-rpc--encode-process-input
-                               local-process (concat sudo-password "\n"))))
+                ;; Feed sudo's stdin password before exposing the relay to callers;
+                ;; subsequent writes use the same queue and stay ordered after it.
+                (when sudo-password
+                  (tramp-rpc--write-remote-process
+                   v remote-pid (tramp-rpc--encode-process-input
+                                 local-process (concat sudo-password "\n"))))
 
-              (process-put local-process :tramp-rpc-vec v)
-              (process-put local-process :tramp-rpc-pid remote-pid)
-              (let ((connection (tramp-rpc--get-connection v)))
-                (process-put local-process :tramp-rpc-connection connection)
-                (process-put local-process :tramp-rpc-connection-process
-                             (tramp-rpc--connection-transport connection)))
-              (process-put local-process 'tramp-vector v)
-              (process-put local-process 'remote-command orig-command)
+                (process-put local-process :tramp-rpc-vec v)
+                (process-put local-process :tramp-rpc-pid remote-pid)
+                (let ((connection (tramp-rpc--get-connection v)))
+                  (process-put local-process :tramp-rpc-connection connection)
+                  (process-put local-process :tramp-rpc-connection-process
+                               (tramp-rpc--connection-transport connection)))
+                (process-put local-process 'tramp-vector v)
+                (process-put local-process 'remote-command orig-command)
 
-              (when filter
-                (set-process-filter local-process filter))
-              ;; Keep our wrapper even when the caller supplied no sentinel;
-              ;; normal exits must still remove tracking.
-              (process-put local-process :tramp-rpc-user-sentinel sentinel)
-              (let ((own-sentinel
-                     (lambda (proc event)
-                       (tramp-rpc--pipe-process-sentinel
-                        proc event (process-get proc :tramp-rpc-user-sentinel)))))
-                (process-put local-process :tramp-rpc-own-sentinel own-sentinel)
-                (set-process-sentinel local-process own-sentinel))
+                (when filter
+                  (set-process-filter local-process filter))
+                ;; Keep our wrapper even when the caller supplied no sentinel;
+                ;; normal exits must still remove tracking.
+                (process-put local-process :tramp-rpc-user-sentinel sentinel)
+                (let ((own-sentinel
+                       (lambda (proc event)
+                         (tramp-rpc--pipe-process-sentinel
+                          proc event (process-get proc :tramp-rpc-user-sentinel)))))
+                  (process-put local-process :tramp-rpc-own-sentinel own-sentinel)
+                  (set-process-sentinel local-process own-sentinel))
 
-              ;; Store process info.
-              (puthash local-process
-                       (list :vec v
-                             :pid remote-pid
-                             :connection-process
-                             (process-get local-process :tramp-rpc-connection-process)
-                             :stderr-buffer stderr-buffer
-                             :stderr-process stderr-process
-                             :pending-output nil
-                             :pending-exit nil
-                             :delivery-timer nil)
-                       tramp-rpc--async-processes)
+                ;; Store process info.
+                (puthash local-process
+                         (list :vec v
+                               :pid remote-pid
+                               :connection-process
+                               (process-get local-process :tramp-rpc-connection-process)
+                               :stderr-buffer stderr-buffer
+                               :stderr-process stderr-process
+                               :pending-output nil
+                               :pending-exit nil
+                               :delivery-timer nil)
+                         tramp-rpc--async-processes)
 
-              (tramp-rpc--debug
-               "MAKE-PROCESS created local=%s remote-pid=%s program=%s"
-               local-process remote-pid program)
+                (tramp-rpc--debug
+                 "MAKE-PROCESS created local=%s remote-pid=%s program=%s"
+                 local-process remote-pid program)
 
-              ;; Start async read loop.
-              (tramp-rpc--start-async-read local-process)
+                (tramp-rpc--register-managed-process local-process)
 
-              ;; Schedule deferred sentinel cleanup.  Callers like `vc-do-command'
-              ;; replace the sentinel with `set-process-sentinel' AFTER
-              ;; `start-file-process' returns, so we must add our cleanup wrapper
-              ;; after that.  `run-at-time 0' ensures it runs once the current
-              ;; code path (including the caller's sentinel setup) completes.
-              ;; The wrapper calls `delete-process' after the sentinel chain
-              ;; finishes, which removes the process from `Vprocess_alist'.
-              ;; Without this, `get-buffer-process' returns stale exited cat
-              ;; relays, causing e.g. `vc-dir-busy' to report a false positive.
-              (let ((proc local-process))
-                (run-at-time 0 nil
-                             (lambda ()
-                               (when (processp proc)
-                                 (tramp-rpc--install-process-cleanup proc)))))
+                ;; Schedule deferred sentinel cleanup.  Callers like `vc-do-command'
+                ;; replace the sentinel with `set-process-sentinel' AFTER
+                ;; `start-file-process' returns, so we must add our cleanup wrapper
+                ;; after that.  `run-at-time 0' ensures it runs once the current
+                ;; code path (including the caller's sentinel setup) completes.
+                ;; The wrapper calls `delete-process' after the sentinel chain
+                ;; finishes, which removes the process from `Vprocess_alist'.
+                ;; Without this, `get-buffer-process' returns stale exited cat
+                ;; relays, causing e.g. `vc-dir-busy' to report a false positive.
+                (let ((proc local-process))
+                  (run-at-time 0 nil
+                               (lambda ()
+                                 (when (processp proc)
+                                   (tramp-rpc--install-process-cleanup proc)))))
 
-              local-process)))))))
+                local-process))))))))
 
 (defun tramp-rpc-handle-start-file-process (name buffer program &rest args)
   "Start async process on remote host.
@@ -1235,85 +1192,85 @@ VEC is the tramp connection vector.
 NAME, BUFFER, COMMAND, CODING, NOQUERY, FILTER, SENTINEL are process params.
 LOCALNAME is the remote working directory.
 DIRENV-ENV is an optional alist of environment variables for the process."
-  (let* ((program (car command))
-         (program-args (cdr command))
-         ;; Get terminal dimensions from buffer or use defaults
-         (size (tramp-rpc--get-terminal-size buffer))
-         (rows (cdr size))
-         (cols (car size))
-         ;; Build environment - add TERM after caller/remote env so it wins.
-         (term-env (or (getenv "TERM") "xterm-256color"))
-         (full-env (append direnv-env `(("TERM" . ,term-env))))
-         ;; Start the PTY process on remote
-         (result (tramp-rpc--call vec "process.start_pty"
-                                   `((cmd . ,program)
-                                     (args . ,(vconcat program-args))
-                                     (cwd . ,localname)
-                                     (rows . ,rows)
-                                     (cols . ,cols)
-                                     (env . ,full-env))))
-         (remote-pid (alist-get 'pid result))
-         (tty-name (alist-get 'tty_name result))
-         (connection (tramp-rpc--get-connection vec))
-         ;; Normalize buffer - it can be t, nil, a buffer, or a string
-         (actual-buffer (cond
-                         ((bufferp buffer) buffer)
-                         ((stringp buffer) (get-buffer-create buffer))
-                         ((eq buffer t) (current-buffer))
-                         (t nil)))
-         ;; Use a local cat relay so Emacs owns incremental decoding of raw
-         ;; PTY bytes, exactly as it does for pipe process output.  If local
-         ;; construction fails, close the already-created remote PTY through
-         ;; the generation that created it.
-         (relays
-          (tramp-rpc--start-cat-relays
-           (or name "tramp-rpc-pty") actual-buffer nil
-           (lambda ()
-             (tramp-rpc--best-effort
-               (tramp-rpc--call vec "process.close_pty"
-                                `((pid . ,remote-pid)) connection)))))
-         (local-process (car relays)))
+  (tramp-rpc--with-process-start
+    (let* ((program (car command))
+           (program-args (cdr command))
+           ;; Get terminal dimensions from buffer or use defaults
+           (size (tramp-rpc--get-terminal-size buffer))
+           (rows (cdr size))
+           (cols (car size))
+           ;; Build environment - add TERM after caller/remote env so it wins.
+           (term-env (or (getenv "TERM") "xterm-256color"))
+           (full-env (append direnv-env `(("TERM" . ,term-env))))
+           ;; Start the PTY process on remote
+           (result (tramp-rpc--call vec "process.start_pty"
+                                    `((cmd . ,program)
+                                      (args . ,(vconcat program-args))
+                                      (cwd . ,localname)
+                                      (rows . ,rows)
+                                      (cols . ,cols)
+                                      (env . ,full-env))))
+           (remote-pid (alist-get 'pid result))
+           (tty-name (alist-get 'tty_name result))
+           (connection (tramp-rpc--get-connection vec))
+           ;; Normalize buffer - it can be t, nil, a buffer, or a string
+           (actual-buffer (cond
+                           ((bufferp buffer) buffer)
+                           ((stringp buffer) (get-buffer-create buffer))
+                           ((eq buffer t) (current-buffer))
+                           (t nil)))
+           ;; Use a local cat relay so Emacs owns incremental decoding of raw
+           ;; PTY bytes, exactly as it does for pipe process output.  If local
+           ;; construction fails, close the already-created remote PTY through
+           ;; the generation that created it.
+           (relays
+            (tramp-rpc--start-cat-relays
+             (or name "tramp-rpc-pty") actual-buffer nil
+             (lambda ()
+               (tramp-rpc--best-effort
+                (tramp-rpc--call vec "process.close_pty"
+                                 `((pid . ,remote-pid)) connection)))))
+           (local-process (car relays)))
 
-    ;; Configure the local relay process.  Its write side is binary; the
-    ;; public coding pair is retained for process API and input encoding.
-    (tramp-rpc--configure-relay-coding local-process coding)
-    (set-process-filter local-process (or filter #'tramp-rpc--pty-default-filter))
-    (set-process-sentinel local-process #'tramp-rpc--pty-sentinel)
-    (set-process-query-on-exit-flag local-process (not noquery))
+      ;; Configure the local relay process.  Its write side is binary; the
+      ;; public coding pair is retained for process API and input encoding.
+      (tramp-rpc--configure-relay-coding local-process coding)
+      (set-process-filter local-process (or filter #'tramp-rpc--pty-default-filter))
+      (set-process-sentinel local-process #'tramp-rpc--pty-sentinel)
+      (set-process-query-on-exit-flag local-process (not noquery))
 
-    ;; Store process info
-    (process-put local-process :tramp-rpc-pty t)
-    (process-put local-process :tramp-rpc-pid remote-pid)
-    (process-put local-process :tramp-rpc-vec vec)
-    (process-put local-process :tramp-rpc-user-sentinel sentinel)
-    (process-put local-process :tramp-rpc-command command)
-    (process-put local-process :tramp-rpc-tty-name tty-name)
-    ;; Standard tramp property expected by tests and upstream code
-    (process-put local-process 'remote-command command)
-    (process-put local-process 'tramp-vector vec)
+      ;; Store process info
+      (process-put local-process :tramp-rpc-pty t)
+      (process-put local-process :tramp-rpc-pid remote-pid)
+      (process-put local-process :tramp-rpc-vec vec)
+      (process-put local-process :tramp-rpc-user-sentinel sentinel)
+      (process-put local-process :tramp-rpc-command command)
+      (process-put local-process :tramp-rpc-tty-name tty-name)
+      ;; Standard tramp property expected by tests and upstream code
+      (process-put local-process 'remote-command command)
+      (process-put local-process 'tramp-vector vec)
 
-    ;; Set up window size adjustment function
-    (process-put local-process 'adjust-window-size-function
-                 #'tramp-rpc--adjust-pty-window-size)
+      ;; Set up window size adjustment function
+      (process-put local-process 'adjust-window-size-function
+                   #'tramp-rpc--adjust-pty-window-size)
 
-    ;; Track the PTY process and its exact transport generation.
-    (puthash local-process
-             (list :vec vec :pid remote-pid
-                   :connection-process (tramp-rpc-connection-process connection)
-                   :rpc-pty t
-                   :pending-output nil
-                   :pending-exit nil
-                   :delivery-timer nil)
-             tramp-rpc--pty-processes)
-    ;; PTY exit uses the exact transport generation that created it.
-    (process-put local-process :tramp-rpc-connection connection)
-    (process-put local-process :tramp-rpc-connection-process
-                 (tramp-rpc-connection-process connection))
+      ;; Track the PTY process and its exact transport generation.
+      (puthash local-process
+               (list :vec vec :pid remote-pid
+                     :connection-process (tramp-rpc-connection-process connection)
+                     :rpc-pty t
+                     :pending-output nil
+                     :pending-exit nil
+                     :delivery-timer nil)
+               tramp-rpc--pty-processes)
+      ;; PTY exit uses the exact transport generation that created it.
+      (process-put local-process :tramp-rpc-connection connection)
+      (process-put local-process :tramp-rpc-connection-process
+                   (tramp-rpc-connection-process connection))
 
-    ;; Start async read loop
-    (tramp-rpc--pty-start-async-read local-process)
+      (tramp-rpc--register-managed-process local-process)
 
-    local-process))
+      local-process)))
 
 (defun tramp-rpc--pty-default-filter (process output)
   "Default filter for PTY processes - insert output into process buffer.
@@ -1345,32 +1302,6 @@ Returns (COLS . ROWS)."
                       (window-body-height window))
               '(80 . 24))))
       '(80 . 24))))
-
-(defun tramp-rpc--pty-start-async-read (local-process)
-  "Subscribe LOCAL-PROCESS to server-pushed PTY output and exit events."
-  (tramp-rpc--subscribe-managed-process
-   local-process tramp-rpc--pty-processes "process.subscribe_pty"
-   (lambda (vec pid connection)
-     (tramp-rpc--best-effort
-       (tramp-rpc--call vec "process.close_pty"
-                        `((pid . ,pid)) connection))
-     (when (process-live-p local-process)
-       (tramp-rpc--best-effort (delete-process local-process))))))
-
-(defun tramp-rpc--find-pty-process-for-notification (connection pid)
-  "Find the RPC PTY relay for remote PID on exact CONNECTION generation."
-  (let (match)
-    (when (and (processp connection) (integerp pid))
-      (maphash
-       (lambda (local-process info)
-         (when (and (null match)
-                    (plist-get info :rpc-pty)
-                    (process-live-p local-process)
-                    (= (or (plist-get info :pid) -1) pid)
-                    (eq connection (plist-get info :connection-process)))
-           (setq match local-process)))
-       tramp-rpc--pty-processes))
-    match))
 
 (defun tramp-rpc--deliver-pending-pty-output (local-process)
   "Deliver queued PTY bytes and then any exit for LOCAL-PROCESS."
@@ -1406,25 +1337,6 @@ EXIT-P marks a terminal delivery; EXIT-SIGNAL is the terminating signal."
       (tramp-rpc--schedule-process-timer
        tramp-rpc--pty-processes local-process :delivery-timer
        #'tramp-rpc--deliver-pending-pty-output local-process))))
-
-(defun tramp-rpc--handle-pty-output-notification (connection params)
-  "Queue PTY output PARAMS received on CONNECTION."
-  (when-let* ((pid (alist-get 'pid params))
-              (local-process
-               (tramp-rpc--find-pty-process-for-notification connection pid))
-              (output (alist-get 'output params)))
-    (tramp-rpc--queue-pty-delivery
-     local-process (tramp-rpc--binary-bytes output))))
-
-(defun tramp-rpc--handle-pty-exit-notification (connection params)
-  "Queue PTY exit PARAMS received on CONNECTION."
-  (when-let* ((pid (alist-get 'pid params))
-              (local-process
-               (tramp-rpc--find-pty-process-for-notification connection pid)))
-    (tramp-rpc--queue-pty-delivery
-     local-process nil (alist-get 'exit_code params) t
-     (alist-get 'signal params))))
-
 
 (defun tramp-rpc--handle-pty-exit (local-process exit-code &optional exit-signal)
   "Handle exit of PTY process associated with LOCAL-PROCESS.
@@ -1770,17 +1682,44 @@ Removes handlers and cleans up async processes."
   ;; Return nil to allow normal unload to proceed
   nil)
 
+(defun tramp-rpc--dispatch-process-notification (local-process method params)
+  "Apply process notification METHOD with PARAMS to relay LOCAL-PROCESS."
+  (let ((pty (gethash local-process tramp-rpc--pty-processes)))
+    (pcase method
+      ("process.output"
+       (if pty
+           (when-let* ((output (alist-get 'stdout params)))
+             (tramp-rpc--queue-pty-delivery
+              local-process (tramp-rpc--binary-bytes output)))
+         (tramp-rpc--handle-process-output-notification local-process params)))
+      ("process.exit"
+       (if pty
+           (tramp-rpc--queue-pty-delivery
+            local-process nil (alist-get 'exit_code params) t
+            (alist-get 'signal params))
+         (tramp-rpc--queue-process-exit
+          local-process (alist-get 'exit_code params)
+          (alist-get 'signal params)))))))
+
 (defun tramp-rpc--handle-process-notification (process method params)
-  "Dispatch process notification METHOD with PARAMS received on PROCESS."
-  (pcase method
-    ("process.output"
-     (tramp-rpc--handle-process-output-notification process params))
-    ("process.exit"
-     (tramp-rpc--handle-process-exit-notification process params))
-    ("process.pty_output"
-     (tramp-rpc--handle-pty-output-notification process params))
-    ("process.pty_exit"
-     (tramp-rpc--handle-pty-exit-notification process params))))
+  "Dispatch process notification METHOD with PARAMS received on PROCESS.
+Notifications for a PID whose start is still being registered are kept for
+`tramp-rpc--register-managed-process'; others for unknown PIDs belong to
+processes that are already gone."
+  (when (member method '("process.output" "process.exit"))
+    (let* ((pid (alist-get 'pid params))
+           (local-process
+            (or (tramp-rpc--find-notification-process
+                 tramp-rpc--async-processes process pid)
+                (tramp-rpc--find-notification-process
+                 tramp-rpc--pty-processes process pid))))
+      (cond
+       (local-process
+        (tramp-rpc--dispatch-process-notification local-process method params))
+       ((> tramp-rpc--process-starts 0)
+        (setq tramp-rpc--early-process-notifications
+              (append tramp-rpc--early-process-notifications
+                      (list (cl-list* process pid method params)))))))))
 
 ;; Relay teardown runs from the transport's generation cleanup: remote
 ;; children are signalled while the transport is still live, local relays
