@@ -636,18 +636,21 @@ EVENT is the process event string."
            (pid (plist-get info :pid))
            (connection (plist-get info :connection-process)))
       (tramp-rpc--cancel-process-timers tramp-rpc--async-processes proc)
-      (unless (or (process-get proc :tramp-rpc-exited)
-                  (process-get proc :tramp-rpc-remote-exited)
-                  (process-get proc :tramp-rpc-transport-cleanup)
-                  (tramp-rpc--transport-dead-p connection))
-        (when (and vec pid)
+      (let ((kill-remote
+             (not (or (process-get proc :tramp-rpc-exited)
+                      (process-get proc :tramp-rpc-remote-exited)
+                      (process-get proc :tramp-rpc-transport-cleanup)
+                      (tramp-rpc--transport-dead-p connection)))))
+        ;; Mark the relay terminal before waiting for the remote kill, so a
+        ;; sentinel call nested in that wait does not kill it again.
+        (process-put proc :tramp-rpc-exited t)
+        (when (and kill-remote vec pid)
           (tramp-rpc--best-effort
             (tramp-rpc--kill-remote-process
              vec pid 9 (process-get proc :tramp-rpc-connection)))))
       (when-let* ((stderr-process (plist-get info :stderr-process)))
         (when (process-live-p stderr-process)
           (tramp-rpc--best-effort (delete-process stderr-process))))
-      (process-put proc :tramp-rpc-exited t)
       (tramp-rpc--call-user-sentinel-once
        proc user-sentinel (tramp-rpc--remote-exit-event proc event))
       (remhash proc tramp-rpc--async-processes))))
