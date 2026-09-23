@@ -2891,6 +2891,33 @@ direct property test would miss it."
                 tramp-rpc-magit--process-caches)
        ,@body)))
 
+(ert-deftest tramp-rpc-mock-test-magit-status-memo-before-snapshot ()
+  "Before the snapshot exists, a status command reuses read-only git results."
+  (skip-unless tramp-rpc-mock-test--tramp-rpc-magit-loaded)
+  (let ((default-directory "/ssh:mock:/repo/")
+        (tramp-rpc-magit--process-caches (make-hash-table :test 'equal))
+        (tramp-rpc-magit--allow-process-cache t)
+        (tramp-rpc-magit--status-memo (make-hash-table :test 'equal))
+        (process-environment (default-toplevel-value 'process-environment)))
+    (cl-letf (((symbol-function 'tramp-rpc--connection-key)
+               (lambda (_vec) '("rpc" nil "mock" nil))))
+      (should-not (tramp-rpc-magit--process-cache-lookup
+                   "git" '("rev-parse" "--show-toplevel")))
+      (tramp-rpc-magit--process-cache-store
+       "git" '("rev-parse" "--show-toplevel") 0 "/repo\n")
+      (should (equal (tramp-rpc-magit--process-cache-lookup
+                      "git" '("rev-parse" "--show-toplevel"))
+                     '(0 . "/repo\n")))
+      ;; Another directory has its own answers.
+      (let ((default-directory "/ssh:mock:/repo/sub/"))
+        (should-not (tramp-rpc-magit--process-cache-lookup
+                     "git" '("rev-parse" "--show-toplevel"))))
+      ;; A command that may change the repository forgets everything.
+      (tramp-rpc-magit--process-cache-store
+       "git" '("update-index" "--refresh") 1 "")
+      (should-not (tramp-rpc-magit--process-cache-lookup
+                   "git" '("rev-parse" "--show-toplevel"))))))
+
 (ert-deftest tramp-rpc-mock-test-git-process-cache-skips-admission-failures ()
   "Transient parallel admission failures are not stored as git results."
   (skip-unless tramp-rpc-mock-test--tramp-rpc-magit-loaded)
