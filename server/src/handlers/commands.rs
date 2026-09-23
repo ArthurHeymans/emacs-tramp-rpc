@@ -175,11 +175,7 @@ pub async fn run_parallel(params: Value) -> HandlerResult {
             )
             .await
             {
-                Ok(result) => msgpack_map! {
-                    "exit_code" => result.exit_code,
-                    "stdout" => Value::Binary(result.stdout),
-                    "stderr" => Value::Binary(result.stderr)
-                },
+                Ok(result) => result.into_value(),
                 Err(ChildError::Spawn(error) | ChildError::Setup(error)) => {
                     failure(error.to_string().into_bytes(), None)
                 }

@@ -48,6 +48,8 @@ use pty::TERMINATED_PTY_STATUSES;
 use pty::{clear_terminated_pty_statuses, get_pty_process_map, terminate_pty_process};
 use subscription::stop_push_subscription;
 
+/// Upper bound for one test-only `read`/`read_pty` request.
+#[cfg(test)]
 const MAX_PROCESS_READ_BYTES: usize = 1024 * 1024;
 
 /// A child that exits or closes stdin before consuming all input is normal

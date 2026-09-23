@@ -541,7 +541,7 @@ exhausted.  ATTEMPT is the zero-based retry count."
               (local-process
                (tramp-rpc--find-async-process-for-notification connection pid)))
     (tramp-rpc--queue-process-exit
-     local-process (alist-get 'exit_code params))))
+     local-process (alist-get 'exit_code params) (alist-get 'signal params))))
 
 (defun tramp-rpc--deliver-process-output (local-process stdout stderr stderr-buffer)
   "Deliver STDOUT and STDERR to LOCAL-PROCESS.
@@ -585,7 +585,8 @@ STDERR-BUFFER is the separate stderr buffer, or nil to mix with stdout."
         (apply #'tramp-rpc--deliver-process-output local-process chunk))
       (when pending-exit
         (accept-process-output local-process 0.01 nil t)
-        (tramp-rpc--handle-process-exit local-process (cdr pending-exit))))))
+        (apply #'tramp-rpc--handle-process-exit local-process
+               (cdr pending-exit))))))
 
 (defun tramp-rpc--queue-process-output (local-process stdout stderr stderr-buffer)
   "Queue one non-exit output chunk and schedule its exact delivery once.
@@ -603,11 +604,13 @@ STDERR-BUFFER receives standard error output."
        tramp-rpc--async-processes local-process :delivery-timer
        #'tramp-rpc--deliver-pending-process-output local-process))))
 
-(defun tramp-rpc--queue-process-exit (local-process exit-code)
-  "Queue EXIT-CODE after all pending output for LOCAL-PROCESS."
+(defun tramp-rpc--queue-process-exit (local-process exit-code &optional exit-signal)
+  "Queue EXIT-CODE after all pending output for LOCAL-PROCESS.
+EXIT-SIGNAL is the signal number that terminated the process, if any."
   (when-let* ((info (gethash local-process tramp-rpc--async-processes)))
     (setq info (plist-put info :pending-exit
-                          (cons 'exit (if (integerp exit-code) exit-code -1))))
+                          (list 'exit (if (integerp exit-code) exit-code -1)
+                                exit-signal)))
     (puthash local-process info tramp-rpc--async-processes)
     (unless (plist-get info :delivery-timer)
       (tramp-rpc--schedule-process-timer
@@ -645,18 +648,26 @@ EVENT is the process event string."
         (when (process-live-p stderr-process)
           (tramp-rpc--best-effort (delete-process stderr-process))))
       (process-put proc :tramp-rpc-exited t)
-      (let ((remote-exit (process-get proc :tramp-rpc-exit-code)))
-        (tramp-rpc--call-user-sentinel-once
-         proc user-sentinel
-         (if remote-exit
-             (if (= remote-exit 0)
-                 "finished\n"
-               (format "exited abnormally with code %d\n" remote-exit))
-           event)))
+      (tramp-rpc--call-user-sentinel-once
+       proc user-sentinel (tramp-rpc--remote-exit-event proc event))
       (remhash proc tramp-rpc--async-processes))))
 
+(defun tramp-rpc--remote-exit-event (process fallback)
+  "Return the sentinel event for the remote exit of PROCESS.
+FALLBACK is used when the remote status is unknown.  Signal deaths use the
+lowercase signal description, like local processes (\"killed\\n\")."
+  (let ((exit-signal (process-get process :tramp-rpc-exit-signal))
+        (exit-code (process-get process :tramp-rpc-exit-code)))
+    (cond
+     ((integerp exit-signal)
+      (format "%s\n" (downcase (tramp-rpc-protocol-signal-description
+                                 exit-signal))))
+     ((null exit-code) fallback)
+     ((= exit-code 0) "finished\n")
+     (t (format "exited abnormally with code %d\n" exit-code)))))
 
-(defun tramp-rpc--handle-process-exit (local-process exit-code)
+
+(defun tramp-rpc--handle-process-exit (local-process exit-code &optional exit-signal)
   "Handle exit of remote process associated with LOCAL-PROCESS.
 Stores the remote exit code and sends EOF to the local cat relay so
 it flushes remaining output and exits naturally.  The process sentinel
@@ -668,7 +679,8 @@ handle sentinel dispatch rather than fighting it with `delete-process'
 + deferred `run-at-time' sentinel calls.  Doing `delete-process'
 before the cat relay drains its pipe causes a stale FD that makes
 `input-pending-p' return t permanently, starving keyboard input.
-EXIT-CODE is the process exit status."
+EXIT-CODE is the process exit status and EXIT-SIGNAL the terminating signal
+number, if any."
   (let ((info (gethash local-process tramp-rpc--async-processes)))
     (when info
       (tramp-rpc--cancel-process-timers tramp-rpc--async-processes local-process)
@@ -680,6 +692,8 @@ EXIT-CODE is the process exit status."
                       vec pid (plist-get info :connection-process)))
                  tramp-rpc--process-write-queues))
       (process-put local-process :tramp-rpc-exit-code (or exit-code 0))
+      (process-put local-process :tramp-rpc-exit-signal
+                   (and (natnump exit-signal) exit-signal))
       (process-put local-process :tramp-rpc-remote-exited t)
       ;; Finish a separate stderr relay before closing stdout, so the public
       ;; process cannot report exit while final stderr bytes remain queued.
@@ -1368,11 +1382,12 @@ Returns (COLS . ROWS)."
           (let ((tramp-rpc--delivering-output t))
             (process-send-string local-process output))))
       (when pending-exit
-        (tramp-rpc--handle-pty-exit local-process (cdr pending-exit))))))
+        (apply #'tramp-rpc--handle-pty-exit local-process (cdr pending-exit))))))
 
 (defun tramp-rpc--queue-pty-delivery
-    (local-process &optional output exit-code exit-p)
-  "Queue PTY OUTPUT and optional EXIT-CODE for LOCAL-PROCESS."
+    (local-process &optional output exit-code exit-p exit-signal)
+  "Queue PTY OUTPUT and optional EXIT-CODE for LOCAL-PROCESS.
+EXIT-P marks a terminal delivery; EXIT-SIGNAL is the terminating signal."
   (when-let* ((info (gethash local-process tramp-rpc--pty-processes)))
     (when output
       (setq info (plist-put info :pending-output
@@ -1380,8 +1395,9 @@ Returns (COLS . ROWS)."
                                     (list output)))))
     (when exit-p
       (setq info (plist-put info :pending-exit
-                            (cons 'exit
-                                  (if (integerp exit-code) exit-code -1)))))
+                            (list 'exit
+                                  (if (integerp exit-code) exit-code -1)
+                                  exit-signal))))
     (puthash local-process info tramp-rpc--pty-processes)
     (unless (plist-get info :delivery-timer)
       (tramp-rpc--schedule-process-timer
@@ -1403,25 +1419,23 @@ Returns (COLS . ROWS)."
               (local-process
                (tramp-rpc--find-pty-process-for-notification connection pid)))
     (tramp-rpc--queue-pty-delivery
-     local-process nil (alist-get 'exit_code params) t)))
+     local-process nil (alist-get 'exit_code params) t
+     (alist-get 'signal params))))
 
 
-(defun tramp-rpc--handle-pty-exit (local-process exit-code)
+(defun tramp-rpc--handle-pty-exit (local-process exit-code &optional exit-signal)
   "Handle exit of PTY process associated with LOCAL-PROCESS.
-EXIT-CODE is the process exit status."
+EXIT-CODE is the process exit status and EXIT-SIGNAL the terminating signal
+number, if any.  The server already released the remote PTY when it reported
+the exit."
   (when (gethash local-process tramp-rpc--pty-processes)
     (tramp-rpc--cancel-process-timers tramp-rpc--pty-processes local-process)
-    ;; Close the remote PTY while the transport is still available.  Keep the
-    ;; local entry until delete-process dispatches its wrapped sentinel.
-    (when-let* ((vec (process-get local-process :tramp-rpc-vec))
-               (pid (process-get local-process :tramp-rpc-pid))
-               (connection (process-get local-process :tramp-rpc-connection)))
-      (tramp-rpc--best-effort
-        (tramp-rpc--call vec "process.close_pty" `((pid . ,pid)) connection)))
     ;; A terminal server response without a status is abnormal.  In
     ;; particular, do not translate a killed remote PTY into local success.
     (process-put local-process :tramp-rpc-exit-code
                  (if (integerp exit-code) exit-code -1))
+    (process-put local-process :tramp-rpc-exit-signal
+                 (and (natnump exit-signal) exit-signal))
     (process-put local-process :tramp-rpc-remote-exited t)
     ;; Close the relay's local stdin and let cat flush the final PTY bytes
     ;; before exiting naturally.  A zero-timeout `accept-process-output' after
@@ -1450,14 +1464,9 @@ EVENT is the process event string."
                              `((pid . ,pid) (signal . 9))
                              (process-get process :tramp-rpc-connection)))))
       (process-put process :tramp-rpc-exited t)
-      (let ((exit-code (process-get process :tramp-rpc-exit-code)))
-        (tramp-rpc--call-user-sentinel-once
-         process (process-get process :tramp-rpc-user-sentinel)
-         (if exit-code
-             (if (= exit-code 0)
-                 "finished\n"
-               (format "exited abnormally with code %d\n" exit-code))
-           event)))
+      (tramp-rpc--call-user-sentinel-once
+       process (process-get process :tramp-rpc-user-sentinel)
+       (tramp-rpc--remote-exit-event process event))
       ;; Run after the wrapped/user sentinel has observed the exit.
       (remhash process tramp-rpc--pty-processes))))
 

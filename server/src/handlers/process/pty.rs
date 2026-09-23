@@ -16,8 +16,8 @@ use serde::Deserialize;
 use std::collections::HashMap;
 use std::io::ErrorKind;
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd};
-use std::os::unix::process::CommandExt;
-use std::process::{Command as StdCommand, Stdio};
+use std::os::unix::process::{CommandExt, ExitStatusExt};
+use std::process::{Command as StdCommand, ExitStatus, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex as StdMutex, OnceLock};
 use tokio::io::Interest;
@@ -28,9 +28,10 @@ use super::super::HandlerResult;
 use super::super::system::expand_tilde;
 #[cfg(test)]
 use super::MAX_PROCESS_READ_BYTES;
+use super::pipe::exit_status_from_wait_status;
 #[cfg(target_os = "macos")]
 use super::signal_process;
-use super::subscription::{PushSubscription, send_process_notification, stop_push_subscription};
+use super::subscription::{PushSubscription, send_exit_notification, stop_push_subscription};
 use super::{
     MANAGED_CHILD_WAIT, MANAGED_PTY_CHILD_WAIT, SignalCode, dup_cloexec,
     require_process_group_signal, set_fd_cloexec, set_fd_nonblocking, signal_process_group,
@@ -39,22 +40,23 @@ use super::{
 
 pub(super) static PTY_PROCESS_MAP: OnceLock<Mutex<HashMap<u32, ManagedPtyProcess>>> =
     OnceLock::new();
-pub(super) static TERMINATED_PTY_STATUSES: OnceLock<StdMutex<HashMap<u32, i32>>> = OnceLock::new();
+pub(super) static TERMINATED_PTY_STATUSES: OnceLock<StdMutex<HashMap<u32, ExitStatus>>> =
+    OnceLock::new();
 pub(super) static PTY_PID_COUNTER: OnceLock<Mutex<u32>> = OnceLock::new();
 
 pub(super) fn get_pty_process_map() -> &'static Mutex<HashMap<u32, ManagedPtyProcess>> {
     PTY_PROCESS_MAP.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-pub(super) fn record_terminated_pty_status(pid: u32, exit_code: i32) {
+pub(super) fn record_terminated_pty_status(pid: u32, status: ExitStatus) {
     TERMINATED_PTY_STATUSES
         .get_or_init(|| StdMutex::new(HashMap::new()))
         .lock()
         .expect("terminated PTY status lock")
-        .insert(pid, exit_code);
+        .insert(pid, status);
 }
 
-pub(super) fn take_terminated_pty_status(pid: u32) -> Option<i32> {
+pub(super) fn take_terminated_pty_status(pid: u32) -> Option<ExitStatus> {
     TERMINATED_PTY_STATUSES
         .get_or_init(|| StdMutex::new(HashMap::new()))
         .lock()
@@ -115,10 +117,10 @@ pub(super) struct ManagedPtyProcess {
     pub(super) io: Arc<PtyIoState>,
     pub(super) child_pid: Pid,
     pub(super) cmd: String,
-    pub(super) exit_status: Option<i32>,
+    pub(super) exit_status: Option<ExitStatus>,
     // Retain an observed terminal status for a read that captured the PTY
     // before explicit SIGKILL removes its registry entry.
-    pub(super) shared_exit_status: Arc<StdMutex<Option<i32>>>,
+    pub(super) shared_exit_status: Arc<StdMutex<Option<ExitStatus>>>,
     pub(super) output_eof: bool,
     pub(super) push_subscription: Option<PushSubscription>,
     pub(super) subscription_requested: bool,
@@ -525,18 +527,22 @@ pub async fn read_pty(params: Value) -> HandlerResult {
     } else {
         Value::Binary(result.output)
     };
-    Ok(msgpack_map! {
-        "output" => output,
-        "exited" => result.exited,
-        "exit_code" => result.exit_code.map(|c| Value::Integer(c.into())).unwrap_or(Value::Nil)
-    })
+    let mut pairs = vec![
+        (Value::String("output".into()), output),
+        (
+            Value::String("exited".into()),
+            Value::Boolean(result.exited),
+        ),
+    ];
+    pairs.extend(crate::protocol::exit_fields(result.exit));
+    Ok(Value::Map(pairs))
 }
 
 pub(super) struct PtyReadResult {
     pub(super) output: Vec<u8>,
     pub(super) pending: bool,
     pub(super) exited: bool,
-    pub(super) exit_code: Option<i32>,
+    pub(super) exit: Option<ExitStatus>,
 }
 
 pub(super) async fn read_pty_now(pid: u32, max_bytes: usize) -> Result<PtyReadResult, RpcError> {
@@ -551,7 +557,7 @@ pub(super) async fn read_pty_now(pid: u32, max_bytes: usize) -> Result<PtyReadRe
                 output: Vec::new(),
                 pending: false,
                 exited: true,
-                exit_code: take_terminated_pty_status(pid),
+                exit: take_terminated_pty_status(pid),
             });
         };
         let fd = dup_cloexec(managed.async_fd.get_ref())
@@ -578,7 +584,7 @@ pub(super) async fn read_pty_now(pid: u32, max_bytes: usize) -> Result<PtyReadRe
             output: Vec::new(),
             pending: false,
             exited: true,
-            exit_code: shared_status.or(retained_status),
+            exit: shared_status.or(retained_status),
         });
     };
 
@@ -612,7 +618,7 @@ pub(super) async fn read_pty_now(pid: u32, max_bytes: usize) -> Result<PtyReadRe
         managed.output_eof = true;
     }
 
-    let (child_exited, exit_code) = check_exit_status(managed);
+    let (child_exited, exit_status) = check_exit_status(managed);
     let exited = child_exited && managed.output_eof;
     drop(processes);
     if exited {
@@ -626,36 +632,25 @@ pub(super) async fn read_pty_now(pid: u32, max_bytes: usize) -> Result<PtyReadRe
         output,
         pending,
         exited,
-        exit_code: exited.then_some(exit_code).flatten(),
+        exit: exited.then_some(exit_status).flatten(),
     })
 }
 
-pub(super) fn check_exit_status(managed: &mut ManagedPtyProcess) -> (bool, Option<i32>) {
-    if managed.exit_status.is_some() {
-        (true, managed.exit_status)
-    } else {
-        match waitpid(managed.child_pid, Some(WaitPidFlag::WNOHANG)) {
-            Ok(WaitStatus::Exited(_, code)) => {
-                managed.exit_status = Some(code);
-                *managed
-                    .shared_exit_status
-                    .lock()
-                    .expect("shared PTY exit status lock") = Some(code);
-                (true, Some(code))
+pub(super) fn check_exit_status(managed: &mut ManagedPtyProcess) -> (bool, Option<ExitStatus>) {
+    if managed.exit_status.is_none() {
+        let status = match waitpid(managed.child_pid, Some(WaitPidFlag::WNOHANG)) {
+            Ok(status @ (WaitStatus::Exited(..) | WaitStatus::Signaled(..))) => {
+                exit_status_from_wait_status(status)
             }
-            Ok(WaitStatus::Signaled(_, signal, _)) => {
-                let code = 128 + signal as i32;
-                managed.exit_status = Some(code);
-                *managed
-                    .shared_exit_status
-                    .lock()
-                    .expect("shared PTY exit status lock") = Some(code);
-                (true, Some(code))
-            }
-            Ok(WaitStatus::StillAlive) => (false, None),
-            _ => (false, None),
-        }
+            _ => return (false, None),
+        };
+        managed.exit_status = Some(status);
+        *managed
+            .shared_exit_status
+            .lock()
+            .expect("shared PTY exit status lock") = Some(status);
     }
+    (true, managed.exit_status)
 }
 
 pub(super) async fn wait_for_pty_readable(pid: u32) -> bool {
@@ -785,11 +780,12 @@ pub async fn write_pty(params: Value) -> HandlerResult {
     })
 }
 
-pub(super) async fn wait_pty_pid(child_pid: Pid) -> Result<Option<i32>, nix::errno::Errno> {
+pub(super) async fn wait_pty_pid(child_pid: Pid) -> Result<Option<ExitStatus>, nix::errno::Errno> {
     loop {
         match waitpid(child_pid, Some(WaitPidFlag::WNOHANG)) {
-            Ok(WaitStatus::Exited(_, code)) => return Ok(Some(code)),
-            Ok(WaitStatus::Signaled(_, signal, _)) => return Ok(Some(128 + signal as i32)),
+            Ok(status @ (WaitStatus::Exited(..) | WaitStatus::Signaled(..))) => {
+                return Ok(Some(exit_status_from_wait_status(status)));
+            }
             Ok(WaitStatus::StillAlive) => {
                 tokio::time::sleep(std::time::Duration::from_millis(5)).await;
             }
@@ -942,7 +938,7 @@ pub(super) async fn terminate_pty_process(
             let mut status = shared_exit_status
                 .lock()
                 .expect("shared PTY exit status lock");
-            *status.get_or_insert(128 + libc::SIGKILL)
+            *status.get_or_insert(ExitStatus::from_raw(libc::SIGKILL))
         };
         if retain_removed_status {
             record_terminated_pty_status(pid, exit_code);
@@ -1021,16 +1017,11 @@ pub async fn kill_pty(params: Value) -> HandlerResult {
         return Err(error);
     }
     if signal == libc::SIGKILL && subscribed {
-        let exit_code = shared_exit_status
+        let status = shared_exit_status
             .as_ref()
             .and_then(|status| *status.lock().expect("shared PTY exit status lock"))
-            .map(i64::from)
-            .unwrap_or_else(|| i64::from(128 + signal));
-        let _ = send_process_notification(
-            "process.pty_exit",
-            msgpack_map! { "pid" => params.pid, "exit_code" => exit_code },
-        )
-        .await;
+            .unwrap_or_else(|| ExitStatus::from_raw(signal));
+        send_exit_notification("process.pty_exit", params.pid, Some(status)).await;
     }
     Ok(Value::Boolean(true))
 }
@@ -1092,14 +1083,21 @@ pub async fn list_pty(_params: Value) -> HandlerResult {
         let Some(managed) = processes.get_mut(&pid) else {
             continue;
         };
-        let (exited, exit_code) = check_exit_status(managed);
-        list.push(msgpack_map! {
-            "pid" => pid,
-            "os_pid" => managed.child_pid.as_raw(),
-            "cmd" => managed.cmd.clone(),
-            "exited" => exited,
-            "exit_code" => exit_code.map(|c| Value::Integer(c.into())).unwrap_or(Value::Nil)
-        });
+        let (exited, exit_status) = check_exit_status(managed);
+        let mut entry = vec![
+            (Value::String("pid".into()), Value::from(pid)),
+            (
+                Value::String("os_pid".into()),
+                Value::from(managed.child_pid.as_raw()),
+            ),
+            (
+                Value::String("cmd".into()),
+                Value::from(managed.cmd.clone()),
+            ),
+            (Value::String("exited".into()), Value::Boolean(exited)),
+        ];
+        entry.extend(crate::protocol::exit_fields(exit_status));
+        list.push(Value::Map(entry));
     }
 
     Ok(Value::Array(list))

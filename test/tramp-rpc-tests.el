@@ -2180,6 +2180,28 @@ This matches the upstream `tramp-test28-process-file' test."
       (ignore-errors (delete-process proc)))))
 
 
+(ert-deftest tramp-rpc-test14-make-process-signal-status ()
+  "A remote process killed by a signal reports it like a local process."
+  :tags '(:process)
+  (skip-unless (tramp-rpc-test-enabled))
+  (let* ((default-directory (tramp-rpc-test--remote-directory))
+         (events nil)
+         (proc (make-process
+                :name "test-signal-status"
+                :command '("sh" "-c" "kill -TERM $$")
+                :connection-type 'pipe
+                :file-handler t
+                :sentinel (lambda (_proc event) (push event events)))))
+    (unwind-protect
+        (progn
+          (with-timeout (10 (error "Process timeout"))
+            (while (or (process-live-p proc) (null events))
+              (accept-process-output nil 0.05)))
+          (should (eq (process-status proc) 'signal))
+          (should (= (process-exit-status proc) 15))
+          (should (equal events '("terminated\n"))))
+      (ignore-errors (delete-process proc)))))
+
 (ert-deftest tramp-rpc-test14-python-shell-make-comint ()
   "Test `python-shell-make-comint' on an existing TRAMP RPC connection."
   :tags '(:process :expensive-test)

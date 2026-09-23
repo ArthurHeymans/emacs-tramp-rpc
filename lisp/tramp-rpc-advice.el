@@ -249,23 +249,30 @@ PROCESS is a PID."
 PROCESS is the process being handled."
   (if (and (processp process) (process-get process :tramp-rpc-pid))
       (cond
-       ((process-get process :tramp-rpc-exited) 'exit)
        ;; Use the real handler to check local relay liveness, not
        ;; `process-live-p' (which would recurse).  Do not perform synchronous
        ;; remote status RPCs here: callers such as mode-line redisplay,
        ;; Flymake, and LSP process management may ask for process status while
-       ;; the user is typing.
-       ((memq (tramp-run-real-handler #'process-status (list process))
-	      '(run open listen connect))
+       ;; the user is typing.  The relay stays live until the remote output has
+       ;; been delivered, so the remote exit status only applies after that.
+       ((and (not (process-get process :tramp-rpc-exited))
+             (memq (tramp-run-real-handler #'process-status (list process))
+	           '(run open listen connect)))
 	'run)
+       ;; A remote signal death is reported as `signal', matching local
+       ;; processes.  Callers such as LSP and compile branch on this.
+       ((integerp (process-get process :tramp-rpc-exit-signal)) 'signal)
        (t 'exit))
     (tramp-run-real-handler #'process-status (list process))))
 
 (defun tramp-rpc-handle-process-exit-status (process)
   "Handler for `process-exit-status' for TRAMP-RPC processes.
-PROCESS is the process being handled."
+PROCESS is the process being handled.  Signal deaths report the signal
+number, like local processes."
   (if (and (processp process) (process-get process :tramp-rpc-pid))
-      (or (process-get process :tramp-rpc-exit-code) 0)
+      (or (process-get process :tramp-rpc-exit-signal)
+          (process-get process :tramp-rpc-exit-code)
+          0)
     (tramp-run-real-handler #'process-exit-status (list process))))
 
 (defun tramp-rpc-handle-process-command (process)

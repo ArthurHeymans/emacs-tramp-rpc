@@ -4,9 +4,10 @@
 
 use crate::WriterHandle;
 use crate::msgpack_map;
-use crate::protocol::{Notification, RpcError, from_value};
+use crate::protocol::{Notification, RpcError, exit_fields, from_value};
 use rmpv::Value;
 use serde::Deserialize;
+use std::process::ExitStatus;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock};
 use tokio::io::AsyncWriteExt;
@@ -14,7 +15,7 @@ use tokio::sync::Notify;
 use tokio::task::JoinHandle;
 
 use super::super::HandlerResult;
-use super::pipe::{get_process_map, read, terminate_pipe_process};
+use super::pipe::{get_process_map, read_output, terminate_pipe_process};
 use super::pty::{get_pty_process_map, read_pty_now, terminate_pty_process, wait_for_pty_readable};
 
 const PUSH_READ_MAX_BYTES: usize = 65_536;
@@ -64,11 +65,12 @@ pub(super) async fn send_process_notification(method: &str, params: Value) -> Re
         .map_err(|e| RpcError::internal_error(format!("Failed to flush notification: {e}")))
 }
 
-fn response_field<'a>(value: &'a Value, key: &str) -> Option<&'a Value> {
-    value
-        .as_map()?
-        .iter()
-        .find_map(|(candidate, value)| (candidate.as_str() == Some(key)).then_some(value))
+/// Send a terminal `process.exit`/`process.pty_exit` notification for PID.
+/// STATUS is `None` when the remote status is unknown.
+pub(super) async fn send_exit_notification(method: &str, pid: u32, status: Option<ExitStatus>) {
+    let mut pairs = vec![(Value::String("pid".into()), Value::from(pid))];
+    pairs.extend(exit_fields(status));
+    let _ = send_process_notification(method, Value::Map(pairs)).await;
 }
 
 fn spawn_pipe_subscription(pid: u32, stop: Arc<AtomicBool>) -> JoinHandle<()> {
@@ -76,53 +78,36 @@ fn spawn_pipe_subscription(pid: u32, stop: Arc<AtomicBool>) -> JoinHandle<()> {
     // cancelling it after it consumed bytes could lose output.
     tokio::spawn(async move {
         while !stop.load(Ordering::Acquire) {
-            let result = read(msgpack_map! {
-                "pid" => pid,
-                "max_bytes" => PUSH_READ_MAX_BYTES as u64,
-                "timeout_ms" => PUSH_READ_TIMEOUT_MS
-            })
-            .await;
-            let Ok(result) = result else {
-                // Read failed; kill and remove the child so it does not linger
-                // until the connection closes.  Errors are ignored because the
-                // process may have already exited and been removed.
+            let Ok(result) = read_output(pid, PUSH_READ_MAX_BYTES, PUSH_READ_TIMEOUT_MS).await
+            else {
+                // Read failed; kill and remove the child so it does not linger.
                 let _ = terminate_pipe_process(pid, libc::SIGKILL, false).await;
-                let _ = send_process_notification(
-                    "process.exit",
-                    msgpack_map! { "pid" => pid, "exit_code" => -1i64 },
-                )
-                .await;
+                send_exit_notification("process.exit", pid, None).await;
                 break;
             };
 
-            let stdout = response_field(&result, "stdout")
-                .and_then(Value::as_slice)
-                .map_or_else(Vec::new, ToOwned::to_owned);
-            let stderr = response_field(&result, "stderr")
-                .and_then(Value::as_slice)
-                .map_or_else(Vec::new, ToOwned::to_owned);
-            if !stdout.is_empty() || !stderr.is_empty() {
+            if !result.stdout.is_empty() || !result.stderr.is_empty() {
+                let bytes_or_nil = |data: Vec<u8>| {
+                    if data.is_empty() {
+                        Value::Nil
+                    } else {
+                        Value::Binary(data)
+                    }
+                };
                 let _ = send_process_notification(
                     "process.output",
                     msgpack_map! {
                         "pid" => pid,
-                        "stdout" => if stdout.is_empty() { Value::Nil } else { Value::Binary(stdout) },
-                        "stderr" => if stderr.is_empty() { Value::Nil } else { Value::Binary(stderr) }
+                        "stdout" => bytes_or_nil(result.stdout),
+                        "stderr" => bytes_or_nil(result.stderr)
                     },
                 )
                 .await;
                 tokio::task::yield_now().await;
             }
 
-            if response_field(&result, "exited").and_then(Value::as_bool) == Some(true) {
-                let exit_code = response_field(&result, "exit_code")
-                    .and_then(Value::as_i64)
-                    .unwrap_or(-1);
-                let _ = send_process_notification(
-                    "process.exit",
-                    msgpack_map! { "pid" => pid, "exit_code" => exit_code },
-                )
-                .await;
+            if result.exited {
+                send_exit_notification("process.exit", pid, result.exit).await;
                 break;
             }
         }
@@ -132,15 +117,10 @@ fn spawn_pipe_subscription(pid: u32, stop: Arc<AtomicBool>) -> JoinHandle<()> {
 fn spawn_pty_subscription(pid: u32, stop: Arc<AtomicBool>, wake: Arc<Notify>) -> JoinHandle<()> {
     tokio::spawn(async move {
         while !stop.load(Ordering::Acquire) {
-            let result = read_pty_now(pid, PUSH_READ_MAX_BYTES).await;
-            let Ok(result) = result else {
+            let Ok(result) = read_pty_now(pid, PUSH_READ_MAX_BYTES).await else {
                 // Read failed; kill and remove the PTY so it does not linger.
                 let _ = terminate_pty_process(pid, libc::SIGKILL, true, true, false).await;
-                let _ = send_process_notification(
-                    "process.pty_exit",
-                    msgpack_map! { "pid" => pid, "exit_code" => -1i64 },
-                )
-                .await;
+                send_exit_notification("process.pty_exit", pid, None).await;
                 break;
             };
             if result.pending {
@@ -162,14 +142,7 @@ fn spawn_pty_subscription(pid: u32, stop: Arc<AtomicBool>, wake: Arc<Notify>) ->
                 tokio::task::yield_now().await;
             }
             if result.exited {
-                let _ = send_process_notification(
-                    "process.pty_exit",
-                    msgpack_map! {
-                        "pid" => pid,
-                        "exit_code" => result.exit_code.unwrap_or(-1)
-                    },
-                )
-                .await;
+                send_exit_notification("process.pty_exit", pid, result.exit).await;
                 break;
             }
         }

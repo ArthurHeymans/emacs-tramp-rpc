@@ -996,6 +996,26 @@ async fn test_process_run_signal_exit_code() {
         })
         .expect("should have exit_code");
     assert_eq!(exit_code, 130, "SIGINT should produce exit code 128+2=130");
+    let signal = result
+        .as_map()
+        .and_then(|m| m.iter().find(|(k, _)| k.as_str() == Some("signal")))
+        .and_then(|(_, v)| v.as_i64());
+    assert_eq!(signal, Some(2), "process.run should report the signal");
+}
+
+#[test]
+fn test_exit_fields_distinguish_signal_from_exit_137() {
+    use std::os::unix::process::ExitStatusExt;
+    let fields = |raw| {
+        crate::protocol::exit_fields(Some(std::process::ExitStatus::from_raw(raw)))
+            .map(|(_, value)| value.as_i64())
+    };
+    assert_eq!(fields(137 << 8), [Some(137), None]);
+    assert_eq!(fields(libc::SIGKILL), [Some(137), Some(9)]);
+    assert_eq!(
+        crate::protocol::exit_fields(None).map(|(_, value)| value.is_nil()),
+        [true, true]
+    );
 }
 
 /// Test that process.run returns 128+signal for SIGKILL.
