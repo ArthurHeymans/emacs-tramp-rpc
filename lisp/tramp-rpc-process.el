@@ -1117,9 +1117,8 @@ DIRENV-ENV is an optional alist of environment variables from direnv."
                     (list "-o" "StrictHostKeyChecking=accept-new")
                     ;; Suppress "Shared connection to ... closed." messages
                     (list "-o" "LogLevel=error")
-                    ;; User-specified SSH options
-                    (mapcan (lambda (opt) (list "-o" opt))
-                            tramp-rpc-ssh-options)
+                    ;; User-specified and default SSH options
+                    (tramp-rpc--ssh-option-args)
                     ;; Raw SSH arguments
                     tramp-rpc-ssh-args
                     ;; Connection parameters

@@ -136,28 +136,6 @@ Set to \"yes\" to keep alive indefinitely."
                  (const :tag "Indefinitely" "yes"))
   :group 'tramp-rpc)
 
-(defcustom tramp-rpc-server-alive-interval 30
-  "SSH ServerAliveInterval in seconds for RPC connections, or nil to disable.
-Server-pushed process notifications generate no traffic while remote processes
-are idle, so keepalives prevent firewalls and NAT routers from silently
-discarding the connection."
-  :type '(choice (integer :tag "Interval (seconds)")
-                 (const :tag "Disabled" nil))
-  :group 'tramp-rpc)
-
-(defcustom tramp-rpc-server-alive-count-max 3
-  "Number of unanswered SSH keepalives before an RPC connection is dead."
-  :type 'integer
-  :group 'tramp-rpc)
-
-(defun tramp-rpc--server-alive-args ()
-  "Return SSH keepalive arguments configured for RPC connections."
-  (when tramp-rpc-server-alive-interval
-    (list "-o" (format "ServerAliveInterval=%d"
-                       tramp-rpc-server-alive-interval)
-          "-o" (format "ServerAliveCountMax=%d"
-                       tramp-rpc-server-alive-count-max))))
-
 (defcustom tramp-rpc-ssh-options nil
   "Additional SSH options to pass when connecting.
 This is a list of strings, each of which is passed as an SSH -o option.
@@ -169,10 +147,24 @@ Note: The following options are always passed by default:
   - BatchMode=yes (for RPC connection; ControlMaster handles auth first)
   - StrictHostKeyChecking=accept-new (accept new keys, reject changed)
   - ControlMaster/ControlPath/ControlPersist (if `tramp-rpc-use-controlmaster')
+  - `tramp-rpc--default-ssh-options'
 
-Set this variable to override or supplement these defaults."
+SSH uses the first value given for an option, so these options override
+the keepalive defaults, e.g. \"ServerAliveInterval=0\" disables them."
   :type '(repeat string)
   :group 'tramp-rpc)
+
+(defconst tramp-rpc--default-ssh-options
+  '("ServerAliveInterval=30" "ServerAliveCountMax=3")
+  "SSH options passed after `tramp-rpc-ssh-options'.
+Server-pushed process notifications generate no traffic while remote
+processes are idle, so keepalives stop firewalls and NAT routers from
+silently discarding the connection, and detect a dead connection.")
+
+(defun tramp-rpc--ssh-option-args ()
+  "Return the -o arguments for user and default SSH options."
+  (mapcan (lambda (opt) (list "-o" opt))
+          (append tramp-rpc-ssh-options tramp-rpc--default-ssh-options)))
 
 (defcustom tramp-rpc-ssh-args nil
   "Raw SSH arguments to pass when connecting.
@@ -1071,7 +1063,7 @@ Returns non-nil on success."
                           "-o" (format "ControlPath=%s" socket-path)
                           "-o" (format "ControlPersist=%s"
                                        tramp-rpc-controlmaster-persist))
-                    (tramp-rpc--server-alive-args)
+                    (tramp-rpc--ssh-option-args)
                     ;; Connect and immediately exit, leaving ControlMaster running
                     (list "-N" host)))
          process)
@@ -1168,10 +1160,8 @@ Returns the connection plist.  Signals `remote-file-error' on failure."
                     (when tramp-rpc-use-controlmaster
                       (list "-o" "BatchMode=yes"))
                     (list "-o" "StrictHostKeyChecking=accept-new")
-                    ;; User-specified SSH options
-                    (mapcan (lambda (opt) (list "-o" opt))
-                            tramp-rpc-ssh-options)
-                    (tramp-rpc--server-alive-args)
+                    ;; User-specified and default SSH options
+                    (tramp-rpc--ssh-option-args)
                     ;; ControlMaster options for connection sharing
                     ;; Use the expanded socket path to match what establish-controlmaster created
                     (when tramp-rpc-use-controlmaster
