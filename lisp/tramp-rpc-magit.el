@@ -117,25 +117,19 @@ using the current `tab-width' instead."
 (defvar tramp-rpc-magit--ancestor-scan-caches (make-hash-table :test 'equal)
   "Cached ancestor scans keyed by remote search directory.")
 
-(defcustom tramp-rpc-magit-ancestor-cache-max-size 128
-  "Maximum number of cached ancestor scans."
-  :type 'integer
-  :group 'tramp-rpc)
+(defvar tramp-rpc-magit--ancestor-cache-max-size 128
+  "Maximum number of cached ancestor scans.")
 
 (defvar tramp-rpc-magit--prefetch-directories (make-hash-table :test 'equal)
   "Remote directories with active prefetch snapshots, keyed by directory.
 Values are creation timestamps so independent repositories cannot clobber
 one another's ancestor-discovery state.")
 
-(defcustom tramp-rpc-magit-prefetch-directory-max-size 128
-  "Maximum number of active prefetch directory snapshots."
-  :type 'integer
-  :group 'tramp-rpc)
+(defvar tramp-rpc-magit--prefetch-directory-max-size 128
+  "Maximum number of active prefetch directory snapshots.")
 
-(defcustom tramp-rpc-magit-process-cache-max-size 64
-  "Maximum number of per-directory Magit process caches."
-  :type 'integer
-  :group 'tramp-rpc)
+(defvar tramp-rpc-magit--process-cache-max-size 64
+  "Maximum number of per-directory Magit process caches.")
 
 (defun tramp-rpc-magit--clear-ancestor-caches ()
   "Clear cached ancestor marker scans."
@@ -191,7 +185,7 @@ admission."
   "Remove expired entries from `tramp-rpc-magit--prefetch-directories'."
   (tramp-rpc-magit--bound-table
    tramp-rpc-magit--prefetch-directories
-   tramp-rpc-magit-prefetch-directory-max-size #'identity))
+   tramp-rpc-magit--prefetch-directory-max-size #'identity))
 
 (defvar tramp-rpc-magit--debug nil
   "When non-nil, log cache hits/misses for debugging.")
@@ -262,7 +256,7 @@ When push notifications are unavailable, cap to
     (puthash key (list :time (float-time) :cache cache)
              tramp-rpc-magit--process-caches)
     (tramp-rpc-magit--bound-table
-     tramp-rpc-magit--process-caches tramp-rpc-magit-process-cache-max-size
+     tramp-rpc-magit--process-caches tramp-rpc-magit--process-cache-max-size
      (lambda (entry)
        (and (listp entry) (plist-get entry :time)))
      #'tramp-rpc-magit--process-cache-timestamp-valid-p)))
@@ -908,7 +902,7 @@ as the `process-file' cache.  Also fetches ancestor markers."
                tramp-rpc-magit--prefetch-directories)
       (tramp-rpc-magit--bound-table
        tramp-rpc-magit--prefetch-directories
-       tramp-rpc-magit-prefetch-directory-max-size #'identity)
+       tramp-rpc-magit--prefetch-directory-max-size #'identity)
       (with-parsed-tramp-file-name directory nil
         ;; Build command list and run in parallel on server.  `update-index
         ;; --refresh' is intentionally not part of this prefetch; it is run by
@@ -948,7 +942,7 @@ as the `process-file' cache.  Also fetches ancestor markers."
                    tramp-rpc-magit--ancestor-scan-caches)
           (tramp-rpc-magit--bound-table
            tramp-rpc-magit--ancestor-scan-caches
-           tramp-rpc-magit-ancestor-cache-max-size #'car))
+           tramp-rpc-magit--ancestor-cache-max-size #'car))
         (when tramp-rpc-magit--debug
           (let ((cache (tramp-rpc-magit--get-process-cache)))
             (tramp-rpc--debug "tramp-rpc-magit: prefetched %d commands + ancestors for %s"
@@ -1025,7 +1019,7 @@ the server scans the entire tree in one operation."
                  tramp-rpc-magit--ancestor-scan-caches)
         (tramp-rpc-magit--bound-table
          tramp-rpc-magit--ancestor-scan-caches
-         tramp-rpc-magit-ancestor-cache-max-size #'car)
+         tramp-rpc-magit--ancestor-cache-max-size #'car)
         scan))))
 
 (defun tramp-rpc-magit--ancestor-cache-covers-p (scan-directory candidate-dir)

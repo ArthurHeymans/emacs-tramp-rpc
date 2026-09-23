@@ -8596,7 +8596,7 @@ This matches tramp-sh and upstream `tramp-test28-process-file', which requires
   "Process cache admission uses its TTL, independent of metadata inhibition."
   (let* ((tramp-rpc-magit--process-caches (make-hash-table :test 'equal))
          (tramp-rpc-magit-process-cache-ttl 120)
-         (tramp-rpc-magit-process-cache-max-size 10)
+         (tramp-rpc-magit--process-cache-max-size 10)
          (remote-file-name-inhibit-cache t)
          (vec (tramp-dissect-file-name "/rpc:cache-host:/")))
     (puthash 'stale (list :time 850 :cache 'stale)
