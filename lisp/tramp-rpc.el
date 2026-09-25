@@ -2483,11 +2483,15 @@ DIR is the directory being handled."
            ;; Empty localname (e.g. "/rpc:host:") -> expand to home.
            ((tramp-string-empty-or-nil-p localname)
             (setq name (tramp-make-tramp-file-name v "~")))
+           ;; Preserve tilde expansion even for nonexistent users.  The
+           ;; generic handler may otherwise prepend "/" before trying it.
+           ((string-prefix-p "~" localname)
+            (setq name (tramp-make-tramp-file-name
+                        v (concat "/:" localname))))
            ;; Non-absolute localname (e.g. ".config/") -> make relative
            ;; to home, matching tramp-sh-handle-expand-file-name behavior.
            ;; Without this, the generic handler prepends "/" (root).
-           ((not (tramp-run-real-handler
-                  #'file-name-absolute-p (list localname)))
+           ((not (string-prefix-p "/" localname))
             (setq name (tramp-make-tramp-file-name
                         v (concat "~/" localname)))))))))
   (condition-case nil
