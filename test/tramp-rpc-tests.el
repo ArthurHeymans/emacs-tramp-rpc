@@ -1808,7 +1808,13 @@ This matches the upstream `tramp-test28-process-file' test."
       (should-not (equal (tramp-file-local-name expanded) "/"))
       ;; It should be the home directory (same as expanding "~")
       (let ((home-expanded (expand-file-name (concat bare-remote "~"))))
-        (should (equal expanded home-expanded))))))
+        (should (equal expanded home-expanded)))
+      ;; Match TRAMP's quoted tilde expansion for nonexistent users.
+      (let ((tramp-tolerate-tilde t))
+        (should (equal (expand-file-name
+                        (concat bare-remote "~does-not-exist"))
+                       (expand-file-name
+                        (concat bare-remote "/:~does-not-exist"))))))))
 
 ;;; ============================================================================
 ;;; Test 12: File Name Completion
