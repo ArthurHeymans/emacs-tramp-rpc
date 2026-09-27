@@ -754,22 +754,30 @@ This is idempotent so it can run from every synchronous wait exit path."
 
 (defmacro tramp-rpc--with-pending-requests (spec &rest body)
   "Run BODY, releasing unresolved request IDS on every exit.
-SPEC is (CONN IDS [VEC EVENT]).  When it includes VEC and EVENT, retire the
-captured generation on user quit."
+SPEC is (CONN IDS).  Abandoning a wait, including on user quit, leaves the
+transport reusable: `tramp-rpc--connection-filter' discards replies whose ID
+no longer has a waiter, so unrelated requests and processes on CONN survive
+a quit.  Only an ambiguously framed write retires the generation; see
+`tramp-rpc--send-request-frame'."
   (declare (indent 1) (debug t))
   (let ((conn (nth 0 spec))
-        (ids (nth 1 spec))
-        (vec (nth 2 spec))
-        (event (nth 3 spec)))
+        (ids (nth 1 spec)))
     `(unwind-protect
-         (condition-case interrupted
-             (progn ,@body)
-           (quit
-            ,(when vec
-               `(tramp-rpc--invalidate-interrupted-connection
-                 (tramp-rpc-connection-process ,conn) ,vec ,event))
-            (signal (car interrupted) (cdr interrupted))))
+         (progn ,@body)
        (tramp-rpc--release-pending-requests ,conn ,ids))))
+
+(defun tramp-rpc--send-request-frame (conn vec bytes event)
+  "Write request frame BYTES to generation CONN for VEC.
+EVENT describes the interrupted operation for transport diagnostics.
+A user quit inside the write leaves frame delivery ambiguous, so the
+generation is retired.  Quits before or after a complete write keep the
+transport usable and must not disconnect its other users."
+  (condition-case interrupted
+      (process-send-string (tramp-rpc-connection-process conn) bytes)
+    (quit
+     (tramp-rpc--invalidate-interrupted-connection
+      (tramp-rpc-connection-process conn) vec event)
+     (signal (car interrupted) (cdr interrupted)))))
 
 (defun tramp-rpc--claim-connection-generation (process vec event reason)
   "Claim PROCESS as a dead generation and detach it from VEC's connection table.
@@ -1859,8 +1867,11 @@ Returns the request ID."
       (unwind-protect
           (prog1
               (progn
-                ;; Send request (binary data with length prefix, no newline)
-                (process-send-string process request)
+                ;; Send request (binary data with length prefix, no newline).
+                ;; Like the synchronous paths, a quit inside the write
+                ;; leaves framing ambiguous and must retire the generation.
+                (tramp-rpc--send-request-frame
+                 conn vec request "Async RPC interrupted while sending\n")
                 id)
             (setq sent t))
         ;; Cover errors, user quits, and any other non-local exit.
@@ -2006,11 +2017,11 @@ Returns the result or signals an error."
     (tramp-rpc--debug "SEND id=%s method=%s" expected-id method)
     (tramp-rpc--track-pending-request conn expected-id)
 
-    (tramp-rpc--with-pending-requests
-        (conn (list expected-id) vec
-              (format "RPC interrupted while waiting for %s\n" method))
+    (tramp-rpc--with-pending-requests (conn (list expected-id))
       ;; Send request (binary data with length prefix, no newline)
-      (process-send-string process request)
+      (tramp-rpc--send-request-frame
+       conn vec request
+       (format "RPC interrupted while sending %s\n" method))
 
       (let* ((state (tramp-rpc--wait-for-response-ids
                      conn (list expected-id) total-timeout
@@ -2078,9 +2089,9 @@ Returns:
          (request (cdr id-and-request)))
     (tramp-rpc--debug "SEND-BATCH id=%s count=%d" expected-id (length requests))
     (tramp-rpc--track-pending-request conn expected-id)
-    (tramp-rpc--with-pending-requests
-        (conn (list expected-id) vec "Batch RPC interrupted\n")
-      (process-send-string process request)
+    (tramp-rpc--with-pending-requests (conn (list expected-id))
+      (tramp-rpc--send-request-frame
+       conn vec request "Batch RPC interrupted while sending\n")
       (let* ((state (tramp-rpc--wait-for-response-ids
                      conn (list expected-id) timeout poll-interval "BATCH"))
              (response (gethash expected-id (plist-get state :responses))))
@@ -2129,31 +2140,25 @@ CONNECTION, when non-nil, is the captured connection generation to use.
 Returns a list of request IDs in the same order."
   (let* ((conn (or connection (tramp-rpc--ensure-connection vec)))
          (process (tramp-rpc-connection-process conn))
-         ids completed dispatch-attempted)
+         ids completed)
     (unwind-protect
-        (condition-case interrupted
-            (progn
-              (dolist (req requests)
-                (let* ((id-and-bytes
-                        (let ((tramp-rpc-protocol--message-target process))
-                          (tramp-rpc-protocol-encode-request-with-id
-                           (car req) (cdr req))))
-                       (id (car id-and-bytes))
-                       (bytes (cdr id-and-bytes)))
-                  (tramp-rpc--debug "SEND-PIPE id=%s method=%s" id (car req))
-                  (push id ids)
-                  (tramp-rpc--track-pending-request conn id)
-                  ;; Once a transport write is attempted, a quit leaves frame
-                  ;; delivery ambiguous and this generation cannot be reused.
-                  (setq dispatch-attempted t)
-                  (process-send-string process bytes)))
-              (setq completed t)
-              (nreverse ids))
-          (quit
-           (when dispatch-attempted
-             (tramp-rpc--invalidate-interrupted-connection
-              process vec "Pipelined RPC interrupted while sending\n"))
-           (signal (car interrupted) (cdr interrupted))))
+        (progn
+          (dolist (req requests)
+            (let* ((id-and-bytes
+                    (let ((tramp-rpc-protocol--message-target process))
+                      (tramp-rpc-protocol-encode-request-with-id
+                       (car req) (cdr req))))
+                   (id (car id-and-bytes))
+                   (bytes (cdr id-and-bytes)))
+              (tramp-rpc--debug "SEND-PIPE id=%s method=%s" id (car req))
+              (push id ids)
+              (tramp-rpc--track-pending-request conn id)
+              ;; Only a quit inside the write makes frame delivery ambiguous.
+              ;; A quit between two complete frames leaves the stream intact.
+              (tramp-rpc--send-request-frame
+               conn vec bytes "Pipelined RPC interrupted while sending\n")))
+          (setq completed t)
+          (nreverse ids))
       (unless completed
         (tramp-rpc--release-pending-requests conn ids)))))
 
@@ -2168,8 +2173,7 @@ captured connection generation to use."
          (conn (or connection (tramp-rpc--ensure-connection vec)))
          (process (tramp-rpc-connection-process conn)))
     (tramp-rpc--debug "RECV-PIPE waiting for %d responses: %S" (length ids) ids)
-    (tramp-rpc--with-pending-requests
-        (conn ids vec "Pipelined RPC interrupted\n")
+    (tramp-rpc--with-pending-requests (conn ids)
       (let* ((state (tramp-rpc--wait-for-response-ids
                      conn ids timeout poll-interval "PIPE"))
              (remaining-ids (plist-get state :remaining))
@@ -2380,7 +2384,7 @@ actual PATH line, matching the robustness of upstream TRAMP."
 (defconst tramp-rpc--system-info-property "tramp-rpc-system-info"
   "TRAMP connection property storing the cached system.info response.")
 
-(defcustom tramp-rpc--watcher-unavailable-ttl 30
+(defcustom tramp-rpc-watcher-unavailable-ttl 30
   "TTL cap in seconds for caches when push notifications are unavailable.
 When the server reports `watcher_available' as false, `fs.events'
 notifications are not running and caches are TTL-only.  Capping to a short
@@ -2392,7 +2396,7 @@ seconds of stale metadata."
 (defvar tramp-rpc--watcher-degraded nil
   "Non-nil when any known connection lacks push notifications.
 Set from `system.info' `watcher_available'.  Once set, metadata and Magit
-process caches use `tramp-rpc--watcher-unavailable-ttl' as a cap.  This is
+process caches use `tramp-rpc-watcher-unavailable-ttl' as a cap.  This is
 global and conservative, one degraded host shortens TTLs for all, because
 cache validity checks do not carry connection context.")
 

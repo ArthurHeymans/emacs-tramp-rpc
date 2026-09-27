@@ -252,13 +252,13 @@ Returns the cache hash table, or nil if none."
 (defun tramp-rpc-magit--process-cache-timestamp-valid-p (timestamp)
   "Return non-nil when process cache TIMESTAMP is within its own TTL.
 When push notifications are unavailable, cap to
-`tramp-rpc--watcher-unavailable-ttl' so unwatched changes surface promptly."
+`tramp-rpc-watcher-unavailable-ttl' so unwatched changes surface promptly."
   (or (null tramp-rpc-magit-process-cache-ttl)
       (let ((ttl tramp-rpc-magit-process-cache-ttl))
         (when (and (boundp 'tramp-rpc--watcher-degraded)
                    tramp-rpc--watcher-degraded
-                   (boundp 'tramp-rpc--watcher-unavailable-ttl))
-          (setq ttl (min ttl tramp-rpc--watcher-unavailable-ttl)))
+                   (boundp 'tramp-rpc-watcher-unavailable-ttl))
+          (setq ttl (min ttl tramp-rpc-watcher-unavailable-ttl)))
         (<= (- (float-time) timestamp) ttl))))
 
 (defun tramp-rpc-magit--set-process-cache (vec directory cache)
@@ -1402,7 +1402,8 @@ Removes handlers."
 
 ;; Prefetched status output is keyed by connection and stale as soon as the
 ;; server reports a change or the connection is retired.  Ancestor scans
-;; follow the file metadata they were derived from.
+;; follow the file metadata they were derived from.  These internal callbacks
+;; keep standalone module use correct; they do not enable the Magit integration.
 (add-hook 'tramp-rpc-connection-invalidate-functions
           #'tramp-rpc-magit--clear-status-cache-for-connection t)
 (add-hook 'tramp-rpc-fs-events-functions

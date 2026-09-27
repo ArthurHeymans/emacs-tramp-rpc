@@ -1690,7 +1690,8 @@ Removes handlers and cleans up async processes."
 
 ;; Relay teardown runs from the transport's generation cleanup: remote
 ;; children are signalled while the transport is still live, local relays
-;; are removed once it is dead.
+;; are removed once it is dead.  Register these internal callbacks even when
+;; this module is loaded standalone, so relays cannot outlive the transport.
 (add-hook 'tramp-rpc-transport-terminate-functions
           #'tramp-rpc--terminate-async-processes t)
 (add-hook 'tramp-rpc-transport-terminate-functions

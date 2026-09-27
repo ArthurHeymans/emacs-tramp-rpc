@@ -142,18 +142,47 @@
   (message "TRAMP-RPC debug logging enabled; logs will be written to %s"
            tramp-rpc-test-debug-directory))
 
-(defun tramp-rpc-test-run-tests-batch-and-exit (&optional selector)
+(defun tramp-rpc-test-run-tests-batch-and-exit (&optional selector require-remote)
   "Run ERT tests matching SELECTOR, write debug logs, then exit Emacs.
 This mirrors `ert-run-tests-batch-and-exit', but writes TRAMP-RPC debug logs
 before exiting.  Do not use `kill-emacs-hook' for this: upstream
-`tramp-test52-unload' asserts that no Tramp-related function remains on hooks."
+`tramp-test52-unload' asserts that no Tramp-related function remains on hooks.
+
+When REQUIRE-REMOTE is non-nil, fail before running if the remote test
+directory is inaccessible.  Upstream marks `tramp-test00-availability' as an
+expected failure in that case and caches the result in `tramp--test-enabled',
+so every remote test then skips while the batch still exits zero."
   (or noninteractive
       (user-error "This function is only for use in batch mode"))
   (let ((exit-code 2))
     (unwind-protect
-        (let ((stats (ert-run-tests-batch selector)))
-          (setq exit-code
-                (if (zerop (ert-stats-completed-unexpected stats)) 0 1)))
+        ;; Catch guard failures so their diagnostic is logged before
+        ;; `kill-emacs' runs; otherwise batch mode exits with code 2 and the
+        ;; reason is lost.
+        (condition-case err
+            (progn
+              (when (and require-remote
+                         (fboundp 'tramp--test-enabled)
+                         (not (tramp--test-enabled)))
+                (error "Remote directory %s is not accessible"
+                       ert-remote-temporary-file-directory))
+              (let* ((tests (ert-select-tests selector t))
+                     (selected (length tests)))
+                (unless (> selected 0)
+                  (error "ERT selector %S selected zero tests" selector))
+                (let* ((stats (ert-run-tests-batch selector))
+                       (skipped (ert-stats-skipped stats))
+                       (executed (- (ert-stats-completed stats) skipped)))
+                  (message "ERT counts: selected=%d executed=%d skipped=%d"
+                           selected executed skipped)
+                  (when (= executed 0)
+                    (error "ERT selector %S executed zero tests (all %d selected tests skipped)"
+                           selector skipped))
+                  (setq exit-code
+                        (if (zerop (ert-stats-completed-unexpected stats)) 0 1)))))
+          (error
+           (message "ERT run failed: %s" (error-message-string err))
+           (setq exit-code 2)))
       (tramp-rpc-test--write-debug-buffers)
       (kill-emacs exit-code))))
 

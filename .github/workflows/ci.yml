@@ -154,6 +154,19 @@ jobs:
             sleep 10
           done
 
+      - name: Byte-compile each module in isolation
+        run: |
+          # package-initialize loads dependency autoloads, and compiling modules
+          # together carries definitions into later files.  Neither should hide
+          # a missing require in the module under test.
+          for file in lisp/*.el; do
+            rm -f lisp/*.elc
+            emacs -Q --batch \
+              --eval '(let ((dir (expand-file-name "elpa" user-emacs-directory))) (dolist (entry (directory-files dir t "^[^.]")) (when (file-directory-p entry) (push entry load-path))))' \
+              --eval '(setq byte-compile-error-on-warn t byte-compile-warnings t load-prefer-newer t)' \
+              -L lisp -f batch-byte-compile "$file"
+          done
+
       - name: Byte-compile
         run: |
           rm -f lisp/*.elc
@@ -631,7 +644,7 @@ jobs:
         run: |
           # Exclude known unfixable tests:
           #   :unstable: not recommended by upstream Tramp
-          #   tramp-test45-asynchronous-requests: upstream stress test is
+          #   tramp-test46-asynchronous-requests: upstream stress test is
           #     timing-sensitive with tramp-rpc's RPC process relay in CI.
           emacs -Q --batch \
             -L lisp \
@@ -639,7 +652,7 @@ jobs:
             --eval "(add-to-list 'package-archives '(\"melpa\" . \"https://melpa.org/packages/\") t)" \
             --eval "(package-initialize)" \
             -l test/run-tramp-tests.el \
-            --eval "(tramp-rpc-test-run-tests-batch-and-exit '(and (not (tag :unstable)) (not tramp-test45-asynchronous-requests)))"
+            --eval "(tramp-rpc-test-run-tests-batch-and-exit '(and (not (tag :unstable)) (not tramp-test46-asynchronous-requests)) t)"
 
       - name: Clone Emacs 31 tests
         if: matrix.emacs_version == 'release-snapshot'

@@ -32,26 +32,6 @@
 (require 'tramp-sh)
 (require 'url)
 
-;; Silence byte-compiler warnings for functions defined in tramp-sh.
-(declare-function tramp-get-remote-path "tramp-sh")
-(declare-function tramp-get-connection-process "tramp")
-(declare-function tramp-check-for-regexp "tramp")
-(declare-function tramp-get-remote-null-device "tramp")
-
-;; Functions from sibling modules.  `tramp-rpc-deploy' is loaded by
-;; tramp-rpc-transport.el before the complete backend is initialized.
-(declare-function tramp-send-command
-                  "tramp-sh" (vec command &optional neveropen nooutput))
-(declare-function tramp-send-command-and-check
-                  "tramp-sh"
-                  (vec command &optional subshell dont-suppress-err exit-status))
-(declare-function tramp-send-command-and-read
-                  "tramp-sh" (vec command &optional noerror marker))
-(declare-function tramp-rpc--proxy-hop-string "tramp-rpc-hops" (vec))
-(declare-function tramp-rpc--sudo-rpc-hop-vec "tramp-rpc-hops" (vec))
-(declare-function tramp-rpc--clear-connection-failure
-                  "tramp-rpc-transport" (vec))
-
 ;; ============================================================================
 ;;; Customization
 ;; ============================================================================
@@ -204,7 +184,7 @@ Examples:
 When nil, the bare name \"tramp-rpc-server\" is used, relying on
 the remote shell's PATH to locate it."
   :type '(choice (const :tag "Use PATH lookup" nil)
-                 (string :tag "Absolute path"))
+          (string :tag "Absolute path"))
   :group 'tramp-rpc-deploy)
 
 (defcustom tramp-rpc-deploy-prefer-build nil
@@ -231,8 +211,8 @@ order, preserving the historical behavior.
 `build' always uses a source-tree keyed binary id for git checkouts and
 only builds from source; release downloads are not used as a fallback."
   :type '(choice (const :tag "Auto" auto)
-                 (const :tag "Release binaries" release)
-                 (const :tag "Build from source" build))
+          (const :tag "Release binaries" release)
+          (const :tag "Build from source" build))
   :group 'tramp-rpc-deploy)
 
 (defvar tramp-rpc-deploy--allow-prompt nil
@@ -296,11 +276,11 @@ Legacy methods (use inline encoding for file transfer):
   \"scpx\"  - Like scp but uses a PTY for the shell session; this is the
              default."
   :type '(choice (const :tag "SCP - out-of-band transfer (recommended)" "scp")
-                 (const :tag "rsync - out-of-band transfer (requires rsync)" "rsync")
-                 (const :tag "sshx - inline encoding (legacy)" "sshx")
-                 (const :tag "ssh - inline encoding (legacy)" "ssh")
-                 (const :tag "scpx - out-of-band with PTY shell" "scpx")
-                 (string :tag "Other TRAMP method"))
+          (const :tag "rsync - out-of-band transfer (requires rsync)" "rsync")
+          (const :tag "sshx - inline encoding (legacy)" "sshx")
+          (const :tag "ssh - inline encoding (legacy)" "ssh")
+          (const :tag "scpx - out-of-band with PTY shell" "scpx")
+          (string :tag "Other TRAMP method"))
   :group 'tramp-rpc-deploy)
 
 (defcustom tramp-rpc-deploy-max-retries 3
@@ -1027,7 +1007,7 @@ Returns the path to the binary on success, nil on failure."
             "target/release"))
          (build-output (expand-file-name
                         (expand-file-name tramp-rpc-deploy-binary-name
-                                           output-directory)
+                                          output-directory)
                         tramp-rpc-deploy-source-directory))
          (build-buffer (get-buffer-create "*tramp-rpc-build*")))
 
@@ -1062,9 +1042,9 @@ shell environment represented by `tramp-own-remote-path'.  Commands sent
 through the existing bootstrap shell do not automatically inherit that
 resolved value, so export it explicitly for the source build."
   (when-let* ((remote-path
-              (condition-case nil
-                  (tramp-get-remote-path vec)
-                (error nil)))
+               (condition-case nil
+                   (tramp-get-remote-path vec)
+                 (error nil)))
               (path (mapconcat #'identity remote-path ":")))
     (format "PATH=%s:$PATH; export PATH; "
             (tramp-shell-quote-argument path))))

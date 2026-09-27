@@ -89,7 +89,7 @@ STAT may be nil, which records a missing file.")
 `remote-file-name-inhibit-cache' t disables caching, while a numeric value
 caps the project-specific TTL.  Nil retains the explicit TRAMP-RPC TTL.
 When push notifications are unavailable (`tramp-rpc--watcher-degraded'),
-caches are TTL-only, so cap to `tramp-rpc--watcher-unavailable-ttl'."
+caches are TTL-only, so cap to `tramp-rpc-watcher-unavailable-ttl'."
   (let ((ttl (cond
                 ((eq remote-file-name-inhibit-cache t) 0)
                 ((numberp remote-file-name-inhibit-cache)
@@ -97,7 +97,7 @@ caches are TTL-only, so cap to `tramp-rpc--watcher-unavailable-ttl'."
                 (t tramp-rpc--cache-ttl))))
     (if (and (boundp 'tramp-rpc--watcher-degraded)
              tramp-rpc--watcher-degraded)
-        (min ttl tramp-rpc--watcher-unavailable-ttl)
+        (min ttl tramp-rpc-watcher-unavailable-ttl)
       ttl)))
 
 (defun tramp-rpc--cache-entry-valid-p (timestamp)
@@ -613,7 +613,8 @@ When RECURSIVE is non-nil, watch subdirectories too."
       (message "No directories being watched."))))
 
 ;; Keep the caches and watches consistent with transport generations, and
-;; receive server notifications.
+;; receive server notifications.  These internal callbacks are required when
+;; this module is loaded standalone; they do not enable editor integrations.
 (add-hook 'tramp-rpc-connection-invalidate-functions
           #'tramp-rpc--clear-file-caches-for-connection t)
 (add-hook 'tramp-rpc-transport-cleanup-functions
