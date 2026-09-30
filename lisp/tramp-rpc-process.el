@@ -58,9 +58,37 @@ unexpected failures remain visible in TRAMP-RPC debug output."
                         ',(car body) (error-message-string err))
       nil)))
 
-(defvar tramp-rpc--delivering-output nil
-  "Non-nil while delivering process output to the local relay.
-Used by advice functions to bypass interception during output delivery.")
+(defvar tramp-rpc--native-process-send-string nil
+  "`process-send-string' as it was before Tramp routed it to a handler.
+Relay writes call this directly.  Suppressing the routing for the duration
+of the write instead cannot be contained: `process-send-string' runs pending
+filters, sentinels and timers while it waits for pipe capacity, so a write
+issued from one of those would also be delivered to the local relay, and
+reappear in the relay's own output rather than reaching the remote process.")
+
+(defun tramp-rpc--capture-native-process-send-string ()
+  "Remember `process-send-string' before Tramp\='s routing advice is added.
+Called by `tramp-rpc-handler-install' ahead of the advice it installs.
+Capturing once the advice is in place would store the advice itself, and
+every relay write would then be forwarded to the remote process, so the
+capture is taken only while the advice is absent and is never replaced."
+  (unless (or tramp-rpc--native-process-send-string
+              (advice-member-p "tramp-advice-process-send-string"
+                               'process-send-string))
+    (setq tramp-rpc--native-process-send-string
+          (symbol-function 'process-send-string))))
+
+(defun tramp-rpc--send-local-relay-string (relay string)
+  "Write STRING to local cat RELAY without routing it to the remote process.
+RELAY carries the remote PID and vector so that writes from Emacs reach the
+remote process; this write is the relay\='s own input and must stay local."
+  (if tramp-rpc--native-process-send-string
+      (funcall tramp-rpc--native-process-send-string relay string)
+    ;; Reached only when the capture did not run, which leaves no un-routed
+    ;; `process-send-string' to call.  Relay output is still correct, but the
+    ;; suppression lasts for the whole write, so a write issued from a filter
+    ;; running inside it is delivered to the relay instead of to the remote.
+    (tramp-run-real-handler #'process-send-string (list relay string))))
 
 (defvar tramp-rpc--closing-local-relay nil
   "Non-nil while sending EOF to a local cat relay process.
@@ -479,29 +507,26 @@ Writes to the local cat relay process, which triggers proper I/O events
 that satisfy function `accept-process-output'.
 STDERR-BUFFER is the separate stderr buffer, or nil to mix with stdout."
   (when (and (processp local-process) (process-live-p local-process))
-    ;; Set flag to bypass our handler - we're writing TO the local process,
-    ;; not sending data to the remote process
-    (let ((tramp-rpc--delivering-output t))
-      ;; Deliver stdout by writing to the cat relay process
-      ;; This triggers actual I/O events that accept-process-output detects
-      (when (and stdout (> (length stdout) 0))
-        (tramp-rpc--debug "DELIVER stdout %d bytes to %s" (length stdout) local-process)
-        (process-send-string local-process stdout))
+    ;; Deliver stdout by writing to the cat relay process
+    ;; This triggers actual I/O events that accept-process-output detects
+    (when (and stdout (> (length stdout) 0))
+      (tramp-rpc--debug "DELIVER stdout %d bytes to %s" (length stdout) local-process)
+      (tramp-rpc--send-local-relay-string local-process stdout))
 
-      ;; Deliver stderr
-      (when (and stderr (> (length stderr) 0))
-        (tramp-rpc--debug "DELIVER stderr %d bytes" (length stderr))
-        (let ((stderr-process
-               (when stderr-buffer
-                 (plist-get (gethash local-process tramp-rpc--async-processes)
-                            :stderr-process))))
-          (cond
-           ;; Write to stderr cat relay if available, triggering proper I/O events
-           ((and stderr-process (process-live-p stderr-process))
-            (process-send-string stderr-process stderr))
-           ;; Mix with stdout if no separate stderr buffer - write to cat relay
-           (t
-            (process-send-string local-process stderr))))))))
+    ;; Deliver stderr
+    (when (and stderr (> (length stderr) 0))
+      (tramp-rpc--debug "DELIVER stderr %d bytes" (length stderr))
+      (let ((stderr-process
+             (when stderr-buffer
+               (plist-get (gethash local-process tramp-rpc--async-processes)
+                          :stderr-process))))
+        (cond
+         ;; Write to stderr cat relay if available, triggering proper I/O events
+         ((and stderr-process (process-live-p stderr-process))
+          (tramp-rpc--send-local-relay-string stderr-process stderr))
+         ;; Mix with stdout if no separate stderr buffer - write to cat relay
+         (t
+          (tramp-rpc--send-local-relay-string local-process stderr)))))))
 
 (defun tramp-rpc--deliver-pending-process-output (local-process)
   "Deliver all queued output chunks for LOCAL-PROCESS in response order."
@@ -1336,8 +1361,7 @@ RESPONSE is the decoded RPC response plist."
             ;; incremental, so a character split across RPC responses is kept
             ;; intact instead of being decoded once per chunk.
             (when (and output (> (length output) 0))
-              (let ((tramp-rpc--delivering-output t))
-                (process-send-string local-process output)))
+              (tramp-rpc--send-local-relay-string local-process output))
 
             ;; Handle process exit or chain next read
             (if exited
