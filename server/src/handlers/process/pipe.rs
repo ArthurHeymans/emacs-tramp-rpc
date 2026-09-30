@@ -30,6 +30,9 @@ use super::super::HandlerResult;
 use super::super::system::expand_tilde;
 #[cfg(target_vendor = "apple")]
 use super::set_fd_cloexec;
+use super::subscription::{
+    PushSubscription, new_pipe_subscription, send_process_notification, stop_push_subscription,
+};
 use super::{
     MANAGED_CHILD_WAIT, MAX_PROCESS_READ_BYTES, ProcessGroupGuard, SignalCode,
     configure_process_group, is_benign_stdin_error, require_process_group_signal, signal_process,
@@ -224,13 +227,15 @@ pub(super) struct ManagedProcess {
     pub(super) child: Child,
     pub(super) child_pid: u32,
     pub(super) lifecycle: Arc<Mutex<()>>,
-    pub(super) read_lock: Arc<Mutex<()>>,
     pub(super) exit_status: Option<ExitStatus>,
     pub(super) shared_exit_status: Arc<StdMutex<Option<ExitStatus>>>,
     pub(super) stdin: Arc<Mutex<Option<ChildStdin>>>,
     pub(super) stdout: Arc<Mutex<Option<ChildStdout>>>,
     pub(super) stderr: Arc<Mutex<Option<ChildStderr>>>,
     pub(super) cmd: String,
+    pub(super) push_subscription: Option<PushSubscription>,
+    pub(super) subscription_requested: bool,
+    pub(super) terminating: bool,
 }
 
 // ============================================================================
@@ -566,7 +571,6 @@ pub async fn start(params: Value) -> HandlerResult {
 
     let managed = ManagedProcess {
         lifecycle: Arc::new(Mutex::new(())),
-        read_lock: Arc::new(Mutex::new(())),
         exit_status: None,
         shared_exit_status: Arc::new(StdMutex::new(None)),
         stdin: Arc::new(Mutex::new(child.stdin.take())),
@@ -575,6 +579,9 @@ pub async fn start(params: Value) -> HandlerResult {
         child,
         child_pid,
         cmd: params.cmd.clone(),
+        push_subscription: None,
+        subscription_requested: false,
+        terminating: false,
     };
 
     get_process_map().lock().await.insert(pid, managed);
@@ -660,7 +667,7 @@ pub async fn read(params: Value) -> HandlerResult {
 
     let timeout = params.timeout_ms.unwrap_or(0);
 
-    let (stdout, stderr, lifecycle, read_lock, shared_exit_status) = {
+    let (stdout, stderr, lifecycle, shared_exit_status) = {
         let processes = get_process_map().lock().await;
         let managed = processes
             .get(&params.pid)
@@ -669,21 +676,12 @@ pub async fn read(params: Value) -> HandlerResult {
             managed.stdout.clone(),
             managed.stderr.clone(),
             managed.lifecycle.clone(),
-            managed.read_lock.clone(),
             managed.shared_exit_status.clone(),
         )
     };
 
-    // A read owns output consumption through the terminal map-removal decision.
-    // This prevents a concurrent EOF reader from removing bytes another request
-    // has already consumed but not yet returned.
-    let _read_guard = read_lock.lock().await;
-
     // Try to read stdout/stderr (with optional blocking timeout) without
-    // holding the global process map lock.  `process.read` is long-polled by
-    // the Emacs client; holding that lock here makes concurrent
-    // `process.write` calls wait behind the read timeout, which turns LSP
-    // typing into a synchronous round-trip bottleneck.
+    // holding the global process map lock.
     let (stdout_result, stderr_result) =
         try_read_streams(stdout, stderr, params.max_bytes, timeout).await?;
 
@@ -1103,15 +1101,55 @@ pub async fn kill(params: Value) -> HandlerResult {
 
     let params: Params = from_value(params).map_err(|e| RpcError::invalid_params(e.to_string()))?;
     let signal = params.signal.resolve()?;
-    // Signaling an unknown pid is an error; internal cleanup paths call
-    // terminate_pipe_process directly and tolerate vanished entries.
-    if !get_process_map().lock().await.contains_key(&params.pid) {
-        return Err(RpcError::process_error(format!(
-            "Process not found: {}",
-            params.pid
-        )));
+    // A subscription owns the output read loop.  Stop it before destructive
+    // SIGKILL so it cannot race registry removal or consume final output.
+    let (subscription, shared_exit_status) = {
+        let mut processes = get_process_map().lock().await;
+        let managed = processes
+            .get_mut(&params.pid)
+            .ok_or_else(|| RpcError::process_error(format!("Process not found: {}", params.pid)))?;
+        if managed.terminating {
+            return Err(RpcError::process_error(format!(
+                "Process is already terminating: {}",
+                params.pid
+            )));
+        }
+        if signal == libc::SIGKILL {
+            managed.terminating = true;
+            (
+                managed.push_subscription.take(),
+                Some(Arc::clone(&managed.shared_exit_status)),
+            )
+        } else {
+            (None, None)
+        }
+    };
+    let subscribed = subscription.is_some();
+    if let Some(subscription) = subscription {
+        stop_push_subscription(subscription).await;
     }
-    terminate_pipe_process(params.pid, signal, false).await?;
+    if let Err(error) = terminate_pipe_process(params.pid, signal, false).await {
+        if let Some(managed) = get_process_map().lock().await.get_mut(&params.pid) {
+            managed.terminating = false;
+            if managed.subscription_requested && managed.push_subscription.is_none() {
+                managed.push_subscription = Some(new_pipe_subscription(params.pid));
+            }
+        }
+        return Err(error);
+    }
+    if signal == libc::SIGKILL && subscribed {
+        let exit_code = shared_exit_status
+            .as_ref()
+            .and_then(|status| *status.lock().expect("shared pipe exit status lock"))
+            .map(crate::protocol::exit_code_from_status)
+            .map(i64::from)
+            .unwrap_or_else(|| i64::from(128 + signal));
+        let _ = send_process_notification(
+            "process.exit",
+            msgpack_map! { "pid" => params.pid, "exit_code" => exit_code },
+        )
+        .await;
+    }
     Ok(Value::Boolean(true))
 }
 

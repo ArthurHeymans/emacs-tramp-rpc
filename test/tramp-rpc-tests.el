@@ -84,11 +84,11 @@
 
 (declare-function tramp-rpc--decode-output "tramp-rpc-protocol" (data))
 (declare-function tramp-rpc--get-route-connection-property "tramp-rpc-transport" (vec property default))
-(declare-function tramp-rpc--handle-async-read-response "tramp-rpc-process")
+(declare-function tramp-rpc--queue-pty-delivery
+                  "tramp-rpc-process"
+                  (local-process &optional output exit-code exit-p))
 (declare-function tramp-rpc--start-cat-relays
                   "tramp-rpc-process" (name buffer stderr-buffer cleanup))
-(declare-function tramp-rpc--pty-handle-async-response
-                  "tramp-rpc-process" (local-process response))
 
 ;;; ============================================================================
 ;;; Test Configuration
@@ -2088,18 +2088,14 @@ This matches the upstream `tramp-test28-process-file' test."
                               (lambda (_process string)
                                 (setq output (concat output string))))
           (process-put process :tramp-rpc-pty t)
-          (puthash process '(:poll-timer nil) tramp-rpc--pty-processes)
-          (cl-letf (((symbol-function 'tramp-rpc--pty-start-async-read)
-                     (lambda (&rest _args) nil)))
-            (tramp-rpc--pty-handle-async-response
-             process `(:result ((output . ,(substring bytes 0 1))
-                                (exited . nil))))
-            (tramp-rpc--pty-handle-async-response
-             process `(:result ((output . ,(concat (substring bytes 1) "\n"))
-                                (exited . nil))))
-            (tramp-rpc-test--wait-for
-             (lambda () (equal output "é\n")) "complete PTY coding output"
-             process))
+          (puthash process (list :pending-output nil :pending-exit nil
+                                 :delivery-timer nil)
+                   tramp-rpc--pty-processes)
+          (tramp-rpc--queue-pty-delivery process (substring bytes 0 1))
+          (tramp-rpc--queue-pty-delivery process (concat (substring bytes 1) "\n"))
+          (tramp-rpc-test--wait-for
+           (lambda () (equal output "é\n")) "complete PTY coding output"
+           process)
           (should (equal output "é\n")))
       (remhash process tramp-rpc--pty-processes)
       (delete-process process))))
@@ -2121,11 +2117,10 @@ This matches the upstream `tramp-test28-process-file' test."
           (process-put process :tramp-rpc-user-sentinel
                        (lambda (_process event)
                          (push event sentinel-events)))
-          (puthash process '(:poll-timer nil) tramp-rpc--pty-processes)
-          (tramp-rpc--pty-handle-async-response
-           process '(:result ((output . "final output\n")
-                              (exited . t)
-                              (exit_code . 0))))
+          (puthash process (list :pending-output nil :pending-exit nil
+                                 :delivery-timer nil)
+                   tramp-rpc--pty-processes)
+          (tramp-rpc--queue-pty-delivery process "final output\n" 0 t)
           (while (process-live-p process)
             (accept-process-output process 0.1 nil t))
           (should (equal output "final output\n"))
@@ -2135,45 +2130,6 @@ This matches the upstream `tramp-test28-process-file' test."
       (when (processp process)
         (ignore-errors (delete-process process))))))
 
-(ert-deftest tramp-rpc-test13d-async-read-rpc-error-exits-process ()
-  "Test async read RPC errors terminate the local process state."
-  (let ((proc (make-pipe-process
-               :name "tramp-rpc-read-error-test"
-               :noquery t))
-        exit-code)
-    (unwind-protect
-        (progn
-          (puthash proc '(:vec mock :pid 12345)
-                   tramp-rpc--async-processes)
-          (cl-letf (((symbol-function 'tramp-rpc--handle-process-exit)
-                     (lambda (_proc code)
-                       (setq exit-code code))))
-            (tramp-rpc--handle-async-read-response
-             proc '(:error (:code -32004 :message "read failed"))))
-          (should (= exit-code -1)))
-      (remhash proc tramp-rpc--async-processes)
-      (ignore-errors (delete-process proc)))))
-
-(ert-deftest tramp-rpc-test13d-pty-read-rpc-error-exits-process ()
-  "PTY read RPC errors stop polling and use an abnormal sentinel exit."
-  (let ((proc (make-pipe-process
-               :name "tramp-rpc-pty-read-error-test"
-               :noquery t))
-        exit-code)
-    (unwind-protect
-        (progn
-          (puthash proc '(:vec mock :pid 12345 :poll-timer nil)
-                   tramp-rpc--pty-processes)
-          (cl-letf (((symbol-function 'tramp-rpc--handle-pty-exit)
-                     (lambda (_proc code)
-                       (setq exit-code code))))
-            (tramp-rpc--pty-handle-async-response
-             proc '(:error (:code -32004 :message "read failed"))))
-          (should (= exit-code -1))
-          (should-not (plist-get (gethash proc tramp-rpc--pty-processes)
-                                 :poll-timer)))
-      (remhash proc tramp-rpc--pty-processes)
-      (ignore-errors (delete-process proc)))))
 
 ;;; ============================================================================
 ;;; Test 14: Async Processes
@@ -2223,51 +2179,6 @@ This matches the upstream `tramp-test28-process-file' test."
           (should (string-match-p "test-input" output)))
       (ignore-errors (delete-process proc)))))
 
-(ert-deftest tramp-rpc-test14-make-process-drains-output-after-exit ()
-  "Test `make-process' continues reading after remote child exit."
-  :tags '(:process :expensive-test)
-  (skip-unless (tramp-rpc-test-enabled))
-
-  (let* ((default-directory (tramp-rpc-test--remote-directory))
-         (output "")
-         (delay-first-read t)
-         (orig-call-async (symbol-function 'tramp-rpc--call-async))
-         proc)
-    (unwind-protect
-        (cl-letf (((symbol-function 'tramp-rpc--call-async)
-                   (lambda (vec method params callback &optional connection)
-                     (if (equal method "process.read")
-                         (let ((params (cons '(max_bytes . 1) params)))
-                           (if delay-first-read
-                               (progn
-                                 (setq delay-first-read nil)
-                                 ;; Let the short-lived child exit before the
-                                 ;; first bounded read.  The old server returned
-                                 ;; exited with the first byte and lost the rest.
-                                 (run-at-time 0.2 nil orig-call-async
-                                              vec method params callback connection))
-                             (funcall orig-call-async
-                                      vec method params callback connection)))
-                       (funcall orig-call-async
-                                vec method params callback connection)))))
-          (setq proc
-                (make-process
-                 :name "tramp-rpc-eof-race"
-                 :buffer nil
-                 :command '("/bin/sh" "-c" "printf firstsecond")
-                 :connection-type 'pipe
-                 :coding 'binary
-                 :noquery t
-                 :file-handler t
-                 :filter (lambda (_proc string)
-                           (setq output (concat output string)))))
-          (with-timeout (15 (error "Process output drain timeout"))
-            (while (process-live-p proc)
-              (accept-process-output proc 0.1)))
-          (should (= 0 (process-exit-status proc)))
-          (should (equal output "firstsecond")))
-      (when (processp proc)
-        (ignore-errors (delete-process proc))))))
 
 (ert-deftest tramp-rpc-test14-python-shell-make-comint ()
   "Test `python-shell-make-comint' on an existing TRAMP RPC connection."

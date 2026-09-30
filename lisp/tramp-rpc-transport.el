@@ -121,6 +121,13 @@ The directory must exist and be writable."
   :type 'string
   :group 'tramp-rpc)
 
+(defvar tramp-rpc--owned-controlmasters (make-hash-table :test 'equal)
+  "Map owned ControlMaster socket paths to (PROCESS . INODE) pairs.
+PROCESS is the establishing SSH process (may be dead when `ControlPersist'
+backgrounds the master).  INODE is the inode number of the socket file at the
+time it was created, used to distinguish this socket instance from a
+replacement created at the same path by another Emacs process.")
+
 (defcustom tramp-rpc-controlmaster-persist 600
   "How long (in seconds) to keep ControlMaster connections alive.
 Set to 0 to close immediately when last connection exits.
@@ -128,6 +135,28 @@ Set to \"yes\" to keep alive indefinitely."
   :type '(choice (integer :tag "Seconds")
                  (const :tag "Indefinitely" "yes"))
   :group 'tramp-rpc)
+
+(defcustom tramp-rpc-server-alive-interval 30
+  "SSH ServerAliveInterval in seconds for RPC connections, or nil to disable.
+Server-pushed process notifications generate no traffic while remote processes
+are idle, so keepalives prevent firewalls and NAT routers from silently
+discarding the connection."
+  :type '(choice (integer :tag "Interval (seconds)")
+                 (const :tag "Disabled" nil))
+  :group 'tramp-rpc)
+
+(defcustom tramp-rpc-server-alive-count-max 3
+  "Number of unanswered SSH keepalives before an RPC connection is dead."
+  :type 'integer
+  :group 'tramp-rpc)
+
+(defun tramp-rpc--server-alive-args ()
+  "Return SSH keepalive arguments configured for RPC connections."
+  (when tramp-rpc-server-alive-interval
+    (list "-o" (format "ServerAliveInterval=%d"
+                       tramp-rpc-server-alive-interval)
+          "-o" (format "ServerAliveCountMax=%d"
+                       tramp-rpc-server-alive-count-max))))
 
 (defcustom tramp-rpc-ssh-options nil
   "Additional SSH options to pass when connecting.
@@ -648,8 +677,6 @@ Also clears the executable, variable `exec-path', and login-shell caches."
          (current (gethash key tramp-rpc--connections)))
     (when (and current
                (or (null process) (eq process (tramp-rpc-connection-process current))))
-      (when-let* ((transport (tramp-rpc-connection-process current)))
-        (tramp-rpc-protocol--clear-deferred-polls-for-target transport))
       (remhash key tramp-rpc--connections)
       (tramp-rpc--flush-owned-route-connection-properties vec)
       (remhash key tramp-rpc--exec-path-cache)
@@ -1039,6 +1066,7 @@ Returns non-nil on success."
                           "-o" (format "ControlPath=%s" socket-path)
                           "-o" (format "ControlPersist=%s"
                                        tramp-rpc-controlmaster-persist))
+                    (tramp-rpc--server-alive-args)
                     ;; Connect and immediately exit, leaving ControlMaster running
                     (list "-N" host)))
          process)
@@ -1047,6 +1075,7 @@ Returns non-nil on success."
     ;; create a ControlMaster on top of a stale ControlPath, which later shows
     ;; up as a generic "Tramp failed to connect" during unrelated file ops.
     (when (file-exists-p socket-path)
+      (remhash socket-path tramp-rpc--owned-controlmasters)
       (delete-file socket-path))
     (with-current-buffer buffer
       (erase-buffer))
@@ -1086,8 +1115,16 @@ Returns non-nil on success."
             ;; tramp-process-actions throws on failure; reaching here means
             ;; the persistent master owns PROCESS and BUFFER.
             (sleep-for 0.1)
+            ;; Record the socket's inode alongside the process so cleanup can
+            ;; verify it is still our socket and not a replacement created at
+            ;; the same path by another Emacs process.
+            (let* ((socket-attrs (file-attributes socket-path 'integer))
+                   (socket-inode (and socket-attrs (nth 10 socket-attrs))))
+              (puthash socket-path (cons process socket-inode)
+                       tramp-rpc--owned-controlmasters))
             (setq success t))
         (unless success
+          (remhash socket-path tramp-rpc--owned-controlmasters)
           (when (and process (process-live-p process))
             (delete-process process))
           (when (buffer-live-p buffer)
@@ -1102,10 +1139,6 @@ wrappers and dynamic loaders can print the same text for unrelated failures."
   (and (not (process-live-p process))
        (memq (process-exit-status process) '(126 127))))
 
-(defun tramp-rpc--connection-sentinel (process _event)
-  "Discard deferred protocol state when RPC connection PROCESS closes."
-  (unless (process-live-p process)
-    (tramp-rpc-protocol--clear-deferred-polls-for-target process)))
 
 (defun tramp-rpc--start-server-process (vec binary-path &optional sudo-password)
   "Start the RPC server on VEC at BINARY-PATH and verify it responds.
@@ -1133,6 +1166,7 @@ Returns the connection plist.  Signals `remote-file-error' on failure."
                     ;; User-specified SSH options
                     (mapcan (lambda (opt) (list "-o" opt))
                             tramp-rpc-ssh-options)
+                    (tramp-rpc--server-alive-args)
                     ;; ControlMaster options for connection sharing
                     ;; Use the expanded socket path to match what establish-controlmaster created
                     (when tramp-rpc-use-controlmaster
@@ -1199,8 +1233,7 @@ Returns the connection plist.  Signals `remote-file-error' on failure."
            :coding 'binary
            :noquery t
            :stderr stderr-buffer
-           :filter #'tramp-rpc--connection-filter
-           :sentinel #'tramp-rpc--connection-sentinel))
+           :filter #'tramp-rpc--connection-filter))
 
     (condition-case start-error
         (progn
@@ -1430,7 +1463,9 @@ down VEC's ControlMaster in that case would disrupt the still-live connection."
       nil)))
 
 (defun tramp-rpc--cleanup-controlmaster-unlocked (vec)
-  "Clean up VEC's ControlMaster while holding its lifecycle mutex."
+  "Clean up VEC's owned ControlMaster while holding its lifecycle mutex.
+A socket reused from another Emacs process is not owned here and must not
+receive `ssh -O exit', which would disconnect that other session."
   (when tramp-rpc-use-controlmaster
     (let* ((host (tramp-file-name-host vec))
            (user (tramp-rpc--ssh-detail-user vec))
@@ -1438,13 +1473,23 @@ down VEC's ControlMaster in that case would disrupt the still-live connection."
                   (tramp-rpc--ssh-detail-port vec)))
            (proxyjump (tramp-rpc--hops-to-proxyjump vec))
            (socket-path (tramp-rpc--controlmaster-socket-path vec))
-           (auth-process-name (format "*tramp-rpc-auth %s*" host))
-           (auth-buffer-name (format " *tramp-rpc-auth %s*" host))
-           (auth-process (get-process auth-process-name))
-           (auth-buffer (get-buffer auth-buffer-name)))
+           (entry (gethash socket-path tramp-rpc--owned-controlmasters))
+           (auth-process (and (consp entry) (car entry)))
+           (stored-inode (and (consp entry) (cdr entry)))
+           (auth-buffer (and (processp auth-process)
+                             (process-buffer auth-process)))
+           ;; Verify the socket's inode to distinguish our socket from a
+           ;; replacement created at the same path by another Emacs process.
+           (current-inode (let ((attrs (and stored-inode
+                                            (file-attributes socket-path
+                                                             'integer))))
+                            (and attrs (nth 10 attrs))))
+           (owned (and (processp auth-process)
+                       stored-inode
+                       (equal stored-inode current-inode))))
       ;; Close the ControlMaster socket gracefully via ssh -O exit.
       ;; This is a local control message (no network round-trip), so fast.
-      (when (file-exists-p socket-path)
+      (when (and owned (file-exists-p socket-path))
         (condition-case err
             (apply #'call-process "ssh" nil nil nil
                    (append
@@ -1459,7 +1504,8 @@ down VEC's ControlMaster in that case would disrupt the still-live connection."
         (delete-process auth-process))
       ;; Kill the auth buffer.
       (when (buffer-live-p auth-buffer)
-        (kill-buffer auth-buffer)))))
+        (kill-buffer auth-buffer))
+      (remhash socket-path tramp-rpc--owned-controlmasters))))
 
 (defun tramp-rpc--cleanup-controlmaster (vec &optional expected-process)
   "Clean up the ControlMaster process and socket for VEC.
@@ -1716,7 +1762,9 @@ Returns the request ID."
     (tramp-rpc--debug "SEND-ASYNC id=%s method=%s" id method)
     ;; Register callback with its exact transport generation.  Roll registration
     ;; back if the transport rejects the send; no response can arrive for a
-    ;; request that was never accepted by the process object.
+    ;; request that was never accepted by the process object.  A quit during
+    ;; send retires the whole generation (like the synchronous path) so the
+    ;; callback is invoked via cleanup rather than the rollback remhash.
     (puthash id callback (tramp-rpc-connection-async-callbacks conn))
     (let (sent)
       (unwind-protect
@@ -1729,7 +1777,8 @@ Returns the request ID."
                  conn vec request "Async RPC interrupted while sending\n")
                 id)
             (setq sent t))
-        ;; Cover errors, user quits, and any other non-local exit.
+        ;; Cover non-quit errors.  Quits retire the generation, clearing the
+        ;; callback table, so remhash is a harmless no-op in that case.
         (unless sent
           (remhash id (tramp-rpc-connection-async-callbacks conn)))))))
 
@@ -1747,6 +1796,27 @@ Returns the result or signals an error.
 Uses 5s total timeout with 10ms polling.
 VEC is the TRAMP connection vector."
   (tramp-rpc--call-with-timeout vec method params 5 0.01))
+
+(defvar tramp-rpc--probing-connection nil
+  "Non-nil while a dead-connection probe is in progress.
+Prevents recursive probing when the probe itself times out.")
+
+(defun tramp-rpc--probe-live-connection (vec conn process method)
+  "Probe CONN after a timeout to detect a dead connection for VEC.
+Sends a lightweight request on the captured generation CONN.  If the probe
+also fails, invalidates the generation so the next caller reconnects instead
+of hitting the full timeout again.  PROCESS is CONN's transport process.
+METHOD names the timed-out call for logging."
+  (unless tramp-rpc--probing-connection
+    (tramp-rpc--debug "PROBE after timeout on method=%s" method)
+    (condition-case _err
+        (let ((tramp-rpc--probing-connection t))
+          (tramp-rpc--call-with-timeout vec "process.list" nil 10 0.01 conn))
+      (remote-file-error
+       (tramp-rpc--debug "PROBE failed; invalidating connection for method=%s" method)
+       (tramp-rpc--invalidate-timed-out-connection
+        process vec
+        (format "dead connection detected after RPC timeout (method=%s)\n" method))))))
 
 (defun tramp-rpc--find-response-by-id (conn expected-id)
   "Check generation CONN's pending responses for EXPECTED-ID.
@@ -1896,8 +1966,11 @@ Returns the result or signals an error."
                expected-id method elapsed
                (buffer-size (tramp-rpc-connection-buffer conn))
                (process-live-p process) stderr-tail)
-              (tramp-rpc--invalidate-timed-out-connection
-               process vec (format "RPC timeout waiting for %s\n" method))
+              ;; Probe the connection to distinguish a busy server from a dead
+              ;; SSH tunnel.  If the probe fails the generation is invalidated
+              ;; so the next caller reconnects rather than hitting another full
+              ;; timeout on a dead connection.
+              (tramp-rpc--probe-live-connection vec conn process method)
               (signal
                'remote-file-error
                (list (concat
@@ -1963,8 +2036,7 @@ Returns:
                expected-id elapsed
                (buffer-size (tramp-rpc-connection-buffer conn))
                (plist-get state :process-live) stderr-tail)
-              (tramp-rpc--invalidate-timed-out-connection
-               process vec "Batch RPC timeout\n")
+              (tramp-rpc--probe-live-connection vec conn process "batch")
               (signal
                'remote-file-error
                (list (concat
@@ -2025,8 +2097,7 @@ When nil, `tramp-rpc-call-timeout' is used.  CONNECTION, when non-nil, is the
 captured connection generation to use."
   (let* ((timeout (or timeout (tramp-rpc--configured-call-timeout)))
          (poll-interval (tramp-rpc--configured-poll-interval))
-         (conn (or connection (tramp-rpc--ensure-connection vec)))
-         (process (tramp-rpc-connection-process conn)))
+         (conn (or connection (tramp-rpc--ensure-connection vec))))
     (tramp-rpc--debug "RECV-PIPE waiting for %d responses: %S" (length ids) ids)
     (tramp-rpc--with-pending-requests (conn ids)
       (let* ((state (tramp-rpc--wait-for-response-ids
@@ -2035,11 +2106,11 @@ captured connection generation to use."
              (responses (plist-get state :responses)))
         (when remaining-ids
           (tramp-rpc--debug "RECV-PIPE missing ids: %S" remaining-ids)
-          (let ((process-live (plist-get state :process-live))
+          (let ((process (tramp-rpc-connection-process conn))
+                (process-live (plist-get state :process-live))
                 (stderr-tail (tramp-rpc--connection-stderr-tail conn)))
             (when process-live
-              (tramp-rpc--invalidate-timed-out-connection
-               process vec "Pipelined RPC timeout\n"))
+              (tramp-rpc--probe-live-connection vec conn process "pipeline"))
             (signal
              'remote-file-error
              (list

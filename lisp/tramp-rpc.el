@@ -1473,8 +1473,11 @@ PRESERVE-PERMISSIONS non-nil preserves file permissions."
 
      ;; Remote source, local dest - read via RPC, write locally
      ((and source-remote (not dest-remote))
-      ;; Use file-local-copy to get a temp local copy, then rename
-      (let ((tmpfile (file-local-copy filename)))
+      ;; Inhibit jka-compr so that compressed file extensions (e.g. .gz)
+      ;; do not cause decompression during file-local-copy or the subsequent
+      ;; write to the tmpfile inside tramp-rpc-handle-file-local-copy.
+      (let ((tmpfile (let ((jka-compr-inhibit t))
+                       (file-local-copy filename))))
         (unwind-protect
             (progn
               (rename-file tmpfile newname ok-if-already-exists)
@@ -1678,7 +1681,8 @@ TRASH non-nil requests moving the file to the trash."
 
 (defun tramp-rpc--write-local-trash-file (filename content stat)
   "Write CONTENT as binary data to local trash FILENAME and apply STAT."
-  (let ((coding-system-for-write 'binary))
+  (let ((jka-compr-inhibit t)
+        (coding-system-for-write 'binary))
     (with-temp-buffer
       (set-buffer-multibyte nil)
       (insert content)
@@ -2371,10 +2375,13 @@ REPLACE non-nil replaces the accessible buffer contents."
 (defun tramp-rpc-handle-file-local-copy (filename)
   "Create a local copy of remote FILENAME using RPC."
   (tramp-skeleton-file-local-copy filename
-    (let ((content (tramp-rpc--read-file-bytes v localname)))
-      (with-temp-file tmpfile
+    (let ((content (tramp-rpc--read-file-bytes v localname))
+          (jka-compr-inhibit t)
+          (coding-system-for-write 'binary))
+      (with-temp-buffer
         (set-buffer-multibyte nil)
-        (insert content)))))
+        (insert content)
+        (write-region (point-min) (point-max) tmpfile nil 0)))))
 
 (defun tramp-rpc-handle-get-home-directory (vec &optional user)
   "Return home directory for USER on remote host VEC using RPC.
@@ -3206,6 +3213,44 @@ VEC-OR-FILENAME can be either a tramp-file-name struct or a filename string."
 (add-hook 'tramp-rpc-transport-cleanup-functions
           #'tramp-rpc--cleanup-file-notify-for-connection t)
 
+(defun tramp-rpc--connection-has-managed-processes-p (vec)
+  "Return non-nil when VEC owns a live managed pipe or PTY process."
+  (let ((key (tramp-rpc--connection-key vec))
+        found)
+    (dolist (table (list tramp-rpc--async-processes
+                         tramp-rpc--pty-processes))
+      (maphash
+       (lambda (process info)
+         (when (and (not found)
+                    (process-live-p process)
+                    (equal key
+                           (tramp-rpc--connection-key
+                            (plist-get info :vec))))
+           (setq found t)))
+       table))
+    found))
+
+(defun tramp-rpc--tramp-cleanup-connection-advice
+    (original vec &optional keep-debug keep-password keep-processes)
+  "Preserve VEC's multiplexed transport when KEEP-PROCESSES is non-nil.
+ORIGINAL is `tramp-cleanup-connection'.  KEEP-DEBUG and KEEP-PASSWORD retain
+their TRAMP meanings.  A managed RPC process depends on the shared server
+transport, so allowing generic cleanup to delete that transport would defeat
+KEEP-PROCESSES and terminate every managed child."
+  (if (and keep-processes
+           (tramp-rpc--managed-file-name-p vec)
+           (tramp-rpc--connection-has-managed-processes-p vec))
+      (progn
+        (unless keep-password
+          (tramp-clear-passwd vec))
+        ;; Invalidate file-derived state without flushing the connection
+        ;; properties that own the live multiplexed transport.
+        (tramp-flush-directory-properties vec "/")
+        (tramp-rpc--clear-direnv-cache vec)
+        (tramp-rpc--clear-file-caches-for-connection vec)
+        nil)
+    (funcall original vec keep-debug keep-password keep-processes)))
+
 (defun tramp-rpc-cleanup-connection (vec)
   "Clean up TRAMP-RPC resources for connection VEC.
 This is called from `tramp-cleanup-connection-hook' after TRAMP's
@@ -3221,6 +3266,10 @@ responses, and RPC-specific caches (direnv, executable, file-exists,
     ;; processes, watches, connection hash, executable cache.
     ;; The redundant tramp-flush-* calls in disconnect are harmless.
     (tramp-rpc--disconnect vec)
+    ;; A direct SSH PTY can outlive an unexpectedly dead RPC generation and
+    ;; therefore may no longer be reachable through `tramp-rpc--disconnect'.
+    ;; Generic TRAMP cleanup is explicit ownership cleanup for those orphans.
+    (tramp-rpc--cleanup-pty-processes vec)
     ;; Clear RPC-specific caches for this connection.
     (tramp-rpc--clear-direnv-cache vec)
     (tramp-rpc--clear-file-caches-for-connection vec)
@@ -3254,6 +3303,8 @@ cleanup of all connections has run."
           (tramp-rpc--cleanup-controlmaster vec))))
     (clrhash tramp-rpc--watched-directories)
     (tramp-rpc--cleanup-file-notify-for-connection)
+    ;; Include direct SSH PTYs whose RPC generation died before global cleanup.
+    (tramp-rpc--cleanup-pty-processes)
     ;; Also kill orphaned auth buffers from failed connection attempts.
     (dolist (buf (buffer-list))
       (when (string-match-p "\\` \\*tramp-rpc-auth " (buffer-name buf))
@@ -3263,7 +3314,6 @@ cleanup of all connections has run."
         (kill-buffer buf)))
     (clrhash tramp-rpc--connections))
   ;; Clear all RPC-specific caches.
-  (tramp-rpc-protocol--clear-deferred-polls)
   (tramp-rpc--clear-direnv-cache)
   (tramp-rpc--clear-file-metadata-caches)
   ;; Note: recentf cleanup is handled by `tramp-recentf-cleanup-all'
@@ -3289,6 +3339,10 @@ cleanup of all connections has run."
 (defun tramp-rpc--install ()
   "Install TRAMP-RPC operations, advice, and lifecycle hooks."
   (tramp-rpc--install-core-external-operations)
+  (unless (advice-member-p #'tramp-rpc--tramp-cleanup-connection-advice
+                           'tramp-cleanup-connection)
+    (advice-add 'tramp-cleanup-connection :around
+                #'tramp-rpc--tramp-cleanup-connection-advice))
   (dolist (function '(tramp-get-connection-property
                       tramp-set-connection-property
                       tramp-flush-connection-property
@@ -3339,6 +3393,8 @@ Removes advice and cleans up async processes."
     (when (featurep feature)
       (unload-feature feature 'force)))
   ;; Remove multi-hop hook, property advice, and cleanup hooks.
+  (advice-remove 'tramp-cleanup-connection
+                 #'tramp-rpc--tramp-cleanup-connection-advice)
   (dolist (function '(tramp-get-connection-property
                       tramp-set-connection-property
                       tramp-flush-connection-property

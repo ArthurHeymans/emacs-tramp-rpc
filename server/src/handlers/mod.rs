@@ -192,8 +192,9 @@ async fn route(method: String, params: Value) -> HandlerResult {
         // Process operations
         "process.run" => process::run(params).await,
         "process.start" => process::start(params).await,
+        "process.subscribe" => process::subscribe(params).await,
+        "process.unsubscribe" => process::unsubscribe(params).await,
         "process.write" => process::write(params).await,
-        "process.read" => process::read(params).await,
         "process.status" => process::status(params).await,
         "process.close_stdin" => process::close_stdin(params).await,
         "process.kill" => process::kill(params).await,
@@ -202,7 +203,8 @@ async fn route(method: String, params: Value) -> HandlerResult {
 
         // PTY (pseudo-terminal) process operations
         "process.start_pty" => process::start_pty(params).await,
-        "process.read_pty" => process::read_pty(params).await,
+        "process.subscribe_pty" => process::subscribe_pty(params).await,
+        "process.unsubscribe_pty" => process::unsubscribe_pty(params).await,
         "process.write_pty" => process::write_pty(params).await,
         "process.resize_pty" => process::resize_pty(params).await,
         "process.kill_pty" => process::kill_pty(params).await,
