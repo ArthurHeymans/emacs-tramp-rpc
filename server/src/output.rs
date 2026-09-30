@@ -29,24 +29,25 @@ impl<W> FrameWriter<W> {
 }
 
 impl<W: AsyncWrite + Unpin> FrameWriter<W> {
-    /// The lock covers the entire frame, including its flush.  A failed write
-    /// may have emitted a partial frame: never append anything to that stream.
+    /// The lock covers the entire frame, including its flush.  Closing the
+    /// writer interrupts blocked writes and lock waiters; any partial frame
+    /// belongs to a permanently closed stream.
     pub async fn write_frame(&self, bytes: &[u8]) -> io::Result<()> {
         let length = u32::try_from(bytes.len())
             .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "Frame length exceeds u32"))?;
-        let mut writer = self.writer.lock().await;
-        if *self.failed.borrow() {
-            return Err(io::Error::new(
-                io::ErrorKind::BrokenPipe,
-                "RPC output closed",
-            ));
-        }
-        let result = async {
-            writer.write_all(&length.to_be_bytes()).await?;
-            writer.write_all(bytes).await?;
-            writer.flush().await
-        }
-        .await;
+        let mut closed = self.failure();
+        let result = tokio::select! {
+            biased;
+            _ = closed.wait_for(|failed| *failed) => {
+                Err(io::Error::new(io::ErrorKind::BrokenPipe, "RPC output closed"))
+            }
+            result = async {
+                let mut writer = self.writer.lock().await;
+                writer.write_all(&length.to_be_bytes()).await?;
+                writer.write_all(bytes).await?;
+                writer.flush().await
+            } => result,
+        };
         if result.is_err() {
             self.close();
         }
@@ -75,6 +76,32 @@ mod tests {
             bytes == b"\0\0\0\x05first\0\0\0\x06second"
                 || bytes == b"\0\0\0\x06second\0\0\0\x05first"
         );
+    }
+
+    #[tokio::test]
+    async fn close_interrupts_blocked_and_queued_frames() {
+        let (write, mut read) = tokio::io::duplex(4);
+        let writer = FrameWriter::new(write);
+        let first = writer.write_frame(b"blocked payload");
+        tokio::pin!(first);
+        let mut header = [0; 4];
+        tokio::select! {
+            result = &mut first => panic!("frame completed before its payload drained: {result:?}"),
+            _ = read.read_exact(&mut header) => {}
+        }
+        assert_eq!(u32::from_be_bytes(header), 15);
+        let queued = writer.write_frame(b"queued");
+        tokio::pin!(queued);
+        assert!(futures::poll!(&mut queued).is_pending());
+        // Leave the peer open but undrained.  Closure must not depend on it.
+        writer.close();
+        let (first, queued) = tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            tokio::join!(first, queued)
+        })
+        .await
+        .expect("closing the writer must unblock every frame");
+        assert_eq!(first.unwrap_err().kind(), io::ErrorKind::BrokenPipe);
+        assert_eq!(queued.unwrap_err().kind(), io::ErrorKind::BrokenPipe);
     }
 
     struct FailAfterHeader {

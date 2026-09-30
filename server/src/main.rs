@@ -380,6 +380,11 @@ where
         }
     }
 
+    // EOF makes output expendable too.  Wake blocked frame writers before
+    // joining output pushes, otherwise an undrained peer prevents child reaping.
+    let output_failed = *output_failure.borrow();
+    writer.close();
+
     // Once the transport is gone no response can be relied on.  Reap managed
     // children before joining request tasks: a task blocked on their pipes or
     // a descendant-held descriptor must not prevent SIGKILL escalation.
@@ -409,7 +414,7 @@ where
     drop(errors);
     let _ = tokio::time::timeout(EOF_TASK_JOIN_WAIT, error_writer).await;
     cleanup_result?;
-    if *output_failure.borrow() {
+    if output_failed {
         Err(RpcError::internal_error("RPC output disconnected"))
     } else {
         Ok(())
@@ -603,8 +608,20 @@ async fn accept_frame<W>(
     }
 }
 
-#[tokio::main]
-async fn main() -> std::process::ExitCode {
+fn main() -> std::process::ExitCode {
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .expect("create RPC runtime");
+    let exit = runtime.block_on(run_server());
+    // Stdio uses blocking workers that cannot be cancelled mid-syscall.  The
+    // connection has already reaped its children; an undrained stdout or open
+    // stdin must not hold process exit in the runtime's blocking-pool join.
+    runtime.shutdown_background();
+    exit
+}
+
+async fn run_server() -> std::process::ExitCode {
     let stdout: WriterHandle = Arc::new(FrameWriter::new(BufWriter::new(tokio::io::stdout())));
     handlers::process::init_notification_writer(Arc::clone(&stdout));
 

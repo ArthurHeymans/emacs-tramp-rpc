@@ -350,6 +350,23 @@ Returns a plist:
       (should (string-match-p "hello-stress"
                               (gethash pid (plist-get result :stdout)))))))
 
+(ert-deftest tramp-rpc-stress-test-eof-with-undrained-output ()
+  "Input EOF shuts the server down even while its output pipe is blocked."
+  (skip-unless (tramp-rpc-stress-test--find-server))
+  (tramp-rpc-stress-test--with-server
+    (tramp-rpc-stress-test--start-process "exec yes")
+    ;; A t filter stops Emacs from reading the pipe, rather than discarding
+    ;; received bytes.  Let the continuous output fill the kernel buffer.
+    (set-process-filter tramp-rpc-stress-test--server-process t)
+    (sleep-for 0.2)
+    (process-send-eof tramp-rpc-stress-test--server-process)
+    (let ((deadline (+ (float-time) 3.0)))
+      (while (and (process-live-p tramp-rpc-stress-test--server-process)
+                  (< (float-time) deadline))
+        (accept-process-output nil 0.02)))
+    (should-not (process-live-p tramp-rpc-stress-test--server-process))
+    (should (= 0 (process-exit-status tramp-rpc-stress-test--server-process)))))
+
 (ert-deftest tramp-rpc-stress-test-many-concurrent-processes ()
   "15 concurrent processes all deliver exit notifications."
   (skip-unless (tramp-rpc-stress-test--find-server))

@@ -1009,7 +1009,7 @@ Resolves program path and loads direnv environment from working directory."
                      (tramp-rpc--forget-managed-process local-process)
                      (remhash (process-get local-process :tramp-rpc-write-queue-key)
                               tramp-rpc--process-write-queues)
-                     (dolist (relay relays)
+                     (dolist (relay (list (car relays) (cdr relays)))
                        (when (processp relay)
                          (set-process-sentinel relay #'ignore)
                          (tramp-rpc--best-effort (delete-process relay))))

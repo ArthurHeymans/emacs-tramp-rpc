@@ -855,6 +855,46 @@ async fn test_output_failure_reaps_children_without_input_eof() {
 }
 
 #[tokio::test]
+async fn test_connection_eof_unblocks_output_and_reaps_children() {
+    let _test_lock = handlers::process::test_process_map_lock().await;
+    handlers::process::start(msgpack_map! {
+        "cmd" => "sleep", "args" => Value::Array(vec![Value::from("30")])
+    })
+    .await
+    .unwrap();
+    let child_pid = handlers::process::test_managed_os_pids().await[0];
+    let (client, reader) = tokio::io::duplex(4096);
+    let (output, mut output_peer) = tokio::io::duplex(4);
+    let writer = Arc::new(FrameWriter::new(output));
+    let connection = tokio::spawn(run_connection(reader, Arc::clone(&writer), None));
+    let notification = tokio::spawn(async move { writer.write_frame(b"undrained output").await });
+    let mut header = [0; 4];
+    tokio::time::timeout(
+        std::time::Duration::from_secs(1),
+        output_peer.read_exact(&mut header),
+    )
+    .await
+    .expect("notification should start writing")
+    .unwrap();
+    // Keep the output peer open without draining its payload.
+    drop(client);
+    tokio::time::timeout(std::time::Duration::from_secs(3), connection)
+        .await
+        .expect("input EOF must not depend on draining output")
+        .expect("connection task should not panic")
+        .expect("input EOF cleanup should succeed");
+    assert!(notification.await.unwrap().is_err());
+    assert!(handlers::process::test_managed_maps_empty().await);
+    assert!(matches!(
+        nix::sys::wait::waitpid(
+            nix::unistd::Pid::from_raw(child_pid),
+            Some(nix::sys::wait::WaitPidFlag::WNOHANG)
+        ),
+        Err(nix::errno::Errno::ECHILD)
+    ));
+}
+
+#[tokio::test]
 async fn test_connection_eof_second_cleanup_catches_late_registration() {
     let _test_lock = handlers::process::test_process_map_lock().await;
     let barrier = Arc::new(CleanupBarrier {

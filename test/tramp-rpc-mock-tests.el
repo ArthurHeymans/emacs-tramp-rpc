@@ -29,6 +29,9 @@
 (defvar tramp-rpc-mock-test--network-guard nil
   "Non-nil while mock selectors must not create network processes.")
 
+(defvar tramp-rpc-mock-test--isolate-tests nil
+  "Non-nil while a TRAMP-RPC mock selector is running.")
+
 (defun tramp-rpc-mock-test--guard-network (orig &rest args)
   "Reject network APIs while a mock selector is running."
   (if tramp-rpc-mock-test--network-guard
@@ -144,7 +147,8 @@ CI uses this instead of a bare `ert-run-tests-batch-and-exit' so a renamed
 tag, a load error, or a broken environment cannot turn a job green while
 it exercised no tests.  Skipped tests count as expected results in ERT, so
 the executed count excludes them."
-  (let* ((tests (ert-select-tests selector t))
+  (let* ((tramp-rpc-mock-test--isolate-tests t)
+         (tests (ert-select-tests selector t))
          (selected (length tests)))
     (unless (> selected 0)
       (error "ERT selector %S selected zero tests" selector))
@@ -2619,9 +2623,6 @@ direct property test would miss it."
         (when (process-live-p process) (delete-process process)))
       (dolist (buffer (list buffer-a buffer-b))
         (when (buffer-live-p buffer) (kill-buffer buffer))))))
-
-(defvar tramp-rpc-mock-test--isolate-tests nil
-  "Non-nil while a TRAMP-RPC mock selector is running.")
 
 (defun tramp-rpc-mock-test--run-isolated (run-test test)
   "Run a selected mock TEST with no state shared with other mock tests."
