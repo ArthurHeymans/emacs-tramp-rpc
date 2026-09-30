@@ -758,8 +758,25 @@ pub async fn write_pty(params: Value) -> HandlerResult {
     })
 }
 
-pub(super) async fn wait_pty_pid(child_pid: Pid) -> Result<Option<ExitStatus>, nix::errno::Errno> {
+pub(super) async fn wait_pty_pid(
+    child_pid: Pid,
+    discard_output: Option<&OwnedFd>,
+) -> Result<Option<ExitStatus>, nix::errno::Errno> {
     loop {
+        if let Some(fd) = discard_output {
+            // Darwin can wait in ttywait during exit, even after SIGKILL, until
+            // the master consumes pending output.  Explicit close/SIGKILL opts
+            // out of delivery; ordinary signals must leave that output intact.
+            // Bound each drain so an active descendant cannot starve the reap.
+            let mut buffer = [0; 4096];
+            for _ in 0..16 {
+                match rustix::io::read(fd, &mut buffer) {
+                    Ok(0) => break,
+                    Ok(_) | Err(rustix::io::Errno::INTR) => {}
+                    Err(_) => break,
+                }
+            }
+        }
         match waitpid(child_pid, Some(WaitPidFlag::WNOHANG)) {
             Ok(status @ (WaitStatus::Exited(..) | WaitStatus::Signaled(..))) => {
                 return Ok(Some(exit_status_from_wait_status(status)));
@@ -786,7 +803,7 @@ pub(super) async fn retire_pty_process(pid: u32, os_pid: u32) {
         && managed.exit_status.is_none()
     {
         tokio::spawn(async move {
-            let _ = wait_pty_pid(Pid::from_raw(os_pid as i32)).await;
+            let _ = wait_pty_pid(Pid::from_raw(os_pid as i32), None).await;
         });
     }
 }
@@ -868,12 +885,25 @@ pub(super) async fn terminate_pty_process(
         return Ok(true);
     }
 
+    let discard_fd = if remove {
+        get_pty_process_map()
+            .lock()
+            .await
+            .get(&pid)
+            .map(|managed| dup_cloexec(managed.async_fd.get_ref()))
+            .transpose()
+            .map_err(|error| {
+                RpcError::process_error(format!("Failed to duplicate closing PTY: {error}"))
+            })?
+    } else {
+        None
+    };
     let mut reap = if cached.is_some() {
         cached
     } else {
         tokio::time::timeout(
             MANAGED_PTY_CHILD_WAIT,
-            wait_pty_pid(Pid::from_raw(os_pid as i32)),
+            wait_pty_pid(Pid::from_raw(os_pid as i32), discard_fd.as_ref()),
         )
         .await
         .ok()
@@ -900,7 +930,7 @@ pub(super) async fn terminate_pty_process(
         // later test or connection.
         reap = match tokio::time::timeout(
             MANAGED_PTY_CHILD_WAIT,
-            wait_pty_pid(Pid::from_raw(os_pid as i32)),
+            wait_pty_pid(Pid::from_raw(os_pid as i32), discard_fd.as_ref()),
         )
         .await
         {

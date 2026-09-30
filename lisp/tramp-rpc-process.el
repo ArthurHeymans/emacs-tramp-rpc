@@ -92,8 +92,9 @@ Value is a plist with :vec, :pid.")
 
 (defun tramp-rpc--track-managed-process
     (process vec pid connection pty &optional stderr-buffer stderr-process)
-  "Register PROCESS with PID on the exact CONNECTION used to start it.
+  "Register PROCESS with PID on VEC using its starting CONNECTION.
 PTY selects the RPC PTY index; direct SSH PTYs are registered separately.
+STDERR-BUFFER and STDERR-PROCESS identify the optional separate stderr relay.
 Terminal status remains on PROCESS after its live index entry is removed."
   (process-put process :tramp-rpc-vec vec)
   (process-put process :tramp-rpc-pid pid)

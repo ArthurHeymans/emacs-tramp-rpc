@@ -2093,13 +2093,25 @@ async fn close_pty_is_idempotent_and_reaps_child() {
             Value::String("args".into()),
             Value::Array(vec![
                 Value::String("-c".into()),
-                Value::String("printf pending; sleep 30".into()),
+                // Opening /dev/tty makes Darwin drain output during child exit.
+                Value::String("exec 3>/dev/tty; printf pending; sleep 30".into()),
             ]),
         ),
     ]))
     .await
     .expect("start pty");
     let pid = map_get(&start, "pid").and_then(Value::as_u64).unwrap() as u32;
+    let os_pid = map_get(&start, "os_pid").and_then(Value::as_i64).unwrap() as i32;
+    // Leave the output unread: close must discard it while reaping, rather than
+    // waiting for the child to exit before it can consume the slave's buffer.
+    assert!(
+        tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            wait_for_pty_readable(pid)
+        )
+        .await
+        .expect("pending PTY output")
+    );
     close_pty(Value::Map(vec![(
         Value::String("pid".into()),
         Value::Integer(pid.into()),
@@ -2113,6 +2125,7 @@ async fn close_pty_is_idempotent_and_reaps_child() {
     .await
     .expect("second close");
     assert!(!get_pty_process_map().lock().await.contains_key(&pid));
+    assert_reaped(os_pid);
 }
 
 #[tokio::test]
