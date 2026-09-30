@@ -482,7 +482,7 @@ PID is the remote process ID."
 Entries are (TRANSPORT PID METHOD . PARAMS).")
 
 (defmacro tramp-rpc--with-process-start (&rest body)
-  "Run BODY, which starts a managed process and registers its relay.
+  "Run BODY to start a managed process and register its relay.
 The server pushes output as soon as the start response is written, so that
 output can be handled together with the response, before BODY registers the
 relay.  Notifications for unknown PIDs are therefore kept while BODY runs
