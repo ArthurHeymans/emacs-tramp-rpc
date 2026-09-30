@@ -61,6 +61,8 @@ SPEC is (PROCESS BUFFER [CONNECTION]); CONNECTION defaults to `connection'."
   "A timed out synchronous ID is not buffered when its response arrives late."
   (tramp-rpc-mock-test-request--with-connection (process buffer)
     (let ((clock (tramp-rpc-mock-test-request--timeout-clock))
+          ;; Probe behavior is tested separately; this models a live server.
+          (tramp-rpc--probing-connection t)
           (vec (tramp-rpc-mock-test-request--vec))
           (tramp-rpc--connections (make-hash-table :test 'equal))
           invalidated)
@@ -86,28 +88,55 @@ SPEC is (PROCESS BUFFER [CONNECTION]); CONNECTION defaults to `connection'."
         (should (zerop (hash-table-count
                         (tramp-rpc-connection-pending-responses connection))))))))
 
-(ert-deftest tramp-rpc-mock-test-request-id-less-error-reaches-oldest-waiter ()
-  "An id-less protocol error must wake the oldest synchronous waiter.
-The server answers an oversized or malformed frame with an error that has no
-id.  Discarding it leaves that waiter to burn the whole call timeout and
-tear down the connection."
+(ert-deftest tramp-rpc-mock-test-request-id-less-error-retires-generation ()
+  "An uncorrelated error fails all callers rather than guessing a request ID."
+  (dolist (synchronous '(nil t))
+    (tramp-rpc-mock-test-request--with-connection (process buffer)
+      (when synchronous
+        (tramp-rpc--track-pending-request connection 202)
+        (tramp-rpc--track-pending-request connection 101))
+      (let ((messages (list '(:id nil :error (:code -32600
+                                              :message "frame too large"))
+                            '(:id 101 :result late)))
+            callback-response)
+        (puthash 303 (lambda (response) (setq callback-response response))
+                 (tramp-rpc-connection-async-callbacks connection))
+        (cl-letf (((symbol-function 'tramp-rpc-protocol-try-read-message)
+                   (lambda (_buffer)
+                     (set-marker (mark-marker) (point-max))
+                     (pop messages))))
+          (tramp-rpc--connection-filter process "error"))
+        (should-not (process-live-p process))
+        (should (tramp-rpc-connection-transport-dead connection))
+        (should (eq (tramp-rpc-connection-cleanup-reason connection)
+                    :protocol-error))
+        (should (string-match-p "frame too large"
+                                (tramp-rpc-connection-cleanup-event connection)))
+        (should (= -32098 (plist-get (plist-get callback-response :error) :code)))
+        (should (zerop (hash-table-count
+                        (tramp-rpc-connection-async-callbacks connection))))
+        (dolist (id (tramp-rpc-connection-pending-ids connection))
+          (should (= -32098
+                     (plist-get
+                      (plist-get (gethash id (tramp-rpc-connection-pending-responses
+                                              connection)) :error)
+                      :code))))))))
+
+(ert-deftest tramp-rpc-mock-test-request-timeout-probe-uses-captured-generation ()
+  "The timeout probe uses the reserved ping method on the original transport."
   (tramp-rpc-mock-test-request--with-connection (process buffer)
-    ;; Track order is newest-first, so 202 is the oldest waiter.
-    (tramp-rpc--track-pending-request connection 202)
-    (tramp-rpc--track-pending-request connection 101)
-    (let ((messages (list '(:id nil :error (:code -32600
-                                            :message "frame too large")))))
-      (cl-letf (((symbol-function 'tramp-rpc-protocol-try-read-message)
-                 (lambda (_buffer)
-                   (set-marker (mark-marker) (point-max))
-                   (pop messages))))
-        (tramp-rpc--connection-filter process "error")))
-    (should (equal (plist-get (gethash 202 (tramp-rpc-connection-pending-responses
-                                            connection))
-                              :error)
-                   '(:code -32600 :message "frame too large")))
-    (should-not (gethash 101 (tramp-rpc-connection-pending-responses
-                              connection)))))
+    (let ((vec (tramp-rpc-mock-test-request--vec))
+          (tramp-rpc--probing-connection nil)
+          probed invalidated)
+      (cl-letf (((symbol-function 'tramp-rpc--call-with-timeout)
+                 (lambda (_vec method _params _timeout _interval conn)
+                   (setq probed (list method conn))
+                   (signal 'remote-file-error '("dead tunnel"))))
+                ((symbol-function 'tramp-rpc--invalidate-timed-out-connection)
+                 (lambda (transport _vec _event) (setq invalidated transport))))
+        (tramp-rpc--probe-live-connection vec connection process "test"))
+      (should (equal probed (list "system.ping" connection)))
+      (should (eq invalidated process)))))
 
 (ert-deftest tramp-rpc-mock-test-stderr-buffer-is-bounded ()
   "Long-lived SSH stderr output must not grow without bound."
@@ -421,6 +450,7 @@ tear down the connection."
     (let* ((vec (tramp-rpc-mock-test-request--vec))
            (connection connection)
            (clock (tramp-rpc-mock-test-request--timeout-clock))
+           (tramp-rpc--probing-connection t)
            (tramp-rpc--connections (make-hash-table :test 'equal))
            (tramp-rpc--async-processes (make-hash-table :test 'eq))
            (managed-process
@@ -688,7 +718,8 @@ The helper also verifies that the output payload in the notification is queued."
 (ert-deftest tramp-rpc-mock-test-request-batch-timeout-cleans-id ()
   "A batch timeout releases its request ID and response table."
   (tramp-rpc-mock-test-request--with-connection (process buffer)
-    (let ((vec (tramp-rpc-mock-test-request--vec))
+    (let ((tramp-rpc--probing-connection t)
+          (vec (tramp-rpc-mock-test-request--vec))
           (tramp-rpc--connections (make-hash-table :test 'equal))
           invalidated)
       (cl-letf (((symbol-function 'tramp-rpc--ensure-connection)

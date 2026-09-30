@@ -46,7 +46,7 @@ pub(crate) const MAX_RESPONSE_OUTPUT_BYTES: usize = MAX_FRAME_SIZE - 1024 * 1024
 const FRAME_CHANNEL_SIZE: usize = 2;
 const GENERAL_TASK_LIMIT: usize = 16;
 const CONTROL_TASK_LIMIT: usize = 4;
-const PTY_WRITE_TASK_LIMIT: usize = 16;
+const PROCESS_WRITE_TASK_LIMIT: usize = 16;
 /// How many decoded-but-not-yet-started requests are buffered before the
 /// connection stops reading frames.  Past this point the bounded frame
 /// channel and the OS pipe throttle the client, which is the only
@@ -139,13 +139,13 @@ async fn read_frames<R>(
 enum TaskClass {
     General,
     Control,
-    PtyWrite,
+    ProcessWrite,
 }
 
 struct Admissions {
     general: Arc<Semaphore>,
     control: Arc<Semaphore>,
-    pty_write: Arc<Semaphore>,
+    process_write: Arc<Semaphore>,
 }
 
 impl Admissions {
@@ -158,7 +158,7 @@ impl Admissions {
         match class {
             TaskClass::General => &self.general,
             TaskClass::Control => &self.control,
-            TaskClass::PtyWrite => &self.pty_write,
+            TaskClass::ProcessWrite => &self.process_write,
         }
     }
 
@@ -178,24 +178,24 @@ impl Default for Admissions {
         Self {
             general: Arc::new(Semaphore::new(GENERAL_TASK_LIMIT)),
             control: Arc::new(Semaphore::new(CONTROL_TASK_LIMIT)),
-            pty_write: Arc::new(Semaphore::new(PTY_WRITE_TASK_LIMIT)),
+            process_write: Arc::new(Semaphore::new(PROCESS_WRITE_TASK_LIMIT)),
         }
     }
 }
 
 fn task_class(method: &str) -> TaskClass {
-    // These operations only signal or close a process.  Keep them available
-    // while long-running general requests consume their slots.
+    // Keep lifecycle operations and connection probes available while
+    // long-running general requests consume their slots.
     match method {
-        "process.kill"
+        "system.ping"
+        | "process.kill"
         | "process.signal"
         | "process.close_stdin"
         | "process.kill_pty"
         | "process.close_pty" => TaskClass::Control,
-        // PTY writes can remain blocked until the remote program reads input.
-        // Isolate them so they cannot consume every general request permit;
-        // lifecycle operations retain their separately reserved control slots.
-        "process.write_pty" => TaskClass::PtyWrite,
+        // Pipe and PTY writes can remain blocked until the program reads input.
+        // Neither may consume the general or lifecycle-operation slots.
+        "process.write" | "process.write_pty" => TaskClass::ProcessWrite,
         _ => TaskClass::General,
     }
 }
@@ -434,7 +434,7 @@ async fn drain_tasks_for(tasks: &mut JoinSet<()>, wait: std::time::Duration) {
 struct AdmissionPass {
     general_waiting: bool,
     control_blocked: bool,
-    pty_write_blocked: bool,
+    process_write_blocked: bool,
 }
 
 impl AdmissionPass {
@@ -443,7 +443,7 @@ impl AdmissionPass {
         match class {
             TaskClass::General => false,
             TaskClass::Control => self.control_blocked,
-            TaskClass::PtyWrite => self.pty_write_blocked,
+            TaskClass::ProcessWrite => self.process_write_blocked,
         }
     }
 
@@ -466,7 +466,7 @@ impl AdmissionPass {
                 self.general_waiting = true;
             }
             TaskClass::Control => self.control_blocked = true,
-            TaskClass::PtyWrite => self.pty_write_blocked = true,
+            TaskClass::ProcessWrite => self.process_write_blocked = true,
         }
     }
 }

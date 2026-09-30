@@ -1268,7 +1268,8 @@ This matches the behavior expected by `tramp-test28-process-file'."
 
 (ert-deftest tramp-rpc-mock-test-pipelined-timeout-preserves-connection ()
   "A live connection remains reusable after a pipeline response timeout."
-  (let* ((buffer (generate-new-buffer " *tramp-rpc-pipeline-test*"))
+  (let* ((tramp-rpc--probing-connection t)
+         (buffer (generate-new-buffer " *tramp-rpc-pipeline-test*"))
          (process (make-pipe-process :name "tramp-rpc-pipeline-test"
                                      :buffer buffer :noquery t))
          (vec (tramp-dissect-file-name "/rpc:mock:/tmp/"))
@@ -1992,6 +1993,32 @@ async callbacks and local relays leaked."
           (cl-letf (((symbol-function 'tramp-rpc--best-effort) #'ignore))
             (tramp-rpc--handle-pty-exit process -1))
           (should (= calls 1)))
+      (when (process-live-p process) (delete-process process)))))
+
+(ert-deftest tramp-rpc-mock-test-pty-sentinel-reentry-kills-once ()
+  "Sentinel reentry during a kill wait must not send a second remote kill."
+  (let* ((process (make-pipe-process :name "pty-sentinel-reentry" :noquery t))
+         (tramp-rpc--pty-processes (make-hash-table :test 'eq))
+         (vec (tramp-dissect-file-name "/rpc:mock:/tmp/"))
+         (kills 0)
+         (user-calls 0))
+    (unwind-protect
+        (progn
+          (process-put process :tramp-rpc-user-sentinel
+                       (lambda (_process _event) (cl-incf user-calls)))
+          (puthash process (list :vec vec :pid 42) tramp-rpc--pty-processes)
+          (cl-letf (((symbol-function 'process-status) (lambda (_) 'signal))
+                    ((symbol-function 'tramp-rpc--call)
+                     (lambda (_vec method _params &optional _connection)
+                       (should (equal method "process.kill_pty"))
+                       (cl-incf kills)
+                       (when (= kills 1)
+                         (tramp-rpc--pty-sentinel process "killed\n"))
+                       t)))
+            (tramp-rpc--pty-sentinel process "killed\n"))
+          (should (= kills 1))
+          (should (= user-calls 1))
+          (should-not (gethash process tramp-rpc--pty-processes)))
       (when (process-live-p process) (delete-process process)))))
 
 (ert-deftest tramp-rpc-mock-test-transport-death-wakes-sync-call ()

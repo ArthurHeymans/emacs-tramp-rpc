@@ -251,16 +251,42 @@ async fn test_new_general_requests_share_bounded_batch_bypass_budget() {
 }
 
 #[test]
-fn test_blocked_pty_writes_use_dedicated_admission() {
+fn test_blocked_process_writes_use_dedicated_admission() {
+    for method in ["process.write", "process.write_pty"] {
+        let admissions = Admissions::default();
+        let _writes = admissions
+            .try_acquire_many(task_class(method), PROCESS_WRITE_TASK_LIMIT)
+            .expect("reserve every write permit");
+
+        assert_eq!(task_class(method), TaskClass::ProcessWrite);
+        assert!(admissions.try_acquire(TaskClass::General).is_some());
+        assert!(
+            admissions
+                .try_acquire(task_class("process.signal"))
+                .is_some()
+        );
+        assert!(admissions.try_acquire(task_class("system.ping")).is_some());
+    }
+}
+
+#[tokio::test]
+async fn test_connection_probe_responds_with_general_slots_occupied() {
     let admissions = Admissions::default();
     let _general = admissions
         .try_acquire_many(TaskClass::General, GENERAL_TASK_LIMIT)
         .expect("reserve every general permit");
-
-    assert_eq!(task_class("process.write_pty"), TaskClass::PtyWrite);
-    assert_eq!(task_class("process.signal"), TaskClass::Control);
-    assert!(admissions.try_acquire(TaskClass::PtyWrite).is_some());
-    assert!(admissions.try_acquire(TaskClass::Control).is_some());
+    assert_eq!(task_class("system.ping"), TaskClass::Control);
+    let _probe = admissions.try_acquire(task_class("system.ping")).unwrap();
+    let request = protocol::Request {
+        version: "2.0".into(),
+        id: RequestId::Number(1),
+        method: "system.ping".into(),
+        params: Value::Nil,
+    };
+    assert_eq!(
+        handlers::dispatch(request).await.result,
+        Some(Value::Boolean(true))
+    );
 }
 
 /// Malformed frames must always be answered.  A dropped response leaves

@@ -1368,18 +1368,20 @@ EVENT is the process event string."
     (when-let* ((info (gethash process tramp-rpc--pty-processes)))
       (tramp-rpc--cancel-process-timers tramp-rpc--pty-processes process)
       ;; A transport cleanup already requested/closed the remote PTY.
-      (unless (or (process-get process :tramp-rpc-exited)
-                  (process-get process :tramp-rpc-remote-exited)
-                  (process-get process :tramp-rpc-transport-cleanup)
-                  (tramp-rpc--transport-dead-p
-                   (plist-get info :connection-process)))
-        (when-let* ((vec (plist-get info :vec))
-                    (pid (plist-get info :pid)))
+      (let ((kill-remote
+             (not (or (process-get process :tramp-rpc-exited)
+                      (process-get process :tramp-rpc-remote-exited)
+                      (process-get process :tramp-rpc-transport-cleanup)
+                      (tramp-rpc--transport-dead-p
+                       (plist-get info :connection-process))))))
+        ;; As for pipe relays, mark terminal before the synchronous kill wait
+        ;; can re-enter this sentinel.
+        (process-put process :tramp-rpc-exited t)
+        (when (and kill-remote (plist-get info :vec) (plist-get info :pid))
           (tramp-rpc--best-effort
-            (tramp-rpc--call vec "process.kill_pty"
-                             `((pid . ,pid) (signal . 9))
+            (tramp-rpc--call (plist-get info :vec) "process.kill_pty"
+                             `((pid . ,(plist-get info :pid)) (signal . 9))
                              (process-get process :tramp-rpc-connection)))))
-      (process-put process :tramp-rpc-exited t)
       (tramp-rpc--call-user-sentinel-once
        process (process-get process :tramp-rpc-user-sentinel)
        (tramp-rpc--remote-exit-event process event))

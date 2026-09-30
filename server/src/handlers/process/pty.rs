@@ -1052,7 +1052,9 @@ pub async fn kill_pty(params: Value) -> HandlerResult {
         signal,
         false,
         signal == libc::SIGKILL,
-        signal == libc::SIGKILL,
+        // The terminal notification consumes this status; no subsequent
+        // polling read or close will release a retained entry.
+        false,
     )
     .await
     {

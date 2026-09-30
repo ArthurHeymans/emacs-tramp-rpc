@@ -1336,7 +1336,8 @@ async fn pty_sigint_survival_keeps_subsequent_writes_open() {
 
     let mut output = Vec::new();
     let mut exited = false;
-    for _ in 0..40 {
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+    while tokio::time::Instant::now() < deadline {
         let read = read_pty(Value::Map(vec![
             (Value::String("pid".into()), Value::Integer(pid.into())),
             (
@@ -1353,6 +1354,9 @@ async fn pty_sigint_survival_keeps_subsequent_writes_open() {
         if exited {
             break;
         }
+        // EOF readiness can remain set before waitpid observes the exit.
+        // Give the child time to finish instead of exhausting a poll count.
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
     }
     assert!(
         output
@@ -1484,42 +1488,48 @@ async fn pty_sigkill_publishes_status_for_in_flight_read_after_removal() {
 }
 
 #[tokio::test]
-async fn pty_sigkill_retains_status_for_follow_up_read() {
+async fn pty_sigkill_does_not_retain_notified_status() {
     let _test_lock = test_process_map_lock().await;
-    let start = start_pty(Value::Map(vec![
-        (Value::String("cmd".into()), Value::String("sleep".into())),
-        (
-            Value::String("args".into()),
-            Value::Array(vec![Value::String("30".into())]),
-        ),
-    ]))
-    .await
-    .expect("start PTY");
-    let pid = map_get(&start, "pid").and_then(Value::as_u64).unwrap() as u32;
-
-    kill_pty(Value::Map(vec![
-        (Value::String("pid".into()), Value::Integer(pid.into())),
-        (
-            Value::String("signal".into()),
-            Value::Integer((libc::SIGKILL as i64).into()),
-        ),
-    ]))
-    .await
-    .expect("SIGKILL PTY");
-    assert!(!get_pty_process_map().lock().await.contains_key(&pid));
-
-    let read = read_pty(Value::Map(vec![(
-        Value::String("pid".into()),
-        Value::Integer(pid.into()),
-    )]))
-    .await
-    .expect("read retained PTY status");
-    assert_eq!(map_get(&read, "exited"), Some(&Value::Boolean(true)));
-    assert_eq!(
-        map_get(&read, "exit_code").and_then(Value::as_i64),
-        Some(128 + libc::SIGKILL as i64)
-    );
-    assert_eq!(take_terminated_pty_status(pid), None);
+    // Include kills before the push starts, as well as push-only clients
+    // which never issue a follow-up read or close.
+    for pushing in [false, true, true, true] {
+        let start = start_pty(Value::Map(vec![
+            (Value::String("cmd".into()), Value::String("sleep".into())),
+            (
+                Value::String("args".into()),
+                Value::Array(vec![Value::String("30".into())]),
+            ),
+        ]))
+        .await
+        .expect("start PTY");
+        let pid = map_get(&start, "pid").and_then(Value::as_u64).unwrap() as u32;
+        let shared = Arc::clone(
+            &get_pty_process_map()
+                .lock()
+                .await
+                .get(&pid)
+                .unwrap()
+                .shared_exit_status,
+        );
+        if pushing {
+            start_output_push(pid).await;
+        }
+        kill_pty(Value::Map(vec![
+            (Value::String("pid".into()), Value::Integer(pid.into())),
+            (
+                Value::String("signal".into()),
+                Value::Integer((libc::SIGKILL as i64).into()),
+            ),
+        ]))
+        .await
+        .expect("SIGKILL PTY");
+        assert!(!get_pty_process_map().lock().await.contains_key(&pid));
+        assert_eq!(
+            shared.lock().unwrap().unwrap().signal(),
+            Some(libc::SIGKILL)
+        );
+        assert_eq!(take_terminated_pty_status(pid), None);
+    }
 }
 
 #[tokio::test]

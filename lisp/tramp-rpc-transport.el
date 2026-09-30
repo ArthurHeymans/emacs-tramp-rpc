@@ -1753,22 +1753,17 @@ Uses length-prefixed binary framing: <4-byte BE length><msgpack payload>."
                           (puthash id response
                                    (tramp-rpc-connection-pending-responses
                                     conn)))
-                         ;; The server answers oversized frames and parse
-                         ;; errors with an id-less error response.  Deliver it
-                         ;; to the oldest waiter instead of discarding it:
-                         ;; otherwise that waiter burns the full call timeout
-                         ;; and tears the connection down with no diagnosis.
+                         ;; An error without an ID cannot be correlated with
+                         ;; concurrent requests.  Fail the whole generation,
+                         ;; including async callers, rather than guess a waiter.
                          ((and (null id) (plist-get response :error))
-                          (when-let* ((oldest
-                                       (car (last
-                                             (tramp-rpc-connection-pending-ids
-                                              conn)))))
-                            (tramp-rpc--debug
-                             "FILTER delivering id-less error to id=%s: %S"
-                             oldest (plist-get response :error))
-                            (puthash oldest response
-                                     (tramp-rpc-connection-pending-responses
-                                      conn))))
+                          (let ((event (format "Uncorrelated RPC error: %S"
+                                               (plist-get response :error))))
+                            (tramp-rpc--cleanup-connection-generation
+                             process (tramp-rpc-connection-vec conn)
+                             event :protocol-error nil)
+                            (when (process-live-p process)
+                              (delete-process process))))
                          ((plist-get response :error)
                           (tramp-rpc--debug
                            "FILTER dropping unmatched error response: %S"
@@ -1838,7 +1833,7 @@ METHOD names the timed-out call for logging."
     (tramp-rpc--debug "PROBE after timeout on method=%s" method)
     (condition-case _err
         (let ((tramp-rpc--probing-connection t))
-          (tramp-rpc--call-with-timeout vec "process.list" nil 10 0.01 conn))
+          (tramp-rpc--call-with-timeout vec "system.ping" nil 10 0.01 conn))
       (remote-file-error
        (tramp-rpc--debug "PROBE failed; invalidating connection for method=%s" method)
        (tramp-rpc--invalidate-timed-out-connection

@@ -422,6 +422,31 @@ Returns a plist:
       (should-error (tramp-rpc-stress-test--rpc-call
                      "process.close_stdin" `((pid . ,pid)))))))
 
+(ert-deftest tramp-rpc-stress-test-blocked-pipe-writes-preserve-metadata ()
+  "Blocked stdin writes must not exhaust the general request pool."
+  (skip-unless (tramp-rpc-stress-test--find-server))
+  (tramp-rpc-stress-test--with-server
+    (let ((pids (cl-loop repeat 16 collect
+                         (tramp-rpc-stress-test--start-process "exec sleep 30")))
+          (payload (msgpack-bin-make (make-string (* 1024 1024) ?A))))
+      (unwind-protect
+          (progn
+            ;; 1 MiB exceeds pipe capacity even on hosts with enlarged pipes.
+            (dolist (pid pids)
+              (tramp-rpc-stress-test--send
+               "process.write" `((pid . ,pid) (data . ,payload))))
+            (should (tramp-rpc-stress-test--rpc-call
+                     "file.stat" `((path . ,tramp-rpc-stress-test--temp-dir)) 3))
+            (should (tramp-rpc-stress-test--rpc-call "system.ping" nil 3))
+            ;; None of the writes should have completed to free a slot.
+            (should (zerop (hash-table-count
+                            (plist-get (tramp-rpc-stress-test--drain-messages 0.1)
+                                       :responses)))))
+        (dolist (pid pids)
+          (ignore-errors
+            (tramp-rpc-stress-test--rpc-call
+             "process.kill" `((pid . ,pid) (signal . 9)))))))))
+
 (ert-deftest tramp-rpc-stress-test-write-then-exit ()
   "Write to stdin of a started process; all stdout bytes arrive."
   (skip-unless (tramp-rpc-stress-test--find-server))

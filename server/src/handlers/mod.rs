@@ -229,7 +229,8 @@ async fn route(method: String, params: Value) -> HandlerResult {
         "process.kill_pty" => process::kill_pty(params).await,
         "process.close_pty" => process::close_pty(params).await,
 
-        // System info
+        // System info and a lightweight, reserved-slot connection probe.
+        "system.ping" => Ok(Value::Boolean(true)),
         "system.info" => system::system_info().await,
         "system.statvfs" => system::system_statvfs(params).await,
         "system.groups" => system::system_groups().await,

@@ -306,6 +306,7 @@ The dispatcher exposes these public methods:
 | PTY | ~process.resize_pty~ | Resize a pseudo-terminal. |
 | PTY | ~process.kill_pty~ | Signal a pseudo-terminal process. |
 | PTY | ~process.close_pty~ | Close a pseudo-terminal process. |
+| System | ~system.ping~ | Probe the connection using reserved control capacity. |
 | System | ~system.info~ | Return server and host information. |
 | System | ~system.statvfs~ | Return filesystem capacity information. |
 | System | ~system.groups~ | Return supplementary groups. |
