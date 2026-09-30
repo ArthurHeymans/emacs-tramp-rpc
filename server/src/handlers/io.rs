@@ -410,13 +410,7 @@ async fn canonicalize_existing_ancestor(path: &Path) -> std::io::Result<PathBuf>
     }
 }
 
-/// Copy SRC to DEST through a temporary file in DEST's directory.
-///
-/// `fs::copy' opens the destination with create+truncate, so checking the
-/// destination first and then copying is a TOCTOU: a file created in between
-/// is silently clobbered even when the caller asked not to overwrite.  Copy
-/// to a sibling temp file, apply metadata there, then rename it into place
-/// (atomically replacing or atomically refusing, depending on OVERWRITE).
+/// Copy SRC to DEST, atomically refusing an existing no-overwrite destination.
 ///
 /// Overwriting keeps `fs::copy' semantics: it follows a destination symlink
 /// and truncates the link target, matching Emacs `copy-file' and the previous
@@ -440,40 +434,40 @@ async fn copy_file_atomically(
     // first so a missing source does not leave an empty destination behind,
     // then write and apply metadata through the returned handle, so replacing
     // DEST with a symlink cannot redirect the chmod/utimes.
-    let metadata = fs::metadata(src).await?;
-    let mut source = fs::File::open(src).await?;
-    let dest_for_open = dest.to_path_buf();
-    let file = tokio::task::spawn_blocking(move || {
+    let src = src.to_path_buf();
+    let dest = dest.to_path_buf();
+    tokio::task::spawn_blocking(move || {
         use std::os::unix::fs::OpenOptionsExt;
-        std::fs::OpenOptions::new()
+
+        let mut source = std::fs::File::open(src)?;
+        let metadata = source.metadata()?;
+        let mut target = std::fs::OpenOptions::new()
             .write(true)
             .create_new(true)
             .custom_flags(libc::O_NOFOLLOW)
-            .open(&dest_for_open)
+            .open(&dest)
+            .map_err(|error| {
+                if error.kind() == std::io::ErrorKind::AlreadyExists {
+                    already_exists(&dest)
+                } else {
+                    error
+                }
+            })?;
+        // File-to-file std::io::copy can use kernel copy offload.  Keep the
+        // entire copy on one blocking worker rather than hopping per chunk.
+        let copied = match std::io::copy(&mut source, &mut target) {
+            Ok(copied) => copied,
+            Err(error) => {
+                drop(target);
+                let _ = std::fs::remove_file(&dest);
+                return Err(error);
+            }
+        };
+        apply_copied_metadata_fd(&metadata, &target, options)?;
+        Ok(copied)
     })
     .await
     .map_err(std::io::Error::other)?
-    .map_err(|error| {
-        if error.kind() == std::io::ErrorKind::AlreadyExists {
-            already_exists(dest)
-        } else {
-            error
-        }
-    })?;
-    let mut target = fs::File::from_std(file);
-    let copied = match tokio::io::copy(&mut source, &mut target).await {
-        Ok(copied) => copied,
-        Err(error) => {
-            drop(target);
-            let _ = fs::remove_file(dest).await;
-            return Err(error);
-        }
-    };
-    target.flush().await?;
-    let std_target = target.into_std().await;
-    apply_copied_metadata_fd(&metadata, &std_target, options).await?;
-    drop(std_target);
-    Ok(copied)
 }
 
 async fn prepare_symlink_destination(path: &Path, overwrite: bool) -> std::io::Result<()> {
@@ -535,12 +529,11 @@ async fn apply_copied_metadata(
 /// that can write the destination directory swap in a symlink and have the
 /// source-controlled metadata applied to its target.  `fchmod'/`futimens' on
 /// the handle created by the copy cannot be redirected.
-async fn apply_copied_metadata_fd(
+fn apply_copied_metadata_fd(
     src_meta: &std::fs::Metadata,
     file: &std::fs::File,
     options: CopyOptions,
 ) -> std::io::Result<()> {
-    let file = file.try_clone()?;
     // `fs::copy' always copies the permission bits; mirror that.
     let permissions = src_meta.permissions();
     let (atime, atime_nsec, mtime, mtime_nsec) = {
@@ -552,26 +545,22 @@ async fn apply_copied_metadata_fd(
             src_meta.mtime_nsec(),
         )
     };
-    tokio::task::spawn_blocking(move || {
-        file.set_permissions(permissions)?;
-        if options.preserve_times {
-            use rustix::fs::{Timespec, Timestamps};
-            let times = Timestamps {
-                last_access: Timespec {
-                    tv_sec: atime,
-                    tv_nsec: atime_nsec,
-                },
-                last_modification: Timespec {
-                    tv_sec: mtime,
-                    tv_nsec: mtime_nsec,
-                },
-            };
-            rustix::fs::futimens(&file, &times).map_err(std::io::Error::from)?;
-        }
-        Ok(())
-    })
-    .await
-    .map_err(std::io::Error::other)?
+    file.set_permissions(permissions)?;
+    if options.preserve_times {
+        use rustix::fs::{Timespec, Timestamps};
+        let times = Timestamps {
+            last_access: Timespec {
+                tv_sec: atime,
+                tv_nsec: atime_nsec,
+            },
+            last_modification: Timespec {
+                tv_sec: mtime,
+                tv_nsec: mtime_nsec,
+            },
+        };
+        rustix::fs::futimens(file, &times).map_err(std::io::Error::from)?;
+    }
+    Ok(())
 }
 
 async fn remove_path_for_overwrite(path: &Path) -> std::io::Result<()> {
@@ -583,12 +572,12 @@ async fn remove_path_for_overwrite(path: &Path) -> std::io::Result<()> {
     }
 }
 
-/// Atomic no-replace for kernels and filesystems without `RENAME_NOREPLACE`.
+/// Best-effort no-replace for filesystems without an atomic rename primitive.
 ///
-/// Hard-linking the source is atomic and works for non-directory sources on
-/// filesystems that support hard links.  When that is unavailable there is no
-/// atomic no-replace primitive, so fail instead of falling back to a
-/// check-then-rename that can overwrite a concurrently created destination.
+/// Prefer an atomic hard link for non-directories.  Directories and filesystems
+/// without hard links need a check-then-rename fallback to preserve ordinary
+/// rename support.  That last resort cannot prevent a concurrent destination
+/// create between the check and rename.
 async fn rename_no_overwrite_fallback(src: &Path, dest: &Path) -> std::io::Result<()> {
     if !fs::symlink_metadata(src).await.map(|meta| meta.is_dir())? {
         match fs::hard_link(src, dest).await {
@@ -599,19 +588,22 @@ async fn rename_no_overwrite_fallback(src: &Path, dest: &Path) -> std::io::Resul
             Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
                 return Err(already_exists(dest));
             }
+            Err(error)
+                if matches!(
+                    error.raw_os_error(),
+                    Some(libc::EPERM) | Some(libc::EOPNOTSUPP) | Some(libc::ENOSYS)
+                ) => {}
             Err(error) => return Err(error),
         }
     }
-    Err(std::io::Error::new(
-        std::io::ErrorKind::Unsupported,
-        format!(
-            "Atomic no-replace rename is not supported for {} on this filesystem",
-            src.display()
-        ),
-    ))
+    match fs::symlink_metadata(dest).await {
+        Ok(_) => Err(already_exists(dest)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => fs::rename(src, dest).await,
+        Err(error) => Err(error),
+    }
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 async fn rename_no_overwrite(src: &Path, dest: &Path) -> std::io::Result<()> {
     use rustix::fs::{CWD, RenameFlags};
 
@@ -627,10 +619,9 @@ async fn rename_no_overwrite(src: &Path, dest: &Path) -> std::io::Result<()> {
     let result = result.map_err(std::io::Error::from);
 
     match result {
-        // Pre-3.15 kernels report ENOSYS, filesystems that do not implement
-        // the flag (NFS, many FUSE mounts, older overlayfs) report EINVAL or
-        // EOPNOTSUPP, and a seccomp filter can report EPERM.  Surfacing any of
-        // these verbatim would fail every no-overwrite rename on such a mount.
+        // rustix maps NOREPLACE to Linux RENAME_NOREPLACE or macOS RENAME_EXCL.
+        // Older kernels, unsupported filesystems, or seccomp filters can
+        // reject the primitive; preserve rename support through the fallback.
         Err(error)
             if matches!(
                 error.raw_os_error(),
@@ -646,7 +637,7 @@ async fn rename_no_overwrite(src: &Path, dest: &Path) -> std::io::Result<()> {
     }
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
 async fn rename_no_overwrite(src: &Path, dest: &Path) -> std::io::Result<()> {
     rename_no_overwrite_fallback(src, dest).await
 }
@@ -1005,6 +996,47 @@ mod tests {
             .expect("missing destination is renamed");
         assert_eq!(fs::read(&dest).await.unwrap(), b"source");
         assert!(fs::metadata(&src).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn rename_directory_without_overwrite() {
+        // Exercise the portable fallback even on hosts with atomic rename.
+        for fallback in [false, true] {
+            let tmp = tempfile::tempdir().expect("create tempdir");
+            let src = tmp.path().join("src");
+            let dest = tmp.path().join("dest");
+            fs::create_dir(&src).await.unwrap();
+            fs::write(src.join("child"), b"source").await.unwrap();
+            tokio::fs::symlink("missing-target", &dest).await.unwrap();
+
+            let result = if fallback {
+                rename_no_overwrite_fallback(&src, &dest).await
+            } else {
+                rename_no_overwrite(&src, &dest).await
+            };
+            assert_eq!(
+                result.unwrap_err().kind(),
+                std::io::ErrorKind::AlreadyExists
+            );
+            assert!(
+                fs::symlink_metadata(&dest)
+                    .await
+                    .unwrap()
+                    .file_type()
+                    .is_symlink()
+            );
+            assert_eq!(fs::read(src.join("child")).await.unwrap(), b"source");
+
+            fs::remove_file(&dest).await.unwrap();
+            if fallback {
+                rename_no_overwrite_fallback(&src, &dest).await
+            } else {
+                rename_no_overwrite(&src, &dest).await
+            }
+            .expect("rename directory to missing destination");
+            assert_eq!(fs::read(dest.join("child")).await.unwrap(), b"source");
+            assert!(!fs::try_exists(&src).await.unwrap());
+        }
     }
 
     #[tokio::test]
@@ -1385,13 +1417,7 @@ mod tests {
         assert_eq!(copy_file_atomically(&src, &dest, options).await.unwrap(), 3);
         assert_eq!(fs::read(&dest).await.unwrap(), b"new");
 
-        let leftovers: Vec<String> = std::fs::read_dir(tmp.path())
-            .unwrap()
-            .filter_map(Result::ok)
-            .map(|entry| entry.file_name().to_string_lossy().into_owned())
-            .filter(|name| name.contains("tramp-rpc-copy"))
-            .collect();
-        assert!(leftovers.is_empty(), "leftover temp files: {leftovers:?}");
+        assert_eq!(std::fs::read_dir(tmp.path()).unwrap().count(), 2);
     }
 
     #[tokio::test]

@@ -252,7 +252,7 @@ This is called from `tramp-multi-hop-p-hook'."
 (declare-function tramp-rpc--sudo-file-name-p "tramp-rpc")
 (declare-function tramp-rpc-multi-hop-p "tramp-rpc")
 (declare-function tramp-rpc-protocol-signal-description "tramp-rpc-protocol"
-                  (signal))
+                  (signal &optional os))
 
 
 ;; Helper modules register internal lifecycle callbacks when loaded.
@@ -2168,7 +2168,8 @@ signal numbers to human-readable strings like \"Interrupt\" or
            ;; Prepend a placeholder 0 for signal 0 so that (nth 1 signals)
            ;; corresponds to signal 1 (HUP), (nth 2 signals) to signal 2 (INT), etc.
            (signals (cons 0 raw-signals))
-           (vec-strings (make-vector 128 nil)))
+           (vec-strings (make-vector 128 nil))
+           (os (alist-get 'os (tramp-rpc--cached-system-info vec))))
       ;; Sanity: remove duplicate leading "0" entry if kill -l included one
       (when (and (stringp (cadr signals)) (string-equal (cadr signals) "0"))
         (setcdr signals (cddr signals)))
@@ -2176,28 +2177,8 @@ signal numbers to human-readable strings like \"Interrupt\" or
       (dotimes (i 128)
         (let ((sig (nth i signals)))
           (aset vec-strings i
-                (cond
-                 ((zerop i) 0)
-                 ((null sig) (tramp-rpc-protocol-signal-description i))
-                 ((string-equal sig "HUP") "Hangup")
-                 ((string-equal sig "INT") "Interrupt")
-                 ((string-equal sig "QUIT") "Quit")
-                 ((string-equal sig "ILL") "Illegal instruction")
-                 ((string-equal sig "TRAP") "Trace/breakpoint trap")
-                 ((string-equal sig "ABRT") "Aborted")
-                 ((string-equal sig "IOT") "Aborted")
-                 ((string-equal sig "BUS") "Bus error")
-                 ((string-equal sig "FPE") "Floating point exception")
-                 ((string-equal sig "KILL") "Killed")
-                 ((string-equal sig "SEGV") "Segmentation fault")
-                 ((string-equal sig "PIPE") "Broken pipe")
-                 ((string-equal sig "ALRM") "Alarm clock")
-                 ((string-equal sig "TERM") "Terminated")
-                 ((string-equal sig "STOP") "Stopped (signal)")
-                 ((string-equal sig "TSTP") "Stopped")
-                 ((string-equal sig "TTIN") "Stopped (tty input)")
-                 ((string-equal sig "TTOU") "Stopped (tty output)")
-                 (t (tramp-rpc-protocol-signal-description i))))))
+                (if (zerop i) 0
+                  (tramp-rpc-protocol-signal-description (or sig i) os)))))
       vec-strings)))
 
 (defun tramp-rpc-handle-process-file

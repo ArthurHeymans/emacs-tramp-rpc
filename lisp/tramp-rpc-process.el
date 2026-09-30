@@ -42,7 +42,8 @@
 ;; Emitted inside the autoload form in tramp-rpc.el.
 (declare-function tramp-rpc-file-name-p "tramp-rpc")
 (declare-function tramp-rpc-protocol-signal-description "tramp-rpc-protocol"
-                  (signal))
+                  (signal &optional os))
+(declare-function tramp-rpc--cached-system-info "tramp-rpc-transport" (vec))
 
 ;; ============================================================================
 ;; Process tracking state
@@ -467,7 +468,13 @@ and claimed by `tramp-rpc--register-managed-process'."
          (setq tramp-rpc--early-process-notifications nil)))))
 
 (defun tramp-rpc--register-managed-process (local-process)
-  "Deliver notifications that arrived before LOCAL-PROCESS was registered."
+  "Save LOCAL-PROCESS's remote OS and deliver its early notifications."
+  ;; Keep the OS on the relay: teardown can clear the connection cache before
+  ;; its sentinel runs.  The startup system.info is already cached, so no RPC
+  ;; is needed while registering or reporting an exit.
+  (when-let* ((vec (process-get local-process :tramp-rpc-vec)))
+    (process-put local-process :tramp-rpc-remote-os
+                 (alist-get 'os (tramp-rpc--cached-system-info vec))))
   (let ((transport (process-get local-process :tramp-rpc-connection-process))
         (pid (process-get local-process :tramp-rpc-pid)))
     (dolist (entry tramp-rpc--early-process-notifications)
@@ -623,7 +630,8 @@ lowercase signal description, like local processes (\"killed\\n\")."
     (cond
      ((integerp exit-signal)
       (format "%s\n" (downcase (tramp-rpc-protocol-signal-description
-                                 exit-signal))))
+                                 exit-signal
+                                 (process-get process :tramp-rpc-remote-os)))))
      ((null exit-code) fallback)
      ((= exit-code 0) "finished\n")
      (t (format "exited abnormally with code %d\n" exit-code)))))

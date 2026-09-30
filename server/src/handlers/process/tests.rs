@@ -1488,7 +1488,7 @@ async fn pty_sigkill_publishes_status_for_in_flight_read_after_removal() {
 }
 
 #[tokio::test]
-async fn pty_sigkill_does_not_retain_notified_status() {
+async fn pty_sigkill_releases_registry_and_publishes_status() {
     let _test_lock = test_process_map_lock().await;
     // Include kills before the push starts, as well as push-only clients
     // which never issue a follow-up read or close.
@@ -1528,7 +1528,6 @@ async fn pty_sigkill_does_not_retain_notified_status() {
             shared.lock().unwrap().unwrap().signal(),
             Some(libc::SIGKILL)
         );
-        assert_eq!(take_terminated_pty_status(pid), None);
     }
 }
 

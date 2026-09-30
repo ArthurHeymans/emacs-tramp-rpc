@@ -131,7 +131,7 @@ fn spawn_pty_push(pid: u32, stop: Arc<AtomicBool>, wake: Arc<Notify>) -> JoinHan
                     .await
                     .get(&pid)
                     .map(|managed| Arc::clone(&managed.shared_exit_status));
-                let _ = terminate_pty_process(pid, libc::SIGKILL, true, true, false).await;
+                let _ = terminate_pty_process(pid, libc::SIGKILL, true, true).await;
                 get_pty_process_map().lock().await.remove(&pid);
                 let status = shared.and_then(|status| *status.lock().expect("shared exit status"));
                 send_exit_notification(pid, status).await;

@@ -109,39 +109,75 @@ expensive expressions such as buffer sizes or `prin1' of large values."
     (concat (msgpack-unsigned-to-bytes len 4) payload)))
 
 (defconst tramp-rpc-protocol--signal-descriptions
-  '((1 . "Hangup")
-    (2 . "Interrupt")
-    (3 . "Quit")
-    (4 . "Illegal instruction")
-    (5 . "Trace/breakpoint trap")
-    (6 . "Aborted")
-    (7 . "Bus error")
-    (8 . "Floating point exception")
-    (9 . "Killed")
-    (10 . "User defined signal 1")
-    (11 . "Segmentation fault")
-    (12 . "User defined signal 2")
-    (13 . "Broken pipe")
-    (14 . "Alarm clock")
-    (15 . "Terminated")
-    (24 . "CPU time limit exceeded")
-    (25 . "File size limit exceeded")
-    (26 . "Virtual timer expired")
-    (27 . "Profiling timer expired")
-    (28 . "Window changed")
-    (29 . "I/O possible")
-    (30 . "Power failure")
-    (31 . "Bad system call"))
-  "Signal descriptions matching local Emacs strings for the common signals.")
+  '(("HUP" . "Hangup")
+    ("INT" . "Interrupt")
+    ("QUIT" . "Quit")
+    ("ILL" . "Illegal instruction")
+    ("TRAP" . "Trace/breakpoint trap")
+    ("ABRT" . "Aborted")
+    ("IOT" . "Aborted")
+    ("EMT" . "EMT trap")
+    ("BUS" . "Bus error")
+    ("FPE" . "Floating point exception")
+    ("KILL" . "Killed")
+    ("USR1" . "User defined signal 1")
+    ("USR2" . "User defined signal 2")
+    ("SEGV" . "Segmentation fault")
+    ("PIPE" . "Broken pipe")
+    ("ALRM" . "Alarm clock")
+    ("TERM" . "Terminated")
+    ("CHLD" . "Child exited")
+    ("CONT" . "Continued")
+    ("STOP" . "Stopped (signal)")
+    ("TSTP" . "Stopped")
+    ("TTIN" . "Stopped (tty input)")
+    ("TTOU" . "Stopped (tty output)")
+    ("URG" . "Urgent I/O condition")
+    ("XCPU" . "CPU time limit exceeded")
+    ("XFSZ" . "File size limit exceeded")
+    ("VTALRM" . "Virtual timer expired")
+    ("PROF" . "Profiling timer expired")
+    ("WINCH" . "Window changed")
+    ("IO" . "I/O possible")
+    ("PWR" . "Power failure")
+    ("INFO" . "Information request")
+    ("SYS" . "Bad system call"))
+  "Signal names and descriptions independent of host signal numbering.")
 
-(defun tramp-rpc-protocol-signal-description (signal)
-  "Return the human-readable description of SIGNAL number.
-Used where no connection is available for the remote `kill -l' mapping,
-such as a process sentinel."
-  (if (integerp signal)
-      (or (alist-get signal tramp-rpc-protocol--signal-descriptions)
-          (format "Signal %d" signal))
-    "Unknown signal"))
+(defconst tramp-rpc-protocol--linux-signals
+  [nil "HUP" "INT" "QUIT" "ILL" "TRAP" "ABRT" "BUS" "FPE" "KILL"
+       "USR1" "SEGV" "USR2" "PIPE" "ALRM" "TERM" nil "CHLD" "CONT"
+       "STOP" "TSTP" "TTIN" "TTOU" "URG" "XCPU" "XFSZ" "VTALRM"
+       "PROF" "WINCH" "IO" "PWR" "SYS"]
+  "Signal names indexed by number on supported Linux targets.")
+
+(defconst tramp-rpc-protocol--macos-signals
+  [nil "HUP" "INT" "QUIT" "ILL" "TRAP" "ABRT" "EMT" "FPE" "KILL"
+       "BUS" "SEGV" "SYS" "PIPE" "ALRM" "TERM" "URG" "STOP" "TSTP"
+       "CONT" "CHLD" "TTIN" "TTOU" "IO" "XCPU" "XFSZ" "VTALRM"
+       "PROF" "WINCH" "INFO" "USR1" "USR2"]
+  "Signal names indexed by number on macOS targets.")
+
+(defun tramp-rpc-protocol-signal-description (signal &optional os)
+  "Return the human-readable description of SIGNAL, a number or name.
+OS is the remote system.info OS string, not the local Emacs system type.
+Without a known OS, only numbers shared by Linux and macOS are named.
+This performs no RPC, so it is safe to use from a process sentinel."
+  (let* ((names (pcase os
+                  ("linux" tramp-rpc-protocol--linux-signals)
+                  ("macos" tramp-rpc-protocol--macos-signals)))
+         (name (cond
+                ((stringp signal)
+                 (string-remove-prefix "SIG" (upcase signal)))
+                ((and (integerp signal) (> signal 0))
+                 (cond
+                  ((and names (< signal (length names))) (aref names signal))
+                  ((memq signal '(1 2 3 4 5 6 8 9 11 13 14 15))
+                   (aref tramp-rpc-protocol--linux-signals signal)))))))
+    (or (cdr (assoc name tramp-rpc-protocol--signal-descriptions))
+        (if (or (integerp signal) (stringp signal))
+            (format "Signal %s" signal)
+          "Unknown signal"))))
 
 (defun tramp-rpc-protocol-encode-request-with-id (method params)
   "Encode a MessagePack-RPC request for METHOD with PARAMS.

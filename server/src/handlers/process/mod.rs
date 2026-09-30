@@ -30,8 +30,6 @@ use rustix::process::{Pid as RustixPid, Signal as RustixSignal};
 #[cfg(any(target_os = "linux", target_os = "android"))]
 use rustix_libc_wrappers::process::SignalExt;
 use serde::Deserialize;
-#[cfg(test)]
-use std::collections::HashMap;
 use std::io::ErrorKind;
 use std::os::fd::{AsFd, OwnedFd};
 #[cfg(test)]
@@ -41,9 +39,7 @@ use tokio::process::Command;
 use tokio::sync::Mutex;
 
 use pipe::{get_process_map, terminate_pipe_process};
-#[cfg(test)]
-use pty::TERMINATED_PTY_STATUSES;
-use pty::{clear_terminated_pty_statuses, get_pty_process_map, terminate_pty_process};
+use pty::{get_pty_process_map, terminate_pty_process};
 use push::stop_output_push;
 
 /// Upper bound for one test-only `read`/`read_pty` request.
@@ -148,13 +144,7 @@ pub(crate) async fn test_process_map_lock() -> tokio::sync::MutexGuard<'static, 
 
 #[cfg(test)]
 pub(crate) async fn test_managed_maps_empty() -> bool {
-    get_process_map().lock().await.is_empty()
-        && get_pty_process_map().lock().await.is_empty()
-        && TERMINATED_PTY_STATUSES
-            .get_or_init(|| StdMutex::new(HashMap::new()))
-            .lock()
-            .expect("terminated PTY status lock")
-            .is_empty()
+    get_process_map().lock().await.is_empty() && get_pty_process_map().lock().await.is_empty()
 }
 
 #[cfg(test)]
@@ -418,7 +408,7 @@ pub async fn cleanup_managed_processes() -> Result<(), RpcError> {
     let pty_reaps = pty_pids.into_iter().map(|(pid, _)| async move {
         (
             pid,
-            terminate_pty_process(pid, libc::SIGTERM, true, true, false).await,
+            terminate_pty_process(pid, libc::SIGTERM, true, true).await,
         )
     });
     let (pipe_results, pty_results) = tokio::join!(
@@ -445,10 +435,6 @@ pub async fn cleanup_managed_processes() -> Result<(), RpcError> {
             failures.push(format!("PTY process {pid}: {}", error.message));
         }
     }
-    // The transport is gone, so no client can consume retained terminal
-    // statuses.  Do not keep tombstones alive for the lifetime of the server.
-    clear_terminated_pty_statuses();
-
     if failures.is_empty() {
         Ok(())
     } else {

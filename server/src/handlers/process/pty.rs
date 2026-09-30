@@ -39,39 +39,8 @@ use super::{
 
 pub(super) static PTY_PROCESS_MAP: OnceLock<Mutex<HashMap<u32, ManagedPtyProcess>>> =
     OnceLock::new();
-pub(super) static TERMINATED_PTY_STATUSES: OnceLock<StdMutex<HashMap<u32, ExitStatus>>> =
-    OnceLock::new();
-
 pub(super) fn get_pty_process_map() -> &'static Mutex<HashMap<u32, ManagedPtyProcess>> {
     PTY_PROCESS_MAP.get_or_init(|| Mutex::new(HashMap::new()))
-}
-
-pub(super) fn record_terminated_pty_status(pid: u32, status: ExitStatus) {
-    TERMINATED_PTY_STATUSES
-        .get_or_init(|| StdMutex::new(HashMap::new()))
-        .lock()
-        .expect("terminated PTY status lock")
-        .insert(pid, status);
-}
-
-pub(super) fn take_terminated_pty_status(pid: u32) -> Option<ExitStatus> {
-    TERMINATED_PTY_STATUSES
-        .get_or_init(|| StdMutex::new(HashMap::new()))
-        .lock()
-        .expect("terminated PTY status lock")
-        .remove(&pid)
-}
-
-pub(super) fn discard_terminated_pty_status(pid: u32) {
-    let _ = take_terminated_pty_status(pid);
-}
-
-pub(super) fn clear_terminated_pty_statuses() {
-    TERMINATED_PTY_STATUSES
-        .get_or_init(|| StdMutex::new(HashMap::new()))
-        .lock()
-        .expect("terminated PTY status lock")
-        .clear();
 }
 
 pub(super) struct PtyIoState {
@@ -551,7 +520,7 @@ pub(super) async fn read_pty_now(pid: u32, max_bytes: usize) -> Result<PtyReadRe
                 output: Vec::new(),
                 pending: false,
                 exited: true,
-                exit: take_terminated_pty_status(pid),
+                exit: None,
             });
         };
         let fd = dup_cloexec(managed.async_fd.get_ref())
@@ -573,12 +542,11 @@ pub(super) async fn read_pty_now(pid: u32, max_bytes: usize) -> Result<PtyReadRe
         let shared_status = *shared_exit_status
             .lock()
             .expect("shared PTY exit status lock");
-        let retained_status = take_terminated_pty_status(pid);
         return Ok(PtyReadResult {
             output: Vec::new(),
             pending: false,
             exited: true,
-            exit: shared_status.or(retained_status),
+            exit: shared_status,
         });
     };
 
@@ -828,7 +796,6 @@ pub(super) async fn terminate_pty_process(
     signal: i32,
     escalate: bool,
     remove: bool,
-    retain_removed_status: bool,
 ) -> Result<bool, RpcError> {
     let Some((os_pid, lifecycle, io, shared_exit_status)) = ({
         let processes = get_pty_process_map().lock().await;
@@ -889,9 +856,6 @@ pub(super) async fn terminate_pty_process(
             *shared_exit_status
                 .lock()
                 .expect("shared PTY exit status lock") = Some(cached_exit_code);
-            if retain_removed_status {
-                record_terminated_pty_status(pid, cached_exit_code);
-            }
             get_pty_process_map().lock().await.remove(&pid);
         }
         return Ok(true);
@@ -970,9 +934,6 @@ pub(super) async fn terminate_pty_process(
             *shared_exit_status
                 .lock()
                 .expect("shared PTY exit status lock") = Some(exit_code);
-            if retain_removed_status {
-                record_terminated_pty_status(pid, exit_code);
-            }
             processes.remove(&pid);
         } else if let Some(managed) = processes.get_mut(&pid) {
             managed.exit_status = Some(exit_code);
@@ -984,15 +945,10 @@ pub(super) async fn terminate_pty_process(
         // SIGKILL was delivered but the bounded reap did not observe a status
         // (for example, another waiter consumed it).  The explicit kill still
         // has deterministic abnormal process semantics for an in-flight read.
-        let exit = {
-            let mut status = shared_exit_status
-                .lock()
-                .expect("shared PTY exit status lock");
-            *status.get_or_insert(ExitStatus::from_raw(libc::SIGKILL))
-        };
-        if retain_removed_status {
-            record_terminated_pty_status(pid, exit);
-        }
+        shared_exit_status
+            .lock()
+            .expect("shared PTY exit status lock")
+            .get_or_insert(ExitStatus::from_raw(libc::SIGKILL));
         retire_pty_process(pid, os_pid).await;
         return Ok(true);
     }
@@ -1047,16 +1003,8 @@ pub async fn kill_pty(params: Value) -> HandlerResult {
     // without turning a survivable signal such as SIGINT into SIGKILL.
     // Explicit close and connection cleanup retain escalation authority.
     // Explicit SIGKILL also opts out of output draining.
-    if let Err(error) = terminate_pty_process(
-        params.pid,
-        signal,
-        false,
-        signal == libc::SIGKILL,
-        // The terminal notification consumes this status; no subsequent
-        // polling read or close will release a retained entry.
-        false,
-    )
-    .await
+    if let Err(error) =
+        terminate_pty_process(params.pid, signal, false, signal == libc::SIGKILL).await
     {
         allow_pty_termination_retry(params.pid, pushing).await;
         return Err(error);
@@ -1113,10 +1061,9 @@ pub async fn close_pty(params: Value) -> HandlerResult {
         stop_output_push(push).await;
     }
     // Explicit close is the opt-out from kill's drain-preserving ownership.
-    if let Err(error) = terminate_pty_process(params.pid, libc::SIGKILL, true, true, false).await {
+    if let Err(error) = terminate_pty_process(params.pid, libc::SIGKILL, true, true).await {
         allow_pty_termination_retry(params.pid, pushing).await;
         return Err(error);
     }
-    discard_terminated_pty_status(params.pid);
     Ok(Value::Boolean(true))
 }
