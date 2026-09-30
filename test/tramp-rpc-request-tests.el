@@ -182,8 +182,6 @@ SPEC is (PROCESS BUFFER [CONNECTION]); CONNECTION defaults to `connection'."
                        (lambda (_vec) connection))
                       ((symbol-function 'tramp-rpc-protocol-encode-request-with-id)
                        (lambda (&rest _) '(102 . "request")))
-                      ((symbol-function 'tramp-rpc-protocol-encode-batch-request-with-id)
-                       (lambda (&rest _) '(102 . "batch")))
                       ((symbol-function 'process-send-string) #'ignore)
                       ((symbol-function 'accept-process-output)
                        (lambda (&rest _) (signal 'quit nil)))
@@ -684,20 +682,18 @@ The helper also verifies that the output payload in the notification is queued."
           (tramp-rpc--connections (make-hash-table :test 'equal)))
       (cl-letf (((symbol-function 'tramp-rpc--ensure-connection)
                  (lambda (_vec) connection))
-                ((symbol-function 'tramp-rpc-protocol-encode-batch-request-with-id)
+                ((symbol-function 'tramp-rpc-protocol-encode-request-with-id)
                  (lambda (&rest _) '(302 . "batch")))
                 ((symbol-function 'process-send-string)
-                 (lambda (&rest _) nil))
-                ((symbol-function 'tramp-rpc-protocol-decode-batch-response)
-                 (lambda (_response) 'batch-result)))
-        (should (eq 'batch-result
-                    (tramp-rpc-mock-test-request--assert-notification-survives-wait
-                     vec process
-                     (lambda ()
-                       (puthash 302 '(:id 302 :result batch)
-                                (tramp-rpc-connection-pending-responses connection)))
-                     (lambda ()
-                       (tramp-rpc--call-batch vec '(("test" . nil)))))))))))
+                 (lambda (&rest _) nil)))
+        (should (equal '(batch-result)
+                       (tramp-rpc-mock-test-request--assert-notification-survives-wait
+                        vec process
+                        (lambda ()
+                          (puthash 302 '(:id 302 :result ((results . (((result . batch-result))))))
+                                   (tramp-rpc-connection-pending-responses connection)))
+                        (lambda ()
+                          (tramp-rpc--call-batch vec '(("test" . nil)))))))))))
 
 (ert-deftest tramp-rpc-mock-test-request-receive-preserves-async-process-notification ()
   "A push notification received during a pipelined wait is handled without disrupting the wait."
@@ -724,7 +720,7 @@ The helper also verifies that the output payload in the notification is queued."
           invalidated)
       (cl-letf (((symbol-function 'tramp-rpc--ensure-connection)
                  (lambda (_vec) connection))
-                ((symbol-function 'tramp-rpc-protocol-encode-batch-request-with-id)
+                ((symbol-function 'tramp-rpc-protocol-encode-request-with-id)
                  (lambda (&rest _) '(102 . "batch")))
                 ((symbol-function 'process-send-string) (lambda (&rest _) nil))
                 ((symbol-function 'tramp-rpc--invalidate-timed-out-connection)
@@ -747,7 +743,7 @@ The helper also verifies that the output payload in the notification is queued."
           (clock-calls 0))
       (cl-letf (((symbol-function 'tramp-rpc--ensure-connection)
                  (lambda (_vec) connection))
-                ((symbol-function 'tramp-rpc-protocol-encode-batch-request-with-id)
+                ((symbol-function 'tramp-rpc-protocol-encode-request-with-id)
                  (lambda (&rest _) '(103 . "batch")))
                 ((symbol-function 'process-send-string) (lambda (&rest _) nil))
                 ((symbol-function 'float-time)
@@ -756,13 +752,11 @@ The helper also verifies that the output payload in the notification is queued."
                    (if (<= clock-calls 2) 0 50)))
                 ((symbol-function 'accept-process-output)
                  (lambda (&rest _)
-                   (puthash 103 '(:id 103 :result batch)
+                   (puthash 103 '(:id 103 :result ((results . (((result . batch-result))))))
                             (tramp-rpc-connection-pending-responses connection))
-                   t))
-                ((symbol-function 'tramp-rpc-protocol-decode-batch-response)
-                 (lambda (_response) 'batch-result)))
-        (should (eq 'batch-result
-                    (tramp-rpc--call-batch vec '(("test" . nil)))))))))
+                   t)))
+        (should (equal '(batch-result)
+                       (tramp-rpc--call-batch vec '(("test" . nil)))))))))
 
 (ert-deftest tramp-rpc-mock-test-request-pipeline-death-keeps-receive-on-old-generation ()
   "A pipeline receives its injected error from the generation that sent it."
@@ -896,5 +890,38 @@ The helper also verifies that the output payload in the notification is queued."
       (should (equal '(110) (tramp-rpc-connection-pending-ids connection)))
       (should (equal '(:id 110 :result live) (gethash 110 pending)))
       (should (= 1 (hash-table-count pending))))))
+
+(ert-deftest tramp-rpc-mock-test-request-batch-pins-all-chunks ()
+  "A reconnect between chunks cannot move the rest of a batch to a new server."
+  (let ((vec (tramp-rpc-mock-test-request--vec))
+        (tramp-rpc--batch-max-entries 2)
+        (requests '(("a") ("b") ("c")))
+        (generation 'original)
+        (ensures 0)
+        connections)
+    (cl-letf (((symbol-function 'tramp-rpc--ensure-connection)
+               (lambda (_vec) (cl-incf ensures) generation))
+              ((symbol-function 'tramp-rpc--call)
+               (lambda (_vec method params &optional connection)
+                 (should (equal method "batch"))
+                 (push connection connections)
+                 (setq generation 'replacement)
+                 `((results . ,(mapcar (lambda (entry)
+                                        `((result . ,(alist-get 'method entry))))
+                                      (append (alist-get 'requests params) nil)))))))
+      (should (equal (tramp-rpc--call-batch vec requests) '("a" "b" "c"))))
+    (should (= ensures 1))
+    (should (equal connections '(original original)))))
+
+(ert-deftest tramp-rpc-mock-test-request-batch-rejects-short-results ()
+  "Missing batch results are protocol failures, not successful nil values."
+  (cl-letf (((symbol-function 'tramp-rpc--call)
+             (lambda (&rest _) '((results . (((result . nil))))))))
+    (should-error (tramp-rpc--call-batch-1
+                   (tramp-rpc-mock-test-request--vec) '(("a") ("b")))
+                  :type 'remote-file-error)
+    (should (equal (tramp-rpc--call-batch-1
+                    (tramp-rpc-mock-test-request--vec) '(("a")))
+                   '(nil)))))
 
 ;;; tramp-rpc-request-tests.el ends here

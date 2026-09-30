@@ -9,7 +9,6 @@ use rmpv::Value;
 use std::process::ExitStatus;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock};
-use tokio::io::AsyncWriteExt;
 use tokio::sync::Notify;
 use tokio::task::JoinHandle;
 
@@ -47,20 +46,10 @@ pub(super) async fn send_process_notification(method: &str, params: Value) -> Re
     let notification = Notification::new(method, params);
     let bytes = rmp_serde::to_vec_named(&notification)
         .map_err(|e| RpcError::internal_error(format!("Failed to encode notification: {e}")))?;
-    let mut writer = writer.lock().await;
     writer
-        .write_all(&(bytes.len() as u32).to_be_bytes())
+        .write_frame(&bytes)
         .await
-        .map_err(|e| {
-            RpcError::internal_error(format!("Failed to write notification length: {e}"))
-        })?;
-    writer.write_all(&bytes).await.map_err(|e| {
-        RpcError::internal_error(format!("Failed to write notification payload: {e}"))
-    })?;
-    writer
-        .flush()
-        .await
-        .map_err(|e| RpcError::internal_error(format!("Failed to flush notification: {e}")))
+        .map_err(|e| RpcError::internal_error(format!("Failed to write notification: {e}")))
 }
 
 /// Send the terminal `process.exit` notification for PID.

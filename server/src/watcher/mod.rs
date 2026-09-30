@@ -15,7 +15,6 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
-use tokio::io::AsyncWriteExt;
 use tokio::sync::{Notify, mpsc};
 use tokio::time::{self, Duration};
 
@@ -776,13 +775,20 @@ impl WatchManager {
     /// so this works even if the directory has been deleted since then.
     ///
     /// Lock ordering: watcher -> watched_paths (same as watch()).
+    #[cfg(test)]
     pub fn unwatch(&self, path: &Path) -> Result<(), notify::Error> {
-        // A path can be registered in both watchers: the nofollow watcher
-        // tracks the symlink itself and the regular watcher tracks its
-        // canonical target.  Remove both, otherwise a single watch.remove
-        // leaves the other registration alive for the life of the server.
+        self.unwatch_with_options(path, None)
+    }
+
+    /// Remove exactly the requested backend.  None preserves legacy removal
+    /// of both registrations; a symlink and its target have independent owners.
+    pub fn unwatch_with_options(
+        &self,
+        path: &Path,
+        nofollow: Option<bool>,
+    ) -> Result<(), notify::Error> {
         let mut removed_nofollow = false;
-        {
+        if nofollow != Some(false) {
             let mut symlink_watcher = lock_or_recover(&self.symlink_watcher);
             if let Some(watcher) = symlink_watcher.as_mut()
                 && watcher.contains(path)
@@ -790,6 +796,14 @@ impl WatchManager {
                 watcher.unwatch(path)?;
                 removed_nofollow = true;
             }
+        }
+
+        if nofollow == Some(true) {
+            return if removed_nofollow {
+                Ok(())
+            } else {
+                Err(notify::Error::generic("Nofollow path not being watched"))
+            };
         }
 
         // Try to canonicalize, but fall back to the raw path
@@ -1226,7 +1240,7 @@ fn fs_events_notification(events: &[WatchEvent]) -> Notification {
 }
 
 async fn send_notification_with_limit<W>(
-    writer: &Arc<tokio::sync::Mutex<W>>,
+    writer: &Arc<crate::output::FrameWriter<W>>,
     events: &[WatchEvent],
     max_frame_size: usize,
 ) -> Result<(), Box<dyn std::error::Error>>
@@ -1253,14 +1267,7 @@ where
         // Each frame is independently valid.  Release the shared writer after
         // every frame so normal RPC responses can make progress between parts
         // of a large notification batch.
-        {
-            let mut writer = writer.lock().await;
-            writer
-                .write_all(&(bytes.len() as u32).to_be_bytes())
-                .await?;
-            writer.write_all(&bytes).await?;
-            writer.flush().await?;
-        }
+        writer.write_frame(&bytes).await?;
         tokio::task::yield_now().await;
     }
     Ok(())
@@ -1332,12 +1339,15 @@ pub async fn handle_add(params: Value) -> HandlerResult {
 
 /// Handle `watch.remove` - stop watching a directory.
 ///
-/// Params: { "path": "/path/to/dir" }
+/// Params: { "path": "/path/to/dir", "nofollow": true|false }
+/// Omitting nofollow retains legacy removal of both registrations.
 pub async fn handle_remove(params: Value) -> HandlerResult {
     #[derive(serde::Deserialize)]
     struct Params {
         #[serde(with = "path_or_bytes")]
         path: Vec<u8>,
+        #[serde(default)]
+        nofollow: Option<bool>,
     }
 
     let params: Params = from_value(params).map_err(|e| RpcError::invalid_params(e.to_string()))?;
@@ -1348,7 +1358,7 @@ pub async fn handle_remove(params: Value) -> HandlerResult {
     let manager = get().ok_or_else(|| RpcError::internal_error("File watcher not available"))?;
 
     let manager = Arc::clone(manager);
-    tokio::task::spawn_blocking(move || manager.unwatch(&path))
+    tokio::task::spawn_blocking(move || manager.unwatch_with_options(&path, params.nofollow))
         .await
         .map_err(|e| RpcError::internal_error(format!("Task join error: {e}")))?
         .map_err(|e| RpcError::internal_error(format!("Failed to unwatch: {e}")))?;

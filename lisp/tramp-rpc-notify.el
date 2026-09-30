@@ -125,8 +125,8 @@ LOCALNAME is the local file name."
       (plist-get entry :directory)))
 
 (defun tramp-rpc--canonical-watch-active-p (canonical-directory)
-  "Return non-nil if CANONICAL-DIRECTORY still has a client-side owner.
-Both explicit watch entries and file-notify watch entries count as owners."
+  "Return non-nil if CANONICAL-DIRECTORY has a target-following owner.
+Synthetic and nofollow descriptors do not own that server registration."
   (let (active)
     (when (and (stringp canonical-directory)
                (hash-table-p tramp-rpc--watched-directories))
@@ -143,6 +143,8 @@ Both explicit watch entries and file-notify watch entries count as owners."
       (maphash
        (lambda (_key entry)
          (when (and (plist-get entry :count)
+                    (not (plist-get entry :synthetic))
+                    (not (plist-get entry :nofollow))
                     (tramp-rpc--canonical-directory-equal-p
                      canonical-directory
                      (tramp-rpc--watch-entry-canonical-directory entry)))
@@ -437,7 +439,12 @@ FLAGS controls the requested operation."
         (let* ((synthetic nil)
                (result (cond
                         (symlink-watch
-                         (if preexisting
+                         (if (or preexisting
+                                 ;; Older servers remove both the symlink and
+                                 ;; target registrations.  Do not acquire a
+                                 ;; nofollow watch we cannot release safely.
+                                 (not (eq t (alist-get 'watch_remove_nofollow
+                                                      (tramp-rpc--system-info v)))))
                              (progn
                                (setq synthetic symlink-watch)
                                nil)
@@ -485,6 +492,7 @@ FLAGS controls the requested operation."
                    (list :count 1
                          :owned (and (not preexisting) (not synthetic))
                          :synthetic synthetic
+                         :nofollow (and symlink-watch (not synthetic) t)
                          :directory directory
                          :canonical-directory canonical-directory
                          :connection-process (tramp-rpc--connection-transport (tramp-rpc--get-connection v)))
@@ -515,16 +523,24 @@ FLAGS controls the requested operation."
        (entry
         (remhash watch-key tramp-rpc--file-notify-watch-counts)
         (when (and (plist-get entry :owned)
-                   ;; If a Magit/cache watch has been installed for the same
-                   ;; key or canonical path while this file notification was
-                   ;; live, do not remove the server watch from underneath it.
-                   (not (tramp-rpc--canonical-watch-active-p
-                         canonical-directory)))
+                   ;; Nofollow registrations are refcounted on the server;
+                   ;; every spelling that acquired one must release it.  Follow
+                   ;; watches are shared, so retain them for other owners.
+                   (or (plist-get entry :nofollow)
+                       (not (tramp-rpc--canonical-watch-active-p
+                             canonical-directory))))
           ;; Removing a file notification should not make
           ;; `file-notify-rm-watch' fail if the remote connection has already
           ;; gone away.
           (condition-case err
-              (tramp-rpc-unwatch-directory (plist-get entry :directory))
+              (with-parsed-tramp-file-name (plist-get entry :directory) nil
+                (tramp-rpc--call
+                 v "watch.remove"
+                 `((path . ,(if (stringp canonical-directory)
+                                (tramp-file-local-name canonical-directory)
+                              localname))
+                   (nofollow . ,(if (plist-get entry :nofollow)
+                                    t :msgpack-false)))))
             (error
              (tramp-rpc--debug "failed to remove file-notify watch %s: %s"
                                (plist-get entry :directory)

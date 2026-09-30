@@ -301,18 +301,19 @@ response plist.  Returns nil if no complete message yet."
 ;; Batch request support
 ;; ============================================================================
 
+(defun tramp-rpc-protocol-batch-params (requests)
+  "Return the batch RPC parameters for (METHOD . PARAMS) REQUESTS."
+  `((requests . ,(vconcat
+                  (mapcar (lambda (req)
+                            `((method . ,(car req)) (params . ,(cdr req))))
+                          requests)))))
+
 (defun tramp-rpc-protocol-encode-batch-request-with-id (requests)
   "Encode a batch request containing multiple REQUESTS.
 REQUESTS is a list of (METHOD . PARAMS) cons cells.
 Returns a cons cell (ID . BYTES) for ID tracking."
-  (let ((batch-requests
-         (mapcar (lambda (req)
-                   `((method . ,(car req))
-                     (params . ,(cdr req))))
-                 requests)))
-    (tramp-rpc-protocol-encode-request-with-id
-     "batch"
-     `((requests . ,(vconcat batch-requests))))))
+  (tramp-rpc-protocol-encode-request-with-id
+   "batch" (tramp-rpc-protocol-batch-params requests)))
 
 (defun tramp-rpc-protocol-decode-batch-response (response)
   "Decode a batch response into a list of individual results.

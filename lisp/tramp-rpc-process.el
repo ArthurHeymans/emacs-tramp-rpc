@@ -90,6 +90,31 @@ Value is a plist with :vec, :pid, :connection-process, :delivery-timer,
   "Hash table mapping local relay processes to their remote PTY process info.
 Value is a plist with :vec, :pid.")
 
+(defun tramp-rpc--track-managed-process
+    (process vec pid connection pty &optional stderr-buffer stderr-process)
+  "Register PROCESS with PID on the exact CONNECTION used to start it.
+PTY selects the RPC PTY index; direct SSH PTYs are registered separately.
+Terminal status remains on PROCESS after its live index entry is removed."
+  (process-put process :tramp-rpc-vec vec)
+  (process-put process :tramp-rpc-pid pid)
+  (process-put process :tramp-rpc-connection connection)
+  (process-put process :tramp-rpc-connection-process
+               (tramp-rpc-connection-process connection))
+  (when pty (process-put process :tramp-rpc-pty t))
+  (puthash process
+           (list :vec vec :pid pid
+                 :connection-process (tramp-rpc-connection-process connection)
+                 :rpc-pty pty :stderr-buffer stderr-buffer
+                 :stderr-process stderr-process :pending-output nil
+                 :pending-exit nil :delivery-timer nil)
+           (if pty tramp-rpc--pty-processes tramp-rpc--async-processes)))
+
+(defun tramp-rpc--forget-managed-process (process)
+  "Release PROCESS's live indexes and timers, retaining its terminal status."
+  (dolist (table (list tramp-rpc--async-processes tramp-rpc--pty-processes))
+    (tramp-rpc--cancel-process-timers table process)
+    (remhash process table)))
+
 (defvar tramp-rpc--process-write-queues (make-hash-table :test 'equal)
   "Hash table mapping (connection process . remote PID) to write queue state.
 Value is a plist with :vec, :connection, :connection-process, :owner-process,
@@ -268,15 +293,17 @@ Capture a connection only when this is the first operation for OWNER."
 ;; Remote process primitives
 ;; ============================================================================
 
-(defun tramp-rpc--start-remote-process (vec program args cwd &optional env)
+(defun tramp-rpc--start-remote-process (vec program args cwd &optional env connection)
   "Start PROGRAM with ARGS in CWD on remote host VEC.
 ENV is an optional alist of environment variables.
+CONNECTION is the captured generation that will own the process.
 Returns the remote process PID."
   (let ((result (tramp-rpc--call vec "process.start"
                                  `((cmd . ,program)
                                    (args . ,(vconcat args))
                                    (cwd . ,cwd)
-                                   ,@(when env `((env . ,env)))))))
+                                   ,@(when env `((env . ,env))))
+                                 connection)))
     (alist-get 'pid result)))
 
 (defun tramp-rpc--write-remote-process (vec pid data &optional owner-process)
@@ -482,7 +509,21 @@ and claimed by `tramp-rpc--register-managed-process'."
         (setq tramp-rpc--early-process-notifications
               (delq entry tramp-rpc--early-process-notifications))
         (tramp-rpc--dispatch-process-notification
-         local-process (nth 2 entry) (nthcdr 3 entry))))))
+         local-process (nth 2 entry) (nthcdr 3 entry))))
+    ;; Transport teardown may have run while process.start was waiting, before
+    ;; there was a relay to clean up.  Do not leave that late registration live.
+    (when (tramp-rpc--transport-dead-p transport)
+      (let ((pty (process-get local-process :tramp-rpc-pty))
+            (vec (process-get local-process :tramp-rpc-vec)))
+        ;; A final notification received with the start response is still valid.
+        ;; Deliver it before deciding whether connection death killed the child.
+        (if pty
+            (tramp-rpc--deliver-pending-pty-output local-process)
+          (tramp-rpc--deliver-pending-process-output local-process))
+        (unless (process-get local-process :tramp-rpc-remote-exited)
+          (if pty
+              (tramp-rpc--cleanup-pty-processes vec transport)
+            (tramp-rpc--cleanup-async-processes vec transport)))))))
 
 (defun tramp-rpc--find-notification-process (table connection pid)
   "Find the relay in TABLE for remote PID on exact CONNECTION generation."
@@ -923,9 +964,10 @@ Resolves program path and loads direnv environment from working directory."
             (tramp-rpc--with-process-start
               (let* ((program (car command))
                      (program-args (cdr command))
+                     (connection (tramp-rpc--ensure-connection v))
                      (remote-pid (tramp-rpc--start-remote-process
-                                  v program program-args localname process-env))
-                     (connection (tramp-rpc--get-connection v))
+                                  v program program-args localname process-env
+                                  connection))
                      (stderr-buffer (cond
                                      ((bufferp stderr) stderr)
                                      ((stringp stderr) (get-buffer-create stderr))
@@ -938,8 +980,8 @@ Resolves program path and loads direnv environment from working directory."
                        (or name "tramp-rpc-async") buffer stderr-buffer
                        (lambda ()
                          (tramp-rpc--best-effort
-                          (tramp-rpc--kill-remote-process
-                           v remote-pid 9 connection)))))
+                           (tramp-rpc--kill-remote-process
+                            v remote-pid 9 connection)))))
                      (local-process (car relays))
                      (stderr-process (cdr relays)))
 
@@ -951,19 +993,28 @@ Resolves program path and loads direnv environment from working directory."
                   (tramp-rpc--configure-relay-coding stderr-process coding))
                 (set-process-query-on-exit-flag local-process (not noquery))
 
+                (tramp-rpc--track-managed-process
+                 local-process v remote-pid connection nil stderr-buffer stderr-process)
+
                 ;; Feed sudo's stdin password before exposing the relay to callers;
                 ;; subsequent writes use the same queue and stay ordered after it.
                 (when sudo-password
-                  (tramp-rpc--write-remote-process
-                   v remote-pid (tramp-rpc--encode-process-input
-                                 local-process (concat sudo-password "\n"))))
-
-                (process-put local-process :tramp-rpc-vec v)
-                (process-put local-process :tramp-rpc-pid remote-pid)
-                (let ((connection (tramp-rpc--get-connection v)))
-                  (process-put local-process :tramp-rpc-connection connection)
-                  (process-put local-process :tramp-rpc-connection-process
-                               (tramp-rpc--connection-transport connection)))
+                  (condition-case err
+                      (tramp-rpc--write-remote-process
+                       v remote-pid (tramp-rpc--encode-process-input
+                                     local-process (concat sudo-password "\n"))
+                       local-process)
+                    ((error quit)
+                     (tramp-rpc--forget-managed-process local-process)
+                     (remhash (process-get local-process :tramp-rpc-write-queue-key)
+                              tramp-rpc--process-write-queues)
+                     (dolist (relay relays)
+                       (when (processp relay)
+                         (set-process-sentinel relay #'ignore)
+                         (tramp-rpc--best-effort (delete-process relay))))
+                     (tramp-rpc--best-effort
+                       (tramp-rpc--kill-remote-process v remote-pid 9 connection))
+                     (signal (car err) (cdr err)))))
                 (process-put local-process 'tramp-vector v)
                 (process-put local-process 'remote-command orig-command)
 
@@ -979,22 +1030,9 @@ Resolves program path and loads direnv environment from working directory."
                   (process-put local-process :tramp-rpc-own-sentinel own-sentinel)
                   (set-process-sentinel local-process own-sentinel))
 
-                ;; Store process info.
-                (puthash local-process
-                         (list :vec v
-                               :pid remote-pid
-                               :connection-process
-                               (process-get local-process :tramp-rpc-connection-process)
-                               :stderr-buffer stderr-buffer
-                               :stderr-process stderr-process
-                               :pending-output nil
-                               :pending-exit nil
-                               :delivery-timer nil)
-                         tramp-rpc--async-processes)
-
                 (tramp-rpc--debug
-                 "MAKE-PROCESS created local=%s remote-pid=%s program=%s"
-                 local-process remote-pid program)
+                  "MAKE-PROCESS created local=%s remote-pid=%s program=%s"
+                  local-process remote-pid program)
 
                 (tramp-rpc--register-managed-process local-process)
 
@@ -1211,17 +1249,18 @@ DIRENV-ENV is an optional alist of environment variables for the process."
            ;; Build environment - add TERM after caller/remote env so it wins.
            (term-env (or (getenv "TERM") "xterm-256color"))
            (full-env (append direnv-env `(("TERM" . ,term-env))))
-           ;; Start the PTY process on remote
+           ;; Capture before starting: the wait can invalidate or replace the
+           ;; connection registered under VEC.
+           (connection (tramp-rpc--ensure-connection vec))
            (result (tramp-rpc--call vec "process.start_pty"
                                     `((cmd . ,program)
                                       (args . ,(vconcat program-args))
                                       (cwd . ,localname)
                                       (rows . ,rows)
                                       (cols . ,cols)
-                                      (env . ,full-env))))
+                                      (env . ,full-env)) connection))
            (remote-pid (alist-get 'pid result))
            (tty-name (alist-get 'tty_name result))
-           (connection (tramp-rpc--get-connection vec))
            ;; Normalize buffer - it can be t, nil, a buffer, or a string
            (actual-buffer (cond
                            ((bufferp buffer) buffer)
@@ -1249,9 +1288,7 @@ DIRENV-ENV is an optional alist of environment variables for the process."
       (set-process-query-on-exit-flag local-process (not noquery))
 
       ;; Store process info
-      (process-put local-process :tramp-rpc-pty t)
-      (process-put local-process :tramp-rpc-pid remote-pid)
-      (process-put local-process :tramp-rpc-vec vec)
+      (tramp-rpc--track-managed-process local-process vec remote-pid connection t)
       (process-put local-process :tramp-rpc-user-sentinel sentinel)
       (process-put local-process :tramp-rpc-command command)
       (process-put local-process :tramp-rpc-tty-name tty-name)
@@ -1262,20 +1299,6 @@ DIRENV-ENV is an optional alist of environment variables for the process."
       ;; Set up window size adjustment function
       (process-put local-process 'adjust-window-size-function
                    #'tramp-rpc--adjust-pty-window-size)
-
-      ;; Track the PTY process and its exact transport generation.
-      (puthash local-process
-               (list :vec vec :pid remote-pid
-                     :connection-process (tramp-rpc-connection-process connection)
-                     :rpc-pty t
-                     :pending-output nil
-                     :pending-exit nil
-                     :delivery-timer nil)
-               tramp-rpc--pty-processes)
-      ;; PTY exit uses the exact transport generation that created it.
-      (process-put local-process :tramp-rpc-connection connection)
-      (process-put local-process :tramp-rpc-connection-process
-                   (tramp-rpc-connection-process connection))
 
       (tramp-rpc--register-managed-process local-process)
 

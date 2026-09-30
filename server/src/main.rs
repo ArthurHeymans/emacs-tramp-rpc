@@ -12,16 +12,18 @@
 //! can be processed in parallel while waiting on I/O.
 
 mod handlers;
+mod output;
 mod protocol;
 mod watcher;
 
+use output::FrameWriter;
 use protocol::{Request, RequestId, Response, RpcError};
 use rmpv::Value;
 use std::collections::VecDeque;
 use std::io::Cursor;
 use std::sync::{Arc, LazyLock};
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufWriter};
-use tokio::sync::{Mutex, OwnedSemaphorePermit, Semaphore, mpsc};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, BufWriter};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc};
 use tokio::task::JoinSet;
 
 /// Global byte budget for active request params.  Slot admission alone bounds
@@ -81,7 +83,7 @@ struct CleanupBarrier {
 
 /// Shared handle to the stdout writer, used by both response writing
 /// and the watcher's notification sending.
-pub type WriterHandle = Arc<Mutex<BufWriter<tokio::io::Stdout>>>;
+pub type WriterHandle = Arc<FrameWriter<BufWriter<tokio::io::Stdout>>>;
 
 async fn read_frames<R>(
     mut stdin: R,
@@ -262,28 +264,19 @@ fn enqueue_deferred(
     Ok(())
 }
 
-async fn write_response<W>(writer: &Arc<Mutex<W>>, response: &Response)
+async fn write_response<W>(writer: &Arc<FrameWriter<W>>, response: &Response) -> std::io::Result<()>
 where
     W: AsyncWrite + Unpin,
 {
-    let Ok(mut msgpack_bytes) = rmp_serde::to_vec_named(response) else {
-        return;
-    };
+    let mut msgpack_bytes = rmp_serde::to_vec_named(response).map_err(std::io::Error::other)?;
     if msgpack_bytes.len() > MAX_FRAME_SIZE {
         let oversized = Response::error(
             response.id.clone(),
             RpcError::internal_error("Response exceeds maximum frame size"),
         );
-        let Ok(encoded_error) = rmp_serde::to_vec_named(&oversized) else {
-            return;
-        };
-        msgpack_bytes = encoded_error;
+        msgpack_bytes = rmp_serde::to_vec_named(&oversized).map_err(std::io::Error::other)?;
     }
-    let mut writer = writer.lock().await;
-    let len_bytes = (msgpack_bytes.len() as u32).to_be_bytes();
-    let _ = writer.write_all(&len_bytes).await;
-    let _ = writer.write_all(&msgpack_bytes).await;
-    let _ = writer.flush().await;
+    writer.write_frame(&msgpack_bytes).await
 }
 
 fn spawn_request<W>(
@@ -291,7 +284,7 @@ fn spawn_request<W>(
     request: Request,
     permit: OwnedSemaphorePermit,
     byte_permit: OwnedSemaphorePermit,
-    writer: &Arc<Mutex<W>>,
+    writer: &Arc<FrameWriter<W>>,
 ) where
     W: AsyncWrite + Unpin + Send + 'static,
 {
@@ -305,7 +298,10 @@ fn spawn_request<W>(
         let panic_after_response = request.method == "test.panic";
         let method = request.method.clone();
         let response = handlers::dispatch(request).await;
-        write_response(&writer, &response).await;
+        if write_response(&writer, &response).await.is_err() {
+            writer.close();
+            return;
+        }
         handlers::after_response(&method, &response).await;
         #[cfg(test)]
         if panic_after_response {
@@ -316,13 +312,14 @@ fn spawn_request<W>(
 
 async fn run_connection<R, W>(
     reader: R,
-    writer: Arc<Mutex<W>>,
+    writer: Arc<FrameWriter<W>>,
     #[cfg(test)] cleanup_barrier: Option<Arc<CleanupBarrier>>,
 ) -> Result<(), RpcError>
 where
     R: AsyncRead + Unpin + Send + 'static,
     W: AsyncWrite + Unpin + Send + 'static,
 {
+    let mut output_failure = writer.failure();
     // Protocol-level failures are answered by a dedicated writer so they can
     // never be dropped: a missing response leaves the client blocked until
     // its own timeout with no indication of what went wrong.
@@ -331,7 +328,10 @@ where
         let writer = Arc::clone(&writer);
         async move {
             while let Some(response) = error_responses.recv().await {
-                write_response(&writer, &response).await;
+                if write_response(&writer, &response).await.is_err() {
+                    writer.close();
+                    break;
+                }
             }
         }
     });
@@ -345,6 +345,9 @@ where
     let mut general_bypass_budget = None;
 
     loop {
+        if *output_failure.borrow() {
+            break;
+        }
         start_admissible(
             &mut deferred,
             &mut tasks,
@@ -358,37 +361,22 @@ where
         let accepting = deferred.len() < DEFERRED_REQUEST_LIMIT
             && deferred_bytes(&deferred) < DEFERRED_BYTE_LIMIT;
 
-        if tasks.is_empty() {
-            if !accepting {
-                break;
-            }
-            let Some(payload) = frames.recv().await else {
-                break;
-            };
-            accept_frame(
-                payload,
-                &mut deferred,
-                &admissions,
-                &mut tasks,
-                &writer,
-                &errors,
-            )
-            .await;
-        } else {
-            tokio::select! {
-                Some(_) = tasks.join_next() => {}
-                payload = frames.recv(), if accepting => match payload {
-                    Some(payload) => {
-                        accept_frame(
-                            payload, &mut deferred, &admissions, &mut tasks, &writer, &errors,
-                        )
-                        .await;
-                    }
-                    // The transport is gone, so stop accepting frames.  The
-                    // shutdown path below still joins in-flight requests.
-                    None => break,
-                },
-            }
+        if tasks.is_empty() && !accepting {
+            break;
+        }
+        tokio::select! {
+            // Replies and notifications share this failure signal.  A broken
+            // output stream tears down the connection even if stdin stays open.
+            _ = output_failure.changed() => break,
+            Some(_) = tasks.join_next(), if !tasks.is_empty() => {}
+            payload = frames.recv(), if accepting => match payload {
+                Some(payload) => {
+                    accept_frame(
+                        payload, &mut deferred, &admissions, &mut tasks, &writer, &errors,
+                    ).await;
+                }
+                None => break,
+            },
         }
     }
 
@@ -420,7 +408,12 @@ where
     let cleanup_result = handlers::cleanup_managed_processes().await;
     drop(errors);
     let _ = tokio::time::timeout(EOF_TASK_JOIN_WAIT, error_writer).await;
-    cleanup_result
+    cleanup_result?;
+    if *output_failure.borrow() {
+        Err(RpcError::internal_error("RPC output disconnected"))
+    } else {
+        Ok(())
+    }
 }
 
 async fn drain_tasks_for(tasks: &mut JoinSet<()>, wait: std::time::Duration) {
@@ -495,7 +488,7 @@ fn try_start(
 fn start_admissible<W>(
     deferred: &mut VecDeque<DeferredRequest>,
     tasks: &mut JoinSet<()>,
-    writer: &Arc<Mutex<W>>,
+    writer: &Arc<FrameWriter<W>>,
     admissions: &Admissions,
     general_bypass_budget: &mut Option<usize>,
 ) where
@@ -557,7 +550,7 @@ async fn accept_frame<W>(
     deferred: &mut VecDeque<DeferredRequest>,
     admissions: &Admissions,
     tasks: &mut JoinSet<()>,
-    writer: &Arc<Mutex<W>>,
+    writer: &Arc<FrameWriter<W>>,
     errors: &mpsc::Sender<Response>,
 ) where
     W: AsyncWrite + Unpin + Send + 'static,
@@ -612,7 +605,7 @@ async fn accept_frame<W>(
 
 #[tokio::main]
 async fn main() -> std::process::ExitCode {
-    let stdout: WriterHandle = Arc::new(Mutex::new(BufWriter::new(tokio::io::stdout())));
+    let stdout: WriterHandle = Arc::new(FrameWriter::new(BufWriter::new(tokio::io::stdout())));
     handlers::process::init_notification_writer(Arc::clone(&stdout));
 
     // Initialize the filesystem watcher for cache invalidation notifications.

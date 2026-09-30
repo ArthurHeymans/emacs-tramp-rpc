@@ -44,6 +44,8 @@
 ;; Emitted inside the autoload form in tramp-rpc.el.
 (defvar tramp-rpc-method)
 (declare-function tramp-rpc--sudo-file-name-p "tramp-rpc")
+(declare-function tramp-rpc-deploy-plan "tramp-rpc-deploy" (vec &optional explicit force))
+(declare-function tramp-rpc-protocol-batch-params "tramp-rpc-protocol" (requests))
 
 ;; ============================================================================
 ;; Hooks into higher layers
@@ -1380,7 +1382,8 @@ probe can then interleave with RPC startup and corrupt the protocol stream."
                (tramp-rpc--establish-controlmaster vec)
              ((file-error remote-file-error)
               (signal (car err) (cdr err)))))))))
-  (let* ((sudo-ssh-user (tramp-rpc--detect-sudo-elevation vec))
+  (let* ((tramp-rpc-deploy--plan (tramp-rpc-deploy-plan vec))
+         (sudo-ssh-user (tramp-rpc--detect-sudo-elevation vec))
          ;; TRAMP's sudo method opens an elevated backend connection.  For the
          ;; RPC backend that means starting the server via sudo.  Prefer sudo
          ;; -n when a ticket is already valid; otherwise read the password with
@@ -1388,7 +1391,7 @@ probe can then interleave with RPC startup and corrupt the protocol stream."
          (sudo-password (when (and sudo-ssh-user
                                    (tramp-rpc--sudo-password-required-p vec))
                           (tramp-rpc--sudo-read-password vec sudo-ssh-user))))
-    (if tramp-rpc-deploy-never-deploy
+    (if (eq (tramp-rpc-deploy-plan-mode tramp-rpc-deploy--plan) 'never)
       ;; Never-deploy mode: use the configured path directly, no fallback.
       (let ((binary-path (tramp-rpc-deploy-ensure-binary vec)))
         (condition-case err
@@ -2046,62 +2049,25 @@ Returns:
   (t                          ; file.exists result
    ((type . \"file\") ...)    ; file.stat result
    (:error -32001 :message \"...\"))  ; or error plist"
-  (if (length> requests tramp-rpc--batch-max-entries)
-      (mapcan (lambda (chunk) (tramp-rpc--call-batch vec chunk))
-              (seq-split requests tramp-rpc--batch-max-entries))
-    (tramp-rpc--call-batch-1 vec requests)))
+  (when requests
+    (if (length> requests tramp-rpc--batch-max-entries)
+        (let ((connection (tramp-rpc--ensure-connection vec)))
+          (mapcan (lambda (chunk)
+                    (tramp-rpc--call-batch-1 vec chunk connection))
+                  (seq-split requests tramp-rpc--batch-max-entries)))
+      (tramp-rpc--call-batch-1 vec requests))))
 
-(defun tramp-rpc--call-batch-1 (vec requests)
-  "Send at most `tramp-rpc--batch-max-entries' REQUESTS for VEC in one batch."
-  (let* ((timeout (tramp-rpc--configured-call-timeout))
-         (poll-interval (tramp-rpc--configured-poll-interval))
-         (conn (tramp-rpc--ensure-connection vec))
-         (process (tramp-rpc-connection-process conn))
-         (id-and-request (let ((tramp-rpc-protocol--message-target process))
-                           (tramp-rpc-protocol-encode-batch-request-with-id
-                            requests)))
-         (expected-id (car id-and-request))
-         (request (cdr id-and-request)))
-    (tramp-rpc--debug "SEND-BATCH id=%s count=%d" expected-id (length requests))
-    (tramp-rpc--track-pending-request conn expected-id)
-    (tramp-rpc--with-pending-requests (conn (list expected-id))
-      (tramp-rpc--send-request-frame
-       conn vec request "Batch RPC interrupted while sending\n")
-      (let* ((state (tramp-rpc--wait-for-response-ids
-                     conn (list expected-id) timeout poll-interval "BATCH"))
-             (response (gethash expected-id (plist-get state :responses))))
-        (unless response
-          (if (or (tramp-rpc-connection-transport-dead conn)
-                  (not (plist-get state :process-live)))
-              (signal 'remote-file-error
-                      (list (format "RPC transport disconnected from %s"
-                                    (tramp-file-name-host vec))))
-            (let ((elapsed (plist-get state :elapsed))
-                  (stderr-tail (tramp-rpc--connection-stderr-tail conn)))
-              (tramp-rpc--debug
-               "TIMEOUT-BATCH id=%s elapsed=%.1fs buffer-size=%d process-live=%s stderr-tail=%S"
-               expected-id elapsed
-               (buffer-size (tramp-rpc-connection-buffer conn))
-               (plist-get state :process-live) stderr-tail)
-              (tramp-rpc--probe-live-connection vec conn process "batch")
-              (signal
-               'remote-file-error
-               (list (concat
-                      (format
-                       "Timeout waiting for batch RPC response from %s (id=%s, waited %.1fs)"
-                       (tramp-file-name-host vec) expected-id elapsed)
-                      (when stderr-tail
-                        (format "; SSH stderr: %s" stderr-tail))))))))
-        (tramp-rpc--debug "RECV-BATCH id=%s (found)" expected-id)
-        (if (tramp-rpc-protocol-error-p response)
-            (progn
-              (tramp-rpc--debug "ERROR-BATCH id=%s msg=%s"
-                                expected-id
-                                (tramp-rpc-protocol-error-message response))
-              (signal 'remote-file-error
-		      (list "Batch RPC error"
-			    (tramp-rpc-protocol-error-message response))))
-          (tramp-rpc-protocol-decode-batch-response response))))))
+(defun tramp-rpc--call-batch-1 (vec requests &optional connection)
+  "Send REQUESTS for VEC in one batch on captured CONNECTION.
+Request tracking, timeout and transport errors use the ordinary RPC lifecycle."
+  (let* ((result (tramp-rpc--call
+                  vec "batch" (tramp-rpc-protocol-batch-params requests)
+                  connection))
+         (results (alist-get 'results result)))
+    (unless (and (or (listp results) (vectorp results))
+                 (= (length results) (length requests)))
+      (signal 'remote-file-error '("Malformed batch RPC response: result count mismatch")))
+    (tramp-rpc-protocol-decode-batch-response (list :result result))))
 
 ;; ============================================================================
 ;; Request pipelining support

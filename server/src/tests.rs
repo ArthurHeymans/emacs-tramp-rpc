@@ -4,6 +4,7 @@
 
 use super::*;
 use rmpv::Value;
+use tokio::io::AsyncWriteExt;
 
 fn make_request(method: &str, params: Value) -> Vec<u8> {
     make_request_with_id(1, method, params)
@@ -174,7 +175,7 @@ async fn test_blocked_batch_uses_idle_permits_without_unbounded_bypass() {
             params: Value::Nil,
         }),
     ]);
-    let writer = Arc::new(Mutex::new(tokio::io::sink()));
+    let writer = Arc::new(FrameWriter::new(tokio::io::sink()));
     let mut tasks = JoinSet::new();
     let mut bypass_budget = None;
 
@@ -209,7 +210,7 @@ async fn test_new_general_requests_share_bounded_batch_bypass_budget() {
         method: "batch".into(),
         params: Value::Nil,
     })]);
-    let writer = Arc::new(Mutex::new(tokio::io::sink()));
+    let writer = Arc::new(FrameWriter::new(tokio::io::sink()));
     let mut tasks = JoinSet::new();
     let mut bypass_budget = None;
     let (errors, _error_responses) = mpsc::channel(1);
@@ -301,7 +302,7 @@ async fn test_every_malformed_frame_is_answered() {
     let (server_writer, mut client_reader) = tokio::io::duplex(4096);
     let connection = tokio::spawn(run_connection(
         server_reader,
-        Arc::new(Mutex::new(server_writer)),
+        Arc::new(FrameWriter::new(server_writer)),
         None,
     ));
 
@@ -363,7 +364,7 @@ async fn test_connection_handles_fragmented_frame_while_writing_response() {
     let _test_lock = handlers::process::test_process_map_lock().await;
     let (mut client, server_reader) = tokio::io::duplex(1024);
     let (server_writer, mut client_reader) = tokio::io::duplex(1024);
-    let writer = Arc::new(Mutex::new(server_writer));
+    let writer = Arc::new(FrameWriter::new(server_writer));
     let connection = tokio::spawn(run_connection(server_reader, writer, None));
     let first = make_request("missing.first", Value::Map(vec![]));
     let second = make_request("missing.second", Value::Map(vec![]));
@@ -401,7 +402,7 @@ async fn test_connection_recovers_admission_after_panicked_tasks() {
     let (server_writer, mut client_reader) = tokio::io::duplex(4096);
     let connection = tokio::spawn(run_connection(
         server_reader,
-        Arc::new(Mutex::new(server_writer)),
+        Arc::new(FrameWriter::new(server_writer)),
         None,
     ));
 
@@ -763,7 +764,7 @@ async fn test_connection_eof_kills_synchronous_process_groups() {
         let (server_writer, _client_reader) = tokio::io::duplex(4096);
         let connection = tokio::spawn(run_connection(
             server_reader,
-            Arc::new(Mutex::new(server_writer)),
+            Arc::new(FrameWriter::new(server_writer)),
             None,
         ));
         client
@@ -821,6 +822,39 @@ fn map_get_id(value: &Value) -> Option<i64> {
 /// still be SIGKILLed and reaped when the transport reaches EOF, so the
 /// connection task terminates within its bounded cleanup window.
 #[tokio::test]
+async fn test_output_failure_reaps_children_without_input_eof() {
+    let _test_lock = handlers::process::test_process_map_lock().await;
+    handlers::process::start(msgpack_map! {
+        "cmd" => "sleep", "args" => Value::Array(vec![Value::from("30")])
+    })
+    .await
+    .unwrap();
+    let managed_pids = handlers::process::test_managed_os_pids().await;
+    assert_eq!(managed_pids.len(), 1);
+    let (client, reader) = tokio::io::duplex(4096);
+    let (output, output_peer) = tokio::io::duplex(4096);
+    let writer = Arc::new(FrameWriter::new(output));
+    let connection = tokio::spawn(run_connection(reader, Arc::clone(&writer), None));
+    drop(output_peer);
+    assert!(writer.write_frame(b"notification").await.is_err());
+    // Keep input open: notification failure alone must initiate teardown.
+    let result = tokio::time::timeout(std::time::Duration::from_secs(3), connection)
+        .await
+        .expect("output failure cleanup should be bounded")
+        .expect("connection should not panic");
+    assert!(result.is_err());
+    assert!(handlers::process::test_managed_maps_empty().await);
+    assert!(matches!(
+        nix::sys::wait::waitpid(
+            nix::unistd::Pid::from_raw(managed_pids[0]),
+            Some(nix::sys::wait::WaitPidFlag::WNOHANG)
+        ),
+        Err(nix::errno::Errno::ECHILD)
+    ));
+    drop(client);
+}
+
+#[tokio::test]
 async fn test_connection_eof_second_cleanup_catches_late_registration() {
     let _test_lock = handlers::process::test_process_map_lock().await;
     let barrier = Arc::new(CleanupBarrier {
@@ -831,7 +865,7 @@ async fn test_connection_eof_second_cleanup_catches_late_registration() {
     let (server_writer, _client_reader) = tokio::io::duplex(4096);
     let connection = tokio::spawn(run_connection(
         server_reader,
-        Arc::new(Mutex::new(server_writer)),
+        Arc::new(FrameWriter::new(server_writer)),
         Some(Arc::clone(&barrier)),
     ));
 
@@ -878,7 +912,7 @@ async fn test_connection_eof_sigkills_blocked_pipe_and_pty_requests() {
     let (server_writer, mut client_reader) = tokio::io::duplex(4096);
     let connection = tokio::spawn(run_connection(
         server_reader,
-        Arc::new(Mutex::new(server_writer)),
+        Arc::new(FrameWriter::new(server_writer)),
         None,
     ));
     let temp = tempfile::tempdir().expect("temporary marker directory");

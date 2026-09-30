@@ -517,7 +517,8 @@ When RECURSIVE is non-nil, watch subdirectories too."
       (if (and recursive
                (not (tramp-rpc--watch-entry-recursive-p entry))
                file-notify-entry
-               (plist-get file-notify-entry :owned))
+               (plist-get file-notify-entry :owned)
+               (not (plist-get file-notify-entry :nofollow)))
           ;; Upgrade a file-notify-owned direct watch by relying on the server's
           ;; atomic non-recursive-to-recursive upgrade path.  Do not remove the
           ;; existing watch first; if the recursive add fails, the server rolls
@@ -567,7 +568,9 @@ When RECURSIVE is non-nil, watch subdirectories too."
       ;; non-recursive explicit watches; otherwise a still-valid file-notify
       ;; descriptor could be left without any server watch underneath it.
       (when (and file-notify-entry
-                 (not (plist-get file-notify-entry :owned)))
+                 (not (plist-get file-notify-entry :owned))
+                 (not (plist-get file-notify-entry :synthetic))
+                 (not (plist-get file-notify-entry :nofollow)))
         (let ((result (tramp-rpc--call v "watch.add"
                                        `((path . ,localname)
                                          (recursive . :msgpack-false)))))
@@ -581,7 +584,8 @@ When RECURSIVE is non-nil, watch subdirectories too."
          v "watch.remove"
          `((path . ,(if (stringp canonical-directory)
                         (tramp-file-local-name canonical-directory)
-                      localname))))))
+                      localname))
+           (nofollow . :msgpack-false)))))
     (tramp-rpc--debug "Unwatched: %s" localname)))
 
 (defun tramp-rpc--cleanup-watches-for-connection (vec &optional connection-process)

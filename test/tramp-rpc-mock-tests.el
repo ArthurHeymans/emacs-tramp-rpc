@@ -1722,7 +1722,7 @@ This matches the behavior expected by `tramp-test28-process-file'."
     (unwind-protect
         (cl-letf (((symbol-function 'tramp-rpc--get-terminal-size)
                    (lambda (_buffer) '(80 . 24)))
-                  ((symbol-function 'tramp-rpc--get-connection)
+                  ((symbol-function 'tramp-rpc--ensure-connection)
                    (lambda (_vec) current-connection))
                   ((symbol-function 'tramp-rpc--call)
                    (lambda (_vec method _params &optional connection)
@@ -2184,7 +2184,7 @@ direct property test would miss it."
                      (pcase method
                        ("process.start_pty" '((pid . 42) (tty_name . "/dev/pts/42")))
                        (_ (error "Unexpected RPC %s" method)))))
-                  ((symbol-function 'tramp-rpc--get-connection)
+                  ((symbol-function 'tramp-rpc--ensure-connection)
                    (lambda (_vec) connection)))
           (setq local-process
                 (tramp-rpc--make-rpc-pty-process
@@ -3140,8 +3140,9 @@ direct property test would miss it."
         (files (cl-loop for i below 40
                         collect (format "/repo/file-%02d" i)))
         batch-sizes)
-    (cl-letf (((symbol-function 'tramp-rpc--call-batch-1)
-               (lambda (_vec requests)
+    (cl-letf (((symbol-function 'tramp-rpc--ensure-connection) (lambda (_vec) 'generation))
+              ((symbol-function 'tramp-rpc--call-batch-1)
+               (lambda (_vec requests &optional _connection)
                  (push (length requests) batch-sizes)
                  (make-list (length requests) '(:error -1)))))
       (tramp-rpc-magit--prefetch-file-metadata vec files))
@@ -3189,7 +3190,8 @@ direct property test would miss it."
         (cl-letf (((symbol-function 'file-symlink-p)
                    (lambda (_filename) "/tmp/real"))
                   ((symbol-function 'tramp-rpc--system-info)
-                   (lambda (_vec) '((os . "linux") (watcher . "inotify"))))
+                   (lambda (_vec) '((os . "linux") (watcher . "inotify")
+                                   (watch_remove_nofollow . t))))
                   ((symbol-function 'tramp-rpc--call)
                    (lambda (_vec method params)
                      (push (list method params) calls)
@@ -3235,7 +3237,8 @@ direct property test would miss it."
         (cl-letf (((symbol-function 'file-symlink-p)
                    (lambda (_filename) "/tmp/real"))
                   ((symbol-function 'tramp-rpc--system-info)
-                   (lambda (_vec) '((os . "linux") (watcher . "inotify"))))
+                   (lambda (_vec) '((os . "linux") (watcher . "inotify")
+                                   (watch_remove_nofollow . t))))
                   ((symbol-function 'tramp-rpc--call)
                    (lambda (_vec method _params)
                      (push method calls)
@@ -5143,7 +5146,7 @@ direct property test would miss it."
   "Test the git install prompt offers download but not build without Cargo."
   :tags '(:deploy)
   (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
-  (let ((tramp-rpc-deploy--allow-prompt t)
+  (let ((tramp-rpc-deploy--plan (tramp-rpc-deploy--make-plan :prompt t))
         prompt choices)
     (cl-letf (((symbol-function 'tramp-rpc-deploy--cargo-available-p)
                (lambda () nil))
@@ -5162,7 +5165,7 @@ direct property test would miss it."
   "Test the git install prompt offers a source build when available."
   :tags '(:deploy)
   (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
-  (let ((tramp-rpc-deploy--allow-prompt t)
+  (let ((tramp-rpc-deploy--plan (tramp-rpc-deploy--make-plan :prompt t))
         choices)
     (cl-letf (((symbol-function 'tramp-rpc-deploy--cargo-available-p)
                (lambda () t))
@@ -5180,7 +5183,7 @@ direct property test would miss it."
   "Test automatic deployment reports the explicit install command."
   :tags '(:deploy)
   (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
-  (let ((tramp-rpc-deploy--allow-prompt nil))
+  (let ((tramp-rpc-deploy--plan nil))
     (let ((err (should-error
                 (tramp-rpc-deploy--ask-git-install-action "x86_64-linux")
                 :type 'remote-file-error)))
@@ -5201,9 +5204,9 @@ Each entry is (HOST ALLOW-PROMPT FORCE-OBTAIN AUTO-DEPLOY)."
              ((symbol-function 'tramp-rpc-deploy--remote-binary-matches-p)
               (lambda (vec _binary)
                 (push (list (tramp-file-name-host vec)
-                            tramp-rpc-deploy--allow-prompt
-                            tramp-rpc-deploy--force-obtain
-                            tramp-rpc-deploy-auto-deploy)
+                            (tramp-rpc-deploy-plan-prompt tramp-rpc-deploy--plan)
+                            (tramp-rpc-deploy-plan-force tramp-rpc-deploy--plan)
+                            (eq 'auto (tramp-rpc-deploy-plan-mode tramp-rpc-deploy--plan)))
                       ,record)
                 t))
              ((symbol-function 'tramp-rpc-deploy--detect-remote-arch)
@@ -5213,9 +5216,9 @@ Each entry is (HOST ALLOW-PROMPT FORCE-OBTAIN AUTO-DEPLOY)."
              ((symbol-function 'tramp-rpc-deploy--transfer-binary)
               (lambda (vec _binary)
                 (push (list (tramp-file-name-host vec)
-                            tramp-rpc-deploy--allow-prompt
-                            tramp-rpc-deploy--force-obtain
-                            tramp-rpc-deploy-auto-deploy)
+                            (tramp-rpc-deploy-plan-prompt tramp-rpc-deploy--plan)
+                            (tramp-rpc-deploy-plan-force tramp-rpc-deploy--plan)
+                            (eq 'auto (tramp-rpc-deploy-plan-mode tramp-rpc-deploy--plan)))
                       ,record)
                 (tramp-make-tramp-file-name vec "/tmp/tramp-rpc-server"))))
      ,@body))
@@ -5231,9 +5234,7 @@ Each entry is (HOST ALLOW-PROMPT FORCE-OBTAIN AUTO-DEPLOY)."
     (tramp-rpc-mock-test--with-deploy-stubs deploys
       (tramp-rpc-deploy-install-binary vec t))
     (should (equal deploys '(("target" t t t))))
-    (should-not tramp-rpc-deploy--allow-prompt)
-    (should-not tramp-rpc-deploy--force-obtain)
-    (should-not tramp-rpc-deploy--explicit-target)
+    (should-not tramp-rpc-deploy--plan)
     (should-not tramp-rpc-deploy-auto-deploy)))
 
 (ert-deftest tramp-rpc-mock-test-deploy-install-flags-scoped-to-target ()
@@ -5245,10 +5246,7 @@ Each entry is (HOST ALLOW-PROMPT FORCE-OBTAIN AUTO-DEPLOY)."
         (tramp-rpc-deploy-auto-deploy t)
         (tramp-rpc-deploy-never-deploy nil)
         (deploys nil))
-    (let ((tramp-rpc-deploy--explicit-target
-           (tramp-rpc-deploy--target-key vec))
-          (tramp-rpc-deploy--explicit-force t)
-          (tramp-rpc-deploy--pre-explicit-auto-deploy t))
+    (let ((tramp-rpc-deploy--plan (tramp-rpc-deploy-plan vec t t)))
       (tramp-rpc-mock-test--with-deploy-stubs deploys
         (tramp-rpc-deploy-ensure-binary other)))
     (should (equal deploys '(("other" nil nil t))))))
@@ -5261,16 +5259,10 @@ Each entry is (HOST ALLOW-PROMPT FORCE-OBTAIN AUTO-DEPLOY)."
         (other (tramp-dissect-file-name "/rpc:user@other:/"))
         (tramp-rpc-deploy-never-deploy nil)
         (deploys nil))
-    ;; Simulate the dynamic environment inside an explicit installation for
-    ;; "target" invoked while the user has auto-deploy disabled:
-    ;; `tramp-rpc-deploy-ensure-binary' has already rebound
-    ;; `tramp-rpc-deploy-auto-deploy' to t for the explicit target when a
-    ;; reentrant deploy for "other" runs.
-    (let ((tramp-rpc-deploy--explicit-target
-           (tramp-rpc-deploy--target-key vec))
-          (tramp-rpc-deploy--explicit-force nil)
-          (tramp-rpc-deploy--pre-explicit-auto-deploy nil)
-          (tramp-rpc-deploy-auto-deploy t))
+    ;; Explicit permissions live in a target-scoped plan, leaving the user's
+    ;; disabled auto-deploy setting intact for a reentrant operation.
+    (let ((tramp-rpc-deploy-auto-deploy nil)
+          (tramp-rpc-deploy--plan (tramp-rpc-deploy-plan vec t)))
       (tramp-rpc-mock-test--with-deploy-stubs deploys
         (tramp-rpc-deploy-ensure-binary other)))
     (should (equal deploys '(("other" nil nil nil))))))
@@ -5290,7 +5282,7 @@ Each entry is (HOST ALLOW-PROMPT FORCE-OBTAIN AUTO-DEPLOY)."
   (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
   (let ((binary (make-temp-file "tramp-rpc-cached"))
         (replacement "replacement")
-        (tramp-rpc-deploy--force-obtain t))
+        (tramp-rpc-deploy--plan (tramp-rpc-deploy--make-plan :force t)))
     (unwind-protect
         (progn
           (set-file-modes binary #o755)
@@ -6450,8 +6442,10 @@ A rejected sudo password must not be reused on the next attempt, otherwise
                (lambda (&rest _) nil))
               ((symbol-function 'tramp-rpc--caller-environment)
                (lambda () nil))
+              ((symbol-function 'tramp-rpc--ensure-connection)
+               (lambda (_vec) (tramp-rpc--make-connection)))
               ((symbol-function 'tramp-rpc--start-remote-process)
-               (lambda (vec program args cwd _env)
+               (lambda (vec program args cwd _env &optional _connection)
                  (setq captured (list vec program args cwd))
                  4242))
               ((symbol-function 'tramp-rpc--write-remote-process)
@@ -8199,8 +8193,10 @@ This matches tramp-sh and upstream `tramp-test28-process-file', which requires
                (lambda (&rest _) nil))
               ((symbol-function 'tramp-rpc--caller-environment)
                (lambda () nil))
+              ((symbol-function 'tramp-rpc--ensure-connection)
+               (lambda (_vec) (tramp-rpc--make-connection)))
               ((symbol-function 'tramp-rpc--start-remote-process)
-               (lambda (_vec program args _cwd _env)
+               (lambda (_vec program args _cwd _env &optional _connection)
                  (setq started (list program args))
                  4242))
               ((symbol-function 'tramp-rpc--write-remote-process)
@@ -8236,8 +8232,10 @@ This matches tramp-sh and upstream `tramp-test28-process-file', which requires
                (lambda (&rest _) nil))
               ((symbol-function 'tramp-rpc--caller-environment)
                (lambda () nil))
+              ((symbol-function 'tramp-rpc--ensure-connection)
+               (lambda (_vec) (tramp-rpc--make-connection)))
               ((symbol-function 'tramp-rpc--start-remote-process)
-               (lambda (_vec program args _cwd _env)
+               (lambda (_vec program args _cwd _env &optional _connection)
                  (setq started (cons program args))
                  51)))
       (unwind-protect
@@ -8307,12 +8305,14 @@ This matches tramp-sh and upstream `tramp-test28-process-file', which requires
                (lambda (&rest _) nil))
               ((symbol-function 'tramp-rpc--caller-environment)
                (lambda () nil))
+              ((symbol-function 'tramp-rpc--ensure-connection)
+               (lambda (_vec) (tramp-rpc--make-connection)))
               ((symbol-function 'tramp-rpc--start-remote-process)
-               (lambda (_vec program args _cwd _env)
+               (lambda (_vec program args _cwd _env &optional _connection)
                  (setq started (list program args))
                  4242))
               ((symbol-function 'tramp-rpc--write-remote-process)
-               (lambda (_vec pid data)
+               (lambda (_vec pid data &optional _owner)
                  (setq written (list pid data)))))
       (unwind-protect
           (progn
@@ -9028,6 +9028,9 @@ SPEC is (RELAY BUFFER TRANSPORT CONNECTION PID).  RELAY is not yet in
 ;;; ============================================================================
 ;;; Test Runner
 ;;; ============================================================================
+
+(load (expand-file-name "test/tramp-rpc-lifecycle-tests.el"
+                        tramp-rpc-mock-test--project-root) nil nil t)
 
 ;;;###autoload
 (defun tramp-rpc-mock-test-all ()

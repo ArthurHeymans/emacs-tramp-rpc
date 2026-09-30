@@ -41,6 +41,7 @@
 
 ;; Functions from tramp-rpc.el
 (declare-function tramp-rpc-file-name-p "tramp-rpc")
+(declare-function tramp-rpc--forget-managed-process "tramp-rpc-process" (process))
 
 ;; Variables from tramp-rpc.el / tramp-rpc-process.el
 
@@ -519,7 +520,7 @@ exited (remote side finished), delete it so the refresh can proceed."
                (process-get proc :tramp-rpc-pid)
                (or (process-get proc :tramp-rpc-exited)
                    (not (process-live-p proc))))
-      (remhash proc tramp-rpc--async-processes)
+      (tramp-rpc--forget-managed-process proc)
       (delete-process proc)))
   (tramp-run-real-handler 'vc-dir-refresh nil))
 

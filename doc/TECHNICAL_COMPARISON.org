@@ -215,8 +215,8 @@ once its start response has been written.  PTY output arrives as ~stdout~.
 **** Filesystem Watch Operations
 | Method       | Parameters                       | Returns                                      |
 |--------------+----------------------------------+----------------------------------------------|
-| watch.add    | ~{path: bin/string, recursive?}~ | ~{path: bin, recursive: bool}~               |
-| watch.remove | ~{path: bin/string}~             | ~true~                                       |
+| watch.add    | ~{path: bin/string, recursive?, nofollow?}~ | ~{path: bin, recursive: bool, nofollow: bool}~ |
+| watch.remove | ~{path: bin/string, nofollow?}~             | ~true~                                       |
 
 The server also pushes ~fs.events~ notifications (no id) when watched directories change:
 
@@ -239,6 +239,13 @@ The server also pushes ~fs.events~ notifications (no id) when watched directorie
 ~watch.add~ defaults ~recursive~ to true when the field is omitted.  ~PATH-BIN~
 values are MessagePack ~bin~ payloads containing remote OS path bytes.  A
 ~rescan~ event means the client should discard cached state for the connection.
+
+~watch.remove~ with ~nofollow: true~ removes only the symlink registration;
+~nofollow: false~ removes only the target-following registration.  Omitting
+~nofollow~ retains legacy removal of both.  ~system.info~ advertises support
+as ~watch_remove_nofollow: true~.  Clients must check this capability before
+acquiring nofollow watches: older servers ignore the removal flag and could
+remove another owner's target watch.
 
 * Performance Analysis
 
