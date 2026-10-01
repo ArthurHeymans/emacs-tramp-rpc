@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 # Test runner for tramp-rpc
 # Usage:
 #   ./test/run-tests.sh [OPTIONS]

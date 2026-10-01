@@ -19,6 +19,8 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  # NB: The platforms below need to be kept in sync with the tramp-rpc-deploy-release-architectures constant
+  # in lisp/tramp-rpc-deploy.el
   build-linux:
     name: Build Linux ${{ matrix.arch }}
     uses: ./.github/workflows/build.yml
