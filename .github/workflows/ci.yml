@@ -465,6 +465,13 @@ jobs:
             -l test/tramp-rpc-tests.el \
             --eval "(tramp-rpc-test--run-guarded \"^tramp-rpc-test\")"
 
+      - name: Run randomized process lifecycle tests
+        env:
+          TRAMP_RPC_TEST_HOST: localhost
+        run: |
+          scripts/chaos-test.sh --no-build --seeds 40 \
+            --server target/x86_64-unknown-linux-musl/release/tramp-rpc-server
+
   test-upstream-tramp:
     name: Upstream Tramp Tests (${{ matrix.emacs_label }})
     runs-on: ubuntu-latest
