@@ -1776,6 +1776,63 @@ This matches the behavior expected by `tramp-test28-process-file'."
         (when (process-live-p process)
           (delete-process process))))))
 
+(ert-deftest tramp-rpc-mock-test-relay-delivery-keeps-reentrant-writes-remote ()
+  "Nested string/region writes stay remote on every relay output path."
+  (dolist (path '(stdout mixed-stderr separate-stderr pty))
+    (dolist (operation '(string region))
+      (let* ((process-connection-type nil)
+             (relay (start-process "tramp-rpc-reentrant-relay" nil "cat"))
+             (stderr-relay (and (eq path 'separate-stderr)
+                                (start-process "tramp-rpc-reentrant-stderr" nil "cat")))
+             (target (or stderr-relay relay))
+             (vec (tramp-dissect-file-name "/rpc:mock:/path"))
+             (reply "REENTRANT-WRITE\n")
+             (payload (make-string 65536 ?x))
+             (tramp-rpc--async-processes (make-hash-table :test 'eq))
+             (tramp-rpc--pty-processes (make-hash-table :test 'eq))
+             (output "") remote-writes replied)
+        (unwind-protect
+            (ert-info ((format "%s output, %s input" path operation))
+              (process-put relay :tramp-rpc-pid 42)
+              (process-put relay :tramp-rpc-vec vec)
+              (process-put relay 'tramp-vector vec)
+              (set-process-filter
+               target
+               (lambda (_process string)
+                 (setq output (concat output string))
+                 (unless replied
+                   (setq replied t)
+                   (if (eq operation 'string)
+                       (process-send-string relay reply)
+                     (with-temp-buffer
+                       (insert reply)
+                       (process-send-region relay (point-min) (point-max)))))))
+              (puthash relay (list :stderr-process stderr-relay)
+                       tramp-rpc--async-processes)
+              (cl-letf (((symbol-function 'tramp-rpc--write-remote-process)
+                         (lambda (_vec _pid data &optional _owner)
+                           (push data remote-writes))))
+                ;; More than a pipe buffer, forcing the filter to run inside
+                ;; the write rather than only after delivery has returned.
+                (dotimes (_ 2)
+                  (pcase path
+                    ('pty
+                     (puthash relay (list :pending-output (list payload))
+                              tramp-rpc--pty-processes)
+                     (tramp-rpc--deliver-pending-pty-output relay))
+                    (_ (tramp-rpc--deliver-process-output
+                        relay (and (eq path 'stdout) payload)
+                        (and (not (eq path 'stdout)) payload)
+                        (and stderr-relay t)))))
+                (tramp-rpc-mock-test--wait-for
+                 (lambda () (>= (length output) (* 2 (length payload))))
+                 "both relay payloads" target))
+              (should replied)
+              (should (equal remote-writes (list reply)))
+              (should (equal output (concat payload payload))))
+          (dolist (process (list relay stderr-relay))
+            (when (process-live-p process) (delete-process process))))))))
+
 (ert-deftest tramp-rpc-mock-test-call-async-send-failure-rolls-back-callback ()
   "A rejected async send must not leave callback state behind."
   (let ((conn (tramp-rpc--make-connection :process 'dead-transport)))
@@ -3702,6 +3759,30 @@ direct property test would miss it."
       (remhash other-descriptor file-notify-descriptors)
       (tramp-rpc--delete-file-notify-descriptor-process descriptor)
       (tramp-rpc--delete-file-notify-descriptor-process other-descriptor))))
+
+(ert-deftest tramp-rpc-mock-test-file-notify-failed-registration-does-not-leak ()
+  "A rejected server watch creates neither a descriptor nor watch state."
+  (let ((tramp-rpc--file-notify-descriptors (make-hash-table :test 'eq))
+        (tramp-rpc--file-notify-watch-counts (make-hash-table :test 'equal))
+        (tramp-rpc--watched-directories (make-hash-table :test 'equal))
+        (before (process-list)))
+    (unwind-protect
+        (cl-letf (((symbol-function 'file-symlink-p) (lambda (_) nil))
+                  ((symbol-function 'tramp-rpc--system-info)
+                   (lambda (_) '((os . "linux"))))
+                  ((symbol-function 'tramp-rpc--call)
+                   (lambda (_vec method _params)
+                     (should (equal method "watch.add"))
+                     (signal 'remote-file-error '("Watch registration failed")))))
+          (should-error
+           (tramp-rpc-handle-file-notify-add-watch
+            "/rpc:mock:/missing/" '(change) #'ignore)
+           :type 'remote-file-error)
+          (should-not (cl-set-difference (process-list) before))
+          (should (zerop (hash-table-count tramp-rpc--file-notify-descriptors)))
+          (should (zerop (hash-table-count tramp-rpc--file-notify-watch-counts))))
+      (dolist (process (cl-set-difference (process-list) before))
+        (tramp-rpc--delete-file-notify-descriptor-process process)))))
 
 (ert-deftest tramp-rpc-mock-test-file-notify-dispatch-matches-canonical-directory ()
   "Dispatch matches canonical watch paths returned by the server."

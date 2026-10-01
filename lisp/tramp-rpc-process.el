@@ -27,6 +27,7 @@
 ;;; Code:
 
 (require 'cl-lib)
+(require 'nadvice)
 (require 'msgpack)
 (require 'tramp)
 (require 'tramp-sh)
@@ -61,9 +62,18 @@ unexpected failures remain visible in TRAMP-RPC debug output."
                         ',(car body) (error-message-string err))
       nil)))
 
-(defvar tramp-rpc--delivering-output nil
-  "Non-nil while delivering process output to the local relay.
-Used by advice functions to bypass interception during output delivery.")
+(defconst tramp-rpc--native-process-send-string
+  (advice--cd*r (symbol-function 'process-send-string))
+  "Unadvised `process-send-string' used to feed local output relays.
+Strip existing advice as well: another TRAMP backend may already have
+installed process routing before this module loads.")
+
+(defun tramp-rpc--send-local-relay-string (relay string)
+  "Write STRING to local output RELAY without process routing.
+A blocked write can run filters and timers which write to the remote
+process.  Bypassing advice only for this call, rather than dynamically
+suppressing routing, keeps those nested writes remote."
+  (funcall tramp-rpc--native-process-send-string relay string))
 
 (defvar tramp-rpc--closing-local-relay nil
   "Non-nil while sending EOF to a local cat relay process.
@@ -557,29 +567,22 @@ Writes to the local cat relay process, which triggers proper I/O events
 that satisfy function `accept-process-output'.
 STDERR-BUFFER is the separate stderr buffer, or nil to mix with stdout."
   (when (and (processp local-process) (process-live-p local-process))
-    ;; Set flag to bypass our handler - we're writing TO the local process,
-    ;; not sending data to the remote process
-    (let ((tramp-rpc--delivering-output t))
-      ;; Deliver stdout by writing to the cat relay process
-      ;; This triggers actual I/O events that accept-process-output detects
-      (when (and stdout (> (length stdout) 0))
-        (tramp-rpc--debug "DELIVER stdout %d bytes to %s" (length stdout) local-process)
-        (process-send-string local-process stdout))
-
-      ;; Deliver stderr
-      (when (and stderr (> (length stderr) 0))
-        (tramp-rpc--debug "DELIVER stderr %d bytes" (length stderr))
-        (let ((stderr-process
-               (when stderr-buffer
-                 (plist-get (gethash local-process tramp-rpc--async-processes)
-                            :stderr-process))))
-          (cond
-           ;; Write to stderr cat relay if available, triggering proper I/O events
-           ((and stderr-process (process-live-p stderr-process))
-            (process-send-string stderr-process stderr))
-           ;; Mix with stdout if no separate stderr buffer - write to cat relay
-           (t
-            (process-send-string local-process stderr))))))))
+    ;; Feed cat directly, generating the real I/O events needed by
+    ;; `accept-process-output' without redirecting nested client writes.
+    (when (and stdout (> (length stdout) 0))
+      (tramp-rpc--debug "DELIVER stdout %d bytes to %s" (length stdout) local-process)
+      (tramp-rpc--send-local-relay-string local-process stdout))
+    (when (and stderr (> (length stderr) 0))
+      (tramp-rpc--debug "DELIVER stderr %d bytes" (length stderr))
+      (let ((stderr-process
+             (when stderr-buffer
+               (plist-get (gethash local-process tramp-rpc--async-processes)
+                          :stderr-process))))
+        (tramp-rpc--send-local-relay-string
+         (if (and stderr-process (process-live-p stderr-process))
+             stderr-process
+           local-process)
+         stderr)))))
 
 (defun tramp-rpc--deliver-pending-process-output (local-process)
   "Deliver queued output and then any exit for LOCAL-PROCESS."
@@ -1346,8 +1349,7 @@ Returns (COLS . ROWS)."
       (puthash local-process info tramp-rpc--pty-processes)
       (dolist (output pending)
         (when (and output (process-live-p local-process))
-          (let ((tramp-rpc--delivering-output t))
-            (process-send-string local-process output))))
+          (tramp-rpc--send-local-relay-string local-process output)))
       (when pending-exit
         (apply #'tramp-rpc--handle-pty-exit local-process (cdr pending-exit))))))
 

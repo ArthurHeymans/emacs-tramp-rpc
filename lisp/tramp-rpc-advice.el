@@ -136,8 +136,7 @@ Return `not-managed' when PROCESS must use the native handler."
 (defun tramp-rpc--managed-send-process (process)
   "Return PROCESS's RPC-managed process, or nil when native delivery is needed."
   (when-let* ((proc (tramp-rpc--resolve-process process)))
-    (and (not tramp-rpc--delivering-output)
-         (not (process-get proc :tramp-rpc-direct-ssh))
+    (and (not (process-get proc :tramp-rpc-direct-ssh))
          (process-get proc :tramp-rpc-pid)
          (process-get proc :tramp-rpc-vec)
          proc)))

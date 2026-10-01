@@ -17,6 +17,7 @@ use super::pty::{get_pty_process_map, read_pty_now, terminate_pty_process, wait_
 
 const PUSH_READ_MAX_BYTES: usize = 65_536;
 const PUSH_READ_TIMEOUT_MS: u64 = 200;
+const PUSH_IDLE_WAIT: std::time::Duration = std::time::Duration::from_millis(20);
 const _: () = assert!(PUSH_READ_MAX_BYTES <= 64 * 1024);
 const _: () = assert!(PUSH_READ_MAX_BYTES < crate::MAX_FRAME_SIZE);
 
@@ -60,7 +61,19 @@ pub(super) async fn send_exit_notification(pid: u32, status: Option<ExitStatus>)
     let _ = send_process_notification("process.exit", Value::Map(pairs)).await;
 }
 
-fn spawn_pipe_push(pid: u32, stop: Arc<AtomicBool>) -> JoinHandle<()> {
+/// EOF need not mean child exit: it can close its output and keep running.
+/// Back off between empty reads without delaying an explicit push stop.
+async fn wait_for_idle_push(stop: &AtomicBool, wake: &Notify) -> bool {
+    if stop.load(Ordering::Acquire) {
+        return false;
+    }
+    tokio::select! {
+        _ = wake.notified() => false,
+        _ = tokio::time::sleep(PUSH_IDLE_WAIT) => !stop.load(Ordering::Acquire),
+    }
+}
+
+fn spawn_pipe_push(pid: u32, stop: Arc<AtomicBool>, wake: Arc<Notify>) -> JoinHandle<()> {
     // A pipe read is deliberately allowed to finish after stop is requested:
     // cancelling it after it consumed bytes could lose output.
     tokio::spawn(async move {
@@ -81,7 +94,8 @@ fn spawn_pipe_push(pid: u32, stop: Arc<AtomicBool>) -> JoinHandle<()> {
                 break;
             };
 
-            if !result.stdout.is_empty() || !result.stderr.is_empty() {
+            let idle = result.stdout.is_empty() && result.stderr.is_empty();
+            if !idle {
                 let bytes_or_nil = |data: Vec<u8>| {
                     if data.is_empty() {
                         Value::Nil
@@ -103,6 +117,9 @@ fn spawn_pipe_push(pid: u32, stop: Arc<AtomicBool>) -> JoinHandle<()> {
 
             if result.exited {
                 send_exit_notification(pid, result.exit).await;
+                break;
+            }
+            if idle && !wait_for_idle_push(&stop, &wake).await {
                 break;
             }
         }
@@ -133,7 +150,8 @@ fn spawn_pty_push(pid: u32, stop: Arc<AtomicBool>, wake: Arc<Notify>) -> JoinHan
                 }
                 continue;
             }
-            if !result.output.is_empty() {
+            let idle = result.output.is_empty();
+            if !idle {
                 let _ = send_process_notification(
                     "process.output",
                     msgpack_map! {
@@ -148,6 +166,9 @@ fn spawn_pty_push(pid: u32, stop: Arc<AtomicBool>, wake: Arc<Notify>) -> JoinHan
                 send_exit_notification(pid, result.exit).await;
                 break;
             }
+            if idle && !wait_for_idle_push(&stop, &wake).await {
+                break;
+            }
         }
     })
 }
@@ -155,7 +176,7 @@ fn spawn_pty_push(pid: u32, stop: Arc<AtomicBool>, wake: Arc<Notify>) -> JoinHan
 pub(super) fn new_pipe_push(pid: u32) -> OutputPush {
     let stop = Arc::new(AtomicBool::new(false));
     let wake = Arc::new(Notify::new());
-    let task = spawn_pipe_push(pid, Arc::clone(&stop));
+    let task = spawn_pipe_push(pid, Arc::clone(&stop), Arc::clone(&wake));
     OutputPush { stop, wake, task }
 }
 
@@ -183,5 +204,27 @@ pub async fn start_output_push(pid: u32) {
         && managed.output_push.is_none()
     {
         managed.output_push = Some(new_pty_push(pid));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn idle_push_backs_off_and_stop_wakes_it() {
+        let stop = AtomicBool::new(false);
+        let wake = Notify::new();
+        let before = tokio::time::Instant::now();
+        assert!(wait_for_idle_push(&stop, &wake).await);
+        assert!(before.elapsed() >= PUSH_IDLE_WAIT);
+
+        let wait = wait_for_idle_push(&stop, &wake);
+        tokio::pin!(wait);
+        assert!(futures::poll!(&mut wait).is_pending());
+        stop.store(true, Ordering::Release);
+        wake.notify_one();
+        assert_eq!(futures::poll!(&mut wait), std::task::Poll::Ready(false));
+        assert!(!wait_for_idle_push(&stop, &wake).await);
     }
 }

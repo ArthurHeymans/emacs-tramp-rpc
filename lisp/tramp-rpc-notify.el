@@ -428,8 +428,7 @@ FLAGS controls the requested operation."
                (tramp-rpc--debug "symlink watch probe failed for %s: %s"
                                  directory (error-message-string err))
                nil)))
-           (descriptor (tramp-rpc--make-file-notify-descriptor
-                        v directory localname)))
+           descriptor)
       (if entry
           (plist-put entry :count (1+ (plist-get entry :count)))
         ;; Keep file-notify's non-recursive watches out of
@@ -497,6 +496,9 @@ FLAGS controls the requested operation."
                          :canonical-directory canonical-directory
                          :connection-process (tramp-rpc--connection-transport (tramp-rpc--get-connection v)))
                    tramp-rpc--file-notify-watch-counts)))
+      ;; A failed registration must not leave a live, untracked descriptor.
+      (setq descriptor (tramp-rpc--make-file-notify-descriptor
+                        v directory localname))
       (let ((watch-entry (gethash watch-key tramp-rpc--file-notify-watch-counts)))
         (puthash descriptor
                  (list :directory directory

@@ -572,17 +572,20 @@ async fn remove_path_for_overwrite(path: &Path) -> std::io::Result<()> {
     }
 }
 
-/// Best-effort no-replace for filesystems without an atomic rename primitive.
+/// No-clobber fallback for filesystems without an atomic rename primitive.
 ///
-/// Prefer an atomic hard link for non-directories.  Directories and filesystems
-/// without hard links need a check-then-rename fallback to preserve ordinary
-/// rename support.  That last resort cannot prevent a concurrent destination
-/// create between the check and rename.
+/// Link non-directories exclusively before removing the source.  If neither
+/// rename flags nor hard links are available, fail rather than letting a
+/// check-then-rename race overwrite a concurrently created destination.
 async fn rename_no_overwrite_fallback(src: &Path, dest: &Path) -> std::io::Result<()> {
     if !fs::symlink_metadata(src).await.map(|meta| meta.is_dir())? {
         match fs::hard_link(src, dest).await {
             Ok(()) => {
-                fs::remove_file(src).await?;
+                if let Err(error) = fs::remove_file(src).await {
+                    // Undo the new link, preserving the original removal error.
+                    let _ = fs::remove_file(dest).await;
+                    return Err(error);
+                }
                 return Ok(());
             }
             Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
@@ -598,7 +601,10 @@ async fn rename_no_overwrite_fallback(src: &Path, dest: &Path) -> std::io::Resul
     }
     match fs::symlink_metadata(dest).await {
         Ok(_) => Err(already_exists(dest)),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => fs::rename(src, dest).await,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "Filesystem does not support atomic non-overwriting rename for this source",
+        )),
         Err(error) => Err(error),
     }
 }
@@ -621,7 +627,7 @@ async fn rename_no_overwrite(src: &Path, dest: &Path) -> std::io::Result<()> {
     match result {
         // rustix maps NOREPLACE to Linux RENAME_NOREPLACE or macOS RENAME_EXCL.
         // Older kernels, unsupported filesystems, or seccomp filters can
-        // reject the primitive; preserve rename support through the fallback.
+        // reject the primitive; try the no-clobber hard-link fallback.
         Err(error)
             if matches!(
                 error.raw_os_error(),
@@ -999,8 +1005,36 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn rename_fallback_rolls_back_when_source_removal_fails() {
+        // Root can unlink in a read-only directory, so it cannot exercise this.
+        if nix::unistd::geteuid().is_root() {
+            return;
+        }
+        let tmp = tempfile::tempdir().expect("create tempdir");
+        let source_dir = tmp.path().join("source-dir");
+        fs::create_dir(&source_dir).await.unwrap();
+        let src = source_dir.join("src");
+        let dest = tmp.path().join("dest");
+        fs::write(&src, b"source").await.unwrap();
+        fs::set_permissions(&source_dir, std::fs::Permissions::from_mode(0o555))
+            .await
+            .unwrap();
+        let result = rename_no_overwrite_fallback(&src, &dest).await;
+        fs::set_permissions(&source_dir, std::fs::Permissions::from_mode(0o755))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            result.unwrap_err().kind(),
+            std::io::ErrorKind::PermissionDenied
+        );
+        assert_eq!(fs::read(&src).await.unwrap(), b"source");
+        assert!(!fs::try_exists(&dest).await.unwrap());
+    }
+
+    #[tokio::test]
     async fn rename_directory_without_overwrite() {
-        // Exercise the portable fallback even on hosts with atomic rename.
+        // The fallback must fail closed when it cannot link a directory.
         for fallback in [false, true] {
             let tmp = tempfile::tempdir().expect("create tempdir");
             let src = tmp.path().join("src");
@@ -1029,13 +1063,19 @@ mod tests {
 
             fs::remove_file(&dest).await.unwrap();
             if fallback {
-                rename_no_overwrite_fallback(&src, &dest).await
+                let error = rename_no_overwrite_fallback(&src, &dest)
+                    .await
+                    .expect_err("no atomic directory fallback is available");
+                assert_eq!(error.kind(), std::io::ErrorKind::Unsupported);
+                assert_eq!(fs::read(src.join("child")).await.unwrap(), b"source");
+                assert!(!fs::try_exists(&dest).await.unwrap());
             } else {
-                rename_no_overwrite(&src, &dest).await
+                rename_no_overwrite(&src, &dest)
+                    .await
+                    .expect("rename directory with native no-replace support");
+                assert_eq!(fs::read(dest.join("child")).await.unwrap(), b"source");
+                assert!(!fs::try_exists(&src).await.unwrap());
             }
-            .expect("rename directory to missing destination");
-            assert_eq!(fs::read(dest.join("child")).await.unwrap(), b"source");
-            assert!(!fs::try_exists(&src).await.unwrap());
         }
     }
 
