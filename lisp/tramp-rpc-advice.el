@@ -20,6 +20,7 @@
 ;; - process-send-string / process-send-region (route to remote stdin)
 ;; - process-send-eof (close remote stdin or send Ctrl-D to PTY)
 ;; - signal-process (forward signals to remote PID)
+;; - interrupt-process (interrupt the remote process, not its local relay)
 ;; - process-status / process-exit-status (return remote process state)
 ;; - process-command / process-tty-name (return stored metadata)
 ;; - set-process-sentinel / process-sentinel (keep tramp-rpc's own sentinel)
@@ -240,6 +241,26 @@ PROCESS is a PID."
           (error
            (message "tramp-rpc: Error signaling process: %s" err)
            -1))))))
+
+(defun tramp-rpc-handle-interrupt-process (&optional process _current-group)
+  "Interrupt TRAMP-RPC PROCESS remotely, for `interrupt-process-functions'.
+The default would signal the local relay, which ends it and, through its
+sentinel, kills the remote process instead of interrupting it.  A direct SSH
+PTY gets the interrupt character, like a terminal.  PROCESS can be a
+process, a buffer, a process or buffer name, or nil for the current buffer.
+Return nil for other processes."
+  (when-let* ((proc (if process
+                        (or (and (stringp process) (get-process process))
+                            (tramp-rpc--resolve-process process))
+                      (get-buffer-process (current-buffer))))
+              ((or (process-get proc :tramp-rpc-direct-ssh)
+                   (process-get proc :tramp-rpc-pid))))
+    (unless (process-live-p proc)
+      (error "Process %s is not active" (process-name proc)))
+    (if (process-get proc :tramp-rpc-direct-ssh)
+        (process-send-string proc (string ?\C-c))
+      (tramp-rpc-handle-signal-process proc 2))
+    t))
 
 ;; ============================================================================
 ;; Process metadata handlers
@@ -569,6 +590,8 @@ exited (remote side finished), delete it so the refresh can proceed."
   ;; This must be before `tramp-signal-process'.  Since tramp.el is
   ;; required, this is guaranteed.
   (add-hook 'signal-process-functions #'tramp-rpc-handle-signal-process)
+  ;; Likewise before `tramp-interrupt-process'.
+  (add-hook 'interrupt-process-functions #'tramp-rpc-handle-interrupt-process)
   (tramp-rpc--add-external-operation
      'process-status
      #'tramp-rpc-handle-process-status 'tramp-rpc 'process)
@@ -639,6 +662,7 @@ exited (remote side finished), delete it so the refresh can proceed."
   (tramp-rpc--remove-external-operation 'process-send-region 'tramp-rpc)
   (tramp-rpc--remove-external-operation 'process-send-eof 'tramp-rpc)
   (remove-hook 'signal-process-functions #'tramp-rpc-handle-signal-process)
+  (remove-hook 'interrupt-process-functions #'tramp-rpc-handle-interrupt-process)
   (tramp-rpc--remove-external-operation 'process-status 'tramp-rpc)
   (tramp-rpc--remove-external-operation 'process-exit-status 'tramp-rpc)
   (tramp-rpc--remove-external-operation 'process-command 'tramp-rpc)

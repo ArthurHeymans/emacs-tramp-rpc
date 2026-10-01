@@ -2190,6 +2190,34 @@ This matches the upstream `tramp-test28-process-file' test."
       (ignore-errors (delete-process proc)))))
 
 
+(ert-deftest tramp-rpc-test14-interrupt-process ()
+  "`interrupt-process' interrupts a remote process, as for a local one."
+  :tags '(:process)
+  (skip-unless (tramp-rpc-test-enabled))
+  (pcase-dolist (`(,type ,direct) '((pipe nil) (pty nil) (pty t)))
+    (let* ((default-directory (tramp-rpc-test--remote-directory))
+           (tramp-rpc-use-direct-ssh-pty direct)
+           (output "")
+           (events nil)
+           (proc (make-process
+                  :name "test-interrupt"
+                  :command '("sh" "-c" "trap 'echo got-int' INT; echo ready; sleep 1; echo after")
+                  :connection-type type
+                  :file-handler t
+                  :filter (lambda (_proc string) (setq output (concat output string)))
+                  :sentinel (lambda (_proc event) (push event events)))))
+      (unwind-protect
+          (ert-info ((format "%s, direct: %s" type direct))
+            (with-timeout (10 (error "Process timeout"))
+              (while (not (string-search "ready" output))
+                (accept-process-output nil 0.05))
+              (interrupt-process proc)
+              (while (null events)
+                (accept-process-output nil 0.05)))
+            (should (string-match-p "got-int\\(.\\|\n\\)*after" output))
+            (should (equal events '("finished\n"))))
+        (ignore-errors (delete-process proc))))))
+
 (ert-deftest tramp-rpc-test14-make-process-signal-status ()
   "A remote process killed by a signal reports it like a local process."
   :tags '(:process)
