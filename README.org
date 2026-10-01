@@ -136,6 +136,13 @@ Access remote files using the ~rpc~ method:
 /rpc:user@host:/path/to/file
 #+end_example
 
+SSH host aliases and =ProxyJump= routes in =~/.ssh/config= work with
+=/rpc:user@final-host:/path= without adding a TRAMP hop: the RPC transport
+uses OpenSSH's configuration for =final-host=.  A remote exit code 127 can
+mean that the RPC server binary is missing; for a git checkout, run
+=M-x tramp-rpc-deploy-install-binary= and enter the *complete* TRAMP name,
+for example =/rpc:user@final-host:/=, to obtain and deploy it.
+
 On first connection, the server binary is automatically obtained and deployed:
 
 1. *Release/package installs*: download from GitHub Releases first (fastest, ~850KB download), then build from source if Rust 1.88 or later is installed and download fails.
