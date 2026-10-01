@@ -2030,6 +2030,40 @@ async callbacks and local relays leaked."
       (remhash process tramp-rpc--pty-processes)
       (when (process-live-p process) (delete-process process)))))
 
+(ert-deftest tramp-rpc-mock-test-pty-delivery-reentered-during-write-keeps-order ()
+  "Output queued while a relay write waits follows the older output.
+A write to a full relay pipe runs timers, which can deliver again for the
+same process before the older chunks are written."
+  (let* ((buffer (generate-new-buffer " *tramp-rpc-pty-order*"))
+         (process (let ((process-connection-type nil))
+                    (start-process "tramp-rpc-pty-order" buffer "cat")))
+         (tramp-rpc--pty-processes (make-hash-table :test 'eq))
+         (send (symbol-function 'tramp-rpc--send-local-relay-string))
+         (reentered nil))
+    (unwind-protect
+        (progn
+          (puthash process (list :pending-output nil :pending-exit nil
+                                 :delivery-timer nil)
+                   tramp-rpc--pty-processes)
+          (set-process-sentinel process #'ignore)
+          (tramp-rpc--queue-pty-delivery process "a")
+          (tramp-rpc--queue-pty-delivery process "b")
+          (cl-letf (((symbol-function 'tramp-rpc--send-local-relay-string)
+                     (lambda (process string)
+                       (unless reentered
+                         (setq reentered t)
+                         (tramp-rpc--queue-pty-delivery process "c" 0 t)
+                         (tramp-rpc--deliver-pending-pty-output process))
+                       (funcall send process string))))
+            (tramp-rpc--deliver-pending-pty-output process))
+          (tramp-rpc-mock-test--wait-for
+           (lambda () (not (process-live-p process)))
+           "relay exit after the final output" process)
+          (should (equal (with-current-buffer buffer (buffer-string))
+                         "abc")))
+      (when (process-live-p process) (delete-process process))
+      (kill-buffer buffer))))
+
 (ert-deftest tramp-rpc-mock-test-pty-terminal-exit-calls-user-sentinel-once ()
   "A terminal PTY exit invokes the real user sentinel exactly once."
   (let* ((process (start-process "tramp-rpc-pty-terminal-exit" nil "cat"))
