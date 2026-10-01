@@ -2212,6 +2212,63 @@ This matches the upstream `tramp-test28-process-file' test."
           (should (equal events '("terminated\n"))))
       (ignore-errors (delete-process proc)))))
 
+(ert-deftest tramp-rpc-test14-sentinel-set-after-start ()
+  "A sentinel set after start, as `compile' does, gets the remote exit."
+  :tags '(:process)
+  (skip-unless (tramp-rpc-test-enabled))
+  (dolist (pty '(nil t))
+    (let* ((default-directory (tramp-rpc-test--remote-directory))
+           (tramp-rpc-use-direct-ssh-pty nil)
+           (process-connection-type pty)
+           (events nil)
+           (sentinel (lambda (_proc event) (push event events)))
+           (proc (start-file-process "test-late-sentinel" nil
+                                     "sh" "-c" "sleep 0.1; exit 3")))
+      (unwind-protect
+          (ert-info ((format "pty: %s" pty))
+            (set-process-sentinel proc sentinel)
+            (should (eq (process-sentinel proc) sentinel))
+            (with-timeout (10 (error "Process timeout"))
+              (while (null events)
+                (accept-process-output nil 0.05)))
+            (should (equal events '("exited abnormally with code 3\n")))
+            (should-not (gethash proc tramp-rpc--async-processes))
+            (should-not (gethash proc tramp-rpc--pty-processes)))
+        (ignore-errors (delete-process proc))))))
+
+(ert-deftest tramp-rpc-test14-kill-process-with-late-sentinel ()
+  "Killing a process whose sentinel was set after start ends it remotely."
+  :tags '(:process)
+  (skip-unless (tramp-rpc-test-enabled))
+  (let* ((default-directory (tramp-rpc-test--remote-directory))
+         (marker (format "tramp-rpc-late-kill-%d" (random 1000000)))
+         (process-connection-type nil)
+         (events nil)
+         (proc (start-file-process "test-late-kill" nil "sh" "-c"
+                                   ;; The trailing command keeps the shell,
+                                   ;; and its MARKER, from exec'ing sleep.
+                                   (format ": %s; sleep 30; :" marker))))
+    (unwind-protect
+        (progn
+          (set-process-sentinel proc (lambda (_proc event) (push event events)))
+          (kill-process proc)
+          ;; Do not run timers until the relay has died, as when a
+          ;; synchronous remote call keeps Emacs busy.
+          (with-timeout (10 (error "Process timeout"))
+            (while (null events)
+              (accept-process-output proc 0.05 nil 1)))
+          (should (equal events '("killed\n")))
+          ;; [x]yz keeps pgrep from matching its own command line.  TRAMP
+          ;; suspends timers, so poll with a deadline, not `with-timeout'.
+          (let ((pattern (concat "[" (substring marker 0 1) "]"
+                                 (substring marker 1)))
+                (deadline (+ (float-time) 5)))
+            (while (and (zerop (process-file "pgrep" nil nil nil "-f" pattern))
+                        (< (float-time) deadline))
+              (sleep-for 0.1))
+            (should-not (zerop (process-file "pgrep" nil nil nil "-f" pattern)))))
+      (ignore-errors (delete-process proc)))))
+
 (ert-deftest tramp-rpc-test14-python-shell-make-comint ()
   "Test `python-shell-make-comint' on an existing TRAMP RPC connection."
   :tags '(:process :expensive-test)

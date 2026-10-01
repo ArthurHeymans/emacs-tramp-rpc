@@ -763,62 +763,30 @@ number, if any."
       (tramp-rpc--best-effort (process-send-eof local-process)))))
 
 ;; ============================================================================
-;; Process cleanup after exit
+;; Sentinels
 ;; ============================================================================
 
-(defun tramp-rpc--install-process-cleanup (process)
-  "Add sentinel cleanup to PROCESS so it is deleted after exit.
-Wrap the caller's current sentinel and invoke it at event time before
-scheduling cleanup.  Keep symbol sentinels as symbols when calling them
-so dynamic rebinding, such as TRAMP's `shell-command-sentinel' test
-rebinding, is still honored.  Without cleanup, `get-buffer-process'
-keeps returning the dead cat relay, which makes `vc-dir-busy' think an
-update is still running."
-  (cl-labels ((cleanup
-               (proc)
-               (run-at-time
-                0 nil
-                (lambda ()
-                  (when (processp proc)
-                    (remhash proc tramp-rpc--async-processes)
-                    (unless (process-live-p proc)
-                      (tramp-rpc--best-effort
-                        (delete-process proc))))))))
-    (cond
-     ((process-live-p process)
-      (let ((sentinel (process-sentinel process)))
-        (unless (process-get process :tramp-rpc-cleanup-sentinel-installed)
-          (process-put process :tramp-rpc-cleanup-sentinel-installed t)
-          (set-process-sentinel
-           process
-           (lambda (proc event)
-             (when sentinel
-               (funcall sentinel proc event)
-               ;; The deferred installer may have captured a caller sentinel
-               ;; that replaced our wrapper.  Only a terminal notification
-               ;; satisfies its exactly-once exit contract; stop/continue
-               ;; events must not suppress the later exit notification.
-               (when (memq (process-status proc) '(exit signal))
-                 (process-put proc :tramp-rpc-user-sentinel-called t)))
-             (when (memq (process-status proc) '(exit signal))
-               ;; Keep our tracking cleanup in the chain even when the caller
-               ;; replaced the sentinel after process creation.
-               (tramp-rpc--pipe-process-sentinel proc event nil)
-               ;; Defer deletion so the full sentinel chain completes first.
-               (cleanup proc)))))))
-     ((processp process)
-      ;; The relay can finish before the deferred installer runs.  A dead
-      ;; relay does not imply that its sentinel already ran: Emacs may still
-      ;; deliver the exit notification later, after `cleanup' removed the
-      ;; tracking the sentinel needs.  While our own wrapper is still in place,
-      ;; finish its exactly-once exit handling now; a later notification is
-      ;; then a no-op.
-      (when (eq (process-sentinel process)
-                (process-get process :tramp-rpc-own-sentinel))
-        (tramp-rpc--pipe-process-sentinel
-         process "finished\n"
-         (process-get process :tramp-rpc-user-sentinel)))
-      (cleanup process)))))
+(defun tramp-rpc--install-own-sentinel (process sentinel)
+  "Install tramp-rpc's SENTINEL on relay PROCESS for its whole lifetime.
+Callers such as `vc-do-command' and `compile' set the sentinel after the
+process has started.  Once SENTINEL is installed, `set-process-sentinel' and
+`process-sentinel' on PROCESS reach the caller's sentinel kept in its
+:tramp-rpc-user-sentinel property instead, which SENTINEL calls with the
+remote exit status."
+  (set-process-sentinel process sentinel)
+  (process-put process :tramp-rpc-own-sentinel sentinel))
+
+(defun tramp-rpc--pipe-relay-sentinel (process event)
+  "Sentinel of pipe relay PROCESS for local EVENT.
+After the sentinel has run, delete the exited relay.  Otherwise
+`get-buffer-process' keeps returning it, and `vc-dir-busy' reports an
+update in progress."
+  (tramp-rpc--pipe-process-sentinel
+   process event (process-get process :tramp-rpc-user-sentinel))
+  (when (memq (process-status process) '(exit signal))
+    (run-at-time 0 nil (lambda ()
+                         (unless (process-live-p process)
+                           (tramp-rpc--best-effort (delete-process process)))))))
 
 ;; ============================================================================
 ;; Coding helper
@@ -1052,36 +1020,15 @@ Resolves program path and loads direnv environment from working directory."
 
                 (when filter
                   (set-process-filter local-process filter))
-                ;; Keep our wrapper even when the caller supplied no sentinel;
-                ;; normal exits must still remove tracking.
                 (process-put local-process :tramp-rpc-user-sentinel sentinel)
-                (let ((own-sentinel
-                       (lambda (proc event)
-                         (tramp-rpc--pipe-process-sentinel
-                          proc event (process-get proc :tramp-rpc-user-sentinel)))))
-                  (process-put local-process :tramp-rpc-own-sentinel own-sentinel)
-                  (set-process-sentinel local-process own-sentinel))
+                (tramp-rpc--install-own-sentinel
+                 local-process #'tramp-rpc--pipe-relay-sentinel)
 
                 (tramp-rpc--debug
                   "MAKE-PROCESS created local=%s remote-pid=%s program=%s"
                   local-process remote-pid program)
 
                 (tramp-rpc--register-managed-process local-process)
-
-                ;; Schedule deferred sentinel cleanup.  Callers like `vc-do-command'
-                ;; replace the sentinel with `set-process-sentinel' AFTER
-                ;; `start-file-process' returns, so we must add our cleanup wrapper
-                ;; after that.  `run-at-time 0' ensures it runs once the current
-                ;; code path (including the caller's sentinel setup) completes.
-                ;; The wrapper calls `delete-process' after the sentinel chain
-                ;; finishes, which removes the process from `Vprocess_alist'.
-                ;; Without this, `get-buffer-process' returns stale exited cat
-                ;; relays, causing e.g. `vc-dir-busy' to report a false positive.
-                (let ((proc local-process))
-                  (run-at-time 0 nil
-                               (lambda ()
-                                 (when (processp proc)
-                                   (tramp-rpc--install-process-cleanup proc)))))
 
                 local-process))))))))
 
@@ -1128,23 +1075,6 @@ EVENT is the process event string."
     (remhash process tramp-rpc--pty-processes)
     (tramp-rpc--call-user-sentinel-once
      process (process-get process :tramp-rpc-user-sentinel) event)))
-
-(defun tramp-rpc--install-direct-ssh-pty-sentinel (process)
-  "Reinstall direct SSH PTY tracking after callers finish setup.
-Callers may replace PROCESS's sentinel after `make-process' returns.  Capture
-that sentinel on the next event-loop turn, preserve it once, and keep the
-tracking cleanup wrapper in the chain."
-  (when (processp process)
-    (if (process-live-p process)
-        (let ((sentinel (process-sentinel process)))
-          (unless (eq sentinel #'tramp-rpc--direct-ssh-pty-sentinel)
-            (set-process-sentinel
-             process
-             (lambda (proc event)
-               (tramp-rpc--call-user-sentinel-once proc sentinel event)
-               (tramp-rpc--direct-ssh-pty-sentinel proc event)))))
-      ;; Its existing sentinel already observed the exit; only release tracking.
-      (remhash process tramp-rpc--pty-processes))))
 
 (defun tramp-rpc--make-direct-ssh-pty-process (vec name buffer command coding noquery
                                                     filter sentinel localname &optional direnv-env)
@@ -1231,8 +1161,8 @@ DIRENV-ENV is an optional alist of environment variables from direnv."
     (when filter
       (set-process-filter process filter))
 
-    ;; Always retain a wrapper so normal exits remove PTY tracking.
-    (set-process-sentinel process #'tramp-rpc--direct-ssh-pty-sentinel)
+    ;; Normal exits must remove PTY tracking.
+    (tramp-rpc--install-own-sentinel process #'tramp-rpc--direct-ssh-pty-sentinel)
 
     ;; Store tramp-rpc metadata for compatibility with other code
     (let ((connection (tramp-rpc--get-connection vec)))
@@ -1252,13 +1182,6 @@ DIRENV-ENV is an optional alist of environment variables from direnv."
     ;; Standard tramp property expected by tests and upstream code
     (process-put process 'remote-command command)
     (process-put process 'tramp-vector vec)
-
-    ;; Match pipe relays: callers can replace the sentinel while their process
-    ;; setup still owns the stack, so reinstall tracking after that setup.
-    (let ((proc process))
-      (run-at-time 0 nil
-                   (lambda ()
-                     (tramp-rpc--install-direct-ssh-pty-sentinel proc))))
 
     process))
 
@@ -1316,7 +1239,7 @@ DIRENV-ENV is an optional alist of environment variables for the process."
       ;; public coding pair is retained for process API and input encoding.
       (tramp-rpc--configure-relay-coding local-process coding)
       (set-process-filter local-process (or filter #'tramp-rpc--pty-default-filter))
-      (set-process-sentinel local-process #'tramp-rpc--pty-sentinel)
+      (tramp-rpc--install-own-sentinel local-process #'tramp-rpc--pty-sentinel)
       (set-process-query-on-exit-flag local-process (not noquery))
 
       ;; Store process info
