@@ -22,6 +22,7 @@
 ;; - signal-process (forward signals to remote PID)
 ;; - process-status / process-exit-status (return remote process state)
 ;; - process-command / process-tty-name (return stored metadata)
+;; - set-process-sentinel / process-sentinel (keep tramp-rpc's own sentinel)
 ;; - vc-call-backend (ensure default-directory for remote VC files)
 ;; - vc-exec-after (handle native-compiled VC process state races)
 ;; - python-shell--tramp-with-environment (avoid sending shell commands to the RPC server)
@@ -295,6 +296,25 @@ STREAM is the output stream being handled."
       (process-get process :tramp-rpc-tty-name)
     (tramp-run-real-handler #'process-tty-name (list process stream))))
 
+(defun tramp-rpc-handle-set-process-sentinel (process sentinel)
+  "Handler for `set-process-sentinel' for TRAMP-RPC processes.
+Replacing tramp-rpc's own sentinel would lose the remote exit status and the
+remote cleanup, so store SENTINEL as the caller's sentinel that it calls.
+PROCESS is the process being handled."
+  (if (and (processp process) (process-get process :tramp-rpc-own-sentinel))
+      (progn
+        (process-put process :tramp-rpc-user-sentinel sentinel)
+        sentinel)
+    (tramp-run-real-handler #'set-process-sentinel (list process sentinel))))
+
+(defun tramp-rpc-handle-process-sentinel (process)
+  "Handler for `process-sentinel' for TRAMP-RPC processes.
+Return the caller's sentinel of PROCESS, or `ignore' when there is none:
+tramp-rpc never runs the default sentinel."
+  (if (and (processp process) (process-get process :tramp-rpc-own-sentinel))
+      (or (process-get process :tramp-rpc-user-sentinel) #'ignore)
+    (tramp-run-real-handler #'process-sentinel (list process))))
+
 ;; ============================================================================
 ;; VC integration handler
 ;; ============================================================================
@@ -497,9 +517,9 @@ PROGRAM is the executable name."
 ;; `vc-dir-busy' tests (get-buffer-process vc-dir-process-buffer).
 ;; In Emacs, `get-buffer-process' returns ANY process associated with the
 ;; buffer -- including exited ones -- as long as `delete-process' has not
-;; been called.  Normally our deferred `tramp-rpc--install-process-cleanup'
-;; handles this, but if the timer hasn't fired yet (or if the cat relay got
-;; stuck), the stale process causes "Another update process is in progress".
+;; been called.  Normally `tramp-rpc--pipe-relay-sentinel' deletes the exited
+;; relay, but if its timer hasn't fired yet (or if the cat relay got stuck),
+;; the stale process causes "Another update process is in progress".
 ;; This handler acts as a safety net: before `vc-dir-refresh' checks the
 ;; busy flag, we delete any exited tramp-rpc relay process from the buffer.
 
@@ -563,6 +583,12 @@ exited (remote side finished), delete it so the refresh can proceed."
      'process-tty-name
      #'tramp-rpc-handle-process-tty-name 'tramp-rpc 'process)
   (tramp-rpc--add-external-operation
+     'set-process-sentinel
+     #'tramp-rpc-handle-set-process-sentinel 'tramp-rpc 'process)
+  (tramp-rpc--add-external-operation
+     'process-sentinel
+     #'tramp-rpc-handle-process-sentinel 'tramp-rpc 'process)
+  (tramp-rpc--add-external-operation
      'vc-call-backend
      #'tramp-rpc-handle-vc-call-backend 'tramp-rpc
      #'tramp-rpc--vc-call-backend-file-name-for-operation)
@@ -618,6 +644,8 @@ exited (remote side finished), delete it so the refresh can proceed."
   (tramp-rpc--remove-external-operation 'process-exit-status 'tramp-rpc)
   (tramp-rpc--remove-external-operation 'process-command 'tramp-rpc)
   (tramp-rpc--remove-external-operation 'process-tty-name 'tramp-rpc)
+  (tramp-rpc--remove-external-operation 'set-process-sentinel 'tramp-rpc)
+  (tramp-rpc--remove-external-operation 'process-sentinel 'tramp-rpc)
   (tramp-rpc--remove-external-operation 'vc-call-backend 'tramp-rpc)
   (tramp-rpc--remove-external-operation 'vc-exec-after 'tramp-rpc)
   (tramp-rpc--remove-external-operation
