@@ -1,0 +1,278 @@
+;;; tramp-rpc-lifecycle-tests.el --- Resource lifecycle tests -*- lexical-binding: t -*-
+
+;; Loaded by tramp-rpc-mock-tests.el; uses its offline isolation and helpers.
+
+(require 'ert)
+(require 'cl-lib)
+
+(ert-deftest tramp-rpc-mock-test-process-start-captures-generation-before-wait ()
+  "Both managed backends retain the generation used for the start request."
+  (dolist (pty '(nil t))
+    (dolist (dead '(nil t))
+      (tramp-rpc-mock-test-request--with-connection (transport buffer)
+        (let* ((vec (tramp-rpc-mock-test-request--vec))
+               (default-directory (tramp-make-tramp-file-name vec "/tmp/"))
+               (tramp-rpc--async-processes (make-hash-table :test 'eq))
+               (tramp-rpc--pty-processes (make-hash-table :test 'eq))
+               (current connection)
+               (ensures 0)
+               relay)
+          (unwind-protect
+              (cl-letf (((symbol-function 'tramp-rpc--ensure-connection)
+                         (lambda (_vec) (cl-incf ensures) current))
+                        ((symbol-function 'tramp-rpc--get-connection)
+                         (lambda (_vec) current))
+                        ((symbol-function 'tramp-rpc--call)
+                         (lambda (_vec method _params &optional captured)
+                           (should (member method '("process.start" "process.start_pty")))
+                           (should (eq captured connection))
+                           ;; Model transport death/replacement during the start wait.
+                           (setq current (tramp-rpc--make-connection :process 'replacement))
+                           (when dead (setf (tramp-rpc-connection-transport-dead connection) t))
+                           '((pid . 42) (tty_name . "/dev/pts/mock"))))
+                        ((symbol-function 'tramp-rpc--remote-path-environment) #'ignore)
+                        ((symbol-function 'tramp-rpc--tramp-remote-process-environment) #'ignore)
+                        ((symbol-function 'tramp-rpc--get-direnv-environment) #'ignore)
+                        ((symbol-function 'tramp-rpc--caller-environment) #'ignore))
+                (setq relay
+                      (if pty
+                          (tramp-rpc--make-rpc-pty-process vec "captured-pty" nil '("true")
+                                                           nil t nil nil "/tmp/")
+                        (tramp-rpc-handle-make-process :name "captured-pipe" :command '("true")
+                                                       :connection-type nil :noquery t)))
+                (should (= ensures 1))
+                (should (eq (process-get relay :tramp-rpc-connection) connection))
+                (let ((info (gethash relay (if pty tramp-rpc--pty-processes
+                                             tramp-rpc--async-processes))))
+                  (if dead
+                      (progn (should-not info) (should-not (process-live-p relay)))
+                    (should (eq (plist-get info :connection-process) transport)))))
+            (when relay
+              (tramp-rpc--forget-managed-process relay)
+              (set-process-sentinel relay #'ignore)
+              (delete-process relay))))))))
+
+(ert-deftest tramp-rpc-mock-test-deploy-plan-freezes-identity-and-stays-lazy ()
+  "One plan hashes once and shares its identity without acquisition or prompts."
+  (let ((vec (tramp-dissect-file-name "/rpc:plan-test:/"))
+        (tramp-rpc-deploy-never-deploy nil)
+        (tramp-rpc-deploy-git-build-policy 'build)
+        (tramp-rpc-deploy-remote-directory "/frozen/deploy")
+        (hashes 0))
+    (cl-letf (((symbol-function 'tramp-rpc-deploy--use-source-binary-id-p) (lambda () t))
+              ((symbol-function 'tramp-rpc-deploy--source-tree-hash)
+               (lambda () (cl-incf hashes) (make-string 64 ?a)))
+              ((symbol-function 'tramp-rpc-deploy--git-revision) (lambda () "revision"))
+              ((symbol-function 'tramp-rpc-deploy--obtain-methods)
+               (lambda (_) (ert-fail "Resolving a plan acquired an artifact"))))
+      (let* ((plan (tramp-rpc-deploy-plan vec))
+             (tramp-rpc-deploy--plan plan)
+             (expected (tramp-rpc-deploy-expected-binary-localname)))
+        (should (string-match-p "git-revision-aaaaaaaaaaaa-build" expected))
+        (should (equal expected (tramp-file-local-name
+                                 (tramp-rpc-deploy--remote-binary-path vec))))
+        (should (string-match-p "git-revision-aaaaaaaaaaaa-build"
+                                (tramp-rpc-deploy--local-cache-path "x86_64-linux")))
+        (let ((tramp-rpc-deploy-remote-directory "/changed")
+              command)
+          (cl-letf (((symbol-function 'tramp-send-command)
+                     (lambda (_vec text &rest _) (setq command text))))
+            (tramp-rpc-deploy--ensure-remote-directory vec))
+          (should (string-match-p "/frozen/deploy" command))
+          (should-not (string-match-p "/changed" command)))
+        (should (= hashes 1))))))
+
+(ert-deftest tramp-rpc-mock-test-deploy-plan-honors-connection-local-policy ()
+  "Deployment policy resolves host-local settings before trying the binary."
+  (let ((connection-local-profile-alist nil)
+        (connection-local-criteria-alist nil)
+        (tramp-rpc-deploy-never-deploy nil))
+    (connection-local-set-profile-variables
+     'rpc-lifecycle-test '((tramp-rpc-deploy-never-deploy . t)
+                           (tramp-rpc-deploy-remote-binary-path . "/opt/custom-server")))
+    (connection-local-set-profiles
+     '(:application tramp :protocol "rpc" :machine "plan-local") 'rpc-lifecycle-test)
+    (let ((plan (tramp-rpc-deploy-plan (tramp-dissect-file-name "/rpc:plan-local:/"))))
+      (should (eq (tramp-rpc-deploy-plan-mode plan) 'never))
+      (should (equal (tramp-rpc-deploy-plan-remote-localname plan) "/opt/custom-server"))
+      (should-not (tramp-rpc-deploy-plan-binary-id plan)))))
+
+(ert-deftest tramp-rpc-mock-test-deploy-refuses-to-publish-changing-sources ()
+  "A successful Cargo exit cannot publish under an obsolete source identity."
+  (let* ((source (make-temp-file "rpc-source-changing" t))
+         (tramp-rpc-deploy-source-directory source)
+         (tramp-rpc-deploy--plan (tramp-rpc-deploy--make-plan
+                                  :source-directory source :source-hash "before")))
+    (unwind-protect
+        (cl-letf (((symbol-function 'tramp-rpc-deploy--cargo-available-p) (lambda () t))
+                  ((symbol-function 'tramp-rpc-deploy--can-build-for-arch-p) (lambda (_) t))
+                  ((symbol-function 'tramp-rpc-deploy--local-cache-path) (lambda (_) "/unused"))
+                  ((symbol-function 'call-process) (lambda (&rest _) 0))
+                  ((symbol-function 'tramp-rpc-deploy--source-tree-hash) (lambda () "after"))
+                  ((symbol-function 'tramp-rpc-deploy--promote-cached-binary)
+                   (lambda (&rest _) (ert-fail "Published an obsolete artifact"))))
+          (should-error (tramp-rpc-deploy--build-binary "x86_64-linux") :type 'remote-file-error))
+      (delete-directory source t))))
+
+(ert-deftest tramp-rpc-mock-test-file-notify-legacy-server-never-acquires-nofollow ()
+  "A legacy server cannot safely release a symlink watch; use a synthetic one."
+  (let ((tramp-rpc--file-notify-descriptors (make-hash-table :test 'eq))
+        (tramp-rpc--file-notify-watch-counts (make-hash-table :test 'equal))
+        (tramp-rpc--watched-directories (make-hash-table :test 'equal))
+        descriptor)
+    (unwind-protect
+        (cl-letf (((symbol-function 'file-symlink-p) (lambda (_) "/target"))
+                  ((symbol-function 'tramp-rpc--system-info) (lambda (_) '((os . "linux"))))
+                  ((symbol-function 'tramp-rpc--call)
+                   (lambda (&rest _) (ert-fail "Unsafe legacy watch RPC"))))
+          (setq descriptor (tramp-rpc-handle-file-notify-add-watch
+                            "/rpc:watch-test:/link" '(change) #'ignore))
+          (should (plist-get (car (hash-table-values tramp-rpc--file-notify-watch-counts))
+                             :synthetic))
+          (tramp-rpc-handle-file-notify-rm-watch descriptor))
+      (when descriptor (tramp-rpc--delete-file-notify-descriptor-process descriptor)))))
+
+(ert-deftest tramp-rpc-mock-test-explicit-unwatch-never-restores-synthetic-as-follow ()
+  "A synthetic symlink descriptor must not keep a target-following watch alive."
+  (let* ((directory "/rpc:watch-test:/link")
+         (vec (tramp-dissect-file-name directory))
+         (key (format "%s:/link" (tramp-rpc--connection-key-string vec)))
+         (tramp-rpc--watched-directories (make-hash-table :test 'equal))
+         (tramp-rpc--file-notify-watch-counts (make-hash-table :test 'equal))
+         calls)
+    (puthash key (list :directory directory :canonical-directory "/rpc:watch-test:/target")
+             tramp-rpc--watched-directories)
+    (puthash key (list :directory directory :canonical-directory "/rpc:watch-test:/target"
+                       :count 1 :synthetic "/target" :owned nil)
+             tramp-rpc--file-notify-watch-counts)
+    (cl-letf (((symbol-function 'tramp-rpc--call)
+               (lambda (_vec method params) (push (list method params) calls))))
+      (tramp-rpc-unwatch-directory directory))
+    (should (= (length calls) 1))
+    (should (equal (caar calls) "watch.remove"))
+    (should (eq (alist-get 'nofollow (cadar calls)) :msgpack-false))
+    (should-not (plist-get (gethash key tramp-rpc--file-notify-watch-counts) :owned))))
+
+(ert-deftest tramp-rpc-mock-test-follow-watch-does-not-take-nofollow-ownership ()
+  "A recursive target watch cannot adopt the symlink's independent registration."
+  (let* ((directory "/rpc:watch-test:/link")
+         (vec (tramp-dissect-file-name directory))
+         (key (format "%s:/link" (tramp-rpc--connection-key-string vec)))
+         (descriptor (make-pipe-process :name "nofollow-owner" :noquery t))
+         (tramp-rpc--file-notify-descriptors (make-hash-table :test 'eq))
+         (tramp-rpc--file-notify-watch-counts (make-hash-table :test 'equal))
+         (tramp-rpc--watched-directories (make-hash-table :test 'equal))
+         (entry (list :directory directory :canonical-directory directory
+                      :count 1 :owned t :nofollow t))
+         calls)
+    (unwind-protect
+        (progn
+          (puthash key entry tramp-rpc--file-notify-watch-counts)
+          (puthash descriptor (list :watch-key key) tramp-rpc--file-notify-descriptors)
+          (cl-letf (((symbol-function 'tramp-rpc--call)
+                     (lambda (_vec method params)
+                       (push (list method params) calls)
+                       '((path . "/target")))))
+            (tramp-rpc-watch-directory directory t)
+            (should (plist-get entry :owned))
+            (tramp-rpc-handle-file-notify-rm-watch descriptor)
+            (should (gethash key tramp-rpc--watched-directories))
+            (should (equal (caar calls) "watch.remove"))
+            (should (eq (alist-get 'nofollow (cadar calls)) t))
+            (should (equal (alist-get 'path (cadar calls)) "/link"))))
+      (tramp-rpc--delete-file-notify-descriptor-process descriptor))))
+
+(ert-deftest tramp-rpc-mock-test-nofollow-aliases-release-every-acquisition ()
+  "Each acquired nofollow spelling releases one server reference, not only the last."
+  (let ((tramp-rpc--file-notify-descriptors (make-hash-table :test 'eq))
+        (tramp-rpc--file-notify-watch-counts (make-hash-table :test 'equal))
+        (tramp-rpc--watched-directories (make-hash-table :test 'equal))
+        (descriptors nil)
+        (removals 0))
+    (unwind-protect
+        (cl-letf (((symbol-function 'tramp-rpc--system-info)
+                   (lambda (_) '((watch_remove_nofollow . t))))
+                  ((symbol-function 'file-symlink-p) (lambda (_) "/target"))
+                  ((symbol-function 'tramp-rpc--call)
+                   (lambda (_vec method params)
+                     (when (equal method "watch.remove")
+                       (should (eq (alist-get 'nofollow params) t))
+                       (cl-incf removals))
+                     '((path . "/link")))))
+          (dolist (path '("/rpc:watch-test:/link" "/rpc:watch-test:/alias/link"))
+            (push (tramp-rpc-handle-file-notify-add-watch path '(change) #'ignore)
+                  descriptors))
+          (dolist (descriptor descriptors)
+            (tramp-rpc-handle-file-notify-rm-watch descriptor))
+          (should (= removals 2)))
+      (dolist (descriptor descriptors)
+        (tramp-rpc--delete-file-notify-descriptor-process descriptor)))))
+
+(ert-deftest tramp-rpc-mock-test-late-registration-preserves-final-output-on-death ()
+  "A final exit received with start still drains its output after transport death."
+  (tramp-rpc-mock-test--with-push-relay (relay buffer transport connection pid)
+    (set-process-sentinel relay #'ignore)
+    (setq tramp-rpc--process-starts 1)
+    (tramp-rpc--handle-process-notification
+     transport "process.output" `((pid . ,pid) (stdout . "final-output")))
+    (tramp-rpc--handle-process-notification
+     transport "process.exit" `((pid . ,pid) (exit_code . 7)))
+    (setf (tramp-rpc-connection-transport-dead connection) t)
+    (tramp-rpc-mock-test--register-push-relay relay transport pid)
+    (tramp-rpc-mock-test--wait-for
+     (lambda () (and (not (process-live-p relay))
+                     (equal (with-current-buffer buffer (buffer-string)) "final-output")))
+     "final output after connection death")
+    (should (equal (with-current-buffer buffer (buffer-string)) "final-output"))
+    (should (= (process-get relay :tramp-rpc-exit-code) 7))))
+
+(ert-deftest tramp-rpc-mock-test-initial-stdin-failure-cleans-relay-and-remote ()
+  "A failed sudo stdin setup leaves no relay or child, including across reconnect."
+  (dolist (separate-stderr '(nil t))
+    (tramp-rpc-mock-test-request--with-connection (transport buffer)
+      (let* ((vec (tramp-rpc-mock-test-request--vec))
+             (default-directory (tramp-make-tramp-file-name vec "/tmp/"))
+             (tramp-rpc--async-processes (make-hash-table :test 'eq))
+             (track (symbol-function 'tramp-rpc--track-managed-process))
+             relay stderr-relay killed-on)
+        (unwind-protect
+            (cl-letf (((symbol-function 'tramp-rpc--ensure-connection) (lambda (_) connection))
+                      ((symbol-function 'tramp-rpc--get-connection)
+                       (lambda (_) (tramp-rpc--make-connection :process 'replacement)))
+                      ((symbol-function 'tramp-rpc--sudo-password-required-p) (lambda (_) t))
+                      ((symbol-function 'tramp-rpc--sudo-read-password) (lambda (&rest _) "secret"))
+                      ((symbol-function 'tramp-rpc--remote-path-environment) #'ignore)
+                      ((symbol-function 'tramp-rpc--tramp-remote-process-environment) #'ignore)
+                      ((symbol-function 'tramp-rpc--get-direnv-environment) #'ignore)
+                      ((symbol-function 'tramp-rpc--caller-environment) #'ignore)
+                      ((symbol-function 'tramp-rpc--track-managed-process)
+                       (lambda (proc &rest args)
+                         (setq relay proc stderr-relay (nth 5 args))
+                         (apply track proc args)))
+                      ((symbol-function 'tramp-rpc--write-remote-process)
+                       (lambda (_vec _pid _data owner)
+                         (should (eq (process-get owner :tramp-rpc-connection) connection))
+                         (signal 'remote-file-error '("stdin rejected"))))
+                      ((symbol-function 'tramp-rpc--call)
+                       (lambda (_vec method _params &optional captured)
+                         (pcase method
+                           ("process.start" '((pid . 42)))
+                           ("process.kill" (setq killed-on captured))
+                           (_ (ert-fail (format "Unexpected RPC %s" method)))))))
+              (should-error
+               (tramp-rpc-handle-make-process
+                :name "failed-stdin" :command '("sudo" "id")
+                :connection-type nil :noquery t :stderr (and separate-stderr buffer))
+               :type 'remote-file-error)
+              (should (eq killed-on connection))
+              (should relay)
+              (should (eq (not (null stderr-relay)) separate-stderr))
+              (should-not (gethash relay tramp-rpc--async-processes))
+              (dolist (proc (list relay stderr-relay))
+                (when proc (should-not (process-live-p proc)))))
+          (dolist (proc (list relay stderr-relay))
+            (when proc
+              (set-process-sentinel proc #'ignore)
+              (delete-process proc))))))))
+
+;;; tramp-rpc-lifecycle-tests.el ends here

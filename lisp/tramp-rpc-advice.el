@@ -41,6 +41,7 @@
 
 ;; Functions from tramp-rpc.el
 (declare-function tramp-rpc-file-name-p "tramp-rpc")
+(declare-function tramp-rpc--forget-managed-process "tramp-rpc-process" (process))
 
 ;; Variables from tramp-rpc.el / tramp-rpc-process.el
 
@@ -135,8 +136,7 @@ Return `not-managed' when PROCESS must use the native handler."
 (defun tramp-rpc--managed-send-process (process)
   "Return PROCESS's RPC-managed process, or nil when native delivery is needed."
   (when-let* ((proc (tramp-rpc--resolve-process process)))
-    (and (not tramp-rpc--delivering-output)
-         (not (process-get proc :tramp-rpc-direct-ssh))
+    (and (not (process-get proc :tramp-rpc-direct-ssh))
          (process-get proc :tramp-rpc-pid)
          (process-get proc :tramp-rpc-vec)
          proc)))
@@ -249,23 +249,30 @@ PROCESS is a PID."
 PROCESS is the process being handled."
   (if (and (processp process) (process-get process :tramp-rpc-pid))
       (cond
-       ((process-get process :tramp-rpc-exited) 'exit)
        ;; Use the real handler to check local relay liveness, not
        ;; `process-live-p' (which would recurse).  Do not perform synchronous
        ;; remote status RPCs here: callers such as mode-line redisplay,
        ;; Flymake, and LSP process management may ask for process status while
-       ;; the user is typing.
-       ((memq (tramp-run-real-handler #'process-status (list process))
-	      '(run open listen connect))
+       ;; the user is typing.  The relay stays live until the remote output has
+       ;; been delivered, so the remote exit status only applies after that.
+       ((and (not (process-get process :tramp-rpc-exited))
+             (memq (tramp-run-real-handler #'process-status (list process))
+	           '(run open listen connect)))
 	'run)
+       ;; A remote signal death is reported as `signal', matching local
+       ;; processes.  Callers such as LSP and compile branch on this.
+       ((integerp (process-get process :tramp-rpc-exit-signal)) 'signal)
        (t 'exit))
     (tramp-run-real-handler #'process-status (list process))))
 
 (defun tramp-rpc-handle-process-exit-status (process)
   "Handler for `process-exit-status' for TRAMP-RPC processes.
-PROCESS is the process being handled."
+PROCESS is the process being handled.  Signal deaths report the signal
+number, like local processes."
   (if (and (processp process) (process-get process :tramp-rpc-pid))
-      (or (process-get process :tramp-rpc-exit-code) 0)
+      (or (process-get process :tramp-rpc-exit-signal)
+          (process-get process :tramp-rpc-exit-code)
+          0)
     (tramp-run-real-handler #'process-exit-status (list process))))
 
 (defun tramp-rpc-handle-process-command (process)
@@ -512,7 +519,7 @@ exited (remote side finished), delete it so the refresh can proceed."
                (process-get proc :tramp-rpc-pid)
                (or (process-get proc :tramp-rpc-exited)
                    (not (process-live-p proc))))
-      (remhash proc tramp-rpc--async-processes)
+      (tramp-rpc--forget-managed-process proc)
       (delete-process proc)))
   (tramp-run-real-handler 'vc-dir-refresh nil))
 

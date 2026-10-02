@@ -5,8 +5,6 @@
 
 use crate::msgpack_map;
 use crate::protocol::{ProcessResult, RpcError, from_value};
-use nix::sys::wait::{WaitPidFlag, WaitStatus, waitpid};
-use nix::unistd::Pid;
 use rmpv::Value;
 use rustix::io::fcntl_dupfd_cloexec;
 #[cfg(target_vendor = "apple")]
@@ -28,15 +26,15 @@ use tokio::sync::{Mutex, Semaphore};
 
 use super::super::HandlerResult;
 use super::super::system::expand_tilde;
+#[cfg(test)]
+use super::MAX_PROCESS_READ_BYTES;
+use super::push::{OutputPush, new_pipe_push, send_exit_notification, stop_output_push};
 #[cfg(target_vendor = "apple")]
 use super::set_fd_cloexec;
-use super::subscription::{
-    PushSubscription, new_pipe_subscription, send_process_notification, stop_push_subscription,
-};
 use super::{
-    MANAGED_CHILD_WAIT, MAX_PROCESS_READ_BYTES, ProcessGroupGuard, SignalCode,
-    configure_process_group, is_benign_stdin_error, require_process_group_signal, signal_process,
-    signal_process_group, wait_for_process_group_exit,
+    MANAGED_CHILD_WAIT, ProcessGroupGuard, SignalCode, configure_process_group,
+    is_benign_stdin_error, require_process_group_signal, signal_process, signal_process_group,
+    wait_for_process_group_exit,
 };
 
 pub(super) fn merged_output_fds() -> std::io::Result<(OwnedFd, OwnedFd, OwnedFd)> {
@@ -232,9 +230,7 @@ pub(super) struct ManagedProcess {
     pub(super) stdin: Arc<Mutex<Option<ChildStdin>>>,
     pub(super) stdout: Arc<Mutex<Option<ChildStdout>>>,
     pub(super) stderr: Arc<Mutex<Option<ChildStderr>>>,
-    pub(super) cmd: String,
-    pub(super) push_subscription: Option<PushSubscription>,
-    pub(super) subscription_requested: bool,
+    pub(super) output_push: Option<OutputPush>,
     pub(super) terminating: bool,
 }
 
@@ -427,7 +423,7 @@ pub(crate) async fn run_child(
 
     // Return binary data directly (no encoding needed!)
     Ok(ProcessResult {
-        exit_code: crate::protocol::exit_code_from_status(status),
+        status,
         stdout,
         stderr,
     })
@@ -483,7 +479,7 @@ pub(super) async fn run_with_output_limit(params: Value, output_limit: usize) ->
     // to GENERAL_TASK_LIMIT concurrent allocations of this size.
     let remaining = Arc::new(Semaphore::new(output_limit));
     match run_child(spec, remaining, output_limit, None).await {
-        Ok(result) => Ok(result.to_value()),
+        Ok(result) => Ok(result.into_value()),
         Err(ChildError::Spawn(error)) => {
             let (cmd, cwd, clear_env) = probe;
             let executable_missing =
@@ -578,9 +574,7 @@ pub async fn start(params: Value) -> HandlerResult {
         stderr: Arc::new(Mutex::new(child.stderr.take())),
         child,
         child_pid,
-        cmd: params.cmd.clone(),
-        push_subscription: None,
-        subscription_requested: false,
+        output_push: None,
         terminating: false,
     };
 
@@ -640,7 +634,18 @@ pub async fn write(params: Value) -> HandlerResult {
     })
 }
 
-/// Read from an async process's stdout/stderr
+/// Output collected by one [`read_output`] step.
+pub(super) struct PipeRead {
+    pub(super) stdout: Vec<u8>,
+    pub(super) stderr: Vec<u8>,
+    /// Set once both streams reached EOF and the child was reaped; the
+    /// registry entry has then been removed.
+    pub(super) exited: bool,
+    pub(super) exit: Option<ExitStatus>,
+}
+
+/// Read from an async process's stdout/stderr (test-only wire shape).
+#[cfg(test)]
 pub async fn read(params: Value) -> HandlerResult {
     #[derive(Deserialize)]
     struct Params {
@@ -665,13 +670,37 @@ pub async fn read(params: Value) -> HandlerResult {
         )));
     }
 
-    let timeout = params.timeout_ms.unwrap_or(0);
+    let result = read_output(params.pid, params.max_bytes, params.timeout_ms.unwrap_or(0)).await?;
+    let bytes_or_nil = |data: Vec<u8>| {
+        if data.is_empty() {
+            Value::Nil
+        } else {
+            Value::Binary(data)
+        }
+    };
+    let mut pairs = vec![
+        (Value::String("stdout".into()), bytes_or_nil(result.stdout)),
+        (Value::String("stderr".into()), bytes_or_nil(result.stderr)),
+        (
+            Value::String("exited".into()),
+            Value::Boolean(result.exited),
+        ),
+    ];
+    pairs.extend(crate::protocol::exit_fields(result.exit));
+    Ok(Value::Map(pairs))
+}
 
+/// Read available stdout/stderr of PID, waiting up to TIMEOUT_MS for data.
+pub(super) async fn read_output(
+    pid: u32,
+    max_bytes: usize,
+    timeout: u64,
+) -> Result<PipeRead, RpcError> {
     let (stdout, stderr, lifecycle, shared_exit_status) = {
         let processes = get_process_map().lock().await;
         let managed = processes
-            .get(&params.pid)
-            .ok_or_else(|| RpcError::process_error(format!("Process not found: {}", params.pid)))?;
+            .get(&pid)
+            .ok_or_else(|| RpcError::process_error(format!("Process not found: {pid}")))?;
         (
             managed.stdout.clone(),
             managed.stderr.clone(),
@@ -679,11 +708,10 @@ pub async fn read(params: Value) -> HandlerResult {
             managed.shared_exit_status.clone(),
         )
     };
-
     // Try to read stdout/stderr (with optional blocking timeout) without
     // holding the global process map lock.
     let (stdout_result, stderr_result) =
-        try_read_streams(stdout, stderr, params.max_bytes, timeout).await?;
+        try_read_streams(stdout, stderr, max_bytes, timeout).await?;
 
     let stdout_eof = matches!(stdout_result, ReadResult::Eof);
     let stderr_eof = matches!(stderr_result, ReadResult::Eof);
@@ -698,7 +726,7 @@ pub async fn read(params: Value) -> HandlerResult {
     // across any await points above.
     let mut exit_status = {
         let mut processes = get_process_map().lock().await;
-        if let Some(managed) = processes.get_mut(&params.pid) {
+        if let Some(managed) = processes.get_mut(&pid) {
             poll_exit_status(managed).map_err(|e| {
                 RpcError::process_error(format!("Failed to query process status: {e}"))
             })?
@@ -719,7 +747,7 @@ pub async fn read(params: Value) -> HandlerResult {
         for _ in 0..5 {
             tokio::task::yield_now().await;
             let mut processes = get_process_map().lock().await;
-            if let Some(managed) = processes.get_mut(&params.pid) {
+            if let Some(managed) = processes.get_mut(&pid) {
                 exit_status = poll_exit_status(managed).map_err(|e| {
                     RpcError::process_error(format!("Failed to query process status: {e}"))
                 })?;
@@ -745,36 +773,14 @@ pub async fn read(params: Value) -> HandlerResult {
     // The terminal read is also the ownership handoff: the child has already
     // been reaped by poll_exit_status and both pipes have reached EOF.
     if exited {
-        get_process_map().lock().await.remove(&params.pid);
+        get_process_map().lock().await.remove(&pid);
     }
 
-    // Return binary data directly (no encoding!)
-    let stdout_val = if stdout_data.is_empty() {
-        Value::Nil
-    } else {
-        Value::Binary(stdout_data)
-    };
-
-    let stderr_val = if stderr_data.is_empty() {
-        Value::Nil
-    } else {
-        Value::Binary(stderr_data)
-    };
-
-    let exit_code = if exited {
-        exit_status
-            .map(crate::protocol::exit_code_from_status)
-            .map(|code| Value::Integer(code.into()))
-            .unwrap_or(Value::Nil)
-    } else {
-        Value::Nil
-    };
-
-    Ok(msgpack_map! {
-        "stdout" => stdout_val,
-        "stderr" => stderr_val,
-        "exited" => exited,
-        "exit_code" => exit_code
+    Ok(PipeRead {
+        stdout: stdout_data,
+        stderr: stderr_data,
+        exited,
+        exit: exit_status.filter(|_| exited),
     })
 }
 
@@ -942,33 +948,45 @@ pub async fn close_stdin(params: Value) -> HandlerResult {
     Ok(Value::Boolean(true))
 }
 
-pub(super) async fn wait_pipe_child(os_pid: u32) -> Result<Option<ExitStatus>, nix::errno::Errno> {
+/// Wait until the managed child behind registry PID is reaped.
+///
+/// This polls tokio's own `try_wait' so the child's `kill_on_drop' state stays
+/// consistent.  Reaping the same child with a second reaper (nix `waitpid')
+/// hides the reap from tokio, which then still believes the process is running
+/// and can send `SIGKILL' to an already-reaped, potentially recycled PID when
+/// the registry entry is dropped.
+pub(super) async fn wait_pipe_child(pid: u32) -> Result<Option<ExitStatus>, RpcError> {
     loop {
-        match waitpid(Pid::from_raw(os_pid as i32), Some(WaitPidFlag::WNOHANG)) {
-            Ok(status @ (WaitStatus::Exited(_, _) | WaitStatus::Signaled(_, _, _))) => {
-                return Ok(Some(exit_status_from_wait_status(status)));
+        {
+            let mut processes = get_process_map().lock().await;
+            let Some(managed) = processes.get_mut(&pid) else {
+                // Another poll consumed the status and removed the entry.
+                return Ok(None);
+            };
+            if let Some(status) = poll_exit_status(managed).map_err(|error| {
+                RpcError::process_error(format!("Failed to reap process {pid}: {error}"))
+            })? {
+                return Ok(Some(status));
             }
-            Ok(WaitStatus::StillAlive) => {
-                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
-            }
-            // Another status poll can only have consumed the status while the
-            // lifecycle lock is not held.  The map entry remains until its
-            // streams reach EOF, even in that case.
-            Err(nix::errno::Errno::ECHILD) => return Ok(None),
-            Err(nix::errno::Errno::EINTR) => continue,
-            Err(error) => return Err(error),
-            Ok(_) => return Err(nix::errno::Errno::EINVAL),
         }
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
     }
 }
 
-pub(super) fn exit_status_from_wait_status(status: WaitStatus) -> ExitStatus {
-    match status {
-        WaitStatus::Exited(_, code) => ExitStatus::from_raw(code << 8),
-        WaitStatus::Signaled(_, signal, core_dumped) => {
-            ExitStatus::from_raw(signal as i32 | if core_dumped { 0x80 } else { 0 })
-        }
-        _ => ExitStatus::from_raw(0),
+/// Remove PID from the registry, reaping the direct child in the background
+/// when it was not confirmed dead.
+///
+/// Dropping an unreaped tokio `Child' leaves a zombie and keeps
+/// `kill_on_drop' armed, so a bounded-wait timeout (for example, a child in
+/// uninterruptible sleep) must not simply discard the entry.
+pub(super) async fn retire_pipe_process(pid: u32) {
+    let removed = get_process_map().lock().await.remove(&pid);
+    if let Some(mut managed) = removed
+        && managed.exit_status.is_none()
+    {
+        tokio::spawn(async move {
+            let _ = managed.child.wait().await;
+        });
     }
 }
 
@@ -1009,7 +1027,7 @@ pub(super) async fn terminate_pipe_process(
             *shared_exit_status
                 .lock()
                 .expect("shared pipe exit status lock") = cached;
-            get_process_map().lock().await.remove(&pid);
+            retire_pipe_process(pid).await;
         }
         return Ok(true);
     }
@@ -1027,7 +1045,7 @@ pub(super) async fn terminate_pipe_process(
     let mut reap = if cached.is_some() {
         cached
     } else {
-        tokio::time::timeout(MANAGED_CHILD_WAIT, wait_pipe_child(os_pid))
+        tokio::time::timeout(MANAGED_CHILD_WAIT, wait_pipe_child(pid))
             .await
             .ok()
             .and_then(Result::ok)
@@ -1046,14 +1064,22 @@ pub(super) async fn terminate_pipe_process(
         require_process_group_signal(signal_process_group(os_pid, libc::SIGKILL), "send SIGKILL")?;
     }
     if reap.is_none() && escalate {
-        reap = tokio::time::timeout(MANAGED_CHILD_WAIT, wait_pipe_child(os_pid))
-            .await
-            .map_err(|_| {
-                RpcError::process_error(format!("Timed out reaping process {pid} after SIGKILL"))
-            })?
-            .map_err(|error| {
-                RpcError::process_error(format!("Failed to reap process {pid}: {error}"))
-            })?;
+        // The escalation reap is the last chance to observe the child.  Retire
+        // it on failure too, so the background reaper owns an unreaped child
+        // instead of leaving the entry registered forever.
+        reap = match tokio::time::timeout(MANAGED_CHILD_WAIT, wait_pipe_child(pid)).await {
+            Ok(Ok(status)) => status,
+            Ok(Err(error)) => {
+                retire_pipe_process(pid).await;
+                return Err(error);
+            }
+            Err(_) => {
+                retire_pipe_process(pid).await;
+                return Err(RpcError::process_error(format!(
+                    "Timed out reaping process {pid} after SIGKILL"
+                )));
+            }
+        };
     }
     if let Some(exit_status) = reap {
         // Publish before any destructive cleanup so a read which captured the
@@ -1066,7 +1092,7 @@ pub(super) async fn terminate_pipe_process(
         }
         if signal == libc::SIGKILL {
             // Explicit SIGKILL is the caller's opt-out from output draining.
-            get_process_map().lock().await.remove(&pid);
+            retire_pipe_process(pid).await;
         }
         return Ok(true);
     }
@@ -1074,7 +1100,7 @@ pub(super) async fn terminate_pipe_process(
         // Explicit SIGKILL is the caller's opt-out from drain-preserving
         // ownership.  Always remove it, whether status() won the reap race or
         // this call did; already in-flight reads retain the shared state.
-        get_process_map().lock().await.remove(&pid);
+        retire_pipe_process(pid).await;
     }
 
     // Signal delivery is the success criterion, matching local
@@ -1101,9 +1127,9 @@ pub async fn kill(params: Value) -> HandlerResult {
 
     let params: Params = from_value(params).map_err(|e| RpcError::invalid_params(e.to_string()))?;
     let signal = params.signal.resolve()?;
-    // A subscription owns the output read loop.  Stop it before destructive
+    // The output push owns the read loop.  Stop it before destructive
     // SIGKILL so it cannot race registry removal or consume final output.
-    let (subscription, shared_exit_status) = {
+    let (push, shared_exit_status) = {
         let mut processes = get_process_map().lock().await;
         let managed = processes
             .get_mut(&params.pid)
@@ -1117,38 +1143,34 @@ pub async fn kill(params: Value) -> HandlerResult {
         if signal == libc::SIGKILL {
             managed.terminating = true;
             (
-                managed.push_subscription.take(),
+                managed.output_push.take(),
                 Some(Arc::clone(&managed.shared_exit_status)),
             )
         } else {
             (None, None)
         }
     };
-    let subscribed = subscription.is_some();
-    if let Some(subscription) = subscription {
-        stop_push_subscription(subscription).await;
+    let pushing = push.is_some();
+    if let Some(push) = push {
+        stop_output_push(push).await;
     }
     if let Err(error) = terminate_pipe_process(params.pid, signal, false).await {
         if let Some(managed) = get_process_map().lock().await.get_mut(&params.pid) {
             managed.terminating = false;
-            if managed.subscription_requested && managed.push_subscription.is_none() {
-                managed.push_subscription = Some(new_pipe_subscription(params.pid));
+            if pushing && managed.output_push.is_none() {
+                managed.output_push = Some(new_pipe_push(params.pid));
             }
         }
         return Err(error);
     }
-    if signal == libc::SIGKILL && subscribed {
-        let exit_code = shared_exit_status
+    // SIGKILL removed the entry, so no push task can report this exit.  Also
+    // report it when the push had not started yet.
+    if signal == libc::SIGKILL {
+        let status = shared_exit_status
             .as_ref()
             .and_then(|status| *status.lock().expect("shared pipe exit status lock"))
-            .map(crate::protocol::exit_code_from_status)
-            .map(i64::from)
-            .unwrap_or_else(|| i64::from(128 + signal));
-        let _ = send_process_notification(
-            "process.exit",
-            msgpack_map! { "pid" => params.pid, "exit_code" => exit_code },
-        )
-        .await;
+            .unwrap_or_else(|| ExitStatus::from_raw(signal));
+        send_exit_notification(params.pid, Some(status)).await;
     }
     Ok(Value::Boolean(true))
 }
@@ -1169,64 +1191,4 @@ pub async fn signal_pid(params: Value) -> HandlerResult {
     signal_process(params.pid, signal)
         .map_err(|error| RpcError::process_error(format!("Failed to signal process: {error}")))?;
     Ok(Value::Boolean(true))
-}
-
-/// Return status of an async process without consuming stdout/stderr.
-pub async fn status(params: Value) -> HandlerResult {
-    #[derive(Deserialize)]
-    struct Params {
-        pid: u32,
-    }
-
-    let params: Params = from_value(params).map_err(|e| RpcError::invalid_params(e.to_string()))?;
-
-    let lifecycle = {
-        let processes = get_process_map().lock().await;
-        processes
-            .get(&params.pid)
-            .map(|managed| managed.lifecycle.clone())
-            .ok_or_else(|| RpcError::process_error(format!("Process not found: {}", params.pid)))?
-    };
-    let _lifecycle_guard = lifecycle.lock().await;
-    let mut processes = get_process_map().lock().await;
-    let managed = processes
-        .get_mut(&params.pid)
-        .ok_or_else(|| RpcError::process_error(format!("Process not found: {}", params.pid)))?;
-    let exit_status = poll_exit_status(managed)
-        .map_err(|e| RpcError::process_error(format!("Failed to query process status: {e}")))?;
-
-    Ok(msgpack_map! {
-        "exited" => exit_status.is_some(),
-        "exit_code" => exit_status.map(crate::protocol::exit_code_from_status).map(|c| Value::Integer(c.into())).unwrap_or(Value::Nil)
-    })
-}
-
-/// List all managed async processes
-pub async fn list(_params: Value) -> HandlerResult {
-    let entries: Vec<(u32, Arc<Mutex<()>>)> = {
-        let processes = get_process_map().lock().await;
-        processes
-            .iter()
-            .map(|(pid, managed)| (*pid, managed.lifecycle.clone()))
-            .collect()
-    };
-    let mut list = Vec::with_capacity(entries.len());
-    for (pid, lifecycle) in entries {
-        let _lifecycle_guard = lifecycle.lock().await;
-        let mut processes = get_process_map().lock().await;
-        let Some(managed) = processes.get_mut(&pid) else {
-            continue;
-        };
-        let exited = poll_exit_status(managed)
-            .map_err(|e| RpcError::process_error(format!("Failed to query process status: {e}")))?;
-        list.push(msgpack_map! {
-            "pid" => pid,
-            "os_pid" => Value::Integer((managed.child_pid as i64).into()),
-            "cmd" => managed.cmd.clone(),
-            "exited" => exited.is_some(),
-            "exit_code" => exited.map(crate::protocol::exit_code_from_status).map(|c| Value::Integer(c.into())).unwrap_or(Value::Nil)
-        });
-    }
-
-    Ok(Value::Array(list))
 }

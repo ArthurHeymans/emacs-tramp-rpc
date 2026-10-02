@@ -367,35 +367,22 @@ impl DirEntry {
 // Process operation types
 // ============================================================================
 
-/// Process execution result - output is now raw bytes
-#[derive(Debug, Serialize, Deserialize)]
+/// Result of a completed `process.run` child.
+#[derive(Debug)]
 pub struct ProcessResult {
-    pub exit_code: i32,
-    /// stdout content as raw bytes
-    #[serde(with = "serde_bytes")]
+    pub status: std::process::ExitStatus,
     pub stdout: Vec<u8>,
-    /// stderr content as raw bytes
-    #[serde(with = "serde_bytes")]
     pub stderr: Vec<u8>,
 }
 
 impl ProcessResult {
-    /// Convert to a MessagePack Value with named fields
-    pub fn to_value(&self) -> Value {
-        Value::Map(vec![
-            (
-                Value::String("exit_code".into()),
-                Value::Integer(self.exit_code.into()),
-            ),
-            (
-                Value::String("stdout".into()),
-                Value::Binary(self.stdout.clone()),
-            ),
-            (
-                Value::String("stderr".into()),
-                Value::Binary(self.stderr.clone()),
-            ),
-        ])
+    /// Convert to a MessagePack map with `exit_code`, `signal`, `stdout` and
+    /// `stderr` fields.
+    pub fn into_value(self) -> Value {
+        let mut pairs = Vec::from(exit_fields(Some(self.status)));
+        pairs.push((Value::String("stdout".into()), Value::Binary(self.stdout)));
+        pairs.push((Value::String("stderr".into()), Value::Binary(self.stderr)));
+        Value::Map(pairs)
     }
 }
 
@@ -457,39 +444,54 @@ impl IntoValue for Value {
     }
 }
 
-/// Extract an exit code from a `std::process::ExitStatus`.
+/// Return the signal number that terminated STATUS, or `None` for a normal exit.
 ///
-/// On Unix, signal-killed processes have `code() == None`.
-/// Convention: return 128 + signal_number (e.g. SIGKILL=9 -> 137).
-pub fn exit_code_from_status(status: std::process::ExitStatus) -> i32 {
-    // Normal exit: code() returns Some(exit_code)
-    if let Some(code) = status.code() {
-        return code;
-    }
-
-    // Signal termination (Unix only)
+/// Kept separate from [`exit_code_from_status`] because the 128 + signal
+/// convention cannot tell a process killed by SIGKILL from one that exited
+/// with code 137.
+pub fn exit_signal_from_status(status: std::process::ExitStatus) -> Option<i32> {
     #[cfg(unix)]
     {
         use std::os::unix::process::ExitStatusExt;
 
-        // Primary: use signal() API
-        if let Some(sig) = status.signal() {
-            return 128 + sig;
-        }
-
-        // Fallback: parse the raw wait status directly.
-        // This handles edge cases where signal() might return None
-        // despite the process being killed by a signal (observed on
-        // some platforms/configurations).
-        let raw = status.into_raw();
-        let termsig = raw & 0x7f;
-        if termsig != 0 && termsig != 0x7f {
-            // WIFSIGNALED: terminated by signal
-            return 128 + termsig;
-        }
+        // Some platforms report `signal() == None` for a signal death, so
+        // fall back to parsing the raw wait status (WIFSIGNALED).
+        status.signal().or_else(|| {
+            let termsig = status.into_raw() & 0x7f;
+            (termsig != 0 && termsig != 0x7f).then_some(termsig)
+        })
     }
+    #[cfg(not(unix))]
+    {
+        let _ = status;
+        None
+    }
+}
 
-    -1
+/// Extract an exit code from a `std::process::ExitStatus`.
+///
+/// Signal deaths use the shell convention 128 + signal (SIGKILL -> 137).
+pub fn exit_code_from_status(status: std::process::ExitStatus) -> i32 {
+    status
+        .code()
+        .or_else(|| exit_signal_from_status(status).map(|signal| 128 + signal))
+        .unwrap_or(-1)
+}
+
+/// Terminal fields shared by `process.run` results and `process.exit`
+/// notifications: the historical `exit_code` plus the terminating `signal`.
+pub fn exit_fields(status: Option<std::process::ExitStatus>) -> [(Value, Value); 2] {
+    let int_or_nil = |value: Option<i32>| value.map_or(Value::Nil, |v| Value::Integer(v.into()));
+    [
+        (
+            Value::String("exit_code".into()),
+            int_or_nil(status.map(exit_code_from_status)),
+        ),
+        (
+            Value::String("signal".into()),
+            int_or_nil(status.and_then(exit_signal_from_status)),
+        ),
+    ]
 }
 
 /// Helper to deserialize from rmpv::Value to a typed struct

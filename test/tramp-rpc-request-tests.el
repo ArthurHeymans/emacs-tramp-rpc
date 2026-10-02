@@ -5,8 +5,16 @@
 (require 'cl-lib)
 (require 'tramp-rpc)
 
+(declare-function tramp-rpc--handle-process-notification
+                  "tramp-rpc-process" (process method params))
 (declare-function tramp-rpc--invalidate-timed-out-connection "tramp-rpc-transport"
                   (process vec event))
+(declare-function tramp-rpc--track-pending-request "tramp-rpc-transport"
+                  (conn id))
+(declare-function tramp-rpc--connection-filter "tramp-rpc-transport"
+                  (process output))
+(declare-function tramp-rpc--drain-connection-stderr "tramp-rpc-transport"
+                  (conn))
 (declare-function tramp-rpc-mock-test--wait-for "tramp-rpc-mock-tests"
                   (predicate description &optional process))
 
@@ -43,18 +51,18 @@ SPEC is (PROCESS BUFFER [CONNECTION]); CONNECTION defaults to `connection'."
            (kill-buffer ,buffer))))))
 
 (defun tramp-rpc-mock-test-request--timeout-clock ()
-  "Return a clock which makes the first wait check expire.
-Each call after the second returns an ever-increasing value so that
-nested timeouts (e.g. the dead-connection probe) also expire."
+  "Return a clock which makes the first wait check expire."
   (let ((calls 0))
     (lambda (&rest _)
       (setq calls (1+ calls))
-      (if (<= calls 2) 0 (* 100 (- calls 2))))))
+      (if (<= calls 2) 0 100))))
 
 (ert-deftest tramp-rpc-mock-test-request-sync-timeout-discards-late-response ()
   "A timed out synchronous ID is not buffered when its response arrives late."
   (tramp-rpc-mock-test-request--with-connection (process buffer)
     (let ((clock (tramp-rpc-mock-test-request--timeout-clock))
+          ;; Probe behavior is tested separately; this models a live server.
+          (tramp-rpc--probing-connection t)
           (vec (tramp-rpc-mock-test-request--vec))
           (tramp-rpc--connections (make-hash-table :test 'equal))
           invalidated)
@@ -69,7 +77,7 @@ nested timeouts (e.g. the dead-connection probe) also expire."
                 ((symbol-function 'float-time) clock))
         (should-error (tramp-rpc--call-with-timeout vec "test" nil 0 0)
                       :type 'remote-file-error)
-        (should (equal (list process vec) invalidated))
+        (should-not invalidated)
         (should-not (tramp-rpc-connection-pending-ids connection))
         (let ((messages (list '(:id 101 :result late))))
           (cl-letf (((symbol-function 'tramp-rpc-protocol-try-read-message)
@@ -79,6 +87,77 @@ nested timeouts (e.g. the dead-connection probe) also expire."
             (tramp-rpc--connection-filter process "late")))
         (should (zerop (hash-table-count
                         (tramp-rpc-connection-pending-responses connection))))))))
+
+(ert-deftest tramp-rpc-mock-test-request-id-less-error-retires-generation ()
+  "An uncorrelated error fails all callers rather than guessing a request ID."
+  (dolist (synchronous '(nil t))
+    (tramp-rpc-mock-test-request--with-connection (process buffer)
+      (when synchronous
+        (tramp-rpc--track-pending-request connection 202)
+        (tramp-rpc--track-pending-request connection 101))
+      (let ((messages (list '(:id nil :error (:code -32600
+                                              :message "frame too large"))
+                            '(:id 101 :result late)))
+            callback-response)
+        (puthash 303 (lambda (response) (setq callback-response response))
+                 (tramp-rpc-connection-async-callbacks connection))
+        (cl-letf (((symbol-function 'tramp-rpc-protocol-try-read-message)
+                   (lambda (_buffer)
+                     (set-marker (mark-marker) (point-max))
+                     (pop messages))))
+          (tramp-rpc--connection-filter process "error"))
+        (should-not (process-live-p process))
+        (should (tramp-rpc-connection-transport-dead connection))
+        (should (eq (tramp-rpc-connection-cleanup-reason connection)
+                    :protocol-error))
+        (should (string-match-p "frame too large"
+                                (tramp-rpc-connection-cleanup-event connection)))
+        (should (= -32098 (plist-get (plist-get callback-response :error) :code)))
+        (should (zerop (hash-table-count
+                        (tramp-rpc-connection-async-callbacks connection))))
+        (dolist (id (tramp-rpc-connection-pending-ids connection))
+          (should (= -32098
+                     (plist-get
+                      (plist-get (gethash id (tramp-rpc-connection-pending-responses
+                                              connection)) :error)
+                      :code))))))))
+
+(ert-deftest tramp-rpc-mock-test-request-timeout-probe-uses-captured-generation ()
+  "The timeout probe uses the reserved ping method on the original transport."
+  (tramp-rpc-mock-test-request--with-connection (process buffer)
+    (let ((vec (tramp-rpc-mock-test-request--vec))
+          (tramp-rpc--probing-connection nil)
+          probed invalidated)
+      (cl-letf (((symbol-function 'tramp-rpc--call-with-timeout)
+                 (lambda (_vec method _params _timeout _interval conn)
+                   (setq probed (list method conn))
+                   (signal 'remote-file-error '("dead tunnel"))))
+                ((symbol-function 'tramp-rpc--invalidate-timed-out-connection)
+                 (lambda (transport _vec _event) (setq invalidated transport))))
+        (tramp-rpc--probe-live-connection vec connection process "test"))
+      (should (equal probed (list "system.ping" connection)))
+      (should (eq invalidated process)))))
+
+(ert-deftest tramp-rpc-mock-test-stderr-buffer-is-bounded ()
+  "Long-lived SSH stderr output must not grow without bound."
+  (tramp-rpc-mock-test-request--with-connection (process buffer)
+    (let ((stderr-buffer (generate-new-buffer " *tramp-rpc-stderr-test*"))
+          (stderr-process nil))
+      (unwind-protect
+          (progn
+            (setq stderr-process
+                  (make-pipe-process :name "tramp-rpc-stderr-test"
+                                     :buffer stderr-buffer :noquery t))
+            (setf (tramp-rpc-connection-stderr-buffer connection) stderr-buffer)
+            (with-current-buffer stderr-buffer
+              (insert (make-string (* 2 tramp-rpc-stderr-buffer-limit) ?x))
+              (insert "TAIL-MARKER"))
+            (tramp-rpc--drain-connection-stderr connection)
+            (with-current-buffer stderr-buffer
+              (should (= (buffer-size) tramp-rpc-stderr-buffer-limit))
+              (should (string-suffix-p "TAIL-MARKER" (buffer-string)))))
+        (when (process-live-p stderr-process) (delete-process stderr-process))
+        (when (buffer-live-p stderr-buffer) (kill-buffer stderr-buffer))))))
 
 (defun tramp-rpc-mock-test-request--check-wait-quit (kind)
   "Abandon a KIND wait without disrupting other users of its transport."
@@ -103,8 +182,6 @@ nested timeouts (e.g. the dead-connection probe) also expire."
                        (lambda (_vec) connection))
                       ((symbol-function 'tramp-rpc-protocol-encode-request-with-id)
                        (lambda (&rest _) '(102 . "request")))
-                      ((symbol-function 'tramp-rpc-protocol-encode-batch-request-with-id)
-                       (lambda (&rest _) '(102 . "batch")))
                       ((symbol-function 'process-send-string) #'ignore)
                       ((symbol-function 'accept-process-output)
                        (lambda (&rest _) (signal 'quit nil)))
@@ -365,6 +442,65 @@ nested timeouts (e.g. the dead-connection probe) also expire."
       (should-not (tramp-rpc--get-connection vec))
       (should (equal vec controlmaster-cleaned)))))
 
+(ert-deftest tramp-rpc-mock-test-request-wait-timeout-preserves-managed-processes ()
+  "A completed request write timing out must not retire shared processes."
+  (tramp-rpc-mock-test-request--with-connection (process buffer)
+    (let* ((vec (tramp-rpc-mock-test-request--vec))
+           (connection connection)
+           (clock (tramp-rpc-mock-test-request--timeout-clock))
+           (tramp-rpc--probing-connection t)
+           (tramp-rpc--connections (make-hash-table :test 'equal))
+           (tramp-rpc--async-processes (make-hash-table :test 'eq))
+           (managed-process
+            (make-pipe-process :name "tramp-rpc-timeout-managed-process"
+                               :noquery t)))
+      (puthash (tramp-rpc--connection-key vec) connection tramp-rpc--connections)
+      (puthash managed-process
+               (list :vec vec :pid 999 :connection-process process)
+               tramp-rpc--async-processes)
+      (unwind-protect
+          (progn
+            (cl-letf (((symbol-function 'tramp-rpc--ensure-connection)
+                       (lambda (_vec) connection))
+                      ((symbol-function 'tramp-rpc-protocol-encode-request-with-id)
+                       (lambda (&rest _) '(109 . "request")))
+                      ((symbol-function 'process-send-string)
+                       (lambda (&rest _) nil))
+                      ((symbol-function 'float-time) clock))
+              (should-error
+               (tramp-rpc--call-with-timeout vec "slow" nil 0 0)
+               :type 'remote-file-error))
+            (should (process-live-p process))
+            (should (eq connection (tramp-rpc--get-connection vec)))
+            (should (process-live-p managed-process))
+            (should (gethash managed-process tramp-rpc--async-processes))
+            (should-not (tramp-rpc-connection-pending-ids connection)))
+        (remhash managed-process tramp-rpc--async-processes)
+        (when (process-live-p managed-process)
+          (delete-process managed-process))))))
+
+(ert-deftest tramp-rpc-mock-test-request-deferred-quit-preserves-sent-frame ()
+  "A keyboard quit deferred until after a complete write preserves transport."
+  (tramp-rpc-mock-test-request--with-connection (process _buffer)
+    (let* ((vec (tramp-rpc-mock-test-request--vec))
+           (connection connection)
+           (tramp-rpc--connections (make-hash-table :test 'equal))
+           (quit-flag nil))
+      (puthash (tramp-rpc--connection-key vec) connection tramp-rpc--connections)
+      (cl-letf (((symbol-function 'process-send-string)
+                 (lambda (&rest _) (setq quit-flag t))))
+        (should
+         (eq (condition-case nil
+                 (progn
+                   (tramp-rpc--send-request-frame
+                    connection vec "request" "interrupted write\n")
+                   nil)
+               (quit 'quit))
+             'quit)))
+      (setq quit-flag nil)
+      (should (process-live-p process))
+      (should (eq connection (tramp-rpc--get-connection vec))))))
+
 (ert-deftest tramp-rpc-mock-test-request-timeout-preserves-replacement-controlmaster ()
   "Timeout cleanup does not tear down a replacement connection."
   (tramp-rpc-mock-test-request--with-connection (process buffer)
@@ -474,15 +610,117 @@ nested timeouts (e.g. the dead-connection probe) also expire."
       (should (equal '(:id 202 :result second)
                      (gethash 202 (tramp-rpc-connection-pending-responses connection)))))))
 
+(defun tramp-rpc-mock-test-request--assert-notification-survives-wait
+    (vec connection-process deliver wait)
+  "Assert a relay notification received inside a synchronous RPC wait is handled.
+CONNECTION-PROCESS is the transport the waiter listens on.  DELIVER runs
+inside the first `accept-process-output\=' and must buffer the response the
+waiter expects.  WAIT performs the synchronous call; its value is returned.
+The helper also verifies that the output payload in the notification is queued."
+  (let* ((relay (make-pipe-process
+                 :name "tramp-rpc-mock-test-request-relay"
+                 :noquery t))
+         (tramp-rpc--async-processes (make-hash-table :test 'eq))
+         (original-accept-process-output
+          (symbol-function 'accept-process-output))
+         queued-output
+         response-delivered
+         result)
+    (unwind-protect
+        (progn
+          (puthash relay
+                   (list :vec vec :pid 42
+                         :connection-process connection-process
+                         :stderr-buffer nil
+                         :pending-output nil :pending-exit nil
+                         :delivery-timer nil)
+                   tramp-rpc--async-processes)
+          (cl-letf (((symbol-function 'tramp-rpc--queue-process-output)
+                     (lambda (_proc stdout _stderr _buf)
+                       (setq queued-output stdout)))
+                    ((symbol-function 'accept-process-output)
+                     (lambda (&rest args)
+                       (if response-delivered
+                           (apply original-accept-process-output args)
+                         (setq response-delivered t)
+                         (tramp-rpc--handle-process-notification
+                          connection-process "process.output"
+                          '((pid . 42) (stdout . "ping")))
+                         (funcall deliver)
+                         t))))
+            (setq result (funcall wait)))
+          (should (equal queued-output "ping"))
+          result)
+      (when (process-live-p relay)
+        (delete-process relay)))))
+
+(ert-deftest tramp-rpc-mock-test-request-wait-preserves-async-process-notification ()
+  "A push notification received during a sync wait is handled without disrupting the wait."
+  (tramp-rpc-mock-test-request--with-connection (process buffer)
+    (let ((vec (tramp-rpc-mock-test-request--vec))
+          (tramp-rpc--connections (make-hash-table :test 'equal)))
+      (cl-letf (((symbol-function 'tramp-rpc--ensure-connection)
+                 (lambda (_vec) connection))
+                ((symbol-function 'tramp-rpc-protocol-encode-request-with-id)
+                 (lambda (&rest _) '(301 . "request")))
+                ((symbol-function 'process-send-string)
+                 (lambda (&rest _) nil)))
+        (should (eq 'done
+                    (tramp-rpc-mock-test-request--assert-notification-survives-wait
+                     vec process
+                     (lambda ()
+                       (puthash 301 '(:id 301 :result done)
+                                (tramp-rpc-connection-pending-responses connection)))
+                     (lambda ()
+                       (tramp-rpc--call-with-timeout
+                        vec "test" nil 1 0.01)))))))))
+
+(ert-deftest tramp-rpc-mock-test-request-batch-wait-preserves-async-process-notification ()
+  "A push notification received during a batch wait is handled without disrupting the wait."
+  (tramp-rpc-mock-test-request--with-connection (process buffer)
+    (let ((vec (tramp-rpc-mock-test-request--vec))
+          (tramp-rpc--connections (make-hash-table :test 'equal)))
+      (cl-letf (((symbol-function 'tramp-rpc--ensure-connection)
+                 (lambda (_vec) connection))
+                ((symbol-function 'tramp-rpc-protocol-encode-request-with-id)
+                 (lambda (&rest _) '(302 . "batch")))
+                ((symbol-function 'process-send-string)
+                 (lambda (&rest _) nil)))
+        (should (equal '(batch-result)
+                       (tramp-rpc-mock-test-request--assert-notification-survives-wait
+                        vec process
+                        (lambda ()
+                          (puthash 302 '(:id 302 :result ((results . (((result . batch-result))))))
+                                   (tramp-rpc-connection-pending-responses connection)))
+                        (lambda ()
+                          (tramp-rpc--call-batch vec '(("test" . nil)))))))))))
+
+(ert-deftest tramp-rpc-mock-test-request-receive-preserves-async-process-notification ()
+  "A push notification received during a pipelined wait is handled without disrupting the wait."
+  (tramp-rpc-mock-test-request--with-connection (process buffer)
+    (let ((vec (tramp-rpc-mock-test-request--vec))
+          (tramp-rpc--connections (make-hash-table :test 'equal)))
+      (tramp-rpc--track-pending-request connection 303)
+      (should (equal '((303 . (:id 303 :result pipelined)))
+                     (tramp-rpc-mock-test-request--assert-notification-survives-wait
+                      vec process
+                      (lambda ()
+                        (puthash 303 '(:id 303 :result pipelined)
+                                 (tramp-rpc-connection-pending-responses connection)))
+                      (lambda ()
+                        (tramp-rpc--receive-responses
+                         vec '(303) 1 connection))))))))
+
 (ert-deftest tramp-rpc-mock-test-request-batch-timeout-cleans-id ()
   "A batch timeout releases its request ID and response table."
   (tramp-rpc-mock-test-request--with-connection (process buffer)
-    (let ((vec (tramp-rpc-mock-test-request--vec))
+    (let ((tramp-rpc--probing-connection t)
+          (vec (tramp-rpc-mock-test-request--vec))
           (tramp-rpc--connections (make-hash-table :test 'equal))
           invalidated)
       (cl-letf (((symbol-function 'tramp-rpc--ensure-connection)
                  (lambda (_vec) connection))
-                ((symbol-function 'tramp-rpc-protocol-encode-batch-request-with-id)
+                ((symbol-function 'tramp-rpc-protocol-encode-request-with-id)
                  (lambda (&rest _) '(102 . "batch")))
                 ((symbol-function 'process-send-string) (lambda (&rest _) nil))
                 ((symbol-function 'tramp-rpc--invalidate-timed-out-connection)
@@ -491,7 +729,7 @@ nested timeouts (e.g. the dead-connection probe) also expire."
                 ((symbol-function 'float-time) (tramp-rpc-mock-test-request--timeout-clock)))
         (should-error (tramp-rpc--call-batch vec '(("test" . nil)))
                       :type 'remote-file-error)
-        (should (equal (list process vec) invalidated))
+        (should-not invalidated)
         (should-not (tramp-rpc-connection-pending-ids connection))
         (should (zerop (hash-table-count
                         (tramp-rpc-connection-pending-responses connection))))))))
@@ -505,7 +743,7 @@ nested timeouts (e.g. the dead-connection probe) also expire."
           (clock-calls 0))
       (cl-letf (((symbol-function 'tramp-rpc--ensure-connection)
                  (lambda (_vec) connection))
-                ((symbol-function 'tramp-rpc-protocol-encode-batch-request-with-id)
+                ((symbol-function 'tramp-rpc-protocol-encode-request-with-id)
                  (lambda (&rest _) '(103 . "batch")))
                 ((symbol-function 'process-send-string) (lambda (&rest _) nil))
                 ((symbol-function 'float-time)
@@ -514,13 +752,11 @@ nested timeouts (e.g. the dead-connection probe) also expire."
                    (if (<= clock-calls 2) 0 50)))
                 ((symbol-function 'accept-process-output)
                  (lambda (&rest _)
-                   (puthash 103 '(:id 103 :result batch)
+                   (puthash 103 '(:id 103 :result ((results . (((result . batch-result))))))
                             (tramp-rpc-connection-pending-responses connection))
-                   t))
-                ((symbol-function 'tramp-rpc-protocol-decode-batch-response)
-                 (lambda (_response) 'batch-result)))
-        (should (eq 'batch-result
-                    (tramp-rpc--call-batch vec '(("test" . nil)))))))))
+                   t)))
+        (should (equal '(batch-result)
+                       (tramp-rpc--call-batch vec '(("test" . nil)))))))))
 
 (ert-deftest tramp-rpc-mock-test-request-pipeline-death-keeps-receive-on-old-generation ()
   "A pipeline receives its injected error from the generation that sent it."
@@ -654,5 +890,38 @@ nested timeouts (e.g. the dead-connection probe) also expire."
       (should (equal '(110) (tramp-rpc-connection-pending-ids connection)))
       (should (equal '(:id 110 :result live) (gethash 110 pending)))
       (should (= 1 (hash-table-count pending))))))
+
+(ert-deftest tramp-rpc-mock-test-request-batch-pins-all-chunks ()
+  "A reconnect between chunks cannot move the rest of a batch to a new server."
+  (let ((vec (tramp-rpc-mock-test-request--vec))
+        (tramp-rpc--batch-max-entries 2)
+        (requests '(("a") ("b") ("c")))
+        (generation 'original)
+        (ensures 0)
+        connections)
+    (cl-letf (((symbol-function 'tramp-rpc--ensure-connection)
+               (lambda (_vec) (cl-incf ensures) generation))
+              ((symbol-function 'tramp-rpc--call)
+               (lambda (_vec method params &optional connection)
+                 (should (equal method "batch"))
+                 (push connection connections)
+                 (setq generation 'replacement)
+                 `((results . ,(mapcar (lambda (entry)
+                                        `((result . ,(alist-get 'method entry))))
+                                      (append (alist-get 'requests params) nil)))))))
+      (should (equal (tramp-rpc--call-batch vec requests) '("a" "b" "c"))))
+    (should (= ensures 1))
+    (should (equal connections '(original original)))))
+
+(ert-deftest tramp-rpc-mock-test-request-batch-rejects-short-results ()
+  "Missing batch results are protocol failures, not successful nil values."
+  (cl-letf (((symbol-function 'tramp-rpc--call)
+             (lambda (&rest _) '((results . (((result . nil))))))))
+    (should-error (tramp-rpc--call-batch-1
+                   (tramp-rpc-mock-test-request--vec) '(("a") ("b")))
+                  :type 'remote-file-error)
+    (should (equal (tramp-rpc--call-batch-1
+                    (tramp-rpc-mock-test-request--vec) '(("a")))
+                   '(nil)))))
 
 ;;; tramp-rpc-request-tests.el ends here

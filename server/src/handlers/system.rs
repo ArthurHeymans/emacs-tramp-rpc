@@ -24,6 +24,7 @@ pub(super) async fn system_info() -> HandlerResult {
         "arch" => std::env::consts::ARCH,
         "watcher" => watcher_kind(),
         "watcher_available" => Value::Boolean(crate::watcher::is_active()),
+        "watch_remove_nofollow" => Value::Boolean(true),
         "max_read_chunk_bytes" => io::MAX_FILE_READ_CHUNK_BYTES as u64,
         "hostname" => hostname(),
         "uid" => getuid().as_raw(),
@@ -64,35 +65,6 @@ pub(super) fn hostname() -> String {
         .and_then(|name| name.into_string().ok())
         .unwrap_or_else(|| "unknown".to_string())
 }
-/// Get environment variable
-pub(super) fn system_getenv(params: Value) -> HandlerResult {
-    #[derive(serde::Deserialize)]
-    struct Params {
-        name: String,
-    }
-
-    let params: Params = from_value(params).map_err(|e| RpcError::invalid_params(e.to_string()))?;
-
-    Ok(std::env::var(&params.name).ok().into_value())
-}
-
-/// Expand path with tilde and environment variables
-pub(super) async fn system_expand_path(params: Value) -> HandlerResult {
-    #[derive(serde::Deserialize)]
-    struct Params {
-        path: String,
-    }
-
-    let params: Params = from_value(params).map_err(|e| RpcError::invalid_params(e.to_string()))?;
-
-    // `~user` expansion consults the passwd database, which can block on
-    // slow NSS backends; keep it off the Tokio workers.
-    let expanded = tokio::task::spawn_blocking(move || expand_tilde(&params.path))
-        .await
-        .map_err(|e| RpcError::internal_error(format!("Task join error: {e}")))?;
-    Ok(expanded.into_value())
-}
-
 /// Get filesystem information (like df)
 pub(super) async fn system_statvfs(params: Value) -> HandlerResult {
     #[derive(serde::Deserialize)]

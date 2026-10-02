@@ -102,7 +102,7 @@ async fn test_split_notification_frames_are_streamed_in_order() {
                 .len(),
         );
     let (write, mut read) = tokio::io::duplex(4096);
-    let writer = Arc::new(tokio::sync::Mutex::new(write));
+    let writer = Arc::new(crate::output::FrameWriter::new(write));
     send_notification_with_limit(&writer, &events, limit)
         .await
         .unwrap();
@@ -220,6 +220,72 @@ fn test_nofollow_symlink_watch_reports_link_attribute_change() {
     }
 
     assert!(found, "symlink metadata changes should be reported");
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn test_unwatch_removes_nofollow_and_regular_registrations() {
+    let manager = test_manager();
+    if lock_or_recover(&manager.symlink_watcher).is_none() {
+        return;
+    }
+    let temp = tempfile::tempdir().unwrap();
+    let target = temp.path().join("target");
+    let link = temp.path().join("link");
+    fs::create_dir(&target).unwrap();
+    std::os::unix::fs::symlink(&target, &link).unwrap();
+
+    manager
+        .watch_with_options(&link, false, true)
+        .expect("nofollow watch");
+    manager
+        .watch_with_options(&link, false, false)
+        .expect("regular watch");
+    assert!(!manager.list().is_empty());
+
+    // A single watch.remove must drop both registrations; returning after the
+    // nofollow one would leave the regular watch alive forever.
+    manager.unwatch(&link).expect("unwatch both registrations");
+    assert!(manager.list().is_empty());
+    assert!(
+        !lock_or_recover(&manager.symlink_watcher)
+            .as_mut()
+            .expect("symlink watcher")
+            .contains(&link),
+        "nofollow registration must be removed as well"
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn test_precise_unwatch_preserves_the_other_backend() {
+    let manager = test_manager();
+    let temp = tempfile::tempdir().unwrap();
+    let target = temp.path().join("target");
+    let link = temp.path().join("link");
+    fs::create_dir(&target).unwrap();
+    std::os::unix::fs::symlink(&target, &link).unwrap();
+    manager.watch_with_options(&link, false, true).unwrap();
+    manager.watch(&target, true).unwrap();
+
+    manager.unwatch_with_options(&link, Some(false)).unwrap();
+    assert!(manager.list().is_empty());
+    assert!(
+        lock_or_recover(&manager.symlink_watcher)
+            .as_mut()
+            .unwrap()
+            .contains(&link)
+    );
+
+    manager.watch(&target, true).unwrap();
+    manager.unwatch_with_options(&link, Some(true)).unwrap();
+    assert_eq!(manager.list(), vec![(target.canonicalize().unwrap(), true)]);
+    assert!(
+        !lock_or_recover(&manager.symlink_watcher)
+            .as_mut()
+            .unwrap()
+            .contains(&link)
+    );
 }
 
 #[cfg(target_os = "linux")]

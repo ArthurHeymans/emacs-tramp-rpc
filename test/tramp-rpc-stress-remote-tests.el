@@ -1,4 +1,4 @@
-;;; tramp-rpc-stress-remote-tests.el --- SSH stress tests for the subscriber model -*- lexical-binding: t -*-
+;;; tramp-rpc-stress-remote-tests.el --- SSH stress tests for pushed process output -*- lexical-binding: t -*-
 
 ;; Copyright (C) 2026 Arthur Heymans <arthur@aheymans.xyz>
 
@@ -8,12 +8,12 @@
 
 ;;; Commentary:
 
-;; Stress tests for the process subscriber model exercised over a real SSH
+;; Stress tests for pushed process output exercised over a real SSH
 ;; connection via the TRAMP-RPC backend.  Unlike `tramp-rpc-stress-tests.el',
 ;; which talks to a locally-spawned server binary over a pipe, these tests go
 ;; through a genuine SSH tunnel to a remote host.
 ;;
-;; Tests are designed to expose real failure modes of the subscriber model:
+;; Tests are designed to expose real failure modes of pushed output:
 ;;
 ;;   * Dropped output notifications under high concurrency.
 ;;   * Output arriving after process.exit notification (output-after-exit race).
@@ -152,7 +152,7 @@ Returns a plist :finished and :hung."
 
 (ert-deftest tramp-rpc-stress-remote-test-output-verified-concurrent ()
   "100 concurrent processes: verify each filter receives exactly its unique token.
-A broken subscriber model will drop output notifications or deliver them to
+A broken push implementation will drop output notifications or deliver them to
 the wrong process.  Exit-status-only checks would miss both failure modes."
   :tags '(:stress :process)
   (skip-unless (tramp-rpc-stress-remote-test--enabled))
@@ -208,7 +208,7 @@ the wrong process.  Exit-status-only checks would miss both failure modes."
 
 (ert-deftest tramp-rpc-stress-remote-test-output-after-exit-race ()
   "50 processes produce 2 KB then exit immediately: all bytes must arrive.
-This is the primary race in the subscriber model: the server emits
+This is the primary race of pushed output: the server emits
 process.output then process.exit in rapid succession.  A broken
 implementation loses the output notification when the exit notification
 is processed first, or drains output only up to the point of exit."
@@ -317,8 +317,8 @@ truncate streams; a correct push implementation delivers every byte."
 
 (ert-deftest tramp-rpc-stress-remote-test-rapid-short-lived ()
   "200 `true' processes: none must hang.
-Verifies cleanup path under high churn — the subscriber task must stop
-cleanly for every process even when exit happens before subscribe fires."
+Verifies cleanup path under high churn: the push task must stop cleanly
+for every process even when it exits before its relay is registered."
   :tags '(:stress :process)
   (skip-unless (tramp-rpc-stress-remote-test--enabled))
   (let* ((default-directory (tramp-rpc-stress-remote-test--remote-dir))
@@ -447,7 +447,7 @@ deliver 40 simultaneous exit notifications and checks every sentinel fires."
 
 (ert-deftest tramp-rpc-stress-remote-test-mixed-workload ()
   "Mixed concurrent load: fast-exit, large-output, stdin-cat, all simultaneous.
-Tests the subscriber model under a heterogeneous notification stream.
+Tests pushed output under a heterogeneous notification stream.
 A broken implementation typically fails one class while handling others."
   :tags '(:stress :process)
   (skip-unless (tramp-rpc-stress-remote-test--enabled))
@@ -548,7 +548,7 @@ A broken implementation typically fails one class while handling others."
 
 (ert-deftest tramp-rpc-stress-remote-test-kill-while-output-flows ()
   "Kill half of 30 active streaming processes mid-stream; survivors must complete.
-Verifies that killing a subscribed process does not corrupt the notification
+Verifies that killing a running process does not corrupt the notification
 stream for other processes sharing the same connection."
   :tags '(:stress :process)
   (skip-unless (tramp-rpc-stress-remote-test--enabled))

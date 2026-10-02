@@ -168,42 +168,21 @@ Value is a cons cell (CHECKED . RESULT).")
 
 (defun tramp-rpc-test--run-with-call-count (thunk)
   "Run THUNK and return (RESULT . RPC-CALL-COUNT)."
-  (let ((count 0)
-        result
-        (orig-call-with-timeout (symbol-function 'tramp-rpc--call-with-timeout))
-        (orig-call-batch (symbol-function 'tramp-rpc--call-batch))
-        (orig-call-async (symbol-function 'tramp-rpc--call-async))
-        (orig-send-requests (symbol-function 'tramp-rpc--send-requests)))
-    (tramp-rpc-test--clear-call-count-caches)
-    (cl-letf (((symbol-function 'tramp-rpc--call-with-timeout)
-               (lambda (vec method params total-timeout poll-interval &optional connection)
-                 (cl-incf count)
-                 (funcall orig-call-with-timeout
-                          vec method params total-timeout poll-interval connection)))
-              ((symbol-function 'tramp-rpc--call-batch)
-               (lambda (vec requests)
-                 (cl-incf count)
-                 (funcall orig-call-batch vec requests)))
-              ((symbol-function 'tramp-rpc--call-async)
-               (lambda (vec method params callback &optional connection)
-                 (cl-incf count)
-                 (funcall orig-call-async vec method params callback connection)))
-              ((symbol-function 'tramp-rpc--send-requests)
-               (lambda (vec requests &optional connection)
-                 (cl-incf count (length requests))
-                 (funcall orig-send-requests vec requests connection))))
-      (setq result (funcall thunk))
-      (cons result count))))
+  (let* ((measurement (tramp-rpc-test--run-with-call-count-capturing-error thunk))
+         (error (plist-get measurement :error)))
+    (if error
+        (signal (car error) (cdr error))
+      (cons (plist-get measurement :result) (plist-get measurement :count)))))
 
 (defun tramp-rpc-test--run-with-call-count-capturing-error (thunk)
   "Run THUNK and return a plist with :result, :error, and :count.
 Unlike `tramp-rpc-test--run-with-call-count', this preserves the call count
-when THUNK signals so tests can assert error-path roundtrips."
+when THUNK signals so tests can assert error-path roundtrips.
+Batches pass through the ordinary call path, so do not count their wrapper."
   (let ((count 0)
         result
         error
         (orig-call-with-timeout (symbol-function 'tramp-rpc--call-with-timeout))
-        (orig-call-batch (symbol-function 'tramp-rpc--call-batch))
         (orig-call-async (symbol-function 'tramp-rpc--call-async))
         (orig-send-requests (symbol-function 'tramp-rpc--send-requests)))
     (tramp-rpc-test--clear-call-count-caches)
@@ -212,10 +191,6 @@ when THUNK signals so tests can assert error-path roundtrips."
                  (cl-incf count)
                  (funcall orig-call-with-timeout
                           vec method params total-timeout poll-interval connection)))
-              ((symbol-function 'tramp-rpc--call-batch)
-               (lambda (vec requests)
-                 (cl-incf count)
-                 (funcall orig-call-batch vec requests)))
               ((symbol-function 'tramp-rpc--call-async)
                (lambda (vec method params callback &optional connection)
                  (cl-incf count)
@@ -259,17 +234,27 @@ Returns BODY's result."
 (ert-deftest tramp-rpc-test-call-count-wrappers-accept-connection ()
   "Call-count wrappers preserve the captured connection argument."
   (let ((connection '(:process test-connection)))
-    (cl-letf (((symbol-function 'tramp-rpc--call-with-timeout)
-               (lambda (_vec method _params _timeout _poll-interval &optional passed-connection)
+    (cl-letf (((symbol-function 'tramp-rpc--ensure-connection)
+               (lambda (_vec) connection))
+              ((symbol-function 'tramp-rpc--call-with-timeout)
+               (lambda (_vec method params _timeout _poll-interval &optional passed-connection)
                  (should (eq passed-connection connection))
-                 (if (equal method "error")
-                     (signal 'file-missing '("missing"))
-                   'ok))))
+                 (cond
+                  ((equal method "error") (signal 'file-missing '("missing")))
+                  ((equal method "batch")
+                   `((results . ,(make-vector (length (alist-get 'requests params))
+                                             '((result . ok))))))
+                  (t 'ok)))))
       (should (eq (tramp-rpc-test--with-call-count 1
                     (tramp-rpc--call 'vec "ok" nil connection))
                   'ok))
       (tramp-rpc-test--with-call-count-error 1 file-missing
-        (tramp-rpc--call 'vec "error" nil connection)))))
+        (tramp-rpc--call 'vec "error" nil connection))
+      (should (equal (tramp-rpc-test--with-call-count 1
+                       (tramp-rpc--call-batch-1 'vec '(("ok")) connection))
+                     '(ok)))
+      (should (= 65 (length (tramp-rpc-test--with-call-count 2
+                             (tramp-rpc--call-batch 'vec (make-list 65 '("ok"))))))))))
 
 (defun tramp-rpc-test--make-remote-path (filename)
   "Make a full TRAMP RPC path for FILENAME."
@@ -314,6 +299,25 @@ Returns non-nil if tests can run."
                              (file-writable-p dir))))
                   (error nil)))))
   (cdr tramp-rpc-test-enabled-checked))
+
+(defun tramp-rpc-test--run-guarded (selector)
+  "Run SELECTOR with ERT, failing when it selects or executes nothing.
+This suite skips most tests when the remote host is unreachable, and ERT
+reports skips as expected results, so a bare batch run would exit 0 after
+exercising almost nothing."
+  (let* ((tests (ert-select-tests selector t))
+         (selected (length tests)))
+    (unless (> selected 0)
+      (error "ERT selector %S selected zero tests" selector))
+    (let* ((stats (ert-run-tests-batch selector))
+           (skipped (ert-stats-skipped stats))
+           (executed (- (ert-stats-completed stats) skipped)))
+      (message "ERT counts: selected=%d executed=%d skipped=%d"
+               selected executed skipped)
+      (when (= executed 0)
+        (error "ERT selector %S executed zero tests (all %d selected tests skipped)"
+               selector skipped))
+      (kill-emacs (if (> (ert-stats-completed-unexpected stats) 0) 1 0)))))
 
 (defun tramp-rpc-test--make-remote-path-2 (filename)
   "Make a full TRAMP RPC path on the second host for FILENAME."
@@ -1948,13 +1952,18 @@ This matches the upstream `tramp-test28-process-file' test."
 
 (ert-deftest tramp-rpc-test13c-make-process-coding-pair ()
   "Test `make-process' handler accepts same-sided cons pair :coding values."
-  (let ((default-directory "/rpc:mock:/tmp/")
-        (default-process-coding-system '(utf-8-unix . utf-8-unix))
-        proc)
-    (cl-letf (((symbol-function 'tramp-rpc--start-remote-process)
+  (let* ((default-directory "/rpc:mock:/tmp/")
+         (default-process-coding-system '(utf-8-unix . utf-8-unix))
+         (transport (make-pipe-process :name "coding-pair-transport" :noquery t))
+         (connection (tramp-rpc--make-connection :process transport))
+         (tramp-rpc--async-processes (make-hash-table :test 'eq))
+         proc)
+    (cl-letf (((symbol-function 'tramp-rpc--ensure-connection)
+               (lambda (_vec) connection))
+              ((symbol-function 'tramp-rpc--get-connection)
+               (lambda (_vec) connection))
+              ((symbol-function 'tramp-rpc--start-remote-process)
                (lambda (&rest _args) 12345))
-              ((symbol-function 'tramp-rpc--start-async-read)
-               (lambda (&rest _args) nil))
               ((symbol-function 'tramp-rpc--kill-remote-process)
                (lambda (&rest _args) nil))
               ((symbol-function 'tramp-rpc--remote-path-environment)
@@ -1979,7 +1988,8 @@ This matches the upstream `tramp-test28-process-file' test."
             (should (equal (process-coding-system proc)
                            '(utf-8-unix . utf-8-unix))))
         (when (processp proc)
-          (ignore-errors (delete-process proc)))))))
+          (ignore-errors (delete-process proc)))
+        (delete-process transport)))))
 
 (ert-deftest tramp-rpc-test13d-coding-byte-boundary ()
   "Process coding applies exactly once across the local relay."
@@ -2179,6 +2189,28 @@ This matches the upstream `tramp-test28-process-file' test."
           (should (string-match-p "test-input" output)))
       (ignore-errors (delete-process proc)))))
 
+
+(ert-deftest tramp-rpc-test14-make-process-signal-status ()
+  "A remote process killed by a signal reports it like a local process."
+  :tags '(:process)
+  (skip-unless (tramp-rpc-test-enabled))
+  (let* ((default-directory (tramp-rpc-test--remote-directory))
+         (events nil)
+         (proc (make-process
+                :name "test-signal-status"
+                :command '("sh" "-c" "kill -TERM $$")
+                :connection-type 'pipe
+                :file-handler t
+                :sentinel (lambda (_proc event) (push event events)))))
+    (unwind-protect
+        (progn
+          (with-timeout (10 (error "Process timeout"))
+            (while (or (process-live-p proc) (null events))
+              (accept-process-output nil 0.05)))
+          (should (eq (process-status proc) 'signal))
+          (should (= (process-exit-status proc) 15))
+          (should (equal events '("terminated\n"))))
+      (ignore-errors (delete-process proc)))))
 
 (ert-deftest tramp-rpc-test14-python-shell-make-comint ()
   "Test `python-shell-make-comint' on an existing TRAMP RPC connection."
