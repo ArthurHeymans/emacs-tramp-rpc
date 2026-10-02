@@ -8049,6 +8049,27 @@ discard it for being unreadable."
     (should (equal body-env
                    '("TERM=dumb" "PYTHONUNBUFFERED=1" "EXISTING=yes")))))
 
+(ert-deftest tramp-rpc-mock-test-interrupt-process-signals-remote-process ()
+  "`interrupt-process' sends SIGINT remotely and leaves the relay running."
+  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
+  (let ((process (start-process "tramp-rpc-interrupt-relay" nil "cat"))
+        (other (start-process "tramp-rpc-interrupt-local" nil "cat"))
+        captured)
+    (unwind-protect
+        (cl-letf (((symbol-function 'tramp-rpc--kill-remote-process)
+                   (lambda (_vec pid signal &optional _connection)
+                     (push (list pid signal) captured))))
+          (process-put process :tramp-rpc-vec
+                       (tramp-dissect-file-name "/rpc:host:/"))
+          (process-put process :tramp-rpc-pid 4242)
+          (should (tramp-rpc-handle-interrupt-process process))
+          (should (equal captured '((4242 2))))
+          (should (process-live-p process))
+          ;; Other processes are left to the next interrupt function.
+          (should-not (tramp-rpc-handle-interrupt-process other)))
+      (dolist (proc (list process other))
+        (when (process-live-p proc) (delete-process proc))))))
+
 (ert-deftest tramp-rpc-mock-test-signal-process-routes-remote-pid ()
   "Remote PID signals use RPC and relays retain their owning connection."
   (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
