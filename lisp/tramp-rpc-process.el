@@ -584,20 +584,48 @@ STDERR-BUFFER is the separate stderr buffer, or nil to mix with stdout."
            local-process)
          stderr)))))
 
+(defun tramp-rpc--take-pending (local-process table key)
+  "Remove and return the first item of LOCAL-PROCESS's KEY queue in TABLE.
+The :pending-exit slot holds a single item rather than a list."
+  (when-let* ((info (gethash local-process table))
+              (pending (plist-get info key)))
+    (puthash local-process
+             (plist-put info key (and (eq key :pending-output) (cdr pending)))
+             table)
+    (if (eq key :pending-output) (car pending) pending)))
+
+(defun tramp-rpc--deliver-pending (local-process table deliver finish)
+  "Deliver LOCAL-PROCESS's queued output from TABLE in order, then its exit.
+DELIVER is called with each queued output chunk and FINISH with the queued
+exit.  Writing a chunk to a full relay pipe lets Emacs run timers and
+filters, which can queue newer chunks and call this again for the same
+process.  Only the outermost call delivers: it takes one chunk at a time,
+so newer chunks still follow older ones, and the exit, which closes the
+relay, waits until every chunk is written."
+  (when-let* ((info (gethash local-process table))
+              ((not (plist-get info :delivering))))
+    (puthash local-process (plist-put info :delivering t) table)
+    (unwind-protect
+        (let (item)
+          (while (setq item (tramp-rpc--take-pending
+                             local-process table :pending-output))
+            (funcall deliver item))
+          (when (setq item (tramp-rpc--take-pending
+                            local-process table :pending-exit))
+            (funcall finish item)))
+      (when-let* ((info (gethash local-process table)))
+        (puthash local-process (plist-put info :delivering nil) table)))))
+
 (defun tramp-rpc--deliver-pending-process-output (local-process)
   "Deliver queued output and then any exit for LOCAL-PROCESS."
-  (when-let* ((info (gethash local-process tramp-rpc--async-processes)))
-    (let ((pending (plist-get info :pending-output))
-          (pending-exit (plist-get info :pending-exit)))
-      (setq info (plist-put info :pending-output nil))
-      (setq info (plist-put info :pending-exit nil))
-      (puthash local-process info tramp-rpc--async-processes)
-      (dolist (chunk pending)
-        (apply #'tramp-rpc--deliver-process-output local-process chunk))
-      (when pending-exit
-        (accept-process-output local-process 0.01 nil t)
-        (apply #'tramp-rpc--handle-process-exit local-process
-               (cdr pending-exit))))))
+  (tramp-rpc--deliver-pending
+   local-process tramp-rpc--async-processes
+   (lambda (chunk)
+     (apply #'tramp-rpc--deliver-process-output local-process chunk))
+   (lambda (pending-exit)
+     (accept-process-output local-process 0.01 nil t)
+     (apply #'tramp-rpc--handle-process-exit local-process
+            (cdr pending-exit)))))
 
 (defun tramp-rpc--queue-process-output (local-process stdout stderr stderr-buffer)
   "Queue one non-exit output chunk and schedule its exact delivery once.
@@ -1341,17 +1369,13 @@ Returns (COLS . ROWS)."
 
 (defun tramp-rpc--deliver-pending-pty-output (local-process)
   "Deliver queued PTY bytes and then any exit for LOCAL-PROCESS."
-  (when-let* ((info (gethash local-process tramp-rpc--pty-processes)))
-    (let ((pending (plist-get info :pending-output))
-          (pending-exit (plist-get info :pending-exit)))
-      (setq info (plist-put info :pending-output nil))
-      (setq info (plist-put info :pending-exit nil))
-      (puthash local-process info tramp-rpc--pty-processes)
-      (dolist (output pending)
-        (when (and output (process-live-p local-process))
-          (tramp-rpc--send-local-relay-string local-process output)))
-      (when pending-exit
-        (apply #'tramp-rpc--handle-pty-exit local-process (cdr pending-exit))))))
+  (tramp-rpc--deliver-pending
+   local-process tramp-rpc--pty-processes
+   (lambda (output)
+     (when (process-live-p local-process)
+       (tramp-rpc--send-local-relay-string local-process output)))
+   (lambda (pending-exit)
+     (apply #'tramp-rpc--handle-pty-exit local-process (cdr pending-exit)))))
 
 (defun tramp-rpc--queue-pty-delivery
     (local-process &optional output exit-code exit-p exit-signal)
