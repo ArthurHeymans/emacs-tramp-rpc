@@ -317,9 +317,22 @@ Returns the remote process PID."
                                  connection)))
     (alist-get 'pid result)))
 
+(defun tramp-rpc--forget-write-queue (local-process info)
+  "Remove the write queue of relay LOCAL-PROCESS with tracking INFO."
+  (when-let* ((pid (plist-get info :pid))
+              (vec (plist-get info :vec)))
+    (remhash (or (process-get local-process :tramp-rpc-write-queue-key)
+                 (tramp-rpc--process-write-queue-key
+                  vec pid (plist-get info :connection-process)))
+             tramp-rpc--process-write-queues)))
+
 (defun tramp-rpc--write-remote-process (vec pid data &optional owner-process)
   "Write DATA to stdin of remote process PID on VEC.
-The queue remains bound to OWNER-PROCESS's original connection generation."
+The queue remains bound to OWNER-PROCESS's original connection generation.
+Like for a local process, writing after OWNER-PROCESS has died is an error;
+its queue is gone and must not be created again."
+  (when (and (processp owner-process) (not (process-live-p owner-process)))
+    (error "Process %s not running" (process-name owner-process)))
   (let* ((queue-key (tramp-rpc--process-write-queue-key-for-owner
                      vec pid owner-process))
          (queue (gethash queue-key tramp-rpc--process-write-queues))
@@ -452,12 +465,9 @@ PID is the remote process ID."
                          (and (processp owner-process)
                               (process-get owner-process :tramp-rpc-connection))
                          (tramp-rpc--ensure-connection vec))))
+    ;; The drain reports a replaced connection itself.  Do not store QUEUE
+    ;; again: cleanup may have removed it while the drain waited.
     (tramp-rpc--drain-write-queue vec pid owner-process)
-    (when (and queue (not (tramp-rpc--process-write-queue-current-p queue)))
-      (setq queue (tramp-rpc--process-write-queue-fail
-                   queue :connection-replaced))
-      (puthash queue-key queue tramp-rpc--process-write-queues)
-      (tramp-rpc--signal-process-write-failure queue))
     (unless (eq (tramp-rpc-connection-process connection)
                 (tramp-rpc--connection-transport (tramp-rpc--get-connection vec)))
       (tramp-rpc--signal-process-write-failure
@@ -647,6 +657,9 @@ EVENT is the process event string."
            (pid (plist-get info :pid))
            (connection (plist-get info :connection-process)))
       (tramp-rpc--cancel-process-timers tramp-rpc--async-processes proc)
+      ;; A relay killed or deleted locally never sees the remote exit,
+      ;; which otherwise removes the queue.
+      (tramp-rpc--forget-write-queue proc info)
       (let ((kill-remote
              (not (or (process-get proc :tramp-rpc-exited)
                       (process-get proc :tramp-rpc-remote-exited)
@@ -699,13 +712,7 @@ number, if any."
   (let ((info (gethash local-process tramp-rpc--async-processes)))
     (when info
       (tramp-rpc--cancel-process-timers tramp-rpc--async-processes local-process)
-      ;; Clean up only this connection's write queue for this process.
-      (when-let* ((pid (plist-get info :pid))
-                   (vec (plist-get info :vec)))
-        (remhash (or (process-get local-process :tramp-rpc-write-queue-key)
-                     (tramp-rpc--process-write-queue-key
-                      vec pid (plist-get info :connection-process)))
-                 tramp-rpc--process-write-queues))
+      (tramp-rpc--forget-write-queue local-process info)
       (process-put local-process :tramp-rpc-exit-code (or exit-code 0))
       (process-put local-process :tramp-rpc-exit-signal
                    (and (natnump exit-signal) exit-signal))
