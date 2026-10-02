@@ -577,17 +577,20 @@ async fn remove_path_for_overwrite(path: &Path) -> std::io::Result<()> {
 /// Link non-directories exclusively before removing the source.  If neither
 /// rename flags nor hard links are available, fail rather than letting a
 /// check-then-rename race overwrite a concurrently created destination.
+/// If source removal fails, retain the destination and report the error:
+/// rollback could delete the last link or a concurrently replaced destination.
 async fn rename_no_overwrite_fallback(src: &Path, dest: &Path) -> std::io::Result<()> {
+    rename_no_overwrite_fallback_with_remove(src, dest, fs::remove_file(src)).await
+}
+
+async fn rename_no_overwrite_fallback_with_remove(
+    src: &Path,
+    dest: &Path,
+    remove_source: impl std::future::Future<Output = std::io::Result<()>>,
+) -> std::io::Result<()> {
     if !fs::symlink_metadata(src).await.map(|meta| meta.is_dir())? {
         match fs::hard_link(src, dest).await {
-            Ok(()) => {
-                if let Err(error) = fs::remove_file(src).await {
-                    // Undo the new link, preserving the original removal error.
-                    let _ = fs::remove_file(dest).await;
-                    return Err(error);
-                }
-                return Ok(());
-            }
+            Ok(()) => return remove_source.await,
             Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
                 return Err(already_exists(dest));
             }
@@ -1005,7 +1008,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn rename_fallback_rolls_back_when_source_removal_fails() {
+    async fn rename_fallback_preserves_destination_when_source_removal_fails() {
         // Root can unlink in a read-only directory, so it cannot exercise this.
         if nix::unistd::geteuid().is_root() {
             return;
@@ -1029,7 +1032,53 @@ mod tests {
             std::io::ErrorKind::PermissionDenied
         );
         assert_eq!(fs::read(&src).await.unwrap(), b"source");
-        assert!(!fs::try_exists(&dest).await.unwrap());
+        assert_eq!(fs::read(&dest).await.unwrap(), b"source");
+    }
+
+    #[tokio::test]
+    async fn rename_fallback_preserves_last_link_after_concurrent_source_removal() {
+        let tmp = tempfile::tempdir().expect("create tempdir");
+        let src = tmp.path().join("src");
+        let dest = tmp.path().join("dest");
+        fs::write(&src, b"source").await.unwrap();
+
+        let error = rename_no_overwrite_fallback_with_remove(&src, &dest, async {
+            // The fallback already linked the destination.  Model another
+            // caller removing the source before our own unlink is attempted.
+            assert_eq!(
+                fs::metadata(&src).await?.ino(),
+                fs::metadata(&dest).await?.ino()
+            );
+            fs::remove_file(&src).await?;
+            fs::remove_file(&src).await
+        })
+        .await
+        .expect_err("the source disappeared before our unlink");
+
+        assert_eq!(error.kind(), std::io::ErrorKind::NotFound);
+        assert!(!fs::try_exists(&src).await.unwrap());
+        assert_eq!(fs::read(&dest).await.unwrap(), b"source");
+    }
+
+    #[tokio::test]
+    async fn rename_fallback_does_not_remove_concurrently_replaced_destination() {
+        let tmp = tempfile::tempdir().expect("create tempdir");
+        let src = tmp.path().join("src");
+        let dest = tmp.path().join("dest");
+        fs::write(&src, b"source").await.unwrap();
+
+        let error = rename_no_overwrite_fallback_with_remove(&src, &dest, async {
+            // Replace the just-created link before source removal fails.
+            fs::remove_file(&dest).await?;
+            fs::write(&dest, b"replacement").await?;
+            Err(std::io::Error::from_raw_os_error(libc::EACCES))
+        })
+        .await
+        .expect_err("source removal failed");
+
+        assert_eq!(error.raw_os_error(), Some(libc::EACCES));
+        assert_eq!(fs::read(&src).await.unwrap(), b"source");
+        assert_eq!(fs::read(&dest).await.unwrap(), b"replacement");
     }
 
     #[tokio::test]

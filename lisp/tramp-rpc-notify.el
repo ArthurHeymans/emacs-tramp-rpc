@@ -92,19 +92,23 @@ LOCALNAME is the local file name."
          (descriptor (make-pipe-process
                       :name name
                       :noquery t
-                      :sentinel #'tramp-rpc--file-notify-process-sentinel)))
-    ;; These two properties are the ones TRAMP's generic file-notify routing and
-    ;; validity helpers expect on watch descriptors.
-    (process-put descriptor 'tramp-vector vec)
-    (process-put descriptor 'tramp-watch-name localname)
-    ;; Match gio/smb-notify: tests can use the library name for broad behavior
-    ;; and this property for backend-specific expectations.
-    (tramp-set-connection-property
-     descriptor "file-monitor" (tramp-rpc--file-notify-monitor vec))
-    ;; RPC-private metadata lives in `tramp-rpc--file-notify-descriptors', but
-    ;; mark the process as ours for debugging and defensive cleanup.
-    (process-put descriptor 'tramp-rpc-file-notify t)
-    descriptor))
+                      :sentinel #'tramp-rpc--file-notify-process-sentinel))
+         initialized)
+    (unwind-protect
+        (progn
+          ;; These properties are used by TRAMP's generic file-notify routing
+          ;; and validity helpers.
+          (process-put descriptor 'tramp-vector vec)
+          (process-put descriptor 'tramp-watch-name localname)
+          ;; Match gio/smb-notify: expose the concrete remote backend.
+          (tramp-set-connection-property
+           descriptor "file-monitor" (tramp-rpc--file-notify-monitor vec))
+          ;; RPC-private metadata lives in the descriptor table.
+          (process-put descriptor 'tramp-rpc-file-notify t)
+          (setq initialized t)
+          descriptor)
+      (unless initialized
+        (tramp-rpc--delete-file-notify-descriptor-process descriptor)))))
 
 (defun tramp-rpc--delete-file-notify-descriptor-process (descriptor)
   "Delete DESCRIPTOR's synthetic process."
@@ -428,88 +432,88 @@ FLAGS controls the requested operation."
                (tramp-rpc--debug "symlink watch probe failed for %s: %s"
                                  directory (error-message-string err))
                nil)))
-           descriptor)
-      (if entry
-          (plist-put entry :count (1+ (plist-get entry :count)))
-        ;; Keep file-notify's non-recursive watches out of
-        ;; `tramp-rpc--watched-directories'.  That table is also used by Magit
-        ;; and cache invalidation, where a truthy entry means a recursive
-        ;; worktree/cache watch may already exist.
-        (let* ((synthetic nil)
-               (result (cond
-                        (symlink-watch
-                         (if (or preexisting
-                                 ;; Older servers remove both the symlink and
-                                 ;; target registrations.  Do not acquire a
-                                 ;; nofollow watch we cannot release safely.
-                                 (not (eq t (alist-get 'watch_remove_nofollow
-                                                      (tramp-rpc--system-info v)))))
-                             (progn
-                               (setq synthetic symlink-watch)
-                               nil)
-                           (condition-case err
-                               (tramp-rpc--call
-                                v "watch.add"
-                                `((path . ,localname)
-                                  (recursive . :msgpack-false)
-                                  (nofollow . t)))
-                             (error
-                              (setq synthetic symlink-watch)
-                              (tramp-rpc--debug
-                               "nofollow file-notify watch unsupported for %s: %s"
-                               directory (error-message-string err))
-                              nil))))
-                        (preexisting nil)
-                        (t
-                         (tramp-rpc--call v "watch.add"
-                                          `((path . ,localname)
-                                            (recursive . :msgpack-false))))))
-               (canonical-localname (and (listp result)
-                                         (alist-get 'path result)))
-               (canonical-directory (cond
-                                     ((and (stringp canonical-localname)
-                                           (tramp-tramp-file-p canonical-localname))
-                                      canonical-localname)
-                                     ((stringp canonical-localname)
-                                      (tramp-make-tramp-file-name
-                                       v canonical-localname))
-                                     ;; If the server watch preexisted, there
-                                     ;; is no `watch.add' response to learn its
-                                     ;; canonical spelling from.  Use TRAMP's
-                                     ;; truename path as a best-effort match key
-                                     ;; for symlinked watched directories.
-                                     (preexisting
-                                      (condition-case err
-                                          (file-truename directory)
-                                        (error
-                                         (tramp-rpc--debug
-                                          "watch truename probe failed for %s: %s"
-                                          directory
-                                          (error-message-string err))
-                                         nil))))))
-          (puthash watch-key
-                   (list :count 1
-                         :owned (and (not preexisting) (not synthetic))
-                         :synthetic synthetic
-                         :nofollow (and symlink-watch (not synthetic) t)
-                         :directory directory
-                         :canonical-directory canonical-directory
-                         :connection-process (tramp-rpc--connection-transport (tramp-rpc--get-connection v)))
-                   tramp-rpc--file-notify-watch-counts)))
-      ;; A failed registration must not leave a live, untracked descriptor.
-      (setq descriptor (tramp-rpc--make-file-notify-descriptor
+           ;; Finish local setup before acquiring or incrementing a watch.
+           (descriptor (tramp-rpc--make-file-notify-descriptor
                         v directory localname))
-      (let ((watch-entry (gethash watch-key tramp-rpc--file-notify-watch-counts)))
-        (puthash descriptor
-                 (list :directory directory
-                       :canonical-directory (plist-get watch-entry
-                                                       :canonical-directory)
-                       :flags flags
-                       :localname localname
-                       :watch-key watch-key
-                       :connection-process (tramp-rpc--connection-transport (tramp-rpc--get-connection v)))
-                 tramp-rpc--file-notify-descriptors))
-      descriptor)))
+           registered)
+      (unwind-protect
+          (progn
+            (if entry
+                (plist-put entry :count (1+ (plist-get entry :count)))
+              ;; Non-recursive file-notify watches must not mask the recursive
+              ;; watches used by Magit and cache invalidation.
+              (let* ((synthetic nil)
+                     (result
+                      (cond
+                       (symlink-watch
+                        (if (or preexisting
+                                ;; Do not acquire a nofollow watch we cannot
+                                ;; release without removing a target watch.
+                                (not (eq t (alist-get 'watch_remove_nofollow
+                                                     (tramp-rpc--system-info v)))))
+                            (progn
+                              (setq synthetic symlink-watch)
+                              nil)
+                          (condition-case err
+                              (tramp-rpc--call
+                               v "watch.add"
+                               `((path . ,localname)
+                                 (recursive . :msgpack-false)
+                                 (nofollow . t)))
+                            (error
+                             (setq synthetic symlink-watch)
+                             (tramp-rpc--debug
+                              "nofollow file-notify watch unsupported for %s: %s"
+                              directory (error-message-string err))
+                             nil))))
+                       (preexisting nil)
+                       (t
+                        (tramp-rpc--call v "watch.add"
+                                         `((path . ,localname)
+                                           (recursive . :msgpack-false))))))
+                     (canonical-localname (and (listp result)
+                                               (alist-get 'path result)))
+                     (canonical-directory
+                      (cond
+                       ((and (stringp canonical-localname)
+                             (tramp-tramp-file-p canonical-localname))
+                        canonical-localname)
+                       ((stringp canonical-localname)
+                        (tramp-make-tramp-file-name v canonical-localname))
+                       ;; Without a watch.add response, use TRAMP's truename
+                       ;; path as a best-effort canonical match key.
+                       (preexisting
+                        (condition-case err
+                            (file-truename directory)
+                          (error
+                           (tramp-rpc--debug
+                            "watch truename probe failed for %s: %s"
+                            directory (error-message-string err))
+                           nil))))))
+                (puthash watch-key
+                         (list :count 1
+                               :owned (and (not preexisting) (not synthetic))
+                               :synthetic synthetic
+                               :nofollow (and symlink-watch (not synthetic) t)
+                               :directory directory
+                               :canonical-directory canonical-directory
+                               :connection-process (tramp-rpc--connection-transport (tramp-rpc--get-connection v)))
+                         tramp-rpc--file-notify-watch-counts)))
+            (let ((watch-entry (gethash watch-key tramp-rpc--file-notify-watch-counts)))
+              (puthash descriptor
+                       (list :directory directory
+                             :canonical-directory (plist-get watch-entry
+                                                             :canonical-directory)
+                             :flags flags
+                             :localname localname
+                             :watch-key watch-key
+                             :connection-process (tramp-rpc--connection-transport (tramp-rpc--get-connection v)))
+                       tramp-rpc--file-notify-descriptors))
+            (setq registered t)
+            descriptor)
+        ;; Registration errors and quits must not leave an untracked process.
+        (unless registered
+          (tramp-rpc--delete-file-notify-descriptor-process descriptor))))))
 
 (defun tramp-rpc-handle-file-notify-rm-watch (descriptor)
   "Like `file-notify-rm-watch' for TRAMP-RPC watch DESCRIPTOR."

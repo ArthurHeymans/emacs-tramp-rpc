@@ -3761,7 +3761,7 @@ direct property test would miss it."
       (tramp-rpc--delete-file-notify-descriptor-process other-descriptor))))
 
 (ert-deftest tramp-rpc-mock-test-file-notify-failed-registration-does-not-leak ()
-  "A rejected server watch creates neither a descriptor nor watch state."
+  "A rejected server watch leaves neither a descriptor nor watch state."
   (let ((tramp-rpc--file-notify-descriptors (make-hash-table :test 'eq))
         (tramp-rpc--file-notify-watch-counts (make-hash-table :test 'equal))
         (tramp-rpc--watched-directories (make-hash-table :test 'equal))
@@ -3778,6 +3778,104 @@ direct property test would miss it."
            (tramp-rpc-handle-file-notify-add-watch
             "/rpc:mock:/missing/" '(change) #'ignore)
            :type 'remote-file-error)
+          (should-not (cl-set-difference (process-list) before))
+          (should (zerop (hash-table-count tramp-rpc--file-notify-descriptors)))
+          (should (zerop (hash-table-count tramp-rpc--file-notify-watch-counts))))
+      (dolist (process (cl-set-difference (process-list) before))
+        (tramp-rpc--delete-file-notify-descriptor-process process)))))
+
+(ert-deftest tramp-rpc-mock-test-file-notify-descriptor-creation-failure-keeps-counts ()
+  "Failed local setup neither acquires a watch nor increments a shared one."
+  (dolist (shared '(nil t))
+    (let* ((tramp-rpc--file-notify-descriptors (make-hash-table :test 'eq))
+           (tramp-rpc--file-notify-watch-counts (make-hash-table :test 'equal))
+           (tramp-rpc--watched-directories (make-hash-table :test 'equal))
+           (directory "/rpc:mock:/tmp/watch/")
+           (before (process-list))
+           calls descriptor)
+      (unwind-protect
+          (cl-letf (((symbol-function 'file-symlink-p) (lambda (_) nil))
+                    ((symbol-function 'tramp-rpc--system-info)
+                     (lambda (_) '((os . "linux"))))
+                    ((symbol-function 'tramp-rpc--call)
+                     (lambda (_vec method _params)
+                       (push method calls)
+                       '((path . "/tmp/watch/")))))
+            (when shared
+              (setq descriptor
+                    (tramp-rpc-handle-file-notify-add-watch
+                     directory '(change) #'ignore)))
+            (let ((counts (copy-tree (hash-table-values
+                                      tramp-rpc--file-notify-watch-counts)))
+                  (saved-calls (copy-sequence calls)))
+              (cl-letf (((symbol-function 'make-pipe-process)
+                         (lambda (&rest _) (error "Descriptor creation failed"))))
+                (should-error
+                 (tramp-rpc-handle-file-notify-add-watch
+                  directory '(change) #'ignore)))
+              (should (equal calls saved-calls))
+              (should (equal counts (hash-table-values
+                                     tramp-rpc--file-notify-watch-counts)))
+              (should (= (hash-table-count tramp-rpc--file-notify-descriptors)
+                         (if shared 1 0))))
+            (when descriptor
+              (tramp-rpc-handle-file-notify-rm-watch descriptor))
+            (should (zerop (hash-table-count tramp-rpc--file-notify-watch-counts)))
+            (should (equal (nreverse calls)
+                           (and shared '("watch.add" "watch.remove"))))
+            (should-not (cl-set-difference (process-list) before)))
+        (dolist (process (cl-set-difference (process-list) before))
+          (tramp-rpc--delete-file-notify-descriptor-process process))))))
+
+(ert-deftest tramp-rpc-mock-test-file-notify-descriptor-initialization-unwinds ()
+  "Errors and quits after process creation close the partial descriptor."
+  (dolist (failure '(error quit))
+    (let ((tramp-rpc--file-notify-descriptors (make-hash-table :test 'eq))
+          (tramp-rpc--file-notify-watch-counts (make-hash-table :test 'equal))
+          (tramp-rpc--watched-directories (make-hash-table :test 'equal))
+          (before (process-list)))
+      (unwind-protect
+          (cl-letf (((symbol-function 'file-symlink-p) (lambda (_) nil))
+                    ((symbol-function 'tramp-rpc--system-info)
+                     (lambda (_) '((os . "linux"))))
+                    ((symbol-function 'tramp-set-connection-property)
+                     (lambda (&rest _)
+                       (signal failure '("Descriptor initialization failed"))))
+                    ((symbol-function 'tramp-rpc--call)
+                     (lambda (&rest _)
+                       (ert-fail "Watch must not be acquired before local setup"))))
+            (should
+             (eq failure
+                 (condition-case err
+                     (tramp-rpc-handle-file-notify-add-watch
+                      "/rpc:mock:/tmp/watch/" '(change) #'ignore)
+                   ((error quit) (car err)))))
+            (should-not (cl-set-difference (process-list) before))
+            (should (zerop (hash-table-count tramp-rpc--file-notify-descriptors)))
+            (should (zerop (hash-table-count tramp-rpc--file-notify-watch-counts))))
+        (dolist (process (cl-set-difference (process-list) before))
+          (tramp-rpc--delete-file-notify-descriptor-process process))))))
+
+(ert-deftest tramp-rpc-mock-test-file-notify-registration-quit-closes-descriptor ()
+  "Quitting watch registration closes the provisional local descriptor."
+  (let ((tramp-rpc--file-notify-descriptors (make-hash-table :test 'eq))
+        (tramp-rpc--file-notify-watch-counts (make-hash-table :test 'equal))
+        (tramp-rpc--watched-directories (make-hash-table :test 'equal))
+        (before (process-list)))
+    (unwind-protect
+        (cl-letf (((symbol-function 'file-symlink-p) (lambda (_) nil))
+                  ((symbol-function 'tramp-rpc--system-info)
+                   (lambda (_) '((os . "linux"))))
+                  ((symbol-function 'tramp-rpc--call)
+                   (lambda (_vec method _params)
+                     (should (equal method "watch.add"))
+                     (signal 'quit nil))))
+          (should
+           (eq 'quit
+               (condition-case nil
+                   (tramp-rpc-handle-file-notify-add-watch
+                    "/rpc:mock:/tmp/watch/" '(change) #'ignore)
+                 (quit 'quit))))
           (should-not (cl-set-difference (process-list) before))
           (should (zerop (hash-table-count tramp-rpc--file-notify-descriptors)))
           (should (zerop (hash-table-count tramp-rpc--file-notify-watch-counts))))

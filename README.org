@@ -457,6 +457,15 @@ with automatic deployment enabled, replaces a mismatch through the verified
 staging-and-activation operation.  With automatic deployment disabled, a
 verified mismatch remains an explicit error.
 
+** File operation compatibility notes
+
+Non-overwriting renames use the filesystem's atomic no-replace operation,
+falling back to an exclusive hard link followed by source removal for
+non-directories.  If source removal fails, the error is reported and the
+destination is retained: deleting it could remove the last copy or a
+concurrently replaced file.  Filesystems without either operation fail
+explicitly rather than risk overwriting a concurrently created destination.
+
 ** Process compatibility notes
 
 - RPC PTYs disable kernel ~ECHO~, ~ECHONL~, and ~ONLCR~.  Emacs terminal
