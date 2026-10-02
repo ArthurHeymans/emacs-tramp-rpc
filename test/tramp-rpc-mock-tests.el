@@ -2490,49 +2490,24 @@ direct property test would miss it."
           (should (= calls 1)))
       (when (process-live-p process) (delete-process process)))))
 
-(ert-deftest tramp-rpc-mock-test-direct-pty-deferred-sentinel-preserves-replacement ()
-  "Deferred direct-PTY wrapping retains a caller replacement sentinel once."
-  (let* ((process (start-process "tramp-rpc-direct-pty-deferred" nil "cat"))
+(ert-deftest tramp-rpc-mock-test-direct-pty-replaced-sentinel-is-called-once ()
+  "A sentinel set after a direct PTY starts runs once and keeps tracking."
+  (let* ((process (start-process "tramp-rpc-direct-pty-replaced" nil "cat"))
          (tramp-rpc--pty-processes (make-hash-table :test 'eq))
-         (calls 0))
+         (calls 0)
+         (sentinel (lambda (_process _event) (cl-incf calls))))
     (unwind-protect
         (progn
-          (process-put process :tramp-rpc-user-sentinel #'ignore)
           (puthash process '(:direct-ssh t) tramp-rpc--pty-processes)
-          (set-process-sentinel process #'tramp-rpc--direct-ssh-pty-sentinel)
-          ;; Simulate a caller replacing the sentinel before the deferred
-          ;; installer runs at the end of `make-process' setup.
-          (set-process-sentinel process (lambda (_process _event) (cl-incf calls)))
-          (tramp-rpc--install-direct-ssh-pty-sentinel process)
+          (tramp-rpc--install-own-sentinel
+           process #'tramp-rpc--direct-ssh-pty-sentinel)
+          (tramp-rpc-handle-set-process-sentinel process sentinel)
+          (should (eq (tramp-rpc-handle-process-sentinel process) sentinel))
           (delete-process process)
           (tramp-rpc-mock-test--wait-for
            (lambda () (and (not (gethash process tramp-rpc--pty-processes))
                            (= calls 1)))
            "replacement direct PTY sentinel")
-          (should-not (gethash process tramp-rpc--pty-processes))
-          (should (= calls 1)))
-      (when (process-live-p process) (delete-process process)))))
-
-(ert-deftest tramp-rpc-mock-test-direct-pty-exits-before-deferred-installer ()
-  "A direct PTY that exits before sentinel installation releases tracking."
-  (let* ((process (start-process "tramp-rpc-direct-pty-early-exit" nil "cat"))
-         (tramp-rpc--pty-processes (make-hash-table :test 'eq))
-         (calls 0))
-    (unwind-protect
-        (progn
-          (puthash process '(:direct-ssh t) tramp-rpc--pty-processes)
-          ;; Simulate a caller replacing our sentinel before the timer runs.
-          (set-process-sentinel process (lambda (_process _event) (cl-incf calls)))
-          (delete-process process)
-          (let ((deadline (+ (float-time) 1.0)))
-            (while (and (< (float-time) deadline)
-                        (or (process-live-p process) (= calls 0)))
-              (accept-process-output nil 0.01)))
-          (ert-info ((format "process status: %S" (process-status process)))
-            (should-not (process-live-p process))
-            (should (= calls 1)))
-          (tramp-rpc--install-direct-ssh-pty-sentinel process)
-          (should-not (gethash process tramp-rpc--pty-processes))
           (should (= calls 1)))
       (when (process-live-p process) (delete-process process)))))
 
@@ -8511,67 +8486,21 @@ This matches tramp-sh and upstream `tramp-test28-process-file', which requires
         (when (processp proc)
           (delete-process proc))))))
 
-(ert-deftest tramp-rpc-mock-test-process-cleanup-handles-already-exited-relay ()
-  "Deferred cleanup must remove relays that exit before installation."
+(ert-deftest tramp-rpc-mock-test-pipe-relay-sentinel-deletes-exited-relay ()
+  "An exited pipe relay is untracked and no longer its buffer's process."
   (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
-  (let* ((buffer (generate-new-buffer " *tramp-rpc-cleanup-exited-test*"))
+  (let* ((buffer (generate-new-buffer " *tramp-rpc-relay-delete-test*"))
          (proc (let ((process-connection-type nil))
-                 (start-process "tramp-rpc-cleanup-exited-test" buffer "cat"))))
+                 (start-process "tramp-rpc-relay-delete-test" buffer "cat"))))
     (unwind-protect
         (progn
           (puthash proc '(:pid 4242) tramp-rpc--async-processes)
+          (process-put proc :tramp-rpc-exited t)
+          (tramp-rpc--install-own-sentinel proc #'tramp-rpc--pipe-relay-sentinel)
           (process-send-eof proc)
-          (while (process-live-p proc)
-            (accept-process-output proc 0.01 nil t))
-          (should (gethash proc tramp-rpc--async-processes))
-          (tramp-rpc--install-process-cleanup proc)
-          (accept-process-output nil 0.05)
-          (should-not (gethash proc tramp-rpc--async-processes))
-          (should-not (get-buffer-process buffer)))
-      (when (processp proc)
-        (ignore-errors (delete-process proc)))
-      (when (buffer-live-p buffer)
-        (kill-buffer buffer)))))
-
-;; Emacs can report a relay as dead before it has run the relay's sentinel.
-;; Simulate that window by reporting the live relay as exited.
-(ert-deftest tramp-rpc-mock-test-process-cleanup-before-exit-notification ()
-  "Cleanup installed before a pending exit notification still runs the sentinel."
-  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
-  (let* ((buffer (generate-new-buffer " *tramp-rpc-cleanup-pending-test*"))
-         (proc (let ((process-connection-type nil))
-                 (start-process "tramp-rpc-cleanup-pending-test" buffer "cat")))
-         (user-events nil)
-         (own (lambda (process event)
-                (tramp-rpc--pipe-process-sentinel
-                 process event (process-get process :tramp-rpc-user-sentinel)))))
-    (unwind-protect
-        (progn
-          (puthash proc '(:pid 4242) tramp-rpc--async-processes)
-          (process-put proc :tramp-rpc-user-sentinel
-                       (lambda (_process event) (push event user-events)))
-          (process-put proc :tramp-rpc-own-sentinel own)
-          (process-put proc :tramp-rpc-remote-exited t)
-          (process-put proc :tramp-rpc-exit-code 3)
-          (set-process-sentinel proc own)
-          (let ((real-live-p (symbol-function 'process-live-p))
-                (real-status (symbol-function 'process-status)))
-            (cl-letf (((symbol-function 'process-live-p)
-                       (lambda (process)
-                         (and (not (eq process proc))
-                              (funcall real-live-p process))))
-                      ((symbol-function 'process-status)
-                       (lambda (process)
-                         (if (eq process proc)
-                             'exit
-                           (funcall real-status process)))))
-              (tramp-rpc--install-process-cleanup proc)))
-          (should (equal user-events '("exited abnormally with code 3\n")))
-          (process-send-eof proc)
-          (while (process-live-p proc)
-            (accept-process-output proc 0.01 nil t))
-          (accept-process-output nil 0.05)
-          (should (equal user-events '("exited abnormally with code 3\n")))
+          (tramp-rpc-mock-test--wait-for
+           (lambda () (null (get-buffer-process buffer)))
+           "relay deletion")
           (should-not (gethash proc tramp-rpc--async-processes)))
       (when (processp proc)
         (ignore-errors (delete-process proc)))
@@ -8579,41 +8508,76 @@ This matches tramp-sh and upstream `tramp-test28-process-file', which requires
       (when (buffer-live-p buffer)
         (kill-buffer buffer)))))
 
-(ert-deftest tramp-rpc-mock-test-process-cleanup-does-not-count-stop-as-exit ()
+(ert-deftest tramp-rpc-mock-test-replaced-pipe-sentinel-gets-remote-exit ()
+  "A sentinel set after start gets the remote exit, not the relay's."
+  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
+  (let* ((proc (let ((process-connection-type nil))
+                 (start-process "tramp-rpc-replaced-sentinel-test" nil "cat")))
+         (events nil)
+         (sentinel (lambda (_process event) (push event events))))
+    (unwind-protect
+        (progn
+          (puthash proc '(:pid 4242) tramp-rpc--async-processes)
+          (tramp-rpc--install-own-sentinel proc #'tramp-rpc--pipe-relay-sentinel)
+          (tramp-rpc-handle-set-process-sentinel proc sentinel)
+          (should (eq (tramp-rpc-handle-process-sentinel proc) sentinel))
+          (process-put proc :tramp-rpc-remote-exited t)
+          (process-put proc :tramp-rpc-exit-code 3)
+          (process-send-eof proc)
+          (tramp-rpc-mock-test--wait-for (lambda () events) "user sentinel")
+          (should (equal events '("exited abnormally with code 3\n"))))
+      (when (processp proc)
+        (ignore-errors (delete-process proc)))
+      (remhash proc tramp-rpc--async-processes))))
+
+(ert-deftest tramp-rpc-mock-test-replaced-pipe-sentinel-relay-kill-kills-remote ()
+  "Killing a relay whose sentinel was replaced still kills the remote process."
+  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
+  (let* ((proc (let ((process-connection-type nil))
+                 (start-process "tramp-rpc-replaced-kill-test" nil "cat")))
+         (vec (tramp-dissect-file-name "/rpc:replaced-kill:/tmp/"))
+         (events nil)
+         (kills nil))
+    (unwind-protect
+        (cl-letf (((symbol-function 'tramp-rpc--kill-remote-process)
+                   (lambda (_vec pid signal &optional _connection)
+                     (push (list pid signal) kills))))
+          (puthash proc (list :vec vec :pid 4242) tramp-rpc--async-processes)
+          (tramp-rpc--install-own-sentinel proc #'tramp-rpc--pipe-relay-sentinel)
+          (tramp-rpc-handle-set-process-sentinel
+           proc (lambda (_process event) (push event events)))
+          (kill-process proc)
+          (tramp-rpc-mock-test--wait-for (lambda () events) "user sentinel")
+          (should (equal kills '((4242 9))))
+          (should (equal events '("killed\n"))))
+      (when (processp proc)
+        (ignore-errors (delete-process proc)))
+      (remhash proc tramp-rpc--async-processes))))
+
+(ert-deftest tramp-rpc-mock-test-pipe-relay-sentinel-does-not-count-stop-as-exit ()
   "A relay stop event must not consume its user's exit notification."
   (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
-  (let* ((buffer (generate-new-buffer " *tramp-rpc-cleanup-stop-test*"))
-         (proc (let ((process-connection-type nil))
-                 (start-process "tramp-rpc-cleanup-stop-test" buffer "cat")))
+  (let* ((proc (let ((process-connection-type nil))
+                 (start-process "tramp-rpc-relay-stop-test" nil "cat")))
          (user-events nil))
     (unwind-protect
         (progn
           (puthash proc '(:pid 4242) tramp-rpc--async-processes)
-          (set-process-sentinel
-           proc
-           (lambda (process event)
-             (tramp-rpc--pipe-process-sentinel
-              process event
-              (lambda (_process user-event)
-                (push user-event user-events)))))
-          (tramp-rpc--install-process-cleanup proc)
-          ;; Exercise the wrapper's non-terminal branch directly.  Emacs can
-          ;; report stop/continue events for subprocesses, but using job-control
-          ;; signals in batch tests is platform- and shell-dependent.
-          (funcall (process-sentinel proc) proc "stopped\n")
+          (process-put proc :tramp-rpc-user-sentinel
+                       (lambda (_process event) (push event user-events)))
+          (tramp-rpc--install-own-sentinel proc #'tramp-rpc--pipe-relay-sentinel)
+          ;; Emacs can report stop/continue events for subprocesses, but
+          ;; job-control signals in batch tests are platform-dependent.
+          (tramp-rpc--pipe-relay-sentinel proc "stopped\n")
           (should-not (process-get proc :tramp-rpc-user-sentinel-called))
           (process-put proc :tramp-rpc-exit-code 0)
           (process-put proc :tramp-rpc-exited t)
           (process-send-eof proc)
-          (while (process-live-p proc)
-            (accept-process-output proc 0.01 nil t))
-          (accept-process-output nil 0.01)
+          (tramp-rpc-mock-test--wait-for (lambda () user-events) "user sentinel")
           (should (equal user-events '("finished\n"))))
       (when (processp proc)
         (ignore-errors (delete-process proc)))
-      (remhash proc tramp-rpc--async-processes)
-      (when (buffer-live-p buffer)
-        (kill-buffer buffer)))))
+      (remhash proc tramp-rpc--async-processes))))
 
 (ert-deftest tramp-rpc-mock-test-sudo-via-rpc-pty-uses-rpc-backend ()
   "PTYs for sudo-via-RPC must not use direct SSH as the sudo target user."
