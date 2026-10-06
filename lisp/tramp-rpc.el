@@ -522,6 +522,51 @@ FILENAME is the file name being handled."
                 (cached cached)))
              (cached cached)))))))))
 
+(defun tramp-rpc-handle-file-accessible-directory-p (filename)
+  "Like `file-accessible-directory-p' for TRAMP-RPC files.
+Uses the tramp-rpc stat cache (TTL-based) directly instead of the TRAMP
+file-property cache, so that group or permission changes on a remote
+directory are reflected without a full cache flush.
+
+The TRAMP file-property cache has no TTL and is only cleared by explicit
+invalidation (e.g., via filesystem-watch events).  A `chgrp' on a directory
+sends IN_ATTRIB to a watch on the *parent* directory, not to a watch on the
+directory itself, so the parent must be watched too.  By going directly
+through the stat cache here we guarantee that the access decision is at most
+one stat-TTL stale, even without an active watch.
+FILENAME is the file name being checked."
+  (with-parsed-tramp-file-name (expand-file-name filename) nil
+    (or (tramp-string-empty-or-nil-p localname)
+        (string-equal localname "/")
+        (when (tramp-connectable-p filename)
+          ;; tramp-rpc--call-file-stat uses the TTL-based stat cache (not the
+          ;; TRAMP file-property cache), so stale "file-readable-p" entries
+          ;; from before a remote chgrp do not gate this check.
+          (when-let* ((stat (tramp-rpc--call-file-stat v localname))
+                      ((equal (alist-get 'type stat) "directory"))
+                      (attrs (tramp-rpc--convert-file-attributes stat 'integer))
+                      (mode (file-attribute-modes attrs))
+                      (remote-uid (tramp-get-remote-uid v 'integer))
+                      (remote-gid (tramp-get-remote-gid v 'integer)))
+            ;; Groups may legitimately be nil (no supplementary groups), so
+            ;; bind it with `let' rather than including it in `when-let*'.
+            (let ((groups (tramp-get-remote-groups v 'integer)))
+              ;; Mirror tramp-handle-file-accessible-directory-p: check ?r
+              ;; (read bit), which controls whether the directory can be listed.
+              (let ((offset 1))  ; offset 1 = read-permission column
+                (or
+                 ;; World readable.
+                 (eq ?r (aref mode (+ offset 6)))
+                 ;; Owner readable.
+                 (and (eq ?r (aref mode offset))
+                      (or (equal remote-uid tramp-root-id-integer)
+                          (equal remote-uid (file-attribute-user-id attrs))))
+                 ;; Group readable (primary or supplementary group).
+                 (and (eq ?r (aref mode (+ offset 3)))
+                      (or (equal remote-gid (file-attribute-group-id attrs))
+                          (member (file-attribute-group-id attrs)
+                                  groups)))))))))))
+
 (defun tramp-rpc-handle-file-readable-p (filename)
   "Like `file-readable-p' for TRAMP-RPC files.
 For cached-missing marker files, avoid delegating to TRAMP's generic handler,
@@ -556,22 +601,47 @@ FILENAME is the file name being handled."
   "Like `access-file' for TRAMP-RPC files.
 FILENAME is the file name being checked.
 STRING is prepended to any resulting error message."
-  (condition-case err
-      (tramp-handle-access-file filename string)
-    (file-error
-     (let* ((target (file-symlink-p filename))
-            (target-file
-             (and target
-                  (if (file-name-absolute-p target)
-                      (with-parsed-tramp-file-name filename nil
-                        (tramp-make-tramp-file-name v target))
-                    (expand-file-name target (file-name-directory filename))))))
-       (if (and target
-                (not (file-exists-p filename))
-                ;; Preserve symlink-cycle errors; only dangling links are missing.
-                (not (file-symlink-p target-file)))
-           (signal 'file-missing (cdr err))
-         (signal (car err) (cdr err)))))))
+  (with-parsed-tramp-file-name (expand-file-name filename) nil
+    ;; For directories, skip the client-side `file-accessible-directory-p'
+    ;; simulation that `tramp-handle-access-file' would run.  That simulation
+    ;; uses local mode-bit arithmetic and gives false negatives when the
+    ;; server's effective credentials differ from the visible mode bits (e.g.
+    ;; supplementary groups acquired after the server started, NFS effective
+    ;; GIDs, ACLs).  A genuine EACCES from `dir.list' surfaces the real error
+    ;; to the user with no loss of information.
+    (when (tramp-connectable-p filename)
+      (let ((stat (tramp-rpc--call-file-stat v localname)))
+        (cond
+         ;; File/directory exists and is a directory: declare it accessible
+         ;; without a permission pre-check.  Let the listing operation signal
+         ;; the OS error if the directory truly cannot be read.
+         ((and stat (equal (alist-get 'type stat) "directory"))
+          nil)
+         ;; Nonexistent path: raise file-missing immediately.
+         ((null stat)
+          (tramp-error v 'file-missing
+                       (format "%s: No such file or directory, %s"
+                               string filename)))
+         ;; Regular file or symlink: fall through to the generic handler,
+         ;; which checks file-readable-p.  The dangling-symlink conversion
+         ;; below converts file-error to file-missing for dangling links.
+         (t
+          (condition-case err
+              (tramp-handle-access-file filename string)
+            (file-error
+             (let* ((target (file-symlink-p filename))
+                    (target-file
+                     (and target
+                          (if (file-name-absolute-p target)
+                              (tramp-make-tramp-file-name v target)
+                            (expand-file-name
+                             target (file-name-directory filename))))))
+               (if (and target
+                        (not (file-exists-p filename))
+                        ;; Preserve symlink-cycle errors.
+                        (not (file-symlink-p target-file)))
+                   (signal 'file-missing (cdr err))
+                 (signal (car err) (cdr err))))))))))))
 
 
 (defun tramp-rpc-handle-file-truename (filename)
@@ -3116,7 +3186,7 @@ FLAGS controls the requested operation."
     (access-file . tramp-rpc-handle-access-file)
     (directory-file-name . tramp-handle-directory-file-name)
     (dired-uncache . tramp-handle-dired-uncache)
-    (file-accessible-directory-p . tramp-handle-file-accessible-directory-p)
+    (file-accessible-directory-p . tramp-rpc-handle-file-accessible-directory-p)
     (file-equal-p . tramp-handle-file-equal-p)
     (file-in-directory-p . tramp-handle-file-in-directory-p)
     (file-name-as-directory . tramp-handle-file-name-as-directory)

@@ -386,9 +386,13 @@ Otherwise clear all entries."
   "Cache of remote login shell keyed by connection-key.")
 
 (defconst tramp-rpc--generic-route-connection-properties
-  '("uname" "uid-integer" "uid-string" "gid-integer" "gid-string" "~")
+  '("uname" "uid-integer" "uid-string" "gid-integer" "gid-string"
+    "groups-integer" "groups-string" "~")
   "Generic TRAMP properties populated by tramp-rpc that depend on the route.
-Home-directory properties named ~USER are route-sensitive as well.")
+Home-directory properties named ~USER are route-sensitive as well.
+Supplementary group lists are included because they are fetched per-route
+via system.groups and must be invalidated together with uid/gid when the
+connection is cleaned up or caches are cleared.")
 
 (defconst tramp-rpc--owned-route-connection-properties
   '("tramp-rpc-login-path" "rpc-signal-strings"
