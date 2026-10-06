@@ -1721,7 +1721,7 @@ async fn cleanup_kills_pty_descendants_after_status_reaps_direct_child() {
     let temp = tempfile::tempdir().expect("temporary PTY marker directory");
     let marker = temp.path().join("pty-descendant-pid");
     let script = format!(
-        "import os,signal,time; pid=os.fork(); (open({marker:?},'w').write(str(pid)), os._exit(0)) if pid else (signal.signal(signal.SIGHUP, signal.SIG_IGN), signal.signal(signal.SIGTERM, signal.SIG_IGN), time.sleep(30))"
+        "import os,signal,time; signal.signal(signal.SIGHUP, signal.SIG_IGN); signal.signal(signal.SIGTERM, signal.SIG_IGN); pid=os.fork(); (open({marker:?},'w').write(str(pid)), os._exit(0)) if pid else time.sleep(30)"
     );
     let start_result = start_pty(Value::Map(vec![
         (Value::String("cmd".into()), Value::String("python3".into())),

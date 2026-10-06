@@ -54,6 +54,19 @@
           emacs:
           ((super.emacsPackagesFor emacs).overrideScope (
             eself: _: {
+              # The locked nixpkgs recipe predates msgpack-read's keyword API.
+              msgpack = eself.melpaBuild {
+                pname = "msgpack";
+                version = "0.1.1";
+                src = super.fetchFromGitHub {
+                  owner = "xuchunyang";
+                  repo = "msgpack.el";
+                  rev = "5353a7b2da854c843cbec4536996242001f63471";
+                  hash = "sha256-XMNaHjNx3E/HbqNyqSfotIq5YpUMydUX6d9et2VE+SI=";
+                };
+                files = ''("msgpack.el")'';
+                packageRequires = [ ];
+              };
               tramp-rpc = eself.callPackage (
                 {
                   archs ? defaultServerArchs super,
@@ -114,10 +127,19 @@
         let
           pkgs = nixpkgs.legacyPackages.${system};
           self' = self.packages.${system};
+          epkgs = (pkgs.extend self.overlays.default).emacsPackagesFor pkgs.emacs;
         in
         {
           tramp-rpc-server = pkgs.pkgsStatic.callPackage ./default.nix { };
           default = self'.tramp-rpc-server;
+          # Use the same pinned TRAMP as the Nix package, not live GNU ELPA
+          # metadata that may be unavailable to GitHub's runners.
+          ci-elisp-dependencies = pkgs.symlinkJoin {
+            name = "tramp-rpc-ci-elisp-dependencies";
+            paths = lib.unique (
+              epkgs.tramp-rpc.packageRequires ++ [ epkgs.package-lint ] ++ epkgs.package-lint.packageRequires
+            );
+          };
         }
       );
 
