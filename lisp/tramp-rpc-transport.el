@@ -78,6 +78,9 @@ decoded parameters.  Notifications nobody handles are discarded.")
 (define-error 'tramp-rpc-server-unavailable
   "TRAMP-RPC server binary is unavailable" 'remote-file-error)
 
+(define-error 'tramp-rpc-incompatible-server
+  "TRAMP-RPC server protocol is incompatible" 'remote-file-error)
+
 (defcustom tramp-rpc-call-timeout 30
   "Maximum seconds to wait for a synchronous RPC call to complete.
 The value must be a positive number."
@@ -1263,11 +1266,13 @@ Returns the connection plist.  Signals `remote-file-error' on failure."
           ;; Wait for server to be ready by sending a ping, and seed the
           ;; connection-local system.info cache for later uid/gid/home/shell
           ;; lookups.  Tear down a failed transport before retrying.
-          (let ((response (tramp-rpc--cache-system-info
-                           vec (tramp-rpc--call vec "system.info" nil))))
-            (unless response
-              (signal 'remote-file-error
-                      (list "Failed to connect to RPC server on" host))))
+          (let* ((info (tramp-rpc--call vec "system.info" nil))
+                 (revision (alist-get 'protocol_revision info)))
+            (unless (equal revision tramp-rpc-protocol-revision)
+              (signal 'tramp-rpc-incompatible-server
+                      (list (format "Server on %s reports protocol revision %S; expected %d.  Rebuild and redeploy the matching server"
+                                    host revision tramp-rpc-protocol-revision))))
+            (tramp-rpc--cache-system-info vec info))
 
           ;; Set connection-local variables in the connection buffer.
           ;; Every TRAMP backend must call this after establishing the

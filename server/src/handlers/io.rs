@@ -285,10 +285,9 @@ pub async fn copy(params: Value) -> HandlerResult {
             .await
             .map_err(|e| map_io_error(e, &src_str))?
     } else {
-        // Copy regular file (or symlink target) atomically: a plain
-        // `fs::copy' would open the destination with create+truncate and could
-        // clobber a file created after the overwrite check.
-        copy_file_atomically(&src_path, &dest_path, options)
+        // Follow a source symlink, but refuse nonregular files and create
+        // no-overwrite destinations exclusively.
+        copy_regular_file(&src_path, &dest_path, options)
             .await
             .map_err(|e| map_io_error(e, &src_str))?
     };
@@ -341,7 +340,7 @@ async fn copy_dir_recursive(
             prepare_symlink_destination(&dest_child, options.overwrite).await?;
             tokio::fs::symlink(&link_target, &dest_child).await?;
         } else {
-            total += copy_file_atomically(&entry_path, &dest_child, options).await?;
+            total += copy_regular_file(&entry_path, &dest_child, options).await?;
         }
     }
 
@@ -410,64 +409,85 @@ async fn canonicalize_existing_ancestor(path: &Path) -> std::io::Result<PathBuf>
     }
 }
 
-/// Copy SRC to DEST, atomically refusing an existing no-overwrite destination.
-///
-/// Overwriting keeps `fs::copy' semantics: it follows a destination symlink
-/// and truncates the link target, matching Emacs `copy-file' and the previous
-/// behavior.  The no-overwrite path creates the destination exclusively, so a
-/// concurrent create cannot be clobbered and no staging name is ever visible
-/// to directory watchers.
-async fn copy_file_atomically(
-    src: &Path,
-    dest: &Path,
-    options: CopyOptions,
-) -> std::io::Result<u64> {
-    if options.overwrite {
-        let copied = fs::copy(src, dest).await?;
-        let metadata = fs::metadata(src).await?;
-        apply_copied_metadata(&metadata, dest, options).await?;
-        return Ok(copied);
-    }
-
-    // `O_CREAT|O_EXCL' refuses an existing destination atomically, so a file
-    // created after the caller's check cannot be truncated.  Open the source
-    // first so a missing source does not leave an empty destination behind,
-    // then write and apply metadata through the returned handle, so replacing
-    // DEST with a symlink cannot redirect the chmod/utimes.
+/// Copy regular files using the same descriptor-owned path for both policies.
+/// No-overwrite creates exclusively; overwrite follows an existing symlink,
+/// but refuses devices, FIFOs and aliases of the source before truncating.
+/// Errors leave partial output: unlinking DEST could delete a concurrent
+/// replacement.  Neither data writes nor metadata updates reopen a pathname.
+async fn copy_regular_file(src: &Path, dest: &Path, options: CopyOptions) -> std::io::Result<u64> {
     let src = src.to_path_buf();
     let dest = dest.to_path_buf();
     tokio::task::spawn_blocking(move || {
         use std::os::unix::fs::OpenOptionsExt;
 
-        let mut source = std::fs::File::open(src)?;
+        // Nonblocking open prevents a FIFO with no writer pinning this worker.
+        let mut source = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NONBLOCK | libc::O_NOCTTY)
+            .open(&src)?;
         let metadata = source.metadata()?;
-        let mut target = std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .custom_flags(libc::O_NOFOLLOW)
-            .open(&dest)
-            .map_err(|error| {
-                if error.kind() == std::io::ErrorKind::AlreadyExists {
-                    already_exists(&dest)
-                } else {
-                    error
-                }
-            })?;
-        // File-to-file std::io::copy can use kernel copy offload.  Keep the
-        // entire copy on one blocking worker rather than hopping per chunk.
-        let copied = match std::io::copy(&mut source, &mut target) {
-            Ok(copied) => copied,
-            Err(error) => {
-                drop(target);
-                let _ = std::fs::remove_file(&dest);
-                return Err(error);
-            }
-        };
+        if !metadata.is_file() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("Not a regular file: {}", src.display()),
+            ));
+        }
+        let mut target = open_copy_destination(&dest, &metadata, options.overwrite)?;
+        // Apply access permissions before any private source bytes are visible.
+        target.set_permissions(std::fs::Permissions::from_mode(
+            metadata.permissions().mode() & 0o777,
+        ))?;
+        let copied = std::io::copy(&mut source, &mut target)?;
+        // Writes can clear setuid/setgid bits; restore the full mode afterward.
         apply_copied_metadata_fd(&metadata, &target, options)?;
         Ok(copied)
     })
     .await
     .map_err(std::io::Error::other)?
+}
+
+fn open_copy_destination(
+    dest: &Path,
+    source: &std::fs::Metadata,
+    overwrite: bool,
+) -> std::io::Result<std::fs::File> {
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+
+    match std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(dest)
+    {
+        Ok(file) => Ok(file),
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists && overwrite => {
+            // Follow existing symlinks, but do not create a dangling link's
+            // target.  Open without truncation until fstat verifies ownership.
+            let file = std::fs::OpenOptions::new()
+                .write(true)
+                .custom_flags(libc::O_NONBLOCK | libc::O_NOCTTY)
+                .open(dest)?;
+            let metadata = file.metadata()?;
+            if !metadata.is_file() {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    format!("Not a regular file: {}", dest.display()),
+                ));
+            }
+            if (source.dev(), source.ino()) == (metadata.dev(), metadata.ino()) {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "Input and output files are the same",
+                ));
+            }
+            file.set_len(0)?;
+            Ok(file)
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            Err(already_exists(dest))
+        }
+        Err(error) => Err(error),
+    }
 }
 
 async fn prepare_symlink_destination(path: &Path, overwrite: bool) -> std::io::Result<()> {
@@ -1458,7 +1478,7 @@ mod tests {
 
         // Emacs `copy-file' with overwrite follows an existing destination
         // symlink and writes through it; the atomic no-overwrite path must not
-        // change that, so overwriting keeps `fs::copy' semantics.
+        // change that when both files are regular.
         copy(msgpack_map! {
             "src" => path_value(&src),
             "dest" => path_value(&dest),
@@ -1492,7 +1512,7 @@ mod tests {
             overwrite: false,
             merge_existing_directories: false,
         };
-        let error = copy_file_atomically(&src, &dest, options)
+        let error = copy_regular_file(&src, &dest, options)
             .await
             .expect_err("an existing destination must be refused");
         assert_eq!(error.kind(), std::io::ErrorKind::AlreadyExists);
@@ -1503,10 +1523,131 @@ mod tests {
             overwrite: true,
             ..options
         };
-        assert_eq!(copy_file_atomically(&src, &dest, options).await.unwrap(), 3);
+        assert_eq!(copy_regular_file(&src, &dest, options).await.unwrap(), 3);
         assert_eq!(fs::read(&dest).await.unwrap(), b"new");
 
         assert_eq!(std::fs::read_dir(tmp.path()).unwrap().count(), 2);
+    }
+
+    #[test]
+    fn copy_destination_is_private_before_writing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let src = tmp.path().join("source");
+        std::fs::write(&src, b"secret").unwrap();
+        std::fs::set_permissions(&src, std::fs::Permissions::from_mode(0o600)).unwrap();
+        for overwrite in [false, true] {
+            let dest = tmp.path().join(format!("dest-{overwrite}"));
+            let file =
+                open_copy_destination(&dest, &std::fs::metadata(&src).unwrap(), overwrite).unwrap();
+            assert_eq!(file.metadata().unwrap().mode() & 0o077, 0);
+            assert_eq!(file.metadata().unwrap().len(), 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn copy_rejects_nonregular_files_without_blocking() {
+        use nix::sys::stat::Mode;
+        let tmp = tempfile::tempdir().unwrap();
+        let fifo = tmp.path().join("fifo");
+        nix::unistd::mkfifo(&fifo, Mode::S_IRUSR | Mode::S_IWUSR).unwrap();
+        for source in [fifo.as_path(), Path::new("/dev/null")] {
+            for overwrite in [false, true] {
+                let dest = tmp.path().join("dest");
+                let result = tokio::time::timeout(
+                    std::time::Duration::from_secs(2),
+                    copy(msgpack_map! {
+                        "src" => path_value(source), "dest" => path_value(&dest),
+                        "overwrite" => overwrite,
+                    }),
+                )
+                .await
+                .expect("nonregular source must not block");
+                assert!(result.is_err());
+                assert!(!dest.exists());
+            }
+        }
+        let src = tmp.path().join("source");
+        fs::write(&src, b"payload").await.unwrap();
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            copy(msgpack_map! {
+                "src" => path_value(&src), "dest" => path_value(&fifo), "overwrite" => true,
+            }),
+        )
+        .await
+        .expect("FIFO destination must not block");
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn copy_overwrite_rejects_source_aliases_without_truncating() {
+        let tmp = tempfile::tempdir().unwrap();
+        let src = tmp.path().join("source");
+        let hardlink = tmp.path().join("hardlink");
+        let symlink = tmp.path().join("symlink");
+        fs::write(&src, b"keep me").await.unwrap();
+        fs::hard_link(&src, &hardlink).await.unwrap();
+        tokio::fs::symlink(&src, &symlink).await.unwrap();
+        for dest in [&src, &hardlink, &symlink] {
+            let error = copy(msgpack_map! {
+                "src" => path_value(&src), "dest" => path_value(dest), "overwrite" => true,
+            })
+            .await
+            .expect_err("source aliases must be refused before truncation");
+            assert!(error.message.contains("same"));
+            assert_eq!(fs::read(&src).await.unwrap(), b"keep me");
+        }
+    }
+
+    #[tokio::test]
+    async fn copy_overwrite_preserves_private_permissions_and_refuses_dangling_link() {
+        let tmp = tempfile::tempdir().unwrap();
+        let src = tmp.path().join("source");
+        let dest = tmp.path().join("dest");
+        fs::write(&src, b"secret").await.unwrap();
+        fs::set_permissions(&src, std::fs::Permissions::from_mode(0o600))
+            .await
+            .unwrap();
+        fs::write(&dest, b"public").await.unwrap();
+        fs::set_permissions(&dest, std::fs::Permissions::from_mode(0o644))
+            .await
+            .unwrap();
+        copy(msgpack_map! {
+            "src" => path_value(&src), "dest" => path_value(&dest), "overwrite" => true,
+        })
+        .await
+        .unwrap();
+        assert_eq!(fs::metadata(&dest).await.unwrap().mode() & 0o777, 0o600);
+        assert_eq!(fs::read(&dest).await.unwrap(), b"secret");
+
+        let link = tmp.path().join("link");
+        let missing = tmp.path().join("missing");
+        tokio::fs::symlink(&missing, &link).await.unwrap();
+        assert!(
+            copy(msgpack_map! {
+                "src" => path_value(&src), "dest" => path_value(&link), "overwrite" => true,
+            })
+            .await
+            .is_err()
+        );
+        assert!(!missing.exists());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn failed_copy_retains_partial_destination() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dest = tmp.path().join("dest");
+        // /proc/self/mem is regular, but reading the unmapped address zero
+        // fails with EIO.  Exercise real copy failure without an injection hook.
+        assert!(
+            copy(msgpack_map! {
+                "src" => "/proc/self/mem", "dest" => path_value(&dest),
+            })
+            .await
+            .is_err()
+        );
+        assert!(dest.exists(), "copy failure must not unlink by pathname");
     }
 
     #[tokio::test]

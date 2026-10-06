@@ -1487,6 +1487,110 @@ async fn pty_sigkill_publishes_status_for_in_flight_read_after_removal() {
     );
 }
 
+async fn pty_output_until(pid: u32, needle: &[u8]) -> Vec<u8> {
+    let mut output = Vec::new();
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(3);
+    while !output.windows(needle.len()).any(|bytes| bytes == needle)
+        && tokio::time::Instant::now() < deadline
+    {
+        let read = read_pty(crate::msgpack_map! { "pid" => pid, "timeout_ms" => 50 })
+            .await
+            .unwrap();
+        if let Some(Value::Binary(bytes)) = map_get(&read, "output") {
+            output.extend_from_slice(bytes);
+        }
+    }
+    output
+}
+
+#[tokio::test]
+async fn pty_foreground_signals_interrupt_jobs_without_retiring_shell() {
+    let _test_lock = test_process_map_lock().await;
+    for signal in [libc::SIGINT, libc::SIGKILL] {
+        let start = start_pty(crate::msgpack_map! {
+            "cmd" => "bash",
+            "args" => Value::Array(vec!["--noprofile".into(), "--norc".into(), "-i".into()]),
+            "env" => crate::msgpack_map! { "PS1" => "RPC_PROMPT>" },
+        })
+        .await
+        .unwrap();
+        let pid = map_get(&start, "pid").and_then(Value::as_u64).unwrap() as u32;
+        pty_output_until(pid, b"RPC_PROMPT>").await;
+        write_pty(crate::msgpack_map! {
+            "pid" => pid, "data" => b"sh -c 'printf ready; exec sleep 30'\n".to_vec(),
+        })
+        .await
+        .unwrap();
+        let ready = pty_output_until(pid, b"ready").await;
+        let job_has_foreground = {
+            let processes = get_pty_process_map().lock().await;
+            let managed = processes.get(&pid).unwrap();
+            nix::unistd::tcgetpgrp(managed.async_fd.get_ref()).unwrap() != managed.child_pid
+        };
+        let signaled = kill_pty(crate::msgpack_map! {
+            "pid" => pid, "signal" => signal, "group" => "foreground",
+        })
+        .await;
+        let prompt = pty_output_until(pid, b"RPC_PROMPT>").await;
+        write_pty(crate::msgpack_map! {
+            "pid" => pid, "data" => b"printf after\n".to_vec(),
+        })
+        .await
+        .unwrap();
+        let output = pty_output_until(pid, b"after").await;
+        let shell_usable = get_pty_process_map()
+            .lock()
+            .await
+            .get(&pid)
+            .is_some_and(|managed| !managed.terminating && !managed.io.is_closed());
+        close_pty(crate::msgpack_map! { "pid" => pid })
+            .await
+            .unwrap();
+        assert!(ready.windows(5).any(|bytes| bytes == b"ready"));
+        assert!(job_has_foreground);
+        assert!(signaled.is_ok());
+        assert!(prompt.windows(11).any(|bytes| bytes == b"RPC_PROMPT>"));
+        assert!(
+            output.windows(5).any(|bytes| bytes == b"after"),
+            "signal {signal}: {output:?}"
+        );
+        assert!(shell_usable, "foreground SIGKILL must not retire the shell");
+    }
+}
+
+#[tokio::test]
+async fn pty_foreground_unless_leader_skips_idle_shell() {
+    let _test_lock = test_process_map_lock().await;
+    let start = start_pty(crate::msgpack_map! {
+        "cmd" => "python3",
+        "args" => Value::Array(vec!["-u".into(), "-c".into(),
+            "import signal,time; signal.signal(signal.SIGINT,lambda *_: print('interrupted')); print('ready'); time.sleep(30)".into()]),
+    }).await.unwrap();
+    let pid = map_get(&start, "pid").and_then(Value::as_u64).unwrap() as u32;
+    let ready = pty_output_until(pid, b"ready").await;
+    kill_pty(crate::msgpack_map! {
+        "pid" => pid, "signal" => libc::SIGINT, "group" => "foreground_unless_leader",
+    })
+    .await
+    .unwrap();
+    let read = read_pty(crate::msgpack_map! { "pid" => pid, "timeout_ms" => 100 })
+        .await
+        .unwrap();
+    let skipped = matches!(map_get(&read, "output"), None | Some(Value::Nil));
+    kill_pty(crate::msgpack_map! {
+        "pid" => pid, "signal" => libc::SIGINT, "group" => "foreground",
+    })
+    .await
+    .unwrap();
+    let output = pty_output_until(pid, b"interrupted").await;
+    close_pty(crate::msgpack_map! { "pid" => pid })
+        .await
+        .unwrap();
+    assert!(ready.windows(5).any(|bytes| bytes == b"ready"));
+    assert!(skipped);
+    assert!(output.windows(11).any(|bytes| bytes == b"interrupted"));
+}
+
 #[tokio::test]
 async fn pty_sigkill_releases_registry_and_publishes_status() {
     let _test_lock = test_process_map_lock().await;

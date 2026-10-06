@@ -6948,7 +6948,8 @@ A rejected sudo password must not be reused on the next attempt, otherwise
               ((symbol-function 'tramp-rpc--call)
                (lambda (_vec method _params)
                  (should (equal method "system.info"))
-                 '((uid . 0) (gid . 0) (home . "/root") (shell . "/bin/sh"))))
+                 `((protocol_revision . ,tramp-rpc-protocol-revision)
+                   (uid . 0) (gid . 0) (home . "/root") (shell . "/bin/sh"))))
               ((symbol-function 'tramp-set-connection-local-variables)
                (lambda (&rest _) nil)))
       (unwind-protect
@@ -7150,7 +7151,8 @@ A rejected sudo password must not be reused on the next attempt, otherwise
               ((symbol-function 'tramp-rpc--call)
                (lambda (_vec method _params)
                  (should (equal method "system.info"))
-                 '((uid . 0) (gid . 0) (home . "/root") (shell . "/bin/sh"))))
+                 `((protocol_revision . ,tramp-rpc-protocol-revision)
+                   (uid . 0) (gid . 0) (home . "/root") (shell . "/bin/sh"))))
               ((symbol-function 'tramp-set-connection-local-variables)
                (lambda (&rest _) nil)))
       (unwind-protect

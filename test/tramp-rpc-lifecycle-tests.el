@@ -275,4 +275,70 @@
               (set-process-sentinel proc #'ignore)
               (delete-process proc))))))))
 
+(ert-deftest tramp-rpc-mock-test-startup-rejects-incompatible-protocol ()
+  "Missing or incompatible revisions fail before publishing readiness."
+  (dolist (revision (list nil 0 "1" (1+ tramp-rpc-protocol-revision)))
+    (let* ((vec (tramp-dissect-file-name "/rpc:protocol-mismatch:/"))
+           (buffer-name (tramp-buffer-name vec))
+           (make-process-function (symbol-function 'make-process))
+           transport configured)
+      (cl-letf (((symbol-function 'make-process)
+                 (lambda (&rest args)
+                   (setq transport
+                         (funcall make-process-function
+                                  :name "protocol-mismatch" :command '("cat")
+                                  :buffer (plist-get args :buffer)
+                                  :connection-type 'pipe :noquery t))))
+                ((symbol-function 'tramp-rpc--call)
+                 (lambda (_vec method _params)
+                   (should (equal method "system.info"))
+                   `((protocol_revision . ,revision) (version . "0.14.0"))))
+                ((symbol-function 'tramp-set-connection-local-variables)
+                 (lambda (&rest _) (setq configured t))))
+        (unwind-protect
+            (progn
+              (should-error (tramp-rpc--start-server-process vec "/unused/server")
+                            :type 'tramp-rpc-incompatible-server)
+              (should-not configured)
+              (should-not (tramp-rpc--get-connection vec))
+              (should-not (process-live-p transport))
+              (should-not (get-buffer buffer-name))
+              (should-not (get-buffer (concat buffer-name " stderr"))))
+          (when (and transport (process-live-p transport))
+            (delete-process transport))
+          (tramp-rpc--remove-connection vec))))))
+
+(ert-deftest tramp-rpc-mock-test-interrupt-routes-foreground-only-for-pty ()
+  "PTY interrupts retain nil/t/lambda semantics and the captured generation."
+  (let ((relay (start-process "interrupt-routing" nil "cat"))
+        (vec (tramp-dissect-file-name "/rpc:interrupt-routing:/"))
+        (owner 'captured-connection)
+        captured)
+    (unwind-protect
+        (cl-letf (((symbol-function 'tramp-rpc--call)
+                   (lambda (_vec method params &optional connection)
+                     (setq captured (list method params connection))))
+                  ((symbol-function 'tramp-rpc--kill-remote-process)
+                   (lambda (_vec pid signal &optional connection)
+                     (setq captured (list "process.kill"
+                                          `((pid . ,pid) (signal . ,signal))
+                                          connection)))))
+          (process-put relay :tramp-rpc-vec vec)
+          (process-put relay :tramp-rpc-pid 42)
+          (process-put relay :tramp-rpc-connection owner)
+          (dolist (pty '(nil t))
+            (process-put relay :tramp-rpc-pty pty)
+            (dolist (current-group '(nil t lambda))
+              (should (tramp-rpc-handle-interrupt-process relay current-group))
+              (should (equal (car captured) (if pty "process.kill_pty" "process.kill")))
+              (should (equal (alist-get 'group (cadr captured))
+                             (and pty current-group
+                                  (if (eq current-group 'lambda)
+                                      "foreground_unless_leader" "foreground"))))
+              (should (= (alist-get 'pid (cadr captured)) 42))
+              (should (= (alist-get 'signal (cadr captured)) 2))
+              (should (eq (nth 2 captured) owner))
+              (should (process-live-p relay)))))
+      (when (process-live-p relay) (delete-process relay)))))
+
 ;;; tramp-rpc-lifecycle-tests.el ends here

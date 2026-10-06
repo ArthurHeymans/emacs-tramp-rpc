@@ -86,6 +86,10 @@ expensive expressions such as buffer sizes or `prin1' of large values."
 (defvar tramp-rpc-protocol--message-target nil
   "TRAMP vector or process used for level-6 protocol debug messages.")
 
+(defconst tramp-rpc-protocol-revision 1
+  "Required RPC contract revision, independent of the package version.
+Bump together with the server's PROTOCOL_REVISION for incompatible changes.")
+
 (defconst tramp-rpc-protocol-max-frame-size (* 100 1024 1024)
   "Largest MessagePack frame accepted from or sent to the RPC server.")
 

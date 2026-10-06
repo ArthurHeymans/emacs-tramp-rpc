@@ -20,6 +20,7 @@ pub(super) async fn system_info() -> HandlerResult {
 
     Ok(msgpack_map! {
         "version" => env!("CARGO_PKG_VERSION"),
+        "protocol_revision" => crate::protocol::PROTOCOL_REVISION,
         "os" => std::env::consts::OS,
         "arch" => std::env::consts::ARCH,
         "watcher" => watcher_kind(),
@@ -191,6 +192,18 @@ pub(crate) fn expand_tilde_bytes(path: &[u8]) -> Option<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn system_info_reports_protocol_revision() {
+        let info = system_info().await.unwrap();
+        let revision = info
+            .as_map()
+            .unwrap()
+            .iter()
+            .find(|(key, _)| key.as_str() == Some("protocol_revision"))
+            .and_then(|(_, value)| value.as_u64());
+        assert_eq!(revision, Some(crate::protocol::PROTOCOL_REVISION));
+    }
 
     #[test]
     fn tilde_expands_home_and_user() {

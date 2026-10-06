@@ -457,7 +457,20 @@ with automatic deployment enabled, replaces a mismatch through the verified
 staging-and-activation operation.  With automatic deployment disabled, a
 verified mismatch remains an explicit error.
 
+At startup, the client requires an exact ~protocol_revision~ match from
+~system.info~.  Older servers without this field are rejected and the partial
+connection is closed.  There is no protocol negotiation or automatic retry:
+rebuild and redeploy the server matching the installed Elisp.  A breaking
+protocol change must ship with new, consistently versioned release binaries;
+old release assets cannot be reused just because their executable starts.
+
 ** File operation compatibility notes
+
+File copies use open descriptors for both data and metadata.  No-overwrite
+creates the destination exclusively with private permissions.  Overwrite
+follows an existing destination symlink, but rejects dangling links, devices,
+FIFOs, and aliases of the source before truncating.  Copy errors leave partial
+output rather than risk deleting a concurrently replaced pathname.
 
 Non-overwriting renames use the filesystem's atomic no-replace operation,
 falling back to an exclusive hard link followed by source removal for
@@ -468,6 +481,10 @@ explicitly rather than risk overwriting a concurrently created destination.
 
 ** Process compatibility notes
 
+- ~interrupt-process~ on an RPC PTY honors ~CURRENT-GROUP~: non-nil targets
+  the terminal's foreground job; ~lambda~ does nothing when the shell owns
+  the terminal.  Signaling a foreground job does not retire the shell or
+  discard its output.
 - RPC PTYs disable kernel ~ECHO~, ~ECHONL~, and ~ONLCR~.  Emacs terminal
   consumers such as comint and eat perform local echo and line handling; code
   that relies directly on kernel echo or CRLF conversion will observe different

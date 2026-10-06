@@ -2240,6 +2240,41 @@ This matches the upstream `tramp-test28-process-file' test."
           (should (equal events '("terminated\n"))))
       (ignore-errors (delete-process proc)))))
 
+(ert-deftest tramp-rpc-test14-interrupt-foreground-job ()
+  "An RPC PTY interrupt ends an interactive shell's job, not its relay."
+  :tags '(:process)
+  (skip-unless (tramp-rpc-test-enabled))
+  (let* ((default-directory (tramp-rpc-test--remote-directory))
+         (tramp-rpc-use-direct-ssh-pty nil)
+         (process-connection-type t)
+         (buffer (generate-new-buffer " *rpc-job-control*"))
+         (proc (start-file-process "rpc-job-control" buffer
+                                   "bash" "--noprofile" "--norc" "-i")))
+    (unwind-protect
+        (cl-labels ((await-marker
+                     (marker)
+                     (with-timeout (10 (error "Missing shell output %s" marker))
+                       (while (not (with-current-buffer buffer
+                                     (save-excursion
+                                       (goto-char (point-min))
+                                       (search-forward marker nil t))))
+                         (accept-process-output nil 0.05)))))
+          (process-send-string proc "export PS1='RPC_PROMPT>'\n")
+          (await-marker "RPC_PROMPT>")
+          (with-current-buffer buffer (erase-buffer))
+          ;; Only the foreground child emits READY: its job-control group has
+          ;; been established before the test sends the interrupt.
+          (process-send-string proc "sh -c 'printf RPC_JOB_READY; exec sleep 60'\n")
+          (await-marker "RPC_JOB_READY")
+          (interrupt-process proc t)
+          (await-marker "RPC_PROMPT>")
+          (should (process-live-p proc))
+          (process-send-string proc "printf 'RPC_SHELL_USABLE\\n'\n")
+          (await-marker "RPC_SHELL_USABLE")
+          (should (gethash proc tramp-rpc--pty-processes)))
+      (ignore-errors (delete-process proc))
+      (kill-buffer buffer))))
+
 (ert-deftest tramp-rpc-test14-sentinel-set-after-start ()
   "A sentinel set after start, as `compile' does, gets the remote exit."
   :tags '(:process)

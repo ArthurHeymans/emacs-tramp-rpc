@@ -106,6 +106,14 @@ pub(super) fn set_window_size<Fd: AsFd>(
     Ok(tcsetwinsize(fd, ws)?)
 }
 
+/// Resolve the terminal's foreground group, falling back to its leader.
+fn foreground_pty_group(fd: impl AsFd, child_pid: Pid) -> Pid {
+    tcgetpgrp(fd)
+        .ok()
+        .filter(|group| group.as_raw() > 0)
+        .unwrap_or(child_pid)
+}
+
 pub(super) fn signal_pty_process_group(
     pid: u32,
     signal: i32,
@@ -438,14 +446,8 @@ pub async fn resize_pty(params: Value) -> HandlerResult {
     set_window_size(&owned_fd, params.rows, params.cols)
         .map_err(|e| RpcError::process_error(format!("Failed to resize PTY: {e}")))?;
 
-    match tcgetpgrp(&owned_fd) {
-        Ok(fg_pgrp) => {
-            let _ = nix::sys::signal::kill(Pid::from_raw(-fg_pgrp.as_raw()), Signal::SIGWINCH);
-        }
-        Err(_) => {
-            let _ = nix::sys::signal::kill(Pid::from_raw(-child_pid.as_raw()), Signal::SIGWINCH);
-        }
-    }
+    let group = foreground_pty_group(&owned_fd, child_pid);
+    let _ = nix::sys::signal::kill(Pid::from_raw(-group.as_raw()), Signal::SIGWINCH);
 
     Ok(Value::Boolean(true))
 }
@@ -989,13 +991,16 @@ pub(super) async fn terminate_pty_process(
     Ok(true)
 }
 
-/// Kill a PTY process group and reap its direct child.
+/// Signal a PTY's leader group or, when requested, its foreground job.
+/// Foreground delivery does not terminate or retire the managed shell.
 pub async fn kill_pty(params: Value) -> HandlerResult {
     #[derive(Deserialize)]
     struct Params {
         pid: u32,
         #[serde(default = "default_pty_signal")]
         signal: SignalCode,
+        #[serde(default)]
+        group: Option<String>,
     }
 
     fn default_pty_signal() -> SignalCode {
@@ -1004,6 +1009,40 @@ pub async fn kill_pty(params: Value) -> HandlerResult {
 
     let params: Params = from_value(params).map_err(|e| RpcError::invalid_params(e.to_string()))?;
     let signal = params.signal.resolve()?;
+    if let Some(group) = params.group {
+        let skip_leader = match group.as_str() {
+            "foreground" => false,
+            "foreground_unless_leader" => true,
+            _ => {
+                return Err(RpcError::invalid_params(format!(
+                    "Unknown PTY signal group: {group}"
+                )));
+            }
+        };
+        let (fd, child_pid) = {
+            let processes = get_pty_process_map().lock().await;
+            let managed = processes.get(&params.pid).ok_or_else(|| {
+                RpcError::process_error(format!("PTY process not found: {}", params.pid))
+            })?;
+            if managed.io.is_closed() {
+                return Err(RpcError::process_error(format!(
+                    "PTY process is closed: {}",
+                    params.pid
+                )));
+            }
+            let fd = dup_cloexec(managed.async_fd.get_ref()).map_err(|error| {
+                RpcError::process_error(format!("Failed to duplicate PTY: {error}"))
+            })?;
+            (fd, managed.child_pid)
+        };
+        let foreground = foreground_pty_group(&fd, child_pid);
+        if !skip_leader || foreground != child_pid {
+            signal_pty_process_group(foreground.as_raw() as u32, signal, "send foreground signal")?;
+        }
+        // Even SIGKILL here targets a job, not the lifetime of the relay.
+        // Normal output/exit delivery retains ownership and drains its bytes.
+        return Ok(Value::Boolean(true));
+    }
     let (push, shared_exit_status) = {
         let mut processes = get_pty_process_map().lock().await;
         let managed = processes.get_mut(&params.pid).ok_or_else(|| {

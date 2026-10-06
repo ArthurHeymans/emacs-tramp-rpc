@@ -196,12 +196,13 @@ PROCESS is the process being handled."
        ;; Not a tramp-rpc process
        (t (tramp-run-real-handler #'process-send-eof (and process (list process))))))))
 
-(defun tramp-rpc-handle-signal-process (process sigcode &optional remote)
+(defun tramp-rpc-handle-signal-process (process sigcode &optional remote current-group)
   "Handler for `signal-process' of TRAMP-RPC processes.
 It will be added to `signal-process-functions'.
 PROCESS is the process object or remote PID being handled.
 SIGCODE identifies the signal to send.  REMOTE identifies the host when
-PROCESS is a PID."
+PROCESS is a PID.  CURRENT-GROUP selects an RPC PTY's foreground job;
+`lambda' skips the signal when the terminal's leader owns the foreground."
   (when (stringp process)
     (setq process
           (or (get-process process)
@@ -232,7 +233,11 @@ PROCESS is a PID."
                ;; Use PTY kill for PTY processes, regular kill for pipes.
                ((process-get rpc-process :tramp-rpc-pty)
                 (tramp-rpc--call vec "process.kill_pty"
-                                 `((pid . ,pid) (signal . ,sigcode))
+                                 (append `((pid . ,pid) (signal . ,sigcode))
+                                         (when current-group
+                                           `((group . ,(if (eq current-group 'lambda)
+                                                           "foreground_unless_leader"
+                                                         "foreground")))))
                                  connection))
                (t
                 (tramp-rpc--kill-remote-process
@@ -242,13 +247,14 @@ PROCESS is a PID."
            (message "tramp-rpc: Error signaling process: %s" err)
            -1))))))
 
-(defun tramp-rpc-handle-interrupt-process (&optional process _current-group)
+(defun tramp-rpc-handle-interrupt-process (&optional process current-group)
   "Interrupt TRAMP-RPC PROCESS remotely, for `interrupt-process-functions'.
 The default would signal the local relay, which ends it and, through its
 sentinel, kills the remote process instead of interrupting it.  A direct SSH
 PTY gets the interrupt character, like a terminal.  PROCESS can be a
 process, a buffer, a process or buffer name, or nil for the current buffer.
-Return nil for other processes."
+CURRENT-GROUP selects the foreground job for RPC PTYs, as in
+`interrupt-process'.  Return nil for other processes."
   (when-let* ((proc (if process
                         (or (and (stringp process) (get-process process))
                             (tramp-rpc--resolve-process process))
@@ -259,7 +265,8 @@ Return nil for other processes."
       (error "Process %s is not active" (process-name proc)))
     (if (process-get proc :tramp-rpc-direct-ssh)
         (process-send-string proc (string ?\C-c))
-      (tramp-rpc-handle-signal-process proc 2))
+      (unless (eq 0 (tramp-rpc-handle-signal-process proc 2 nil current-group))
+        (signal 'remote-file-error '("Failed to interrupt remote process"))))
     t))
 
 ;; ============================================================================
