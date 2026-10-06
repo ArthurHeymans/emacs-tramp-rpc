@@ -1424,9 +1424,12 @@ ask again in `auto' mode.  Explicit installation overrides
 `tramp-rpc-deploy-never-deploy' is non-nil."
   (interactive
    (list (tramp-dissect-file-name
-          ;; /rpc: is the initial input, not the completion directory;
-          ;; completing hosts must not treat user@host as a path under /rpc:.
-          (read-file-name "Remote TRAMP-RPC host: " nil nil nil "/rpc:"))
+          ;; Keep the local directory out of the input and start typing
+          ;; after the method prefix, without losing TRAMP completion.
+          (let ((insert-default-directory nil))
+            (minibuffer-with-setup-hook
+                (lambda () (goto-char (point-max)))
+              (read-file-name "Remote TRAMP-RPC host: " nil nil nil "/rpc:"))))
          current-prefix-arg))
   (let ((plan (tramp-rpc-deploy-plan vec t force)))
     (when (eq (tramp-rpc-deploy-plan-mode plan) 'never)

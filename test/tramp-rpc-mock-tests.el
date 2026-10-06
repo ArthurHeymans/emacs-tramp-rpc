@@ -5508,19 +5508,26 @@ Each entry is (HOST ALLOW-PROMPT FORCE-OBTAIN AUTO-DEPLOY)."
      ,@body))
 
 (ert-deftest tramp-rpc-mock-test-deploy-install-host-prompt-uses-initial-input ()
-  "Start with `/rpc:' as input, not the directory for completion.
-Putting it in DIR turns a typed user@host into `/rpc:/user@host'."
+  "Read a host after `/rpc:', without inserting the local directory."
   :tags '(:deploy)
   (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
   (let ((tramp-rpc-deploy-never-deploy nil)
+        (default-directory temporary-file-directory)
+        (insert-default-directory t)
+        (read-file-name-function nil)
+        (minibuffer-setup-hook nil)
         target)
-    (cl-letf (((symbol-function 'read-file-name)
-               (lambda (_prompt dir default mustmatch initial &optional _predicate)
-                 (should-not dir)
-                 (should-not default)
-                 (should-not mustmatch)
-                 (should (equal initial "/rpc:"))
-                 "/rpc:username@final-host:/"))
+    ;; Use the real filename reader; only replace the minibuffer interaction.
+    (cl-letf (((symbol-function 'read-from-minibuffer)
+               (lambda (_prompt initial &rest _)
+                 (with-temp-buffer
+                   (insert (car initial))
+                   (goto-char (cdr initial))
+                   (run-hooks 'minibuffer-setup-hook)
+                   (should (equal (buffer-string) "/rpc:"))
+                   (should (= (point) (point-max)))
+                   (insert "username@final-host:/")
+                   (buffer-string))))
               ((symbol-function 'read-string)
                (lambda (&rest _)
                  (error "Host prompt lost TRAMP completion")))
