@@ -86,6 +86,10 @@ expensive expressions such as buffer sizes or `prin1' of large values."
 (defvar tramp-rpc-protocol--message-target nil
   "TRAMP vector or process used for level-6 protocol debug messages.")
 
+(defconst tramp-rpc-protocol-revision 1
+  "Required RPC contract revision, independent of the package version.
+Bump together with the server's PROTOCOL_REVISION for incompatible changes.")
+
 (defconst tramp-rpc-protocol-max-frame-size (* 100 1024 1024)
   "Largest MessagePack frame accepted from or sent to the RPC server.")
 
@@ -107,6 +111,77 @@ expensive expressions such as buffer sizes or `prin1' of large values."
   "Add 4-byte big-endian length prefix to PAYLOAD (unibyte string)."
   (let ((len (length payload)))
     (concat (msgpack-unsigned-to-bytes len 4) payload)))
+
+(defconst tramp-rpc-protocol--signal-descriptions
+  '(("HUP" . "Hangup")
+    ("INT" . "Interrupt")
+    ("QUIT" . "Quit")
+    ("ILL" . "Illegal instruction")
+    ("TRAP" . "Trace/breakpoint trap")
+    ("ABRT" . "Aborted")
+    ("IOT" . "Aborted")
+    ("EMT" . "EMT trap")
+    ("BUS" . "Bus error")
+    ("FPE" . "Floating point exception")
+    ("KILL" . "Killed")
+    ("USR1" . "User defined signal 1")
+    ("USR2" . "User defined signal 2")
+    ("SEGV" . "Segmentation fault")
+    ("PIPE" . "Broken pipe")
+    ("ALRM" . "Alarm clock")
+    ("TERM" . "Terminated")
+    ("CHLD" . "Child exited")
+    ("CONT" . "Continued")
+    ("STOP" . "Stopped (signal)")
+    ("TSTP" . "Stopped")
+    ("TTIN" . "Stopped (tty input)")
+    ("TTOU" . "Stopped (tty output)")
+    ("URG" . "Urgent I/O condition")
+    ("XCPU" . "CPU time limit exceeded")
+    ("XFSZ" . "File size limit exceeded")
+    ("VTALRM" . "Virtual timer expired")
+    ("PROF" . "Profiling timer expired")
+    ("WINCH" . "Window changed")
+    ("IO" . "I/O possible")
+    ("PWR" . "Power failure")
+    ("INFO" . "Information request")
+    ("SYS" . "Bad system call"))
+  "Signal names and descriptions independent of host signal numbering.")
+
+(defconst tramp-rpc-protocol--linux-signals
+  [nil "HUP" "INT" "QUIT" "ILL" "TRAP" "ABRT" "BUS" "FPE" "KILL"
+       "USR1" "SEGV" "USR2" "PIPE" "ALRM" "TERM" nil "CHLD" "CONT"
+       "STOP" "TSTP" "TTIN" "TTOU" "URG" "XCPU" "XFSZ" "VTALRM"
+       "PROF" "WINCH" "IO" "PWR" "SYS"]
+  "Signal names indexed by number on supported Linux targets.")
+
+(defconst tramp-rpc-protocol--macos-signals
+  [nil "HUP" "INT" "QUIT" "ILL" "TRAP" "ABRT" "EMT" "FPE" "KILL"
+       "BUS" "SEGV" "SYS" "PIPE" "ALRM" "TERM" "URG" "STOP" "TSTP"
+       "CONT" "CHLD" "TTIN" "TTOU" "IO" "XCPU" "XFSZ" "VTALRM"
+       "PROF" "WINCH" "INFO" "USR1" "USR2"]
+  "Signal names indexed by number on macOS targets.")
+
+(defun tramp-rpc-protocol-signal-description (signal &optional os)
+  "Return the human-readable description of SIGNAL, a number or name.
+OS is the remote system.info OS string, not the local Emacs system type.
+Without a known OS, only numbers shared by Linux and macOS are named.
+This performs no RPC, so it is safe to use from a process sentinel."
+  (let* ((names (pcase os
+                  ("linux" tramp-rpc-protocol--linux-signals)
+                  ("macos" tramp-rpc-protocol--macos-signals)))
+         (name (cond
+                ((stringp signal)
+                 (string-remove-prefix "SIG" (upcase signal)))
+                ((and (integerp signal) (> signal 0))
+                 (cond
+                  ((and names (< signal (length names))) (aref names signal))
+                  ((memq signal '(1 2 3 4 5 6 8 9 11 13 14 15))
+                   (aref tramp-rpc-protocol--linux-signals signal)))))))
+    (or (cdr (assoc name tramp-rpc-protocol--signal-descriptions))
+        (if (or (integerp signal) (stringp signal))
+            (format "Signal %s" signal)
+          "Unknown signal"))))
 
 (defun tramp-rpc-protocol-encode-request-with-id (method params)
   "Encode a MessagePack-RPC request for METHOD with PARAMS.
@@ -230,18 +305,19 @@ response plist.  Returns nil if no complete message yet."
 ;; Batch request support
 ;; ============================================================================
 
+(defun tramp-rpc-protocol-batch-params (requests)
+  "Return the batch RPC parameters for (METHOD . PARAMS) REQUESTS."
+  `((requests . ,(vconcat
+                  (mapcar (lambda (req)
+                            `((method . ,(car req)) (params . ,(cdr req))))
+                          requests)))))
+
 (defun tramp-rpc-protocol-encode-batch-request-with-id (requests)
   "Encode a batch request containing multiple REQUESTS.
 REQUESTS is a list of (METHOD . PARAMS) cons cells.
 Returns a cons cell (ID . BYTES) for ID tracking."
-  (let ((batch-requests
-         (mapcar (lambda (req)
-                   `((method . ,(car req))
-                     (params . ,(cdr req))))
-                 requests)))
-    (tramp-rpc-protocol-encode-request-with-id
-     "batch"
-     `((requests . ,(vconcat batch-requests))))))
+  (tramp-rpc-protocol-encode-request-with-id
+   "batch" (tramp-rpc-protocol-batch-params requests)))
 
 (defun tramp-rpc-protocol-decode-batch-response (response)
   "Decode a batch response into a list of individual results.

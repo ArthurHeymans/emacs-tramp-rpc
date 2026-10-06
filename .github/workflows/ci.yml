@@ -4,7 +4,6 @@ on:
   push:
     branches: [main, master]
   pull_request:
-    branches: [main, master]
   workflow_dispatch:
 
 permissions:
@@ -23,7 +22,7 @@ jobs:
         uses: actions/checkout@v5
 
       - name: Install Nix
-        uses: DeterminateSystems/nix-installer-action@main
+        uses: DeterminateSystems/nix-installer-action@v22
 
       - name: Cache Nix store
         uses: nix-community/cache-nix-action@v7
@@ -113,6 +112,19 @@ jobs:
       - name: Check formatting
         run: cargo fmt --all --check
 
+      - name: Check version consistency
+        run: |
+          CARGO_VERSION=$(grep -oP '^version = "\K[^"]+' Cargo.toml)
+          ELISP_VERSION=$(grep -oP '^;; Version: \K.*' lisp/tramp-rpc.el)
+          DEPLOY_VERSION=$(grep -oP 'tramp-rpc-deploy-version "\K[^"]+' lisp/tramp-rpc-deploy.el)
+          echo "Cargo.toml:           $CARGO_VERSION"
+          echo "lisp/tramp-rpc.el:    $ELISP_VERSION"
+          echo "tramp-rpc-deploy.el:  $DEPLOY_VERSION"
+          if [ "$CARGO_VERSION" != "$ELISP_VERSION" ] || [ "$CARGO_VERSION" != "$DEPLOY_VERSION" ]; then
+            echo "::error::Version mismatch between Cargo.toml, lisp/tramp-rpc.el and lisp/tramp-rpc-deploy.el"
+            exit 1
+          fi
+
   elisp:
     name: Emacs Lisp (${{ matrix.emacs_label }})
     runs-on: ubuntu-latest
@@ -134,25 +146,8 @@ jobs:
         with:
           version: ${{ matrix.emacs_version }}
 
-      - name: Install dependencies
-        run: |
-          for attempt in 1 2 3; do
-            emacs -Q --batch \
-              --eval "(require 'package)" \
-              --eval "(add-to-list 'package-archives '(\"melpa\" . \"https://melpa.org/packages/\") t)" \
-              --eval "(package-initialize)" \
-              --eval "(package-refresh-contents)" \
-              --eval "(setq package-install-upgrade-built-in t)" \
-              --eval "(package-install 'tramp)" \
-              --eval "(package-install 'msgpack)" \
-              --eval "(package-install 'package-lint)" && break
-            if [ "$attempt" -eq 3 ]; then
-              echo "Dependency installation failed after $attempt attempts" >&2
-              exit 1
-            fi
-            echo "Attempt $attempt failed, retrying in 10s..."
-            sleep 10
-          done
+      - name: Install pinned dependencies
+        run: bash scripts/install-ci-dependencies.sh
 
       - name: Byte-compile each module in isolation
         run: |
@@ -205,6 +200,7 @@ jobs:
             lisp/tramp-rpc-deploy.el \
             lisp/tramp-rpc-hops.el \
             lisp/tramp-rpc-magit.el \
+            lisp/tramp-rpc-notify.el \
             lisp/tramp-rpc-process.el \
             lisp/tramp-rpc-protocol.el \
             lisp/tramp-rpc-transport.el
@@ -223,6 +219,7 @@ jobs:
             lisp/tramp-rpc-deploy.el \
             lisp/tramp-rpc-hops.el \
             lisp/tramp-rpc-magit.el \
+            lisp/tramp-rpc-notify.el \
             lisp/tramp-rpc-process.el \
             lisp/tramp-rpc-protocol.el \
             lisp/tramp-rpc-transport.el
@@ -257,30 +254,14 @@ jobs:
         with:
           version: ${{ matrix.emacs_version }}
 
-      - name: Install dependencies
-        run: |
-          for attempt in 1 2 3; do
-            emacs -Q --batch \
-              --eval "(require 'package)" \
-              --eval "(add-to-list 'package-archives '(\"melpa\" . \"https://melpa.org/packages/\") t)" \
-              --eval "(package-initialize)" \
-              --eval "(package-refresh-contents)" \
-              --eval "(setq package-install-upgrade-built-in t)" \
-              --eval "(package-install 'tramp)" \
-              --eval "(package-install 'msgpack)" && break
-            if [ "$attempt" -eq 3 ]; then
-              echo "Dependency installation failed after $attempt attempts" >&2
-              exit 1
-            fi
-            echo "Attempt $attempt failed, retrying in 10s..."
-            sleep 10
-          done
+      - name: Install pinned dependencies
+        run: bash scripts/install-ci-dependencies.sh
 
       - name: Run autoload tests
         run: ./test/run-autoload-tests.sh
 
-  test-protocol:
-    name: Protocol Tests (${{ matrix.emacs_label }})
+  test-mock:
+    name: Mock Tests (${{ matrix.emacs_label }})
     runs-on: ubuntu-latest
     needs: elisp
     strategy:
@@ -301,26 +282,10 @@ jobs:
         with:
           version: ${{ matrix.emacs_version }}
 
-      - name: Install dependencies
-        run: |
-          for attempt in 1 2 3; do
-            emacs -Q --batch \
-              --eval "(require 'package)" \
-              --eval "(add-to-list 'package-archives '(\"melpa\" . \"https://melpa.org/packages/\") t)" \
-              --eval "(package-initialize)" \
-              --eval "(package-refresh-contents)" \
-              --eval "(setq package-install-upgrade-built-in t)" \
-              --eval "(package-install 'tramp)" \
-              --eval "(package-install 'msgpack)" && break
-            if [ "$attempt" -eq 3 ]; then
-              echo "Dependency installation failed after $attempt attempts" >&2
-              exit 1
-            fi
-            echo "Attempt $attempt failed, retrying in 10s..."
-            sleep 10
-          done
+      - name: Install pinned dependencies
+        run: bash scripts/install-ci-dependencies.sh
 
-      - name: Run protocol tests
+      - name: Run mock tests
         run: |
           emacs -Q --batch \
             --eval "(require 'package)" \
@@ -328,17 +293,7 @@ jobs:
             --eval "(package-initialize)" \
             --eval "(setq debug-on-error t)" \
             -l test/tramp-rpc-mock-tests.el \
-            --eval "(ert-run-tests-batch-and-exit \"^tramp-rpc-mock-test-protocol\")"
-
-      - name: Run request lifecycle tests
-        run: |
-          emacs -Q --batch \
-            --eval "(require 'package)" \
-            --eval "(add-to-list 'package-archives '(\"melpa\" . \"https://melpa.org/packages/\") t)" \
-            --eval "(package-initialize)" \
-            --eval "(setq debug-on-error t)" \
-            -l test/tramp-rpc-mock-tests.el \
-            --eval "(ert-run-tests-batch-and-exit \"^tramp-rpc-mock-test-request\")"
+            --eval "(tramp-rpc-mock-test--run-guarded '(and \"^tramp-rpc-mock-test\" (not (tag :multi-hop)) (not (tag :server))))"
 
   test-multi-hop:
     name: Multi-Hop Tests (${{ matrix.emacs_label }})
@@ -367,24 +322,8 @@ jobs:
           git clone --depth 1 https://github.com/emacsmirror/tramp.git ~/src/tramp
           echo "Tramp commit: $(git -C ~/src/tramp rev-parse HEAD)"
 
-      - name: Install dependencies
-        run: |
-          for attempt in 1 2 3; do
-            emacs -Q --batch \
-              --eval "(require 'package)" \
-              --eval "(add-to-list 'package-archives '(\"melpa\" . \"https://melpa.org/packages/\") t)" \
-              --eval "(package-initialize)" \
-              --eval "(package-refresh-contents)" \
-              --eval "(setq package-install-upgrade-built-in t)" \
-              --eval "(package-install 'tramp)" \
-              --eval "(package-install 'msgpack)" && break
-            if [ "$attempt" -eq 3 ]; then
-              echo "Dependency installation failed after $attempt attempts" >&2
-              exit 1
-            fi
-            echo "Attempt $attempt failed, retrying in 10s..."
-            sleep 10
-          done
+      - name: Install pinned dependencies
+        run: bash scripts/install-ci-dependencies.sh
 
       - name: Run multi-hop tests
         run: |
@@ -396,7 +335,7 @@ jobs:
             --eval "(package-initialize)" \
             --eval "(setq debug-on-error t)" \
             -l test/tramp-rpc-mock-tests.el \
-            --eval "(ert-run-tests-batch-and-exit '(tag :multi-hop))"
+            --eval "(tramp-rpc-mock-test--run-guarded '(tag :multi-hop))"
 
   test-server:
     name: Server Integration Tests (${{ matrix.emacs_label }})
@@ -429,24 +368,8 @@ jobs:
       - name: Make server executable
         run: chmod +x target/x86_64-unknown-linux-musl/release/tramp-rpc-server
 
-      - name: Install dependencies
-        run: |
-          for attempt in 1 2 3; do
-            emacs -Q --batch \
-              --eval "(require 'package)" \
-              --eval "(add-to-list 'package-archives '(\"melpa\" . \"https://melpa.org/packages/\") t)" \
-              --eval "(package-initialize)" \
-              --eval "(package-refresh-contents)" \
-              --eval "(setq package-install-upgrade-built-in t)" \
-              --eval "(package-install 'tramp)" \
-              --eval "(package-install 'msgpack)" && break
-            if [ "$attempt" -eq 3 ]; then
-              echo "Dependency installation failed after $attempt attempts" >&2
-              exit 1
-            fi
-            echo "Attempt $attempt failed, retrying in 10s..."
-            sleep 10
-          done
+      - name: Install pinned dependencies
+        run: bash scripts/install-ci-dependencies.sh
 
       - name: Run server integration tests
         run: |
@@ -456,7 +379,17 @@ jobs:
             --eval "(package-initialize)" \
             --eval "(setq debug-on-error t)" \
             -l test/tramp-rpc-mock-tests.el \
-            --eval "(ert-run-tests-batch-and-exit '(tag :server))"
+            --eval "(tramp-rpc-mock-test--run-guarded '(tag :server))"
+
+      - name: Run pushed-output stress tests
+        run: |
+          emacs -Q --batch \
+            --eval "(require 'package)" \
+            --eval "(add-to-list 'package-archives '(\"melpa\" . \"https://melpa.org/packages/\") t)" \
+            --eval "(package-initialize)" \
+            -l test/tramp-rpc-mock-tests.el \
+            -l test/tramp-rpc-stress-tests.el \
+            --eval "(tramp-rpc-mock-test--run-guarded \"^tramp-rpc-stress-test-\")"
 
   test-full-suite:
     name: Full Test Suite (with SSH) (${{ matrix.emacs_label }})
@@ -516,24 +449,8 @@ jobs:
           mkdir -p ~/.cache/emacs/tramp-rpc
           cp target/x86_64-unknown-linux-musl/release/tramp-rpc-server ~/.cache/emacs/tramp-rpc/tramp-rpc-server-${VERSION}
 
-      - name: Install dependencies
-        run: |
-          for attempt in 1 2 3; do
-            emacs -Q --batch \
-              --eval "(require 'package)" \
-              --eval "(add-to-list 'package-archives '(\"melpa\" . \"https://melpa.org/packages/\") t)" \
-              --eval "(package-initialize)" \
-              --eval "(package-refresh-contents)" \
-              --eval "(setq package-install-upgrade-built-in t)" \
-              --eval "(package-install 'tramp)" \
-              --eval "(package-install 'msgpack)" && break
-            if [ "$attempt" -eq 3 ]; then
-              echo "Dependency installation failed after $attempt attempts" >&2
-              exit 1
-            fi
-            echo "Attempt $attempt failed, retrying in 10s..."
-            sleep 10
-          done
+      - name: Install pinned dependencies
+        run: bash scripts/install-ci-dependencies.sh
 
       - name: Run full test suite
         env:
@@ -546,7 +463,14 @@ jobs:
             --eval "(setq debug-on-error t)" \
             --eval "(setq tramp-verbose 0)" \
             -l test/tramp-rpc-tests.el \
-            --eval "(ert-run-tests-batch-and-exit \"^tramp-rpc-test\")"
+            --eval "(tramp-rpc-test--run-guarded \"^tramp-rpc-test\")"
+
+      - name: Run randomized process lifecycle tests
+        env:
+          TRAMP_RPC_TEST_HOST: localhost
+        run: |
+          scripts/chaos-test.sh --no-build --seeds 40 \
+            --server target/x86_64-unknown-linux-musl/release/tramp-rpc-server
 
   test-upstream-tramp:
     name: Upstream Tramp Tests (${{ matrix.emacs_label }})
@@ -620,22 +544,8 @@ jobs:
           mkdir -p ~/.cache/emacs/tramp-rpc
           cp target/x86_64-unknown-linux-musl/release/tramp-rpc-server ~/.cache/emacs/tramp-rpc/tramp-rpc-server-${VERSION}
 
-      - name: Install dependencies
-        run: |
-          for attempt in 1 2 3; do
-            emacs -Q --batch \
-              --eval "(require 'package)" \
-              --eval "(add-to-list 'package-archives '(\"melpa\" . \"https://melpa.org/packages/\") t)" \
-              --eval "(package-initialize)" \
-              --eval "(package-refresh-contents)" \
-              --eval "(package-install 'msgpack)" && break
-            if [ "$attempt" -eq 3 ]; then
-              echo "Dependency installation failed after $attempt attempts" >&2
-              exit 1
-            fi
-            echo "Attempt $attempt failed, retrying in 10s..."
-            sleep 10
-          done
+      - name: Install pinned dependencies
+        run: bash scripts/install-ci-dependencies.sh
 
       - name: Run upstream tramp tests
         env:
@@ -646,10 +556,13 @@ jobs:
           #   :unstable: not recommended by upstream Tramp
           #   tramp-test46-asynchronous-requests: upstream stress test is
           #     timing-sensitive with tramp-rpc's RPC process relay in CI.
+          # Use the checkout's TRAMP, not the installed package's autoloads.
+          # Mixing them leaves tramp-autoloads loaded after unload on Emacs 30.
           emacs -Q --batch \
             -L lisp \
             --eval "(require 'package)" \
             --eval "(add-to-list 'package-archives '(\"melpa\" . \"https://melpa.org/packages/\") t)" \
+            --eval "(setq package-load-list '((tramp nil) all))" \
             --eval "(package-initialize)" \
             -l test/run-tramp-tests.el \
             --eval "(tramp-rpc-test-run-tests-batch-and-exit '(and (not (tag :unstable)) (not tramp-test46-asynchronous-requests)) t)"
@@ -676,6 +589,7 @@ jobs:
             -L lisp \
             --eval "(require 'package)" \
             --eval "(add-to-list 'package-archives '(\"melpa\" . \"https://melpa.org/packages/\") t)" \
+            --eval "(setq package-load-list '((tramp nil) all))" \
             --eval "(package-initialize)" \
             -l tramp-rpc \
             --eval "(message \"Loaded Tramp: %s\" (locate-library \"tramp\"))" \
@@ -700,6 +614,7 @@ jobs:
             -L lisp \
             --eval "(require 'package)" \
             --eval "(add-to-list 'package-archives '(\"melpa\" . \"https://melpa.org/packages/\") t)" \
+            --eval "(setq package-load-list '((tramp nil) all))" \
             --eval "(package-initialize)" \
             -l tramp-rpc \
             --eval "(message \"Loaded Tramp: %s\" (locate-library \"tramp\"))" \
@@ -717,9 +632,10 @@ jobs:
         rust-linux,
         rust-macos,
         rust-extra,
+        format,
         elisp,
         test-autoload,
-        test-protocol,
+        test-mock,
         test-multi-hop,
         test-server,
         test-full-suite,
@@ -734,9 +650,10 @@ jobs:
           echo "Rust Linux: ${{ needs.rust-linux.result }}"
           echo "Rust macOS: ${{ needs.rust-macos.result }}"
           echo "Rust Extra: ${{ needs.rust-extra.result }}"
+          echo "Rust Format: ${{ needs.format.result }}"
           echo "Elisp: ${{ needs.elisp.result }}"
           echo "Autoload Tests: ${{ needs.test-autoload.result }}"
-          echo "Protocol Tests: ${{ needs.test-protocol.result }}"
+          echo "Mock Tests: ${{ needs.test-mock.result }}"
           echo "Multi-Hop Tests: ${{ needs.test-multi-hop.result }}"
           echo "Server Tests: ${{ needs.test-server.result }}"
           echo "Full Test Suite: ${{ needs.test-full-suite.result }}"
@@ -745,9 +662,10 @@ jobs:
           if [[ "${{ needs.rust-linux.result }}" != "success" ]] || \
              [[ "${{ needs.rust-macos.result }}" != "success" ]] || \
              [[ "${{ needs.rust-extra.result }}" != "success" ]] || \
+             [[ "${{ needs.format.result }}" != "success" ]] || \
              [[ "${{ needs.elisp.result }}" != "success" ]] || \
              [[ "${{ needs.test-autoload.result }}" != "success" ]] || \
-             [[ "${{ needs.test-protocol.result }}" != "success" ]] || \
+             [[ "${{ needs.test-mock.result }}" != "success" ]] || \
              [[ "${{ needs.test-multi-hop.result }}" != "success" ]] || \
              [[ "${{ needs.test-server.result }}" != "success" ]] || \
              [[ "${{ needs.test-full-suite.result }}" != "success" ]] || \

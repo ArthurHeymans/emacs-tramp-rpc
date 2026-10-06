@@ -20,8 +20,10 @@
 ;; - process-send-string / process-send-region (route to remote stdin)
 ;; - process-send-eof (close remote stdin or send Ctrl-D to PTY)
 ;; - signal-process (forward signals to remote PID)
+;; - interrupt-process (interrupt the remote process, not its local relay)
 ;; - process-status / process-exit-status (return remote process state)
 ;; - process-command / process-tty-name (return stored metadata)
+;; - set-process-sentinel / process-sentinel (keep tramp-rpc's own sentinel)
 ;; - vc-call-backend (ensure default-directory for remote VC files)
 ;; - vc-exec-after (handle native-compiled VC process state races)
 ;; - python-shell--tramp-with-environment (avoid sending shell commands to the RPC server)
@@ -41,6 +43,7 @@
 
 ;; Functions from tramp-rpc.el
 (declare-function tramp-rpc-file-name-p "tramp-rpc")
+(declare-function tramp-rpc--forget-managed-process "tramp-rpc-process" (process))
 
 ;; Variables from tramp-rpc.el / tramp-rpc-process.el
 
@@ -135,8 +138,7 @@ Return `not-managed' when PROCESS must use the native handler."
 (defun tramp-rpc--managed-send-process (process)
   "Return PROCESS's RPC-managed process, or nil when native delivery is needed."
   (when-let* ((proc (tramp-rpc--resolve-process process)))
-    (and (not tramp-rpc--delivering-output)
-         (not (process-get proc :tramp-rpc-direct-ssh))
+    (and (not (process-get proc :tramp-rpc-direct-ssh))
          (process-get proc :tramp-rpc-pid)
          (process-get proc :tramp-rpc-vec)
          proc)))
@@ -194,12 +196,13 @@ PROCESS is the process being handled."
        ;; Not a tramp-rpc process
        (t (tramp-run-real-handler #'process-send-eof (and process (list process))))))))
 
-(defun tramp-rpc-handle-signal-process (process sigcode &optional remote)
+(defun tramp-rpc-handle-signal-process (process sigcode &optional remote current-group)
   "Handler for `signal-process' of TRAMP-RPC processes.
 It will be added to `signal-process-functions'.
 PROCESS is the process object or remote PID being handled.
 SIGCODE identifies the signal to send.  REMOTE identifies the host when
-PROCESS is a PID."
+PROCESS is a PID.  CURRENT-GROUP selects an RPC PTY's foreground job;
+`lambda' skips the signal when the terminal's leader owns the foreground."
   (when (stringp process)
     (setq process
           (or (get-process process)
@@ -230,7 +233,11 @@ PROCESS is a PID."
                ;; Use PTY kill for PTY processes, regular kill for pipes.
                ((process-get rpc-process :tramp-rpc-pty)
                 (tramp-rpc--call vec "process.kill_pty"
-                                 `((pid . ,pid) (signal . ,sigcode))
+                                 (append `((pid . ,pid) (signal . ,sigcode))
+                                         (when current-group
+                                           `((group . ,(if (eq current-group 'lambda)
+                                                           "foreground_unless_leader"
+                                                         "foreground")))))
                                  connection))
                (t
                 (tramp-rpc--kill-remote-process
@@ -239,6 +246,28 @@ PROCESS is a PID."
           (error
            (message "tramp-rpc: Error signaling process: %s" err)
            -1))))))
+
+(defun tramp-rpc-handle-interrupt-process (&optional process current-group)
+  "Interrupt TRAMP-RPC PROCESS remotely, for `interrupt-process-functions'.
+The default would signal the local relay, which ends it and, through its
+sentinel, kills the remote process instead of interrupting it.  A direct SSH
+PTY gets the interrupt character, like a terminal.  PROCESS can be a
+process, a buffer, a process or buffer name, or nil for the current buffer.
+CURRENT-GROUP selects the foreground job for RPC PTYs, as in
+`interrupt-process'.  Return nil for other processes."
+  (when-let* ((proc (if process
+                        (or (and (stringp process) (get-process process))
+                            (tramp-rpc--resolve-process process))
+                      (get-buffer-process (current-buffer))))
+              ((or (process-get proc :tramp-rpc-direct-ssh)
+                   (process-get proc :tramp-rpc-pid))))
+    (unless (process-live-p proc)
+      (error "Process %s is not active" (process-name proc)))
+    (if (process-get proc :tramp-rpc-direct-ssh)
+        (process-send-string proc (string ?\C-c))
+      (unless (eq 0 (tramp-rpc-handle-signal-process proc 2 nil current-group))
+        (signal 'remote-file-error '("Failed to interrupt remote process"))))
+    t))
 
 ;; ============================================================================
 ;; Process metadata handlers
@@ -249,23 +278,30 @@ PROCESS is a PID."
 PROCESS is the process being handled."
   (if (and (processp process) (process-get process :tramp-rpc-pid))
       (cond
-       ((process-get process :tramp-rpc-exited) 'exit)
        ;; Use the real handler to check local relay liveness, not
        ;; `process-live-p' (which would recurse).  Do not perform synchronous
        ;; remote status RPCs here: callers such as mode-line redisplay,
        ;; Flymake, and LSP process management may ask for process status while
-       ;; the user is typing.
-       ((memq (tramp-run-real-handler #'process-status (list process))
-	      '(run open listen connect))
+       ;; the user is typing.  The relay stays live until the remote output has
+       ;; been delivered, so the remote exit status only applies after that.
+       ((and (not (process-get process :tramp-rpc-exited))
+             (memq (tramp-run-real-handler #'process-status (list process))
+	           '(run open listen connect)))
 	'run)
+       ;; A remote signal death is reported as `signal', matching local
+       ;; processes.  Callers such as LSP and compile branch on this.
+       ((integerp (process-get process :tramp-rpc-exit-signal)) 'signal)
        (t 'exit))
     (tramp-run-real-handler #'process-status (list process))))
 
 (defun tramp-rpc-handle-process-exit-status (process)
   "Handler for `process-exit-status' for TRAMP-RPC processes.
-PROCESS is the process being handled."
+PROCESS is the process being handled.  Signal deaths report the signal
+number, like local processes."
   (if (and (processp process) (process-get process :tramp-rpc-pid))
-      (or (process-get process :tramp-rpc-exit-code) 0)
+      (or (process-get process :tramp-rpc-exit-signal)
+          (process-get process :tramp-rpc-exit-code)
+          0)
     (tramp-run-real-handler #'process-exit-status (list process))))
 
 (defun tramp-rpc-handle-process-command (process)
@@ -286,6 +322,25 @@ STREAM is the output stream being handled."
            (not (process-get process :tramp-rpc-direct-ssh)))
       (process-get process :tramp-rpc-tty-name)
     (tramp-run-real-handler #'process-tty-name (list process stream))))
+
+(defun tramp-rpc-handle-set-process-sentinel (process sentinel)
+  "Handler for `set-process-sentinel' for TRAMP-RPC processes.
+Replacing tramp-rpc's own sentinel would lose the remote exit status and the
+remote cleanup, so store SENTINEL as the caller's sentinel that it calls.
+PROCESS is the process being handled."
+  (if (and (processp process) (process-get process :tramp-rpc-own-sentinel))
+      (progn
+        (process-put process :tramp-rpc-user-sentinel sentinel)
+        sentinel)
+    (tramp-run-real-handler #'set-process-sentinel (list process sentinel))))
+
+(defun tramp-rpc-handle-process-sentinel (process)
+  "Handler for `process-sentinel' for TRAMP-RPC processes.
+Return the caller's sentinel of PROCESS, or `ignore' when there is none:
+tramp-rpc never runs the default sentinel."
+  (if (and (processp process) (process-get process :tramp-rpc-own-sentinel))
+      (or (process-get process :tramp-rpc-user-sentinel) #'ignore)
+    (tramp-run-real-handler #'process-sentinel (list process))))
 
 ;; ============================================================================
 ;; VC integration handler
@@ -489,9 +544,9 @@ PROGRAM is the executable name."
 ;; `vc-dir-busy' tests (get-buffer-process vc-dir-process-buffer).
 ;; In Emacs, `get-buffer-process' returns ANY process associated with the
 ;; buffer -- including exited ones -- as long as `delete-process' has not
-;; been called.  Normally our deferred `tramp-rpc--install-process-cleanup'
-;; handles this, but if the timer hasn't fired yet (or if the cat relay got
-;; stuck), the stale process causes "Another update process is in progress".
+;; been called.  Normally `tramp-rpc--pipe-relay-sentinel' deletes the exited
+;; relay, but if its timer hasn't fired yet (or if the cat relay got stuck),
+;; the stale process causes "Another update process is in progress".
 ;; This handler acts as a safety net: before `vc-dir-refresh' checks the
 ;; busy flag, we delete any exited tramp-rpc relay process from the buffer.
 
@@ -512,7 +567,7 @@ exited (remote side finished), delete it so the refresh can proceed."
                (process-get proc :tramp-rpc-pid)
                (or (process-get proc :tramp-rpc-exited)
                    (not (process-live-p proc))))
-      (remhash proc tramp-rpc--async-processes)
+      (tramp-rpc--forget-managed-process proc)
       (delete-process proc)))
   (tramp-run-real-handler 'vc-dir-refresh nil))
 
@@ -542,6 +597,8 @@ exited (remote side finished), delete it so the refresh can proceed."
   ;; This must be before `tramp-signal-process'.  Since tramp.el is
   ;; required, this is guaranteed.
   (add-hook 'signal-process-functions #'tramp-rpc-handle-signal-process)
+  ;; Likewise before `tramp-interrupt-process'.
+  (add-hook 'interrupt-process-functions #'tramp-rpc-handle-interrupt-process)
   (tramp-rpc--add-external-operation
      'process-status
      #'tramp-rpc-handle-process-status 'tramp-rpc 'process)
@@ -554,6 +611,12 @@ exited (remote side finished), delete it so the refresh can proceed."
   (tramp-rpc--add-external-operation
      'process-tty-name
      #'tramp-rpc-handle-process-tty-name 'tramp-rpc 'process)
+  (tramp-rpc--add-external-operation
+     'set-process-sentinel
+     #'tramp-rpc-handle-set-process-sentinel 'tramp-rpc 'process)
+  (tramp-rpc--add-external-operation
+     'process-sentinel
+     #'tramp-rpc-handle-process-sentinel 'tramp-rpc 'process)
   (tramp-rpc--add-external-operation
      'vc-call-backend
      #'tramp-rpc-handle-vc-call-backend 'tramp-rpc
@@ -606,10 +669,13 @@ exited (remote side finished), delete it so the refresh can proceed."
   (tramp-rpc--remove-external-operation 'process-send-region 'tramp-rpc)
   (tramp-rpc--remove-external-operation 'process-send-eof 'tramp-rpc)
   (remove-hook 'signal-process-functions #'tramp-rpc-handle-signal-process)
+  (remove-hook 'interrupt-process-functions #'tramp-rpc-handle-interrupt-process)
   (tramp-rpc--remove-external-operation 'process-status 'tramp-rpc)
   (tramp-rpc--remove-external-operation 'process-exit-status 'tramp-rpc)
   (tramp-rpc--remove-external-operation 'process-command 'tramp-rpc)
   (tramp-rpc--remove-external-operation 'process-tty-name 'tramp-rpc)
+  (tramp-rpc--remove-external-operation 'set-process-sentinel 'tramp-rpc)
+  (tramp-rpc--remove-external-operation 'process-sentinel 'tramp-rpc)
   (tramp-rpc--remove-external-operation 'vc-call-backend 'tramp-rpc)
   (tramp-rpc--remove-external-operation 'vc-exec-after 'tramp-rpc)
   (tramp-rpc--remove-external-operation

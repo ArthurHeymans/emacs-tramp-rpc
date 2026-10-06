@@ -2,6 +2,9 @@
 
 for details about the project see @README.org
 
+# Backwards compatibility
+Elisp code needs to match the respective rust server. There is no backwards compatibility.
+
 # Building the Rust server
 The script to build the rust server is located at: scripts/build-all.sh
 

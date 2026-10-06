@@ -183,14 +183,15 @@ The modules form a strict layering; each requires only the ones below it.
 Where a lower layer needs to reach up, it runs a hook that the upper layer
 registers on at load time.  The only ~declare-function~ back-references
 left are for functions emitted by the autoload form and for the
-file-notify dispatch callbacks in ~tramp-rpc.el~.
+file-notify dispatch callbacks in ~tramp-rpc-notify.el~.
 
 | Module                     | Purpose                                              |
 |----------------------------+------------------------------------------------------|
-| ~tramp-rpc.el~             | TRAMP file handlers, file-notify, registration       |
+| ~tramp-rpc.el~             | TRAMP file handlers and registration                 |
 | ~tramp-rpc-magit.el~       | Magit/Projectile prefetch and process-file cache     |
 | ~tramp-rpc-advice.el~      | Advice functions for process/VC integration          |
 | ~tramp-rpc-process.el~     | Async process & PTY support                          |
+| ~tramp-rpc-notify.el~      | Public ~file-notify~ descriptors on server watches   |
 | ~tramp-rpc-cache.el~       | Metadata caches & filesystem watch notifications     |
 | ~tramp-rpc-transport.el~   | SSH/ControlMaster, connection generations, RPC calls |
 | ~tramp-rpc-deploy.el~      | Binary deployment & version management               |
@@ -202,8 +203,12 @@ file-notify dispatch callbacks in ~tramp-rpc.el~.
 
 The core module provides:
 - All TRAMP file handler operations (~file-exists-p~, ~file-attributes~, ~insert-file-contents~, etc.)
-- Public ~file-notify~ descriptors on top of server watches
 - File name handler registration, dispatch, and unload
+
+*** Notify Module (~tramp-rpc-notify.el~)
+
+Public ~file-notify~ descriptors (~file-notify-add-watch~ and friends) on
+top of the server watches managed by the cache module.
 
 *** Transport Module (~tramp-rpc-transport.el~)
 
@@ -291,26 +296,18 @@ The dispatcher exposes these public methods:
 | File I/O | ~file.make_hardlink~ | Create a hard link. |
 | File I/O | ~file.chown~ | Change file ownership. |
 | Process | ~process.run~ | Run a command synchronously. |
-| Process | ~process.start~ | Start a managed pipe process. |
-| Process | ~process.subscribe~ | Subscribe to managed process output and exit notifications. |
-| Process | ~process.unsubscribe~ | Stop managed process notifications. |
+| Process | ~process.start~ | Start a managed pipe process; its output is pushed. |
 | Process | ~process.write~ | Write to managed process stdin. |
-| Process | ~process.status~ | Return managed process status. |
 | Process | ~process.close_stdin~ | Close managed process stdin. |
 | Process | ~process.kill~ | Signal a managed process. |
 | Process | ~process.signal~ | Signal a positive OS PID permitted by the server's credentials. |
-| Process | ~process.list~ | List managed processes. |
-| PTY | ~process.start_pty~ | Start a pseudo-terminal process. |
-| PTY | ~process.subscribe_pty~ | Subscribe to pseudo-terminal output and exit notifications. |
-| PTY | ~process.unsubscribe_pty~ | Stop pseudo-terminal notifications. |
+| PTY | ~process.start_pty~ | Start a pseudo-terminal process; its output is pushed. |
 | PTY | ~process.write_pty~ | Write pseudo-terminal input. |
 | PTY | ~process.resize_pty~ | Resize a pseudo-terminal. |
 | PTY | ~process.kill_pty~ | Signal a pseudo-terminal process. |
 | PTY | ~process.close_pty~ | Close a pseudo-terminal process. |
-| PTY | ~process.list_pty~ | List pseudo-terminal processes. |
+| System | ~system.ping~ | Probe the connection using reserved control capacity. |
 | System | ~system.info~ | Return server and host information. |
-| System | ~system.getenv~ | Read an environment variable. |
-| System | ~system.expand_path~ | Expand home-directory paths. |
 | System | ~system.statvfs~ | Return filesystem capacity information. |
 | System | ~system.groups~ | Return supplementary groups. |
 | Commands | ~commands.run_parallel~ | Run commands concurrently. |
@@ -320,7 +317,13 @@ The dispatcher exposes these public methods:
 | High-level | ~highlevel.dir_locals_find_file_cache_update~ | Update directory-local file cache data. |
 | Watch | ~watch.add~ | Add a filesystem watch. |
 | Watch | ~watch.remove~ | Remove a filesystem watch. |
-| Watch | ~watch.list~ | List filesystem watches. |
+
+The server also pushes notifications, which carry no request id:
+- =fs.events= reports changes below watched directories.
+- =process.output= carries =stdout= and =stderr= bytes of a started
+  process (PTY output arrives as =stdout=), and =process.exit= its
+  =exit_code= plus the terminating =signal=, if any.  A process only
+  starts pushing after its start response has been written.
 
 * Binary Deployment
 
@@ -454,8 +457,34 @@ with automatic deployment enabled, replaces a mismatch through the verified
 staging-and-activation operation.  With automatic deployment disabled, a
 verified mismatch remains an explicit error.
 
+At startup, the client requires an exact ~protocol_revision~ match from
+~system.info~.  Older servers without this field are rejected and the partial
+connection is closed.  There is no protocol negotiation or automatic retry:
+rebuild and redeploy the server matching the installed Elisp.  A breaking
+protocol change must ship with new, consistently versioned release binaries;
+old release assets cannot be reused just because their executable starts.
+
+** File operation compatibility notes
+
+File copies use open descriptors for both data and metadata.  No-overwrite
+creates the destination exclusively with private permissions.  Overwrite
+follows an existing destination symlink, but rejects dangling links, devices,
+FIFOs, and aliases of the source before truncating.  Copy errors leave partial
+output rather than risk deleting a concurrently replaced pathname.
+
+Non-overwriting renames use the filesystem's atomic no-replace operation,
+falling back to an exclusive hard link followed by source removal for
+non-directories.  If source removal fails, the error is reported and the
+destination is retained: deleting it could remove the last copy or a
+concurrently replaced file.  Filesystems without either operation fail
+explicitly rather than risk overwriting a concurrently created destination.
+
 ** Process compatibility notes
 
+- ~interrupt-process~ on an RPC PTY honors ~CURRENT-GROUP~: non-nil targets
+  the terminal's foreground job; ~lambda~ does nothing when the shell owns
+  the terminal.  Signaling a foreground job does not retire the shell or
+  discard its output.
 - RPC PTYs disable kernel ~ECHO~, ~ECHONL~, and ~ONLCR~.  Emacs terminal
   consumers such as comint and eat perform local echo and line handling; code
   that relies directly on kernel echo or CRLF conversion will observe different

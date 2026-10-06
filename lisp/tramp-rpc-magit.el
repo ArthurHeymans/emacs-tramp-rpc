@@ -108,11 +108,6 @@ using the current `tab-width' instead."
   :type 'boolean
   :group 'tramp-rpc)
 
-(defconst tramp-rpc-magit--metadata-batch-size 64
-  "Maximum metadata requests sent in one RPC batch.
-The server rejects batches larger than 64 entries, so status prefetches for
-large worktrees must be split without losing item/result ordering.")
-
 (defconst tramp-rpc-magit--ancestor-marker-names
   '(".git" ".svn" ".hg" ".bzr" "_darcs"
     ".fslckout" "_FOSSIL_" ".pijul" ".sl" ".jj"
@@ -122,25 +117,19 @@ large worktrees must be split without losing item/result ordering.")
 (defvar tramp-rpc-magit--ancestor-scan-caches (make-hash-table :test 'equal)
   "Cached ancestor scans keyed by remote search directory.")
 
-(defcustom tramp-rpc-magit-ancestor-cache-max-size 128
-  "Maximum number of cached ancestor scans."
-  :type 'integer
-  :group 'tramp-rpc)
+(defvar tramp-rpc-magit--ancestor-cache-max-size 128
+  "Maximum number of cached ancestor scans.")
 
 (defvar tramp-rpc-magit--prefetch-directories (make-hash-table :test 'equal)
   "Remote directories with active prefetch snapshots, keyed by directory.
 Values are creation timestamps so independent repositories cannot clobber
 one another's ancestor-discovery state.")
 
-(defcustom tramp-rpc-magit-prefetch-directory-max-size 128
-  "Maximum number of active prefetch directory snapshots."
-  :type 'integer
-  :group 'tramp-rpc)
+(defvar tramp-rpc-magit--prefetch-directory-max-size 128
+  "Maximum number of active prefetch directory snapshots.")
 
-(defcustom tramp-rpc-magit-process-cache-max-size 64
-  "Maximum number of per-directory Magit process caches."
-  :type 'integer
-  :group 'tramp-rpc)
+(defvar tramp-rpc-magit--process-cache-max-size 64
+  "Maximum number of per-directory Magit process caches.")
 
 (defun tramp-rpc-magit--clear-ancestor-caches ()
   "Clear cached ancestor marker scans."
@@ -196,7 +185,7 @@ admission."
   "Remove expired entries from `tramp-rpc-magit--prefetch-directories'."
   (tramp-rpc-magit--bound-table
    tramp-rpc-magit--prefetch-directories
-   tramp-rpc-magit-prefetch-directory-max-size #'identity))
+   tramp-rpc-magit--prefetch-directory-max-size #'identity))
 
 (defvar tramp-rpc-magit--debug nil
   "When non-nil, log cache hits/misses for debugging.")
@@ -267,7 +256,7 @@ When push notifications are unavailable, cap to
     (puthash key (list :time (float-time) :cache cache)
              tramp-rpc-magit--process-caches)
     (tramp-rpc-magit--bound-table
-     tramp-rpc-magit--process-caches tramp-rpc-magit-process-cache-max-size
+     tramp-rpc-magit--process-caches tramp-rpc-magit--process-cache-max-size
      (lambda (entry)
        (and (listp entry) (plist-get entry :time)))
      #'tramp-rpc-magit--process-cache-timestamp-valid-p)))
@@ -651,26 +640,15 @@ VEC is the TRAMP connection vector."
           (push (cons "file.truename" (tramp-rpc--encode-path local-file))
                 requests))))
     (when requests
-      (setq items (nreverse items)
-            requests (nreverse requests))
-      (while requests
-        (let (batch-items batch-requests)
-          (dotimes (_ tramp-rpc-magit--metadata-batch-size)
-            (when requests
-              (push (pop items) batch-items)
-              (push (pop requests) batch-requests)))
-          (setq batch-items (nreverse batch-items)
-                batch-requests (nreverse batch-requests))
-          (cl-mapc
-           (lambda (item result)
-             (unless (and (consp result) (plist-get result :error))
-               (pcase (car item)
-                 ('stat (tramp-rpc-magit--cache-file-stat
-                         vec (cadr item) result))
-                 ('truename (tramp-rpc-magit--cache-file-truename
-                             vec (cadr item) result)))))
-           batch-items
-           (tramp-rpc--call-batch vec batch-requests)))))))
+      (cl-mapc
+       (lambda (item result)
+         (unless (tramp-rpc--batch-error-p result)
+           (pcase (car item)
+             ('stat (tramp-rpc-magit--cache-file-stat vec (cadr item) result))
+             ('truename (tramp-rpc-magit--cache-file-truename
+                         vec (cadr item) result)))))
+       (nreverse items)
+       (tramp-rpc--call-batch vec (nreverse requests))))))
 
 (defun tramp-rpc-magit--prefetch-dynamic-status (vec directory root-local)
   "Prefetch status data that depends on initial git output.
@@ -732,7 +710,12 @@ ROOT-LOCAL is the local form of the repository root."
             (add-ref-name name)
             (when (and name (not (string-suffix-p "@{upstream}" name)))
               (add-log-range (concat name ".."))
-              (add-log-range (concat ".." name)))))
+              (add-log-range (concat ".." name))))
+          ;; The upstream header line.
+          (when upstream
+            (add-git "log" "--no-walk" "--format=%s"
+                     (concat upstream "^{commit}") "--")
+            (add-git "merge-base" "--is-ancestor" "HEAD" upstream)))
 
         ;; File-section wash commands for files already expanded in status.
         (let* ((status (or (cached "status" "-z" "--porcelain"
@@ -873,12 +856,29 @@ our prefetch command/key."
                  (string-match-p "\\`GIT_[^=]*=" entry))
         (setq safe nil)))))
 
+(defvar tramp-rpc-magit--status-memo nil
+  "Git results of the Magit status command in progress, or nil.
+Before `update-index --refresh' builds the status snapshot, Magit asks the
+same questions (such as `rev-parse --show-toplevel') many times.  The status
+handlers bind this to a fresh table so those answers are reused for the rest
+of that command.  Entries are keyed by `default-directory' and argv.")
+
+(defun tramp-rpc-magit--active-process-cache ()
+  "Return the process cache for `default-directory', or the status memo.
+The memo is keyed per directory, so it is only used when no snapshot
+exists."
+  (or (tramp-rpc-magit--get-process-cache)
+      (and tramp-rpc-magit--status-memo
+           (or (gethash default-directory tramp-rpc-magit--status-memo)
+               (puthash default-directory (make-hash-table :test 'equal)
+                        tramp-rpc-magit--status-memo)))))
+
 (defun tramp-rpc-magit--process-cache-lookup (program args)
   "Look up PROGRAM ARGS in the `process-file' cache.
 Returns (exit-code . stdout) if found, nil otherwise."
   (when-let* (((bound-and-true-p tramp-rpc-magit--allow-process-cache))
               ((tramp-rpc-magit--git-cache-safe-environment-p))
-              (cache (tramp-rpc-magit--get-process-cache)))
+              (cache (tramp-rpc-magit--active-process-cache)))
     (when (or (string-suffix-p "/git" program)
               (string= "git" program))
       (let* ((core-args (tramp-rpc-magit--strip-git-prefix-args args))
@@ -894,17 +894,20 @@ Returns (exit-code . stdout) if found, nil otherwise."
 
 (defun tramp-rpc-magit--process-cache-store (program args exit-code stdout)
   "Store a just-run git PROGRAM ARGS result in the active Magit cache.
-EXIT-CODE and STDOUT are the values returned by `process-file'."
+EXIT-CODE and STDOUT are the values returned by `process-file'.
+A command that may change the repository drops the status memo."
   (when-let* (((bound-and-true-p tramp-rpc-magit--allow-process-cache))
               ((tramp-rpc-magit--git-cache-safe-environment-p))
-              (cache (tramp-rpc-magit--get-process-cache)))
+              (cache (tramp-rpc-magit--active-process-cache)))
     (when (or (string-suffix-p "/git" program)
               (string= "git" program))
       (let* ((core-args (tramp-rpc-magit--strip-git-prefix-args args))
              (key (and (tramp-rpc-magit--git-cacheable-args-p core-args)
                        (apply #'tramp-rpc-magit--process-cache-key core-args))))
-        (when key
-          (puthash key (cons exit-code stdout) cache))))))
+        (cond
+         (key (puthash key (cons exit-code stdout) cache))
+         (tramp-rpc-magit--status-memo
+          (clrhash tramp-rpc-magit--status-memo)))))))
 
 (defun tramp-rpc-magit--prefetch (directory)
   "Prefetch magit status and ancestor data for DIRECTORY.
@@ -924,7 +927,7 @@ as the `process-file' cache.  Also fetches ancestor markers."
                tramp-rpc-magit--prefetch-directories)
       (tramp-rpc-magit--bound-table
        tramp-rpc-magit--prefetch-directories
-       tramp-rpc-magit-prefetch-directory-max-size #'identity)
+       tramp-rpc-magit--prefetch-directory-max-size #'identity)
       (with-parsed-tramp-file-name directory nil
         ;; Build command list and run in parallel on server.  `update-index
         ;; --refresh' is intentionally not part of this prefetch; it is run by
@@ -964,7 +967,7 @@ as the `process-file' cache.  Also fetches ancestor markers."
                    tramp-rpc-magit--ancestor-scan-caches)
           (tramp-rpc-magit--bound-table
            tramp-rpc-magit--ancestor-scan-caches
-           tramp-rpc-magit-ancestor-cache-max-size #'car))
+           tramp-rpc-magit--ancestor-cache-max-size #'car))
         (when tramp-rpc-magit--debug
           (let ((cache (tramp-rpc-magit--get-process-cache)))
             (tramp-rpc--debug "tramp-rpc-magit: prefetched %d commands + ancestors for %s"
@@ -1041,7 +1044,7 @@ the server scans the entire tree in one operation."
                  tramp-rpc-magit--ancestor-scan-caches)
         (tramp-rpc-magit--bound-table
          tramp-rpc-magit--ancestor-scan-caches
-         tramp-rpc-magit-ancestor-cache-max-size #'car)
+         tramp-rpc-magit--ancestor-cache-max-size #'car)
         scan))))
 
 (defun tramp-rpc-magit--ancestor-cache-covers-p (scan-directory candidate-dir)
@@ -1227,6 +1230,7 @@ DIRECTORY is the directory being handled."
   (let* ((directory (or directory default-directory))
          (tramp-rpc--suppress-fs-notifications t)
          (tramp-rpc-magit--allow-process-cache t)
+         (tramp-rpc-magit--status-memo (make-hash-table :test 'equal))
          (process-file-side-effects nil)
          (tramp-rpc-magit--status-setup-prefetch-active t)
          (magit-diff-adjust-tab-width
@@ -1253,6 +1257,7 @@ inotify events from clearing caches mid-refresh."
     (tramp-rpc-magit--clear-caches-for-directory default-directory))
   (let ((tramp-rpc--suppress-fs-notifications t)
         (tramp-rpc-magit--allow-process-cache t)
+        (tramp-rpc-magit--status-memo (make-hash-table :test 'equal))
         (process-file-side-effects nil)
         (magit-diff-adjust-tab-width
          (if (and tramp-rpc-magit-disable-remote-diff-tab-width-detection

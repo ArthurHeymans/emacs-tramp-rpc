@@ -29,6 +29,9 @@
 (defvar tramp-rpc-mock-test--network-guard nil
   "Non-nil while mock selectors must not create network processes.")
 
+(defvar tramp-rpc-mock-test--isolate-tests nil
+  "Non-nil while a TRAMP-RPC mock selector is running.")
+
 (defun tramp-rpc-mock-test--guard-network (orig &rest args)
   "Reject network APIs while a mock selector is running."
   (if tramp-rpc-mock-test--network-guard
@@ -137,6 +140,27 @@
   (if (and tramp-rpc-mock-test--msgpack-available (msgpack-bin-p data))
       (msgpack-bin-string data)
     data))
+
+(defun tramp-rpc-mock-test--run-guarded (selector)
+  "Run SELECTOR with ERT, failing when it selects or executes nothing.
+CI uses this instead of a bare `ert-run-tests-batch-and-exit' so a renamed
+tag, a load error, or a broken environment cannot turn a job green while
+it exercised no tests.  Skipped tests count as expected results in ERT, so
+the executed count excludes them."
+  (let* ((tramp-rpc-mock-test--isolate-tests t)
+         (tests (ert-select-tests selector t))
+         (selected (length tests)))
+    (unless (> selected 0)
+      (error "ERT selector %S selected zero tests" selector))
+    (let* ((stats (ert-run-tests-batch selector))
+           (skipped (ert-stats-skipped stats))
+           (executed (- (ert-stats-completed stats) skipped)))
+      (message "ERT counts: selected=%d executed=%d skipped=%d"
+               selected executed skipped)
+      (when (= executed 0)
+        (error "ERT selector %S executed zero tests (all %d selected tests skipped)"
+               selector skipped))
+      (kill-emacs (if (> (ert-stats-completed-unexpected stats) 0) 1 0)))))
 
 (defun tramp-rpc-mock-test--wait-for (predicate description &optional process)
   "Run the event loop until PREDICATE succeeds or report DESCRIPTION."
@@ -888,7 +912,7 @@ literally finds nothing."
     (tramp-rpc-mock-test--stop-server)))
 
 (ert-deftest tramp-rpc-mock-test-server-highlevel-locate-dominating-file-depth-limit ()
-  "Ensure dominating-file helper errors after 100 ancestor levels."
+  "Ensure dominating-file helper reports not-found after 100 ancestor levels."
   :tags '(:server)
   (skip-unless tramp-rpc-mock-test--msgpack-available)
   (skip-unless (tramp-rpc-mock-test--find-server))
@@ -907,10 +931,8 @@ literally finds nothing."
                          "highlevel.locate_dominating_file_multi"
                          `((file . ,(encode-coding-string file 'utf-8))
                            (names . [".git"])))))
-            (should (stringp (plist-get result :error)))
-            (should (string-match-p
-                     "Maximum ancestor traversal depth (100) exceeded"
-                     (plist-get result :error))))))
+            ;; Hitting the bound is "not found", not a remote error.
+            (should (zerop (length result))))))
     (tramp-rpc-mock-test--stop-server)))
 
 (ert-deftest tramp-rpc-mock-test-server-highlevel-test-files-in-dir ()
@@ -992,7 +1014,7 @@ literally finds nothing."
     (tramp-rpc-mock-test--stop-server)))
 
 (ert-deftest tramp-rpc-mock-test-server-highlevel-dir-locals-cache-update-depth-limit ()
-  "Ensure dir-locals cache helper errors after 100 ancestor levels."
+  "Ensure dir-locals cache helper reports not-found after 100 ancestor levels."
   :tags '(:server)
   (skip-unless tramp-rpc-mock-test--msgpack-available)
   (skip-unless (tramp-rpc-mock-test--find-server))
@@ -1011,10 +1033,11 @@ literally finds nothing."
                          `((file . ,(encode-coding-string file 'utf-8))
                            (names . [".dir-locals.el"])
                            (cache_dirs . [])))))
-            (should (stringp (plist-get result :error)))
-            (should (string-match-p
-                     "Maximum ancestor traversal depth (100) exceeded"
-                     (plist-get result :error))))))
+            ;; Hitting the bound is "not found", not a remote error.
+            (should-not (plist-get result :error))
+            (should (alist-get 'file result))
+            (should-not (alist-get 'locals result))
+            (should-not (alist-get 'cache result)))))
     (tramp-rpc-mock-test--stop-server)))
 
 (ert-deftest tramp-rpc-mock-test-server-process-run ()
@@ -1249,7 +1272,8 @@ This matches the behavior expected by `tramp-test28-process-file'."
 
 (ert-deftest tramp-rpc-mock-test-pipelined-timeout-preserves-connection ()
   "A live connection remains reusable after a pipeline response timeout."
-  (let* ((buffer (generate-new-buffer " *tramp-rpc-pipeline-test*"))
+  (let* ((tramp-rpc--probing-connection t)
+         (buffer (generate-new-buffer " *tramp-rpc-pipeline-test*"))
          (process (make-pipe-process :name "tramp-rpc-pipeline-test"
                                      :buffer buffer :noquery t))
          (vec (tramp-dissect-file-name "/rpc:mock:/tmp/"))
@@ -1651,6 +1675,74 @@ This matches the behavior expected by `tramp-test28-process-file'."
       (kill-buffer buffer)
       (clrhash tramp-rpc--process-write-queues))))
 
+(ert-deftest tramp-rpc-mock-test-process-write-queue-released-with-relay ()
+  "A relay that dies locally releases its queue, and later writes fail."
+  (let* ((vec (tramp-dissect-file-name "/rpc:queue-relay-death:/tmp/"))
+         (buffer (generate-new-buffer " *tramp-rpc-queue-relay-death*"))
+         (connection (start-process "tramp-rpc-queue-relay-death" buffer "sleep" "10"))
+         (owner (start-process "tramp-rpc-queue-relay-death-owner" nil "cat"))
+         (tramp-rpc--connections (make-hash-table :test 'equal))
+         (tramp-rpc--async-processes (make-hash-table :test 'eq))
+         (tramp-rpc--process-write-queues (make-hash-table :test 'equal)))
+    (unwind-protect
+        (progn
+          (process-put owner :tramp-rpc-vec vec)
+          (process-put owner :tramp-rpc-pid 1)
+          (puthash (tramp-rpc--connection-key vec)
+                   (tramp-rpc--make-connection :process connection)
+                   tramp-rpc--connections)
+          (puthash owner (list :vec vec :pid 1 :connection-process connection)
+                   tramp-rpc--async-processes)
+          (set-process-sentinel
+           owner (lambda (process event)
+                   (tramp-rpc--pipe-process-sentinel process event nil)))
+          (cl-letf (((symbol-function 'tramp-rpc--ensure-connection)
+                     (lambda (_vec) (tramp-rpc--get-connection vec)))
+                    ((symbol-function 'tramp-rpc--call-async) #'ignore)
+                    ((symbol-function 'tramp-rpc--kill-remote-process) #'ignore))
+            (tramp-rpc--write-remote-process vec 1 "pending" owner)
+            (should (= (hash-table-count tramp-rpc--process-write-queues) 1))
+            (kill-process owner)
+            (tramp-rpc-mock-test--wait-for
+             (lambda () (not (gethash owner tramp-rpc--async-processes)))
+             "relay sentinel")
+            (should (= (hash-table-count tramp-rpc--process-write-queues) 0))
+            (should-error (tramp-rpc--write-remote-process vec 1 "late" owner))
+            (should (= (hash-table-count tramp-rpc--process-write-queues) 0))))
+      (dolist (process (list owner connection))
+        (when (process-live-p process) (delete-process process)))
+      (kill-buffer buffer))))
+
+(ert-deftest tramp-rpc-mock-test-close-stdin-keeps-queue-removed-during-drain ()
+  "A queue removed by cleanup while EOF drains it is not stored again."
+  (let* ((vec (tramp-dissect-file-name "/rpc:queue-drain-cleanup:/tmp/"))
+         (buffer (generate-new-buffer " *tramp-rpc-queue-drain-cleanup*"))
+         (connection (start-process "tramp-rpc-queue-drain-cleanup" buffer "sleep" "10"))
+         (owner (start-process "tramp-rpc-queue-drain-cleanup-owner" nil "sleep" "10"))
+         (tramp-rpc--connections (make-hash-table :test 'equal))
+         (tramp-rpc--process-write-queues (make-hash-table :test 'equal)))
+    (unwind-protect
+        (progn
+          (puthash (tramp-rpc--connection-key vec)
+                   (tramp-rpc--make-connection :process connection)
+                   tramp-rpc--connections)
+          (cl-letf (((symbol-function 'tramp-rpc--ensure-connection)
+                     (lambda (_vec) (tramp-rpc--get-connection vec)))
+                    ((symbol-function 'tramp-rpc--call-async) #'ignore)
+                    ((symbol-function 'tramp-rpc--drain-write-queue)
+                     ;; The connection dies and is replaced during the drain.
+                     (lambda (&rest _args)
+                       (tramp-rpc--cleanup-process-write-queues vec connection)
+                       (remhash (tramp-rpc--connection-key vec)
+                                tramp-rpc--connections))))
+            (tramp-rpc--write-remote-process vec 1 "pending" owner)
+            (should-error (tramp-rpc--close-remote-stdin vec 1 owner)
+                          :type 'tramp-rpc-process-write-error)
+            (should (= (hash-table-count tramp-rpc--process-write-queues) 0))))
+      (dolist (process (list owner connection))
+        (when (process-live-p process) (delete-process process)))
+      (kill-buffer buffer))))
+
 (ert-deftest tramp-rpc-mock-test-process-write-queue-reconnect-does-not-close-new-stdin ()
   "An old queue fails after reconnect instead of draining or closing the new one."
   (let* ((vec (tramp-dissect-file-name "/rpc:queue-reconnect:/tmp/"))
@@ -1702,9 +1794,8 @@ This matches the behavior expected by `tramp-test28-process-file'."
     (unwind-protect
         (cl-letf (((symbol-function 'tramp-rpc--get-terminal-size)
                    (lambda (_buffer) '(80 . 24)))
-                  ((symbol-function 'tramp-rpc--get-connection)
+                  ((symbol-function 'tramp-rpc--ensure-connection)
                    (lambda (_vec) current-connection))
-                  ((symbol-function 'tramp-rpc--pty-start-async-read) #'ignore)
                   ((symbol-function 'tramp-rpc--call)
                    (lambda (_vec method _params &optional connection)
                      (if (equal method "process.start_pty")
@@ -1752,6 +1843,63 @@ This matches the behavior expected by `tramp-test28-process-file'."
       (dolist (process (list relay-a relay-b connection-a connection-b))
         (when (process-live-p process)
           (delete-process process))))))
+
+(ert-deftest tramp-rpc-mock-test-relay-delivery-keeps-reentrant-writes-remote ()
+  "Nested string/region writes stay remote on every relay output path."
+  (dolist (path '(stdout mixed-stderr separate-stderr pty))
+    (dolist (operation '(string region))
+      (let* ((process-connection-type nil)
+             (relay (start-process "tramp-rpc-reentrant-relay" nil "cat"))
+             (stderr-relay (and (eq path 'separate-stderr)
+                                (start-process "tramp-rpc-reentrant-stderr" nil "cat")))
+             (target (or stderr-relay relay))
+             (vec (tramp-dissect-file-name "/rpc:mock:/path"))
+             (reply "REENTRANT-WRITE\n")
+             (payload (make-string 65536 ?x))
+             (tramp-rpc--async-processes (make-hash-table :test 'eq))
+             (tramp-rpc--pty-processes (make-hash-table :test 'eq))
+             (output "") remote-writes replied)
+        (unwind-protect
+            (ert-info ((format "%s output, %s input" path operation))
+              (process-put relay :tramp-rpc-pid 42)
+              (process-put relay :tramp-rpc-vec vec)
+              (process-put relay 'tramp-vector vec)
+              (set-process-filter
+               target
+               (lambda (_process string)
+                 (setq output (concat output string))
+                 (unless replied
+                   (setq replied t)
+                   (if (eq operation 'string)
+                       (process-send-string relay reply)
+                     (with-temp-buffer
+                       (insert reply)
+                       (process-send-region relay (point-min) (point-max)))))))
+              (puthash relay (list :stderr-process stderr-relay)
+                       tramp-rpc--async-processes)
+              (cl-letf (((symbol-function 'tramp-rpc--write-remote-process)
+                         (lambda (_vec _pid data &optional _owner)
+                           (push data remote-writes))))
+                ;; More than a pipe buffer, forcing the filter to run inside
+                ;; the write rather than only after delivery has returned.
+                (dotimes (_ 2)
+                  (pcase path
+                    ('pty
+                     (puthash relay (list :pending-output (list payload))
+                              tramp-rpc--pty-processes)
+                     (tramp-rpc--deliver-pending-pty-output relay))
+                    (_ (tramp-rpc--deliver-process-output
+                        relay (and (eq path 'stdout) payload)
+                        (and (not (eq path 'stdout)) payload)
+                        (and stderr-relay t)))))
+                (tramp-rpc-mock-test--wait-for
+                 (lambda () (>= (length output) (* 2 (length payload))))
+                 "both relay payloads" target))
+              (should replied)
+              (should (equal remote-writes (list reply)))
+              (should (equal output (concat payload payload))))
+          (dolist (process (list relay stderr-relay))
+            (when (process-live-p process) (delete-process process))))))))
 
 (ert-deftest tramp-rpc-mock-test-call-async-send-failure-rolls-back-callback ()
   "A rejected async send must not leave callback state behind."
@@ -1874,8 +2022,8 @@ This matches the behavior expected by `tramp-test28-process-file'."
       (when (buffer-live-p buffer)
         (kill-buffer buffer)))))
 
-(ert-deftest tramp-rpc-mock-test-pty-subscription-error-exits-process ()
-  "A PTY subscription error terminates the process with exit code -1."
+(ert-deftest tramp-rpc-mock-test-pty-read-error-exits-process ()
+  "A PTY exit without a status terminates the process with exit code -1."
   (let ((process (make-pipe-process
                   :name "tramp-rpc-pty-sub-error-mock"
                   :noquery t))
@@ -1891,6 +2039,41 @@ This matches the behavior expected by `tramp-test28-process-file'."
           (should (= (process-get process :tramp-rpc-exit-code) -1)))
       (remhash process tramp-rpc--pty-processes)
       (when (process-live-p process) (delete-process process)))))
+
+(ert-deftest tramp-rpc-mock-test-generation-cleanup-survives-failing-hooks ()
+  "A failing terminate or cleanup hook must not strand a generation.
+`cleanup-started' is claimed before the hooks run, so an error or quit in
+them would otherwise leave the generation permanently un-cleanable with its
+async callbacks and local relays leaked."
+  (let* ((vec (tramp-dissect-file-name "/rpc:cleanup-hook:/tmp/"))
+         (buffer (generate-new-buffer " *tramp-rpc-cleanup-hook*"))
+         (connection (start-process "tramp-rpc-cleanup-hook" buffer "sleep" "10"))
+         (conn (tramp-rpc--make-connection :process connection :buffer buffer
+                                           :vec vec))
+         (tramp-rpc--connections (make-hash-table :test 'equal))
+         (tramp-rpc--async-processes (make-hash-table :test 'eq))
+         (tramp-rpc--pty-processes (make-hash-table :test 'eq))
+         (tramp-rpc--process-write-queues (make-hash-table :test 'equal))
+         (tramp-rpc-transport-terminate-functions
+          (list (lambda (&rest _) (error "terminate hook failed"))))
+         (tramp-rpc-transport-cleanup-functions
+          (list (lambda (&rest _) (error "cleanup hook failed"))))
+         (callbacks 0))
+    (unwind-protect
+        (progn
+          (puthash (tramp-rpc--connection-key vec) conn tramp-rpc--connections)
+          (tramp-rpc--attach-connection conn)
+          (puthash 7 (lambda (_response) (setq callbacks (1+ callbacks)))
+                   (tramp-rpc-connection-async-callbacks conn))
+          (tramp-rpc--cleanup-connection-generation
+           connection vec "hook failure\n" :explicit-disconnect t)
+          (should (tramp-rpc-connection-transport-dead conn))
+          (should (tramp-rpc-connection-transport-cleaned conn))
+          (should (= callbacks 1))
+          (should-not (process-live-p connection)))
+      (when (process-live-p connection) (delete-process connection))
+      (when (buffer-live-p buffer) (kill-buffer buffer)))))
+
 
 (ert-deftest tramp-rpc-mock-test-pty-sigkill-status-reaches-sentinel-and-exit-status ()
   "A terminal SIGKILL result remains abnormal through the local PTY relay."
@@ -1915,6 +2098,40 @@ This matches the behavior expected by `tramp-test28-process-file'."
       (remhash process tramp-rpc--pty-processes)
       (when (process-live-p process) (delete-process process)))))
 
+(ert-deftest tramp-rpc-mock-test-pty-delivery-reentered-during-write-keeps-order ()
+  "Output queued while a relay write waits follows the older output.
+A write to a full relay pipe runs timers, which can deliver again for the
+same process before the older chunks are written."
+  (let* ((buffer (generate-new-buffer " *tramp-rpc-pty-order*"))
+         (process (let ((process-connection-type nil))
+                    (start-process "tramp-rpc-pty-order" buffer "cat")))
+         (tramp-rpc--pty-processes (make-hash-table :test 'eq))
+         (send (symbol-function 'tramp-rpc--send-local-relay-string))
+         (reentered nil))
+    (unwind-protect
+        (progn
+          (puthash process (list :pending-output nil :pending-exit nil
+                                 :delivery-timer nil)
+                   tramp-rpc--pty-processes)
+          (set-process-sentinel process #'ignore)
+          (tramp-rpc--queue-pty-delivery process "a")
+          (tramp-rpc--queue-pty-delivery process "b")
+          (cl-letf (((symbol-function 'tramp-rpc--send-local-relay-string)
+                     (lambda (process string)
+                       (unless reentered
+                         (setq reentered t)
+                         (tramp-rpc--queue-pty-delivery process "c" 0 t)
+                         (tramp-rpc--deliver-pending-pty-output process))
+                       (funcall send process string))))
+            (tramp-rpc--deliver-pending-pty-output process))
+          (tramp-rpc-mock-test--wait-for
+           (lambda () (not (process-live-p process)))
+           "relay exit after the final output" process)
+          (should (equal (with-current-buffer buffer (buffer-string))
+                         "abc")))
+      (when (process-live-p process) (delete-process process))
+      (kill-buffer buffer))))
+
 (ert-deftest tramp-rpc-mock-test-pty-terminal-exit-calls-user-sentinel-once ()
   "A terminal PTY exit invokes the real user sentinel exactly once."
   (let* ((process (start-process "tramp-rpc-pty-terminal-exit" nil "cat"))
@@ -1928,7 +2145,7 @@ This matches the behavior expected by `tramp-test28-process-file'."
                                  :delivery-timer nil)
                    tramp-rpc--pty-processes)
           (set-process-sentinel process #'tramp-rpc--pty-sentinel)
-          ;; First exit notification (e.g. from subscription error path).
+          ;; First exit notification (e.g. from a server read error).
           (cl-letf (((symbol-function 'tramp-rpc--best-effort) #'ignore))
             (tramp-rpc--handle-pty-exit process -1))
           ;; `delete-process' queues the real sentinel callback.
@@ -1939,6 +2156,32 @@ This matches the behavior expected by `tramp-test28-process-file'."
           (cl-letf (((symbol-function 'tramp-rpc--best-effort) #'ignore))
             (tramp-rpc--handle-pty-exit process -1))
           (should (= calls 1)))
+      (when (process-live-p process) (delete-process process)))))
+
+(ert-deftest tramp-rpc-mock-test-pty-sentinel-reentry-kills-once ()
+  "Sentinel reentry during a kill wait must not send a second remote kill."
+  (let* ((process (make-pipe-process :name "pty-sentinel-reentry" :noquery t))
+         (tramp-rpc--pty-processes (make-hash-table :test 'eq))
+         (vec (tramp-dissect-file-name "/rpc:mock:/tmp/"))
+         (kills 0)
+         (user-calls 0))
+    (unwind-protect
+        (progn
+          (process-put process :tramp-rpc-user-sentinel
+                       (lambda (_process _event) (cl-incf user-calls)))
+          (puthash process (list :vec vec :pid 42) tramp-rpc--pty-processes)
+          (cl-letf (((symbol-function 'process-status) (lambda (_) 'signal))
+                    ((symbol-function 'tramp-rpc--call)
+                     (lambda (_vec method _params &optional _connection)
+                       (should (equal method "process.kill_pty"))
+                       (cl-incf kills)
+                       (when (= kills 1)
+                         (tramp-rpc--pty-sentinel process "killed\n"))
+                       t)))
+            (tramp-rpc--pty-sentinel process "killed\n"))
+          (should (= kills 1))
+          (should (= user-calls 1))
+          (should-not (gethash process tramp-rpc--pty-processes)))
       (when (process-live-p process) (delete-process process)))))
 
 (ert-deftest tramp-rpc-mock-test-transport-death-wakes-sync-call ()
@@ -1965,34 +2208,156 @@ This matches the behavior expected by `tramp-test28-process-file'."
       (when (process-live-p process) (delete-process process))
       (when (buffer-live-p buffer) (kill-buffer buffer)))))
 
+(ert-deftest tramp-rpc-mock-test-process-signal-status-and-exit-status ()
+  "A signal-killed remote process reports `signal' and its signal number.
+Local processes report `signal'/9 for SIGKILL; callers such as LSP and
+compile branch on that, so the 128 + signal exit code alone is not enough."
+  (let ((process (start-process "tramp-rpc-signal-status" nil "cat")))
+    (unwind-protect
+        (progn
+          (process-put process :tramp-rpc-pid 42)
+          (process-put process :tramp-rpc-exit-code 137)
+          (process-put process :tramp-rpc-exit-signal 9)
+          (process-put process :tramp-rpc-exited t)
+          (should (eq (tramp-rpc-handle-process-status process) 'signal))
+          (should (= (tramp-rpc-handle-process-exit-status process) 9)))
+      (when (process-live-p process) (delete-process process)))))
+
+(ert-deftest tramp-rpc-mock-test-signal-description-matches-emacs ()
+  "Signal descriptions match the strings local Emacs uses."
+  (should (equal (tramp-rpc-protocol-signal-description 9) "Killed"))
+  (should (equal (tramp-rpc-protocol-signal-description 15) "Terminated"))
+  (should (equal (tramp-rpc-protocol-signal-description 11) "Segmentation fault"))
+  (should (equal (tramp-rpc-protocol-signal-description 99) "Signal 99"))
+  (dolist (case '((10 "linux" "User defined signal 1")
+                  (10 "macos" "Bus error")
+                  (12 "macos" "Bad system call")
+                  (30 "linux" "Power failure")
+                  (30 "macos" "User defined signal 1")
+                  (31 "macos" "User defined signal 2")
+                  (10 nil "Signal 10")
+                  (30 "unknown" "Signal 30")
+                  ("USR1" nil "User defined signal 1")
+                  ("SIGBUS" nil "Bus error")))
+    (should (equal (tramp-rpc-protocol-signal-description
+                    (nth 0 case) (nth 1 case))
+                   (nth 2 case)))))
+
+(ert-deftest tramp-rpc-mock-test-signal-sentinel-retains-remote-os ()
+  "Signal sentinels use the remote OS even after its cache is cleared."
+  (let* ((vec (tramp-dissect-file-name "/rpc:signal-macos:/tmp/"))
+         (process (start-process "tramp-rpc-signal-os" nil "cat"))
+         (info '((os . "macos")))
+         (tramp-rpc--early-process-notifications nil))
+    (unwind-protect
+        (cl-letf (((symbol-function 'tramp-rpc--cached-system-info)
+                   (lambda (_vec) info))
+                  ((symbol-function 'tramp-rpc--call)
+                   (lambda (&rest _) (ert-fail "signal handling issued an RPC"))))
+          (process-put process :tramp-rpc-vec vec)
+          (tramp-rpc--register-managed-process process)
+          (setq info nil)
+          (process-put process :tramp-rpc-exit-signal 10)
+          (should (equal (tramp-rpc--remote-exit-event process "fallback")
+                         "bus error\n"))
+          (process-put process :tramp-rpc-exit-signal 30)
+          (should (equal (tramp-rpc--remote-exit-event process "fallback")
+                         "user defined signal 1\n")))
+      (when (process-live-p process) (delete-process process)))))
+
+(ert-deftest tramp-rpc-mock-test-process-file-macos-signal-strings ()
+  "Remote signal names and fallback numbers both use macOS descriptions."
+  (let ((vec (tramp-dissect-file-name "/rpc:signal-strings-macos:/tmp/")))
+    (unwind-protect
+        (cl-letf (((symbol-function 'tramp-rpc--cached-system-info)
+                   (lambda (_vec) '((os . "macos"))))
+                  ((symbol-function 'tramp-rpc--call)
+                   (lambda (&rest _)
+                     '((exit_code . 0)
+                       (stdout . "HUP INT QUIT ILL TRAP ABRT EMT FPE KILL BUS SEGV SYS PIPE ALRM TERM URG STOP TSTP CONT CHLD TTIN TTOU IO XCPU XFSZ VTALRM PROF WINCH INFO USR1 USR2")))))
+          (let ((strings (tramp-rpc--get-signal-strings vec)))
+            (should (equal (aref strings 10) "Bus error"))
+            (should (equal (aref strings 30) "User defined signal 1")))
+          (tramp-rpc--flush-route-connection-property vec "rpc-signal-strings")
+          (cl-letf (((symbol-function 'tramp-rpc--call)
+                     (lambda (&rest _) '((exit_code . 1) (stdout . "")))))
+            (should (equal (aref (tramp-rpc--get-signal-strings vec) 30)
+                           "User defined signal 1"))))
+      (tramp-rpc--flush-route-connection-property vec "rpc-signal-strings"))))
+
+(ert-deftest tramp-rpc-mock-test-signal-exit-still-sends-relay-eof ()
+  "A signal-killed process must still send EOF to its local relay.
+The advised `process-status' must keep reporting the draining relay as live
+after the remote signal is recorded; otherwise `process-live-p' turns false
+and the relay (and its sentinel) stays alive forever.  The `tramp-vector'
+property is required for the advised status to be consulted, which is why a
+direct property test would miss it."
+  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
+  (let* ((vec (tramp-dissect-file-name "/rpc:user@host:/tmp/"))
+         (process (start-process "tramp-rpc-signal-eof" nil "cat"))
+         (tramp-rpc--async-processes (make-hash-table :test 'eq))
+         (tramp-rpc--process-write-queues (make-hash-table :test 'equal))
+         eof-sent)
+    (unwind-protect
+        (progn
+          (process-put process 'tramp-vector vec)
+          (process-put process :tramp-rpc-pid 42)
+          (puthash process (list :vec vec :pid 42 :connection-process nil)
+                   tramp-rpc--async-processes)
+          (cl-letf (((symbol-function 'process-send-eof)
+                     (lambda (proc) (setq eof-sent proc))))
+            (tramp-rpc--handle-process-exit process 137 9))
+          (should (eq eof-sent process))
+          (should (eq (process-get process :tramp-rpc-exit-signal) 9))
+          (should (process-get process :tramp-rpc-remote-exited)))
+      (when (processp process) (ignore-errors (delete-process process))))))
+
+(ert-deftest tramp-rpc-mock-test-pty-signal-exit-still-sends-relay-eof ()
+  "A signal-killed PTY process must still send EOF to its local relay."
+  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
+  (let* ((vec (tramp-dissect-file-name "/rpc:user@host:/tmp/"))
+         (process (start-process "tramp-rpc-pty-signal-eof" nil "cat"))
+         (tramp-rpc--pty-processes (make-hash-table :test 'eq))
+         eof-sent)
+    (unwind-protect
+        (progn
+          (process-put process 'tramp-vector vec)
+          (process-put process :tramp-rpc-pid 42)
+          (process-put process :tramp-rpc-pty t)
+          (puthash process '(:poll-timer nil) tramp-rpc--pty-processes)
+          (cl-letf (((symbol-function 'process-send-eof)
+                     (lambda (proc) (setq eof-sent proc))))
+            (tramp-rpc--handle-pty-exit process 137 9))
+          (should (eq eof-sent process))
+          (should (eq (process-get process :tramp-rpc-exit-signal) 9))
+          (should (process-get process :tramp-rpc-remote-exited)))
+      (when (processp process) (ignore-errors (delete-process process))))))
+
 (ert-deftest tramp-rpc-mock-test-pty-constructor-keeps-owning-generation ()
-  "RPC PTY construction retains the transport generation used at exit."
+  "RPC PTY construction retains its generation; exit needs no further RPC."
   (let* ((connection-process
           (make-pipe-process :name "tramp-rpc-old-generation-mock" :noquery t))
          (connection (tramp-rpc--make-connection :process connection-process))
          (vec (tramp-dissect-file-name "/rpc:pty-generation:/tmp/"))
          (tramp-rpc--pty-processes (make-hash-table :test 'eq))
-         local-process captured-connection)
+         local-process)
     (unwind-protect
         (cl-letf (((symbol-function 'tramp-rpc--call)
-                   (lambda (_vec method params &optional captured)
+                   (lambda (_vec method _params &optional _captured)
                      (pcase method
                        ("process.start_pty" '((pid . 42) (tty_name . "/dev/pts/42")))
-                       ("process.close_pty"
-                        (should (equal params '((pid . 42))))
-                        (setq captured-connection captured)
-                        '((ok . t))))))
-                  ((symbol-function 'tramp-rpc--get-connection)
-                   (lambda (_vec) connection))
-                  ((symbol-function 'tramp-rpc--pty-start-async-read) #'ignore))
+                       (_ (error "Unexpected RPC %s" method)))))
+                  ((symbol-function 'tramp-rpc--ensure-connection)
+                   (lambda (_vec) connection)))
           (setq local-process
                 (tramp-rpc--make-rpc-pty-process
                  vec "tramp-rpc-pty-generation-mock" nil '("true") nil t
                  nil nil "/tmp/"))
           (should (eq (process-get local-process :tramp-rpc-connection)
                       connection))
+          ;; The server released the PTY when it reported the exit.
           (tramp-rpc--handle-pty-exit local-process 0)
-          (should (eq captured-connection connection)))
+          (should (process-get local-process :tramp-rpc-remote-exited)))
       (when (and local-process (process-live-p local-process))
         (delete-process local-process))
       (when (process-live-p connection-process)
@@ -2227,49 +2592,24 @@ This matches the behavior expected by `tramp-test28-process-file'."
           (should (= calls 1)))
       (when (process-live-p process) (delete-process process)))))
 
-(ert-deftest tramp-rpc-mock-test-direct-pty-deferred-sentinel-preserves-replacement ()
-  "Deferred direct-PTY wrapping retains a caller replacement sentinel once."
-  (let* ((process (start-process "tramp-rpc-direct-pty-deferred" nil "cat"))
+(ert-deftest tramp-rpc-mock-test-direct-pty-replaced-sentinel-is-called-once ()
+  "A sentinel set after a direct PTY starts runs once and keeps tracking."
+  (let* ((process (start-process "tramp-rpc-direct-pty-replaced" nil "cat"))
          (tramp-rpc--pty-processes (make-hash-table :test 'eq))
-         (calls 0))
+         (calls 0)
+         (sentinel (lambda (_process _event) (cl-incf calls))))
     (unwind-protect
         (progn
-          (process-put process :tramp-rpc-user-sentinel #'ignore)
           (puthash process '(:direct-ssh t) tramp-rpc--pty-processes)
-          (set-process-sentinel process #'tramp-rpc--direct-ssh-pty-sentinel)
-          ;; Simulate a caller replacing the sentinel before the deferred
-          ;; installer runs at the end of `make-process' setup.
-          (set-process-sentinel process (lambda (_process _event) (cl-incf calls)))
-          (tramp-rpc--install-direct-ssh-pty-sentinel process)
+          (tramp-rpc--install-own-sentinel
+           process #'tramp-rpc--direct-ssh-pty-sentinel)
+          (tramp-rpc-handle-set-process-sentinel process sentinel)
+          (should (eq (tramp-rpc-handle-process-sentinel process) sentinel))
           (delete-process process)
           (tramp-rpc-mock-test--wait-for
            (lambda () (and (not (gethash process tramp-rpc--pty-processes))
                            (= calls 1)))
            "replacement direct PTY sentinel")
-          (should-not (gethash process tramp-rpc--pty-processes))
-          (should (= calls 1)))
-      (when (process-live-p process) (delete-process process)))))
-
-(ert-deftest tramp-rpc-mock-test-direct-pty-exits-before-deferred-installer ()
-  "A direct PTY that exits before sentinel installation releases tracking."
-  (let* ((process (start-process "tramp-rpc-direct-pty-early-exit" nil "cat"))
-         (tramp-rpc--pty-processes (make-hash-table :test 'eq))
-         (calls 0))
-    (unwind-protect
-        (progn
-          (puthash process '(:direct-ssh t) tramp-rpc--pty-processes)
-          ;; Simulate a caller replacing our sentinel before the timer runs.
-          (set-process-sentinel process (lambda (_process _event) (cl-incf calls)))
-          (delete-process process)
-          (let ((deadline (+ (float-time) 1.0)))
-            (while (and (< (float-time) deadline)
-                        (or (process-live-p process) (= calls 0)))
-              (accept-process-output nil 0.01)))
-          (ert-info ((format "process status: %S" (process-status process)))
-            (should-not (process-live-p process))
-            (should (= calls 1)))
-          (tramp-rpc--install-direct-ssh-pty-sentinel process)
-          (should-not (gethash process tramp-rpc--pty-processes))
           (should (= calls 1)))
       (when (process-live-p process) (delete-process process)))))
 
@@ -2418,9 +2758,6 @@ This matches the behavior expected by `tramp-test28-process-file'."
       (dolist (buffer (list buffer-a buffer-b))
         (when (buffer-live-p buffer) (kill-buffer buffer))))))
 
-(defvar tramp-rpc-mock-test--isolate-tests nil
-  "Non-nil while a TRAMP-RPC mock selector is running.")
-
 (defun tramp-rpc-mock-test--run-isolated (run-test test)
   "Run a selected mock TEST with no state shared with other mock tests."
   (if (and tramp-rpc-mock-test--isolate-tests
@@ -2497,10 +2834,10 @@ This matches the behavior expected by `tramp-test28-process-file'."
          (emacs (or (executable-find "emacs")
                     (error "Cannot find Emacs executable")))
          (wrapper (expand-file-name "emacs-wrapper" runner-temp-directory))
-         (supported-source (getenv "TRAMP_SOURCE"))
          (skipped (expand-file-name "skipped.el" runner-temp-directory))
          (empty (expand-file-name "empty.el" runner-temp-directory))
-         (unsupported (expand-file-name "unsupported" runner-temp-directory)))
+         (unsupported (expand-file-name "unsupported" runner-temp-directory))
+         (supported (expand-file-name "supported" runner-temp-directory)))
     (unwind-protect
         (progn
           (with-temp-file wrapper
@@ -2518,6 +2855,11 @@ This matches the behavior expected by `tramp-test28-process-file'."
           (make-directory (expand-file-name "lisp" unsupported) t)
           (with-temp-file (expand-file-name "lisp/tramp.el" unsupported)
             (insert "(defvar tramp-version \"0\")\n(provide 'tramp)\n"))
+          ;; A fake supported Tramp keeps the guard checks independent of the
+          ;; bundled Tramp version, which is older than the minimum on Emacs 30.
+          (make-directory (expand-file-name "lisp" supported) t)
+          (with-temp-file (expand-file-name "lisp/tramp.el" supported)
+            (insert "(defvar tramp-version \"99.0\")\n(provide 'tramp)\n"))
           (cl-labels
               ((run (test-file &optional tramp-source)
                  (with-temp-buffer
@@ -2536,11 +2878,11 @@ This matches the behavior expected by `tramp-test28-process-file'."
                                    process-environment))))
                      (list (call-process runner nil t nil "--protocol")
                            (buffer-string))))))
-            (pcase-let ((`(,status ,output) (run skipped supported-source)))
+            (pcase-let ((`(,status ,output) (run skipped supported)))
               (should (/= status 0))
               (should (string-match-p
                        "ERT counts: selected=2 executed=0 skipped=2" output)))
-            (pcase-let ((`(,status ,output) (run empty supported-source)))
+            (pcase-let ((`(,status ,output) (run empty supported)))
               (should (/= status 0))
               (should (string-match-p "selected zero tests" output)))
             (pcase-let ((`(,status ,output) (run skipped unsupported)))
@@ -2683,6 +3025,33 @@ This matches the behavior expected by `tramp-test28-process-file'."
                 tramp-rpc-magit--process-caches)
        ,@body)))
 
+(ert-deftest tramp-rpc-mock-test-magit-status-memo-before-snapshot ()
+  "Before the snapshot exists, a status command reuses read-only git results."
+  (skip-unless tramp-rpc-mock-test--tramp-rpc-magit-loaded)
+  (let ((default-directory "/ssh:mock:/repo/")
+        (tramp-rpc-magit--process-caches (make-hash-table :test 'equal))
+        (tramp-rpc-magit--allow-process-cache t)
+        (tramp-rpc-magit--status-memo (make-hash-table :test 'equal))
+        (process-environment (default-toplevel-value 'process-environment)))
+    (cl-letf (((symbol-function 'tramp-rpc--connection-key)
+               (lambda (_vec) '("rpc" nil "mock" nil))))
+      (should-not (tramp-rpc-magit--process-cache-lookup
+                   "git" '("rev-parse" "--show-toplevel")))
+      (tramp-rpc-magit--process-cache-store
+       "git" '("rev-parse" "--show-toplevel") 0 "/repo\n")
+      (should (equal (tramp-rpc-magit--process-cache-lookup
+                      "git" '("rev-parse" "--show-toplevel"))
+                     '(0 . "/repo\n")))
+      ;; Another directory has its own answers.
+      (let ((default-directory "/ssh:mock:/repo/sub/"))
+        (should-not (tramp-rpc-magit--process-cache-lookup
+                     "git" '("rev-parse" "--show-toplevel"))))
+      ;; A command that may change the repository forgets everything.
+      (tramp-rpc-magit--process-cache-store
+       "git" '("update-index" "--refresh") 1 "")
+      (should-not (tramp-rpc-magit--process-cache-lookup
+                   "git" '("rev-parse" "--show-toplevel"))))))
+
 (ert-deftest tramp-rpc-mock-test-git-process-cache-skips-admission-failures ()
   "Transient parallel admission failures are not stored as git results."
   (skip-unless tramp-rpc-mock-test--tramp-rpc-magit-loaded)
@@ -2752,6 +3121,32 @@ This matches the behavior expected by `tramp-test28-process-file'."
       (should-not (gethash (tramp-rpc-magit--process-cache-key
                             "update-index" "--refresh")
                            cache)))))
+
+(ert-deftest tramp-rpc-mock-test-magit-prefetch-after-stale-update-index ()
+  "`update-index --refresh' exiting 1 (stale files) still builds the snapshot."
+  (skip-unless tramp-rpc-mock-test--tramp-rpc-magit-loaded)
+  (dolist (exit-code '(0 1 128))
+    (let ((default-directory "/rpc:user@host:/repo/")
+          (tramp-rpc-magit--allow-process-cache t)
+          (prefetched nil))
+      (cl-letf (((symbol-function 'tramp-rpc--process-environment)
+                 (lambda (&rest _) nil))
+                ((symbol-function 'tramp-rpc-magit--process-cache-lookup)
+                 (lambda (&rest _) nil))
+                ((symbol-function 'tramp-rpc--decode-output)
+                 (lambda (output) output))
+                ((symbol-function 'tramp-rpc--call)
+                 (lambda (&rest _)
+                   `((exit_code . ,exit-code) (stdout . "") (stderr . ""))))
+                ((symbol-function 'tramp-rpc-magit--clear-status-cache-for-connection)
+                 #'ignore)
+                ((symbol-function 'tramp-rpc-magit--prefetch)
+                 (lambda (directory) (setq prefetched directory))))
+        (should (= exit-code
+                   (tramp-rpc-handle-process-file
+                    "git" nil nil nil "update-index" "--refresh")))
+        (should (equal prefetched
+                       (and (< exit-code 2) default-directory)))))))
 
 (ert-deftest tramp-rpc-mock-test-git-process-cache-does-not-reuse-subdir ()
   "A repo-root process cache is not reused for a different cwd."
@@ -2907,8 +3302,9 @@ This matches the behavior expected by `tramp-test28-process-file'."
         (files (cl-loop for i below 40
                         collect (format "/repo/file-%02d" i)))
         batch-sizes)
-    (cl-letf (((symbol-function 'tramp-rpc--call-batch)
-               (lambda (_vec requests)
+    (cl-letf (((symbol-function 'tramp-rpc--ensure-connection) (lambda (_vec) 'generation))
+              ((symbol-function 'tramp-rpc--call-batch-1)
+               (lambda (_vec requests &optional _connection)
                  (push (length requests) batch-sizes)
                  (make-list (length requests) '(:error -1)))))
       (tramp-rpc-magit--prefetch-file-metadata vec files))
@@ -2956,7 +3352,8 @@ This matches the behavior expected by `tramp-test28-process-file'."
         (cl-letf (((symbol-function 'file-symlink-p)
                    (lambda (_filename) "/tmp/real"))
                   ((symbol-function 'tramp-rpc--system-info)
-                   (lambda (_vec) '((os . "linux") (watcher . "inotify"))))
+                   (lambda (_vec) '((os . "linux") (watcher . "inotify")
+                                   (watch_remove_nofollow . t))))
                   ((symbol-function 'tramp-rpc--call)
                    (lambda (_vec method params)
                      (push (list method params) calls)
@@ -3002,7 +3399,8 @@ This matches the behavior expected by `tramp-test28-process-file'."
         (cl-letf (((symbol-function 'file-symlink-p)
                    (lambda (_filename) "/tmp/real"))
                   ((symbol-function 'tramp-rpc--system-info)
-                   (lambda (_vec) '((os . "linux") (watcher . "inotify"))))
+                   (lambda (_vec) '((os . "linux") (watcher . "inotify")
+                                   (watch_remove_nofollow . t))))
                   ((symbol-function 'tramp-rpc--call)
                    (lambda (_vec method _params)
                      (push method calls)
@@ -3466,6 +3864,128 @@ This matches the behavior expected by `tramp-test28-process-file'."
       (tramp-rpc--delete-file-notify-descriptor-process descriptor)
       (tramp-rpc--delete-file-notify-descriptor-process other-descriptor))))
 
+(ert-deftest tramp-rpc-mock-test-file-notify-failed-registration-does-not-leak ()
+  "A rejected server watch leaves neither a descriptor nor watch state."
+  (let ((tramp-rpc--file-notify-descriptors (make-hash-table :test 'eq))
+        (tramp-rpc--file-notify-watch-counts (make-hash-table :test 'equal))
+        (tramp-rpc--watched-directories (make-hash-table :test 'equal))
+        (before (process-list)))
+    (unwind-protect
+        (cl-letf (((symbol-function 'file-symlink-p) (lambda (_) nil))
+                  ((symbol-function 'tramp-rpc--system-info)
+                   (lambda (_) '((os . "linux"))))
+                  ((symbol-function 'tramp-rpc--call)
+                   (lambda (_vec method _params)
+                     (should (equal method "watch.add"))
+                     (signal 'remote-file-error '("Watch registration failed")))))
+          (should-error
+           (tramp-rpc-handle-file-notify-add-watch
+            "/rpc:mock:/missing/" '(change) #'ignore)
+           :type 'remote-file-error)
+          (should-not (cl-set-difference (process-list) before))
+          (should (zerop (hash-table-count tramp-rpc--file-notify-descriptors)))
+          (should (zerop (hash-table-count tramp-rpc--file-notify-watch-counts))))
+      (dolist (process (cl-set-difference (process-list) before))
+        (tramp-rpc--delete-file-notify-descriptor-process process)))))
+
+(ert-deftest tramp-rpc-mock-test-file-notify-descriptor-creation-failure-keeps-counts ()
+  "Failed local setup neither acquires a watch nor increments a shared one."
+  (dolist (shared '(nil t))
+    (let* ((tramp-rpc--file-notify-descriptors (make-hash-table :test 'eq))
+           (tramp-rpc--file-notify-watch-counts (make-hash-table :test 'equal))
+           (tramp-rpc--watched-directories (make-hash-table :test 'equal))
+           (directory "/rpc:mock:/tmp/watch/")
+           (before (process-list))
+           calls descriptor)
+      (unwind-protect
+          (cl-letf (((symbol-function 'file-symlink-p) (lambda (_) nil))
+                    ((symbol-function 'tramp-rpc--system-info)
+                     (lambda (_) '((os . "linux"))))
+                    ((symbol-function 'tramp-rpc--call)
+                     (lambda (_vec method _params)
+                       (push method calls)
+                       '((path . "/tmp/watch/")))))
+            (when shared
+              (setq descriptor
+                    (tramp-rpc-handle-file-notify-add-watch
+                     directory '(change) #'ignore)))
+            (let ((counts (copy-tree (hash-table-values
+                                      tramp-rpc--file-notify-watch-counts)))
+                  (saved-calls (copy-sequence calls)))
+              (cl-letf (((symbol-function 'make-pipe-process)
+                         (lambda (&rest _) (error "Descriptor creation failed"))))
+                (should-error
+                 (tramp-rpc-handle-file-notify-add-watch
+                  directory '(change) #'ignore)))
+              (should (equal calls saved-calls))
+              (should (equal counts (hash-table-values
+                                     tramp-rpc--file-notify-watch-counts)))
+              (should (= (hash-table-count tramp-rpc--file-notify-descriptors)
+                         (if shared 1 0))))
+            (when descriptor
+              (tramp-rpc-handle-file-notify-rm-watch descriptor))
+            (should (zerop (hash-table-count tramp-rpc--file-notify-watch-counts)))
+            (should (equal (nreverse calls)
+                           (and shared '("watch.add" "watch.remove"))))
+            (should-not (cl-set-difference (process-list) before)))
+        (dolist (process (cl-set-difference (process-list) before))
+          (tramp-rpc--delete-file-notify-descriptor-process process))))))
+
+(ert-deftest tramp-rpc-mock-test-file-notify-descriptor-initialization-unwinds ()
+  "Errors and quits after process creation close the partial descriptor."
+  (dolist (failure '(error quit))
+    (let ((tramp-rpc--file-notify-descriptors (make-hash-table :test 'eq))
+          (tramp-rpc--file-notify-watch-counts (make-hash-table :test 'equal))
+          (tramp-rpc--watched-directories (make-hash-table :test 'equal))
+          (before (process-list)))
+      (unwind-protect
+          (cl-letf (((symbol-function 'file-symlink-p) (lambda (_) nil))
+                    ((symbol-function 'tramp-rpc--system-info)
+                     (lambda (_) '((os . "linux"))))
+                    ((symbol-function 'tramp-set-connection-property)
+                     (lambda (&rest _)
+                       (signal failure '("Descriptor initialization failed"))))
+                    ((symbol-function 'tramp-rpc--call)
+                     (lambda (&rest _)
+                       (ert-fail "Watch must not be acquired before local setup"))))
+            (should
+             (eq failure
+                 (condition-case err
+                     (tramp-rpc-handle-file-notify-add-watch
+                      "/rpc:mock:/tmp/watch/" '(change) #'ignore)
+                   ((error quit) (car err)))))
+            (should-not (cl-set-difference (process-list) before))
+            (should (zerop (hash-table-count tramp-rpc--file-notify-descriptors)))
+            (should (zerop (hash-table-count tramp-rpc--file-notify-watch-counts))))
+        (dolist (process (cl-set-difference (process-list) before))
+          (tramp-rpc--delete-file-notify-descriptor-process process))))))
+
+(ert-deftest tramp-rpc-mock-test-file-notify-registration-quit-closes-descriptor ()
+  "Quitting watch registration closes the provisional local descriptor."
+  (let ((tramp-rpc--file-notify-descriptors (make-hash-table :test 'eq))
+        (tramp-rpc--file-notify-watch-counts (make-hash-table :test 'equal))
+        (tramp-rpc--watched-directories (make-hash-table :test 'equal))
+        (before (process-list)))
+    (unwind-protect
+        (cl-letf (((symbol-function 'file-symlink-p) (lambda (_) nil))
+                  ((symbol-function 'tramp-rpc--system-info)
+                   (lambda (_) '((os . "linux"))))
+                  ((symbol-function 'tramp-rpc--call)
+                   (lambda (_vec method _params)
+                     (should (equal method "watch.add"))
+                     (signal 'quit nil))))
+          (should
+           (eq 'quit
+               (condition-case nil
+                   (tramp-rpc-handle-file-notify-add-watch
+                    "/rpc:mock:/tmp/watch/" '(change) #'ignore)
+                 (quit 'quit))))
+          (should-not (cl-set-difference (process-list) before))
+          (should (zerop (hash-table-count tramp-rpc--file-notify-descriptors)))
+          (should (zerop (hash-table-count tramp-rpc--file-notify-watch-counts))))
+      (dolist (process (cl-set-difference (process-list) before))
+        (tramp-rpc--delete-file-notify-descriptor-process process)))))
+
 (ert-deftest tramp-rpc-mock-test-file-notify-dispatch-matches-canonical-directory ()
   "Dispatch matches canonical watch paths returned by the server."
   (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
@@ -3819,7 +4339,11 @@ This matches the behavior expected by `tramp-test28-process-file'."
           (should (string-match-p
                    "DONE"
                    (with-current-buffer stdout-buffer (buffer-string))))
-          (should (> (with-current-buffer stderr-buffer (buffer-size)) 100000)))
+          ;; A full 200000-byte stderr stream must have been drained (or the
+          ;; child would still be blocked on a full pipe), and the retained
+          ;; buffer is bounded to its configured tail.
+          (should (= (with-current-buffer stderr-buffer (buffer-size))
+                     tramp-rpc-stderr-buffer-limit)))
       (when (process-live-p process)
         (delete-process process))
       (ignore-errors
@@ -4906,7 +5430,7 @@ This matches the behavior expected by `tramp-test28-process-file'."
   "Test the git install prompt offers download but not build without Cargo."
   :tags '(:deploy)
   (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
-  (let ((tramp-rpc-deploy--allow-prompt t)
+  (let ((tramp-rpc-deploy--plan (tramp-rpc-deploy--make-plan :prompt t))
         prompt choices)
     (cl-letf (((symbol-function 'tramp-rpc-deploy--cargo-available-p)
                (lambda () nil))
@@ -4925,7 +5449,7 @@ This matches the behavior expected by `tramp-test28-process-file'."
   "Test the git install prompt offers a source build when available."
   :tags '(:deploy)
   (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
-  (let ((tramp-rpc-deploy--allow-prompt t)
+  (let ((tramp-rpc-deploy--plan (tramp-rpc-deploy--make-plan :prompt t))
         choices)
     (cl-letf (((symbol-function 'tramp-rpc-deploy--cargo-available-p)
                (lambda () t))
@@ -4943,7 +5467,7 @@ This matches the behavior expected by `tramp-test28-process-file'."
   "Test automatic deployment reports the explicit install command."
   :tags '(:deploy)
   (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
-  (let ((tramp-rpc-deploy--allow-prompt nil))
+  (let ((tramp-rpc-deploy--plan nil))
     (let ((err (should-error
                 (tramp-rpc-deploy--ask-git-install-action "x86_64-linux")
                 :type 'remote-file-error)))
@@ -4964,9 +5488,9 @@ Each entry is (HOST ALLOW-PROMPT FORCE-OBTAIN AUTO-DEPLOY)."
              ((symbol-function 'tramp-rpc-deploy--remote-binary-matches-p)
               (lambda (vec _binary)
                 (push (list (tramp-file-name-host vec)
-                            tramp-rpc-deploy--allow-prompt
-                            tramp-rpc-deploy--force-obtain
-                            tramp-rpc-deploy-auto-deploy)
+                            (tramp-rpc-deploy-plan-prompt tramp-rpc-deploy--plan)
+                            (tramp-rpc-deploy-plan-force tramp-rpc-deploy--plan)
+                            (eq 'auto (tramp-rpc-deploy-plan-mode tramp-rpc-deploy--plan)))
                       ,record)
                 t))
              ((symbol-function 'tramp-rpc-deploy--detect-remote-arch)
@@ -4976,9 +5500,9 @@ Each entry is (HOST ALLOW-PROMPT FORCE-OBTAIN AUTO-DEPLOY)."
              ((symbol-function 'tramp-rpc-deploy--transfer-binary)
               (lambda (vec _binary)
                 (push (list (tramp-file-name-host vec)
-                            tramp-rpc-deploy--allow-prompt
-                            tramp-rpc-deploy--force-obtain
-                            tramp-rpc-deploy-auto-deploy)
+                            (tramp-rpc-deploy-plan-prompt tramp-rpc-deploy--plan)
+                            (tramp-rpc-deploy-plan-force tramp-rpc-deploy--plan)
+                            (eq 'auto (tramp-rpc-deploy-plan-mode tramp-rpc-deploy--plan)))
                       ,record)
                 (tramp-make-tramp-file-name vec "/tmp/tramp-rpc-server"))))
      ,@body))
@@ -4994,9 +5518,7 @@ Each entry is (HOST ALLOW-PROMPT FORCE-OBTAIN AUTO-DEPLOY)."
     (tramp-rpc-mock-test--with-deploy-stubs deploys
       (tramp-rpc-deploy-install-binary vec t))
     (should (equal deploys '(("target" t t t))))
-    (should-not tramp-rpc-deploy--allow-prompt)
-    (should-not tramp-rpc-deploy--force-obtain)
-    (should-not tramp-rpc-deploy--explicit-target)
+    (should-not tramp-rpc-deploy--plan)
     (should-not tramp-rpc-deploy-auto-deploy)))
 
 (ert-deftest tramp-rpc-mock-test-deploy-install-flags-scoped-to-target ()
@@ -5008,10 +5530,7 @@ Each entry is (HOST ALLOW-PROMPT FORCE-OBTAIN AUTO-DEPLOY)."
         (tramp-rpc-deploy-auto-deploy t)
         (tramp-rpc-deploy-never-deploy nil)
         (deploys nil))
-    (let ((tramp-rpc-deploy--explicit-target
-           (tramp-rpc-deploy--target-key vec))
-          (tramp-rpc-deploy--explicit-force t)
-          (tramp-rpc-deploy--pre-explicit-auto-deploy t))
+    (let ((tramp-rpc-deploy--plan (tramp-rpc-deploy-plan vec t t)))
       (tramp-rpc-mock-test--with-deploy-stubs deploys
         (tramp-rpc-deploy-ensure-binary other)))
     (should (equal deploys '(("other" nil nil t))))))
@@ -5024,16 +5543,10 @@ Each entry is (HOST ALLOW-PROMPT FORCE-OBTAIN AUTO-DEPLOY)."
         (other (tramp-dissect-file-name "/rpc:user@other:/"))
         (tramp-rpc-deploy-never-deploy nil)
         (deploys nil))
-    ;; Simulate the dynamic environment inside an explicit installation for
-    ;; "target" invoked while the user has auto-deploy disabled:
-    ;; `tramp-rpc-deploy-ensure-binary' has already rebound
-    ;; `tramp-rpc-deploy-auto-deploy' to t for the explicit target when a
-    ;; reentrant deploy for "other" runs.
-    (let ((tramp-rpc-deploy--explicit-target
-           (tramp-rpc-deploy--target-key vec))
-          (tramp-rpc-deploy--explicit-force nil)
-          (tramp-rpc-deploy--pre-explicit-auto-deploy nil)
-          (tramp-rpc-deploy-auto-deploy t))
+    ;; Explicit permissions live in a target-scoped plan, leaving the user's
+    ;; disabled auto-deploy setting intact for a reentrant operation.
+    (let ((tramp-rpc-deploy-auto-deploy nil)
+          (tramp-rpc-deploy--plan (tramp-rpc-deploy-plan vec t)))
       (tramp-rpc-mock-test--with-deploy-stubs deploys
         (tramp-rpc-deploy-ensure-binary other)))
     (should (equal deploys '(("other" nil nil nil))))))
@@ -5053,7 +5566,7 @@ Each entry is (HOST ALLOW-PROMPT FORCE-OBTAIN AUTO-DEPLOY)."
   (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
   (let ((binary (make-temp-file "tramp-rpc-cached"))
         (replacement "replacement")
-        (tramp-rpc-deploy--force-obtain t))
+        (tramp-rpc-deploy--plan (tramp-rpc-deploy--make-plan :force t)))
     (unwind-protect
         (progn
           (set-file-modes binary #o755)
@@ -6213,13 +6726,13 @@ A rejected sudo password must not be reused on the next attempt, otherwise
                (lambda (&rest _) nil))
               ((symbol-function 'tramp-rpc--caller-environment)
                (lambda () nil))
+              ((symbol-function 'tramp-rpc--ensure-connection)
+               (lambda (_vec) (tramp-rpc--make-connection)))
               ((symbol-function 'tramp-rpc--start-remote-process)
-               (lambda (vec program args cwd _env)
+               (lambda (vec program args cwd _env &optional _connection)
                  (setq captured (list vec program args cwd))
                  4242))
               ((symbol-function 'tramp-rpc--write-remote-process)
-               (lambda (&rest _) nil))
-              ((symbol-function 'tramp-rpc--start-async-read)
                (lambda (&rest _) nil)))
       (unwind-protect
           (progn
@@ -6435,7 +6948,8 @@ A rejected sudo password must not be reused on the next attempt, otherwise
               ((symbol-function 'tramp-rpc--call)
                (lambda (_vec method _params)
                  (should (equal method "system.info"))
-                 '((uid . 0) (gid . 0) (home . "/root") (shell . "/bin/sh"))))
+                 `((protocol_revision . ,tramp-rpc-protocol-revision)
+                   (uid . 0) (gid . 0) (home . "/root") (shell . "/bin/sh"))))
               ((symbol-function 'tramp-set-connection-local-variables)
                (lambda (&rest _) nil)))
       (unwind-protect
@@ -6637,7 +7151,8 @@ A rejected sudo password must not be reused on the next attempt, otherwise
               ((symbol-function 'tramp-rpc--call)
                (lambda (_vec method _params)
                  (should (equal method "system.info"))
-                 '((uid . 0) (gid . 0) (home . "/root") (shell . "/bin/sh"))))
+                 `((protocol_revision . ,tramp-rpc-protocol-revision)
+                   (uid . 0) (gid . 0) (home . "/root") (shell . "/bin/sh"))))
               ((symbol-function 'tramp-set-connection-local-variables)
                (lambda (&rest _) nil)))
       (unwind-protect
@@ -7036,6 +7551,16 @@ background, which can precede the socket becoming visible."
 ;;; VC handler tests (No server or SSH required)
 ;;; ============================================================================
 
+(defun tramp-rpc-mock-test--reject-real-vc-exec-after ()
+  "Return a `tramp-run-real-handler' replacement rejecting `vc-exec-after'.
+Other operations, such as a pending sentinel of an earlier test asking for
+`process-status', still reach the real handler."
+  (let ((real (symbol-function 'tramp-run-real-handler)))
+    (lambda (operation &rest args)
+      (if (eq operation 'vc-exec-after)
+          (error "Unexpected process state")
+        (apply real operation args)))))
+
 (ert-deftest tramp-rpc-mock-test-vc-exec-after-logical-exit-runs-code ()
   "Test `vc-exec-after' handler treats exited TRAMP-RPC relays as done."
   :tags '(:vc-handler)
@@ -7051,10 +7576,13 @@ background, which can precede the socket becoming visible."
           (process-put proc :tramp-rpc-pid 123)
           (process-put proc :tramp-rpc-exited t)
           (cl-letf (((symbol-function 'tramp-run-real-handler)
-                     (lambda (&rest _) (error "Unexpected process state"))))
+                     (tramp-rpc-mock-test--reject-real-vc-exec-after)))
+            ;; Pass PROC explicitly so the check does not depend on
+            ;; `get-buffer-process' picking the relay out of the buffer.
             (tramp-rpc-handle-vc-exec-after
-             (lambda () (setq ran t))))
+             (lambda () (setq ran t)) nil proc))
           (should ran))
+      (set-process-sentinel proc #'ignore)
       (when (process-live-p proc)
         (delete-process proc))
       (kill-buffer buffer))))
@@ -7077,10 +7605,11 @@ background, which can precede the socket becoming visible."
           (cl-letf (((symbol-function 'process-status)
                      (lambda (_process) 'closed))
                     ((symbol-function 'tramp-run-real-handler)
-                     (lambda (&rest _) (error "Unexpected process state"))))
+                     (tramp-rpc-mock-test--reject-real-vc-exec-after)))
             (tramp-rpc-handle-vc-exec-after
              (lambda () (setq ran t))))
           (should ran))
+      (set-process-sentinel proc #'ignore)
       (when (process-live-p proc)
         (delete-process proc))
       (kill-buffer buffer))))
@@ -7102,13 +7631,14 @@ background, which can precede the socket becoming visible."
           (cl-letf (((symbol-function 'vc--process-sentinel)
                      (lambda (&rest _) (error "vc--process-sentinel called")))
                     ((symbol-function 'tramp-run-real-handler)
-                     (lambda (&rest _) (error "Unexpected process state"))))
+                     (tramp-rpc-mock-test--reject-real-vc-exec-after)))
             (tramp-rpc-handle-vc-exec-after
              (lambda () (setq ran t)))
             (cl-letf (((symbol-function 'process-status) (lambda (_process) 'exit))
                       ((symbol-function 'process-exit-status) (lambda (_process) 0)))
               (funcall (process-sentinel proc) proc "finished")))
           (should ran))
+      (set-process-sentinel proc #'ignore)
       (when (process-live-p proc)
         (delete-process proc))
       (kill-buffer buffer))))
@@ -7353,8 +7883,9 @@ discard it for being unreadable."
         (tramp-rpc--exec-path-cache (make-hash-table :test 'equal))
         (vec (make-tramp-file-name :method "rpc" :host "host" :user "user"
                                    :localname "/")))
-    (cl-letf (((symbol-function 'file-directory-p)
-               (lambda (_filename) t))
+    (cl-letf (((symbol-function 'tramp-rpc--call-batch)
+               (lambda (_vec requests)
+                 (make-list (length requests) '((type . "directory")))))
               ((symbol-function 'tramp-rpc--fetch-default-remote-path)
                (lambda (_vec) '("/bin" "/usr/bin")))
               ((symbol-function 'tramp-rpc--fetch-remote-exec-path)
@@ -7364,6 +7895,40 @@ discard it for being unreadable."
       (should (equal (tramp-rpc--remote-path-environment vec)
                      '(("PATH" . "/bin:/usr/bin:/home/user/.cargo/bin:/home/user/.local/bin")))))))
 
+(ert-deftest tramp-rpc-mock-test-remote-path-drops-missing-dirs-in-one-batch ()
+  "Candidate PATH directories are checked with a single batch request."
+  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
+  (let ((tramp-rpc-remote-path nil)
+        (tramp-remote-path '("/bin" "/missing" "/file" "/usr/bin"))
+        (vec (make-tramp-file-name :method "rpc" :host "host" :localname "/"))
+        (batches 0))
+    (cl-letf (((symbol-function 'tramp-rpc--call-batch)
+               (lambda (_vec requests)
+                 (cl-incf batches)
+                 (mapcar (lambda (request)
+                           (pcase (tramp-rpc--decode-string
+                                   (alist-get 'path (cdr request)))
+                             ("/missing" '(:error (:code -32001)))
+                             ("/file" '((type . "file")))
+                             (_ '((type . "directory")))))
+                         requests))))
+      (should (equal (tramp-rpc--compute-remote-path vec)
+                     '(("/bin" "/usr/bin") . t)))
+      (should (= batches 1)))))
+
+(ert-deftest tramp-rpc-mock-test-remote-path-keeps-dirs-when-check-fails ()
+  "A failed directory check keeps every candidate and is not cached."
+  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
+  (let ((tramp-rpc-remote-path nil)
+        (tramp-remote-path '("/bin" "/missing"))
+        (tramp-rpc--exec-path-cache (make-hash-table :test 'equal))
+        (vec (make-tramp-file-name :method "rpc" :host "host" :localname "/")))
+    (cl-letf (((symbol-function 'tramp-rpc--call-batch)
+               (lambda (&rest _)
+                 (signal 'remote-file-error '("RPC transport closed")))))
+      (should (equal (tramp-rpc--cached-remote-path vec) '("/bin" "/missing")))
+      (should (= (hash-table-count tramp-rpc--exec-path-cache) 0)))))
+
 (ert-deftest tramp-rpc-mock-test-remote-path-environment-compat-override ()
   "Test deprecated `tramp-rpc-remote-path' still overrides `tramp-remote-path'."
   (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
@@ -7372,8 +7937,9 @@ discard it for being unreadable."
         (tramp-rpc--exec-path-cache (make-hash-table :test 'equal))
         (vec (make-tramp-file-name :method "rpc" :host "host" :user "user"
                                    :localname "/")))
-    (cl-letf (((symbol-function 'file-directory-p)
-               (lambda (_filename) t))
+    (cl-letf (((symbol-function 'tramp-rpc--call-batch)
+               (lambda (_vec requests)
+                 (make-list (length requests) '((type . "directory")))))
               ((symbol-function 'tramp-rpc--fetch-remote-exec-path)
                (lambda (_vec) '("/login/bin"))))
       (should (equal (tramp-rpc--remote-path-environment vec)
@@ -7386,8 +7952,9 @@ discard it for being unreadable."
         (tramp-remote-path '(tramp-own-remote-path "/usr/bin"))
         (vec (make-tramp-file-name :method "rpc" :host "host" :user "user"
                                    :localname "/")))
-    (cl-letf (((symbol-function 'file-directory-p)
-               (lambda (_filename) t))
+    (cl-letf (((symbol-function 'tramp-rpc--call-batch)
+               (lambda (_vec requests)
+                 (make-list (length requests) '((type . "directory")))))
               ((symbol-function 'tramp-rpc--get-remote-login-shell)
                (lambda (_vec) "/bin/sh"))
               ((symbol-function 'tramp-rpc--call)
@@ -7587,6 +8154,27 @@ discard it for being unreadable."
        (setq body-env tramp-remote-process-environment)))
     (should (equal body-env
                    '("TERM=dumb" "PYTHONUNBUFFERED=1" "EXISTING=yes")))))
+
+(ert-deftest tramp-rpc-mock-test-interrupt-process-signals-remote-process ()
+  "`interrupt-process' sends SIGINT remotely and leaves the relay running."
+  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
+  (let ((process (start-process "tramp-rpc-interrupt-relay" nil "cat"))
+        (other (start-process "tramp-rpc-interrupt-local" nil "cat"))
+        captured)
+    (unwind-protect
+        (cl-letf (((symbol-function 'tramp-rpc--kill-remote-process)
+                   (lambda (_vec pid signal &optional _connection)
+                     (push (list pid signal) captured))))
+          (process-put process :tramp-rpc-vec
+                       (tramp-dissect-file-name "/rpc:host:/"))
+          (process-put process :tramp-rpc-pid 4242)
+          (should (tramp-rpc-handle-interrupt-process process))
+          (should (equal captured '((4242 2))))
+          (should (process-live-p process))
+          ;; Other processes are left to the next interrupt function.
+          (should-not (tramp-rpc-handle-interrupt-process other)))
+      (dolist (proc (list process other))
+        (when (process-live-p proc) (delete-process proc))))))
 
 (ert-deftest tramp-rpc-mock-test-signal-process-routes-remote-pid ()
   "Remote PID signals use RPC and relays retain their owning connection."
@@ -7791,6 +8379,52 @@ discard it for being unreadable."
               (should (string-match-p "missing executable" (buffer-string))))))
       (ignore-errors (delete-file stderr-file)))))
 
+(ert-deftest tramp-rpc-mock-test-process-file-signal-and-exit-codes ()
+  "`process-file' returns the raw exit code unless signal strings are opted in.
+This matches tramp-sh and upstream `tramp-test28-process-file', which requires
+128 + signal by default and a description only when
+`process-file-return-signal-string' is set."
+  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
+  (let ((default-directory "/rpc:user@host:/work/")
+        (process-file-side-effects nil)
+        (result '((exit_code . 0) (stdout . "") (stderr . ""))))
+    (cl-letf (((symbol-function 'tramp-rpc--cached-remote-path)
+               (lambda (_vec) '("/usr/bin")))
+              ((symbol-function 'tramp-rpc--get-direnv-environment)
+               (lambda (&rest _) nil))
+              ((symbol-function 'tramp-rpc--caller-environment)
+               (lambda () nil))
+              ((symbol-function 'tramp-rpc-magit--process-cache-lookup)
+               (lambda (&rest _) nil))
+              ((symbol-function 'tramp-rpc-magit--process-cache-store)
+               (lambda (&rest _) nil))
+              ((symbol-function 'tramp-rpc--get-signal-strings)
+               (lambda (_vec)
+                 (vector 0 "Hangup" "Interrupt" nil nil nil nil nil nil
+                         "Killed" nil "Segmentation fault" nil nil nil
+                         "Terminated")))
+              ((symbol-function 'tramp-rpc--call)
+               (lambda (&rest _) (copy-tree result))))
+      ;; A real signal stays an integer by default, exactly as tramp-sh does.
+      (setq result '((exit_code . 137) (signal . 9)
+                     (stdout . "") (stderr . "")))
+      (should (= (tramp-rpc-handle-process-file "cmd" nil nil nil) 137))
+      ;; Opting in produces the description from the real signal.
+      (let ((process-file-return-signal-string t))
+        (should (equal (tramp-rpc-handle-process-file "cmd" nil nil nil)
+                       "Killed")))
+      ;; A plain exit above 128 stays an integer by default and is described
+      ;; under the legacy interpretation only when opted in.
+      (setq result '((exit_code . 137) (stdout . "") (stderr . "")))
+      (should (= (tramp-rpc-handle-process-file "cmd" nil nil nil) 137))
+      (let ((process-file-return-signal-string t))
+        (should (equal (tramp-rpc-handle-process-file "cmd" nil nil nil)
+                       "Killed")))
+      ;; Exit 128 is not a signal, even when opted in.
+      (setq result '((exit_code . 128) (stdout . "") (stderr . "")))
+      (let ((process-file-return-signal-string t))
+        (should (= (tramp-rpc-handle-process-file "cmd" nil nil nil) 128))))))
+
 (ert-deftest tramp-rpc-mock-test-process-file-preserves-other-rpc-errors ()
   "A process cwd ENOENT remains a remote-file-error, not status 127."
   (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
@@ -7866,13 +8500,13 @@ discard it for being unreadable."
                (lambda (&rest _) nil))
               ((symbol-function 'tramp-rpc--caller-environment)
                (lambda () nil))
+              ((symbol-function 'tramp-rpc--ensure-connection)
+               (lambda (_vec) (tramp-rpc--make-connection)))
               ((symbol-function 'tramp-rpc--start-remote-process)
-               (lambda (_vec program args _cwd _env)
+               (lambda (_vec program args _cwd _env &optional _connection)
                  (setq started (list program args))
                  4242))
               ((symbol-function 'tramp-rpc--write-remote-process)
-               (lambda (&rest _) nil))
-              ((symbol-function 'tramp-rpc--start-async-read)
                (lambda (&rest _) nil))
               ((symbol-function 'tramp-rpc--make-pty-process)
                (lambda (&rest _)
@@ -7905,11 +8539,12 @@ discard it for being unreadable."
                (lambda (&rest _) nil))
               ((symbol-function 'tramp-rpc--caller-environment)
                (lambda () nil))
+              ((symbol-function 'tramp-rpc--ensure-connection)
+               (lambda (_vec) (tramp-rpc--make-connection)))
               ((symbol-function 'tramp-rpc--start-remote-process)
-               (lambda (_vec program args _cwd _env)
+               (lambda (_vec program args _cwd _env &optional _connection)
                  (setq started (cons program args))
-                 51))
-              ((symbol-function 'tramp-rpc--start-async-read) #'ignore))
+                 51)))
       (unwind-protect
           (progn
             (setq proc (tramp-rpc-handle-make-process
@@ -7977,15 +8612,15 @@ discard it for being unreadable."
                (lambda (&rest _) nil))
               ((symbol-function 'tramp-rpc--caller-environment)
                (lambda () nil))
+              ((symbol-function 'tramp-rpc--ensure-connection)
+               (lambda (_vec) (tramp-rpc--make-connection)))
               ((symbol-function 'tramp-rpc--start-remote-process)
-               (lambda (_vec program args _cwd _env)
+               (lambda (_vec program args _cwd _env &optional _connection)
                  (setq started (list program args))
                  4242))
               ((symbol-function 'tramp-rpc--write-remote-process)
-               (lambda (_vec pid data)
-                 (setq written (list pid data))))
-              ((symbol-function 'tramp-rpc--start-async-read)
-               (lambda (&rest _) nil)))
+               (lambda (_vec pid data &optional _owner)
+                 (setq written (list pid data)))))
       (unwind-protect
           (progn
             (setq proc (tramp-rpc-handle-make-process
@@ -8003,63 +8638,98 @@ discard it for being unreadable."
         (when (processp proc)
           (delete-process proc))))))
 
-(ert-deftest tramp-rpc-mock-test-process-cleanup-handles-already-exited-relay ()
-  "Deferred cleanup must remove relays that exit before installation."
+(ert-deftest tramp-rpc-mock-test-pipe-relay-sentinel-deletes-exited-relay ()
+  "An exited pipe relay is untracked and no longer its buffer's process."
   (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
-  (let* ((buffer (generate-new-buffer " *tramp-rpc-cleanup-exited-test*"))
+  (let* ((buffer (generate-new-buffer " *tramp-rpc-relay-delete-test*"))
          (proc (let ((process-connection-type nil))
-                 (start-process "tramp-rpc-cleanup-exited-test" buffer "cat"))))
+                 (start-process "tramp-rpc-relay-delete-test" buffer "cat"))))
     (unwind-protect
         (progn
           (puthash proc '(:pid 4242) tramp-rpc--async-processes)
-          (process-send-eof proc)
-          (while (process-live-p proc)
-            (accept-process-output proc 0.01 nil t))
-          (should (gethash proc tramp-rpc--async-processes))
-          (tramp-rpc--install-process-cleanup proc)
-          (accept-process-output nil 0.05)
-          (should-not (gethash proc tramp-rpc--async-processes))
-          (should-not (get-buffer-process buffer)))
-      (when (processp proc)
-        (ignore-errors (delete-process proc)))
-      (when (buffer-live-p buffer)
-        (kill-buffer buffer)))))
-
-(ert-deftest tramp-rpc-mock-test-process-cleanup-does-not-count-stop-as-exit ()
-  "A relay stop event must not consume its user's exit notification."
-  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
-  (let* ((buffer (generate-new-buffer " *tramp-rpc-cleanup-stop-test*"))
-         (proc (let ((process-connection-type nil))
-                 (start-process "tramp-rpc-cleanup-stop-test" buffer "cat")))
-         (user-events nil))
-    (unwind-protect
-        (progn
-          (puthash proc '(:pid 4242) tramp-rpc--async-processes)
-          (set-process-sentinel
-           proc
-           (lambda (process event)
-             (tramp-rpc--pipe-process-sentinel
-              process event
-              (lambda (_process user-event)
-                (push user-event user-events)))))
-          (tramp-rpc--install-process-cleanup proc)
-          ;; Exercise the wrapper's non-terminal branch directly.  Emacs can
-          ;; report stop/continue events for subprocesses, but using job-control
-          ;; signals in batch tests is platform- and shell-dependent.
-          (funcall (process-sentinel proc) proc "stopped\n")
-          (should-not (process-get proc :tramp-rpc-user-sentinel-called))
-          (process-put proc :tramp-rpc-exit-code 0)
           (process-put proc :tramp-rpc-exited t)
+          (tramp-rpc--install-own-sentinel proc #'tramp-rpc--pipe-relay-sentinel)
           (process-send-eof proc)
-          (while (process-live-p proc)
-            (accept-process-output proc 0.01 nil t))
-          (accept-process-output nil 0.01)
-          (should (equal user-events '("finished\n"))))
+          (tramp-rpc-mock-test--wait-for
+           (lambda () (null (get-buffer-process buffer)))
+           "relay deletion")
+          (should-not (gethash proc tramp-rpc--async-processes)))
       (when (processp proc)
         (ignore-errors (delete-process proc)))
       (remhash proc tramp-rpc--async-processes)
       (when (buffer-live-p buffer)
         (kill-buffer buffer)))))
+
+(ert-deftest tramp-rpc-mock-test-replaced-pipe-sentinel-gets-remote-exit ()
+  "A sentinel set after start gets the remote exit, not the relay's."
+  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
+  (let* ((proc (let ((process-connection-type nil))
+                 (start-process "tramp-rpc-replaced-sentinel-test" nil "cat")))
+         (events nil)
+         (sentinel (lambda (_process event) (push event events))))
+    (unwind-protect
+        (progn
+          (puthash proc '(:pid 4242) tramp-rpc--async-processes)
+          (tramp-rpc--install-own-sentinel proc #'tramp-rpc--pipe-relay-sentinel)
+          (tramp-rpc-handle-set-process-sentinel proc sentinel)
+          (should (eq (tramp-rpc-handle-process-sentinel proc) sentinel))
+          (process-put proc :tramp-rpc-remote-exited t)
+          (process-put proc :tramp-rpc-exit-code 3)
+          (process-send-eof proc)
+          (tramp-rpc-mock-test--wait-for (lambda () events) "user sentinel")
+          (should (equal events '("exited abnormally with code 3\n"))))
+      (when (processp proc)
+        (ignore-errors (delete-process proc)))
+      (remhash proc tramp-rpc--async-processes))))
+
+(ert-deftest tramp-rpc-mock-test-replaced-pipe-sentinel-relay-kill-kills-remote ()
+  "Killing a relay whose sentinel was replaced still kills the remote process."
+  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
+  (let* ((proc (let ((process-connection-type nil))
+                 (start-process "tramp-rpc-replaced-kill-test" nil "cat")))
+         (vec (tramp-dissect-file-name "/rpc:replaced-kill:/tmp/"))
+         (events nil)
+         (kills nil))
+    (unwind-protect
+        (cl-letf (((symbol-function 'tramp-rpc--kill-remote-process)
+                   (lambda (_vec pid signal &optional _connection)
+                     (push (list pid signal) kills))))
+          (puthash proc (list :vec vec :pid 4242) tramp-rpc--async-processes)
+          (tramp-rpc--install-own-sentinel proc #'tramp-rpc--pipe-relay-sentinel)
+          (tramp-rpc-handle-set-process-sentinel
+           proc (lambda (_process event) (push event events)))
+          (kill-process proc)
+          (tramp-rpc-mock-test--wait-for (lambda () events) "user sentinel")
+          (should (equal kills '((4242 9))))
+          (should (equal events '("killed\n"))))
+      (when (processp proc)
+        (ignore-errors (delete-process proc)))
+      (remhash proc tramp-rpc--async-processes))))
+
+(ert-deftest tramp-rpc-mock-test-pipe-relay-sentinel-does-not-count-stop-as-exit ()
+  "A relay stop event must not consume its user's exit notification."
+  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
+  (let* ((proc (let ((process-connection-type nil))
+                 (start-process "tramp-rpc-relay-stop-test" nil "cat")))
+         (user-events nil))
+    (unwind-protect
+        (progn
+          (puthash proc '(:pid 4242) tramp-rpc--async-processes)
+          (process-put proc :tramp-rpc-user-sentinel
+                       (lambda (_process event) (push event user-events)))
+          (tramp-rpc--install-own-sentinel proc #'tramp-rpc--pipe-relay-sentinel)
+          ;; Emacs can report stop/continue events for subprocesses, but
+          ;; job-control signals in batch tests are platform-dependent.
+          (tramp-rpc--pipe-relay-sentinel proc "stopped\n")
+          (should-not (process-get proc :tramp-rpc-user-sentinel-called))
+          (process-put proc :tramp-rpc-exit-code 0)
+          (process-put proc :tramp-rpc-exited t)
+          (process-send-eof proc)
+          (tramp-rpc-mock-test--wait-for (lambda () user-events) "user sentinel")
+          (should (equal user-events '("finished\n"))))
+      (when (processp proc)
+        (ignore-errors (delete-process proc)))
+      (remhash proc tramp-rpc--async-processes))))
 
 (ert-deftest tramp-rpc-mock-test-sudo-via-rpc-pty-uses-rpc-backend ()
   "PTYs for sudo-via-RPC must not use direct SSH as the sudo target user."
@@ -8369,7 +9039,7 @@ discard it for being unreadable."
   "Process cache admission uses its TTL, independent of metadata inhibition."
   (let* ((tramp-rpc-magit--process-caches (make-hash-table :test 'equal))
          (tramp-rpc-magit-process-cache-ttl 120)
-         (tramp-rpc-magit-process-cache-max-size 10)
+         (tramp-rpc-magit--process-cache-max-size 10)
          (remote-file-name-inhibit-cache t)
          (vec (tramp-dissect-file-name "/rpc:cache-host:/")))
     (puthash 'stale (list :time 850 :cache 'stale)
@@ -8548,147 +9218,71 @@ discard it for being unreadable."
       (when-let* ((buffer (get-buffer buffer-name)))
         (kill-buffer buffer)))))
 
-(ert-deftest tramp-rpc-mock-test-async-read-subscribes-instead-of-polling ()
-  "Async process startup subscribes on its captured connection."
-  (let* ((process (start-process "tramp-rpc-mock-subscribe" nil "cat"))
-         (connection-process
-          (start-process "tramp-rpc-mock-subscribe-connection" nil "cat"))
-         (connection (list :process connection-process))
-         (vec (tramp-dissect-file-name "/rpc:user@host:/"))
-         (tramp-rpc--async-processes (make-hash-table :test 'eq))
-         method-called connection-called)
-    (unwind-protect
-        (progn
-          (process-put process :tramp-rpc-connection connection)
-          (puthash process
-                   (list :vec vec :pid 42
-                         :connection-process connection-process)
-                   tramp-rpc--async-processes)
-          (cl-letf (((symbol-function 'tramp-rpc--call-async)
-                     (lambda (_vec method _params _callback
-                                   &optional rpc-connection)
-                       (setq method-called method
-                             connection-called rpc-connection))))
-            (tramp-rpc--start-async-read process))
-          (should (equal method-called "process.subscribe"))
-          (should (eq connection-called connection)))
-      (dolist (proc (list process connection-process))
-        (when (process-live-p proc)
-          (delete-process proc))))))
+(defmacro tramp-rpc-mock-test--with-push-relay (spec &rest body)
+  "Run BODY with a pipe relay registered for PID on a transport generation.
+SPEC is (RELAY BUFFER TRANSPORT CONNECTION PID).  RELAY is not yet in
+`tramp-rpc--async-processes'; BODY registers it."
+  (declare (indent 1))
+  (let ((relay (nth 0 spec)) (buffer (nth 1 spec))
+        (transport (nth 2 spec)) (connection (nth 3 spec)) (pid (nth 4 spec)))
+    `(let* ((,buffer (generate-new-buffer " *tramp-rpc-push-output*"))
+            (,relay (let ((process-connection-type nil))
+                      (start-process "tramp-rpc-push-relay" ,buffer "cat")))
+            (,transport (let ((process-connection-type nil))
+                          (start-process "tramp-rpc-push-transport" nil "cat")))
+            (,connection (tramp-rpc--make-connection :process ,transport))
+            (,pid 42)
+            (tramp-rpc--async-processes (make-hash-table :test 'eq))
+            (tramp-rpc--process-starts 0)
+            (tramp-rpc--early-process-notifications nil))
+       (unwind-protect
+           (progn
+             (tramp-rpc--attach-connection ,connection)
+             (set-process-filter
+              ,relay (lambda (_process output)
+                       (with-current-buffer ,buffer
+                         (goto-char (point-max))
+                         (insert output))))
+             (process-put ,relay :tramp-rpc-pid ,pid)
+             (process-put ,relay :tramp-rpc-connection ,connection)
+             (process-put ,relay :tramp-rpc-connection-process ,transport)
+             ,@body)
+         (dolist (proc (list ,relay ,transport))
+           (when (process-live-p proc)
+             (delete-process proc)))
+         (kill-buffer ,buffer)))))
 
-(ert-deftest tramp-rpc-mock-test-rpc-pty-subscribes-instead-of-polling ()
-  "RPC PTY startup subscribes on its captured connection."
-  (let* ((process (start-process "tramp-rpc-mock-pty-subscribe" nil "cat"))
-         (connection-process
-          (start-process "tramp-rpc-mock-pty-connection" nil "cat"))
-         (connection (list :process connection-process))
-         (vec (tramp-dissect-file-name "/rpc:user@host:/"))
-         (tramp-rpc--pty-processes (make-hash-table :test 'eq))
-         method-called connection-called)
-    (unwind-protect
-        (progn
-          (process-put process :tramp-rpc-vec vec)
-          (process-put process :tramp-rpc-pid 42)
-          (process-put process :tramp-rpc-connection connection)
-          (puthash process
-                   (list :vec vec :pid 42 :rpc-pty t
-                         :connection-process connection-process)
-                   tramp-rpc--pty-processes)
-          (cl-letf (((symbol-function 'tramp-rpc--call-async)
-                     (lambda (_vec method _params _callback
-                                   &optional rpc-connection)
-                       (setq method-called method
-                             connection-called rpc-connection))))
-            (tramp-rpc--pty-start-async-read process))
-          (should (equal method-called "process.subscribe_pty"))
-          (should (eq connection-called connection)))
-      (dolist (proc (list process connection-process))
-        (when (process-live-p proc)
-          (delete-process proc))))))
+(defun tramp-rpc-mock-test--register-push-relay (relay transport pid)
+  "Register RELAY for PID on TRANSPORT like `make-process' does."
+  (puthash relay
+           (list :pid pid :connection-process transport
+                 :pending-output nil :pending-exit nil :delivery-timer nil)
+           tramp-rpc--async-processes)
+  (tramp-rpc--register-managed-process relay))
 
-(ert-deftest tramp-rpc-mock-test-async-subscription-retries-before-kill ()
-  "A transient pipe subscription error retries once before killing its child."
-  (let* ((process (start-process "tramp-rpc-subscribe-retry" nil "cat"))
-         (connection-process
-          (start-process "tramp-rpc-subscribe-retry-connection" nil "cat"))
-         (connection (tramp-rpc--make-connection
-                      :process connection-process))
-         (vec (tramp-dissect-file-name "/rpc:subscribe-retry:/tmp/"))
-         (tramp-rpc--async-processes (make-hash-table :test 'eq))
-         callbacks
-         killed)
-    (unwind-protect
-        (progn
-          (process-put process :tramp-rpc-connection connection)
-          (puthash process
-                   (list :vec vec :pid 42
-                         :connection-process connection-process)
-                   tramp-rpc--async-processes)
-          (cl-letf (((symbol-function 'tramp-rpc--call-async)
-                     (lambda (_vec _method _params callback
-                                   &optional _connection)
-                       (push callback callbacks)))
-                    ((symbol-function 'tramp-rpc--kill-remote-process)
-                     (lambda (&rest _) (setq killed t))))
-            (tramp-rpc--start-async-read process)
-            (let ((first-callback (car callbacks)))
-              (funcall first-callback
-                       '(:error (:code -32098 :message "temporary"))))
-            (should (= (length callbacks) 2))
-            (should (process-live-p process))
-            (should-not killed)
-            (funcall (car callbacks)
-                     '(:error (:code -32098 :message "still failing")))
-            (should killed)
-            (should-not (process-live-p process))))
-      (remhash process tramp-rpc--async-processes)
-      (dolist (proc (list process connection-process))
-        (when (process-live-p proc)
-          (delete-process proc))))))
+(ert-deftest tramp-rpc-mock-test-push-output-before-registration-is-kept ()
+  "Output pushed before its start is registered reaches the relay in order."
+  (tramp-rpc-mock-test--with-push-relay (relay buffer transport connection pid)
+    (ignore connection)
+    (setq tramp-rpc--process-starts 1)
+    (tramp-rpc--handle-process-notification
+     transport "process.output" `((pid . ,pid) (stdout . "early-")))
+    (should tramp-rpc--early-process-notifications)
+    (tramp-rpc-mock-test--register-push-relay relay transport pid)
+    (should-not tramp-rpc--early-process-notifications)
+    (tramp-rpc--handle-process-notification
+     transport "process.output" `((pid . ,pid) (stdout . "late")))
+    (tramp-rpc-mock-test--wait-for
+     (lambda ()
+       (with-current-buffer buffer (equal (buffer-string) "early-late")))
+     "early and late push output")))
 
-(ert-deftest tramp-rpc-mock-test-pty-subscription-retries-before-close ()
-  "A transient PTY subscription error retries once before closing its child."
-  (let* ((process (start-process "tramp-rpc-pty-subscribe-retry" nil "cat"))
-         (connection-process
-          (start-process "tramp-rpc-pty-subscribe-retry-connection" nil "cat"))
-         (connection (tramp-rpc--make-connection
-                      :process connection-process))
-         (vec (tramp-dissect-file-name "/rpc:pty-subscribe-retry:/tmp/"))
-         (tramp-rpc--pty-processes (make-hash-table :test 'eq))
-         callbacks
-         closed)
-    (unwind-protect
-        (progn
-          (process-put process :tramp-rpc-vec vec)
-          (process-put process :tramp-rpc-pid 42)
-          (process-put process :tramp-rpc-connection connection)
-          (puthash process
-                   (list :vec vec :pid 42 :rpc-pty t
-                         :connection-process connection-process)
-                   tramp-rpc--pty-processes)
-          (cl-letf (((symbol-function 'tramp-rpc--call-async)
-                     (lambda (_vec _method _params callback
-                                   &optional _connection)
-                       (push callback callbacks)))
-                    ((symbol-function 'tramp-rpc--call)
-                     (lambda (_vec method _params &optional _connection)
-                       (when (equal method "process.close_pty")
-                         (setq closed t)))))
-            (tramp-rpc--pty-start-async-read process)
-            (let ((first-callback (car callbacks)))
-              (funcall first-callback
-                       '(:error (:code -32098 :message "temporary"))))
-            (should (= (length callbacks) 2))
-            (should (process-live-p process))
-            (should-not closed)
-            (funcall (car callbacks)
-                     '(:error (:code -32098 :message "still failing")))
-            (should closed)
-            (should-not (process-live-p process))))
-      (remhash process tramp-rpc--pty-processes)
-      (dolist (proc (list process connection-process))
-        (when (process-live-p proc)
-          (delete-process proc))))))
+(ert-deftest tramp-rpc-mock-test-push-output-for-unknown-pid-is-dropped ()
+  "Without a pending start, notifications for unknown PIDs are discarded."
+  (tramp-rpc-mock-test--with-push-relay (_relay _buffer transport _connection pid)
+    (tramp-rpc--handle-process-notification
+     transport "process.output" `((pid . ,pid) (stdout . "stale")))
+    (should-not tramp-rpc--early-process-notifications)))
 
 (ert-deftest tramp-rpc-mock-test-push-notifications-deliver-ordered-output ()
   "Push notifications deliver each output chunk once and in order."
@@ -8711,10 +9305,10 @@ discard it for being unreadable."
                          :pending-output nil :pending-exit nil
                          :delivery-timer nil)
                    tramp-rpc--async-processes)
-          (tramp-rpc--handle-process-output-notification
-           connection '((pid . 1) (stdout . "chunk-a")))
-          (tramp-rpc--handle-process-output-notification
-           connection '((pid . 1) (stdout . "chunk-b")))
+          (tramp-rpc--handle-process-notification
+           connection "process.output" '((pid . 1) (stdout . "chunk-a")))
+          (tramp-rpc--handle-process-notification
+           connection "process.output" '((pid . 1) (stdout . "chunk-b")))
           (tramp-rpc-mock-test--wait-for
            (lambda ()
              (with-current-buffer buffer
@@ -8730,6 +9324,9 @@ discard it for being unreadable."
 ;;; ============================================================================
 ;;; Test Runner
 ;;; ============================================================================
+
+(load (expand-file-name "test/tramp-rpc-lifecycle-tests.el"
+                        tramp-rpc-mock-test--project-root) nil nil t)
 
 ;;;###autoload
 (defun tramp-rpc-mock-test-all ()

@@ -182,30 +182,41 @@ TRAMP-RPC exposes these method categories:
 **** Process Operations
 | Method            | Parameters                   | Returns                    |
 |-------------------+------------------------------+----------------------------|
-| process.run       | cmd, args, cwd, env?, stdin? | {exit_code, stdout, stderr} |
+| process.run       | cmd, args, cwd, env?, stdin? | {exit_code, signal, stdout, stderr} |
 | process.start     | cmd, args, cwd, env?         | {pid}                      |
-| process.read      | pid, timeout_ms?             | {stdout, stderr, exited}   |
 | process.write     | pid, data                    | {written}                  |
 | process.kill      | pid, signal?                 | boolean                    |
 | process.signal    | OS pid permitted by server credentials, signal | boolean         |
 | process.close_stdin | pid                        | boolean                    |
-| process.list      | (none)                       | [{pid, cmd, running}]      |
 | process.start_pty | cmd, args, cwd, rows, cols   | {pid, tty_name}            |
-| process.read_pty  | pid, timeout_ms?             | {output, exited}           |
 | process.write_pty | pid, data                    | {written}                  |
 | process.resize_pty| pid, rows, cols              | boolean                    |
-| process.kill_pty  | pid, signal?                 | boolean                    |
+| process.kill_pty  | pid, signal?, group?         | boolean                    |
 | process.close_pty | pid                          | boolean                    |
-| process.list_pty  | (none)                       | [{pid, cmd, running}]      |
+
+A started process pushes ~process.output~ ({pid, stdout, stderr}) and
+finally ~process.exit~ ({pid, exit_code, signal}) notifications, beginning
+once its start response has been written.  PTY output arrives as ~stdout~.
+
+~process.kill_pty~ defaults to signaling the managed child's own process
+group.  ~group: "foreground"~ selects the terminal's current job;
+~group: "foreground_unless_leader"~ skips delivery when the terminal's
+leader owns the foreground.  These routes only deliver a signal, even for
+SIGKILL: the managed shell and its output lifecycle remain registered.
 
 **** System Operations
 | Method              | Parameters | Returns                           |
 |---------------------+------------+-----------------------------------|
-| system.info         | (none)     | {home, uid, gid, username, ...}   |
-| system.getenv       | name       | string or null                    |
-| system.expand_path  | path       | string (tilde expanded)           |
+| system.info         | (none)     | {protocol_revision, version, home, uid, gid, ...} |
 | system.statvfs      | path       | {total, free, available}          |
 | system.groups       | (none)     | [{gid, name}]                     |
+
+~system.info~ advertises integer ~protocol_revision: 1~.  The client checks
+exact equality at startup; missing or different revisions fail the connection
+with a redeployment error.  This revision is independent of the package
+version and the RPC envelope's ~"2.0"~ version field.  Incompatible RPC
+changes bump both the Rust and Elisp constants; there is no backward-compatible
+mode.
 
 **** Batch/Parallel Operations
 | Method                | Parameters                      | Returns             |
@@ -217,9 +228,8 @@ TRAMP-RPC exposes these method categories:
 **** Filesystem Watch Operations
 | Method       | Parameters                       | Returns                                      |
 |--------------+----------------------------------+----------------------------------------------|
-| watch.add    | ~{path: bin/string, recursive?}~ | ~{path: bin, recursive: bool}~               |
-| watch.remove | ~{path: bin/string}~             | ~true~                                       |
-| watch.list   | ~(none)~                         | ~[{path: bin, recursive: bool}]~             |
+| watch.add    | ~{path: bin/string, recursive?, nofollow?}~ | ~{path: bin, recursive: bool, nofollow: bool}~ |
+| watch.remove | ~{path: bin/string, nofollow?}~             | ~true~                                       |
 
 The server also pushes ~fs.events~ notifications (no id) when watched directories change:
 
@@ -242,6 +252,13 @@ The server also pushes ~fs.events~ notifications (no id) when watched directorie
 ~watch.add~ defaults ~recursive~ to true when the field is omitted.  ~PATH-BIN~
 values are MessagePack ~bin~ payloads containing remote OS path bytes.  A
 ~rescan~ event means the client should discard cached state for the connection.
+
+~watch.remove~ with ~nofollow: true~ removes only the symlink registration;
+~nofollow: false~ removes only the target-following registration.  Omitting
+~nofollow~ retains legacy removal of both.  ~system.info~ advertises support
+as ~watch_remove_nofollow: true~.  Clients must check this capability before
+acquiring nofollow watches: older servers ignore the removal flag and could
+remove another owner's target watch.
 
 * Performance Analysis
 
@@ -372,7 +389,7 @@ Key features:
 
 1. *Foreign File Name Handler*: Registered as a TRAMP foreign handler
 2. *Connection Sharing*: Uses SSH ControlMaster for connection reuse
-3. *Async Process Support*: Full ~make-process~ implementation with polling
+3. *Async Process Support*: Full ~make-process~ implementation with pushed output
 4. *PTY Support*: Terminal emulator integration (vterm, eat)
 5. *Batch/Pipeline Support*: Multiple operations in single round-trip
 
