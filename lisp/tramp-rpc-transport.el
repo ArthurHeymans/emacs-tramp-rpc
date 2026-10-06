@@ -1403,6 +1403,9 @@ probe can then interleave with RPC startup and corrupt the protocol stream."
             (progn
               (tramp-rpc--cleanup-bootstrap-connection vec)
               (tramp-rpc--start-server-process vec binary-path sudo-password))
+          (tramp-rpc-incompatible-server
+           (tramp-rpc--cleanup-failed-connection vec)
+           (signal (car err) (cdr err)))
           (remote-file-error
            (tramp-rpc--cleanup-failed-connection vec)
            (signal 'remote-file-error

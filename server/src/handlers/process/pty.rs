@@ -810,6 +810,8 @@ pub(super) async fn retire_pty_process(pid: u32, os_pid: u32) {
     }
 }
 
+/// Return whether this call found and handled the registry entry.
+/// A missing entry is an idempotent removal, but does not own an exit notification.
 pub(super) async fn terminate_pty_process(
     pid: u32,
     signal: i32,
@@ -828,7 +830,7 @@ pub(super) async fn terminate_pty_process(
         })
     }) else {
         return if remove {
-            Ok(true)
+            Ok(false)
         } else {
             Err(RpcError::process_error(format!(
                 "PTY process not found: {pid}"
@@ -1072,15 +1074,17 @@ pub async fn kill_pty(params: Value) -> HandlerResult {
     // without turning a survivable signal such as SIGINT into SIGKILL.
     // Explicit close and connection cleanup retain escalation authority.
     // Explicit SIGKILL also opts out of output draining.
-    if let Err(error) =
-        terminate_pty_process(params.pid, signal, false, signal == libc::SIGKILL).await
-    {
-        allow_pty_termination_retry(params.pid, pushing).await;
-        return Err(error);
-    }
-    // SIGKILL removed the entry, so no push task can report this exit.  Also
-    // report it when the push had not started yet.
-    if signal == libc::SIGKILL {
+    let handled =
+        match terminate_pty_process(params.pid, signal, false, signal == libc::SIGKILL).await {
+            Ok(handled) => handled,
+            Err(error) => {
+                allow_pty_termination_retry(params.pid, pushing).await;
+                return Err(error);
+            }
+        };
+    // A push iteration can finish and report natural exit while being stopped.
+    // Only the caller that still owned the registry entry reports SIGKILL.
+    if signal == libc::SIGKILL && handled {
         let status = shared_exit_status
             .as_ref()
             .and_then(|status| *status.lock().expect("shared PTY exit status lock"))

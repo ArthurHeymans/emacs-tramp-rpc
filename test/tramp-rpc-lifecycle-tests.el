@@ -308,6 +308,28 @@
             (delete-process transport))
           (tramp-rpc--remove-connection vec))))))
 
+(ert-deftest tramp-rpc-mock-test-never-deploy-preserves-protocol-error ()
+  "A system-installed incompatible server is not reported as missing."
+  (let ((vec (tramp-dissect-file-name "/rpc:protocol-mismatch:/"))
+        (tramp-rpc-use-controlmaster nil)
+        (tramp-rpc-deploy-never-deploy t)
+        (tramp-rpc-deploy-remote-binary-path "/opt/tramp-rpc-server")
+        (details '("Server protocol mismatch; rebuild and redeploy"))
+        cleaned)
+    (cl-letf (((symbol-function 'tramp-rpc--ensure-controlmaster-directory) #'ignore)
+              ((symbol-function 'tramp-rpc--detect-sudo-elevation) #'ignore)
+              ((symbol-function 'tramp-rpc-deploy-ensure-binary)
+               (lambda (_) "/opt/tramp-rpc-server"))
+              ((symbol-function 'tramp-rpc--cleanup-bootstrap-connection) #'ignore)
+              ((symbol-function 'tramp-rpc--cleanup-failed-connection)
+               (lambda (_) (setq cleaned t)))
+              ((symbol-function 'tramp-rpc--start-server-process)
+               (lambda (&rest _) (signal 'tramp-rpc-incompatible-server details))))
+      (should (equal (should-error (tramp-rpc--connect vec)
+                                  :type 'tramp-rpc-incompatible-server)
+                     (cons 'tramp-rpc-incompatible-server details)))
+      (should cleaned))))
+
 (ert-deftest tramp-rpc-mock-test-interrupt-routes-foreground-only-for-pty ()
   "PTY interrupts retain nil/t/lambda semantics and the captured generation."
   (let ((relay (start-process "interrupt-routing" nil "cat"))

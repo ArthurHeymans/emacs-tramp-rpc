@@ -1421,6 +1421,35 @@ async fn repeated_pty_kill_after_reap_preserves_exit_status() {
 }
 
 #[tokio::test]
+async fn pty_removal_reports_exit_notification_ownership() {
+    let _test_lock = test_process_map_lock().await;
+    let start =
+        start_pty(crate::msgpack_map! { "cmd" => "sleep", "args" => vec![Value::from("30")] })
+            .await
+            .expect("start PTY");
+    let pid = map_get(&start, "pid").and_then(Value::as_u64).unwrap() as u32;
+
+    assert!(
+        terminate_pty_process(pid, libc::SIGKILL, false, true)
+            .await
+            .unwrap()
+    );
+    // A push task may already have removed and reported this process by the
+    // time kill_pty finishes stopping it.  Removal must not claim a second exit.
+    assert!(
+        !terminate_pty_process(pid, libc::SIGKILL, false, true)
+            .await
+            .unwrap()
+    );
+    assert_eq!(
+        close_pty(crate::msgpack_map! { "pid" => pid })
+            .await
+            .unwrap(),
+        Value::Boolean(true)
+    );
+}
+
+#[tokio::test]
 async fn pty_sigkill_publishes_status_for_in_flight_read_after_removal() {
     let _test_lock = test_process_map_lock().await;
     let start = start_pty(Value::Map(vec![
