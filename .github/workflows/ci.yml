@@ -549,10 +549,13 @@ jobs:
           #   :unstable: not recommended by upstream Tramp
           #   tramp-test46-asynchronous-requests: upstream stress test is
           #     timing-sensitive with tramp-rpc's RPC process relay in CI.
+          # Use the checkout's TRAMP, not the installed package's autoloads.
+          # Mixing them leaves tramp-autoloads loaded after unload on Emacs 30.
           emacs -Q --batch \
             -L lisp \
             --eval "(require 'package)" \
             --eval "(add-to-list 'package-archives '(\"melpa\" . \"https://melpa.org/packages/\") t)" \
+            --eval "(setq package-load-list '((tramp nil) all))" \
             --eval "(package-initialize)" \
             -l test/run-tramp-tests.el \
             --eval "(tramp-rpc-test-run-tests-batch-and-exit '(and (not (tag :unstable)) (not tramp-test46-asynchronous-requests)) t)"
@@ -579,6 +582,7 @@ jobs:
             -L lisp \
             --eval "(require 'package)" \
             --eval "(add-to-list 'package-archives '(\"melpa\" . \"https://melpa.org/packages/\") t)" \
+            --eval "(setq package-load-list '((tramp nil) all))" \
             --eval "(package-initialize)" \
             -l tramp-rpc \
             --eval "(message \"Loaded Tramp: %s\" (locate-library \"tramp\"))" \
@@ -603,6 +607,7 @@ jobs:
             -L lisp \
             --eval "(require 'package)" \
             --eval "(add-to-list 'package-archives '(\"melpa\" . \"https://melpa.org/packages/\") t)" \
+            --eval "(setq package-load-list '((tramp nil) all))" \
             --eval "(package-initialize)" \
             -l tramp-rpc \
             --eval "(message \"Loaded Tramp: %s\" (locate-library \"tramp\"))" \
