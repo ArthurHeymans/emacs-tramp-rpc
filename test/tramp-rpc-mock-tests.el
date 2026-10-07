@@ -8298,7 +8298,8 @@ discard it for being unreadable."
       (should (= (tramp-rpc-handle-process-file "rg" nil nil nil "pattern") 0))
       (should (equal (alist-get 'cmd captured-params) "rg"))
       (should (equal (alist-get 'args captured-params) ["pattern"]))
-      (should (eq (alist-get 'merge_stderr captured-params) t))
+      ;; Discarded output does not need an ordered merged stream.
+      (should-not (alist-get 'merge_stderr captured-params))
       (should-not
        (tramp-rpc--process-file-merge-output-p '(nil "/tmp/stderr")))
       (should (tramp-rpc--process-file-merge-output-p '(t t)))

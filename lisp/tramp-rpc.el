@@ -2129,6 +2129,15 @@ an Emacs buffer, matching `call-process' and `process-file'."
       (eq (car destination) :file)
       (eq (cadr destination) t)))
 
+(defun tramp-rpc--process-file-cache-output-p (destination)
+  "Return non-nil if stdout-only cache entries satisfy DESTINATION.
+Discarded output and (STDOUT nil) destinations do not need stderr.  Other
+forms must run the process to capture diagnostics and merged stream ordering."
+  (or (null destination)
+      (and (consp destination)
+           (not (eq (car destination) :file))
+           (null (cadr destination)))))
+
 (defun tramp-rpc--route-process-file-output (destination stdout &optional stderr)
   "Route `process-file' STDOUT and STDERR according to DESTINATION.
 DESTINATION follows the `process-file' convention: nil discards output; t,
@@ -2195,8 +2204,10 @@ ARGS contains the original function arguments."
     ;; Unquote localname in case of file-name-quoted paths (e.g. /: prefix).
     (setq localname (file-name-unquote localname))
     ;; Try serving from magit prefetch cache first (no RPC needed)
-    (let ((cached (when (null infile)  ; no stdin redirection
-                    (tramp-rpc-magit--process-cache-lookup program args))))
+    (let* ((cache-output-p (and (null infile)
+                                (tramp-rpc--process-file-cache-output-p destination)))
+           (cached (when cache-output-p
+                     (tramp-rpc-magit--process-cache-lookup program args))))
       (if cached
           ;; Cache hit - serve from prefetch
           (let ((exit-code (car cached))
@@ -2232,8 +2243,12 @@ ARGS contains the original function arguments."
                             (args . ,(vconcat args))
                             (cwd . ,localname)
                             (env . ,env)
-                            ,@(when (tramp-rpc--process-file-merge-output-p
-                                     destination)
+                            ;; Discarded output does not need a merged stream.
+                            ;; Keep stdout separate so exit-code-only Magit
+                            ;; calls can still populate the stdout-only cache.
+                            ,@(when (and destination
+                                         (tramp-rpc--process-file-merge-output-p
+                                          destination))
                                 '((merge_stderr . t)))
                             ,@(when stdin-content
                                 `((stdin . ,stdin-content)))))
@@ -2255,9 +2270,9 @@ ARGS contains the original function arguments."
                             (stderr (tramp-rpc--decode-output
                                      (alist-get 'stderr result))))
 
-                        ;; Memoize uncached Magit git calls made during lazy
-                        ;; remote status expansion.
-                        (when (null infile)
+                        ;; Never let merged diagnostics poison stdout-only
+                        ;; cache entries used by subsequent Magit calls.
+                        (when cache-output-p
                           (tramp-rpc-magit--process-cache-store
                            program args exit-code stdout))
 
