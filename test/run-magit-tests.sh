@@ -12,8 +12,12 @@ export TRAMP_RPC_TEST_SERVER TRAMP_RPC_TEST_HOST="${TRAMP_RPC_TEST_HOST:-localho
 args=(-L "$ROOT/lisp" -L "$MAGIT_SOURCE/lisp")
 if [[ -n "${TRAMP_SOURCE:-}" ]]; then args+=(-L "$TRAMP_SOURCE/lisp"); fi
 if [[ -n "${MSGPACK_SOURCE:-}" ]]; then args+=(-L "$MSGPACK_SOURCE"); fi
-IFS=: read -ra deps <<< "${MAGIT_DEPENDENCY_DIRS:-}"
-for dep in "${deps[@]}"; do args+=(-L "$dep"); done
+if [[ -n "${MAGIT_DEPENDENCY_DIRS:-}" ]]; then
+    IFS=: read -ra deps <<< "$MAGIT_DEPENDENCY_DIRS"
+    for dep in "${deps[@]}"; do
+        if [[ -n "$dep" ]]; then args+=(-L "$dep"); fi
+    done
+fi
 "${EMACS:-emacs}" -Q --batch "${args[@]}" \
     --eval '(setq tramp-rpc-deploy-never-deploy t
                   tramp-rpc-deploy-remote-binary-path (getenv "TRAMP_RPC_TEST_SERVER")
