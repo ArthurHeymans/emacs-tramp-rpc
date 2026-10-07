@@ -5507,6 +5507,57 @@ Each entry is (HOST ALLOW-PROMPT FORCE-OBTAIN AUTO-DEPLOY)."
                 (tramp-make-tramp-file-name vec "/tmp/tramp-rpc-server"))))
      ,@body))
 
+(ert-deftest tramp-rpc-mock-test-deploy-install-host-prompt-uses-initial-input ()
+  "Read a host after `/rpc:', without inserting the local directory."
+  :tags '(:deploy)
+  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
+  (let ((tramp-rpc-deploy-never-deploy nil)
+        (default-directory temporary-file-directory)
+        (insert-default-directory t)
+        (read-file-name-function nil)
+        (minibuffer-setup-hook nil)
+        target)
+    ;; Use the real filename reader; only replace the minibuffer interaction.
+    (cl-letf (((symbol-function 'read-from-minibuffer)
+               (lambda (_prompt initial &rest _)
+                 (with-temp-buffer
+                   (insert (car initial))
+                   (goto-char (cdr initial))
+                   (run-hooks 'minibuffer-setup-hook)
+                   (should (equal (buffer-string) "/rpc:"))
+                   (should (= (point) (point-max)))
+                   (insert "username@final-host:/")
+                   (buffer-string))))
+              ((symbol-function 'read-string)
+               (lambda (&rest _)
+                 (error "Host prompt lost TRAMP completion")))
+              ((symbol-function 'tramp-rpc-deploy-ensure-binary)
+               (lambda (vec _plan)
+                 (setq target vec)
+                 "/tmp/tramp-rpc-server")))
+      (call-interactively #'tramp-rpc-deploy-install-binary))
+    (should (equal (tramp-file-name-user target) "username"))
+    (should (equal (tramp-file-name-host target) "final-host"))
+    (should (equal (tramp-file-name-localname target) "/"))))
+
+(ert-deftest tramp-rpc-mock-test-deploy-install-ssh-config-host-completion ()
+  "TRAMP completes an SSH-config alias without contacting the remote."
+  :tags '(:deploy)
+  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
+  (let ((config (make-temp-file "tramp-rpc-ssh-config")))
+    (unwind-protect
+        (progn
+          (with-temp-file config
+            (insert "Host final-host\n  HostName final.invalid\n"
+                    "  ProxyJump proxy-host\n"))
+          (cl-letf (((symbol-function 'tramp-get-completion-function)
+                     (lambda (_method)
+                       (list (list #'tramp-parse-sconfig config)))))
+            (should (member "rpc:final-host:"
+                            (tramp-completion-handle-file-name-all-completions
+                             "rpc:fin" "/")))))
+      (delete-file config))))
+
 (ert-deftest tramp-rpc-mock-test-deploy-install-command-overrides-auto-deploy ()
   "Test explicit installation enables prompts, forcing, and deployment."
   :tags '(:deploy)
