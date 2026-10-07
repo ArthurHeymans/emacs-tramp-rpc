@@ -195,6 +195,16 @@
                             (member "update-index"
                                     (append (alist-get 'args (cdr entry)) nil))))
                      trace)))
+      (let ((state-keys
+             (mapcan (lambda (entry)
+                       (when (equal (car entry) "commands.run_parallel")
+                         (cl-loop for command across (alist-get 'commands (cdr entry))
+                                  for key = (alist-get 'key command)
+                                  when (string-prefix-p "state_file:" key)
+                                  collect key)))
+                     trace)))
+        (should (= (length state-keys) (length tramp-rpc-magit--state-files)))
+        (should (= (length state-keys) (length (delete-dups state-keys)))))
       (should (< (plist-get fast :process-run) (plist-get plain :process-run)))
       (should (< (plist-get fast :rpcs) (plist-get plain :rpcs)))
       (should (= (length updates) 1))
@@ -244,7 +254,7 @@
         (let ((row (tramp-rpc-magit-test--measure
                     "expired-file-expand" #'tramp-rpc-magit-test--expand)))
           (should (equal expected (plist-get row :result)))
-          (should (> (plist-get row :batches) 0)))
+          (should (= (plist-get row :rpcs) 0)))
         (let ((row (tramp-rpc-magit-test--measure
                     "repeat-expand" #'tramp-rpc-magit-test--expand)))
           (should (= (plist-get row :rpcs) 0)))))))
@@ -446,7 +456,7 @@
                      (tramp-rpc-magit-test--git "rev-parse" "origin/main"))))))
 
 (ert-deftest tramp-rpc-magit-test-many-files-and-custom-diff ()
-  "Cross the 200-command batch boundary and exercise non-default diff argv."
+  "Many changed files should not schedule speculative per-file Git commands."
   (tramp-rpc-magit-test--with-repo
     (tramp-rpc-magit-test--init)
     (dotimes (i 55)
@@ -456,7 +466,7 @@
       (tramp-rpc-magit-test--write (format "file-%02d.txt" i) "changed\n"))
     (let* ((pair (tramp-rpc-magit-test--parity "55-files"))
            (fast (cdr pair)))
-      (should (>= (plist-get fast :batches) 3)))
+      (should (= (plist-get fast :batches) 2)))
     (let ((old (get 'magit-status-mode 'magit-diff-current-arguments)))
       (unwind-protect
           (progn
@@ -517,6 +527,100 @@
             (push (buffer-string) outputs))))
       (should (string-match-p "no upstream configured" (cadr outputs)))
       (should (equal (car outputs) (cadr outputs))))))
+
+(ert-deftest tramp-rpc-magit-test-output-destinations-and-cache-storage ()
+  "Preserve diagnostics for every destination without poisoning stdout hits."
+  (tramp-rpc-magit-test--with-repo
+    (tramp-rpc-magit-test--init)
+    (tramp-rpc-magit-test--write "tracked.txt" "base\n")
+    (tramp-rpc-magit-test--commit "initial")
+    (tramp-rpc-magit-test--status t t)
+    (let ((process-file-side-effects nil)
+          (tramp-rpc-magit--allow-process-cache t)
+          (args '("rev-parse" "--abbrev-ref" "@{upstream}"))
+          (output (generate-new-buffer " *rpc-magit-output*"))
+          (file (make-temp-file "rpc-magit-output-"))
+          (stderr-file (make-temp-file "rpc-magit-stderr-")))
+      (unwind-protect
+          (progn
+            (dolist (destination (list t output (buffer-name output)
+                                      (list :file file) '(t t) (list t stderr-file)))
+              (with-current-buffer output (erase-buffer))
+              (let ((row (tramp-rpc-magit-test--measure
+                          (format "output-destination/%S" destination)
+                          (lambda ()
+                            (with-temp-buffer
+                              (should (= (apply #'process-file "git" nil destination nil args)
+                                         128))
+                              (cond
+                               ((equal destination (list :file file))
+                                (insert-file-contents file))
+                               ((equal destination (list t stderr-file))
+                                (insert-file-contents stderr-file))
+                               ((or (eq destination output)
+                                    (equal destination (buffer-name output)))
+                                (insert (with-current-buffer output (buffer-string)))))
+                              (buffer-string))))))
+                (should (= (plist-get row :process-run) 1))
+                (should (= (plist-get row :hits) 0))
+                (should (string-match-p "no upstream configured" (plist-get row :result)))))
+            ;; An uncached merged-output call must not store diagnostics under
+            ;; a key that a later stdout-only caller can hit.
+            (let ((missing '("rev-parse" "--verify" "refs/heads/nonexistent")))
+              (with-temp-buffer
+                (should (= (apply #'process-file "git" nil t nil missing) 128))
+                (should-not (string-empty-p (buffer-string))))
+              (dolist (expected-rpcs '(1 0))
+                (let ((row (tramp-rpc-magit-test--measure
+                            "stdout-after-merged-miss"
+                            (lambda ()
+                              (with-temp-buffer
+                                (should (= (apply #'process-file "git" nil '(t nil) nil missing)
+                                           128))
+                                (buffer-string))))))
+                  (should (string-empty-p (plist-get row :result)))
+                  (should (= (plist-get row :process-run) expected-rpcs)))))
+            ;; Exit-code-only calls remain eligible for the prefetched cache.
+            (let ((row (tramp-rpc-magit-test--measure
+                        "discarded-output-hit"
+                        (lambda () (process-file "git" nil nil nil "rev-parse" "HEAD")))))
+              (should (= (plist-get row :result) 0))
+              (should (= (plist-get row :rpcs) 0))
+              (should (= (plist-get row :hits) 1))))
+        (kill-buffer output)
+        (delete-file file)
+        (delete-file stderr-file)))))
+
+(ert-deftest tramp-rpc-magit-test-expired-unwashed-section ()
+  "Actual deferred section bodies still get a snapshot after expiry."
+  (tramp-rpc-magit-test--with-repo
+    (tramp-rpc-magit-test--rich-fixture)
+    (let ((expected (tramp-rpc-magit-test--status nil t)))
+      (tramp-rpc-magit-test--status t)
+      (with-current-buffer (magit-get-mode-buffer 'magit-status-mode)
+        (should (cl-some (lambda (section) (oref section washer))
+                         (tramp-rpc-magit-test--sections)))
+        (maphash (lambda (_key entry)
+                   (setf (plist-get entry :time) (- (float-time) 3600)))
+                 tramp-rpc-magit--process-caches)
+        (let ((row (tramp-rpc-magit-test--measure
+                    "expired-lazy-expand" #'tramp-rpc-magit-test--expand)))
+          (should (equal expected (plist-get row :result)))
+          (should (> (plist-get row :batches) 0)))))))
+
+(ert-deftest tramp-rpc-magit-test-opt-in-tab-width-probing ()
+  "Retain batched file inspection when remote tab-width probing is enabled."
+  (tramp-rpc-magit-test--with-repo
+    (tramp-rpc-magit-test--init)
+    (dotimes (i 55)
+      (tramp-rpc-magit-test--write (format "file-%02d.txt" i) "\tbase\n"))
+    (tramp-rpc-magit-test--commit "tabbed files")
+    (dotimes (i 55)
+      (tramp-rpc-magit-test--write (format "file-%02d.txt" i) "\tchanged\n"))
+    (let* ((magit-diff-adjust-tab-width 'always)
+           (tramp-rpc-magit-disable-remote-diff-tab-width-detection nil)
+           (pair (tramp-rpc-magit-test--parity "opt-in-tab-width")))
+      (should (>= (plist-get (cdr pair) :batches) 3)))))
 
 (ert-deftest tramp-rpc-magit-test-timing-samples ()
   "Interleave repeated plain/optimized runs; do not assert wall-clock speed."

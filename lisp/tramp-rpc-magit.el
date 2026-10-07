@@ -59,18 +59,18 @@
 ;; Magit integration - client-side parallel prefetch
 ;; ============================================================================
 
-;; The prefetch sends all git commands magit will need via a single
-;; commands.run_parallel RPC call.  The server runs them in parallel
-;; using Tokio-managed child processes and returns
-;; {key: {exit_code, stdout, stderr}}.
-;; The results are stored directly as the process-file cache --
-;; no reconstruction or key normalization needed.
+;; Prefetch batches common status queries with commands.run_parallel;
+;; a second phase handles refs and gitdirs discovered by the first batch.
+;; The server runs Tokio-managed child processes and returns
+;; {key: {exit_code, stdout, stderr}}.  The process-file cache keeps
+;; (exit-code . stdout) for callers that discard stderr.  Commands needing
+;; diagnostics or ordered merged output bypass that cache.
 
 (defcustom tramp-rpc-magit-optimize t
   "Whether to enable magit prefetch optimizations.
 When non-nil, tramp-rpc will automatically install handlers on
 `magit-status-setup-buffer' and `magit-status-refresh-buffer' to
-prefetch git commands in parallel, dramatically speeding up
+prefetch git commands in parallel, reducing serial round-trips for
 magit-status on remote repositories."
   :type 'boolean
   :group 'tramp-rpc)
@@ -329,12 +329,7 @@ The batch RPC supplies the same effective environment as `process-file'."
   (let ((cmds nil)
         (gitdir (concat (file-name-as-directory directory) ".git")))
     (cl-flet ((add-git (&rest args)
-                (push `((key . ,(apply #'tramp-rpc-magit--process-cache-key args))
-                        (cmd . "git")
-                        (args . ,(vconcat (append tramp-rpc-magit--git-prefetch-prefix-args
-                                                   args)))
-                        (cwd . ,directory))
-                      cmds))
+                (push (tramp-rpc-magit--git-command-entry directory args) cmds))
               (add-state-file (relative-path)
                 (push (tramp-rpc-magit--state-file-entry gitdir relative-path)
                       cmds)))
@@ -653,7 +648,8 @@ VEC is the TRAMP connection vector."
 (defun tramp-rpc-magit--prefetch-dynamic-status (vec directory root-local)
   "Prefetch status data that depends on initial git output.
 This second-stage batch covers worktree-specific gitdirs, current branch and
-upstream names, and commands used to wash already-expanded file sections.
+upstream names, and file inspection commands when diff `tab-width' detection
+can open files.
 VEC is the TRAMP connection vector.
 DIRECTORY is the directory being handled.
 ROOT-LOCAL is the local form of the repository root."
@@ -680,12 +676,14 @@ ROOT-LOCAL is the local form of the repository root."
                (add-git "rev-parse" "--verify" name)
                (add-git "rev-parse" "--verify" "--abbrev-ref" name)
                (add-git "rev-parse" "--verify" (concat "refs/tags/" name)))))
-        ;; Magit checks state files in the real gitdir.  In linked worktrees,
-        ;; that is not WORKTREE/.git, so use the prefetched rev-parse result.
-        (when-let* ((gitdir (cached "rev-parse" "--git-dir")))
-          (add-state-dir (if (file-name-absolute-p gitdir)
-                             gitdir
-                           (expand-file-name gitdir root-local))))
+        ;; The first batch already checked WORKTREE/.git.  Only repeat the
+        ;; state probes when rev-parse locates a different gitdir (e.g. a
+        ;; linked worktree), not for every ordinary repository refresh.
+        (when-let* ((gitdir (cached "rev-parse" "--git-dir"))
+                    (gitdir (directory-file-name
+                             (expand-file-name gitdir root-local)))
+                    ((not (equal gitdir (expand-file-name ".git" root-local)))))
+          (add-state-dir gitdir))
 
         ;; Current branch/upstream/ref-name probes.
         (let* ((branch (cached "symbolic-ref" "--short" "HEAD"))
@@ -717,7 +715,8 @@ ROOT-LOCAL is the local form of the repository root."
                      (concat upstream "^{commit}") "--")
             (add-git "merge-base" "--is-ancestor" "HEAD" upstream)))
 
-        ;; File-section wash commands for files already expanded in status.
+        ;; Keep metadata available for section formatting, but only inspect
+        ;; Git file contents when tab-width detection can actually open files.
         (let* ((status (or (cached "status" "-z" "--porcelain"
                                    "--untracked-files=normal" "--" :raw)
                            (cached "status" "-z" "--porcelain"
@@ -731,12 +730,13 @@ ROOT-LOCAL is the local form of the repository root."
           (dolist (file files)
             (let ((abs-file (expand-file-name file root-local)))
               (push abs-file expanded-files)
-              (add-git "diff" "--quiet" "--cached" "--submodule=short"
-                       "--" file)
-              (add-git "ls-files" "-c" "-z" "--" file)
-              (when head
-                (add-git "ls-tree" "--full-tree" head "--" abs-file)
-                (add-git "cat-file" "-p" (format "%s:%s" head file))))))
+              (when (bound-and-true-p magit-diff-adjust-tab-width)
+                (add-git "diff" "--quiet" "--cached" "--submodule=short"
+                         "--" file)
+                (add-git "ls-files" "-c" "-z" "--" file)
+                (when head
+                  (add-git "ls-tree" "--full-tree" head "--" abs-file)
+                  (add-git "cat-file" "-p" (format "%s:%s" head file)))))))
 
         (when commands
           (tramp-rpc-magit--run-command-entries
@@ -748,7 +748,8 @@ ROOT-LOCAL is the local form of the repository root."
 (defun tramp-rpc-magit--prefetch-file-section (section)
   "Prefetch the git commands needed to expand Magit file SECTION.
 This is intentionally much smaller than the full status prefetch and is used
-when the status cache has expired but TAB is expanding a single file section."
+when the status cache has expired but TAB is expanding a single file section
+whose deferred body or `tab-width' painting can still inspect files."
   (when-let* ((file (tramp-rpc-magit--section-slot section 'value))
               ((stringp file))
               (directory default-directory)
@@ -911,9 +912,9 @@ A command that may change the repository drops the status memo."
 
 (defun tramp-rpc-magit--prefetch (directory)
   "Prefetch magit status and ancestor data for DIRECTORY.
-Sends all git commands magit will need via a single
-commands.run_parallel RPC call, then stores the results directly
-as the `process-file' cache.  Also fetches ancestor markers."
+Batch common git commands with commands.run_parallel, then fetch data that
+depends on those results and store eligible stdout in the `process-file'
+cache.  Also fetch ancestor markers."
   (when (and (file-remote-p directory)
              (tramp-rpc-file-name-p directory))
     ;; Suppress fs.events cache handling during prefetch.  The git commands
@@ -1194,7 +1195,14 @@ all Magit caches go, including prefetched status."
              (tramp-rpc-file-name-p default-directory)
              (tramp-rpc-magit--section-slot section 'hidden)
              (memq (tramp-rpc-magit--section-slot section 'type)
-                   tramp-rpc-magit--lazy-status-section-types))
+                   tramp-rpc-magit--lazy-status-section-types)
+             ;; Showing an already materialized section needs no new snapshot.
+             ;; File painting can still inspect files when tab-width detection
+             ;; is enabled, even when its washer has already run.
+             (or (tramp-rpc-magit--section-slot section 'washer)
+                 (and (eq (tramp-rpc-magit--section-slot section 'type) 'file)
+                      (bound-and-true-p magit-diff-adjust-tab-width)
+                      (not (tramp-rpc-magit--section-slot section 'painted)))))
     (if (eq (tramp-rpc-magit--section-slot section 'type) 'file)
         (tramp-rpc-magit--prefetch-file-section section)
       (when (null (tramp-rpc-magit--get-process-cache))
@@ -1206,7 +1214,6 @@ ORIG is the original advised function.
 SECTION is the Magit section being handled."
   (let ((tramp-rpc-magit--allow-process-cache t)
         (process-file-side-effects nil))
-    (tramp-rpc-magit--maybe-prefetch-for-section section)
     (let ((magit-diff-adjust-tab-width
            (if (and tramp-rpc-magit-disable-remote-diff-tab-width-detection
                     (derived-mode-p 'magit-status-mode)
@@ -1215,6 +1222,7 @@ SECTION is the Magit section being handled."
                nil
              (and (boundp 'magit-diff-adjust-tab-width)
                   magit-diff-adjust-tab-width))))
+      (tramp-rpc-magit--maybe-prefetch-for-section section)
       (funcall orig section))))
 
 ;; ============================================================================
