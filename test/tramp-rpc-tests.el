@@ -496,15 +496,15 @@ The directory is deleted after BODY completes."
   "Test `file-writable-p' for TRAMP RPC files."
   (skip-unless (tramp-rpc-test-enabled))
 
-  ;; Existing file.  TRAMP's generic writable check probes access and file
-  ;; metadata; one-time connection system information is primed separately.
+  ;; Existing files need one kernel access check; repeated predicates are cached.
   (tramp-rpc-test--with-temp-file tmp "test content"
-    (should (tramp-rpc-test--with-call-count 2
-              (file-writable-p tmp))))
+    (should (tramp-rpc-test--with-call-count 1
+              (and (file-writable-p tmp) (file-writable-p tmp)))))
 
-  ;; Non-existent file in writable directory
+  ;; A missing target additionally checks write/search access to its parent.
   (let ((new-file (tramp-rpc-test--make-temp-name)))
-    (should (file-writable-p new-file))))
+    (should (tramp-rpc-test--with-call-count 2
+              (and (file-writable-p new-file) (file-writable-p new-file))))))
 
 ;;; ============================================================================
 ;;; Test 03: File Types

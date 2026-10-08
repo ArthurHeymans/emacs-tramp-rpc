@@ -1213,12 +1213,6 @@ This matches the behavior expected by `tramp-test28-process-file'."
 (load (expand-file-name "tramp-rpc-request-tests.el"
                         (file-name-directory (or load-file-name buffer-file-name))))
 
-(ert-deftest tramp-rpc-mock-test-file-executable-root ()
-  "Root requires an execute bit, rather than bypassing all mode checks."
-  (let ((attrs '(nil 1 1 1 0 0 0 0 "----------")))
-    (should-not (tramp-rpc--mode-executable-p "----------" 0 0 attrs nil))
-    (should (tramp-rpc--mode-executable-p "------x---" 0 0 attrs nil))))
-
 (ert-deftest tramp-rpc-mock-test-directory-count-semantics ()
   "Both directory handlers share Emacs COUNT semantics."
   (let ((entries '("a" "b" "c")))
@@ -4621,36 +4615,6 @@ direct property test would miss it."
                        vec "/tmp/file/.editorconfig"))
           (should (gethash key tramp-rpc--file-stat-cache)))
       (tramp-rpc--invalidate-cache-for-path filename))))
-
-(ert-deftest tramp-rpc-mock-test-access-file-dangling-symlink-is-missing ()
-  "`access-file' reports non-cyclic dangling symlinks as `file-missing'."
-  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
-  (cl-letf (((symbol-function 'tramp-handle-access-file)
-             (lambda (_filename _string)
-               (signal 'file-error '("Apparent cycle"))))
-            ((symbol-function 'file-symlink-p)
-             (lambda (filename)
-               (and (string-suffix-p "/link" filename) "does-not-exist")))
-            ((symbol-function 'file-exists-p) #'ignore))
-    (should-error
-     (tramp-rpc-handle-access-file "/rpc:mockhost:/tmp/link" "error")
-     :type 'file-missing)))
-
-(ert-deftest tramp-rpc-mock-test-access-file-cyclic-symlink-stays-file-error ()
-  "`access-file' keeps self-referential symlinks as `file-error'."
-  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
-  (cl-letf (((symbol-function 'tramp-handle-access-file)
-             (lambda (_filename _string)
-               (signal 'file-error '("Apparent cycle"))))
-            ((symbol-function 'file-symlink-p)
-             (lambda (_filename) "link"))
-            ((symbol-function 'file-exists-p) #'ignore))
-    (condition-case err
-        (progn
-          (tramp-rpc-handle-access-file "/rpc:mockhost:/tmp/link" "error")
-          (ert-fail "Expected file-error"))
-      (error
-       (should (eq (car err) 'file-error))))))
 
 (ert-deftest tramp-rpc-mock-test-subtree-invalidation-clears-descendant-caches ()
   "Subtree invalidation clears stale metadata for cached descendants."
@@ -9383,143 +9347,8 @@ SPEC is (RELAY BUFFER TRANSPORT CONNECTION PID).  RELAY is not yet in
           (delete-process proc)))
       (kill-buffer buffer))))
 
-;;; ============================================================================
-;;; Group Permission / file-accessible-directory-p Tests (No server or SSH)
-;;; ============================================================================
-
-;; Helper: build a minimal stat alist for a directory.
-(defun tramp-rpc-mock-test--dir-stat (mode-octal &optional uid gid)
-  "Return a minimal file.stat alist for a directory.
-MODE-OCTAL is the Unix permission bits (e.g. #o750).  UID defaults to 1000,
-GID defaults to 1000."
-  `((type . "directory")
-    (mode . ,(logior #o040000 mode-octal))
-    (nlinks . 2)
-    (uid . ,(or uid 1000))
-    (gid . ,(or gid 1000))
-    (uname . "testuser")
-    (gname . "testgroup")
-    (atime . 1700000000)
-    (mtime . 1700000001)
-    (ctime . 1700000002)
-    (size . 4096)
-    (inode . 99999)
-    (dev . 1)))
-
-;; Helper: call the handler with mocked stat/uid/gid/groups.
-(defun tramp-rpc-mock-test--check-accessible (stat uid gid groups)
-  "Run `tramp-rpc-handle-file-accessible-directory-p' with mocked primitives.
-STAT is what `tramp-rpc--call-file-stat' returns (nil means no file).
-UID, GID, and GROUPS are the remote credentials."
-  (cl-letf (((symbol-function 'tramp-rpc--call-file-stat)
-             (lambda (_v _l &optional _lstat) stat))
-            ((symbol-function 'tramp-get-remote-uid)
-             (lambda (_v _fmt) uid))
-            ((symbol-function 'tramp-get-remote-gid)
-             (lambda (_v _fmt) gid))
-            ((symbol-function 'tramp-get-remote-groups)
-             (lambda (_v _fmt) groups))
-            ((symbol-function 'tramp-connectable-p)
-             (lambda (_f) t)))
-    (tramp-rpc-handle-file-accessible-directory-p "/rpc:mockhost:/testdir")))
-
-(ert-deftest tramp-rpc-mock-test-file-accessible-directory-p-world-readable ()
-  "World-readable directory is accessible regardless of uid/gid."
-  :tags '(:group-fix :permissions)
-  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
-  ;; drwxr-xr-x: world read set
-  (should (tramp-rpc-mock-test--check-accessible
-           (tramp-rpc-mock-test--dir-stat #o755 1000 1000) 2000 2000 nil)))
-
-(ert-deftest tramp-rpc-mock-test-file-accessible-directory-p-owner-readable ()
-  "Owner-readable directory is accessible only to the file owner."
-  :tags '(:group-fix :permissions)
-  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
-  (let ((stat (tramp-rpc-mock-test--dir-stat #o700 1000 1000)))
-    ;; Correct owner: accessible.
-    (should (tramp-rpc-mock-test--check-accessible stat 1000 2000 nil))
-    ;; Wrong owner: not accessible.
-    (should-not (tramp-rpc-mock-test--check-accessible stat 2000 2000 nil))))
-
-(ert-deftest tramp-rpc-mock-test-file-accessible-directory-p-primary-group ()
-  "Directory with group-read is accessible when user's primary GID matches."
-  :tags '(:group-fix :permissions)
-  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
-  ;; drwx------ except group-r: drwxr----- (#o740) — file owned by gid 500.
-  (let ((stat (tramp-rpc-mock-test--dir-stat #o740 1000 500)))
-    ;; Primary GID matches file GID.
-    (should (tramp-rpc-mock-test--check-accessible stat 2000 500 nil))
-    ;; Primary GID doesn't match and no supplementary groups.
-    (should-not (tramp-rpc-mock-test--check-accessible stat 2000 999 nil))))
-
-(ert-deftest tramp-rpc-mock-test-file-accessible-directory-p-supplementary-group ()
-  "Directory with group-read is accessible via supplementary group membership."
-  :tags '(:group-fix :permissions)
-  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
-  ;; drwxr----- (#o740): file owned by gid 500.  User's primary gid is 999.
-  (let ((stat (tramp-rpc-mock-test--dir-stat #o740 1000 500)))
-    ;; Supplementary groups include the file's gid 500: accessible.
-    ;; Must be exactly t, not a list tail, so Emacs does not treat it as EACCES.
-    (should (eq t (tramp-rpc-mock-test--check-accessible stat 2000 999 '(300 500 700))))
-    ;; Supplementary groups do not include 500: not accessible.
-    (should-not (tramp-rpc-mock-test--check-accessible stat 2000 999 '(300 700)))))
-
-(ert-deftest tramp-rpc-mock-test-file-accessible-directory-p-not-directory ()
-  "A regular file is never treated as an accessible directory."
-  :tags '(:group-fix :permissions)
-  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
-  ;; Use a file stat (type=file), not a directory.
-  (let ((file-stat `((type . "file")
-                     (mode . ,(logior #o100000 #o755))
-                     (nlinks . 1) (uid . 1000) (gid . 1000)
-                     (uname . "u") (gname . "g")
-                     (atime . 0) (mtime . 0) (ctime . 0)
-                     (size . 0) (inode . 1) (dev . 1))))
-    (should-not (tramp-rpc-mock-test--check-accessible file-stat 1000 1000 nil))))
-
-(ert-deftest tramp-rpc-mock-test-file-accessible-directory-p-nonexistent ()
-  "A nonexistent path (nil stat) returns nil."
-  :tags '(:group-fix :permissions)
-  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
-  (should-not (tramp-rpc-mock-test--check-accessible nil 1000 1000 nil)))
-
-(ert-deftest tramp-rpc-mock-test-file-accessible-directory-p-no-read-bit ()
-  "A directory with no read bits returns nil even if execute is set."
-  :tags '(:group-fix :permissions)
-  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
-  ;; drwx--x--x (#o711): execute set for group/world, but no read.
-  (let ((stat (tramp-rpc-mock-test--dir-stat #o711 1000 500)))
-    (should-not (tramp-rpc-mock-test--check-accessible stat 2000 999 '(500)))))
-
-(ert-deftest tramp-rpc-mock-test-file-accessible-directory-p-bypasses-tramp-property-cache ()
-  "The handler uses the stat cache and bypasses the TRAMP file-property cache.
-This is the core regression test: after a remote chgrp, a stale
-\"file-readable-p\" TRAMP property (nil) must not prevent access."
-  :tags '(:group-fix :cache)
-  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
-  ;; Directory gid changed to 500.  User is in supplementary group 500.
-  ;; drwxrwx--- (#o770).
-  (let* ((stat (tramp-rpc-mock-test--dir-stat #o770 1000 500))
-         (vec (tramp-dissect-file-name "/rpc:mockhost:/testdir")))
-    ;; Poison the TRAMP file-property cache with a stale nil result, as would
-    ;; happen if the user accessed the directory before having group 500.
-    (tramp-set-file-property vec "/testdir" "file-readable-p" nil)
-    (unwind-protect
-        (cl-letf (((symbol-function 'tramp-rpc--call-file-stat)
-                   (lambda (_v _l &optional _lstat) stat))
-                  ((symbol-function 'tramp-get-remote-uid)
-                   (lambda (_v _fmt) 2000))
-                  ((symbol-function 'tramp-get-remote-gid)
-                   (lambda (_v _fmt) 999))
-                  ((symbol-function 'tramp-get-remote-groups)
-                   (lambda (_v _fmt) '(300 500 700)))
-                  ((symbol-function 'tramp-connectable-p)
-                   (lambda (_f) t)))
-          ;; The stale TRAMP property must NOT prevent access: the handler
-          ;; reads the stat directly (TTL-based cache) and must return t.
-          (should (tramp-rpc-handle-file-accessible-directory-p
-                   "/rpc:mockhost:/testdir")))
-      (tramp-flush-file-properties vec "/testdir"))))
+(load (expand-file-name "tramp-rpc-access-tests.el"
+                        (file-name-directory (or load-file-name buffer-file-name))))
 
 (ert-deftest tramp-rpc-mock-test-groups-in-route-connection-properties ()
   "groups-integer and groups-string are in the route flush list.

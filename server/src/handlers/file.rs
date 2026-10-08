@@ -38,6 +38,58 @@ pub async fn stat(params: Value) -> HandlerResult {
     }
 }
 
+/// Return an effective-credential access decision, following symlinks.
+/// Filesystem denials are results; unsupported checks and RPC failures are errors.
+pub async fn access(params: Value) -> HandlerResult {
+    #[derive(Deserialize)]
+    struct Params {
+        #[serde(with = "path_or_bytes")]
+        path: Vec<u8>,
+        /// Any combination of r/w/x; empty checks existence only.
+        mode: String,
+    }
+
+    let params: Params = from_value(params).map_err(|e| RpcError::invalid_params(e.to_string()))?;
+    let mode = params
+        .mode
+        .bytes()
+        .try_fold(rustix::fs::Access::empty(), |mode, bit| {
+            Ok::<_, RpcError>(
+                mode | match bit {
+                    b'r' => rustix::fs::Access::READ_OK,
+                    b'w' => rustix::fs::Access::WRITE_OK,
+                    b'x' => rustix::fs::Access::EXEC_OK,
+                    _ => {
+                        return Err(RpcError::invalid_params(
+                            "Access mode must contain only r/w/x",
+                        ));
+                    }
+                },
+            )
+        })?;
+    let path = bytes_to_path(&params.path).await?;
+    tokio::task::spawn_blocking(move || {
+        let (errno, message) = match crate::access::check(&path, mode) {
+            Ok(()) => (0, None),
+            Err(crate::access::Error::Unsupported(error)) => {
+                return Err(RpcError::io_error(std::io::Error::from_raw_os_error(
+                    error.raw_os_error(),
+                )));
+            }
+            Err(crate::access::Error::Filesystem(error)) => {
+                (error.raw_os_error(), Some(error.to_string()))
+            }
+        };
+        let mut result = vec![(Value::from("errno"), Value::from(errno))];
+        if let Some(message) = message {
+            result.push((Value::from("message"), Value::from(message)));
+        }
+        Ok(Value::Map(result))
+    })
+    .await
+    .map_err(|error| RpcError::internal_error(format!("Access task join error: {error}")))?
+}
+
 /// Get the true name of a file (resolve symlinks)
 pub async fn truename(params: Value) -> HandlerResult {
     #[derive(Deserialize)]
@@ -476,6 +528,78 @@ use crate::protocol::path_or_bytes;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn access_params(path: &Path, mode: &str) -> Value {
+        Value::Map(vec![
+            (
+                Value::from("path"),
+                Value::Binary(path.as_os_str().as_bytes().to_vec()),
+            ),
+            (Value::from("mode"), Value::from(mode)),
+        ])
+    }
+
+    fn access_errno(result: Value) -> Option<i64> {
+        result
+            .as_map()?
+            .iter()
+            .find(|(key, _)| key.as_str() == Some("errno"))?
+            .1
+            .as_i64()
+    }
+
+    #[tokio::test]
+    async fn test_access_paths_and_errors() {
+        let temp = tempfile::tempdir().unwrap();
+        let file = temp.path().join("file");
+        std::fs::write(&file, "contents").unwrap();
+        assert_eq!(
+            access_errno(access(access_params(&file, "rw")).await.unwrap()),
+            Some(0)
+        );
+        assert_eq!(
+            access_errno(
+                access(access_params(&temp.path().join("./"), ""))
+                    .await
+                    .unwrap()
+            ),
+            Some(0)
+        );
+        let result = access(access_params(&file.join("./"), "")).await.unwrap();
+        assert_eq!(access_errno(result), Some(libc::ENOTDIR.into()));
+
+        let missing = temp.path().join("missing");
+        let link = temp.path().join("link");
+        std::os::unix::fs::symlink(&missing, &link).unwrap();
+        let result = access(access_params(&link, "r")).await.unwrap();
+        assert_eq!(access_errno(result), Some(libc::ENOENT.into()));
+        std::fs::remove_file(&link).unwrap();
+        std::os::unix::fs::symlink("link", &link).unwrap();
+        let result = access(access_params(&link, "r")).await.unwrap();
+        assert_eq!(access_errno(result), Some(libc::ELOOP.into()));
+    }
+
+    // APFS rejects non-UTF-8 filenames; exercise byte-named files on Linux
+    // without preventing macOS from running the portable path/error checks.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn test_access_non_utf8_path() {
+        let temp = tempfile::tempdir().unwrap();
+        let file = temp.path().join(OsStr::from_bytes(b"file-\xff"));
+        std::fs::write(&file, "contents").unwrap();
+        assert_eq!(
+            access_errno(access(access_params(&file, "rw")).await.unwrap()),
+            Some(0)
+        );
+    }
+
+    #[tokio::test]
+    async fn test_access_rejects_invalid_mode() {
+        let error = access(access_params(Path::new("/"), "z"))
+            .await
+            .unwrap_err();
+        assert_eq!(error.code, RpcError::INVALID_PARAMS);
+    }
 
     /// Verify get_user_name resolves the current process uid.
     /// This must succeed on any system -- the running user always has

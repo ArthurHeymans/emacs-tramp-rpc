@@ -231,6 +231,7 @@ This is called from `tramp-multi-hop-p-hook'."
 (require 'seq)
 (require 'tramp)
 (require 'tramp-sh)
+(require 'tramp-cmds)
 (require 'tramp-cache)
 (require 'tramp-compat)
 (require 'tramp-rpc-protocol)
@@ -402,46 +403,64 @@ FORCE-UNCOMPRESSED is passed to `tramp-rpc--file-read-params'."
 ;; File name handler operations
 ;; ============================================================================
 
-(defun tramp-rpc--mode-executable-p (mode-string remote-uid remote-gid attrs groups)
-  "Return non-nil when MODE-STRING permits the remote user to execute ATTRS.
-REMOTE-UID is the remote user ID.
-REMOTE-GID is the remote group ID."
-  (if (equal remote-uid tramp-root-id-integer)
-      ;; Root may execute only when some execute bit is set.
-      (or (memq (aref mode-string 3) '(?x ?s))
-          (memq (aref mode-string 6) '(?x ?s))
-          (memq (aref mode-string 9) '(?x ?t)))
-    (or
-     ;; World executable.
-     (memq (aref mode-string 9) '(?x ?t))
-     ;; Owner executable.
-     (and (memq (aref mode-string 3) '(?x ?s))
-          (equal remote-uid (file-attribute-user-id attrs)))
-     ;; Group executable and we are in that group.
-     (and (memq (aref mode-string 6) '(?x ?s))
-          (or (equal remote-gid (file-attribute-group-id attrs))
-              (member (file-attribute-group-id attrs) groups))))))
+(defun tramp-rpc--call-file-access (vec localname mode)
+  "Return the kernel access decision for MODE on LOCALNAME on VEC.
+The result contains errno (zero on success) and a message on failure.
+MODE is a string of r/w/x flags; empty checks existence.  RPC failures
+and malformed responses signal rather than becoming permission denials."
+  (let* ((result (tramp-rpc--call
+                  vec "file.access"
+                  (append (tramp-rpc--encode-path localname)
+                          `((mode . ,mode)))))
+         (errno (and (listp result) (alist-get 'errno result))))
+    (unless (and (integerp errno) (>= errno 0)
+                 (or (zerop errno) (stringp (alist-get 'message result))))
+      (error "Invalid file.access response: %S" result))
+    result))
+
+(defun tramp-rpc--check-file-access (vec localname mode)
+  "Check MODE access to LOCALNAME on VEC, returning t or signaling.
+Map kernel denials to the same error types as native `access-file'."
+  (let* ((result (tramp-rpc--call-file-access vec localname mode))
+         (errno (alist-get 'errno result)))
+    (unless (zerop errno)
+      (signal (pcase errno
+                (2 'file-missing) ; ENOENT on Linux and macOS
+                (13 'permission-denied) ; EACCES
+                (17 'file-already-exists) ; EEXIST
+                (_ 'file-error))
+              (list (alist-get 'message result)
+                    (tramp-make-tramp-file-name vec localname))))
+    t))
+
+(defun tramp-rpc--file-access-p (filename mode)
+  "Return whether FILENAME permits MODE, using a route-aware cache.
+MODE is r/w/x or the symbol `directory' for directory search access.
+Only a missing file's write check falls back to its immediate parent."
+  (with-parsed-tramp-file-name (expand-file-name filename) nil
+    (or (and (eq mode 'directory) non-essential
+             (or (tramp-string-empty-or-nil-p localname)
+                 (string-equal localname "/")))
+        (when (tramp-connectable-p v)
+          (let ((property (tramp-rpc--file-property-key v localname mode)))
+            (with-tramp-file-property v localname property
+              (let* ((directory (eq mode 'directory))
+                     ;; Resolving /./ checks directory search permission.
+                     (path (if directory
+                               (concat (file-name-as-directory localname) "./")
+                             localname))
+                     (result (tramp-rpc--call-file-access
+                              v path (if directory "" mode)))
+                     (errno (alist-get 'errno result)))
+                (if (and (equal mode "w") (eql errno 2))
+                    (zerop (alist-get
+                            'errno (tramp-rpc--call-file-access
+                                    v (file-name-directory localname) "wx")))
+                  (zerop errno)))))))))
 
 (defun tramp-rpc-handle-file-executable-p (filename)
-  "Like `file-executable-p' for TRAMP-RPC files.
-Checks execute permission from `file-attributes' mode string and
-the remote uid/gid.  No dedicated RPC call needed.
-For symlinks, follows through to the target (like
-`tramp-handle-file-readable-p' does).
-FILENAME is the file name being handled."
-  (with-parsed-tramp-file-name (expand-file-name filename) nil
-    (with-tramp-file-property v localname "file-executable-p"
-      (when-let* ((attrs (file-attributes filename 'integer)))
-        (if (stringp (file-attribute-type attrs))
-            ;; Symlink: follow it and check the target.
-            (file-executable-p (file-truename filename))
-          ;; Regular file or directory: check mode bits.
-          (when-let* ((mode-string (file-attribute-modes attrs))
-                      (remote-uid (tramp-get-remote-uid v 'integer))
-                      (remote-gid (tramp-get-remote-gid v 'integer)))
-            (tramp-rpc--mode-executable-p
-             mode-string remote-uid remote-gid attrs
-             (tramp-get-remote-groups v 'integer))))))))
+  "Like `file-executable-p' for TRAMP-RPC FILENAME."
+  (tramp-rpc--file-access-p filename "x"))
 
 (defun tramp-rpc--call-file-stat (vec localname &optional lstat)
   "Call file.stat for LOCALNAME on VEC, returning nil if file doesn't exist.
@@ -526,61 +545,23 @@ FILENAME is the file name being handled."
              (cached cached)))))))))
 
 (defun tramp-rpc-handle-file-accessible-directory-p (filename)
-  "Like `file-accessible-directory-p' for TRAMP-RPC files.
-Uses the tramp-rpc stat cache (TTL-based) directly instead of the TRAMP
-file-property cache, so that group or permission changes on a remote
-directory are reflected without a full cache flush.
-
-The TRAMP file-property cache has no TTL and is only cleared by explicit
-invalidation (e.g., via filesystem-watch events).  A `chgrp' on a directory
-sends IN_ATTRIB to a watch on the *parent* directory, not to a watch on the
-directory itself, so the parent must be watched too.  By going directly
-through the stat cache here we guarantee that the access decision is at most
-one stat-TTL stale, even without an active watch.
-FILENAME is the file name being checked."
-  (with-parsed-tramp-file-name (expand-file-name filename) nil
-    (or (tramp-string-empty-or-nil-p localname)
-        (string-equal localname "/")
-        (when (tramp-connectable-p filename)
-          ;; tramp-rpc--call-file-stat uses the TTL-based stat cache (not the
-          ;; TRAMP file-property cache), so stale "file-readable-p" entries
-          ;; from before a remote chgrp do not gate this check.
-          (when-let* ((stat (tramp-rpc--call-file-stat v localname))
-                      ((equal (alist-get 'type stat) "directory"))
-                      (attrs (tramp-rpc--convert-file-attributes stat 'integer))
-                      (mode (file-attribute-modes attrs))
-                      (remote-uid (tramp-get-remote-uid v 'integer))
-                      (remote-gid (tramp-get-remote-gid v 'integer)))
-            ;; Groups may legitimately be nil (no supplementary groups), so
-            ;; bind it with `let' rather than including it in `when-let*'.
-            (let ((groups (tramp-get-remote-groups v 'integer)))
-              ;; Mirror tramp-handle-file-accessible-directory-p: check ?r
-              ;; (read bit), which controls whether the directory can be listed.
-              (let ((offset 1))  ; offset 1 = read-permission column
-                (or
-                 ;; World readable.
-                 (eq ?r (aref mode (+ offset 6)))
-                 ;; Owner readable.
-                 (and (eq ?r (aref mode offset))
-                      (or (equal remote-uid tramp-root-id-integer)
-                          (equal remote-uid (file-attribute-user-id attrs))))
-                 ;; Group readable (primary or supplementary group).
-                 ;; `member' returns a list tail, not t; normalise to t so
-                 ;; Emacs does not treat a non-t truthy value as EACCES.
-                 (and (eq ?r (aref mode (+ offset 3)))
-                      (or (equal remote-gid (file-attribute-group-id attrs))
-                          (and (member (file-attribute-group-id attrs)
-                                       groups)
-                               t)))))))))))
+  "Like `file-accessible-directory-p' for TRAMP-RPC FILENAME.
+A directory must be searchable, not necessarily readable."
+  (tramp-rpc--file-access-p filename 'directory))
 
 (defun tramp-rpc-handle-file-readable-p (filename)
-  "Like `file-readable-p' for TRAMP-RPC files.
-For cached-missing marker files, avoid delegating to TRAMP's generic handler,
-which would otherwise perform another remote stat.
-FILENAME is the file name being handled."
-  (pcase (tramp-rpc-magit--file-exists-p filename)
+  "Like `file-readable-p' for TRAMP-RPC FILENAME.
+Use cached missing marker results, otherwise ask the remote kernel."
+  (pcase (if (eq remote-file-name-inhibit-cache t)
+             'not-cached
+           (tramp-rpc-magit--file-exists-p filename))
     ('nil nil)
-    (_ (tramp-handle-file-readable-p filename))))
+    (_ (tramp-rpc--file-access-p filename "r"))))
+
+(defun tramp-rpc-handle-file-writable-p (filename)
+  "Like `file-writable-p' for TRAMP-RPC FILENAME.
+For missing files, check write and search access to the immediate parent."
+  (tramp-rpc--file-access-p filename "w"))
 
 (defun tramp-rpc-handle-file-regular-p (filename)
   "Like `file-regular-p' for TRAMP-RPC files.
@@ -604,28 +585,31 @@ FILENAME is the file name being handled."
         result))))
 
 (defun tramp-rpc-handle-access-file (filename string)
-  "Like `access-file' for TRAMP-RPC files.
-Delegates to `tramp-handle-access-file' and converts non-cyclic
-dangling symlink errors from `file-error' to `file-missing'.
-FILENAME is the file name being checked.
+  "Like `access-file' for TRAMP-RPC FILENAME.
+Check read access directly, without metadata or predicate caches.
 STRING is prepended to any resulting error message."
-  (with-parsed-tramp-file-name (expand-file-name filename) nil
-    (condition-case err
-        (tramp-handle-access-file filename string)
-      (file-error
-       (let* ((target (file-symlink-p filename))
-              (target-file
-               (and target
-                    (if (file-name-absolute-p target)
-                        (tramp-make-tramp-file-name v target)
-                      (expand-file-name
-                       target (file-name-directory filename))))))
-         (if (and target
-                  (not (file-exists-p filename))
-                  ;; Preserve symlink-cycle errors.
-                  (not (file-symlink-p target-file)))
-             (signal 'file-missing (cdr err))
-           (signal (car err) (cdr err))))))))
+  (let ((timeout (bound-and-true-p remote-file-name-access-timeout))
+        (v (tramp-dissect-file-name
+            (if (file-name-absolute-p filename) filename default-directory)))
+        (tramp-dont-suspend-timers t))
+    (with-tramp-timeout
+        (timeout
+         (unless (and (not non-essential) (tramp-connectable-p v))
+           (tramp-cleanup-connection v 'keep-debug 'keep-password))
+         (tramp-error
+          v 'file-error
+          (format "%s: Timeout %s second(s) accessing %s"
+                  string timeout filename)))
+      (with-parsed-tramp-file-name (expand-file-name filename) nil
+        (unless (tramp-connectable-p v)
+          (tramp-error v 'file-error "%s: Connection unavailable, %s"
+                       string filename))
+        (condition-case err
+            (progn
+              (tramp-rpc--check-file-access v localname "r")
+              nil)
+          (file-error
+           (signal (car err) (cons string (cdr err)))))))))
 
 (defun tramp-rpc-handle-file-truename (filename)
   "Like `file-truename' for TRAMP-RPC files.
@@ -2590,7 +2574,7 @@ DIR is the directory being handled."
     ;; =========================================================================
     (file-exists-p . tramp-rpc-handle-file-exists-p)
     (file-readable-p . tramp-rpc-handle-file-readable-p)
-    (file-writable-p . tramp-handle-file-writable-p)
+    (file-writable-p . tramp-rpc-handle-file-writable-p)
     (file-executable-p . tramp-rpc-handle-file-executable-p)
     (file-directory-p . tramp-rpc-handle-file-directory-p)
     (file-regular-p . tramp-rpc-handle-file-regular-p)

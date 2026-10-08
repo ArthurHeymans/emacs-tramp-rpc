@@ -11,6 +11,7 @@
 //! Uses tokio for async concurrent request processing - multiple requests
 //! can be processed in parallel while waiting on I/O.
 
+mod access;
 mod handlers;
 mod output;
 mod protocol;

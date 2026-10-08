@@ -195,6 +195,7 @@ async fn route(method: String, params: Value) -> HandlerResult {
     match method.as_str() {
         // File metadata operations
         "file.stat" => file::stat(params).await,
+        "file.access" => file::access(params).await,
         "file.truename" => file::truename(params).await,
 
         // Directory operations
@@ -402,6 +403,34 @@ mod tests {
         assert_eq!(frame_error.code, RpcError::INTERNAL_ERROR);
         validate_batch_response_size(&response, frame_size)
             .expect("a response exactly at the frame limit is legal");
+    }
+
+    #[tokio::test]
+    async fn access_decisions_are_results_in_single_and_batch_dispatch() {
+        let tmp = tempfile::tempdir().unwrap();
+        let file = tmp.path().join("file");
+        std::fs::write(&file, "contents").unwrap();
+        let mut requests = Vec::new();
+        let mut expected = Vec::new();
+        for path in [file.clone(), tmp.path().join("missing"), file.join("child")] {
+            let params = msgpack_map! {
+                "path" => Value::Binary(path.as_os_str().as_bytes().to_vec()),
+                "mode" => "r",
+            };
+            expected.push(route("file.access".into(), params.clone()).await.unwrap());
+            requests.push(msgpack_map! { "method" => "file.access", "params" => params });
+        }
+        let batch = batch_execute(msgpack_map! { "requests" => Value::Array(requests) })
+            .await
+            .unwrap();
+        let batch: std::collections::HashMap<
+            String,
+            Vec<std::collections::HashMap<String, Value>>,
+        > = from_value(batch).unwrap();
+        for (entry, decision) in batch["results"].iter().zip(&expected) {
+            assert_eq!(entry.get("result"), Some(decision));
+            assert!(!entry.contains_key("error"));
+        }
     }
 
     #[tokio::test]
