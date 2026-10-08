@@ -599,50 +599,27 @@ FILENAME is the file name being handled."
 
 (defun tramp-rpc-handle-access-file (filename string)
   "Like `access-file' for TRAMP-RPC files.
+Delegates to `tramp-handle-access-file' and converts non-cyclic
+dangling symlink errors from `file-error' to `file-missing'.
 FILENAME is the file name being checked.
 STRING is prepended to any resulting error message."
   (with-parsed-tramp-file-name (expand-file-name filename) nil
-    ;; For directories, skip the client-side `file-accessible-directory-p'
-    ;; simulation that `tramp-handle-access-file' would run.  That simulation
-    ;; uses local mode-bit arithmetic and gives false negatives when the
-    ;; server's effective credentials differ from the visible mode bits (e.g.
-    ;; supplementary groups acquired after the server started, NFS effective
-    ;; GIDs, ACLs).  A genuine EACCES from `dir.list' surfaces the real error
-    ;; to the user with no loss of information.
-    (when (tramp-connectable-p filename)
-      (let ((stat (tramp-rpc--call-file-stat v localname)))
-        (cond
-         ;; File/directory exists and is a directory: declare it accessible
-         ;; without a permission pre-check.  Let the listing operation signal
-         ;; the OS error if the directory truly cannot be read.
-         ((and stat (equal (alist-get 'type stat) "directory"))
-          nil)
-         ;; Nonexistent path: raise file-missing immediately.
-         ((null stat)
-          (tramp-error v 'file-missing
-                       (format "%s: No such file or directory, %s"
-                               string filename)))
-         ;; Regular file or symlink: fall through to the generic handler,
-         ;; which checks file-readable-p.  The dangling-symlink conversion
-         ;; below converts file-error to file-missing for dangling links.
-         (t
-          (condition-case err
-              (tramp-handle-access-file filename string)
-            (file-error
-             (let* ((target (file-symlink-p filename))
-                    (target-file
-                     (and target
-                          (if (file-name-absolute-p target)
-                              (tramp-make-tramp-file-name v target)
-                            (expand-file-name
-                             target (file-name-directory filename))))))
-               (if (and target
-                        (not (file-exists-p filename))
-                        ;; Preserve symlink-cycle errors.
-                        (not (file-symlink-p target-file)))
-                   (signal 'file-missing (cdr err))
-                 (signal (car err) (cdr err))))))))))))
-
+    (condition-case err
+        (tramp-handle-access-file filename string)
+      (file-error
+       (let* ((target (file-symlink-p filename))
+              (target-file
+               (and target
+                    (if (file-name-absolute-p target)
+                        (tramp-make-tramp-file-name v target)
+                      (expand-file-name
+                       target (file-name-directory filename))))))
+         (if (and target
+                  (not (file-exists-p filename))
+                  ;; Preserve symlink-cycle errors.
+                  (not (file-symlink-p target-file)))
+             (signal 'file-missing (cdr err))
+           (signal (car err) (cdr err))))))))
 
 (defun tramp-rpc-handle-file-truename (filename)
   "Like `file-truename' for TRAMP-RPC files.
