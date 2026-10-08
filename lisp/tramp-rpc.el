@@ -562,10 +562,13 @@ FILENAME is the file name being checked."
                       (or (equal remote-uid tramp-root-id-integer)
                           (equal remote-uid (file-attribute-user-id attrs))))
                  ;; Group readable (primary or supplementary group).
+                 ;; `member' returns a list tail, not t; normalise to t so
+                 ;; Emacs does not treat a non-t truthy value as EACCES.
                  (and (eq ?r (aref mode (+ offset 3)))
                       (or (equal remote-gid (file-attribute-group-id attrs))
-                          (member (file-attribute-group-id attrs)
-                                  groups)))))))))))
+                          (and (member (file-attribute-group-id attrs)
+                                       groups)
+                               t)))))))))))
 
 (defun tramp-rpc-handle-file-readable-p (filename)
   "Like `file-readable-p' for TRAMP-RPC files.

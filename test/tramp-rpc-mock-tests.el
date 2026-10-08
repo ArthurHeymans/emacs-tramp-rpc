@@ -8803,7 +8803,8 @@ UID, GID, and GROUPS are the remote credentials."
   ;; drwxr----- (#o740): file owned by gid 500.  User's primary gid is 999.
   (let ((stat (tramp-rpc-mock-test--dir-stat #o740 1000 500)))
     ;; Supplementary groups include the file's gid 500: accessible.
-    (should (tramp-rpc-mock-test--check-accessible stat 2000 999 '(300 500 700)))
+    ;; Must be exactly t, not a list tail, so Emacs does not treat it as EACCES.
+    (should (eq t (tramp-rpc-mock-test--check-accessible stat 2000 999 '(300 500 700))))
     ;; Supplementary groups do not include 500: not accessible.
     (should-not (tramp-rpc-mock-test--check-accessible stat 2000 999 '(300 700)))))
 
