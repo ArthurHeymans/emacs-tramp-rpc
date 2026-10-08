@@ -1284,6 +1284,11 @@ This matches the behavior expected by `tramp-test28-process-file'."
     (unwind-protect
         (cl-letf (((symbol-function 'tramp-rpc--ensure-connection)
                    (lambda (_vec) conn))
+                  ;; The frozen timeout clock cannot drive a real probe.  A
+                  ;; successful probe leaves this captured generation alive.
+                  ((symbol-function 'tramp-rpc--probe-live-connection)
+                   (lambda (_vec passed-conn _process _method)
+                     (should (eq passed-conn conn))))
                   ((symbol-function 'float-time)
                    (lambda (&rest _)
                      (setq calls (1+ calls))
@@ -7654,7 +7659,8 @@ Other operations, such as a pending sentinel of an earlier test asking for
           ;; Simulate native-compiled VC observing a raw relay state such as
           ;; `closed' rather than the logical state from TRAMP-RPC handler.
           (cl-letf (((symbol-function 'process-status)
-                     (lambda (_process) 'closed))
+                     (let ((original (symbol-function 'process-status)))
+                       (lambda (p) (if (eq p proc) 'closed (funcall original p)))))
                     ((symbol-function 'tramp-run-real-handler)
                      (tramp-rpc-mock-test--reject-real-vc-exec-after)))
             (tramp-rpc-handle-vc-exec-after
@@ -7685,8 +7691,12 @@ Other operations, such as a pending sentinel of an earlier test asking for
                      (tramp-rpc-mock-test--reject-real-vc-exec-after)))
             (tramp-rpc-handle-vc-exec-after
              (lambda () (setq ran t)))
-            (cl-letf (((symbol-function 'process-status) (lambda (_process) 'exit))
-                      ((symbol-function 'process-exit-status) (lambda (_process) 0)))
+            (cl-letf (((symbol-function 'process-status)
+                       (let ((original (symbol-function 'process-status)))
+                         (lambda (p) (if (eq p proc) 'exit (funcall original p)))))
+                      ((symbol-function 'process-exit-status)
+                       (let ((original (symbol-function 'process-exit-status)))
+                         (lambda (p) (if (eq p proc) 0 (funcall original p))))))
               (funcall (process-sentinel proc) proc "finished")))
           (should ran))
       (set-process-sentinel proc #'ignore)
