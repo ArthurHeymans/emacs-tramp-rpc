@@ -80,37 +80,37 @@ supported here because tramp-rpc starts elevated backends with sudo."
               (concat hop-str tramp-postfix-hop-format) 'nodefault)))
      (split-string hop tramp-postfix-hop-regexp 'omit))))
 
-(defun tramp-rpc--hidden-sudo-proxy-handler-alist ()
-  "Return foreign handler alist without the tramp-rpc sudo predicate.
-`tramp-compute-multi-hops' asks TRAMP which handler owns the target; if the
-sudo predicate remains registered while it is expanding hidden ad-hoc proxies,
-it can re-enter `tramp-rpc--sudo-file-name-p'."
+(defun tramp-rpc--proxy-handler-alist ()
+  "Return foreign handlers excluding TRAMP-RPC during proxy expansion.
+TRAMP only expands proxies for shell handlers.  Temporarily hiding both
+RPC predicates lets it compute the route without recursing into sudo
+handler detection or treating an RPC target as an opaque foreign method."
   (cl-remove-if
-   (lambda (entry) (eq (car entry) 'tramp-rpc--sudo-file-name-p))
+   (lambda (entry)
+     (memq (car entry) '(tramp-rpc-file-name-p tramp-rpc--sudo-file-name-p)))
    tramp-foreign-file-name-handler-alist))
 
 (defun tramp-rpc--computed-hop-pairs (vec)
   "Return hidden TRAMP proxy hops of VEC as (HOP-STRING . HOP-VEC) pairs.
 Native TRAMP helpers, including `tramp-file-name-with-sudo', can store
-ad-hoc hops in `tramp-default-proxies-alist' instead of VEC's hop slot."
-  (when (and (tramp-rpc--privilege-elevation-vec-p vec)
+ad-hoc hops in `tramp-default-proxies-alist' instead of VEC's hop slot.
+Invalid proxy configurations signal rather than silently using a direct route."
+  (when (and (or (tramp-rpc-file-name-p vec)
+                 (tramp-rpc--privilege-elevation-vec-p vec))
              (not tramp-rpc--sudo-file-name-p-in-progress))
-    (condition-case nil
-        (let ((tramp-rpc--sudo-file-name-p-in-progress t)
-              (tramp-verbose 0)
-              (tramp-foreign-file-name-handler-alist
-               (tramp-rpc--hidden-sudo-proxy-handler-alist)))
-          (mapcar
-           (lambda (hop-vec)
-             (cons (tramp-rpc--hop-vec-to-string hop-vec) hop-vec))
-           (butlast (tramp-compute-multi-hops vec))))
-      (error nil))))
+    (let ((tramp-rpc--sudo-file-name-p-in-progress t)
+          (tramp-foreign-file-name-handler-alist
+           (tramp-rpc--proxy-handler-alist)))
+      (mapcar
+       (lambda (hop-vec)
+         (cons (tramp-rpc--hop-vec-to-string hop-vec) hop-vec))
+       (butlast (tramp-compute-multi-hops vec))))))
 
 (defun tramp-rpc--hop-pairs (vec)
   "Return VEC's explicit or hidden proxy hops as pairs.
 Explicit hops are preferred because they preserve the exact user spelling
-from the filename.  Hidden proxy expansion is used for native TRAMP sudo
-helpers which record ad-hoc hops in `tramp-default-proxies-alist'."
+from the filename.  Hidden proxy expansion recovers ordinary RPC routes
+and native sudo helper routes stored in `tramp-default-proxies-alist'."
   (or (tramp-rpc--explicit-hop-pairs vec)
       (tramp-rpc--computed-hop-pairs vec)))
 

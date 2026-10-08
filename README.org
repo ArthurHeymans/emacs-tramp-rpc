@@ -164,6 +164,10 @@ TRAMP's ad-hoc multi-hop syntax works with the ~rpc~ method:
   these chains.  RPC-to-RPC chains remain RPC-backed at the final target;
   intermediate rpc hops provide SSH routing.
 
+Hidden routes in ~tramp-default-proxies-alist~ also apply to ordinary ~rpc~
+targets, as with upstream TRAMP.  Invalid proxy configurations signal an error
+rather than silently connecting directly.
+
 ** Deployment Commands
 
 | Command                          | Description                    |

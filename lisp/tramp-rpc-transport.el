@@ -413,9 +413,10 @@ connection is cleaned up or caches are cleared.")
            (string-prefix-p "~" property))))
 
 (defun tramp-rpc--route-property-name (vec property)
-  "Return route-aware TRAMP connection PROPERTY name for VEC."
-  (format "%s:%s" property
-          (secure-hash 'sha1 (prin1-to-string (tramp-rpc--connection-key vec)))))
+  "Return PROPERTY qualified by VEC's complete RPC route."
+  (let ((print-length nil) (print-level nil) (print-circle nil))
+    (format "%s:%s" property
+            (secure-hash 'sha1 (prin1-to-string (tramp-rpc--connection-key vec))))))
 
 (defun tramp-rpc--route-generic-connection-property-advice
     (original vec property &rest args)
