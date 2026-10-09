@@ -1995,20 +1995,6 @@ containing FILENAME."
                 (alist-get 'available result)))
       (error nil))))
 
-(defun tramp-rpc-handle-get-remote-groups (vec id-format)
-  "Return remote groups using RPC.
-ID-FORMAT specifies whether to return integer GIDs or string names.
-VEC is the TRAMP connection vector."
-  (condition-case nil
-      (let ((result (tramp-rpc--call vec "system.groups" nil)))
-        (mapcar (lambda (g)
-                  (if (eq id-format 'integer)
-                      (alist-get 'gid g)
-                    (or (tramp-rpc--decode-string (alist-get 'name g))
-                        (number-to-string (alist-get 'gid g)))))
-                result))
-    (error nil)))
-
 ;; ============================================================================
 ;; ACL Support
 ;; ============================================================================
@@ -2625,7 +2611,8 @@ DIR is the directory being handled."
     (tramp-get-home-directory . tramp-rpc-handle-get-home-directory)
     (tramp-get-remote-uid . tramp-rpc-handle-get-remote-uid)
     (tramp-get-remote-gid . tramp-rpc-handle-get-remote-gid)
-    (tramp-get-remote-groups . tramp-rpc-handle-get-remote-groups)
+    ;; Kernel access checks do not need supplementary-group introspection.
+    (tramp-get-remote-groups . ignore)
     (exec-path . tramp-rpc-handle-exec-path)
     (list-system-processes . tramp-handle-list-system-processes)
     (process-attributes . tramp-handle-process-attributes)

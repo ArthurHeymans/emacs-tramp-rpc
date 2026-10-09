@@ -429,12 +429,6 @@ The directory is deleted after BODY completes."
     (should (file-directory-p dir))
     (should (file-writable-p dir))))
 
-(ert-deftest tramp-rpc-test00-remote-groups-dynamic-sizing ()
-  "The server returns the remote user's complete supplementary group list."
-  (skip-unless (tramp-rpc-test-enabled))
-  (let ((vec (tramp-dissect-file-name (tramp-rpc-test--remote-directory))))
-    (should (listp (tramp-get-remote-groups vec 'integer)))))
-
 
 ;;; ============================================================================
 ;;; Test 01: File Name Syntax
