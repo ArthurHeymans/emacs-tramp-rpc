@@ -162,7 +162,7 @@ TRAMP-RPC exposes these method categories:
 | file.stat          | path, lstat             | FileAttributes (or null if absent) |
 | file.access        | path, mode              | {errno: 0} or {errno, message}     |
 | file.truename      | path                    | string (canonical path)            |
-| file.read          | path, offset?, length?  | {content: binary, size: int}       |
+| file.read          | path, offset?, length?  | {content: binary, size: int, file_size: int} |
 | file.write         | path, content, append?  | {written: int}                     |
 | file.copy          | src, dest, preserve?    | boolean                            |
 | file.rename        | src, dest, overwrite?   | boolean                            |
@@ -172,6 +172,11 @@ TRAMP-RPC exposes these method categories:
 | file.make_symlink  | target, link_path       | boolean                            |
 | file.make_hardlink | src, dest               | boolean                            |
 | file.chown         | path, uid, gid          | boolean                            |
+
+~file.read~ reports the chunk's byte count in ~size~ and the open file's total
+size snapshot in ~file_size~.  Unbounded pipelined reads use the first chunk's
+snapshot to plan the remaining requests, without a separate ~file.stat~ lookup.
+A missing or invalid snapshot signals an error when needed for chunk planning.
 
 ~file.access~ follows symlinks and checks access using the server's effective
 credentials.  ~mode~ contains any combination of ~r~, ~w~, and ~x~; an empty

@@ -706,12 +706,12 @@ Returns the result or signals an error."
     (tramp-rpc-mock-test--stop-server)))
 
 (ert-deftest tramp-rpc-mock-test-file-read-chunks-past-rpc-limit ()
-  "File reads pipeline chunks beyond the server's per-request byte limit."
-  (let ((source "abcdefghij")
-        (tramp-rpc--file-read-chunk-size 4)
-        (tramp-rpc-compress-file-read nil)
-        (report-file-size t)
-        calls batch-sizes stat-calls)
+  "File reads pipeline chunks using the first response's size snapshot."
+  (let* ((source "abcdefghij")
+         (tramp-rpc--file-read-chunk-size 4)
+         (tramp-rpc-compress-file-read nil)
+         (reported-size (length source))
+         calls batch-sizes)
     (cl-labels ((read-result
                  (params)
                  (let* ((offset (or (alist-get 'offset params) 0))
@@ -719,16 +719,12 @@ Returns the result or signals an error."
                         (end (min (length source) (+ offset requested))))
                    (push (cons offset requested) calls)
                    `((content . ,(substring source offset end))
-                     ,@(when report-file-size
-                         `((file_size . ,(length source))))))))
+                     (file_size . ,reported-size)))))
       (cl-letf (((symbol-function 'tramp-rpc--cached-system-info)
                  (lambda (_vec) '((max_read_chunk_bytes . 16))))
-                ;; Only the old-server fallback may stat; the primary path
-                ;; must plan chunks from the first response's `file_size'.
                 ((symbol-function 'tramp-rpc--call-file-stat)
                  (lambda (&rest _)
-                   (setq stat-calls (1+ (or stat-calls 0)))
-                   `((size . ,(length source)))))
+                   (ert-fail "File reads must use their own size snapshot")))
                 ((symbol-function 'tramp-rpc--call)
                  (lambda (_vec method params &rest _)
                    (should (equal method "file.read"))
@@ -740,19 +736,17 @@ Returns the result or signals an error."
         (should (equal (tramp-rpc--read-file-bytes 'vec "/tmp/file") source))
         (should (equal (nreverse calls) '((0 . 4) (4 . 4) (8 . 2))))
         (should (equal (nreverse batch-sizes) '(2)))
-        (should-not stat-calls)
         (setq calls nil batch-sizes nil)
         (should (equal (tramp-rpc--read-file-bytes 'vec "/tmp/file" 2 9)
                        "cdefghi"))
         (should (equal (nreverse calls) '((2 . 4) (6 . 3))))
         (should (equal (nreverse batch-sizes) '(1)))
-        (should-not stat-calls)
-        ;; Old servers omit `file_size'; one file.stat fallback plans the rest.
-        (setq calls nil batch-sizes nil report-file-size nil)
-        (should (equal (tramp-rpc--read-file-bytes 'vec "/tmp/file") source))
-        (should (equal (nreverse calls) '((0 . 4) (4 . 4) (8 . 2))))
-        (should (equal (nreverse batch-sizes) '(2)))
-        (should (equal stat-calls 1))))))
+        (dolist (invalid-size '(nil -1 "10"))
+          (setq calls nil batch-sizes nil reported-size invalid-size)
+          (should-error (tramp-rpc--read-file-bytes 'vec "/tmp/file")
+                        :type 'remote-file-error)
+          (should (= (length calls) 1))
+          (should-not batch-sizes))))))
 
 (ert-deftest tramp-rpc-mock-test-server-rename-dangling-symlink-no-overwrite ()
   "No-overwrite rename treats a dangling symlink as an existing destination."
@@ -5240,7 +5234,8 @@ direct property test would miss it."
         (cl-letf (((symbol-function 'tramp-rpc--cached-system-info)
                    (lambda (_vec) '((max_read_chunk_bytes . 4))))
                   ((symbol-function 'tramp-rpc--call-file-stat)
-                   (lambda (&rest _) '((size . 4))))
+                   (lambda (&rest _)
+                     (ert-fail "Chunked retry must use its read size snapshot")))
                   ((symbol-function 'tramp-rpc--call)
                    (lambda (_vec method _params &rest _)
                      (pcase method
@@ -5249,7 +5244,7 @@ direct property test would miss it."
                            (attrs . ,file-stat))))
                        ("file.read"
                         (setq retry-called t)
-                        '((content . "data")))
+                        '((content . "data") (file_size . 4)))
                        (_ (error "Unexpected RPC method: %s" method)))))
                   ((symbol-function 'tramp-rpc--call-batch)
                    (lambda (_vec _requests)
