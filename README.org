@@ -271,7 +271,9 @@ Access predicates cache answers from the remote kernel, not guesses from
 mode bits or group lists.  Entries distinguish connection routes and trailing
 slashes, while obeying TRAMP's ~remote-file-name-inhibit-cache~ and watch
 invalidation.  ~access-file~ always checks fresh read access and raises native
-Emacs error classes for filesystem denials.
+Emacs error classes for filesystem denials.  Writable checks of missing targets
+also test write/search access to the immediate parent in the same RPC, only
+after an ~ENOENT~ target lookup.
 Like native Emacs, ~file-accessible-directory-p~ checks whether a directory
 is searchable; read permission is only needed to list its names.  New login
 group memberships require reconnecting the RPC server.

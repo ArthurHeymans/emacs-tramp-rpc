@@ -600,6 +600,8 @@ Returns the result or signals an error."
           (should result)
           (should-not (plist-get result :error))
           ;; Check expected fields
+          (should (= (alist-get 'protocol_revision result)
+                     tramp-rpc-protocol-revision))
           (should (assoc 'uid result))
           (should (assoc 'gid result))
           (should (assoc 'home result))

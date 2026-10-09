@@ -86,7 +86,7 @@ expensive expressions such as buffer sizes or `prin1' of large values."
 (defvar tramp-rpc-protocol--message-target nil
   "TRAMP vector or process used for level-6 protocol debug messages.")
 
-(defconst tramp-rpc-protocol-revision 1
+(defconst tramp-rpc-protocol-revision 2
   "Required RPC contract revision, independent of the package version.
 Bump together with the server's PROTOCOL_REVISION for incompatible changes.")
 

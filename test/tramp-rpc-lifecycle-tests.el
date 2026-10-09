@@ -277,7 +277,8 @@
 
 (ert-deftest tramp-rpc-mock-test-startup-rejects-incompatible-protocol ()
   "Missing or incompatible revisions fail before publishing readiness."
-  (dolist (revision (list nil 0 "1" (1+ tramp-rpc-protocol-revision)))
+  (dolist (revision (list nil 0 "1" (1- tramp-rpc-protocol-revision)
+                         (1+ tramp-rpc-protocol-revision)))
     (let* ((vec (tramp-dissect-file-name "/rpc:protocol-mismatch:/"))
            (buffer-name (tramp-buffer-name vec))
            (make-process-function (symbol-function 'make-process))

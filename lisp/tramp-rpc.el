@@ -403,15 +403,18 @@ FORCE-UNCOMPRESSED is passed to `tramp-rpc--file-read-params'."
 ;; File name handler operations
 ;; ============================================================================
 
-(defun tramp-rpc--call-file-access (vec localname mode)
+(defun tramp-rpc--call-file-access (vec localname mode &optional check-parent)
   "Return the kernel access decision for MODE on LOCALNAME on VEC.
 The result contains errno (zero on success) and a message on failure.
-MODE is a string of r/w/x flags; empty checks existence.  RPC failures
-and malformed responses signal rather than becoming permission denials."
+MODE is a string of r/w/x flags; empty checks existence.  CHECK-PARENT
+requests an immediate parent write/search check for a missing write target.
+RPC failures and malformed responses signal, not permission denials."
   (let* ((result (tramp-rpc--call
                   vec "file.access"
                   (append (tramp-rpc--encode-path localname)
-                          `((mode . ,mode)))))
+                          `((mode . ,mode))
+                          (when check-parent
+                            '((check_parent_if_missing . t))))))
          (errno (and (listp result) (alist-get 'errno result))))
     (unless (and (integerp errno) (>= errno 0)
                  (or (zerop errno) (stringp (alist-get 'message result))))
@@ -450,13 +453,8 @@ Only a missing file's write check falls back to its immediate parent."
                                (concat (file-name-as-directory localname) "./")
                              localname))
                      (result (tramp-rpc--call-file-access
-                              v path (if directory "" mode)))
-                     (errno (alist-get 'errno result)))
-                (if (and (equal mode "w") (eql errno 2))
-                    (zerop (alist-get
-                            'errno (tramp-rpc--call-file-access
-                                    v (file-name-directory localname) "wx")))
-                  (zerop errno)))))))))
+                              v path (if directory "" mode) (equal mode "w"))))
+                (zerop (alist-get 'errno result)))))))))
 
 (defun tramp-rpc-handle-file-executable-p (filename)
   "Like `file-executable-p' for TRAMP-RPC FILENAME."

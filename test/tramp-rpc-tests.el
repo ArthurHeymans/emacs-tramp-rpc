@@ -501,9 +501,9 @@ The directory is deleted after BODY completes."
     (should (tramp-rpc-test--with-call-count 1
               (and (file-writable-p tmp) (file-writable-p tmp)))))
 
-  ;; A missing target additionally checks write/search access to its parent.
+  ;; The server checks a missing target and its parent in the same RPC.
   (let ((new-file (tramp-rpc-test--make-temp-name)))
-    (should (tramp-rpc-test--with-call-count 2
+    (should (tramp-rpc-test--with-call-count 1
               (and (file-writable-p new-file) (file-writable-p new-file))))))
 
 ;;; ============================================================================

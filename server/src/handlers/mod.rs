@@ -420,6 +420,13 @@ mod tests {
             expected.push(route("file.access".into(), params.clone()).await.unwrap());
             requests.push(msgpack_map! { "method" => "file.access", "params" => params });
         }
+        let params = msgpack_map! {
+            "path" => Value::Binary(tmp.path().join("missing").as_os_str().as_bytes().to_vec()),
+            "mode" => "w",
+            "check_parent_if_missing" => true,
+        };
+        expected.push(route("file.access".into(), params.clone()).await.unwrap());
+        requests.push(msgpack_map! { "method" => "file.access", "params" => params });
         let batch = batch_execute(msgpack_map! { "requests" => Value::Array(requests) })
             .await
             .unwrap();

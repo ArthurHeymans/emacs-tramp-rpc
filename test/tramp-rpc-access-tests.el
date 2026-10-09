@@ -48,7 +48,7 @@
                        ("/testdir" "x") ("/testdir/./" "")))))))
 
 (ert-deftest tramp-rpc-mock-test-access-errors-and-writable-parent ()
-  "Denials are decisions; only ENOENT checks a writable parent."
+  "Writable predicates request the server-side parent check in one RPC."
   :tags '(:permissions)
   (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
   (let ((remote-file-name-inhibit-cache t)
@@ -63,17 +63,20 @@
                (lambda (_vec _method params &optional _connection)
                  (let ((mode (alist-get 'mode params)))
                    (push (list (tramp-rpc--binary-bytes (alist-get 'path params))
-                               mode) calls)
+                               mode (alist-get 'check_parent_if_missing params))
+                         calls)
                    (tramp-rpc-access-test--decision
-                    (unless (equal mode "wx") errno))))))
+                    (unless (and (equal mode "w") (eql errno 2)
+                                 (alist-get 'check_parent_if_missing params))
+                      errno))))))
       (should (eq t (tramp-rpc-handle-file-writable-p filename)))
-      (should (equal (nreverse calls)
-                     '(("/parent/missing" "w") ("/parent/" "wx"))))
+      (should (equal calls '(("/parent/missing" "w" t))))
       (dolist (denial '(1 13 20)) ; EPERM, EACCES, ENOTDIR are not missing files.
         (setq errno denial calls nil)
         (should-not (tramp-rpc-handle-file-writable-p filename))
         (should (= 1 (length calls)))
-        (should-not (tramp-rpc-handle-file-readable-p filename))))
+        (should-not (tramp-rpc-handle-file-readable-p filename))
+        (should-not (nth 2 (car calls)))))
     (cl-letf (((symbol-function 'tramp-connectable-p) (lambda (_) t))
               ((symbol-function 'tramp-rpc--call)
                (lambda (&rest _)
