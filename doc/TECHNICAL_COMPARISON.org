@@ -224,7 +224,6 @@ SIGKILL: the managed shell and its output lifecycle remain registered.
 |---------------------+------------+-----------------------------------|
 | system.info         | (none)     | {protocol_revision, version, home, uid, gid, ...} |
 | system.statvfs      | path       | {total, free, available}          |
-| system.groups       | (none)     | [{gid, name}]                     |
 
 ~system.info~ advertises integer ~protocol_revision: 1~.  The client checks
 exact equality at startup; missing or different revisions fail the connection

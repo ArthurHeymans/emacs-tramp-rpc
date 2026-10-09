@@ -9350,14 +9350,14 @@ SPEC is (RELAY BUFFER TRANSPORT CONNECTION PID).  RELAY is not yet in
 (load (expand-file-name "tramp-rpc-access-tests.el"
                         (file-name-directory (or load-file-name buffer-file-name))))
 
-(ert-deftest tramp-rpc-mock-test-groups-in-route-connection-properties ()
-  "groups-integer and groups-string are in the route flush list.
-This ensures M-x tramp-rpc-clear-all-caches also clears the supplementary
-group cache."
-  :tags '(:group-fix :cache)
+(ert-deftest tramp-rpc-mock-test-remote-groups-are-unavailable ()
+  "Group introspection returns nil without a connection or RPC."
   (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
-  (should (member "groups-integer" tramp-rpc--generic-route-connection-properties))
-  (should (member "groups-string" tramp-rpc--generic-route-connection-properties)))
+  (let ((vec (tramp-dissect-file-name "/rpc:mockhost:/")))
+    (cl-letf (((symbol-function 'tramp-rpc--call)
+               (lambda (&rest _) (ert-fail "Group introspection must not call RPC"))))
+      (should-not (tramp-get-remote-groups vec 'integer))
+      (should-not (tramp-get-remote-groups vec 'string)))))
 
 ;;; ============================================================================
 ;;; Test Runner

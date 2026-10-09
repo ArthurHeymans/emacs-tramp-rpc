@@ -234,7 +234,6 @@ async fn route(method: String, params: Value) -> HandlerResult {
         "system.ping" => Ok(Value::Boolean(true)),
         "system.info" => system::system_info().await,
         "system.statvfs" => system::system_statvfs(params).await,
-        "system.groups" => system::system_groups().await,
 
         // Parallel command execution and ancestor scanning
         "commands.run_parallel" => commands::run_parallel(params).await,

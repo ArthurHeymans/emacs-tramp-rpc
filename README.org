@@ -274,7 +274,8 @@ invalidation.  ~access-file~ always checks fresh read access and raises native
 Emacs error classes for filesystem denials.
 Like native Emacs, ~file-accessible-directory-p~ checks whether a directory
 is searchable; read permission is only needed to list its names.  New login
-group memberships require reconnecting the RPC server.
+group memberships require reconnecting the RPC server.  Supplementary-group
+introspection is not provided; access decisions come from the kernel.
 
 *** Magit Module (~tramp-rpc-magit.el~)
 
@@ -330,7 +331,6 @@ The dispatcher exposes these public methods:
 | System | ~system.ping~ | Probe the connection using reserved control capacity. |
 | System | ~system.info~ | Return server and host information. |
 | System | ~system.statvfs~ | Return filesystem capacity information. |
-| System | ~system.groups~ | Return supplementary groups. |
 | Commands | ~commands.run_parallel~ | Run commands concurrently. |
 | Commands | ~ancestors.scan~ | Scan ancestor directories. |
 | High-level | ~highlevel.test_files_in_dir~ | Find named files in a directory. |

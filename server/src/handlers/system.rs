@@ -108,41 +108,6 @@ fn statvfs_blocking(path: &str) -> HandlerResult {
     })
 }
 
-/// Get groups for the current user without NSS lookups on a Tokio worker.
-pub(super) async fn system_groups() -> HandlerResult {
-    tokio::task::spawn_blocking(|| {
-        // rustix sizes the buffer with a `getgroups(0)` probe, which is the
-        // one wrapper available on every supported platform (nix declines to
-        // expose `getgroups` on Apple targets).
-        let gids: Vec<u32> = rustix::process::getgroups()
-            .map_err(|error| RpcError::io_error(error.into()))?
-            .iter()
-            .map(|gid| gid.as_raw())
-            .collect();
-
-        // Convert to group info with names
-        let group_info: Vec<Value> = gids
-            .iter()
-            .map(|&gid| {
-                let gname = get_group_name(gid);
-                msgpack_map! {
-                    "gid" => gid,
-                    "name" => gname.into_value()
-                }
-            })
-            .collect();
-
-        Ok(Value::Array(group_info))
-    })
-    .await
-    .map_err(|e| RpcError::internal_error(format!("Group lookup task join error: {e}")))?
-}
-
-/// Get group name from gid (delegates to file.rs's mutex-protected, cached version)
-fn get_group_name(gid: u32) -> Option<String> {
-    file::get_group_name(gid)
-}
-
 /// Expand ~ to home directory.
 ///
 /// Handles `~`, `~/...`, and `~user/...` (resolved via the passwd database).
