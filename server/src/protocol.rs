@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 
 /// Client/server contract revision, independent of release and framing versions.
 /// Bump together with `tramp-rpc-protocol-revision` for incompatible RPC changes.
-pub const PROTOCOL_REVISION: u64 = 1;
+pub const PROTOCOL_REVISION: u64 = 2;
 
 /// Default empty params (nil/null)
 fn default_params() -> Value {

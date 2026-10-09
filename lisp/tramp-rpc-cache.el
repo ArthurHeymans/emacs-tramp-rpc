@@ -149,6 +149,14 @@ Unlike `tramp-rpc--cache-get', this preserves cached nil values."
           (remhash key cache)
           'not-cached)))))
 
+(defun tramp-rpc--file-property-key (vec localname property)
+  "Return a route-aware TRAMP cache property for VEC, LOCALNAME and PROPERTY.
+TRAMP unifies file keys by stripping hops and trailing slashes.  Include
+those distinctions in the property instead, retaining TRAMP's normal
+expiry, subtree invalidation and connection cleanup."
+  (tramp-rpc--route-property-name
+   vec (format "rpc-file:%s:%s" property (string-suffix-p "/" localname))))
+
 (defun tramp-rpc--file-stat-cache-key (vec localname lstat)
   "Return file.stat cache key for VEC, LOCALNAME, and LSTAT."
   (cons (expand-file-name (tramp-make-tramp-file-name vec localname))

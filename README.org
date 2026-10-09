@@ -164,6 +164,10 @@ TRAMP's ad-hoc multi-hop syntax works with the ~rpc~ method:
   these chains.  RPC-to-RPC chains remain RPC-backed at the final target;
   intermediate rpc hops provide SSH routing.
 
+Hidden routes in ~tramp-default-proxies-alist~ also apply to ordinary ~rpc~
+targets, as with upstream TRAMP.  Invalid proxy configurations signal an error
+rather than silently connecting directly.
+
 ** Deployment Commands
 
 | Command                          | Description                    |
@@ -263,6 +267,17 @@ Modules with caches derived from file metadata register on
 this is how the Magit module drops its ancestor scans and prefetched
 status without the cache module knowing about it.
 
+Access predicates cache answers from the remote kernel, not guesses from
+mode bits or group lists.  Entries distinguish connection routes and trailing
+slashes, while obeying TRAMP's ~remote-file-name-inhibit-cache~ and watch
+invalidation.  ~access-file~ always checks fresh read access and raises native
+Emacs error classes for filesystem denials.  Writable checks of missing targets
+also test write/search access to the immediate parent in the same RPC, only
+after an ~ENOENT~ target lookup.
+Like native Emacs, ~file-accessible-directory-p~ checks whether a directory
+is searchable; read permission is only needed to list its names.  New login
+group memberships require reconnecting the RPC server.
+
 *** Magit Module (~tramp-rpc-magit.el~)
 
 Optimizations for git/magit/projectile on remote hosts:
@@ -288,6 +303,7 @@ The dispatcher exposes these public methods:
 |----------+--------+-------------|
 | Batch | ~batch~ | Execute up to 64 requests with bounded concurrency. |
 | File | ~file.stat~ | Return file metadata. |
+| File | ~file.access~ | Check effective-credential access; return errno (0 on success) and a failure message. |
 | File | ~file.truename~ | Resolve a file's canonical path. |
 | Directory | ~dir.list~ | List directory entries, optionally with attributes. |
 | Directory | ~dir.create~ | Create a directory. |
@@ -667,6 +683,33 @@ emacs -Q --batch -l test/tramp-rpc-mock-tests.el \
 
 This runs protocol tests plus server integration tests that communicate directly with the RPC server (no SSH needed).
 
+*** Kernel Access and ACL Tests
+
+Compare native Emacs access predicates and ~access-file~ against an isolated
+server copy (Linux or macOS):
+
+#+begin_src bash
+TRAMP_RPC_ACCESS_TEST_SERVER=/path/to/isolated/tramp-rpc-server \
+  emacs -Q --batch -L lisp -l test/run-access-tests.el
+#+end_src
+
+On Linux, also test real non-owner named-user/group ACL grants, ACL masks,
+directory search, missing-target writability, and cache invalidation after ACL
+changes:
+
+#+begin_src bash
+TRAMP_RPC_ACCESS_TEST_SERVER=/path/to/rebuilt/tramp-rpc-server \
+  test/run-access-acl-tests.sh
+#+end_src
+
+The ACL runner copies the binary and uses a disposable user namespace with DAC
+bypass capabilities removed from both Emacs and the server.  It requires an
+ACL-capable filesystem, subordinate UID/GID ranges, ~unshare~, ~newuidmap~,
+~newgidmap~, ~setpriv~, and ~setfacl~.  ~TRAMP_SOURCE~ and ~MSGPACK_SOURCE~ can
+supply dependency source directories; otherwise install TRAMP and msgpack as
+Emacs packages.  Both runners fail on missing prerequisites or skipped tests.
+The regular mock suite skips the ACL test outside this isolated setup.
+
 *** Full Remote Tests (requires SSH)
 
 #+begin_src bash
@@ -695,7 +738,9 @@ emacs -Q --batch \
 
 The GitHub Actions workflow runs:
 
-1. *Rust Build* - Builds for 4 targets (x86_64/aarch64 Linux/macOS) with format check
+1. *Rust Build* - Builds for 4 targets (x86_64/aarch64 Linux/macOS) with format check;
+   macOS jobs also compare the built server's access behavior with native Emacs,
+   including when the binary is restored from cache
 2. *Elisp Byte-compile* - Verifies all .el files compile without errors
 3. *Autoload Tests* - Verifies method registration and handler setup
 4. *Protocol Tests* - MessagePack-RPC encoding/decoding (no server)

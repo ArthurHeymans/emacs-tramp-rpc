@@ -140,6 +140,30 @@ jobs:
         env:
           RUSTFLAGS: "-D warnings"
 
+      - name: Install Emacs access-test dependencies on macOS
+        if: ${{ inputs.test && contains(inputs.target, 'apple-darwin') }}
+        run: |
+          brew install emacs
+          emacs -Q --batch \
+            --eval "(require 'package)" \
+            --eval "(add-to-list 'package-archives
+                       '(\"melpa\" . \"https://melpa.org/packages/\") t)" \
+            --eval "(package-initialize)" \
+            --eval "(package-refresh-contents)" \
+            --eval "(setq package-install-upgrade-built-in t)" \
+            --eval "(package-install 'tramp)" \
+            --eval "(package-install 'msgpack)"
+
+      - name: Compare macOS access with native Emacs
+        if: ${{ inputs.test && contains(inputs.target, 'apple-darwin') }}
+        env:
+          TRAMP_RPC_ACCESS_TEST_SERVER: >-
+            ${{ runner.temp }}/tramp-rpc-access-${{ inputs.target }}
+        run: |
+          binary="target/${{ inputs.target }}/release/tramp-rpc-server"
+          cp "$binary" "$TRAMP_RPC_ACCESS_TEST_SERVER"
+          emacs -Q --batch -L lisp -l test/run-access-tests.el
+
       - name: Verify Cargo.lock was not modified
         run: |
           if ! git diff --exit-code -- Cargo.lock; then

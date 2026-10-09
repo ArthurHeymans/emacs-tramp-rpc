@@ -203,7 +203,26 @@ so every remote test then skips while the batch still exits zero."
 (let ((test-file (expand-file-name "test/tramp-tests.el" tramp-rpc-test-source)))
   (unless (file-exists-p test-file)
     (error "Upstream tramp-tests.el not found at %s.\nSet TRAMP_TEST_SOURCE to the tramp source tree" test-file))
-  (load test-file))
+  (load test-file)
+  ;; Upstream's access timeout fixture delays `file-exists-p', a preflight
+  ;; used by tramp-sh.  RPC checks access directly; delay that RPC instead,
+  ;; retaining the upstream timeout assertion and all other attribute tests.
+  (with-temp-buffer
+    (insert-file-contents test-file)
+    (goto-char (point-min))
+    (when (re-search-forward "^(ert-deftest tramp-test18-file-attributes " nil t)
+      (goto-char (match-beginning 0))
+      (let* ((form (read (current-buffer)))
+             (adapted
+              (cl-subst
+               '((symbol-function #'tramp-rpc--check-file-access)
+                 (lambda (_vec _localname _mode) (sleep-for 5)))
+               '((symbol-function #'file-exists-p)
+                 (lambda (_filename) (sleep-for 5)))
+               form :test #'equal)))
+        (unless (equal form adapted)
+          (ert-delete-test 'tramp-test18-file-attributes)
+          (eval adapted t))))))
 
 ;; ============================================================================
 ;; Predicate overrides

@@ -160,6 +160,7 @@ TRAMP-RPC exposes these method categories:
 | Method             | Parameters              | Returns                            |
 |--------------------+-------------------------+------------------------------------|
 | file.stat          | path, lstat             | FileAttributes (or null if absent) |
+| file.access        | path, mode, check_parent_if_missing? | {errno: 0} or {errno, message} |
 | file.truename      | path                    | string (canonical path)            |
 | file.read          | path, offset?, length?  | {content: binary, size: int}       |
 | file.write         | path, content, append?  | {written: int}                     |
@@ -171,6 +172,23 @@ TRAMP-RPC exposes these method categories:
 | file.make_symlink  | target, link_path       | boolean                            |
 | file.make_hardlink | src, dest               | boolean                            |
 | file.chown         | path, uid, gid          | boolean                            |
+
+~file.access~ follows symlinks and checks access using the server's effective
+credentials.  ~mode~ contains any combination of ~r~, ~w~, and ~x~; an empty
+string checks existence.  Paths may be strings or raw bytes.  Filesystem denials
+are normal results with ~errno~ and a human-readable ~message~, not RPC errors;
+transport, protocol and unsupported-check failures still signal errors.
+For write-only checks, ~check_parent_if_missing~ retries an ~ENOENT~ decision
+against the immediate parent's write/search permissions within the same RPC.
+Other access modes reject the option.
+
+On Linux the server uses ~faccessat2(AT_EACCESS)~.  If an older kernel or
+container filter rejects it, a legacy ~faccessat~ retry is permitted only when
+real, effective and filesystem IDs match unambiguously and their capability
+semantics are equivalent.  Unmapped namespace IDs and failed credential queries
+disable this retry.  An unresolved ~ENOSYS~ or ~EPERM~ then raises an RPC error,
+not a cacheable denial: ~EPERM~ may come from a syscall filter rather than the
+filesystem.  It never reconstructs permissions from mode bits or ACL metadata.
 
 **** Directory Operations
 | Method           | Parameters               | Returns                  |
