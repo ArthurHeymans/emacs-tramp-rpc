@@ -330,10 +330,9 @@ FORCE-UNCOMPRESSED is non-nil."
     (vec localname &optional beg end force-uncompressed)
   "Read bytes from LOCALNAME on VEC in bounded, pipelined RPC chunks.
 BEG and END are byte offsets.  The total length is fixed by END, or by the
-`file_size' snapshot the server reports with the first chunk when END is nil
-\(one `file.stat' fallback for servers without that field).  Concurrent
-appends are excluded; concurrent truncation can yield a short result.  If no
-size can be determined, only the first chunk is returned.
+`file_size' snapshot the server reports with the first chunk when END is nil.
+Concurrent appends are excluded; concurrent truncation can yield a short
+result.  An invalid snapshot signals when needed to plan further chunks.
 FORCE-UNCOMPRESSED is passed to `tramp-rpc--file-read-params'."
   (let* ((offset (or beg 0))
          (chunk-size (tramp-rpc--read-chunk-size vec))
@@ -354,16 +353,13 @@ FORCE-UNCOMPRESSED is passed to `tramp-rpc--file-read-params'."
             first
           (let* ((total (if end
                             (- end offset)
-                          ;; Fix the END-nil read length to one size snapshot:
-                          ;; prefer the fstat `file_size' the server sent with
-                          ;; the first chunk (no extra RPC); fall back to one
-                          ;; `file.stat' for older servers.
-                          (max 0 (- (or (alist-get 'file_size first-result)
-                                        (alist-get 'size
-                                                   (tramp-rpc--call-file-stat
-                                                    vec localname))
-                                         received)
-                                    offset))))
+                          (let ((file-size (alist-get 'file_size first-result)))
+                            (unless (and (integerp file-size) (>= file-size 0))
+                              (signal 'remote-file-error
+                                      (list "RPC"
+                                            (format "Invalid file.read size snapshot: %S"
+                                                    file-size))))
+                            (max 0 (- file-size offset)))))
                  (next-offset (+ offset received))
                  (remaining (max 0 (- total received)))
                  (pieces (list first))
