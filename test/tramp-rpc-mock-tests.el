@@ -1664,7 +1664,7 @@ This matches the behavior expected by `tramp-test28-process-file'."
             (funcall callback '(:error (:message "closed stdin")))
             (should-error (process-send-string owner "later")
                           :type 'tramp-rpc-process-write-error)
-            (should-error (tramp-rpc-handle-process-send-eof owner)
+            (should-error (process-send-eof owner)
                           :type 'tramp-rpc-process-write-error)))
       (dolist (process (list owner connection))
         (when (process-live-p process) (delete-process process)))
@@ -1927,6 +1927,47 @@ This matches the behavior expected by `tramp-test28-process-file'."
       (when (process-live-p process) (delete-process process))
       (kill-buffer buffer))))
 
+(ert-deftest tramp-rpc-mock-test-process-metadata-routes-by-ownership ()
+  "Process metadata of RPC processes ignores Tramp handler dispatch."
+  (let* ((buffer (generate-new-buffer " *tramp-rpc-owned-metadata*"))
+         (process (make-pipe-process :name "tramp-rpc-owned-metadata"
+                                     :buffer buffer :noquery t)))
+    (unwind-protect
+        (progn
+          ;; No `tramp-vector': routing must not depend on file names.
+          (process-put process :tramp-rpc-pid 42)
+          (process-put process :tramp-rpc-exited t)
+          (process-put process :tramp-rpc-exit-signal 9)
+          (dolist (target (list process buffer (process-name process)))
+            (should (eq (process-status target) 'signal)))
+          (with-current-buffer buffer
+            (should (eq (process-status nil) 'signal)))
+          ;; `process-status' accepts process names, not buffer names.
+          (should-not (process-status (buffer-name buffer)))
+          (should (= (process-exit-status process) 9)))
+      (when (process-live-p process) (delete-process process))
+      (kill-buffer buffer))))
+
+(ert-deftest tramp-rpc-mock-test-relay-eof-routes-by-caller ()
+  "Public EOF closes remote stdin; closing the relay sends local EOF."
+  (let* ((process (make-process :name "tramp-rpc-relay-eof" :command '("cat")
+                                :connection-type 'pipe :noquery t))
+         remote-closes)
+    (unwind-protect
+        (cl-letf (((symbol-function 'tramp-rpc--close-remote-stdin)
+                   (lambda (_vec pid _owner) (push pid remote-closes))))
+          (process-put process :tramp-rpc-pid 42)
+          (process-put process :tramp-rpc-vec
+                       (tramp-dissect-file-name "/rpc:mock:/path"))
+          (process-send-eof process)
+          (should (equal remote-closes '(42)))
+          (should (process-live-p process))
+          (tramp-rpc--close-local-relay process)
+          (tramp-rpc-mock-test--wait-for
+           (lambda () (not (process-live-p process))) "local relay EOF" process)
+          (should (equal remote-closes '(42))))
+      (when (process-live-p process) (delete-process process)))))
+
 (ert-deftest tramp-rpc-mock-test-transport-write-keeps-reentrant-input-remote ()
   "An LSP reply sent during a blocked transport write reaches remote stdin."
   (let* ((process-connection-type nil)
@@ -2176,7 +2217,7 @@ async callbacks and local relays leaked."
           ;; The exit code 137 (SIGKILL) must not become local exit 0.
           (tramp-rpc--queue-pty-delivery process nil 137 t)
           (accept-process-output process 0.1)
-          (should (= (tramp-rpc-handle-process-exit-status process) 137))
+          (should (= (process-exit-status process) 137))
           (should (equal events '("exited abnormally with code 137\n"))))
       (remhash process tramp-rpc--pty-processes)
       (when (process-live-p process) (delete-process process)))))
@@ -2302,8 +2343,8 @@ compile branch on that, so the 128 + signal exit code alone is not enough."
           (process-put process :tramp-rpc-exit-code 137)
           (process-put process :tramp-rpc-exit-signal 9)
           (process-put process :tramp-rpc-exited t)
-          (should (eq (tramp-rpc-handle-process-status process) 'signal))
-          (should (= (tramp-rpc-handle-process-exit-status process) 9)))
+          (should (eq (process-status process) 'signal))
+          (should (= (process-exit-status process) 9)))
       (when (process-live-p process) (delete-process process)))))
 
 (ert-deftest tramp-rpc-mock-test-signal-description-matches-emacs ()
@@ -2686,8 +2727,8 @@ direct property test would miss it."
           (puthash process '(:direct-ssh t) tramp-rpc--pty-processes)
           (tramp-rpc--install-own-sentinel
            process #'tramp-rpc--direct-ssh-pty-sentinel)
-          (tramp-rpc-handle-set-process-sentinel process sentinel)
-          (should (eq (tramp-rpc-handle-process-sentinel process) sentinel))
+          (set-process-sentinel process sentinel)
+          (should (eq (process-sentinel process) sentinel))
           (delete-process process)
           (tramp-rpc-mock-test--wait-for
            (lambda () (and (not (gethash process tramp-rpc--pty-processes))
@@ -8782,8 +8823,8 @@ This matches tramp-sh and upstream `tramp-test28-process-file', which requires
         (progn
           (puthash proc '(:pid 4242) tramp-rpc--async-processes)
           (tramp-rpc--install-own-sentinel proc #'tramp-rpc--pipe-relay-sentinel)
-          (tramp-rpc-handle-set-process-sentinel proc sentinel)
-          (should (eq (tramp-rpc-handle-process-sentinel proc) sentinel))
+          (set-process-sentinel proc sentinel)
+          (should (eq (process-sentinel proc) sentinel))
           (process-put proc :tramp-rpc-remote-exited t)
           (process-put proc :tramp-rpc-exit-code 3)
           (process-send-eof proc)
@@ -8807,7 +8848,7 @@ This matches tramp-sh and upstream `tramp-test28-process-file', which requires
                      (push (list pid signal) kills))))
           (puthash proc (list :vec vec :pid 4242) tramp-rpc--async-processes)
           (tramp-rpc--install-own-sentinel proc #'tramp-rpc--pipe-relay-sentinel)
-          (tramp-rpc-handle-set-process-sentinel
+          (set-process-sentinel
            proc (lambda (_process event) (push event events)))
           (kill-process proc)
           (tramp-rpc-mock-test--wait-for (lambda () events) "user sentinel")

@@ -62,23 +62,17 @@ unexpected failures remain visible in TRAMP-RPC debug output."
                         ',(car body) (error-message-string err))
       nil)))
 
-(defconst tramp-rpc--native-process-send-string
-  (advice--cd*r (symbol-function 'process-send-string))
-  "Unadvised `process-send-string' used to feed local output relays.
-Strip existing advice as well: another TRAMP backend may already have
-installed process routing before this module loads.")
+(defun tramp-rpc--native-call (function &rest args)
+  "Call FUNCTION with ARGS, bypassing all of its advice for this call only.
+Local relays carry RPC ownership, so tramp-rpc's own writes to them would
+otherwise be routed to the remote process.  A blocked call can run filters
+and timers; bypassing advice per call, rather than dynamically suppressing
+routing, keeps their nested process calls routed."
+  (apply (advice--cd*r (symbol-function function)) args))
 
 (defun tramp-rpc--send-local-relay-string (relay string)
-  "Write STRING to local output RELAY without process routing.
-A blocked write can run filters and timers which write to the remote
-process.  Bypassing advice only for this call, rather than dynamically
-suppressing routing, keeps those nested writes remote."
-  (funcall tramp-rpc--native-process-send-string relay string))
-
-(defvar tramp-rpc--closing-local-relay nil
-  "Non-nil while sending EOF to a local cat relay process.
-Tells the `process-send-eof' advice to call the original function
-instead of routing to the remote process.")
+  "Write STRING to local output RELAY without process routing."
+  (tramp-rpc--native-call #'process-send-string relay string))
 
 (defcustom tramp-rpc-synchronous-pipe-writes nil
   "Whether pipe process writes wait for remote acknowledgement.
@@ -766,8 +760,8 @@ number, if any."
 (defun tramp-rpc--close-local-relay (local-process)
   "Send local EOF to LOCAL-PROCESS and let its output drain naturally."
   (when (process-live-p local-process)
-    (let ((tramp-rpc--closing-local-relay t))
-      (tramp-rpc--best-effort (process-send-eof local-process)))))
+    (tramp-rpc--best-effort
+      (tramp-rpc--native-call #'process-send-eof local-process))))
 
 ;; ============================================================================
 ;; Sentinels
@@ -1345,9 +1339,7 @@ the exit."
     ;; before exiting naturally.  A zero-timeout `accept-process-output' after
     ;; `process-send-string' does not wait for the relay round trip, while
     ;; deleting it here discards the final output returned with EXITED.
-    (when (process-live-p local-process)
-      (let ((tramp-rpc--closing-local-relay t))
-        (tramp-rpc--best-effort (process-send-eof local-process))))))
+    (tramp-rpc--close-local-relay local-process)))
 
 (defun tramp-rpc--pty-sentinel (process event)
   "Sentinel for PTY relay PROCESS, preserving its user sentinel once.
