@@ -1184,8 +1184,7 @@ MUSTBENEW requests an overwrite check; `excl' rejects an existing file."
                              ,@(when (integerp append)
                                  `((offset . ,append)))))))
 
-      (let ((tramp-rpc--suppress-fs-notifications t))
-        (tramp-rpc--call v "file.write" params))
+      (tramp-rpc--call v "file.write" params)
 
       ;; Invalidate caches for the written file
       (tramp-rpc--invalidate-cache-for-path filename)
