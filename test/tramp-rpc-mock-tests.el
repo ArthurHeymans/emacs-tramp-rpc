@@ -1263,8 +1263,7 @@ This matches the behavior expected by `tramp-test28-process-file'."
 
 (ert-deftest tramp-rpc-mock-test-pipelined-timeout-preserves-connection ()
   "A live connection remains reusable after a pipeline response timeout."
-  (let* ((tramp-rpc--probing-connection t)
-         (buffer (generate-new-buffer " *tramp-rpc-pipeline-test*"))
+  (let* ((buffer (generate-new-buffer " *tramp-rpc-pipeline-test*"))
          (process (make-pipe-process :name "tramp-rpc-pipeline-test"
                                      :buffer buffer :noquery t))
          (vec (tramp-dissect-file-name "/rpc:mock:/tmp/"))
