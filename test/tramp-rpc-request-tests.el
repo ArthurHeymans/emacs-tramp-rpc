@@ -62,7 +62,7 @@ SPEC is (PROCESS BUFFER [CONNECTION]); CONNECTION defaults to `connection'."
   (tramp-rpc-mock-test-request--with-connection (process buffer)
     (let ((clock (tramp-rpc-mock-test-request--timeout-clock))
           ;; Probe behavior is tested separately; this models a live server.
-          (tramp-rpc--probing-connection t)
+          (_ (setf (tramp-rpc-connection-probing connection) t))
           (vec (tramp-rpc-mock-test-request--vec))
           (tramp-rpc--connections (make-hash-table :test 'equal))
           invalidated)
@@ -126,7 +126,6 @@ SPEC is (PROCESS BUFFER [CONNECTION]); CONNECTION defaults to `connection'."
   "The timeout probe uses the reserved ping method on the original transport."
   (tramp-rpc-mock-test-request--with-connection (process buffer)
     (let ((vec (tramp-rpc-mock-test-request--vec))
-          (tramp-rpc--probing-connection nil)
           probed invalidated)
       (cl-letf (((symbol-function 'tramp-rpc--call-with-timeout)
                  (lambda (_vec method _params _timeout _interval conn)
@@ -137,6 +136,28 @@ SPEC is (PROCESS BUFFER [CONNECTION]); CONNECTION defaults to `connection'."
         (tramp-rpc--probe-live-connection vec connection process "test"))
       (should (equal probed (list "system.ping" connection)))
       (should (eq invalidated process)))))
+
+(ert-deftest tramp-rpc-mock-test-request-probe-is-per-generation ()
+  "A probe on one generation neither blocks nor repeats on another."
+  (tramp-rpc-mock-test-request--with-connection (process buffer)
+    (tramp-rpc-mock-test-request--with-connection (other-process other-buffer
+                                                   other)
+      (let ((vec (tramp-rpc-mock-test-request--vec))
+            probed)
+        (cl-letf (((symbol-function 'tramp-rpc--call-with-timeout)
+                   (lambda (_vec _method _params _timeout _interval conn)
+                     (push conn probed)
+                     ;; The other generation times out during this probe.
+                     (when (eq conn connection)
+                       (tramp-rpc--probe-live-connection
+                        vec other other-process "other")
+                       ;; This generation's probe timing out does not recurse.
+                       (tramp-rpc--probe-live-connection
+                        vec connection process "again")))))
+          (tramp-rpc--probe-live-connection vec connection process "test"))
+        (should (equal probed (list other connection)))
+        (should-not (tramp-rpc-connection-probing connection))
+        (should-not (tramp-rpc-connection-probing other))))))
 
 (ert-deftest tramp-rpc-mock-test-stderr-buffer-is-bounded ()
   "Long-lived SSH stderr output must not grow without bound."
@@ -448,7 +469,7 @@ SPEC is (PROCESS BUFFER [CONNECTION]); CONNECTION defaults to `connection'."
     (let* ((vec (tramp-rpc-mock-test-request--vec))
            (connection connection)
            (clock (tramp-rpc-mock-test-request--timeout-clock))
-           (tramp-rpc--probing-connection t)
+           (_ (setf (tramp-rpc-connection-probing connection) t))
            (tramp-rpc--connections (make-hash-table :test 'equal))
            (tramp-rpc--async-processes (make-hash-table :test 'eq))
            (managed-process
@@ -714,7 +735,7 @@ The helper also verifies that the output payload in the notification is queued."
 (ert-deftest tramp-rpc-mock-test-request-batch-timeout-cleans-id ()
   "A batch timeout releases its request ID and response table."
   (tramp-rpc-mock-test-request--with-connection (process buffer)
-    (let ((tramp-rpc--probing-connection t)
+    (let ((_ (setf (tramp-rpc-connection-probing connection) t))
           (vec (tramp-rpc-mock-test-request--vec))
           (tramp-rpc--connections (make-hash-table :test 'equal))
           invalidated)

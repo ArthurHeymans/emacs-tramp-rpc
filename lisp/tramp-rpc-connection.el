@@ -61,7 +61,9 @@
   ;; Non-nil once no response can be relied on from PROCESS.
   transport-dead
   ;; Non-nil once the transport sentinel wrapper has been installed.
-  sentinel-installed)
+  sentinel-installed
+  ;; Non-nil while a dead-connection probe of this generation runs.
+  probing)
 
 (defun tramp-rpc--connection-transport (connection)
   "Return the transport process of CONNECTION, or nil when CONNECTION is nil.

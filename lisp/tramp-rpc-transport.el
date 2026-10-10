@@ -1831,21 +1831,22 @@ Uses 5s total timeout with 10ms polling.
 VEC is the TRAMP connection vector."
   (tramp-rpc--call-with-timeout vec method params 5 0.01))
 
-(defvar tramp-rpc--probing-connection nil
-  "Non-nil while a dead-connection probe is in progress.
-Prevents recursive probing when the probe itself times out.")
-
 (defun tramp-rpc--probe-live-connection (vec conn process method)
   "Probe CONN after a timeout to detect a dead connection for VEC.
 Sends a lightweight request on the captured generation CONN.  If the probe
 also fails, invalidates the generation so the next caller reconnects instead
 of hitting the full timeout again.  PROCESS is CONN's transport process.
-METHOD names the timed-out call for logging."
-  (unless tramp-rpc--probing-connection
+METHOD names the timed-out call for logging.  The probe itself times out
+on CONN, which must not start another probe, but a timeout on another
+generation probes that generation independently."
+  (unless (tramp-rpc-connection-probing conn)
     (tramp-rpc--debug "PROBE after timeout on method=%s" method)
     (condition-case _err
-        (let ((tramp-rpc--probing-connection t))
-          (tramp-rpc--call-with-timeout vec "system.ping" nil 10 0.01 conn))
+        (unwind-protect
+            (progn
+              (setf (tramp-rpc-connection-probing conn) t)
+              (tramp-rpc--call-with-timeout vec "system.ping" nil 10 0.01 conn))
+          (setf (tramp-rpc-connection-probing conn) nil))
       (remote-file-error
        (tramp-rpc--debug "PROBE failed; invalidating connection for method=%s" method)
        (tramp-rpc--invalidate-timed-out-connection
