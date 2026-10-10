@@ -15,7 +15,7 @@
 
 ;;; Commentary:
 
-;; This file provides all the own Tramp handlers that tramp-rpc
+;; This file provides the advice and Tramp handlers that tramp-rpc
 ;; installs on Emacs built-in process functions:
 ;; - process-send-string / process-send-region (route to remote stdin)
 ;; - process-send-eof (close remote stdin or send Ctrl-D to PTY)
@@ -104,36 +104,29 @@ PROCESS is the process being handled."
   "Return the process object denoted by PROCESS, or nil."
   (cond
    ((processp process) process)
+   ((null process) (get-buffer-process (current-buffer)))
    ((bufferp process) (get-buffer-process process))
    ((stringp process)
-    (when-let* ((buffer (get-buffer process)))
-      (get-buffer-process buffer)))))
+    (or (get-process process)
+        (when-let* ((buffer (get-buffer process)))
+          (get-buffer-process buffer))))))
 
-(defun tramp-rpc--send-managed-process-string (process string operation)
-  "Send STRING to RPC-managed PROCESS for OPERATION.
-Return `not-managed' when PROCESS must use the native handler."
-  (let ((proc (tramp-rpc--managed-send-process process)))
-    (cond
-     ((not proc) 'not-managed)
-     ((process-get proc :tramp-rpc-pty)
-      (let ((vec (process-get proc :tramp-rpc-vec))
-            (pid (process-get proc :tramp-rpc-pid)))
-        (tramp-rpc--debug "%s PTY pid=%s len=%d" operation pid (length string))
-        (tramp-rpc--call
-         vec "process.write_pty"
-         `((pid . ,pid)
-           (data . ,(msgpack-bin-make
-                     (tramp-rpc--encode-process-input proc string))))
-         (process-get proc :tramp-rpc-connection))
-        nil))
-     (t
-      (let ((vec (process-get proc :tramp-rpc-vec))
-            (pid (process-get proc :tramp-rpc-pid)))
-        (tramp-rpc--debug "%s pipe pid=%s len=%d" operation pid (length string))
-        (tramp-rpc--write-remote-process
-         vec pid (tramp-rpc--encode-process-input proc string) proc)
-        (when tramp-rpc-synchronous-pipe-writes
-          (tramp-rpc--drain-write-queue vec pid proc)))))))
+(defun tramp-rpc--send-managed-process-string (proc string operation)
+  "Send STRING to the remote stdin of RPC-managed PROC for OPERATION."
+  (let ((vec (process-get proc :tramp-rpc-vec))
+        (pid (process-get proc :tramp-rpc-pid))
+        (data (tramp-rpc--encode-process-input proc string)))
+    (if (process-get proc :tramp-rpc-pty)
+        (progn
+          (tramp-rpc--debug "%s PTY pid=%s len=%d" operation pid (length string))
+          (tramp-rpc--call vec "process.write_pty"
+                           `((pid . ,pid) (data . ,(msgpack-bin-make data)))
+                           (process-get proc :tramp-rpc-connection)))
+      (tramp-rpc--debug "%s pipe pid=%s len=%d" operation pid (length string))
+      (tramp-rpc--write-remote-process vec pid data proc)
+      (when tramp-rpc-synchronous-pipe-writes
+        (tramp-rpc--drain-write-queue vec pid proc))))
+  nil)
 
 (defun tramp-rpc--managed-send-process (process)
   "Return PROCESS's RPC-managed process, or nil when native delivery is needed."
@@ -143,23 +136,21 @@ Return `not-managed' when PROCESS must use the native handler."
          (process-get proc :tramp-rpc-vec)
          proc)))
 
-(defun tramp-rpc-handle-process-send-string (process string)
-  "Send STRING to the TRAMP-RPC PROCESS."
-  (when (eq (tramp-rpc--send-managed-process-string
-             process string "SEND-STRING")
-            'not-managed)
-    (tramp-run-real-handler #'process-send-string (list process string))))
+(defun tramp-rpc--process-send-string-advice (orig-fun process string)
+  "Send STRING to RPC-managed PROCESS, otherwise call ORIG-FUN.
+Route by process ownership, not file name handlers: a native pipe write
+can run timers and filters while Tramp's handlers are inhibited."
+  (if-let* ((proc (tramp-rpc--managed-send-process process)))
+      (tramp-rpc--send-managed-process-string proc string "SEND-STRING")
+    (funcall orig-fun process string)))
 
-(defun tramp-rpc-handle-process-send-region (process start end)
-  "Handler for `process-send-region' for TRAMP-RPC processes.
-PROCESS is the process being handled.
-START and END are buffer positions delimiting the text to send."
+(defun tramp-rpc--process-send-region-advice (orig-fun process start end)
+  "Send region START to END to RPC-managed PROCESS.
+Call ORIG-FUN for other processes without inhibiting nested RPC writes."
   (if-let* ((proc (tramp-rpc--managed-send-process process)))
       (tramp-rpc--send-managed-process-string
        proc (buffer-substring-no-properties start end) "SEND-REGION")
-    ;; Preserve native region delivery for bypasses and non-RPC processes.
-    (tramp-run-real-handler #'process-send-region
-                            (list process start end))))
+    (funcall orig-fun process start end)))
 
 (defun tramp-rpc-handle-process-send-eof (&optional process)
   "Handler for `process-send-eof' for TRAMP-RPC processes.
@@ -585,12 +576,16 @@ exited (remote side finished), delete it so the refresh can proceed."
                            'process-coding-system)
     (advice-add 'process-coding-system :around
                 #'tramp-rpc--process-coding-system-advice))
-  (tramp-rpc--add-external-operation
-     'process-send-string
-     #'tramp-rpc-handle-process-send-string 'tramp-rpc 'process)
-    (tramp-rpc--add-external-operation
-     'process-send-region
-     #'tramp-rpc-handle-process-send-region 'tramp-rpc 'process)
+  (unless (advice-member-p #'tramp-rpc--process-send-string-advice
+                           'process-send-string)
+    ;; Check ownership before Tramp's external-operation dispatch, even when
+    ;; another backend installs that dispatch after us.
+    (advice-add 'process-send-string :around
+                #'tramp-rpc--process-send-string-advice '((depth . -10))))
+  (unless (advice-member-p #'tramp-rpc--process-send-region-advice
+                           'process-send-region)
+    (advice-add 'process-send-region :around
+                #'tramp-rpc--process-send-region-advice '((depth . -10))))
   (tramp-rpc--add-external-operation
      'process-send-eof
      #'tramp-rpc-handle-process-send-eof 'tramp-rpc 'process)
@@ -665,8 +660,8 @@ exited (remote side finished), delete it so the refresh can proceed."
                  #'tramp-rpc--set-process-coding-system-advice)
   (advice-remove 'process-coding-system
                  #'tramp-rpc--process-coding-system-advice)
-  (tramp-rpc--remove-external-operation 'process-send-string 'tramp-rpc)
-  (tramp-rpc--remove-external-operation 'process-send-region 'tramp-rpc)
+  (advice-remove 'process-send-string #'tramp-rpc--process-send-string-advice)
+  (advice-remove 'process-send-region #'tramp-rpc--process-send-region-advice)
   (tramp-rpc--remove-external-operation 'process-send-eof 'tramp-rpc)
   (remove-hook 'signal-process-functions #'tramp-rpc-handle-signal-process)
   (remove-hook 'interrupt-process-functions #'tramp-rpc-handle-interrupt-process)

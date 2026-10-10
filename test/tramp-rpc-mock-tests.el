@@ -25,6 +25,7 @@
 (require 'ert)
 (require 'cl-lib)
 (require 'subr-x)
+(require 'jsonrpc)
 
 (defvar tramp-rpc-mock-test--network-guard nil
   "Non-nil while mock selectors must not create network processes.")
@@ -1631,11 +1632,11 @@ This matches the behavior expected by `tramp-test28-process-file'."
                     ((symbol-function 'tramp-rpc--drain-write-queue)
                      (lambda (&rest _args) (cl-incf drains))))
             (let ((tramp-rpc-synchronous-pipe-writes nil))
-              (tramp-rpc-handle-process-send-string process "async")
+              (process-send-string process "async")
               (should (= writes 1))
               (should (= drains 0)))
             (let ((tramp-rpc-synchronous-pipe-writes t))
-              (tramp-rpc-handle-process-send-string process "sync")
+              (process-send-string process "sync")
               (should (= writes 2))
               (should (= drains 1)))))
       (when (process-live-p process) (delete-process process)))))
@@ -1661,7 +1662,7 @@ This matches the behavior expected by `tramp-test28-process-file'."
                        (setq callback cb))))
             (tramp-rpc--write-remote-process vec 1 "failed" owner)
             (funcall callback '(:error (:message "closed stdin")))
-            (should-error (tramp-rpc-handle-process-send-string owner "later")
+            (should-error (process-send-string owner "later")
                           :type 'tramp-rpc-process-write-error)
             (should-error (tramp-rpc-handle-process-send-eof owner)
                           :type 'tramp-rpc-process-write-error)))
@@ -1801,7 +1802,7 @@ This matches the behavior expected by `tramp-test28-process-file'."
                  vec "tramp-rpc-pty-reconnect" nil '("cat") nil t
                  nil nil "/tmp/"))
           (setq current-connection connection-b)
-          (tramp-rpc-handle-process-send-string process "input")
+          (process-send-string process "input")
           (should (eq write-connection connection-a)))
       (when (processp process)
         (remhash process tramp-rpc--pty-processes)
@@ -1895,6 +1896,93 @@ This matches the behavior expected by `tramp-test28-process-file'."
               (should (equal output (concat payload payload))))
           (dolist (process (list relay stderr-relay))
             (when (process-live-p process) (delete-process process))))))))
+
+(ert-deftest tramp-rpc-mock-test-process-input-routing-ignores-handler-inhibition ()
+  "All process designators route RPC stdin even with file handlers inhibited."
+  (let* ((buffer (generate-new-buffer " *tramp-rpc-inhibited-input*"))
+         (process (make-pipe-process :name "tramp-rpc-inhibited-input"
+                                     :buffer buffer :noquery t))
+         (vec (tramp-dissect-file-name "/rpc:mock:/path"))
+         writes)
+    (unwind-protect
+        (progn
+          (process-put process :tramp-rpc-vec vec)
+          (process-put process :tramp-rpc-pid 42)
+          (cl-letf (((symbol-function 'tramp-rpc--write-remote-process)
+                     (lambda (_vec _pid data owner)
+                       (should (eq owner process))
+                       (push data writes))))
+            (with-current-buffer buffer
+              (insert "INPUT")
+              (dolist (target (list process buffer (process-name process)
+                                   (buffer-name buffer) nil))
+                (dolist (operation '(process-send-string process-send-region))
+                  (let ((inhibit-file-name-handlers '(tramp-file-name-handler))
+                        (inhibit-file-name-operation operation))
+                    (pcase operation
+                      ('process-send-string (process-send-string target "INPUT"))
+                      ('process-send-region
+                       (process-send-region target (point-min) (point-max)))))))))
+          (should (equal writes (make-list 10 "INPUT"))))
+      (when (process-live-p process) (delete-process process))
+      (kill-buffer buffer))))
+
+(ert-deftest tramp-rpc-mock-test-transport-write-keeps-reentrant-input-remote ()
+  "An LSP reply sent during a blocked transport write reaches remote stdin."
+  (let* ((process-connection-type nil)
+         (transport (start-process "tramp-rpc-reentrant-transport" nil "cat"))
+         (relay (start-process "tramp-rpc-reentrant-client" nil "cat"))
+         (vec (tramp-dissect-file-name "/rpc:mock:/path"))
+         (conn (tramp-rpc--make-connection :process transport :vec vec))
+         (client (make-instance 'jsonrpc-process-connection
+                                :name "tramp-rpc-reentrant-client"
+                                :process relay
+                                :request-dispatcher (lambda (&rest _) nil)))
+         (payload (make-string (* 1024 1024) ?x))
+         (output "") remote-writes writing replied)
+    (unwind-protect
+        (progn
+          ;; The real SSH transport is native but carries the RPC vector.
+          (process-put transport 'tramp-vector vec)
+          (process-put relay 'tramp-vector vec)
+          (process-put relay :tramp-rpc-vec vec)
+          (process-put relay :tramp-rpc-pid 42)
+          (set-process-filter
+           transport
+           (lambda (_process string)
+             (setq output (concat output string))
+             (unless replied
+               (setq replied t)
+               ;; A full pipe runs filters before the write returns, just
+               ;; as Windows can run the timer that replies to an LSP request.
+               (should writing)
+               (jsonrpc-connection-receive
+                client '(:jsonrpc "2.0" :id 1
+                         :method "window/workDoneProgress/create"
+                         :params (:token "loading"))))))
+          (cl-letf (((symbol-function 'tramp-rpc--write-remote-process)
+                     (lambda (_vec _pid data &optional _owner)
+                       (push data remote-writes))))
+            (dotimes (_ 2)
+              (setq writing t)
+              (unwind-protect
+                  (tramp-rpc--send-request-frame conn vec payload "test write")
+                (setq writing nil)))
+            (tramp-rpc-mock-test--wait-for
+             (lambda () (>= (length output) (* 2 (length payload))))
+             "both transport payloads" transport))
+          (should replied)
+          (should (= (length remote-writes) 1))
+          (should (string-prefix-p "Content-Length: " (car remote-writes)))
+          (should (string-match-p "\"result\":null" (car remote-writes)))
+          (should (equal output (concat payload payload))))
+      (dolist (process (list transport relay))
+        (set-process-sentinel process #'ignore)
+        (when (process-live-p process) (delete-process process)))
+      (dolist (buffer (list (process-buffer relay)
+                           (jsonrpc-stderr-buffer client)
+                           (jsonrpc-events-buffer client)))
+        (when (buffer-live-p buffer) (kill-buffer buffer))))))
 
 (ert-deftest tramp-rpc-mock-test-call-async-send-failure-rolls-back-callback ()
   "A rejected async send must not leave callback state behind."
@@ -8906,14 +8994,12 @@ This matches tramp-sh and upstream `tramp-test28-process-file', which requires
                      (lambda (_process string) string))
                     ((symbol-function 'tramp-rpc--write-remote-process)
                      (lambda (_vec _pid data _owner) (setq written data))))
-            (tramp-rpc-handle-process-send-region process 8 15))
+            (process-send-region process 8 15))
           (should (equal written "PAYLOAD"))
           (process-put process :tramp-rpc-direct-ssh t)
-          (cl-letf (((symbol-function 'tramp-run-real-handler)
-                     (lambda (operation args) (setq native (list operation args)))))
-            (tramp-rpc-handle-process-send-region process 8 15))
-          (should (equal native
-                         (list #'process-send-region (list process 8 15)))))
+          (tramp-rpc--process-send-region-advice
+           (lambda (&rest args) (setq native args)) process 8 15)
+          (should (equal native (list process 8 15))))
       (when (process-live-p process) (delete-process process)))))
 
 (ert-deftest tramp-rpc-mock-test-route-aware-property-names-do-not-collide ()
