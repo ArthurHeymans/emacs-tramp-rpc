@@ -1319,8 +1319,8 @@ This matches the behavior expected by `tramp-test28-process-file'."
 (declare-function tramp-rpc-magit--process-cache-lookup "tramp-rpc-magit" (program args))
 (declare-function tramp-rpc-magit--process-cache-store "tramp-rpc-magit" (program args exit-code stdout))
 (declare-function tramp-rpc-magit--cache-file-truename "tramp-rpc-magit" (vec localname result))
-(declare-function tramp-rpc-handle-magit-status-setup-buffer "tramp-rpc-magit" (&optional directory))
-(declare-function tramp-rpc-handle-magit-status-refresh-buffer "tramp-rpc-magit" ())
+(declare-function tramp-rpc-magit--status-setup-buffer "tramp-rpc-magit" (orig-fun directory))
+(declare-function tramp-rpc-magit--status-refresh-buffer "tramp-rpc-magit" (orig-fun args))
 (declare-function tramp-rpc-magit--section-show-advice
                   "tramp-rpc-magit" (orig section))
 (declare-function tramp-rpc--file-notify-dispatch-rescan
@@ -3366,12 +3366,12 @@ direct property test would miss it."
         (tramp-rpc-magit-disable-remote-diff-tab-width-detection nil)
         cleared side-effects)
     (cl-letf (((symbol-function 'tramp-rpc-magit--clear-caches-for-directory)
-               (lambda (directory) (push directory cleared)))
-              ((symbol-function 'tramp-run-real-handler)
-               (lambda (_operation _args)
-                 (setq side-effects process-file-side-effects)
-                 'ok)))
-      (tramp-rpc-handle-magit-status-setup-buffer "/ssh:mock:/repo"))
+               (lambda (directory) (push directory cleared))))
+      (tramp-rpc-magit--status-setup-buffer
+       (lambda (_directory)
+         (setq side-effects process-file-side-effects)
+         'ok)
+       "/ssh:mock:/repo"))
     (should (equal cleared '("/ssh:mock:/repo")))
     (should-not side-effects)))
 
@@ -3383,11 +3383,11 @@ direct property test would miss it."
         (tramp-rpc-magit--status-setup-prefetch-active t)
         (tramp-rpc-magit-disable-remote-diff-tab-width-detection nil)
         captured)
-    (cl-letf (((symbol-function 'tramp-run-real-handler)
-               (lambda (_operation _args)
-                 (setq captured process-file-side-effects)
-                 'ok)))
-      (tramp-rpc-handle-magit-status-refresh-buffer))
+    (tramp-rpc-magit--status-refresh-buffer
+     (lambda ()
+       (setq captured process-file-side-effects)
+       'ok)
+     nil)
     (should-not captured)
     (should process-file-side-effects)))
 
@@ -3652,7 +3652,6 @@ direct property test would miss it."
       (tramp-rpc-magit--clear-status-cache-for-paths vec nil)
       (should-not (cached-p vec "/a/"))
       (should (cached-p other "/a/")))))
-
 
 (ert-deftest tramp-rpc-mock-test-file-notify-unexpected-events-invalidate-caches ()
   "Unexpected fs.events clear status/cache state and dispatch notifications."
@@ -7760,15 +7759,9 @@ background, which can precede the socket becoming visible."
 ;;; VC handler tests (No server or SSH required)
 ;;; ============================================================================
 
-(defun tramp-rpc-mock-test--reject-real-vc-exec-after ()
-  "Return a `tramp-run-real-handler' replacement rejecting `vc-exec-after'.
-Other operations, such as a pending sentinel of an earlier test asking for
-`process-status', still reach the real handler."
-  (let ((real (symbol-function 'tramp-run-real-handler)))
-    (lambda (operation &rest args)
-      (if (eq operation 'vc-exec-after)
-          (error "Unexpected process state")
-        (apply real operation args)))))
+(defun tramp-rpc-mock-test--reject-real-vc-exec-after (&rest _args)
+  "Stand in for the stock `vc-exec-after', which must not be reached."
+  (error "Unexpected process state"))
 
 (ert-deftest tramp-rpc-mock-test-vc-exec-after-logical-exit-runs-code ()
   "Test `vc-exec-after' handler treats exited TRAMP-RPC relays as done."
@@ -7784,12 +7777,11 @@ Other operations, such as a pending sentinel of an earlier test asking for
         (with-current-buffer buffer
           (process-put proc :tramp-rpc-pid 123)
           (process-put proc :tramp-rpc-exited t)
-          (cl-letf (((symbol-function 'tramp-run-real-handler)
-                     (tramp-rpc-mock-test--reject-real-vc-exec-after)))
-            ;; Pass PROC explicitly so the check does not depend on
-            ;; `get-buffer-process' picking the relay out of the buffer.
-            (tramp-rpc-handle-vc-exec-after
-             (lambda () (setq ran t)) nil proc))
+          ;; Pass PROC explicitly so the check does not depend on
+          ;; `get-buffer-process' picking the relay out of the buffer.
+          (tramp-rpc--vc-exec-after-advice
+           #'tramp-rpc-mock-test--reject-real-vc-exec-after
+           (lambda () (setq ran t)) nil proc)
           (should ran))
       (set-process-sentinel proc #'ignore)
       (when (process-live-p proc)
@@ -7813,10 +7805,9 @@ Other operations, such as a pending sentinel of an earlier test asking for
           ;; `closed' rather than the logical state from TRAMP-RPC handler.
           (cl-letf (((symbol-function 'process-status)
                      (let ((original (symbol-function 'process-status)))
-                       (lambda (p) (if (eq p proc) 'closed (funcall original p)))))
-                    ((symbol-function 'tramp-run-real-handler)
-                     (tramp-rpc-mock-test--reject-real-vc-exec-after)))
-            (tramp-rpc-handle-vc-exec-after
+                       (lambda (p) (if (eq p proc) 'closed (funcall original p))))))
+            (tramp-rpc--vc-exec-after-advice
+             #'tramp-rpc-mock-test--reject-real-vc-exec-after
              (lambda () (setq ran t))))
           (should ran))
       (set-process-sentinel proc #'ignore)
@@ -7839,10 +7830,9 @@ Other operations, such as a pending sentinel of an earlier test asking for
         (with-current-buffer buffer
           (process-put proc :tramp-rpc-pid 123)
           (cl-letf (((symbol-function 'vc--process-sentinel)
-                     (lambda (&rest _) (error "vc--process-sentinel called")))
-                    ((symbol-function 'tramp-run-real-handler)
-                     (tramp-rpc-mock-test--reject-real-vc-exec-after)))
-            (tramp-rpc-handle-vc-exec-after
+                     (lambda (&rest _) (error "vc--process-sentinel called"))))
+            (tramp-rpc--vc-exec-after-advice
+             #'tramp-rpc-mock-test--reject-real-vc-exec-after
              (lambda () (setq ran t)))
             (cl-letf (((symbol-function 'process-status)
                        (let ((original (symbol-function 'process-status)))
@@ -7856,6 +7846,35 @@ Other operations, such as a pending sentinel of an earlier test asking for
       (when (process-live-p proc)
         (delete-process proc))
       (kill-buffer buffer))))
+
+(ert-deftest tramp-rpc-mock-test-vc-exec-after-nested-in-immediate-code ()
+  "CODE run at once for a missing process still routes nested relays."
+  :tags '(:vc-handler)
+  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
+  (require 'vc-dispatcher)
+  (let* ((default-directory "/rpc:mock:/tmp/")
+         (proc (make-process :name "tramp-rpc-vc-exec-after-nested"
+                             :command '("sh" "-c" "sleep 60")
+                             :noquery t))
+         (ran nil))
+    (unwind-protect
+        (with-temp-buffer
+          (process-put proc :tramp-rpc-pid 123)
+          (process-put proc :tramp-rpc-exited t)
+          ;; Native-compiled VC may observe the raw relay state.
+          (cl-letf (((symbol-function 'process-status)
+                     (let ((original (symbol-function 'process-status)))
+                       (lambda (p)
+                         (if (eq p proc) 'closed (funcall original p))))))
+            ;; No buffer process, so the stock code runs CODE immediately.
+            (vc-exec-after
+             (lambda ()
+               (apply #'vc-exec-after (lambda () (setq ran t))
+                      (list nil proc)))))
+          (should ran))
+      (set-process-sentinel proc #'ignore)
+      (when (process-live-p proc)
+        (delete-process proc)))))
 
 (ert-deftest tramp-rpc-mock-test-dir-locals-cache-covers-uses-containment ()
   "Ensure cache coverage check uses containment, not string length."

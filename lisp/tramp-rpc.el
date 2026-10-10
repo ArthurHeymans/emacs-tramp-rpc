@@ -2848,7 +2848,6 @@ cleanup of all connections has run."
 
 (defun tramp-rpc--after-load-integrations (_file)
   "Install integrations whose optional packages have just loaded."
-  (tramp-rpc-process-install-optional-handlers)
   (tramp-rpc-advice-install-optional-handlers)
   (tramp-rpc-magit-install-optional-handlers))
 

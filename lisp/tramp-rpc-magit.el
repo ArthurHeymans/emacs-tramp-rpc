@@ -38,6 +38,7 @@
 
 ;; Functions from tramp-rpc.el
 (declare-function tramp-rpc-file-name-p "tramp-rpc")
+(declare-function tramp-rpc--managed-file-name-p "tramp-rpc-hops" (vec-or-filename))
 
 ;; Functions from magit-section.el.
 (autoload 'magit-section-show "magit-section")
@@ -1295,10 +1296,17 @@ SECTION is the Magit section being handled."
 ;; Magit handlers
 ;; ============================================================================
 
-(defun tramp-rpc-handle-magit-status-setup-buffer (&optional directory)
-  "Handler for `magit-status-setup-buffer' to prefetch data.
-The git index rewrites of the refresh do not clear its caches.
-DIRECTORY is the directory being handled."
+(defun tramp-rpc-magit--status-setup-buffer-advice (orig-fun
+                                                     &optional directory)
+  "Set up the Magit status buffer of TRAMP-RPC DIRECTORY with prefetched data.
+The git index rewrites of the refresh do not clear its caches.  ORIG-FUN is
+`magit-status-setup-buffer', called directly for other directories."
+  (if (tramp-rpc--managed-file-name-p (or directory default-directory))
+      (tramp-rpc-magit--status-setup-buffer orig-fun directory)
+    (funcall orig-fun directory)))
+
+(defun tramp-rpc-magit--status-setup-buffer (orig-fun directory)
+  "Call ORIG-FUN to set up the status buffer of DIRECTORY with prefetching."
   (let* ((directory (or directory default-directory))
          (tramp-rpc--expected-fs-events
           (tramp-rpc-magit--expect-git-index-events directory))
@@ -1317,14 +1325,21 @@ DIRECTORY is the directory being handled."
     ;; metadata prefetched during the refresh must survive for lazy sections.
     (tramp-rpc-magit--clear-caches-for-directory directory)
     (condition-case err
-        (tramp-run-real-handler 'magit-status-setup-buffer (list directory))
+        (funcall orig-fun directory)
       (error
        (tramp-rpc-magit--clear-caches-for-directory directory)
        (signal (car err) (cdr err))))))
 
-(defun tramp-rpc-handle-magit-status-refresh-buffer ()
-  "Handler for `magit-status-refresh-buffer' to prefetch data.
-The git index rewrites of the refresh do not clear its caches."
+(defun tramp-rpc-magit--status-refresh-buffer-advice (orig-fun &rest args)
+  "Refresh a TRAMP-RPC Magit status buffer with prefetched data.
+The git index rewrites of the refresh do not clear its caches.  ORIG-FUN is
+`magit-status-refresh-buffer', called with ARGS."
+  (if (tramp-rpc--managed-file-name-p default-directory)
+      (tramp-rpc-magit--status-refresh-buffer orig-fun args)
+    (apply orig-fun args)))
+
+(defun tramp-rpc-magit--status-refresh-buffer (orig-fun args)
+  "Call ORIG-FUN with ARGS to refresh the status buffer with prefetching."
   (unless tramp-rpc-magit--status-setup-prefetch-active
     (tramp-rpc-magit--clear-caches-for-directory default-directory))
   (let ((tramp-rpc--expected-fs-events
@@ -1342,10 +1357,16 @@ The git index rewrites of the refresh do not clear its caches."
     ;; The scoped clear above drops stale metadata.  Fresh metadata prefetched
     ;; during the refresh must survive so lazy Magit sections can reuse it.
     (condition-case err
-        (tramp-run-real-handler 'magit-status-refresh-buffer nil)
+        (apply orig-fun args)
       (error
        (tramp-rpc-magit--clear-caches-for-directory default-directory)
        (signal (car err) (cdr err))))))
+
+(defconst tramp-rpc-magit--status-advice
+  '((magit-status-setup-buffer . tramp-rpc-magit--status-setup-buffer-advice)
+    (magit-status-refresh-buffer
+     . tramp-rpc-magit--status-refresh-buffer-advice))
+  "Magit status functions and the advice prefetching for TRAMP-RPC.")
 
 ;;;###autoload
 (defun tramp-rpc-magit-enable ()
@@ -1358,12 +1379,8 @@ magit-status on remote repositories."
   (when (fboundp 'magit-section-show)
     (advice-add 'magit-section-show :around #'tramp-rpc-magit--section-show-advice))
 
-  (tramp-rpc--add-external-operation
-   'magit-status-setup-buffer
-   #'tramp-rpc-handle-magit-status-setup-buffer 'tramp-rpc)
-  (tramp-rpc--add-external-operation
-   'magit-status-refresh-buffer
-   #'tramp-rpc-handle-magit-status-refresh-buffer 'tramp-rpc)
+  (pcase-dolist (`(,function . ,advice) tramp-rpc-magit--status-advice)
+    (advice-add function :around advice))
   (setq tramp-rpc-magit--magit-enabled t)
   (message "tramp-rpc magit optimizations enabled"))
 
@@ -1372,8 +1389,8 @@ magit-status on remote repositories."
   "Disable tramp-rpc magit optimizations."
   (interactive)
   (advice-remove 'magit-section-show #'tramp-rpc-magit--section-show-advice)
-  (tramp-rpc--remove-external-operation 'magit-status-setup-buffer 'tramp-rpc)
-  (tramp-rpc--remove-external-operation 'magit-status-refresh-buffer 'tramp-rpc)
+  (pcase-dolist (`(,function . ,advice) tramp-rpc-magit--status-advice)
+    (advice-remove function advice))
   (tramp-rpc-magit--clear-cache)
   (setq tramp-rpc-magit--magit-enabled nil)
   (message "tramp-rpc magit optimizations disabled"))
