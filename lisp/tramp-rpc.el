@@ -1184,8 +1184,7 @@ MUSTBENEW requests an overwrite check; `excl' rejects an existing file."
                              ,@(when (integerp append)
                                  `((offset . ,append)))))))
 
-      (let ((tramp-rpc--suppress-fs-notifications t))
-        (tramp-rpc--call v "file.write" params))
+      (tramp-rpc--call v "file.write" params)
 
       ;; Invalidate caches for the written file
       (tramp-rpc--invalidate-cache-for-path filename)
@@ -2849,7 +2848,6 @@ cleanup of all connections has run."
 
 (defun tramp-rpc--after-load-integrations (_file)
   "Install integrations whose optional packages have just loaded."
-  (tramp-rpc-process-install-optional-handlers)
   (tramp-rpc-advice-install-optional-handlers)
   (tramp-rpc-magit-install-optional-handlers))
 

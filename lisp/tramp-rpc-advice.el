@@ -320,89 +320,71 @@ sentinel."
 ;; ============================================================================
 
 ;; VC backends like vc-git-state use process-file internally, but they don't
-;; set default-directory to the remote file's directory. This means process-file
-;; runs locally instead of going through our tramp handler. We fix this by
-;; advising vc-call-backend to set default-directory when the file is remote.
+;; set default-directory to the remote file's directory.  This means
+;; process-file runs locally instead of going through our tramp handler.  We
+;; fix this by advising vc-call-backend to set default-directory when the
+;; file is remote.
 
-(defun tramp-rpc--vc-call-backend-file-name-for-operation
-    (_operation _backend function-name &rest args)
-  "Helper function for `vc-call-backend' handler.
-FUNCTION-NAME names the function being checked.
-ARGS contains the original function arguments."
-  (or (and ;; Operations that take a file and may call process-file
-           (memq function-name '(registered state state-heuristic dir-status-files
-                                 working-revision previous-revision next-revision
-                                 responsible-p))
-	   (stringp (car args)) (car args))
-      ""))
+(defconst tramp-rpc--vc-file-operations
+  '(registered state state-heuristic dir-status-files working-revision
+    previous-revision next-revision responsible-p)
+  "VC backend operations that take a file and may call `process-file'.")
 
-(defun tramp-rpc-handle-vc-call-backend (backend function-name &rest args)
-  "Handler for `vc-call-backend' for TRAMP files correctly.
-When FUNCTION-NAME is an operation that takes a file argument and that file is
-a TRAMP path, ensure `default-directory' is set to the file's directory so that
-`process-file' calls are routed through the TRAMP handler.
-BACKEND is the VC backend."
-  (let ((default-directory (file-name-directory (car args))))
-    (tramp-run-real-handler
-     #'vc-call-backend (append `(,backend ,function-name) args))))
+(defun tramp-rpc--vc-call-backend-advice (orig-fun backend function-name
+                                                   &rest args)
+  "Run VC FUNCTION-NAME for a TRAMP-RPC file in that file's directory.
+VC backends run `process-file' in `default-directory', so set it to the
+directory of the file argument.  ORIG-FUN is `vc-call-backend', called with
+BACKEND, FUNCTION-NAME and ARGS."
+  (let ((file (car args)))
+    (if (and (memq function-name tramp-rpc--vc-file-operations)
+             (stringp file)
+             (tramp-rpc--managed-file-name-p file))
+        (let ((default-directory (file-name-directory file)))
+          (apply orig-fun backend function-name args))
+      (apply orig-fun backend function-name args))))
 
-(defun tramp-rpc--vc-exec-after-real (code okstatus proc)
-  "Call the real `vc-exec-after' with the arity this Emacs supports.
-CODE is the process exit code.
-OKSTATUS lists successful exit statuses.
-PROC is the process being handled."
-  (tramp-run-real-handler
-   #'vc-exec-after
-   (if (and proc (>= (cdr (func-arity #'vc-exec-after)) 3))
-       (list code okstatus proc)       ; Emacs 31+
-     (list code okstatus))))           ; Emacs 30
+(defun tramp-rpc--vc-exec-after-managed (code okstatus proc)
+  "Run CODE once TRAMP-RPC relay PROC is done, using its logical state.
+OKSTATUS is as for `vc-exec-after'."
+  (if (or (process-get proc :tramp-rpc-exited)
+          (not (memq (process-status proc) '(run open listen connect))))
+      (progn
+        ;; Match `vc-exec-after': drain pending output before the next VC
+        ;; stage.  Use zero-timeout accepts so we drain what is immediately
+        ;; available without blocking callers such as Dired/diff-hl that
+        ;; run with `inhibit-quit' bound; Emacs 30 warns about blocking
+        ;; `accept-process-output' in that context.
+        (while (accept-process-output proc 0 nil t))
+        (when (cond
+               ((null okstatus) t)
+               ((processp okstatus) (zerop (process-exit-status okstatus))) ; Emacs 30
+               ((integerp okstatus) (<= (process-exit-status proc) okstatus))) ; Emacs 31+
+          (if (functionp code) (funcall code) (eval code t))))
+    (vc-set-mode-line-busy-indicator)
+    (letrec ((fun (lambda (p _msg)
+                    (remove-function (process-sentinel p) fun)
+                    (when-let* ((buf (process-buffer p))
+                                ((buffer-live-p buf)))
+                      (with-current-buffer buf
+                        (tramp-rpc--vc-exec-after-managed code okstatus p))))))
+      (add-function :after (process-sentinel proc) fun)))
+  nil)
 
-(defun tramp-rpc-handle-vc-exec-after (code &optional okstatus proc)
-  "Handler for `vc-exec-after' to handle TRAMP-RPC relay processes.
+(defun tramp-rpc--vc-exec-after-advice (orig-fun code &rest args)
+  "Run CODE after a TRAMP-RPC relay using its logical process state.
 
 Some native-compiled VC functions can observe the raw local relay process
-state instead of the logical state provided by the `process-status' handler.  A
-short-lived remote command can leave the local cat relay in a non-`run' and
+state instead of the logical state provided by the `process-status' advice.
+A short-lived remote command can leave the local cat relay in a non-`run' and
 non-`exit' state while TRAMP-RPC has already recorded the remote exit.  The
 stock `vc-exec-after' then signals \"Unexpected process state\".  For
 TRAMP-RPC processes, reproduce `vc-exec-after' using the logical process
-state.
-CODE is the process exit code.
-OKSTATUS lists successful exit statuses.
-PROC is the process being handled."
-  (let ((proc (or proc (get-buffer-process (current-buffer)))))
-    (if (and (processp proc)
-             (process-get proc :tramp-rpc-pid))
-        (let ((status (cond
-                       ((process-get proc :tramp-rpc-exited) 'exit)
-                       ((memq (process-status proc) '(run open listen connect)) 'run)
-                       (t 'exit))))
-          (cond
-           ((eq status 'exit)
-            ;; Match `vc-exec-after': drain pending output before the next VC
-            ;; stage.  Use zero-timeout accepts so we drain what is immediately
-            ;; available without blocking callers such as Dired/diff-hl that
-            ;; run with `inhibit-quit' bound; Emacs 30 warns about blocking
-            ;; `accept-process-output' in that context.
-            (while (accept-process-output proc 0 nil t))
-            (when (cond
-                   ((null okstatus) t)
-                   ((processp okstatus) (zerop (process-exit-status okstatus))) ; Emacs 30
-                   ((integerp okstatus) (<= (process-exit-status proc) okstatus))) ; Emacs 31+
-              (if (functionp code) (funcall code) (eval code t))))
-           ((eq status 'run)
-            (vc-set-mode-line-busy-indicator)
-            (letrec ((fun (lambda (p _msg)
-                            (remove-function (process-sentinel p) fun)
-                            (when-let* ((buf (process-buffer p))
-                                        (_ (buffer-live-p buf)))
-                              (with-current-buffer buf
-                                (tramp-rpc-handle-vc-exec-after code okstatus p))))))
-              (add-function :after (process-sentinel proc) fun)))
-           (t
-            (tramp-rpc--vc-exec-after-real code okstatus proc))))
-      (tramp-rpc--vc-exec-after-real code okstatus proc)))
-  nil)
+state.  ORIG-FUN is `vc-exec-after'; ARGS are its OKSTATUS and PROC."
+  (let ((proc (or (nth 1 args) (get-buffer-process (current-buffer)))))
+    (if (and (processp proc) (process-get proc :tramp-rpc-pid))
+        (tramp-rpc--vc-exec-after-managed code (car args) proc)
+      (apply orig-fun code args))))
 
 ;; ============================================================================
 ;; Python shell integration
@@ -466,14 +448,13 @@ BODYFUN performs the wrapped operation."
 ;;
 ;; This handler bypasses the shell wrapper for tramp-rpc connections.
 
-(defun tramp-rpc-handle-eglot--cmd (contact)
-  "Handler for `eglot--cmd' to avoid shell wrapping for tramp-rpc.
-For tramp-rpc connections, return CONTACT directly without wrapping
-in a shell command.  This is safe because tramp-rpc uses pipes (not PTYs)
-and handles binary data correctly."
+(defun tramp-rpc--eglot--cmd-advice (orig-fun contact &rest args)
+  "Return CONTACT unwrapped for TRAMP-RPC, otherwise call ORIG-FUN.
+TRAMP-RPC uses pipes, not PTYs, and handles binary data correctly, so the
+shell wrapper is not needed.  ARGS are passed to ORIG-FUN."
   (if (tramp-rpc-file-name-p default-directory)
       contact
-    (tramp-run-real-handler 'eglot--cmd (list contact))))
+    (apply orig-fun contact args)))
 
 ;; ============================================================================
 ;; Magit: force pipe mode for stdin piping
@@ -496,19 +477,18 @@ and handles binary data correctly."
 ;; is not flagged as an unused lexical variable by the byte-compiler.
 (defvar magit-tramp-pipe-stty-settings)
 
-(defun tramp-rpc-handle-magit-start-process (program &optional input &rest args)
-  "Force pipe mode for tramp-rpc when INPUT will be piped to the process.
+(defun tramp-rpc--magit-start-process-advice (orig-fun program
+                                                      &optional input
+                                                      &rest args)
+  "Force pipe mode for TRAMP-RPC when INPUT will be piped to the process.
 PTY mode breaks stdin piping because `process-send-eof' sends Ctrl-D
 which does not close the pipe — git waits for more input forever.
-PROGRAM is the executable name."
-  (if input
-      ;; Let-bind magit-tramp-pipe-stty-settings to "" so that
-      ;; magit-start-process sets process-connection-type to nil (pipe).
+ORIG-FUN is `magit-start-process', called with PROGRAM, INPUT and ARGS."
+  (if (and input (tramp-rpc--managed-file-name-p default-directory))
+      ;; magit-start-process uses a pipe when this is "".
       (let ((magit-tramp-pipe-stty-settings ""))
-	(tramp-run-real-handler
-	 'magit-start-process (append `(,program ,input) args)))
-    (tramp-run-real-handler
-     'magit-start-process (append `(,program ,input) args))))
+        (apply orig-fun program input args))
+    (apply orig-fun program input args)))
 
 ;; ============================================================================
 ;; vc-dir stale-process guard
@@ -523,33 +503,27 @@ PROGRAM is the executable name."
 ;; This handler acts as a safety net: before `vc-dir-refresh' checks the
 ;; busy flag, we delete any exited tramp-rpc relay process from the buffer.
 
-(defun tramp-rpc--vc-dir-refresh-file-name-for-operation
-    (_operation)
-  "Helper function for `vc-dir-refresh' handler."
-  (if (and (bound-and-true-p vc-dir-process-buffer)
-           (buffer-live-p vc-dir-process-buffer))
-      (tramp-get-default-directory vc-dir-process-buffer)
-      ""))
-
-(defun tramp-rpc-handle-vc-dir-refresh ()
-  "Handler for `vc-dir-refresh' to clean up stale TRAMP-RPC relay processes.
-If the `vc-dir' process buffer has a tramp-rpc cat relay that has already
-exited (remote side finished), delete it so the refresh can proceed."
-  (let ((proc (get-buffer-process vc-dir-process-buffer)))
-    (when (and proc
-               (process-get proc :tramp-rpc-pid)
-               (or (process-get proc :tramp-rpc-exited)
-                   (not (process-live-p proc))))
-      (tramp-rpc--forget-managed-process proc)
-      (delete-process proc)))
-  (tramp-run-real-handler 'vc-dir-refresh nil))
+(defun tramp-rpc--vc-dir-refresh-advice (orig-fun &rest args)
+  "Delete an exited TRAMP-RPC relay of the `vc-dir' buffer, then ORIG-FUN.
+The relay would otherwise make the refresh report a busy update process.
+ARGS are passed to ORIG-FUN."
+  (when-let* (((bound-and-true-p vc-dir-process-buffer))
+              ((buffer-live-p vc-dir-process-buffer))
+              (proc (get-buffer-process vc-dir-process-buffer))
+              ((process-get proc :tramp-rpc-pid))
+              ((or (process-get proc :tramp-rpc-exited)
+                   (not (process-live-p proc)))))
+    (tramp-rpc--forget-managed-process proc)
+    (delete-process proc))
+  (apply orig-fun args))
 
 ;; ============================================================================
 ;; Install and uninstall handler
 ;; ============================================================================
 
-(defconst tramp-rpc--process-advice
-  '((process-send-string . tramp-rpc--process-send-string-advice)
+(defconst tramp-rpc--advice
+  '(;; Process primitives, routed by process ownership.
+    (process-send-string . tramp-rpc--process-send-string-advice)
     (process-send-region . tramp-rpc--process-send-region-advice)
     (process-send-eof . tramp-rpc--process-send-eof-advice)
     (process-status . tramp-rpc--process-status-advice)
@@ -559,30 +533,33 @@ exited (remote side finished), delete it so the refresh can proceed."
     (set-process-sentinel . tramp-rpc--set-process-sentinel-advice)
     (process-sentinel . tramp-rpc--process-sentinel-advice)
     (set-process-coding-system . tramp-rpc--set-process-coding-system-advice)
-    (process-coding-system . tramp-rpc--process-coding-system-advice))
-  "Process primitives and the advice routing them by process ownership.")
+    (process-coding-system . tramp-rpc--process-coding-system-advice)
+    (vterm--window-adjust-process-window-size
+     . tramp-rpc--vterm-window-adjust-advice)
+    (eat--adjust-process-window-size . tramp-rpc--eat-window-adjust-advice)
+    ;; Integrations, which wrap the original call for TRAMP-RPC files.
+    (vc-call-backend . tramp-rpc--vc-call-backend-advice)
+    (vc-exec-after . tramp-rpc--vc-exec-after-advice)
+    (vc-dir-refresh . tramp-rpc--vc-dir-refresh-advice)
+    (eglot--cmd . tramp-rpc--eglot--cmd-advice)
+    (magit-start-process . tramp-rpc--magit-start-process-advice))
+  "Functions tramp-rpc advises, with their advice.
+Advice, unlike a Tramp external operation, calls the original function
+directly: Tramp runs it under `tramp-run-real-handler', which disables the
+handler for nested calls of the same operation, including callbacks run while
+it waits.  Advising a function that is not loaded yet takes effect when it
+is defined.")
 
 (defun tramp-rpc-handler-install ()
   "Install all process handler for tramp-rpc."
-  (pcase-dolist (`(,function . ,advice) tramp-rpc--process-advice)
+  (pcase-dolist (`(,function . ,advice) tramp-rpc--advice)
     ;; Outermost, so ownership is checked before any Tramp dispatch.
     (advice-add function :around advice '((depth . -10))))
   ;; This must be before `tramp-signal-process'.  Since tramp.el is
   ;; required, this is guaranteed.
   (add-hook 'signal-process-functions #'tramp-rpc-handle-signal-process)
   ;; Likewise before `tramp-interrupt-process'.
-  (add-hook 'interrupt-process-functions #'tramp-rpc-handle-interrupt-process)
-  (tramp-rpc--add-external-operation
-     'vc-call-backend
-     #'tramp-rpc-handle-vc-call-backend 'tramp-rpc
-     #'tramp-rpc--vc-call-backend-file-name-for-operation)
-  (tramp-rpc--add-external-operation
-     'vc-exec-after
-     #'tramp-rpc-handle-vc-exec-after 'tramp-rpc 'default-directory)
-  (tramp-rpc--add-external-operation
-   'vc-dir-refresh
-   #'tramp-rpc-handle-vc-dir-refresh 'tramp-rpc
-   #'tramp-rpc--vc-dir-refresh-file-name-for-operation))
+  (add-hook 'interrupt-process-functions #'tramp-rpc-handle-interrupt-process))
 
 (defun tramp-rpc-advice-install-optional-handlers ()
   "Install handlers for loaded optional integration packages."
@@ -604,33 +581,20 @@ exited (remote side finished), delete it so the refresh can proceed."
           (advice-add
            'python-shell--tramp-with-environment
            :around
-           #'tramp-rpc-handle-python-shell--tramp-with-environment-compat))))
-  (when (featurep 'eglot)
-    (tramp-rpc--add-external-operation
-       'eglot--cmd
-       #'tramp-rpc-handle-eglot--cmd 'tramp-rpc 'default-directory))
-  (when (featurep 'magit-process)
-    (tramp-rpc--add-external-operation
-       'magit-start-process
-       #'tramp-rpc-handle-magit-start-process 'tramp-rpc 'default-directory)))
+           #'tramp-rpc-handle-python-shell--tramp-with-environment-compat)))))
 
 (defun tramp-rpc-handler-remove ()
   "Remove all process handler installed by tramp-rpc."
-  (pcase-dolist (`(,function . ,advice) tramp-rpc--process-advice)
+  (pcase-dolist (`(,function . ,advice) tramp-rpc--advice)
     (advice-remove function advice))
   (remove-hook 'signal-process-functions #'tramp-rpc-handle-signal-process)
   (remove-hook 'interrupt-process-functions #'tramp-rpc-handle-interrupt-process)
-  (tramp-rpc--remove-external-operation 'vc-call-backend 'tramp-rpc)
-  (tramp-rpc--remove-external-operation 'vc-exec-after 'tramp-rpc)
   (tramp-rpc--remove-external-operation
    'python-shell--tramp-with-environment 'tramp-rpc)
   (when (fboundp 'python-shell--tramp-with-environment)
     (advice-remove
      'python-shell--tramp-with-environment
-     #'tramp-rpc-handle-python-shell--tramp-with-environment-compat))
-  (tramp-rpc--remove-external-operation 'eglot--cmd 'tramp-rpc)
-  (tramp-rpc--remove-external-operation 'magit-start-process 'tramp-rpc)
-  (tramp-rpc--remove-external-operation 'vc-dir-refresh 'tramp-rpc))
+     #'tramp-rpc-handle-python-shell--tramp-with-environment-compat)))
 
 
 ;; ============================================================================

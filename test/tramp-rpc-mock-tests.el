@@ -1318,8 +1318,8 @@ This matches the behavior expected by `tramp-test28-process-file'."
 (declare-function tramp-rpc-magit--process-cache-lookup "tramp-rpc-magit" (program args))
 (declare-function tramp-rpc-magit--process-cache-store "tramp-rpc-magit" (program args exit-code stdout))
 (declare-function tramp-rpc-magit--cache-file-truename "tramp-rpc-magit" (vec localname result))
-(declare-function tramp-rpc-handle-magit-status-setup-buffer "tramp-rpc-magit" (&optional directory))
-(declare-function tramp-rpc-handle-magit-status-refresh-buffer "tramp-rpc-magit" ())
+(declare-function tramp-rpc-magit--status-setup-buffer "tramp-rpc-magit" (orig-fun directory))
+(declare-function tramp-rpc-magit--status-refresh-buffer "tramp-rpc-magit" (orig-fun args))
 (declare-function tramp-rpc-magit--section-show-advice
                   "tramp-rpc-magit" (orig section))
 (declare-function tramp-rpc--file-notify-dispatch-rescan
@@ -1329,11 +1329,15 @@ This matches the behavior expected by `tramp-test28-process-file'."
 (declare-function tramp-rpc-handle-file-regular-p "tramp-rpc" (filename))
 (declare-function tramp-rpc--clear-file-caches-for-connection "tramp-rpc-cache" (vec))
 (declare-function tramp-rpc--invalidate-cache-for-subtree "tramp-rpc-cache" (directory))
+(declare-function tramp-rpc-magit--clear-status-cache-for-paths
+                  "tramp-rpc-magit" (vec paths))
 (declare-function tramp-rpc-magit--clear-status-cache-for-connection
                   "tramp-rpc-magit" (vec))
 (defvar tramp-rpc-magit-disable-remote-diff-tab-width-detection)
 (defvar tramp-rpc-magit--allow-process-cache)
 (defvar tramp-rpc-magit--process-caches)
+(defvar tramp-rpc-magit--git-index-event-regexp)
+(defvar tramp-rpc--expected-fs-events)
 (defvar tramp-rpc-magit--ancestor-scan-caches)
 (defvar tramp-rpc-magit--prefetch-directories)
 
@@ -3361,12 +3365,12 @@ direct property test would miss it."
         (tramp-rpc-magit-disable-remote-diff-tab-width-detection nil)
         cleared side-effects)
     (cl-letf (((symbol-function 'tramp-rpc-magit--clear-caches-for-directory)
-               (lambda (directory) (push directory cleared)))
-              ((symbol-function 'tramp-run-real-handler)
-               (lambda (_operation _args)
-                 (setq side-effects process-file-side-effects)
-                 'ok)))
-      (tramp-rpc-handle-magit-status-setup-buffer "/ssh:mock:/repo"))
+               (lambda (directory) (push directory cleared))))
+      (tramp-rpc-magit--status-setup-buffer
+       (lambda (_directory)
+         (setq side-effects process-file-side-effects)
+         'ok)
+       "/ssh:mock:/repo"))
     (should (equal cleared '("/ssh:mock:/repo")))
     (should-not side-effects)))
 
@@ -3378,11 +3382,11 @@ direct property test would miss it."
         (tramp-rpc-magit--status-setup-prefetch-active t)
         (tramp-rpc-magit-disable-remote-diff-tab-width-detection nil)
         captured)
-    (cl-letf (((symbol-function 'tramp-run-real-handler)
-               (lambda (_operation _args)
-                 (setq captured process-file-side-effects)
-                 'ok)))
-      (tramp-rpc-handle-magit-status-refresh-buffer))
+    (tramp-rpc-magit--status-refresh-buffer
+     (lambda ()
+       (setq captured process-file-side-effects)
+       'ok)
+     nil)
     (should-not captured)
     (should process-file-side-effects)))
 
@@ -3547,8 +3551,8 @@ direct property test would miss it."
         (remhash descriptor tramp-rpc--file-notify-descriptors)
         (tramp-rpc--delete-file-notify-descriptor-process descriptor)))))
 
-(ert-deftest tramp-rpc-mock-test-file-notify-suppression-still-dispatches ()
-  "Suppression skips concrete cache work, but rescans invalidate all state."
+(ert-deftest tramp-rpc-mock-test-file-notify-expected-events-skip-only-cache-work ()
+  "Expected events still dispatch; any other event keeps its full effect."
   (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
   (let* ((vec (tramp-dissect-file-name "/rpc:mock:/tmp/"))
          (proc (make-process :name "tramp-rpc-fs-events-test"
@@ -3557,43 +3561,99 @@ direct property test would miss it."
                              :connection-type 'pipe
                              :noquery t))
          (status-clears 0)
+         (cleared-paths nil)
          (invalidations nil)
-         (connection-clears nil)
          (dispatches nil)
-         (rescans nil)
-         (tramp-rpc--suppress-fs-notifications t))
+         (tramp-rpc--expected-fs-events
+          (list (cons "other-connection" ".")
+                (cons (tramp-rpc--connection-key-string vec)
+                      tramp-rpc-magit--git-index-event-regexp))))
     (unwind-protect
         (progn
           (process-put proc :tramp-rpc-vec vec)
           (puthash (tramp-rpc--connection-key vec) (tramp-rpc--make-connection :process proc)
                    tramp-rpc--connections)
-          (cl-letf (((symbol-function 'tramp-rpc-magit--clear-status-cache-for-connection)
-                     (lambda (_vec) (cl-incf status-clears)))
+          (cl-letf (((symbol-function 'tramp-rpc-magit--clear-status-cache-for-paths)
+                     (lambda (_vec paths) (cl-incf status-clears) (push paths cleared-paths)))
                     ((symbol-function 'tramp-rpc--invalidate-cache-for-path)
                      (lambda (path) (push path invalidations)))
-                    ((symbol-function 'tramp-rpc--clear-file-caches-for-connection)
-                     (lambda (clear-vec) (push clear-vec connection-clears)))
                     ((symbol-function 'tramp-rpc--file-notify-dispatch)
-                     (lambda (action path &optional path1 cookie)
-                       (push (list action path path1 cookie) dispatches)))
-                    ((symbol-function 'tramp-rpc--file-notify-dispatch-rescan)
-                     (lambda (rescan-process) (push rescan-process rescans))))
+                     (lambda (action path &optional _path1 _cookie)
+                       (push (list action path) dispatches))))
+            ;; Only index churn: dispatched, but no cache or status work.
+            (tramp-rpc--handle-notification
+             proc "fs.events"
+             '((events . (((action . "renamed")
+                            (path . "/tmp/repo/.git/index.lock")
+                            (path1 . "/tmp/repo/.git/index"))))))
+            (should (= status-clears 0))
+            (should-not invalidations)
+            (should (equal dispatches
+                           '(("renamed" "/rpc:mock:/tmp/repo/.git/index.lock"))))
+            ;; Another path in the same batch still invalidates.
             (tramp-rpc--handle-notification
              proc "fs.events"
              '((events . (((action . "changed")
-                            (path . "/tmp/changed"))
-                           ((action . "rescan"))))))
+                            (path . "/tmp/repo/.git/index"))
+                           ((action . "changed")
+                            (path . "/tmp/repo/file"))))))
             (should (= status-clears 1))
-            (should-not invalidations)
-            (should (equal connection-clears (list vec)))
-            (should (equal rescans (list proc)))
-            (should (equal dispatches
-                           '(("changed" "/rpc:mock:/tmp/changed" nil nil))))))
+            ;; Status caches only learn about the unexpected path.
+            (should (equal cleared-paths '(("/rpc:mock:/tmp/repo/file"))))
+            (should (equal invalidations '("/rpc:mock:/tmp/repo/file")))
+            (should (= (length dispatches) 3))))
       (when (process-live-p proc)
         (delete-process proc)))))
 
-(ert-deftest tramp-rpc-mock-test-file-notify-unsuppressed-events-invalidate-caches ()
-  "Unsuppressed fs.events clear status/cache state and dispatch notifications."
+(ert-deftest tramp-rpc-mock-test-magit-status-cache-cleared-by-repository ()
+  "Status caches are cleared only for repositories containing a change."
+  (skip-unless tramp-rpc-mock-test--tramp-rpc-magit-loaded)
+  (let* ((tramp-rpc-magit--process-caches (make-hash-table :test 'equal))
+         (vec (tramp-dissect-file-name "/rpc:mock:/"))
+         (other (tramp-dissect-file-name "/rpc:other:/")))
+    (cl-flet ((snapshot (vec directory toplevel gitdir)
+                (let ((cache (make-hash-table :test 'equal)))
+                  (when toplevel
+                    (puthash (tramp-rpc-magit--process-cache-key
+                              "rev-parse" "--show-toplevel")
+                             (cons 0 (concat toplevel "\n")) cache)
+                    (puthash (tramp-rpc-magit--process-cache-key
+                              "rev-parse" "--git-dir")
+                             (cons 0 (concat gitdir "\n")) cache))
+                  (tramp-rpc-magit--set-process-cache
+                   vec (tramp-make-tramp-file-name vec directory) cache)))
+              (cached-p (vec directory)
+                (gethash (tramp-rpc-magit--get-cache-key
+                          vec (tramp-make-tramp-file-name vec directory))
+                         tramp-rpc-magit--process-caches)))
+      (snapshot vec "/a/" "/a" ".git")
+      (snapshot vec "/a/sub/" "/a" "/a/.git")
+      (snapshot vec "/main/" "/main" ".git")
+      (snapshot vec "/linked/" "/linked" "/main/.git/worktrees/linked")
+      (snapshot vec "/unknown/" nil nil)
+      (snapshot other "/a/" "/a" ".git")
+      (tramp-rpc-magit--clear-status-cache-for-paths
+       vec '("/rpc:mock:/a/file" "/rpc:mock:/main/.git/refs/heads/x"))
+      ;; The changed worktree, including its subdirectory snapshot.
+      (should-not (cached-p vec "/a/"))
+      (should-not (cached-p vec "/a/sub/"))
+      ;; A linked worktree shares the changed refs of its main repository.
+      (should-not (cached-p vec "/main/"))
+      (should-not (cached-p vec "/linked/"))
+      ;; A snapshot without its repository location is conservatively cleared.
+      (should-not (cached-p vec "/unknown/"))
+      (should (cached-p other "/a/"))
+      (snapshot vec "/a/" "/a" ".git")
+      (tramp-rpc-magit--clear-status-cache-for-paths
+       vec '("/rpc:mock:/elsewhere/file"))
+      (should (cached-p vec "/a/"))
+      ;; Unknown changes clear the whole connection.
+      (tramp-rpc-magit--clear-status-cache-for-paths vec nil)
+      (should-not (cached-p vec "/a/"))
+      (should (cached-p other "/a/")))))
+
+(ert-deftest tramp-rpc-mock-test-file-notify-unexpected-events-invalidate-caches ()
+  "Unexpected fs.events clear status/cache state and dispatch notifications."
   (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
   (let* ((vec (tramp-dissect-file-name "/rpc:mock:/tmp/"))
          (proc (make-process :name "tramp-rpc-fs-events-unsuppressed-test"
@@ -3602,18 +3662,18 @@ direct property test would miss it."
                              :connection-type 'pipe
                              :noquery t))
          (status-clears 0)
+         (cleared-paths nil)
          (invalidations nil)
          (connection-clears nil)
          (dispatches nil)
-         (rescans nil)
-         (tramp-rpc--suppress-fs-notifications nil))
+         (rescans nil))
     (unwind-protect
         (progn
           (process-put proc :tramp-rpc-vec vec)
           (puthash (tramp-rpc--connection-key vec) (tramp-rpc--make-connection :process proc)
                    tramp-rpc--connections)
-          (cl-letf (((symbol-function 'tramp-rpc-magit--clear-status-cache-for-connection)
-                     (lambda (_vec) (cl-incf status-clears)))
+          (cl-letf (((symbol-function 'tramp-rpc-magit--clear-status-cache-for-paths)
+                     (lambda (_vec paths) (cl-incf status-clears) (push paths cleared-paths)))
                     ((symbol-function 'tramp-rpc--invalidate-cache-for-path)
                      (lambda (path) (push path invalidations)))
                     ((symbol-function 'tramp-rpc--clear-file-caches-for-connection)
@@ -3632,6 +3692,8 @@ direct property test would miss it."
                             (path1 . "/tmp/new"))
                            ((action . "rescan"))))))
             (should (= status-clears 1))
+            ;; The batch contains a rescan, so the changed paths are unknown.
+            (should (equal cleared-paths '(nil)))
             (should (member "/rpc:mock:/tmp/changed" invalidations))
             (should (member "/rpc:mock:/tmp/old" invalidations))
             (should (member "/rpc:mock:/tmp/new" invalidations))
@@ -3697,6 +3759,7 @@ direct property test would miss it."
          (retired (make-pipe-process :name "tramp-rpc-retired-events" :noquery t))
          (current (make-pipe-process :name "tramp-rpc-current-events" :noquery t))
          (status-clears 0)
+         (cleared-paths nil)
          (invalidations nil)
          (dispatches nil))
     (unwind-protect
@@ -3704,8 +3767,8 @@ direct property test would miss it."
           (process-put retired :tramp-rpc-vec vec)
           (puthash (tramp-rpc--connection-key vec) (tramp-rpc--make-connection :process current)
                    tramp-rpc--connections)
-          (cl-letf (((symbol-function 'tramp-rpc-magit--clear-status-cache-for-connection)
-                     (lambda (_vec) (cl-incf status-clears)))
+          (cl-letf (((symbol-function 'tramp-rpc-magit--clear-status-cache-for-paths)
+                     (lambda (_vec paths) (cl-incf status-clears) (push paths cleared-paths)))
                     ((symbol-function 'tramp-rpc--invalidate-cache-for-path)
                      (lambda (path) (push path invalidations)))
                     ((symbol-function 'tramp-rpc--file-notify-dispatch)
@@ -3744,8 +3807,7 @@ direct property test would miss it."
          (tramp-rpc--file-stat-cache (make-hash-table :test 'equal))
          (tramp-rpc--watched-directories (make-hash-table :test 'equal))
          (tramp-rpc--file-notify-descriptors (make-hash-table :test 'eq))
-         (tramp-rpc--file-notify-watch-counts (make-hash-table :test 'equal))
-         (tramp-rpc--suppress-fs-notifications nil))
+         (tramp-rpc--file-notify-watch-counts (make-hash-table :test 'equal)))
     (unwind-protect
         (progn
           (puthash process-key-a 'process-a tramp-rpc-magit--process-caches)
@@ -3817,7 +3879,7 @@ direct property test would miss it."
                      :directory "/rpc:mock:/tmp/link/"
                      :canonical-directory "/rpc:mock:/tmp/real/")
                    tramp-rpc--file-notify-watch-counts)
-          (cl-letf (((symbol-function 'tramp-rpc-magit--clear-status-cache-for-connection)
+          (cl-letf (((symbol-function 'tramp-rpc-magit--clear-status-cache-for-paths)
                      #'ignore)
                     ((symbol-function 'tramp-rpc--invalidate-cache-for-path)
                      (lambda (path) (push path invalidations)))
@@ -3855,7 +3917,7 @@ direct property test would miss it."
                      (lambda (_vec method _params)
                        (when (equal method "watch.add")
                          '((path . "/tmp/real/")))))
-                    ((symbol-function 'tramp-rpc-magit--clear-status-cache-for-connection)
+                    ((symbol-function 'tramp-rpc-magit--clear-status-cache-for-paths)
                      #'ignore)
                     ((symbol-function 'tramp-rpc--invalidate-cache-for-path)
                      (lambda (path) (push path invalidations)))
@@ -7696,15 +7758,9 @@ background, which can precede the socket becoming visible."
 ;;; VC handler tests (No server or SSH required)
 ;;; ============================================================================
 
-(defun tramp-rpc-mock-test--reject-real-vc-exec-after ()
-  "Return a `tramp-run-real-handler' replacement rejecting `vc-exec-after'.
-Other operations, such as a pending sentinel of an earlier test asking for
-`process-status', still reach the real handler."
-  (let ((real (symbol-function 'tramp-run-real-handler)))
-    (lambda (operation &rest args)
-      (if (eq operation 'vc-exec-after)
-          (error "Unexpected process state")
-        (apply real operation args)))))
+(defun tramp-rpc-mock-test--reject-real-vc-exec-after (&rest _args)
+  "Stand in for the stock `vc-exec-after', which must not be reached."
+  (error "Unexpected process state"))
 
 (ert-deftest tramp-rpc-mock-test-vc-exec-after-logical-exit-runs-code ()
   "Test `vc-exec-after' handler treats exited TRAMP-RPC relays as done."
@@ -7720,12 +7776,11 @@ Other operations, such as a pending sentinel of an earlier test asking for
         (with-current-buffer buffer
           (process-put proc :tramp-rpc-pid 123)
           (process-put proc :tramp-rpc-exited t)
-          (cl-letf (((symbol-function 'tramp-run-real-handler)
-                     (tramp-rpc-mock-test--reject-real-vc-exec-after)))
-            ;; Pass PROC explicitly so the check does not depend on
-            ;; `get-buffer-process' picking the relay out of the buffer.
-            (tramp-rpc-handle-vc-exec-after
-             (lambda () (setq ran t)) nil proc))
+          ;; Pass PROC explicitly so the check does not depend on
+          ;; `get-buffer-process' picking the relay out of the buffer.
+          (tramp-rpc--vc-exec-after-advice
+           #'tramp-rpc-mock-test--reject-real-vc-exec-after
+           (lambda () (setq ran t)) nil proc)
           (should ran))
       (set-process-sentinel proc #'ignore)
       (when (process-live-p proc)
@@ -7749,10 +7804,9 @@ Other operations, such as a pending sentinel of an earlier test asking for
           ;; `closed' rather than the logical state from TRAMP-RPC handler.
           (cl-letf (((symbol-function 'process-status)
                      (let ((original (symbol-function 'process-status)))
-                       (lambda (p) (if (eq p proc) 'closed (funcall original p)))))
-                    ((symbol-function 'tramp-run-real-handler)
-                     (tramp-rpc-mock-test--reject-real-vc-exec-after)))
-            (tramp-rpc-handle-vc-exec-after
+                       (lambda (p) (if (eq p proc) 'closed (funcall original p))))))
+            (tramp-rpc--vc-exec-after-advice
+             #'tramp-rpc-mock-test--reject-real-vc-exec-after
              (lambda () (setq ran t))))
           (should ran))
       (set-process-sentinel proc #'ignore)
@@ -7775,10 +7829,9 @@ Other operations, such as a pending sentinel of an earlier test asking for
         (with-current-buffer buffer
           (process-put proc :tramp-rpc-pid 123)
           (cl-letf (((symbol-function 'vc--process-sentinel)
-                     (lambda (&rest _) (error "vc--process-sentinel called")))
-                    ((symbol-function 'tramp-run-real-handler)
-                     (tramp-rpc-mock-test--reject-real-vc-exec-after)))
-            (tramp-rpc-handle-vc-exec-after
+                     (lambda (&rest _) (error "vc--process-sentinel called"))))
+            (tramp-rpc--vc-exec-after-advice
+             #'tramp-rpc-mock-test--reject-real-vc-exec-after
              (lambda () (setq ran t)))
             (cl-letf (((symbol-function 'process-status)
                        (let ((original (symbol-function 'process-status)))
@@ -7792,6 +7845,35 @@ Other operations, such as a pending sentinel of an earlier test asking for
       (when (process-live-p proc)
         (delete-process proc))
       (kill-buffer buffer))))
+
+(ert-deftest tramp-rpc-mock-test-vc-exec-after-nested-in-immediate-code ()
+  "CODE run at once for a missing process still routes nested relays."
+  :tags '(:vc-handler)
+  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
+  (require 'vc-dispatcher)
+  (let* ((default-directory "/rpc:mock:/tmp/")
+         (proc (make-process :name "tramp-rpc-vc-exec-after-nested"
+                             :command '("sh" "-c" "sleep 60")
+                             :noquery t))
+         (ran nil))
+    (unwind-protect
+        (with-temp-buffer
+          (process-put proc :tramp-rpc-pid 123)
+          (process-put proc :tramp-rpc-exited t)
+          ;; Native-compiled VC may observe the raw relay state.
+          (cl-letf (((symbol-function 'process-status)
+                     (let ((original (symbol-function 'process-status)))
+                       (lambda (p)
+                         (if (eq p proc) 'closed (funcall original p))))))
+            ;; No buffer process, so the stock code runs CODE immediately.
+            (vc-exec-after
+             (lambda ()
+               (apply #'vc-exec-after (lambda () (setq ran t))
+                      (list nil proc)))))
+          (should ran))
+      (set-process-sentinel proc #'ignore)
+      (when (process-live-p proc)
+        (delete-process proc)))))
 
 (ert-deftest tramp-rpc-mock-test-dir-locals-cache-covers-uses-containment ()
   "Ensure cache coverage check uses containment, not string length."

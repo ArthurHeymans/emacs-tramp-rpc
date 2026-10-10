@@ -38,6 +38,7 @@
 
 ;; Functions from tramp-rpc.el
 (declare-function tramp-rpc-file-name-p "tramp-rpc")
+(declare-function tramp-rpc--managed-file-name-p "tramp-rpc-hops" (vec-or-filename))
 
 ;; Functions from magit-section.el.
 (autoload 'magit-section-show "magit-section")
@@ -206,6 +207,22 @@ run normally instead of using a possibly stale status snapshot.")
   (when (file-remote-p filename)
     (with-parsed-tramp-file-name filename nil
       (tramp-rpc--connection-key-string v))))
+
+(defconst tramp-rpc-magit--git-index-event-regexp
+  (rx (or bos "/") ".git/"
+      (* (or "worktrees" "modules") "/" (+ (not (any "/"))) "/")
+      "index" (? ".lock") eos)
+  "Paths of the git index files, including worktree and submodule ones.")
+
+(defun tramp-rpc-magit--expect-git-index-events (directory)
+  "Return `tramp-rpc--expected-fs-events' with DIRECTORY's git index churn.
+Magit's own git commands, such as `git status', rewrite the index while a
+status snapshot is built.  Those events would discard the snapshot, while
+events for any other path on the connection must still invalidate it."
+  (if-let* ((key (tramp-rpc-magit--file-connection-key directory)))
+      (cons (cons key tramp-rpc-magit--git-index-event-regexp)
+            tramp-rpc--expected-fs-events)
+    tramp-rpc--expected-fs-events))
 
 (defun tramp-rpc-magit--get-cache-key (vec directory)
   "Build a cache key for VEC and DIRECTORY.
@@ -917,10 +934,10 @@ depends on those results and store eligible stdout in the `process-file'
 cache.  Also fetch ancestor markers."
   (when (and (file-remote-p directory)
              (tramp-rpc-file-name-p directory))
-    ;; Suppress fs.events cache handling during prefetch.  The git commands
-    ;; we run on the server touch .git/index etc., triggering inotify events
-    ;; that would clear the cache we're building.
-    (let ((tramp-rpc--suppress-fs-notifications t))
+    ;; The git commands we run on the server rewrite .git/index, triggering
+    ;; events that would clear the cache we're building.
+    (let ((tramp-rpc--expected-fs-events
+           (tramp-rpc-magit--expect-git-index-events directory)))
       ;; Remember every active repository independently.  Magit can refresh
       ;; multiple repositories from different threads or nested callbacks.
       (tramp-rpc-magit--prune-prefetch-directories)
@@ -1149,6 +1166,56 @@ Returns t, nil, or \\='not-cached if not in cache."
        (and (consp key) (equal (car key) connection-key)))
      tramp-rpc-magit--process-caches)))
 
+(defun tramp-rpc-magit--status-cache-roots (directory cache)
+  "Return the remote directories that CACHE for DIRECTORY depends on.
+These are the worktree, the gitdir and, for a linked worktree, the shared
+.git directory.  Return nil when CACHE does not know them."
+  (cl-flet ((stdout (&rest args)
+              (when-let* ((entry (gethash (apply #'tramp-rpc-magit--process-cache-key
+                                                 args)
+                                          cache))
+                          ((eql (car entry) 0)))
+                (string-trim (cdr entry)))))
+    (when-let* ((toplevel (stdout "rev-parse" "--show-toplevel"))
+                (gitdir (stdout "rev-parse" "--git-dir")))
+      (let ((gitdir (directory-file-name
+                     (expand-file-name gitdir (file-local-name directory)))))
+        (delete-dups
+         (list toplevel gitdir
+               (if (string-match (rx bos (group (* nonl) "/.git") "/worktrees/")
+                                 gitdir)
+                   (match-string 1 gitdir)
+                 gitdir)))))))
+
+(defun tramp-rpc-magit--clear-status-cache-for-paths (vec paths)
+  "Clear status caches on VEC's connection that PATHS may have changed.
+A nil PATHS means unknown changes, which clear every status cache of the
+connection, as does a cache that does not know its repository."
+  (if (null paths)
+      (tramp-rpc-magit--clear-status-cache-for-connection vec)
+    (let ((connection-key (tramp-rpc--connection-key-string vec))
+          (locals (mapcar #'file-local-name paths)))
+      (tramp-rpc--hash-remove-if
+       (lambda (key entry)
+         (and (consp key)
+              (equal (car key) connection-key)
+              (let* ((cache (if (hash-table-p entry)
+                                entry
+                              (and (listp entry) (plist-get entry :cache))))
+                     (roots (and (hash-table-p cache)
+                                 (tramp-rpc-magit--status-cache-roots
+                                  (cdr key) cache))))
+                (or (null roots)
+                    (cl-some
+                     (lambda (path)
+                       (cl-some (lambda (root)
+                                  (or (string= path root)
+                                      (string-prefix-p
+                                       (file-name-as-directory root) path)))
+                                roots))
+                     locals)))))
+       tramp-rpc-magit--process-caches))))
+
 (defun tramp-rpc-magit--clear-caches-for-directory (directory)
   "Clear Magit and file metadata caches for remote DIRECTORY only.
 The file metadata clear also drops the ancestor scans for that connection
@@ -1229,14 +1296,20 @@ SECTION is the Magit section being handled."
 ;; Magit handlers
 ;; ============================================================================
 
-(defun tramp-rpc-handle-magit-status-setup-buffer (&optional directory)
-  "Handler for `magit-status-setup-buffer' to prefetch data.
-Suppresses fs.events cache handling during refresh to prevent
-inotify events (from git commands touching .git/index etc.) from
-clearing caches mid-refresh.
-DIRECTORY is the directory being handled."
+(defun tramp-rpc-magit--status-setup-buffer-advice (orig-fun
+                                                     &optional directory)
+  "Set up the Magit status buffer of TRAMP-RPC DIRECTORY with prefetched data.
+The git index rewrites of the refresh do not clear its caches.  ORIG-FUN is
+`magit-status-setup-buffer', called directly for other directories."
+  (if (tramp-rpc--managed-file-name-p (or directory default-directory))
+      (tramp-rpc-magit--status-setup-buffer orig-fun directory)
+    (funcall orig-fun directory)))
+
+(defun tramp-rpc-magit--status-setup-buffer (orig-fun directory)
+  "Call ORIG-FUN to set up the status buffer of DIRECTORY with prefetching."
   (let* ((directory (or directory default-directory))
-         (tramp-rpc--suppress-fs-notifications t)
+         (tramp-rpc--expected-fs-events
+          (tramp-rpc-magit--expect-git-index-events directory))
          (tramp-rpc-magit--allow-process-cache t)
          (tramp-rpc-magit--status-memo (make-hash-table :test 'equal))
          (process-file-side-effects nil)
@@ -1252,18 +1325,25 @@ DIRECTORY is the directory being handled."
     ;; metadata prefetched during the refresh must survive for lazy sections.
     (tramp-rpc-magit--clear-caches-for-directory directory)
     (condition-case err
-        (tramp-run-real-handler 'magit-status-setup-buffer (list directory))
+        (funcall orig-fun directory)
       (error
        (tramp-rpc-magit--clear-caches-for-directory directory)
        (signal (car err) (cdr err))))))
 
-(defun tramp-rpc-handle-magit-status-refresh-buffer ()
-  "Handler for `magit-status-refresh-buffer' to prefetch data.
-Suppresses fs.events cache handling during refresh to prevent
-inotify events from clearing caches mid-refresh."
+(defun tramp-rpc-magit--status-refresh-buffer-advice (orig-fun &rest args)
+  "Refresh a TRAMP-RPC Magit status buffer with prefetched data.
+The git index rewrites of the refresh do not clear its caches.  ORIG-FUN is
+`magit-status-refresh-buffer', called with ARGS."
+  (if (tramp-rpc--managed-file-name-p default-directory)
+      (tramp-rpc-magit--status-refresh-buffer orig-fun args)
+    (apply orig-fun args)))
+
+(defun tramp-rpc-magit--status-refresh-buffer (orig-fun args)
+  "Call ORIG-FUN with ARGS to refresh the status buffer with prefetching."
   (unless tramp-rpc-magit--status-setup-prefetch-active
     (tramp-rpc-magit--clear-caches-for-directory default-directory))
-  (let ((tramp-rpc--suppress-fs-notifications t)
+  (let ((tramp-rpc--expected-fs-events
+         (tramp-rpc-magit--expect-git-index-events default-directory))
         (tramp-rpc-magit--allow-process-cache t)
         (tramp-rpc-magit--status-memo (make-hash-table :test 'equal))
         (process-file-side-effects nil)
@@ -1277,10 +1357,16 @@ inotify events from clearing caches mid-refresh."
     ;; The scoped clear above drops stale metadata.  Fresh metadata prefetched
     ;; during the refresh must survive so lazy Magit sections can reuse it.
     (condition-case err
-        (tramp-run-real-handler 'magit-status-refresh-buffer nil)
+        (apply orig-fun args)
       (error
        (tramp-rpc-magit--clear-caches-for-directory default-directory)
        (signal (car err) (cdr err))))))
+
+(defconst tramp-rpc-magit--status-advice
+  '((magit-status-setup-buffer . tramp-rpc-magit--status-setup-buffer-advice)
+    (magit-status-refresh-buffer
+     . tramp-rpc-magit--status-refresh-buffer-advice))
+  "Magit status functions and the advice prefetching for TRAMP-RPC.")
 
 ;;;###autoload
 (defun tramp-rpc-magit-enable ()
@@ -1293,12 +1379,8 @@ magit-status on remote repositories."
   (when (fboundp 'magit-section-show)
     (advice-add 'magit-section-show :around #'tramp-rpc-magit--section-show-advice))
 
-  (tramp-rpc--add-external-operation
-   'magit-status-setup-buffer
-   #'tramp-rpc-handle-magit-status-setup-buffer 'tramp-rpc)
-  (tramp-rpc--add-external-operation
-   'magit-status-refresh-buffer
-   #'tramp-rpc-handle-magit-status-refresh-buffer 'tramp-rpc)
+  (pcase-dolist (`(,function . ,advice) tramp-rpc-magit--status-advice)
+    (advice-add function :around advice))
   (setq tramp-rpc-magit--magit-enabled t)
   (message "tramp-rpc magit optimizations enabled"))
 
@@ -1307,8 +1389,8 @@ magit-status on remote repositories."
   "Disable tramp-rpc magit optimizations."
   (interactive)
   (advice-remove 'magit-section-show #'tramp-rpc-magit--section-show-advice)
-  (tramp-rpc--remove-external-operation 'magit-status-setup-buffer 'tramp-rpc)
-  (tramp-rpc--remove-external-operation 'magit-status-refresh-buffer 'tramp-rpc)
+  (pcase-dolist (`(,function . ,advice) tramp-rpc-magit--status-advice)
+    (advice-remove function advice))
   (tramp-rpc-magit--clear-cache)
   (setq tramp-rpc-magit--magit-enabled nil)
   (message "tramp-rpc magit optimizations disabled"))
@@ -1420,7 +1502,7 @@ Removes handlers."
 (add-hook 'tramp-rpc-connection-invalidate-functions
           #'tramp-rpc-magit--clear-status-cache-for-connection t)
 (add-hook 'tramp-rpc-fs-events-functions
-          #'tramp-rpc-magit--clear-status-cache-for-connection t)
+          #'tramp-rpc-magit--clear-status-cache-for-paths t)
 (add-hook 'tramp-rpc-cache-invalidate-functions
           #'tramp-rpc-magit--cache-invalidated t)
 

@@ -1435,21 +1435,16 @@ Returns the final (width . height) cons, or nil if resize was not handled."
                   (funcall display-updater width height))
                 (cons width height)))))))))
 
-(defun tramp-rpc-handle-vterm--window-adjust-process-window-size (process windows)
-  "Handler for vterm's window adjust function to handle TRAMP-RPC PTY processes.
-For tramp-rpc processes, resize the remote PTY and update vterm's display.
-For direct SSH PTY, let the original function handle it (SSH handles resize).
-PROCESS is the process being handled.
+(defun tramp-rpc--vterm-window-adjust-advice (orig-fun process windows)
+  "Resize the remote PTY of TRAMP-RPC PROCESS and update vterm's display.
+Call ORIG-FUN, vterm's window adjust function, for other processes and
+direct SSH PTYs, whose resize SSH handles.
 WINDOWS is the list of windows displaying the process buffer."
   (cond
-   ;; Direct SSH PTY - let original function handle it
-   ((and (processp process)
-         (process-get process :tramp-rpc-direct-ssh))
-    (tramp-run-real-handler
-     'vterm--window-adjust-process-window-size (list process windows)))
    ;; RPC-based PTY - resize via RPC
    ((and (processp process)
-         (process-get process :tramp-rpc-pty))
+         (process-get process :tramp-rpc-pty)
+         (not (process-get process :tramp-rpc-direct-ssh)))
     (unless vterm-copy-mode
         (tramp-rpc--handle-pty-resize
          process windows
@@ -1465,25 +1460,18 @@ WINDOWS is the list of windows displaying the process buffer."
                        ((fboundp 'vterm--set-size)))
              (funcall (symbol-function 'vterm--set-size)
                       term height width))))))
-   ;; Not our process, call original
-   (t (tramp-run-real-handler
-       'vterm--window-adjust-process-window-size (list process windows)))))
+   (t (funcall orig-fun process windows))))
 
-(defun tramp-rpc-handle-eat--adjust-process-window-size (process windows)
-  "Handler for eat's window adjust function to handle TRAMP-RPC PTY processes.
-For tramp-rpc processes, resize the remote PTY and update eat's display.
-For direct SSH PTY, let the original function handle it (SSH handles resize).
-PROCESS is the process being handled.
+(defun tramp-rpc--eat-window-adjust-advice (orig-fun process windows)
+  "Resize the remote PTY of TRAMP-RPC PROCESS and update eat's display.
+Call ORIG-FUN, eat's window adjust function, for other processes and
+direct SSH PTYs, whose resize SSH handles.
 WINDOWS is the list of windows displaying the process buffer."
   (cond
-   ;; Direct SSH PTY - let original function handle it
-   ((and (processp process)
-         (process-get process :tramp-rpc-direct-ssh))
-    (tramp-run-real-handler
-     'eat--adjust-process-window-size (list process windows)))
    ;; RPC-based PTY - resize via RPC
    ((and (processp process)
-         (process-get process :tramp-rpc-pty))
+         (process-get process :tramp-rpc-pty)
+         (not (process-get process :tramp-rpc-direct-ssh)))
     (tramp-rpc--handle-pty-resize
        process windows
        ;; Size adjuster: ensure minimum of 1
@@ -1499,9 +1487,7 @@ WINDOWS is the list of windows displaying the process buffer."
          (pcase major-mode
            ('eat-mode (run-hooks 'eat-update-hook))
            ('eshell-mode (run-hooks 'eat-eshell-update-hook))))))
-   ;; Not our process, call original
-   (t (tramp-run-real-handler
-       'eat--adjust-process-window-size (list process windows)))))
+   (t (funcall orig-fun process windows))))
 
 ;; ============================================================================
 ;; Process cleanup
@@ -1628,36 +1614,13 @@ transport is live."
    tramp-rpc--async-processes)
   (tramp-rpc--cleanup-process-write-queues vec connection-process))
 
-;; Install optional terminal emulator handlers after their packages load.
-(defun tramp-rpc-process-install-optional-handlers ()
-  "Install handlers for loaded optional terminal packages."
-  (when (featurep 'vterm)
-    (tramp-rpc--add-external-operation
-     'vterm--window-adjust-process-window-size
-     #'tramp-rpc-handle-vterm--window-adjust-process-window-size
-     'tramp-rpc 'process))
-  (when (featurep 'eat)
-    (tramp-rpc--add-external-operation
-     'eat--adjust-process-window-size
-     #'tramp-rpc-handle-eat--adjust-process-window-size
-     'tramp-rpc 'process)))
-
-(defun tramp-rpc--process-handler-remove ()
-  "Remove handlers."
-  (tramp-rpc--remove-external-operation
-   'vterm--window-adjust-process-window-size 'tramp-rpc)
-  (tramp-rpc--remove-external-operation
-   'eat--adjust-process-window-size 'tramp-rpc))
-
 ;; ============================================================================
 ;; Unload support
 ;; ============================================================================
 
 (defun tramp-rpc-process-unload-function ()
   "Unload function for tramp-rpc-process.
-Removes handlers and cleans up async processes."
-  ;; Remove all handlers
-  (tramp-rpc--process-handler-remove)
+Cleans up async processes."
   ;; Clean up all async processes.
   (tramp-rpc--cleanup-async-processes)
   ;; Clean up PTY processes.
