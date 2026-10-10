@@ -26,6 +26,7 @@ TRAMP-RPC replaces this with a lightweight Rust server that runs on the remote h
 - Async process support (~make-process~, ~start-file-process~)
 - Full VC mode integration (git, etc.)
 - Magit/Projectile optimizations with parallel git command prefetch
+- Majutsu log refresh batching with a shared jj working-copy snapshot
 - Automatic binary deployment (download or build from source)
 - Support for Linux and macOS (x86_64 and aarch64)
 - Batch/pipelined requests for reduced round-trip latency
@@ -200,6 +201,7 @@ file-notify dispatch callbacks in ~tramp-rpc-notify.el~.
 |----------------------------+------------------------------------------------------|
 | ~tramp-rpc.el~             | TRAMP file handlers and registration                 |
 | ~tramp-rpc-magit.el~       | Magit/Projectile prefetch and process-file cache     |
+| ~tramp-rpc-majutsu.el~     | Majutsu refresh-local query batching and root memo  |
 | ~tramp-rpc-advice.el~      | Advice functions for process/VC integration          |
 | ~tramp-rpc-process.el~     | Async process & PTY support                          |
 | ~tramp-rpc-notify.el~      | Public ~file-notify~ descriptors on server watches   |
@@ -286,6 +288,24 @@ Optimizations for git/magit/projectile on remote hosts:
 - Process-file cache for serving git commands from prefetched data
 - Ancestor directory scanning for fast project/VC root detection
 - Projectile integration (force git ls-files, alien indexing for remote)
+
+*** Majutsu Module (~tramp-rpc-majutsu.el~)
+
+When Majutsu is loaded, RPC log refreshes prefetch the enabled built-in
+log, status, workspace and conflict sections.  A ~jj op log~ command
+snapshots the working copy and returns a concrete operation ID; log,
+workspace and conflict queries run in parallel at that operation via
+~commands.run_parallel~.  Status runs without operation pinning so files
+refused by auto-tracking or size limits remain visible.
+Exact command results, including separate stderr, are cached only for
+that refresh.  Unexpected commands discard the cache and use Majutsu's
+normal responsive runner.  Mutations, editors and signing are not batched.
+
+Batching requires Majutsu's in-memory stderr-buffer support; without it,
+refreshes run unchanged.  Custom repository,
+operation or log-specific configuration arguments bypass batching.  Set ~tramp-rpc-majutsu-optimize~ to
+nil to disable the integration.  Workspace-root lookups are also memoized
+for the duration of opening a log buffer, not across commands.
 
 *** Advice Module (~tramp-rpc-advice.el~)
 

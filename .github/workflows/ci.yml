@@ -203,7 +203,8 @@ jobs:
             lisp/tramp-rpc-notify.el \
             lisp/tramp-rpc-process.el \
             lisp/tramp-rpc-protocol.el \
-            lisp/tramp-rpc-transport.el
+            lisp/tramp-rpc-transport.el \
+            lisp/tramp-rpc-majutsu.el
 
       - name: Check documentation strings
         run: |
@@ -222,7 +223,8 @@ jobs:
             lisp/tramp-rpc-notify.el \
             lisp/tramp-rpc-process.el \
             lisp/tramp-rpc-protocol.el \
-            lisp/tramp-rpc-transport.el
+            lisp/tramp-rpc-transport.el \
+            lisp/tramp-rpc-majutsu.el
 
       - name: Check function declarations
         run: |

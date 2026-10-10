@@ -264,6 +264,7 @@ This is called from `tramp-multi-hop-p-hook'."
 (require 'tramp-rpc-cache)
 (require 'tramp-rpc-notify)
 (require 'tramp-rpc-magit)
+(require 'tramp-rpc-majutsu)
 
 
 (defcustom tramp-rpc-compress-file-read (fboundp 'zlib-decompress-region)
@@ -2849,7 +2850,8 @@ cleanup of all connections has run."
 (defun tramp-rpc--after-load-integrations (_file)
   "Install integrations whose optional packages have just loaded."
   (tramp-rpc-advice-install-optional-handlers)
-  (tramp-rpc-magit-install-optional-handlers))
+  (tramp-rpc-magit-install-optional-handlers)
+  (tramp-rpc-majutsu-install-optional-handlers))
 
 (defun tramp-rpc--unload-from-tramp ()
   "Unload tramp-rpc when TRAMP itself is unloaded."
@@ -2907,7 +2909,8 @@ Removes advice and cleans up async processes."
   (tramp-rpc--remove-external-operation 'move-file-to-trash 'tramp-rpc)
   ;; Unload helper modules explicitly.  Their standard feature unload
   ;; functions perform module-specific cleanup.
-  (dolist (feature '(tramp-rpc-advice tramp-rpc-magit tramp-rpc-notify
+  (dolist (feature '(tramp-rpc-advice tramp-rpc-magit tramp-rpc-majutsu
+                     tramp-rpc-notify
                      tramp-rpc-cache
                      tramp-rpc-process tramp-rpc-transport tramp-rpc-deploy
                      tramp-rpc-hops tramp-rpc-connection tramp-rpc-protocol))
