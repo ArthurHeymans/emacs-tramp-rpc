@@ -16,6 +16,7 @@
 
 (require 'cl-lib)
 (require 'tramp-rpc-transport)
+(require 'tramp-rpc-environment)
 
 (declare-function tramp-rpc-file-name-p "tramp-rpc")
 (declare-function majutsu-jj--executable "ext:majutsu-jj" ())

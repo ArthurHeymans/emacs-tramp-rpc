@@ -198,6 +198,7 @@ jobs:
             lisp/tramp-rpc-cache.el \
             lisp/tramp-rpc-connection.el \
             lisp/tramp-rpc-deploy.el \
+            lisp/tramp-rpc-environment.el \
             lisp/tramp-rpc-hops.el \
             lisp/tramp-rpc-magit.el \
             lisp/tramp-rpc-notify.el \
@@ -218,6 +219,7 @@ jobs:
             lisp/tramp-rpc-cache.el \
             lisp/tramp-rpc-connection.el \
             lisp/tramp-rpc-deploy.el \
+            lisp/tramp-rpc-environment.el \
             lisp/tramp-rpc-hops.el \
             lisp/tramp-rpc-magit.el \
             lisp/tramp-rpc-notify.el \
