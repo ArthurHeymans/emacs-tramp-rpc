@@ -153,6 +153,50 @@ This allows testing autoload behavior in a clean state."
             (ert-fail (with-current-buffer buffer (buffer-string)))))
       (kill-buffer buffer))))
 
+(ert-deftest tramp-rpc-autoload-test-unload-reload-environment ()
+  "Environment caching and explicit resets work after unloading and reloading."
+  (let* ((emacs (expand-file-name invocation-name invocation-directory))
+         (tramp-dir (file-name-directory (locate-library "tramp")))
+         (msgpack-dir (file-name-directory (locate-library "msgpack")))
+         (buffer (generate-new-buffer " *tramp-rpc-autoload-unload*"))
+         (form
+          `(progn
+             (require 'tramp-rpc)
+             (unload-feature 'tramp-rpc t)
+             (require 'tramp-rpc)
+             (let* ((vec (tramp-dissect-file-name "/rpc:unload-reload:/tmp/"))
+                    (buffer (generate-new-buffer " *environment-reload*"))
+                    (process (make-pipe-process :name "environment-reload"
+                                                :buffer buffer :noquery t))
+                    (tramp-rpc-remote-path '("/first")))
+               (unwind-protect
+                   (cl-letf (((symbol-function 'tramp-rpc--call-batch)
+                              (lambda (_vec requests)
+                                (make-list (length requests)
+                                           '((type . "directory"))))))
+                     (tramp-rpc--set-connection vec process buffer)
+                     (unless (equal (tramp-rpc--cached-remote-path vec) '("/first"))
+                       (error "Remote PATH not computed after reload"))
+                     (setq tramp-rpc-remote-path '("/second"))
+                     (unless (equal (tramp-rpc--cached-remote-path vec) '("/first"))
+                       (error "Remote PATH was not cached"))
+                     (tramp-rpc-clear-all-caches)
+                     (unless (equal (tramp-rpc--cached-remote-path vec) '("/second"))
+                       (error "Remote PATH cache did not reset")))
+                 (delete-process process)
+                 (kill-buffer buffer))))))
+    (unwind-protect
+        (let ((status
+               (call-process emacs nil buffer nil
+                             "-Q" "--batch"
+                             "-L" tramp-dir
+                             "-L" msgpack-dir
+                             "-L" tramp-rpc-autoload-test--lisp-dir
+                             "--eval" (prin1-to-string form))))
+          (unless (zerop status)
+            (ert-fail (with-current-buffer buffer (buffer-string)))))
+      (kill-buffer buffer))))
+
 (ert-deftest tramp-rpc-autoload-test-function-stubs ()
   "Test that autoloads register function stubs."
   (tramp-rpc-autoload-test--clean-environment)

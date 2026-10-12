@@ -36,6 +36,7 @@
 (require 'tramp-rpc-protocol)
 (require 'tramp-rpc-connection)
 (require 'tramp-rpc-transport)
+(require 'tramp-rpc-environment)
 
 ;; Functions from tramp-rpc-notify.el
 (declare-function tramp-rpc--canonical-watch-active-p "tramp-rpc-notify")
@@ -333,9 +334,7 @@ removed key and value.  Return the number of removed entries."
   "Clear all project-owned caches and route-aware connection properties."
   (interactive)
   (tramp-rpc--clear-file-metadata-caches)
-  (tramp-rpc--clear-direnv-cache)
-  (clrhash tramp-rpc--exec-path-cache)
-  (clrhash tramp-rpc--login-shell-cache)
+  (tramp-rpc--clear-environment-caches)
   (maphash
    (lambda (_key connection)
      (when-let* ((vec (tramp-rpc-connection-vec connection)))

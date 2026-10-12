@@ -63,7 +63,10 @@
   ;; Non-nil once the transport sentinel wrapper has been installed.
   sentinel-installed
   ;; Non-nil while a dead-connection probe of this generation runs.
-  probing)
+  probing
+  ;; Lazily allocated by tramp-rpc-environment.el.  Replacing this object
+  ;; clears caches without letting in-flight probes refill the new state.
+  environment)
 
 (defun tramp-rpc--connection-transport (connection)
   "Return the transport process of CONNECTION, or nil when CONNECTION is nil.

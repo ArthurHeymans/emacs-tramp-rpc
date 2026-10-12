@@ -1340,10 +1340,6 @@ This matches the behavior expected by `tramp-test28-process-file'."
   (tramp-cleanup-all-connections)
   (tramp-rpc-mock-test--clear-hash-tables
    'tramp-rpc--process-write-queues
-   'tramp-rpc--direnv-cache
-   'tramp-rpc--direnv-available-cache
-   'tramp-rpc--exec-path-cache
-   'tramp-rpc--login-shell-cache
    'tramp-rpc-magit--process-caches
    'tramp-rpc-magit--ancestor-scan-caches
    'tramp-rpc-magit--prefetch-directories)
@@ -4474,9 +4470,13 @@ direct property test would miss it."
         (count 0))
     (tramp-flush-connection-properties vec)
     (cl-letf (((symbol-function 'tramp-rpc--ensure-connection)
-               (lambda (_vec) '(:process mock)))
+               (lambda (vec)
+                 (let ((connection (tramp-rpc--make-connection :vec vec)))
+                   (puthash (tramp-rpc--connection-key vec) connection
+                            tramp-rpc--connections)
+                   connection)))
               ((symbol-function 'tramp-rpc--call)
-               (lambda (_vec method _params)
+               (lambda (_vec method _params &optional _connection)
                  (should (equal method "system.info"))
                  (cl-incf count)
                  '((uid . 1234)
@@ -7861,6 +7861,23 @@ discard it for being unreadable."
 ;;; Remote Process Environment Tests (No server or SSH required)
 ;;; ============================================================================
 
+(defmacro tramp-rpc-mock-test--with-environment-connection (vec &rest body)
+  "Run BODY with a live local transport registered for VEC, without SSH."
+  (declare (indent 1) (debug t))
+  (let ((buffer (make-symbol "buffer"))
+        (process (make-symbol "process")))
+    `(let* ((tramp-rpc--connections (make-hash-table :test 'equal))
+            (,buffer (generate-new-buffer " *tramp-rpc-environment-test*"))
+            (,process (make-pipe-process :name "tramp-rpc-environment-test"
+                                         :buffer ,buffer :noquery t)))
+       (unwind-protect
+           (progn
+             (tramp-rpc--set-connection ,vec ,process ,buffer)
+             ,@body)
+         (delete-process ,process)
+         (kill-buffer ,buffer)
+         (tramp-flush-connection-properties ,vec)))))
+
 (ert-deftest tramp-rpc-mock-test-remote-path-environment-uses-tramp-remote-path ()
   "Test that `tramp-remote-path' becomes a PATH environment entry."
   (let ((tramp-rpc-remote-path nil)
@@ -7869,20 +7886,20 @@ discard it for being unreadable."
                              tramp-own-remote-path
                              "/usr/bin"
                              unsupported-entry))
-        (tramp-rpc--exec-path-cache (make-hash-table :test 'equal))
         (vec (make-tramp-file-name :method "rpc" :host "host" :user "user"
                                    :localname "/")))
-    (cl-letf (((symbol-function 'tramp-rpc--call-batch)
-               (lambda (_vec requests)
-                 (make-list (length requests) '((type . "directory")))))
-              ((symbol-function 'tramp-rpc--fetch-default-remote-path)
-               (lambda (_vec) '("/bin" "/usr/bin")))
-              ((symbol-function 'tramp-rpc--fetch-remote-exec-path)
-               (lambda (_vec) '("/home/user/.local/bin" "/usr/bin")))
-              ((symbol-function 'tramp-get-home-directory)
-               (lambda (_vec &optional _user) "/home/user")))
-      (should (equal (tramp-rpc--remote-path-environment vec)
-                     '(("PATH" . "/bin:/usr/bin:/home/user/.cargo/bin:/home/user/.local/bin")))))))
+    (tramp-rpc-mock-test--with-environment-connection vec
+      (cl-letf (((symbol-function 'tramp-rpc--call-batch)
+                 (lambda (_vec requests)
+                   (make-list (length requests) '((type . "directory")))))
+                ((symbol-function 'tramp-rpc--fetch-default-remote-path)
+                 (lambda (_vec) '("/bin" "/usr/bin")))
+                ((symbol-function 'tramp-rpc--fetch-remote-exec-path)
+                 (lambda (_vec) '("/home/user/.local/bin" "/usr/bin")))
+                ((symbol-function 'tramp-get-home-directory)
+                 (lambda (_vec &optional _user) "/home/user")))
+        (should (equal (tramp-rpc--remote-path-environment vec)
+                       '(("PATH" . "/bin:/usr/bin:/home/user/.cargo/bin:/home/user/.local/bin"))))))))
 
 (ert-deftest tramp-rpc-mock-test-remote-path-drops-missing-dirs-in-one-batch ()
   "Candidate PATH directories are checked with a single batch request."
@@ -7908,28 +7925,31 @@ discard it for being unreadable."
   "A failed directory check keeps every candidate and is not cached."
   (let ((tramp-rpc-remote-path nil)
         (tramp-remote-path '("/bin" "/missing"))
-        (tramp-rpc--exec-path-cache (make-hash-table :test 'equal))
-        (vec (make-tramp-file-name :method "rpc" :host "host" :localname "/")))
-    (cl-letf (((symbol-function 'tramp-rpc--call-batch)
-               (lambda (&rest _)
-                 (signal 'remote-file-error '("RPC transport closed")))))
-      (should (equal (tramp-rpc--cached-remote-path vec) '("/bin" "/missing")))
-      (should (= (hash-table-count tramp-rpc--exec-path-cache) 0)))))
+        (vec (make-tramp-file-name :method "rpc" :host "host" :localname "/"))
+        (batches 0))
+    (tramp-rpc-mock-test--with-environment-connection vec
+      (cl-letf (((symbol-function 'tramp-rpc--call-batch)
+                 (lambda (&rest _)
+                   (cl-incf batches)
+                   (signal 'remote-file-error '("RPC transport closed")))))
+        (dotimes (_ 2)
+          (should (equal (tramp-rpc--cached-remote-path vec) '("/bin" "/missing"))))
+        (should (= batches 2))))))
 
 (ert-deftest tramp-rpc-mock-test-remote-path-environment-compat-override ()
   "Test deprecated `tramp-rpc-remote-path' still overrides `tramp-remote-path'."
   (let ((tramp-rpc-remote-path '(tramp-rpc-own-remote-path "/custom/bin"))
         (tramp-remote-path '("/ignored/bin"))
-        (tramp-rpc--exec-path-cache (make-hash-table :test 'equal))
         (vec (make-tramp-file-name :method "rpc" :host "host" :user "user"
                                    :localname "/")))
-    (cl-letf (((symbol-function 'tramp-rpc--call-batch)
-               (lambda (_vec requests)
-                 (make-list (length requests) '((type . "directory")))))
-              ((symbol-function 'tramp-rpc--fetch-remote-exec-path)
-               (lambda (_vec) '("/login/bin"))))
-      (should (equal (tramp-rpc--remote-path-environment vec)
-                     '(("PATH" . "/login/bin:/custom/bin")))))))
+    (tramp-rpc-mock-test--with-environment-connection vec
+      (cl-letf (((symbol-function 'tramp-rpc--call-batch)
+                 (lambda (_vec requests)
+                   (make-list (length requests) '((type . "directory")))))
+                ((symbol-function 'tramp-rpc--fetch-remote-exec-path)
+                 (lambda (_vec) '("/login/bin"))))
+        (should (equal (tramp-rpc--remote-path-environment vec)
+                       '(("PATH" . "/login/bin:/custom/bin"))))))))
 
 (ert-deftest tramp-rpc-mock-test-compute-remote-path-reports-failed-fetch ()
   "A failed login-shell PATH fetch leaves the result incomplete."
@@ -7949,55 +7969,51 @@ discard it for being unreadable."
 
 (ert-deftest tramp-rpc-mock-test-remote-path-not-cached-after-failure ()
   "Recompute a degraded remote PATH instead of caching it."
-  (let ((tramp-rpc--exec-path-cache (make-hash-table :test 'equal))
-        (vec (make-tramp-file-name :method "rpc" :host "host" :user "user"
+  (let ((vec (make-tramp-file-name :method "rpc" :host "host" :user "user"
                                    :localname "/"))
-        (results '((("/usr/bin")) (("/home/user/bin" "/usr/bin") . t))))
-    (cl-letf (((symbol-function 'tramp-rpc--compute-remote-path)
-               (lambda (_vec) (pop results))))
-      (should (equal (tramp-rpc--cached-remote-path vec) '("/usr/bin")))
-      (should (= (hash-table-count tramp-rpc--exec-path-cache) 0))
-      (should (equal (tramp-rpc--cached-remote-path vec)
-                     '("/home/user/bin" "/usr/bin")))
-      (should (= (hash-table-count tramp-rpc--exec-path-cache) 1)))))
+        (tramp-rpc-remote-path '("/usr/bin"))
+        (batches 0))
+    (tramp-rpc-mock-test--with-environment-connection vec
+      (cl-letf (((symbol-function 'tramp-rpc--call-batch)
+                 (lambda (&rest _)
+                   (if (= (cl-incf batches) 1)
+                       (signal 'remote-file-error '("RPC transport closed"))
+                     '(((type . "directory")))))))
+        (dotimes (_ 3)
+          (should (equal (tramp-rpc--cached-remote-path vec) '("/usr/bin"))))
+        (should (= batches 2))))))
 
 (ert-deftest tramp-rpc-mock-test-login-path-not-cached-after-failure ()
   "Do not cache a failed login-shell PATH fetch as an empty PATH."
   (let ((vec (make-tramp-file-name :method "rpc" :host "host" :user "user"
                                    :localname "/"))
         (fetched nil))
-    (unwind-protect
-        (progn
-          (tramp-rpc--flush-route-connection-property vec "tramp-rpc-login-path")
-          (cl-letf (((symbol-function 'tramp-rpc--fetch-remote-exec-path)
-                     (lambda (_vec)
-                       (if fetched
-                           '("/home/user/bin")
-                         (setq fetched t)
-                         (signal 'remote-file-error '("RPC transport disconnected"))))))
-            (should-not (tramp-rpc--cached-login-path vec))
-            (should (equal (tramp-rpc--cached-login-path vec)
-                           '("/home/user/bin")))))
-      (tramp-rpc--flush-route-connection-property vec "tramp-rpc-login-path"))))
+    (tramp-rpc-mock-test--with-environment-connection vec
+      (cl-letf (((symbol-function 'tramp-rpc--fetch-remote-exec-path)
+                 (lambda (_vec)
+                   (if fetched
+                       '("/home/user/bin")
+                     (setq fetched t)
+                     (signal 'remote-file-error '("RPC transport disconnected"))))))
+        (should-not (tramp-rpc--cached-login-path vec))
+        (should (equal (tramp-rpc--cached-login-path vec)
+                       '("/home/user/bin")))))))
 
 (ert-deftest tramp-rpc-mock-test-login-path-cache-survives-connection-start ()
-  "Login PATH caching must keep one stable TRAMP connection-property key."
+  "Login PATH is reused within a live connection generation."
   (let ((vec (make-tramp-file-name :method "rpc" :host "host" :user "user"
                                    :localname "/"))
         (fetches 0))
-    (unwind-protect
-        (progn
-          (tramp-flush-connection-property vec "tramp-rpc-login-path")
-          (cl-letf (((symbol-function 'tramp-rpc--fetch-remote-exec-path)
-                     (lambda (_vec)
-                       (cl-incf fetches)
-                       '("/home/user/.local/bin" "/usr/bin"))))
-            (should (equal (tramp-rpc--cached-login-path vec)
-                           '("/home/user/.local/bin" "/usr/bin")))
-            (should (equal (tramp-rpc--cached-login-path vec)
-                           '("/home/user/.local/bin" "/usr/bin")))
-            (should (= fetches 1))))
-      (tramp-flush-connection-property vec "tramp-rpc-login-path"))))
+    (tramp-rpc-mock-test--with-environment-connection vec
+      (cl-letf (((symbol-function 'tramp-rpc--fetch-remote-exec-path)
+                 (lambda (_vec)
+                   (cl-incf fetches)
+                   '("/home/user/.local/bin" "/usr/bin"))))
+        (should (equal (tramp-rpc--cached-login-path vec)
+                       '("/home/user/.local/bin" "/usr/bin")))
+        (should (equal (tramp-rpc--cached-login-path vec)
+                       '("/home/user/.local/bin" "/usr/bin")))
+        (should (= fetches 1))))))
 
 (ert-deftest tramp-rpc-mock-test-shell-process-appends-login-path ()
   "Shell commands must retain login PATH entries like `tramp-sh'."
@@ -8198,8 +8214,7 @@ discard it for being unreadable."
 (ert-deftest tramp-rpc-mock-test-process-file-passes-path-and-unresolved-command ()
   "Test `process-file' searches commands with `tramp-remote-path' PATH."
   (let ((default-directory "/rpc:user@host:/work/")
-        (captured-params nil)
-        (tramp-rpc--exec-path-cache (make-hash-table :test 'equal)))
+        (captured-params nil))
     (cl-letf (((symbol-function 'tramp-rpc--cached-remote-path)
                (lambda (_vec) '("/home/user/.cargo/bin" "/usr/bin" "/bin")))
               ((symbol-function 'tramp-rpc--get-direnv-environment)
@@ -8858,40 +8873,34 @@ This matches tramp-sh and upstream `tramp-test28-process-file', which requires
   :tags '(:direnv)
   (let* ((vec (make-tramp-file-name :method "rpc" :host "host" :user "user"
                                     :localname "/"))
-         ;; Local direnv cache to avoid polluting global state
-         (tramp-rpc--direnv-cache (make-hash-table :test 'equal))
          (fetch-count 0))
-    (cl-letf (((symbol-function 'tramp-get-home-directory)
-               (lambda (_vec &optional _user) "/home/user"))
-              ((symbol-function 'tramp-rpc--fetch-direnv-environment)
-               (lambda (_vec _dir)
-                 (cl-incf fetch-count)
-                 '(("PATH" . "/usr/bin")))))
-      ;; First access via tilde path - should call fetch
-      (tramp-rpc--get-direnv-environment vec "~/project")
-      (should (= fetch-count 1))
-      ;; Second access via absolute path - should hit the cache, not fetch again
-      (tramp-rpc--get-direnv-environment vec "/home/user/project")
-      (should (= fetch-count 1)))))
+    (tramp-rpc-mock-test--with-environment-connection vec
+      (cl-letf (((symbol-function 'tramp-get-home-directory)
+                 (lambda (_vec &optional _user) "/home/user"))
+                ((symbol-function 'tramp-rpc--call)
+                 (lambda (_vec _method _params &optional _connection)
+                   (cl-incf fetch-count)
+                   '((exit_code . 0) (stdout . "{\"PATH\":\"/usr/bin\"}")))))
+        (should (equal (tramp-rpc--get-direnv-environment vec "~/project")
+                       '(("PATH" . "/usr/bin"))))
+        (should (equal (tramp-rpc--get-direnv-environment vec "/home/user/project")
+                       '(("PATH" . "/usr/bin"))))
+        (should (= fetch-count 1))))))
 
 (ert-deftest tramp-rpc-mock-test-clear-all-caches-clears-route-owned-state ()
-  "The public all-cache command clears explicit caches and route properties."
+  "The public all-cache command clears route properties without an RPC."
   (let* ((vec (tramp-dissect-file-name "/rpc:user@cache-host:/"))
-         (tramp-rpc--connections (make-hash-table :test 'equal))
-         (tramp-rpc--exec-path-cache (make-hash-table :test 'equal))
-         (tramp-rpc--login-shell-cache (make-hash-table :test 'equal)))
-    (puthash 'connection (tramp-rpc--make-connection :vec vec) tramp-rpc--connections)
-    (puthash 'key 'value tramp-rpc--exec-path-cache)
-    (puthash 'key 'value tramp-rpc--login-shell-cache)
+         (tramp-rpc--connections (make-hash-table :test 'equal)))
+    (puthash (tramp-rpc--connection-key vec)
+             (tramp-rpc--make-connection :vec vec) tramp-rpc--connections)
     (tramp-set-connection-property vec "~" "/home/user")
     (tramp-set-connection-property vec "~user" "/home/user")
     (tramp-rpc--set-route-connection-property vec "rpc-signal-strings" ["HUP"])
     (cl-letf (((symbol-function 'tramp-rpc--clear-file-metadata-caches) #'ignore)
-              ((symbol-function 'tramp-rpc--clear-direnv-cache) #'ignore)
+              ((symbol-function 'tramp-rpc--call)
+               (lambda (&rest _) (ert-fail "Cache clearing must not issue RPCs")))
               ((symbol-function 'tramp-flush-directory-properties) #'ignore))
       (tramp-rpc-clear-all-caches))
-    (should (= (hash-table-count tramp-rpc--exec-path-cache) 0))
-    (should (= (hash-table-count tramp-rpc--login-shell-cache) 0))
     (should-not (tramp-get-connection-property vec "~" nil))
     (should-not (tramp-get-connection-property vec "~user" nil))
     (should-not
@@ -9474,6 +9483,8 @@ SPEC is (RELAY BUFFER TRANSPORT CONNECTION PID).  RELAY is not yet in
 ;;; ============================================================================
 
 (load (expand-file-name "test/tramp-rpc-lifecycle-tests.el"
+                        tramp-rpc-mock-test--project-root) nil nil t)
+(load (expand-file-name "test/tramp-rpc-environment-tests.el"
                         tramp-rpc-mock-test--project-root) nil nil t)
 
 ;;;###autoload

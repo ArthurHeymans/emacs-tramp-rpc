@@ -32,6 +32,14 @@ elif (( TRAMP_SOURCE_CONFIGURED )); then
     exit 1
 fi
 
+if [[ -n "${MSGPACK_SOURCE:-}" ]]; then
+    if [[ ! -f "$MSGPACK_SOURCE/msgpack.el" ]]; then
+        echo "MSGPACK_SOURCE does not contain msgpack.el: $MSGPACK_SOURCE" >&2
+        exit 1
+    fi
+    EMACS_LOAD_PATH_ARGS+=(-L "$MSGPACK_SOURCE")
+fi
+
 echo "Running tramp-rpc autoload tests..."
 echo "Project root: $PROJECT_ROOT"
 echo "TRAMP source: $TRAMP_SOURCE"
