@@ -215,7 +215,9 @@ or hidden TRAMP ad-hoc proxy hops).")
 ;; `tramp-rpc-connection' generation; see tramp-rpc-connection.el.
 
 (defvar tramp-rpc--process-timer-recorder nil
-  "Function called for process timers created during a suspended RPC wait.")
+  "Function called for process timers created during a suspended RPC wait.
+Called with the new timer and a predicate reporting whether that timer
+is still its process's current timer.")
 
 ;; tramp-rpc--process-write-queues is defined in tramp-rpc-process.el
 
@@ -1609,11 +1611,10 @@ connection's filter, and therefore no nested wait, can run inside BODY."
              (with-tramp-suspended-timers
                ,@body))
          (dolist (timer-state ,recorded)
-           (pcase-let ((`(,timer ,table ,process ,timer-key) timer-state))
+           (pcase-let ((`(,timer ,current-p) timer-state))
              (when (and (timerp timer)
                         (not (memq timer timer-list))
-                        (when-let* ((info (gethash process table)))
-                          (eq timer (plist-get info timer-key))))
+                        (funcall current-p))
                (timer-activate timer))))))))
 
 (defun tramp-rpc--wait-for-response-ids (conn ids timeout poll-interval label)

@@ -192,8 +192,7 @@ SPEC is (PROCESS BUFFER [CONNECTION]); CONNECTION defaults to `connection'."
       (unwind-protect
           (progn
             (puthash (tramp-rpc--connection-key vec) connection tramp-rpc--connections)
-            (puthash relay (list :vec vec :pid 42 :connection-process process)
-                     tramp-rpc--async-processes)
+            (puthash relay (tramp-rpc-mock-test--remote-state relay :vec vec :pid 42 :connection-process process) tramp-rpc--async-processes)
             ;; A different synchronous waiter and an async reader share this
             ;; transport.  Cancelling our request must not release either.
             (tramp-rpc--track-pending-request connection 900)
@@ -476,9 +475,7 @@ SPEC is (PROCESS BUFFER [CONNECTION]); CONNECTION defaults to `connection'."
             (make-pipe-process :name "tramp-rpc-timeout-managed-process"
                                :noquery t)))
       (puthash (tramp-rpc--connection-key vec) connection tramp-rpc--connections)
-      (puthash managed-process
-               (list :vec vec :pid 999 :connection-process process)
-               tramp-rpc--async-processes)
+      (puthash managed-process (tramp-rpc-mock-test--remote-state managed-process :vec vec :pid 999 :connection-process process) tramp-rpc--async-processes)
       (unwind-protect
           (progn
             (cl-letf (((symbol-function 'tramp-rpc--ensure-connection)
@@ -649,13 +646,7 @@ The helper also verifies that the output payload in the notification is queued."
          result)
     (unwind-protect
         (progn
-          (puthash relay
-                   (list :vec vec :pid 42
-                         :connection-process connection-process
-                         :stderr-buffer nil
-                         :pending-output nil :pending-exit nil
-                         :delivery-timer nil)
-                   tramp-rpc--async-processes)
+          (puthash relay (tramp-rpc-mock-test--remote-state relay :vec vec :pid 42 :connection-process connection-process :stderr-buffer nil :pending-output nil :pending-exit nil :delivery-timer nil) tramp-rpc--async-processes)
           (cl-letf (((symbol-function 'tramp-rpc--queue-process-output)
                      (lambda (_proc stdout _stderr _buf)
                        (setq queued-output stdout)))

@@ -2743,12 +2743,12 @@ VEC-OR-FILENAME can be either a tramp-file-name struct or a filename string."
     (dolist (table (list tramp-rpc--async-processes
                          tramp-rpc--pty-processes))
       (maphash
-       (lambda (process info)
+       (lambda (process remote)
          (when (and (not found)
                     (process-live-p process)
                     (equal key
                            (tramp-rpc--connection-key
-                            (plist-get info :vec))))
+                            (tramp-rpc-remote-process-vec remote))))
            (setq found t)))
        table))
     found))
