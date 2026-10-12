@@ -65,8 +65,8 @@
 
 (defun tramp-rpc--process-coding-advised-p (process)
   "Return non-nil when PROCESS has a public relay coding state."
-  (and (processp process)
-       (process-get process :tramp-rpc-coding)))
+  (when-let* ((remote (tramp-rpc--remote-process process)))
+    (tramp-rpc-remote-process-coding remote)))
 
 (defun tramp-rpc--set-process-coding-system-advice
     (orig-fun process &optional decoding encoding)
@@ -84,16 +84,16 @@ PROCESS is the process being handled."
         (check-coding-system decoding)
         (check-coding-system effective-encoding)
         (funcall orig-fun process decoding 'binary)
-        (process-put process :tramp-rpc-coding
-                     (cons decoding effective-encoding)))
+        (setf (tramp-rpc-remote-process-coding
+               (tramp-rpc--remote-process process))
+              (cons decoding effective-encoding)))
     (funcall orig-fun process decoding encoding)))
 
 (defun tramp-rpc--process-coding-system-advice (orig-fun process)
   "Return a relay's requested coding pair rather than its binary write side.
 ORIG-FUN is the original advised function.
 PROCESS is the process being handled."
-  (or (and (tramp-rpc--process-coding-advised-p process)
-           (process-get process :tramp-rpc-coding))
+  (or (tramp-rpc--process-coding-advised-p process)
       (funcall orig-fun process)))
 
 ;; ============================================================================
@@ -120,15 +120,16 @@ PROCESS is the process being handled."
 
 (defun tramp-rpc--send-managed-process-string (proc string operation)
   "Send STRING to the remote stdin of RPC-managed PROC for OPERATION."
-  (let ((vec (process-get proc :tramp-rpc-vec))
-        (pid (process-get proc :tramp-rpc-pid))
-        (data (tramp-rpc--encode-process-input proc string)))
-    (if (process-get proc :tramp-rpc-pty)
+  (let* ((remote (tramp-rpc--remote-process proc))
+         (vec (tramp-rpc-remote-process-vec remote))
+         (pid (tramp-rpc-remote-process-pid remote))
+         (data (tramp-rpc--encode-process-input proc string)))
+    (if (tramp-rpc-remote-process-pty remote)
         (progn
           (tramp-rpc--debug "%s PTY pid=%s len=%d" operation pid (length string))
           (tramp-rpc--call vec "process.write_pty"
                            `((pid . ,pid) (data . ,(msgpack-bin-make data)))
-                           (process-get proc :tramp-rpc-connection)))
+                           (tramp-rpc-remote-process-connection remote)))
       (tramp-rpc--debug "%s pipe pid=%s len=%d" operation pid (length string))
       (tramp-rpc--write-remote-process vec pid data proc)
       (when tramp-rpc-synchronous-pipe-writes
@@ -137,10 +138,11 @@ PROCESS is the process being handled."
 
 (defun tramp-rpc--managed-send-process (process)
   "Return PROCESS's RPC-managed process, or nil when native delivery is needed."
-  (when-let* ((proc (tramp-rpc--resolve-process process)))
-    (and (not (process-get proc :tramp-rpc-direct-ssh))
-         (process-get proc :tramp-rpc-pid)
-         (process-get proc :tramp-rpc-vec)
+  (when-let* ((proc (tramp-rpc--resolve-process process))
+              (remote (tramp-rpc--remote-process proc)))
+    (and (not (tramp-rpc-remote-process-direct-ssh remote))
+         (tramp-rpc-remote-process-pid remote)
+         (tramp-rpc-remote-process-vec remote)
          proc)))
 
 (defun tramp-rpc--process-send-string-advice (orig-fun process string)
@@ -159,18 +161,19 @@ PROCESS is the process being handled."
 (defun tramp-rpc--process-send-eof-advice (orig-fun &optional process)
   "Close the remote stdin of RPC-managed PROCESS, otherwise call ORIG-FUN."
   (if-let* ((proc (tramp-rpc--managed-send-process process)))
-      (let ((pid (process-get proc :tramp-rpc-pid))
-            (vec (process-get proc :tramp-rpc-vec)))
+      (let* ((remote (tramp-rpc--remote-process proc))
+             (pid (tramp-rpc-remote-process-pid remote))
+             (vec (tramp-rpc-remote-process-vec remote)))
         ;; Short-lived processes (like git apply) may exit before the caller
         ;; sends EOF, which is fine: stdin was already closed on exit.
-        (unless (or (process-get proc :tramp-rpc-exited)
+        (unless (or (tramp-rpc-remote-process-exited remote)
                     (not (process-live-p proc)))
-          (if (process-get proc :tramp-rpc-pty)
+          (if (tramp-rpc-remote-process-pty remote)
               ;; PTY processes: send Ctrl-D (EOF character) via the PTY.
               (tramp-rpc--call vec "process.write_pty"
                                `((pid . ,pid)
                                  (data . ,(msgpack-bin-make (string ?\C-d))))
-                               (process-get proc :tramp-rpc-connection))
+                               (tramp-rpc-remote-process-connection remote))
             ;; Pipe processes: a queue failure must reach the caller.
             (tramp-rpc--close-remote-stdin vec pid proc))))
     (apply orig-fun (and process (list process)))))
@@ -187,11 +190,12 @@ PROCESS is a PID.  CURRENT-GROUP selects an RPC PTY's foreground job;
           (or (get-process process)
               (and (string-match-p (rx bol (+ digit) eol) process)
                    (string-to-number process)))))
-  (let (pid vec rpc-process)
+  (let (pid vec rpc-process remote-state)
     (cond
      ((processp process)
-      (setq pid (process-get process :tramp-rpc-pid)
-            vec (process-get process :tramp-rpc-vec)
+      (setq remote-state (tramp-rpc--remote-process process)
+            pid (and remote-state (tramp-rpc-remote-process-pid remote-state))
+            vec (and remote-state (tramp-rpc-remote-process-vec remote-state))
             rpc-process process))
      ((and (numberp process)
            (stringp remote)
@@ -199,8 +203,8 @@ PROCESS is a PID.  CURRENT-GROUP selects an RPC PTY's foreground job;
       (setq pid process
             vec (tramp-dissect-file-name remote))))
     (when (and pid vec)
-      (let ((connection (and rpc-process
-                             (process-get rpc-process :tramp-rpc-connection))))
+      (let ((connection (and remote-state
+                             (tramp-rpc-remote-process-connection remote-state))))
         (condition-case err
             (progn
               (cond
@@ -210,7 +214,7 @@ PROCESS is a PID.  CURRENT-GROUP selects an RPC PTY's foreground job;
                 (tramp-rpc--call vec "process.signal"
                                  `((pid . ,pid) (signal . ,sigcode))))
                ;; Use PTY kill for PTY processes, regular kill for pipes.
-               ((process-get rpc-process :tramp-rpc-pty)
+               ((tramp-rpc-remote-process-pty remote-state)
                 (tramp-rpc--call vec "process.kill_pty"
                                  (append `((pid . ,pid) (signal . ,sigcode))
                                          (when current-group
@@ -235,11 +239,12 @@ process, a buffer, a process or buffer name, or nil for the current buffer.
 CURRENT-GROUP selects the foreground job for RPC PTYs, as in
 `interrupt-process'.  Return nil for other processes."
   (when-let* ((proc (tramp-rpc--resolve-process process))
-              ((or (process-get proc :tramp-rpc-direct-ssh)
-                   (process-get proc :tramp-rpc-pid))))
+              (remote (tramp-rpc--remote-process proc))
+              ((or (tramp-rpc-remote-process-direct-ssh remote)
+                   (tramp-rpc-remote-process-pid remote))))
     (unless (process-live-p proc)
       (error "Process %s is not active" (process-name proc)))
-    (if (process-get proc :tramp-rpc-direct-ssh)
+    (if (tramp-rpc-remote-process-direct-ssh remote)
         (process-send-string proc (string ?\C-c))
       (unless (eq 0 (tramp-rpc-handle-signal-process proc 2 nil current-group))
         (signal 'remote-file-error '("Failed to interrupt remote process"))))
@@ -255,7 +260,8 @@ CURRENT-GROUP selects the foreground job for RPC PTYs, as in
   (if-let* ((proc (if (stringp process)
                       (get-process process)
                     (tramp-rpc--resolve-process process)))
-            ((process-get proc :tramp-rpc-pid)))
+            (remote (tramp-rpc--remote-process proc))
+            ((tramp-rpc-remote-process-pid remote)))
       (cond
        ;; Check local relay liveness with ORIG-FUN.  Do not perform
        ;; synchronous remote status RPCs here: callers such as mode-line
@@ -263,12 +269,12 @@ CURRENT-GROUP selects the foreground job for RPC PTYs, as in
        ;; status while the user is typing.  The relay stays live until the
        ;; remote output has been delivered, so the remote exit status only
        ;; applies after that.
-       ((and (not (process-get proc :tramp-rpc-exited))
+       ((and (not (tramp-rpc-remote-process-exited remote))
              (memq (funcall orig-fun proc) '(run open listen connect)))
         'run)
        ;; A remote signal death is reported as `signal', matching local
        ;; processes.  Callers such as LSP and compile branch on this.
-       ((integerp (process-get proc :tramp-rpc-exit-signal)) 'signal)
+       ((integerp (tramp-rpc-remote-process-exit-signal remote)) 'signal)
        (t 'exit))
     (funcall orig-fun process)))
 
@@ -276,24 +282,25 @@ CURRENT-GROUP selects the foreground job for RPC PTYs, as in
   "Return the remote exit status of RPC-managed PROCESS.
 Signal deaths report the signal number, like local processes.  Call
 ORIG-FUN for other processes."
-  (if (and (processp process) (process-get process :tramp-rpc-pid))
-      (or (process-get process :tramp-rpc-exit-signal)
-          (process-get process :tramp-rpc-exit-code)
+  (if-let* ((remote (tramp-rpc--remote-process process))
+            ((tramp-rpc-remote-process-pid remote)))
+      (or (tramp-rpc-remote-process-exit-signal remote)
+          (tramp-rpc-remote-process-exit-code remote)
           0)
     (funcall orig-fun process)))
 
 (defun tramp-rpc--process-command-advice (orig-fun process)
   "Return the remote command of RPC PROCESS, otherwise call ORIG-FUN."
-  (or (and (processp process) (process-get process :tramp-rpc-command))
+  (or (when-let* ((remote (tramp-rpc--remote-process process)))
+        (tramp-rpc-remote-process-command remote))
       (funcall orig-fun process)))
 
 (defun tramp-rpc--process-tty-name-advice (orig-fun process &optional stream)
   "Return the remote TTY name of RPC PTY PROCESS, otherwise call ORIG-FUN.
 Direct SSH PTYs use their local PTY name.  STREAM is passed to ORIG-FUN."
-  (if (and (processp process)
-           (process-get process :tramp-rpc-pty)
-           (not (process-get process :tramp-rpc-direct-ssh)))
-      (process-get process :tramp-rpc-tty-name)
+  (if (tramp-rpc--rpc-pty-process-p process)
+      (tramp-rpc-remote-process-tty-name
+       (tramp-rpc--remote-process process))
     (funcall orig-fun process stream)))
 
 (defun tramp-rpc--set-process-sentinel-advice (orig-fun process sentinel)
@@ -301,9 +308,10 @@ Direct SSH PTYs use their local PTY name.  STREAM is passed to ORIG-FUN."
 Replacing tramp-rpc's own sentinel would lose the remote exit status and the
 remote cleanup, so its own sentinel calls SENTINEL instead.  Call ORIG-FUN
 for other processes."
-  (if (and (processp process) (process-get process :tramp-rpc-own-sentinel))
+  (if-let* ((remote (tramp-rpc--remote-process process))
+            ((tramp-rpc-remote-process-own-sentinel remote)))
       (progn
-        (process-put process :tramp-rpc-user-sentinel sentinel)
+        (setf (tramp-rpc-remote-process-user-sentinel remote) sentinel)
         sentinel)
     (funcall orig-fun process sentinel)))
 
@@ -311,8 +319,9 @@ for other processes."
   "Return the caller's sentinel of RPC PROCESS, otherwise call ORIG-FUN.
 Return `ignore' when there is none: tramp-rpc never runs the default
 sentinel."
-  (if (and (processp process) (process-get process :tramp-rpc-own-sentinel))
-      (or (process-get process :tramp-rpc-user-sentinel) #'ignore)
+  (if-let* ((remote (tramp-rpc--remote-process process))
+            ((tramp-rpc-remote-process-own-sentinel remote)))
+      (or (tramp-rpc-remote-process-user-sentinel remote) #'ignore)
     (funcall orig-fun process)))
 
 ;; ============================================================================
@@ -347,7 +356,8 @@ BACKEND, FUNCTION-NAME and ARGS."
 (defun tramp-rpc--vc-exec-after-managed (code okstatus proc)
   "Run CODE once TRAMP-RPC relay PROC is done, using its logical state.
 OKSTATUS is as for `vc-exec-after'."
-  (if (or (process-get proc :tramp-rpc-exited)
+  (if (or (when-let* ((remote (tramp-rpc--remote-process proc)))
+            (tramp-rpc-remote-process-exited remote))
           (not (memq (process-status proc) '(run open listen connect))))
       (progn
         ;; Match `vc-exec-after': drain pending output before the next VC
@@ -382,7 +392,8 @@ stock `vc-exec-after' then signals \"Unexpected process state\".  For
 TRAMP-RPC processes, reproduce `vc-exec-after' using the logical process
 state.  ORIG-FUN is `vc-exec-after'; ARGS are its OKSTATUS and PROC."
   (let ((proc (or (nth 1 args) (get-buffer-process (current-buffer)))))
-    (if (and (processp proc) (process-get proc :tramp-rpc-pid))
+    (if (when-let* ((remote (tramp-rpc--remote-process proc)))
+          (tramp-rpc-remote-process-pid remote))
         (tramp-rpc--vc-exec-after-managed code (car args) proc)
       (apply orig-fun code args))))
 
@@ -510,8 +521,9 @@ ARGS are passed to ORIG-FUN."
   (when-let* (((bound-and-true-p vc-dir-process-buffer))
               ((buffer-live-p vc-dir-process-buffer))
               (proc (get-buffer-process vc-dir-process-buffer))
-              ((process-get proc :tramp-rpc-pid))
-              ((or (process-get proc :tramp-rpc-exited)
+              (remote (tramp-rpc--remote-process proc))
+              ((tramp-rpc-remote-process-pid remote))
+              ((or (tramp-rpc-remote-process-exited remote)
                    (not (process-live-p proc)))))
     (tramp-rpc--forget-managed-process proc)
     (delete-process proc))

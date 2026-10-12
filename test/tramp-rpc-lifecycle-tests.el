@@ -41,12 +41,14 @@
                         (tramp-rpc-handle-make-process :name "captured-pipe" :command '("true")
                                                        :connection-type nil :noquery t)))
                 (should (= ensures 1))
-                (should (eq (process-get relay :tramp-rpc-connection) connection))
+                (should (eq (tramp-rpc-remote-process-connection
+                             (tramp-rpc--remote-process relay)) connection))
                 (let ((info (gethash relay (if pty tramp-rpc--pty-processes
                                              tramp-rpc--async-processes))))
                   (if dead
                       (progn (should-not info) (should-not (process-live-p relay)))
-                    (should (eq (plist-get info :connection-process) transport)))))
+                    (should (eq (tramp-rpc--connection-transport
+                                  (tramp-rpc-remote-process-connection info)) transport)))))
             (when relay
               (tramp-rpc--forget-managed-process relay)
               (set-process-sentinel relay #'ignore)
@@ -224,7 +226,8 @@
                      (equal (with-current-buffer buffer (buffer-string)) "final-output")))
      "final output after connection death")
     (should (equal (with-current-buffer buffer (buffer-string)) "final-output"))
-    (should (= (process-get relay :tramp-rpc-exit-code) 7))))
+    (should (= (tramp-rpc-remote-process-exit-code
+                (tramp-rpc--remote-process relay)) 7))))
 
 (ert-deftest tramp-rpc-mock-test-initial-stdin-failure-cleans-relay-and-remote ()
   "A failed sudo stdin setup leaves no relay or child, including across reconnect."
@@ -251,7 +254,8 @@
                          (apply track proc args)))
                       ((symbol-function 'tramp-rpc--write-remote-process)
                        (lambda (_vec _pid _data owner)
-                         (should (eq (process-get owner :tramp-rpc-connection) connection))
+                         (should (eq (tramp-rpc-remote-process-connection
+                                      (tramp-rpc--remote-process owner)) connection))
                          (signal 'remote-file-error '("stdin rejected"))))
                       ((symbol-function 'tramp-rpc--call)
                        (lambda (_vec method _params &optional captured)
@@ -346,11 +350,11 @@
                      (setq captured (list "process.kill"
                                           `((pid . ,pid) (signal . ,signal))
                                           connection)))))
-          (process-put relay :tramp-rpc-vec vec)
-          (process-put relay :tramp-rpc-pid 42)
-          (process-put relay :tramp-rpc-connection owner)
+          (tramp-rpc-mock-test--remote-state relay :vec vec)
+          (tramp-rpc-mock-test--remote-state relay :pid 42)
+          (tramp-rpc-mock-test--remote-state relay :connection owner)
           (dolist (pty '(nil t))
-            (process-put relay :tramp-rpc-pty pty)
+            (tramp-rpc-mock-test--remote-state relay :pty pty)
             (dolist (current-group '(nil t lambda))
               (should (tramp-rpc-handle-interrupt-process relay current-group))
               (should (equal (car captured) (if pty "process.kill_pty" "process.kill")))
