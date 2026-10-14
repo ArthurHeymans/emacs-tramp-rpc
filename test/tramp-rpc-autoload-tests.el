@@ -184,6 +184,47 @@ This allows testing autoload behavior in a clean state."
             (ert-fail (with-current-buffer buffer (buffer-string)))))
       (kill-buffer buffer))))
 
+(ert-deftest tramp-rpc-autoload-test-unload-reload-environment ()
+  "Unloading and reloading tramp-rpc keeps environment invalidation.
+The environment feature must unload with the rest; a surviving feature
+would make the reload's `require' a no-op and its invalidation callback
+would never be registered again."
+  (let* ((emacs (expand-file-name invocation-name invocation-directory))
+         (tramp-dir (file-name-directory (locate-library "tramp")))
+         (msgpack-dir (file-name-directory (locate-library "msgpack")))
+         (buffer (generate-new-buffer " *tramp-rpc-autoload-unload*"))
+         (form
+          `(progn
+             (require 'tramp-rpc)
+             (let ((vec (tramp-dissect-file-name "/rpc:unload-reload:/tmp/")))
+               (puthash (tramp-rpc--connection-key vec) '("/stale")
+                        tramp-rpc--exec-path-cache)
+               (unload-feature 'tramp-rpc t)
+               (when (featurep 'tramp-rpc-environment)
+                 (error "tramp-rpc-environment survived unload"))
+               (require 'tramp-rpc)
+               (unless (memq #'tramp-rpc--clear-environment-caches
+                             tramp-rpc-connection-invalidate-functions)
+                 (error "Environment invalidation not re-registered"))
+               (puthash (tramp-rpc--connection-key vec) '("/stale")
+                        tramp-rpc--exec-path-cache)
+               (run-hook-with-args
+                'tramp-rpc-connection-invalidate-functions vec)
+               (when (gethash (tramp-rpc--connection-key vec)
+                              tramp-rpc--exec-path-cache)
+                 (error "Stale exec-path cache survived invalidation"))))))
+    (unwind-protect
+        (let ((status
+               (call-process emacs nil buffer nil
+                             "-Q" "--batch"
+                             "-L" tramp-dir
+                             "-L" msgpack-dir
+                             "-L" tramp-rpc-autoload-test--lisp-dir
+                             "--eval" (prin1-to-string form))))
+          (unless (zerop status)
+            (ert-fail (with-current-buffer buffer (buffer-string)))))
+      (kill-buffer buffer))))
+
 (ert-deftest tramp-rpc-autoload-test-function-stubs ()
   "Test that autoloads register function stubs."
   (tramp-rpc-autoload-test--clean-environment)

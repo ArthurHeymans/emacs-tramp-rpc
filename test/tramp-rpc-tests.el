@@ -141,6 +141,27 @@ Value is a cons cell (CHECKED . RESULT).")
       (error "Timed out waiting for %s (process status: %S)"
              description (and (processp process) (process-status process))))))
 
+(defun tramp-rpc-test--remote-state (process &rest fields)
+  "Attach remote-process state with FIELDS to PROCESS and return it."
+  (let ((remote (tramp-rpc--ensure-remote-process process)))
+    (while fields
+      (let ((key (pop fields))
+            (value (pop fields)))
+        (pcase key
+          (:pty (setf (tramp-rpc-remote-process-pty remote) value))
+          (:user-sentinel
+           (setf (tramp-rpc-remote-process-user-sentinel remote) value))
+          (:stderr-process
+           (setf (tramp-rpc-remote-process-stderr-process remote) value))
+          (:pending-output
+           (setf (tramp-rpc-remote-process-pending-output remote) value))
+          (:pending-exit
+           (setf (tramp-rpc-remote-process-pending-exit remote) value))
+          (:delivery-timer
+           (setf (tramp-rpc-remote-process-delivery-timer remote) value))
+          (_ (error "Unknown remote-state field %s" key)))))
+    remote))
+
 (defun tramp-rpc-test--clear-call-count-caches ()
   "Clear TRAMP/TRAMP-RPC caches before call-count measurement."
   (maphash
@@ -2058,8 +2079,7 @@ This matches the upstream `tramp-test28-process-file' test."
           (set-process-filter stderr
                               (lambda (_process string)
                                 (setq stderr-output (concat stderr-output string))))
-          (puthash stdout (list :stderr-process stderr)
-                   tramp-rpc--async-processes)
+          (puthash stdout (tramp-rpc-test--remote-state stdout :stderr-process stderr) tramp-rpc--async-processes)
           (tramp-rpc--deliver-process-output
            stdout (encode-coding-string "sortie\n" 'binary)
            (encode-coding-string "erreur\n" 'binary) t)
@@ -2091,10 +2111,8 @@ This matches the upstream `tramp-test28-process-file' test."
           (set-process-filter process
                               (lambda (_process string)
                                 (setq output (concat output string))))
-          (process-put process :tramp-rpc-pty t)
-          (puthash process (list :pending-output nil :pending-exit nil
-                                 :delivery-timer nil)
-                   tramp-rpc--pty-processes)
+          (tramp-rpc-test--remote-state process :pty t)
+          (puthash process (tramp-rpc-test--remote-state process :pending-output nil :pending-exit nil :delivery-timer nil) tramp-rpc--pty-processes)
           (tramp-rpc--queue-pty-delivery process (substring bytes 0 1))
           (tramp-rpc--queue-pty-delivery process (concat (substring bytes 1) "\n"))
           (tramp-rpc-test--wait-for
@@ -2117,13 +2135,11 @@ This matches the upstream `tramp-test28-process-file' test."
            (lambda (_process string)
              (setq output (concat output string))))
           (set-process-sentinel process #'tramp-rpc--pty-sentinel)
-          (process-put process :tramp-rpc-pty t)
-          (process-put process :tramp-rpc-user-sentinel
+          (tramp-rpc-test--remote-state process :pty t)
+          (tramp-rpc-test--remote-state process :user-sentinel
                        (lambda (_process event)
                          (push event sentinel-events)))
-          (puthash process (list :pending-output nil :pending-exit nil
-                                 :delivery-timer nil)
-                   tramp-rpc--pty-processes)
+          (puthash process (tramp-rpc-test--remote-state process :pending-output nil :pending-exit nil :delivery-timer nil) tramp-rpc--pty-processes)
           (tramp-rpc--queue-pty-delivery process "final output\n" 0 t)
           (while (process-live-p process)
             (accept-process-output process 0.1 nil t))

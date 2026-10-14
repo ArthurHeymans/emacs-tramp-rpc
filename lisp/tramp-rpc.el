@@ -237,6 +237,7 @@ This is called from `tramp-multi-hop-p-hook'."
 (require 'tramp-rpc-protocol)
 (require 'tramp-rpc-connection)
 (require 'tramp-rpc-transport)
+(require 'tramp-rpc-environment)
 
 ;; Package-Requires enforces this for package installations.  Keep loading
 ;; harmless for tooling that checks each file against Emacs's older bundled
@@ -2742,12 +2743,12 @@ VEC-OR-FILENAME can be either a tramp-file-name struct or a filename string."
     (dolist (table (list tramp-rpc--async-processes
                          tramp-rpc--pty-processes))
       (maphash
-       (lambda (process info)
+       (lambda (process remote)
          (when (and (not found)
                     (process-live-p process)
                     (equal key
                            (tramp-rpc--connection-key
-                            (plist-get info :vec))))
+                            (tramp-rpc-remote-process-vec remote))))
            (setq found t)))
        table))
     found))
@@ -2912,7 +2913,8 @@ Removes advice and cleans up async processes."
   (dolist (feature '(tramp-rpc-advice tramp-rpc-magit tramp-rpc-majutsu
                      tramp-rpc-notify
                      tramp-rpc-cache
-                     tramp-rpc-process tramp-rpc-transport tramp-rpc-deploy
+                     tramp-rpc-process tramp-rpc-environment
+                     tramp-rpc-transport tramp-rpc-deploy
                      tramp-rpc-hops tramp-rpc-connection tramp-rpc-protocol))
     (when (featurep feature)
       (unload-feature feature 'force)))

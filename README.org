@@ -206,6 +206,7 @@ file-notify dispatch callbacks in ~tramp-rpc-notify.el~.
 | ~tramp-rpc-process.el~     | Async process & PTY support                          |
 | ~tramp-rpc-notify.el~      | Public ~file-notify~ descriptors on server watches   |
 | ~tramp-rpc-cache.el~       | Metadata caches & filesystem watch notifications     |
+| ~tramp-rpc-environment.el~ | Remote process environment (PATH, login shell, direnv) |
 | ~tramp-rpc-transport.el~   | SSH/ControlMaster, connection generations, RPC calls |
 | ~tramp-rpc-deploy.el~      | Binary deployment & version management               |
 | ~tramp-rpc-hops.el~        | Hop-chain analysis and sudo elevation                |
@@ -230,13 +231,23 @@ Everything needed to reach a host and talk to its server:
 - Server process startup, including sudo-via-RPC privilege elevation
 - Connection generation lookup, replacement and cleanup
 - RPC call primitives: synchronous, batch, pipelined and asynchronous calls
-- The effective remote process environment (PATH, login shell, direnv)
 
 Upper layers plug into the transport through hooks instead of being
 called by name: ~tramp-rpc-connection-invalidate-functions~,
 ~tramp-rpc-transport-terminate-functions~,
 ~tramp-rpc-transport-cleanup-functions~ and
 ~tramp-rpc-notification-functions~.
+
+*** Environment Module (~tramp-rpc-environment.el~)
+
+The effective environment handed to remote processes, built on the
+transport's call primitives: the remote PATH (from ~tramp-remote-path~
+and the login shell), TRAMP's remote process environment, the caller's
+environment, and direnv variables, merged by
+~tramp-rpc--process-environment~.  Its per-connection caches (exec-path,
+login shell, direnv) are dropped through
+~tramp-rpc-connection-invalidate-functions~ when a generation is
+retired or replaced.
 
 *** Connection Module (~tramp-rpc-connection.el~)
 
