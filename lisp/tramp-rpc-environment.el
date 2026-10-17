@@ -220,8 +220,9 @@ entry is appended."
 (defun tramp-rpc--ensure-inside-emacs-env (env)
   "Ensure INSIDE_EMACS is set in environment alist ENV.
 ENV is an alist of (KEY . VALUE) string pairs, or nil.
-If INSIDE_EMACS is not already present, it is added with the value
-from `tramp-inside-emacs'.  Returns the (possibly augmented) alist."
+INSIDE_EMACS is set to `tramp-inside-emacs' unless its current value
+already names tramp; an unrelated value such as \\=`31.1,comint' is
+replaced, as in `tramp-sh'.  Returns the (possibly augmented) alist."
   (if-let* ((ie (cdr (assoc "INSIDE_EMACS" env)))
 	    ((string-match-p "tramp" ie)))
       env
