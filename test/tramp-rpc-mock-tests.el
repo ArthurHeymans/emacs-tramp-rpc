@@ -2925,6 +2925,73 @@ registry."
       (dolist (buffer (list buffer-a buffer-b))
         (when (buffer-live-p buffer) (kill-buffer buffer))))))
 
+(ert-deftest tramp-rpc-mock-test-invalidation-runs-on-a-detached-generation ()
+  "Invalidators never observe the generation being retired or replaced."
+  (let* ((vec (tramp-dissect-file-name "/rpc:invalidate-detach:/tmp/"))
+         (buffer (generate-new-buffer " *tramp-rpc-invalidate-detach*"))
+         (process (start-process "tramp-rpc-invalidate-detach" buffer "cat"))
+         (tramp-rpc--connections (make-hash-table :test 'equal))
+         (observed 'unset))
+    (unwind-protect
+        (progn
+          (tramp-rpc--set-connection vec process buffer)
+          (let ((tramp-rpc-connection-invalidate-functions
+                 (list (lambda (invalidate-vec)
+                         (setq observed (tramp-rpc--get-connection invalidate-vec))))))
+            ;; Replacement publishes a successor after detaching the old one.
+            (tramp-rpc--set-connection vec process buffer)
+            (should (null observed))
+            (setq observed 'unset)
+            ;; Retirement detaches as well.
+            (tramp-rpc--remove-connection vec process))
+          (should (null observed))
+          (should-not (tramp-rpc--get-connection vec)))
+      (when (process-live-p process) (delete-process process))
+      (when (buffer-live-p buffer) (kill-buffer buffer)))))
+
+(ert-deftest tramp-rpc-mock-test-invalidation-may-publish-replacement ()
+  "A callback that reconnects keeps its successor through the retirement."
+  (let* ((vec (tramp-dissect-file-name "/rpc:invalidate-replace:/tmp/"))
+         (buffer (generate-new-buffer " *tramp-rpc-invalidate-replace*"))
+         (retiring (start-process "tramp-rpc-invalidate-old" buffer "cat"))
+         (replacement (start-process "tramp-rpc-invalidate-new" buffer "cat"))
+         (tramp-rpc--connections (make-hash-table :test 'equal)))
+    (unwind-protect
+        (progn
+          (tramp-rpc--set-connection vec retiring buffer)
+          (let ((tramp-rpc-connection-invalidate-functions
+                 (list (lambda (invalidate-vec)
+                         (tramp-rpc--set-connection invalidate-vec replacement buffer)))))
+            (tramp-rpc--remove-connection vec retiring))
+          (should (eq replacement
+                      (tramp-rpc-connection-process
+                       (tramp-rpc--get-connection vec)))))
+      (dolist (process (list retiring replacement))
+        (when (process-live-p process) (delete-process process)))
+      (when (buffer-live-p buffer) (kill-buffer buffer)))))
+
+(ert-deftest tramp-rpc-mock-test-invalidation-failure-does-not-strand-cleanup ()
+  "A failing invalidator is reported and does not skip the remaining ones."
+  (let* ((vec (tramp-dissect-file-name "/rpc:invalidate-failure:/tmp/"))
+         (buffer (generate-new-buffer " *tramp-rpc-invalidate-failure*"))
+         (process (start-process "tramp-rpc-invalidate-failure" buffer "cat"))
+         (tramp-rpc--connections (make-hash-table :test 'equal))
+         (seen nil))
+    (unwind-protect
+        (progn
+          (tramp-rpc--set-connection vec process buffer)
+          (let ((tramp-rpc-connection-invalidate-functions
+                 (list (lambda (_vec)
+                         (push 'failed seen)
+                         (error "invalidation failed"))
+                       (lambda (_vec)
+                         (push 'reached seen)))))
+            (tramp-rpc--remove-connection vec process))
+          (should (equal (nreverse seen) '(failed reached)))
+          (should-not (tramp-rpc--get-connection vec)))
+      (when (process-live-p process) (delete-process process))
+      (when (buffer-live-p buffer) (kill-buffer buffer)))))
+
 (ert-deftest tramp-rpc-mock-test-cleanup-callback-reconnect-preserves-new-caches ()
   "Cache clearing precedes a cleanup callback that reconnects and repopulates."
   (let* ((vec (tramp-dissect-file-name "/rpc:cache-callback:/tmp/"))
