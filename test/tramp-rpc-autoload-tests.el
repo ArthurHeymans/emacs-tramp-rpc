@@ -185,10 +185,11 @@ This allows testing autoload behavior in a clean state."
       (kill-buffer buffer))))
 
 (ert-deftest tramp-rpc-autoload-test-unload-reload-environment ()
-  "Unloading and reloading tramp-rpc keeps environment invalidation.
+  "Unloading and reloading tramp-rpc keeps the environment module working.
 The environment feature must unload with the rest; a surviving feature
-would make the reload's `require' a no-op and its invalidation callback
-would never be registered again."
+would make the reload's `require' a no-op and leave stale definitions.
+Its state belongs to a connection generation, so replacement needs no
+invalidation callback at all."
   (let* ((emacs (expand-file-name invocation-name invocation-directory))
          (tramp-dir (file-name-directory (locate-library "tramp")))
          (msgpack-dir (file-name-directory (locate-library "msgpack")))
@@ -196,23 +197,26 @@ would never be registered again."
          (form
           `(progn
              (require 'tramp-rpc)
-             (let ((vec (tramp-dissect-file-name "/rpc:unload-reload:/tmp/")))
-               (puthash (tramp-rpc--connection-key vec) '("/stale")
-                        tramp-rpc--exec-path-cache)
-               (unload-feature 'tramp-rpc t)
-               (when (featurep 'tramp-rpc-environment)
-                 (error "tramp-rpc-environment survived unload"))
-               (require 'tramp-rpc)
-               (unless (memq #'tramp-rpc--clear-environment-caches
-                             tramp-rpc-connection-invalidate-functions)
-                 (error "Environment invalidation not re-registered"))
-               (puthash (tramp-rpc--connection-key vec) '("/stale")
-                        tramp-rpc--exec-path-cache)
-               (run-hook-with-args
-                'tramp-rpc-connection-invalidate-functions vec)
-               (when (gethash (tramp-rpc--connection-key vec)
-                              tramp-rpc--exec-path-cache)
-                 (error "Stale exec-path cache survived invalidation"))))))
+             (unload-feature 'tramp-rpc t)
+             (when (featurep 'tramp-rpc-environment)
+               (error "tramp-rpc-environment survived unload"))
+             (require 'tramp-rpc)
+             (unless (featurep 'tramp-rpc-environment)
+               (error "tramp-rpc-environment did not reload"))
+             (unless (fboundp 'tramp-rpc--clear-environment-caches)
+               (error "Environment cache reset not redefined"))
+             (let* ((vec (tramp-dissect-file-name "/rpc:unload-reload:/tmp/"))
+                    (tramp-rpc--connections (make-hash-table :test 'equal))
+                    (retiring (tramp-rpc--make-connection :process 'old
+                                                         :vec vec)))
+               (puthash (tramp-rpc--connection-key vec) retiring
+                        tramp-rpc--connections)
+               (setf (tramp-rpc-connection-exec-path retiring)
+                     '(("/stale") . t))
+               (tramp-rpc--set-connection vec 'new nil)
+               (when (tramp-rpc-connection-exec-path
+                      (tramp-rpc--get-connection vec))
+                 (error "Stale exec-path survived generation replacement"))))))
     (unwind-protect
         (let ((status
                (call-process emacs nil buffer nil

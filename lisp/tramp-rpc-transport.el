@@ -238,9 +238,11 @@ is still its process's current timer.")
 Home-directory properties named ~USER are route-sensitive as well.")
 
 (defconst tramp-rpc--owned-route-connection-properties
-  '("tramp-rpc-login-path" "rpc-signal-strings"
-    " rpc-acl-enabled" " rpc-selinux-enabled" "tramp-rpc-system-info")
-  "Project-specific route-aware TRAMP connection properties.")
+  '("rpc-signal-strings"
+    " rpc-acl-enabled" " rpc-selinux-enabled")
+  "Project-specific route-aware TRAMP connection properties.
+The remote environment and `system.info' are generation state, not
+connection properties; see `tramp-rpc-connection'.")
 
 (defvar tramp-rpc--route-property-access nil
   "Non-nil while accessing an explicitly route-qualified TRAMP property.")
@@ -1910,9 +1912,6 @@ This is more efficient when the server has async support."
 ;; system.info
 ;; ============================================================================
 
-(defconst tramp-rpc--system-info-property "tramp-rpc-system-info"
-  "TRAMP connection property storing the cached system.info response.")
-
 (defcustom tramp-rpc-watcher-unavailable-ttl 30
   "TTL cap in seconds for caches when push notifications are unavailable.
 When the server reports `watcher_available' as false, `fs.events'
@@ -1939,12 +1938,16 @@ An explicit non-t value marks degraded."
       (when (and cell (not (eq (cdr cell) t)))
         (setq tramp-rpc--watcher-degraded t)))))
 
-(defun tramp-rpc--cache-system-info (vec info)
-  "Store system.info INFO for VEC and seed related TRAMP properties."
+(defun tramp-rpc--cache-system-info (vec info &optional connection)
+  "Store system.info INFO for VEC and seed related TRAMP properties.
+The response itself lives on the generation that probed it, so a replacement
+server cannot inherit it.  CONNECTION is that generation when the caller
+already has it."
   (when info
     (tramp-rpc--note-watcher-availability info)
-    (tramp-rpc--set-route-connection-property
-     vec tramp-rpc--system-info-property info)
+    (when-let* ((connection (or connection
+                               (tramp-rpc--get-connection vec))))
+      (setf (tramp-rpc-connection-system-info connection) info))
     ;; Store remote uname so `tramp-check-remote-uname' works.  The server
     ;; returns "linux" or "macos"; map to the kernel names tramp-sh expects.
     (when-let* ((os (alist-get 'os info)))
@@ -1973,22 +1976,21 @@ An explicit non-t value marks degraded."
 
 (defun tramp-rpc--cached-system-info (vec)
   "Return the system.info cached for VEC, or nil.  Never issues an RPC."
-  (tramp-rpc--get-route-connection-property
-   vec tramp-rpc--system-info-property nil))
+  (when-let* ((connection (tramp-rpc--get-connection vec)))
+    (tramp-rpc-connection-system-info connection)))
 
 (defun tramp-rpc--system-info (vec)
   "Return cached system.info for VEC, fetching it at most once per connection."
   (or (tramp-rpc--cached-system-info vec)
-      (progn
-        ;; Establishing a new connection already performs and caches a
-        ;; `system.info' call as its readiness ping.  Re-check the property after
-        ;; connection setup so a cold caller does not immediately send a second
-        ;; identical RPC.
-        (tramp-rpc--ensure-connection vec)
-        (or (tramp-rpc--get-route-connection-property
-             vec tramp-rpc--system-info-property nil)
+      ;; Establishing a new connection already performs and caches a
+      ;; `system.info' call as its readiness ping.  Re-read the generation
+      ;; after connection setup so a cold caller does not immediately send a
+      ;; second identical RPC.
+      (let ((connection (tramp-rpc--ensure-connection vec)))
+        (or (tramp-rpc-connection-system-info connection)
             (tramp-rpc--cache-system-info
-             vec (tramp-rpc--call vec "system.info" nil))))))
+             vec (tramp-rpc--call vec "system.info" nil connection)
+             connection)))))
 
 (provide 'tramp-rpc-transport)
 ;;; tramp-rpc-transport.el ends here
