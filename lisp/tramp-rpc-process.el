@@ -113,8 +113,8 @@ round trips."
   ;; which must run exactly once.
   own-sentinel user-sentinel user-sentinel-called
   ;; Terminal status.  EXITED is the local relay, REMOTE-EXITED the
-  ;; remote process; TRANSPORT-CLEANUP/DEAD mark transport teardown.
-  exited remote-exited transport-cleanup transport-dead
+  ;; remote process; TRANSPORT-CLEANUP marks transport teardown.
+  exited remote-exited transport-cleanup
   exit-code exit-signal
   ;; Ordered stdin write queue key, see `tramp-rpc--process-write-queues'.
   write-queue-key
@@ -1143,12 +1143,13 @@ PROGRAM is the command to run, ARGS are its arguments."
 ;; ============================================================================
 
 (defun tramp-rpc--make-pty-process (vec name buffer command coding noquery
-                                         filter sentinel localname &optional direnv-env)
+                                         filter sentinel localname &optional process-env)
   "Create a PTY-based process for terminal emulators.
 VEC is the tramp connection vector.
 NAME, BUFFER, COMMAND, CODING, NOQUERY, FILTER, SENTINEL are process params.
 LOCALNAME is the remote working directory.
-DIRENV-ENV is an optional alist of environment variables from direnv.
+PROCESS-ENV is the effective child environment alist built by
+`tramp-rpc--process-environment' (configured PATH, direnv, caller overrides).
 
 When `tramp-rpc-use-direct-ssh-pty' is non-nil (the default), this uses
 a direct SSH connection for the PTY, providing much lower latency for
@@ -1160,10 +1161,10 @@ interactive terminal use.  Otherwise, uses the RPC-based PTY implementation."
            (not (tramp-rpc--sudo-rpc-hop-vec vec)))
       ;; Use direct SSH for low-latency PTY
       (tramp-rpc--make-direct-ssh-pty-process
-       vec name buffer command coding noquery filter sentinel localname direnv-env)
+       vec name buffer command coding noquery filter sentinel localname process-env)
     ;; Use RPC-based PTY
     (tramp-rpc--make-rpc-pty-process
-     vec name buffer command coding noquery filter sentinel localname direnv-env)))
+     vec name buffer command coding noquery filter sentinel localname process-env)))
 
 (defun tramp-rpc--direct-ssh-pty-sentinel (process event)
   "Remove direct SSH PTY PROCESS and invoke its user sentinel once.
@@ -1174,7 +1175,7 @@ EVENT is the process event string."
      process (tramp-rpc--user-sentinel process) event)))
 
 (defun tramp-rpc--make-direct-ssh-pty-process (vec name buffer command coding noquery
-                                                    filter sentinel localname &optional direnv-env)
+                                                    filter sentinel localname &optional process-env)
   "Create a PTY process using direct SSH connection.
 This provides much lower latency than the RPC-based PTY by using a direct
 SSH connection with `-t` for the terminal.  The SSH connection reuses the
@@ -1183,7 +1184,8 @@ existing ControlMaster socket, so authentication is already handled.
 VEC is the tramp connection vector.
 NAME, BUFFER, COMMAND, CODING, NOQUERY, FILTER, SENTINEL are process params.
 LOCALNAME is the remote working directory.
-DIRENV-ENV is an optional alist of environment variables from direnv."
+PROCESS-ENV is the effective child environment alist built by
+`tramp-rpc--process-environment'."
   (let* ((host (tramp-file-name-host vec))
          (user (tramp-file-name-user vec))
          (port (tramp-rpc--port-to-string (tramp-file-name-port vec)))
@@ -1195,7 +1197,7 @@ DIRENV-ENV is an optional alist of environment variables from direnv."
                           (format "export %s=%s;"
                                   (car pair)
                                   (tramp-shell-quote-argument (cdr pair))))
-                       (append direnv-env
+                       (append process-env
                                `(("TERM" . ,(or (getenv "TERM") "xterm-256color"))))
                        " "))
          ;; Build the remote command - cd to dir, export env, exec program
@@ -1279,14 +1281,15 @@ DIRENV-ENV is an optional alist of environment variables from direnv."
     process))
 
 (defun tramp-rpc--make-rpc-pty-process (vec name buffer command coding noquery
-                                             filter sentinel localname &optional direnv-env)
+                                             filter sentinel localname &optional process-env)
   "Create a PTY-based process using the RPC server.
 This is the fallback when direct SSH PTY is disabled.
 
 VEC is the tramp connection vector.
 NAME, BUFFER, COMMAND, CODING, NOQUERY, FILTER, SENTINEL are process params.
 LOCALNAME is the remote working directory.
-DIRENV-ENV is an optional alist of environment variables for the process."
+PROCESS-ENV is the effective child environment alist built by
+`tramp-rpc--process-environment'."
   (tramp-rpc--with-process-start
     (let* ((program (car command))
            (program-args (cdr command))
@@ -1296,7 +1299,7 @@ DIRENV-ENV is an optional alist of environment variables for the process."
            (cols (car size))
            ;; Build environment - add TERM after caller/remote env so it wins.
            (term-env (or (getenv "TERM") "xterm-256color"))
-           (full-env (append direnv-env `(("TERM" . ,term-env))))
+           (full-env (append process-env `(("TERM" . ,term-env))))
            ;; Capture before starting: the wait can invalidate or replace the
            ;; connection registered under VEC.
            (connection (tramp-rpc--ensure-connection vec))
@@ -1636,8 +1639,7 @@ transport loss; explicit disconnect and global cleanup still remove them."
            ;; Keep tracking through delete-process so the wrapped sentinel and
            ;; user's sentinel are not suppressed.  The final remhash is
            ;; idempotent.
-           (setf (tramp-rpc-remote-process-transport-cleanup info) t
-                 (tramp-rpc-remote-process-transport-dead info) t)
+           (setf (tramp-rpc-remote-process-transport-cleanup info) t)
            (when (process-live-p local-process)
              (delete-process local-process))
            (tramp-rpc--clear-delivery-state local-process)
@@ -1701,8 +1703,7 @@ transport is live."
          (when (process-live-p stderr-process)
            (tramp-rpc--best-effort (delete-process stderr-process))))
        ;; Keep tracking while delete-process dispatches the wrapped sentinel.
-       (setf (tramp-rpc-remote-process-transport-cleanup info) t
-             (tramp-rpc-remote-process-transport-dead info) t)
+       (setf (tramp-rpc-remote-process-transport-cleanup info) t)
        (when (process-live-p local-process)
          (delete-process local-process))
        (tramp-rpc--clear-delivery-state local-process)

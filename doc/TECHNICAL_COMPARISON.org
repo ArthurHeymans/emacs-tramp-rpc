@@ -233,7 +233,7 @@ SIGKILL: the managed shell and its output lifecycle remain registered.
 | system.info         | (none)     | {protocol_revision, version, home, uid, gid, ...} |
 | system.statvfs      | path       | {total, free, available}          |
 
-~system.info~ advertises integer ~protocol_revision: 1~.  The client checks
+~system.info~ advertises integer ~protocol_revision: 2~.  The client checks
 exact equality at startup; missing or different revisions fail the connection
 with a redeployment error.  This revision is independent of the package
 version and the RPC envelope's ~"2.0"~ version field.  Incompatible RPC
