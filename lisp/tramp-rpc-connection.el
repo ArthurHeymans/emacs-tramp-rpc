@@ -63,7 +63,15 @@
   ;; Non-nil once the transport sentinel wrapper has been installed.
   sentinel-installed
   ;; Non-nil while a dead-connection probe of this generation runs.
-  probing)
+  probing
+  ;; Remote environment as probed through this transport.  These belong to
+  ;; the generation for the same reason requests do: a replacement must not
+  ;; inherit a value observed through its predecessor, and nothing has to be
+  ;; invalidated when a generation is retired.  Nil means "not computed";
+  ;; see tramp-rpc-environment.el for the cons conventions.
+  system-info exec-path login-shell login-path direnv-available
+  ;; Remote directory -> (TIMESTAMP . ENV) for direnv, per generation.
+  (direnv-env (make-hash-table :test 'equal)))
 
 (defun tramp-rpc--connection-transport (connection)
   "Return the transport process of CONNECTION, or nil when CONNECTION is nil.

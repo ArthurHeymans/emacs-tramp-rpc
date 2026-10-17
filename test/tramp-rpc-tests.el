@@ -169,16 +169,10 @@ Value is a cons cell (CHECKED . RESULT).")
      (let* ((proc (tramp-rpc-connection-process conn))
             (vec (and proc (process-get proc :tramp-rpc-vec))))
        (when vec
-         ;; Keep the startup system.info response warm.  It is connection
-         ;; metadata, not a file-operation cache, and refetching it makes call
-         ;; counts depend on whether this connection was just replaced.
-         (let ((system-info
-                (tramp-rpc--get-route-connection-property
-                 vec tramp-rpc--system-info-property nil)))
-           (tramp-flush-directory-properties vec "/")
-           (tramp-flush-connection-properties vec)
-           (when system-info
-             (tramp-rpc--cache-system-info vec system-info)))
+         ;; `system.info' lives on the generation, so flushing TRAMP
+         ;; properties no longer refetches it and call counts stay stable.
+         (tramp-flush-directory-properties vec "/")
+         (tramp-flush-connection-properties vec)
          (tramp-rpc--clear-file-caches-for-connection vec))))
    tramp-rpc--connections))
 
@@ -432,8 +426,17 @@ The directory is deleted after BODY completes."
   (skip-unless (tramp-rpc-test-enabled))
 
   (let ((vec (tramp-dissect-file-name (tramp-rpc-test--remote-directory))))
-    ;; This test alone measures the cold connection-metadata lookup.
+    ;; The response belongs to the generation, so flushing TRAMP's property
+    ;; cache no longer makes a connection-metadata lookup cold.
     (tramp-flush-connection-properties vec)
+    (tramp-rpc-test--with-call-count 0
+      (list (tramp-get-remote-uid vec 'integer)
+            (tramp-get-remote-gid vec 'integer)
+            (tramp-get-home-directory vec)))
+    ;; Dropping the generation's own copy does, and the three lookups then
+    ;; share a single refetch.
+    (setf (tramp-rpc-connection-system-info (tramp-rpc--get-connection vec))
+          nil)
     (let ((result (tramp-rpc-test--with-call-count 1
                     (list (tramp-get-remote-uid vec 'integer)
                           (tramp-get-remote-gid vec 'integer)

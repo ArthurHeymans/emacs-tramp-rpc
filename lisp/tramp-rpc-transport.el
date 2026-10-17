@@ -60,8 +60,19 @@
 
 (defvar tramp-rpc-connection-invalidate-functions nil
   "Functions called with VEC when VEC's connection state must be forgotten.
-Run before a new generation becomes visible and when a generation is
-retired, so caches keyed by the TRAMP connection spelling can be dropped.")
+Run after a generation is detached from the connection table and its owned
+connection properties are flushed, and before a successor is installed.
+VEC therefore has no live generation while these functions start, and a
+callback that installs one must not be punished by the retiring side.
+Callbacks must only drop state they own: they may run on a VEC that has
+never connected and must not depend on the retiring generation itself.
+Each function runs in its own error handler, so one failure cannot leave a
+claimed generation half-cleaned.")
+
+(defvar tramp-rpc--retiring-generation nil
+  "Non-nil while connection invalidators run for a detached generation.
+Invalidation is not reentered from a callback: the outermost run owns it,
+and every callback observes the same detached generation.")
 
 (defvar tramp-rpc-transport-terminate-functions nil
   "Functions called with VEC, PROCESS and CONNECTION before a transport dies.
@@ -227,9 +238,11 @@ is still its process's current timer.")
 Home-directory properties named ~USER are route-sensitive as well.")
 
 (defconst tramp-rpc--owned-route-connection-properties
-  '("tramp-rpc-login-path" "rpc-signal-strings"
-    " rpc-acl-enabled" " rpc-selinux-enabled" "tramp-rpc-system-info")
-  "Project-specific route-aware TRAMP connection properties.")
+  '("rpc-signal-strings"
+    " rpc-acl-enabled" " rpc-selinux-enabled")
+  "Project-specific route-aware TRAMP connection properties.
+The remote environment and `system.info' are generation state, not
+connection properties; see `tramp-rpc-connection'.")
 
 (defvar tramp-rpc--route-property-access nil
   "Non-nil while accessing an explicitly route-qualified TRAMP property.")
@@ -344,37 +357,68 @@ hop."
         (puthash key (make-mutex "tramp-rpc connection lifecycle")
                  tramp-rpc--connection-lifecycle-mutexes))))
 
+(defun tramp-rpc--live-connection-p (connection)
+  "Return non-nil when CONNECTION is a usable generation."
+  (and connection
+       (process-live-p (tramp-rpc-connection-process connection))
+       (buffer-live-p (tramp-rpc-connection-buffer connection))))
+
+(defun tramp-rpc--run-connection-invalidators (vec)
+  "Run `tramp-rpc-connection-invalidate-functions' for a detached VEC.
+The retiring generation has already left the connection table.  A callback
+that publishes a replacement keeps it: nothing below removes connection
+state again.  Errors and quits from one callback are reported and do not
+skip the remaining callbacks, because callers cannot finish cleanup when
+invalidation signals."
+  (unless tramp-rpc--retiring-generation
+    (let ((tramp-rpc--retiring-generation t))
+      (run-hook-wrapped
+       'tramp-rpc-connection-invalidate-functions
+       (lambda (function vec)
+         (condition-case err
+             (funcall function vec)
+           ((error quit)
+            (tramp-rpc--debug "Connection invalidation %S failed for %s: %s"
+                              function (tramp-file-name-host vec)
+                              (error-message-string err))))
+         nil)
+       vec))))
+
 (defun tramp-rpc--set-connection (vec process buffer &optional stderr-buffer)
   "Store the RPC connection for VEC.
-Caches keyed only by the TRAMP connection spelling are invalidated before a
-new generation is made visible.
+A generation already registered for VEC is detached first.  Owned
+connection properties and caches keyed by the TRAMP connection spelling are
+always dropped before the successor is published, so a new generation
+never reuses state left by an earlier one.
 PROCESS is the RPC transport process.
 BUFFER receives the RPC response stream.
 STDERR-BUFFER receives the transport's standard error output."
-  (run-hook-with-args 'tramp-rpc-connection-invalidate-functions vec)
-  (let ((connection
-         (tramp-rpc--make-connection
-          :process process :buffer buffer :stderr-buffer stderr-buffer
-          :vec vec)))
-    ;; Retain the exact generation and vector on its transport so late cleanup
-    ;; cannot accidentally route RPCs through a replacement connection.
-    (tramp-rpc--attach-connection connection)
-    (puthash (tramp-rpc--connection-key vec) connection
-             tramp-rpc--connections)))
+  (let ((key (tramp-rpc--connection-key vec)))
+    (remhash key tramp-rpc--connections)
+    (tramp-rpc--flush-owned-route-connection-properties vec)
+    (tramp-rpc--run-connection-invalidators vec)
+    (let ((connection
+           (tramp-rpc--make-connection
+            :process process :buffer buffer :stderr-buffer stderr-buffer
+            :vec vec)))
+      ;; Retain the exact generation and vector on its transport so late cleanup
+      ;; cannot accidentally route RPCs through a replacement connection.
+      (tramp-rpc--attach-connection connection)
+      (puthash key connection tramp-rpc--connections))))
 
 (defun tramp-rpc--remove-connection (vec &optional process)
   "Remove VEC's connection, optionally only when PROCESS is current.
-This is the single place a retired generation runs
-`tramp-rpc-connection-invalidate-functions', before it leaves the
-connection table, so higher layers drop their per-connection caches
-for file metadata and the remote environment exactly once."
+The expected generation is detached and its owned connection properties are
+flushed before `tramp-rpc-connection-invalidate-functions' runs, so a
+callback that publishes a replacement cannot have it removed by the
+resumed retirement."
   (let* ((key (tramp-rpc--connection-key vec))
          (current (gethash key tramp-rpc--connections)))
     (when (and current
                (or (null process) (eq process (tramp-rpc-connection-process current))))
-      (run-hook-with-args 'tramp-rpc-connection-invalidate-functions vec)
       (remhash key tramp-rpc--connections)
-      (tramp-rpc--flush-owned-route-connection-properties vec))))
+      (tramp-rpc--flush-owned-route-connection-properties vec)
+      (tramp-rpc--run-connection-invalidators vec))))
 
 (defun tramp-rpc--connection-error-response (vec event)
   "Return an RPC error response for a transport failure on VEC.
@@ -550,28 +594,30 @@ throws `non-essential' instead of opening a new connection.
 This prevents background operations (timers, fontification,
 completion) from blocking on unreachable hosts."
   (let ((conn (tramp-rpc--get-connection vec)))
-    (if (and conn
-             (process-live-p (tramp-rpc-connection-process conn))
-             (buffer-live-p (tramp-rpc-connection-buffer conn)))
+    (if (tramp-rpc--live-connection-p conn)
         conn
       (with-mutex (tramp-rpc--connection-lifecycle-mutex vec)
         ;; Another thread may have reconnected while this one waited.
         (setq conn (tramp-rpc--get-connection vec))
-        (if (and conn
-                 (process-live-p (tramp-rpc-connection-process conn))
-                 (buffer-live-p (tramp-rpc-connection-buffer conn)))
+        (if (tramp-rpc--live-connection-p conn)
             conn
           ;; Stale connection - remove it before reconnecting.
           (when conn
             (tramp-rpc--remove-connection vec))
-          ;; During non-essential operations, don't open new connections.
-          ;; This mirrors the (unless (tramp-connectable-p vec)
-          ;; (throw 'non-essential 'non-essential)) pattern used by every
-          ;; standard TRAMP backend in their maybe-open-connection functions.
-          (unless (tramp-connectable-p vec)
-            (throw 'non-essential 'non-essential))
-          ;; Need to establish connection.
-          (tramp-rpc--connect vec))))))
+          ;; Retirement invalidators may have published a replacement (for
+          ;; example a callback that reconnects); use it instead of dialling
+          ;; a second transport for the same route.
+          (setq conn (tramp-rpc--get-connection vec))
+          (if (tramp-rpc--live-connection-p conn)
+              conn
+            ;; During non-essential operations, don't open new connections.
+            ;; This mirrors the (unless (tramp-connectable-p vec)
+            ;; (throw 'non-essential 'non-essential)) pattern used by every
+            ;; standard TRAMP backend in their maybe-open-connection functions.
+            (unless (tramp-connectable-p vec)
+              (throw 'non-essential 'non-essential))
+            ;; Need to establish connection.
+            (tramp-rpc--connect vec)))))))
 
 (defun tramp-rpc--ensure-controlmaster-directory ()
   "Ensure the ControlMaster socket directory exists.
@@ -1866,9 +1912,6 @@ This is more efficient when the server has async support."
 ;; system.info
 ;; ============================================================================
 
-(defconst tramp-rpc--system-info-property "tramp-rpc-system-info"
-  "TRAMP connection property storing the cached system.info response.")
-
 (defcustom tramp-rpc-watcher-unavailable-ttl 30
   "TTL cap in seconds for caches when push notifications are unavailable.
 When the server reports `watcher_available' as false, `fs.events'
@@ -1895,12 +1938,16 @@ An explicit non-t value marks degraded."
       (when (and cell (not (eq (cdr cell) t)))
         (setq tramp-rpc--watcher-degraded t)))))
 
-(defun tramp-rpc--cache-system-info (vec info)
-  "Store system.info INFO for VEC and seed related TRAMP properties."
+(defun tramp-rpc--cache-system-info (vec info &optional connection)
+  "Store system.info INFO for VEC and seed related TRAMP properties.
+The response itself lives on the generation that probed it, so a replacement
+server cannot inherit it.  CONNECTION is that generation when the caller
+already has it."
   (when info
     (tramp-rpc--note-watcher-availability info)
-    (tramp-rpc--set-route-connection-property
-     vec tramp-rpc--system-info-property info)
+    (when-let* ((connection (or connection
+                               (tramp-rpc--get-connection vec))))
+      (setf (tramp-rpc-connection-system-info connection) info))
     ;; Store remote uname so `tramp-check-remote-uname' works.  The server
     ;; returns "linux" or "macos"; map to the kernel names tramp-sh expects.
     (when-let* ((os (alist-get 'os info)))
@@ -1929,22 +1976,21 @@ An explicit non-t value marks degraded."
 
 (defun tramp-rpc--cached-system-info (vec)
   "Return the system.info cached for VEC, or nil.  Never issues an RPC."
-  (tramp-rpc--get-route-connection-property
-   vec tramp-rpc--system-info-property nil))
+  (when-let* ((connection (tramp-rpc--get-connection vec)))
+    (tramp-rpc-connection-system-info connection)))
 
 (defun tramp-rpc--system-info (vec)
   "Return cached system.info for VEC, fetching it at most once per connection."
   (or (tramp-rpc--cached-system-info vec)
-      (progn
-        ;; Establishing a new connection already performs and caches a
-        ;; `system.info' call as its readiness ping.  Re-check the property after
-        ;; connection setup so a cold caller does not immediately send a second
-        ;; identical RPC.
-        (tramp-rpc--ensure-connection vec)
-        (or (tramp-rpc--get-route-connection-property
-             vec tramp-rpc--system-info-property nil)
+      ;; Establishing a new connection already performs and caches a
+      ;; `system.info' call as its readiness ping.  Re-read the generation
+      ;; after connection setup so a cold caller does not immediately send a
+      ;; second identical RPC.
+      (let ((connection (tramp-rpc--ensure-connection vec)))
+        (or (tramp-rpc-connection-system-info connection)
             (tramp-rpc--cache-system-info
-             vec (tramp-rpc--call vec "system.info" nil))))))
+             vec (tramp-rpc--call vec "system.info" nil connection)
+             connection)))))
 
 (provide 'tramp-rpc-transport)
 ;;; tramp-rpc-transport.el ends here

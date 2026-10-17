@@ -244,10 +244,10 @@ The effective environment handed to remote processes, built on the
 transport's call primitives: the remote PATH (from ~tramp-remote-path~
 and the login shell), TRAMP's remote process environment, the caller's
 environment, and direnv variables, merged by
-~tramp-rpc--process-environment~.  Its per-connection caches (exec-path,
-login shell, direnv) are dropped through
-~tramp-rpc-connection-invalidate-functions~ when a generation is
-retired or replaced.
+~tramp-rpc--process-environment~.  The probes behind it (exec-path,
+login shell, login path, direnv) are cached on the
+~tramp-rpc-connection~ generation that performed them, so a replacement
+starts with none of it and retirement needs no invalidation.
 
 *** Connection Module (~tramp-rpc-connection.el~)
 

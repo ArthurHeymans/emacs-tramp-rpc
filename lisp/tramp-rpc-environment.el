@@ -21,11 +21,17 @@
 ;; and direnv variables for the process directory.  `tramp-rpc--process-environment'
 ;; merges these layers into the alist sent with process-running RPCs.
 ;;
-;; The results are cached per connection (exec-path, login shell, and
-;; direnv availability/environments).  The transport does not know about
-;; these caches; this module drops them by registering on
-;; `tramp-rpc-connection-invalidate-functions', which the transport runs
-;; whenever a connection generation is retired or replaced.
+;; The results are cached on the `tramp-rpc-connection' generation that
+;; probed them (exec-path, login shell, login path, direnv
+;; availability/environments), so a replacement generation starts with none of
+;; it and a retired one needs no invalidation.  `tramp-rpc-clear-all-caches'
+;; can still reset a live generation's environment explicitly.
+;;
+;; A probe can span several RPCs.  Its result is stored on the generation
+;; captured when the probe started, never on whatever generation is current
+;; afterwards, so a successor cannot inherit a half-probed value.  If that
+;; generation dies mid-probe the calls reconnect on their own; the result still
+;; describes this route and is simply dropped with the dead object.
 
 ;;; Code:
 
@@ -66,14 +72,6 @@ treated like `tramp-own-remote-path'."
 ;; Direnv environment caching for process execution
 ;; ============================================================================
 
-(defvar tramp-rpc--direnv-cache (make-hash-table :test 'equal)
-  "Cache of direnv environments keyed by (connection-key . directory).
-Value is a plist with :env (alist) and :timestamp.")
-
-(defvar tramp-rpc--direnv-available-cache (make-hash-table :test 'equal)
-  "Cache tracking whether direnv is available on each connection.
-Value is :available, :unavailable, or nil (unknown).")
-
 (defcustom tramp-rpc-use-direnv t
   "Whether to load direnv environment for remote processes.
 When enabled, runs `direnv export json` to get project-specific
@@ -101,24 +99,26 @@ home path map to the same cache key."
 Returns alist of (VAR . VALUE) pairs, or nil if direnv unavailable/disabled.
 Results are cached for `tramp-rpc-direnv-cache-timeout' seconds."
   (when tramp-rpc-use-direnv
-    (let* ((conn-key (tramp-rpc--connection-key vec))
-           (direnv-status (gethash conn-key tramp-rpc--direnv-available-cache)))
+    (let ((connection (tramp-rpc--get-connection vec)))
       ;; Skip if we already know direnv is unavailable on this host
-      (unless (eq direnv-status :unavailable)
+      (unless (and connection
+                   (eq (tramp-rpc-connection-direnv-available connection)
+                       :unavailable))
         (let* ((cache-key (tramp-rpc--direnv-cache-key vec directory))
-               (cached (gethash cache-key tramp-rpc--direnv-cache))
+               (cache (and connection
+                           (tramp-rpc-connection-direnv-env connection)))
+               (cached (and cache (gethash cache-key cache)))
                (now (float-time)))
           ;; Check if cache is valid
           (if (and cached
-                   (< (- now (plist-get cached :timestamp))
+                   (< (- now (car cached))
                       tramp-rpc-direnv-cache-timeout))
-              (plist-get cached :env)
+              (cdr cached)
             ;; Need to fetch fresh
             (let ((env (tramp-rpc--fetch-direnv-environment vec directory)))
               ;; Cache the result (even if nil, to avoid repeated failures)
-              (puthash cache-key
-                       (list :env env :timestamp now)
-                       tramp-rpc--direnv-cache)
+              (when cache
+                (puthash cache-key (cons now env) cache))
               env)))))))
 
 (defcustom tramp-rpc-direnv-essential-vars
@@ -164,43 +164,28 @@ See `tramp-rpc-direnv-essential-vars' for the list of variables."
                (tramp-rpc--debug "direnv JSON parse failed: %S" err)
                nil))
           ;; If exit code is 127 (command not found), mark direnv as unavailable
-          (when (eq exit-code 127)
-            (puthash (tramp-rpc--connection-key vec)
-                     :unavailable
-                     tramp-rpc--direnv-available-cache))
+          (when-let* (((eq exit-code 127))
+                      (connection (tramp-rpc--get-connection vec)))
+            (setf (tramp-rpc-connection-direnv-available connection)
+                  :unavailable))
           nil))
     (error
      (tramp-rpc--debug "direnv fetch failed: %S" err)
      nil)))
 
 (defun tramp-rpc--clear-direnv-cache (&optional vec)
-  "Clear the direnv caches.
-If VEC is provided, only clear entries for that connection.
-Otherwise clear all entries."
+  "Drop the direnv environment cached for generations.
+With VEC, reset only the generation serving VEC; without it, reset every
+live generation.  Used by the explicit cache-clearing commands; retiring a
+generation needs no such step."
   (if vec
-      (let ((conn-key (tramp-rpc--connection-key vec)))
-        ;; Clear environment cache entries for this connection
-        (let ((keys-to-remove nil))
-          (maphash (lambda (key _value)
-                     (when (equal (car key) conn-key)
-                       (push key keys-to-remove)))
-                   tramp-rpc--direnv-cache)
-          (dolist (key keys-to-remove)
-            (remhash key tramp-rpc--direnv-cache)))
-        ;; Clear availability cache for this connection
-        (remhash conn-key tramp-rpc--direnv-available-cache))
-    (clrhash tramp-rpc--direnv-cache)
-    (clrhash tramp-rpc--direnv-available-cache)))
-
-;; ============================================================================
-;; Remote exec-path and login-shell caches
-;; ============================================================================
-
-(defvar tramp-rpc--exec-path-cache (make-hash-table :test 'equal)
-  "Cache of remote variable `exec-path' keyed by connection-key.")
-
-(defvar tramp-rpc--login-shell-cache (make-hash-table :test 'equal)
-  "Cache of remote login shell keyed by connection-key.")
+      (when-let* ((connection (tramp-rpc--get-connection vec)))
+        (setf (tramp-rpc-connection-direnv-available connection) nil)
+        (clrhash (tramp-rpc-connection-direnv-env connection)))
+    (maphash (lambda (_key connection)
+               (setf (tramp-rpc-connection-direnv-available connection) nil)
+               (clrhash (tramp-rpc-connection-direnv-env connection)))
+             tramp-rpc--connections)))
 
 ;; ============================================================================
 ;; Environment merging
@@ -245,14 +230,16 @@ server side."
 
 (defun tramp-rpc--cached-remote-path (vec)
   "Return cached remote PATH directories for VEC, computing them if needed.
-Return incomplete results without caching them."
-  (let* ((key (tramp-rpc--connection-key vec))
-         (cached (gethash key tramp-rpc--exec-path-cache)))
-    (or cached
-        (let ((computed (tramp-rpc--compute-remote-path vec)))
-          (when (cdr computed)
-            (puthash key (car computed) tramp-rpc--exec-path-cache))
-          (car computed)))))
+Return incomplete results without caching them.  The cache belongs to the
+generation that probed it, so it can never be reused by a successor."
+  (let ((connection (tramp-rpc--get-connection vec)))
+    (if-let* ((cached (and connection
+                           (tramp-rpc-connection-exec-path connection))))
+        (car cached)
+      (let ((computed (tramp-rpc--compute-remote-path vec)))
+        (when (and connection (cdr computed))
+          (setf (tramp-rpc-connection-exec-path connection) computed))
+        (car computed)))))
 
 (defun tramp-rpc--remote-path-environment (vec)
   "Return the configured PATH environment entry for VEC.
@@ -265,10 +252,17 @@ Uses `tramp-remote-path' by default.  A non-nil deprecated
 (defun tramp-rpc--cached-login-path (vec)
   "Return the login shell PATH directories for VEC, caching the result.
 A failed fetch is not cached."
-  (condition-case nil
-      (tramp-rpc--with-route-connection-property vec "tramp-rpc-login-path"
-        (or (tramp-rpc--fetch-remote-exec-path vec) '()))
-    (error '())))
+  (let ((connection (tramp-rpc--get-connection vec)))
+    (if-let* ((cached (and connection
+                           (tramp-rpc-connection-login-path connection))))
+        (cdr cached)
+      (condition-case nil
+          (let ((path (or (tramp-rpc--fetch-remote-exec-path vec) '())))
+            (when connection
+              (setf (tramp-rpc-connection-login-path connection)
+                    (cons t path)))
+            path)
+        (error '())))))
 
 (defun tramp-rpc--process-path-environment (vec)
   "Return the PATH entry used for shell child processes on VEC.
@@ -462,10 +456,10 @@ succeeds."
 Tries the `shell' field from system.info (populated via getpwuid on
 the server).  Falls back to looking up the user via `getent passwd'
 and extracting field 7.  Returns \"/bin/sh\" if all lookups fail.
-Result is cached per connection."
-  (let* ((key (tramp-rpc--connection-key vec))
-         (cached (gethash key tramp-rpc--login-shell-cache)))
-    (or cached
+Result is cached on the generation serving VEC."
+  (let ((connection (tramp-rpc--get-connection vec)))
+    (or (and connection
+             (tramp-rpc-connection-login-shell connection))
         (let ((shell
                (condition-case nil
                    (let* ((info (tramp-rpc--system-info vec))
@@ -474,7 +468,8 @@ Result is cached per connection."
                          sh
                        (tramp-rpc--get-remote-login-shell-via-getent vec)))
                  (error (tramp-rpc--get-remote-login-shell-via-getent vec)))))
-          (puthash key shell tramp-rpc--login-shell-cache)
+          (when connection
+            (setf (tramp-rpc-connection-login-shell connection) shell))
           shell))))
 
 (defun tramp-rpc--get-remote-login-shell-via-getent (vec)
@@ -531,34 +526,25 @@ Signals when VEC cannot be reached."
 ;; Cache invalidation
 ;; ============================================================================
 
+(defun tramp-rpc--reset-connection-environment (connection)
+  "Drop CONNECTION's cached remote environment."
+  (setf (tramp-rpc-connection-exec-path connection) nil
+        (tramp-rpc-connection-login-shell connection) nil
+        (tramp-rpc-connection-login-path connection) nil
+        (tramp-rpc-connection-direnv-available connection) nil)
+  (clrhash (tramp-rpc-connection-direnv-env connection)))
+
 (defun tramp-rpc--clear-environment-caches (&optional vec)
-  "Clear cached remote environments, exec-paths and login shells.
-With VEC, clear only that connection's entries; without it, clear all."
-  (tramp-rpc--clear-direnv-cache vec)
+  "Reset the remote environment cached for generations.
+With VEC, reset the generation serving VEC; without it, reset every live
+generation.  Generation retirement needs no equivalent: the environment is
+part of the generation, so a successor starts with none of it."
   (if vec
-      (let ((key (tramp-rpc--connection-key vec)))
-        (remhash key tramp-rpc--exec-path-cache)
-        (remhash key tramp-rpc--login-shell-cache))
-    (clrhash tramp-rpc--exec-path-cache)
-    (clrhash tramp-rpc--login-shell-cache)))
-
-;; ============================================================================
-;; Unload support
-;; ============================================================================
-
-(defun tramp-rpc-environment-unload-function ()
-  "Unload function for tramp-rpc-environment.
-Removes its connection-invalidation callback."
-  (remove-hook 'tramp-rpc-connection-invalidate-functions
-               #'tramp-rpc--clear-environment-caches)
-  ;; Return nil to allow normal unload to proceed
-  nil)
-
-;; The cached PATH, login shell and direnv state describe a connection's
-;; remote host as last probed; a retired or replaced generation must not
-;; hand them to its successor.
-(add-hook 'tramp-rpc-connection-invalidate-functions
-          #'tramp-rpc--clear-environment-caches t)
+      (when-let* ((connection (tramp-rpc--get-connection vec)))
+        (tramp-rpc--reset-connection-environment connection))
+    (maphash (lambda (_key connection)
+               (tramp-rpc--reset-connection-environment connection))
+             tramp-rpc--connections)))
 
 (provide 'tramp-rpc-environment)
 ;;; tramp-rpc-environment.el ends here
