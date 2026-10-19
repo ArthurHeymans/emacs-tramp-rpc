@@ -1162,6 +1162,21 @@ This matches the behavior expected by `tramp-test28-process-file'."
 (defconst tramp-rpc-mock-test--tramp-rpc-loaded t
   "The full TRAMP-RPC backend was loaded successfully.")
 
+(ert-deftest tramp-rpc-mock-test-expand-file-name-relative-remote-directory ()
+  "Relative remote directories resolve under home, like explicit names."
+  (cl-letf (((symbol-function 'tramp-connectable-p) (lambda (_) t))
+            ((symbol-function 'tramp-get-home-directory)
+             (lambda (&rest _) "/home/user")))
+    (dolist (directory '("/rpc:host:tmp" "/rpc:host:tmp/"))
+      (let ((default-directory directory))
+        (dolist (name '("file" "./file" "a/../file"))
+          (should (equal (expand-file-name name directory)
+                         "/rpc:host:/home/user/tmp/file"))
+          (should (equal (expand-file-name name)
+                         "/rpc:host:/home/user/tmp/file")))
+        (should (equal (expand-file-name "" directory)
+                       (expand-file-name "" (expand-file-name directory))))))))
+
 (ert-deftest tramp-rpc-mock-test-sanitize-native-comp-load-history ()
   "Malformed native-comp entries are removed only from TRAMP-RPC modules."
   (let* ((anonymous '(defun . --anonymous-lambda))
