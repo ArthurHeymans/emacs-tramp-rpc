@@ -210,7 +210,7 @@ run normally instead of using a possibly stale status snapshot.")
 
 (defconst tramp-rpc-magit--git-index-event-regexp
   (rx (or bos "/") ".git/"
-      (* (or "worktrees" "modules") "/" (+ (not (any "/"))) "/")
+      (* (or "worktrees" "modules") "/" (+ (not "/")) "/")
       "index" (? ".lock") eos)
   "Paths of the git index files, including worktree and submodule ones.")
 
