@@ -2503,8 +2503,14 @@ signalling an error.
 `tramp-verbose' is suppressed during the first attempt because
 `tramp-error' logs a level-1 message before signalling, which
 would otherwise flood the echo area with \"Cannot expand tilde\".
-NAME identifies the connection.
-DIR is the directory being handled."
+Relative NAME is resolved against DIR or `default-directory' before
+expanding a relative remote localname against the remote home directory."
+  ;; Like `tramp-handle-expand-file-name', combine NAME and DIR first so
+  ;; the home-relative normalization also sees a remote directory supplied
+  ;; through DIR or `default-directory'.
+  (unless (file-name-absolute-p name)
+    (setq name (file-name-concat (or dir default-directory "/")
+                                 (if (string-empty-p name) "." name))))
   ;; The generic `tramp-handle-expand-file-name' defaults non-absolute
   ;; localnames to "/" (root), but the ssh handler
   ;; (`tramp-sh-handle-expand-file-name') defaults to "~/" instead.
@@ -2513,9 +2519,8 @@ DIR is the directory being handled."
   ;; relative to the home directory rather than the filesystem root.
   ;; Guard with `tramp-connectable-p' so that the tilde substitution is
   ;; skipped during completion when no connection exists, avoiding a
-  ;; blocking connection attempt when `non-essential' is t.  When not
-  ;; connectable the generic handler falls through to "/" (root) rather
-  ;; than the home directory — acceptable for the completion case.
+  ;; blocking connection attempt when `non-essential' is t.  Leave that
+  ;; case to the generic handler's non-connecting expansion.
   ;; Use `tramp-dissect-file-name' and `tramp-make-tramp-file-name'
   ;; instead of `file-remote-p' to avoid re-entering expand-file-name.
   (when (tramp-tramp-file-p name)
