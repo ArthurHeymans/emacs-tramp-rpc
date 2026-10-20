@@ -59,7 +59,7 @@
         (tramp-rpc-deploy-git-build-policy 'build)
         (tramp-rpc-deploy-remote-directory "/frozen/deploy")
         (hashes 0))
-    (cl-letf (((symbol-function 'tramp-rpc-deploy--use-source-binary-id-p) (lambda () t))
+    (cl-letf (((symbol-function 'tramp-rpc-deploy--use-source-binary-id-p) #'always)
               ((symbol-function 'tramp-rpc-deploy--source-tree-hash)
                (lambda () (cl-incf hashes) (make-string 64 ?a)))
               ((symbol-function 'tramp-rpc-deploy--git-revision) (lambda () "revision"))
@@ -104,8 +104,8 @@
          (tramp-rpc-deploy--plan (tramp-rpc-deploy--make-plan
                                   :source-directory source :source-hash "before")))
     (unwind-protect
-        (cl-letf (((symbol-function 'tramp-rpc-deploy--cargo-available-p) (lambda () t))
-                  ((symbol-function 'tramp-rpc-deploy--can-build-for-arch-p) (lambda (_) t))
+        (cl-letf (((symbol-function 'tramp-rpc-deploy--cargo-available-p) #'always)
+                  ((symbol-function 'tramp-rpc-deploy--can-build-for-arch-p) #'always)
                   ((symbol-function 'tramp-rpc-deploy--local-cache-path) (lambda (_) "/unused"))
                   ((symbol-function 'call-process) (lambda (&rest _) 0))
                   ((symbol-function 'tramp-rpc-deploy--source-tree-hash) (lambda () "after"))
@@ -239,7 +239,7 @@
             (cl-letf (((symbol-function 'tramp-rpc--ensure-connection) (lambda (_) connection))
                       ((symbol-function 'tramp-rpc--get-connection)
                        (lambda (_) (tramp-rpc--make-connection :process 'replacement)))
-                      ((symbol-function 'tramp-rpc--sudo-password-required-p) (lambda (_) t))
+                      ((symbol-function 'tramp-rpc--sudo-password-required-p) #'always)
                       ((symbol-function 'tramp-rpc--sudo-read-password) (lambda (&rest _) "secret"))
                       ((symbol-function 'tramp-rpc--remote-path-environment) #'ignore)
                       ((symbol-function 'tramp-rpc--tramp-remote-process-environment) #'ignore)
