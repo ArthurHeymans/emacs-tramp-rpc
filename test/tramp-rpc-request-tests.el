@@ -70,7 +70,7 @@ SPEC is (PROCESS BUFFER [CONNECTION]); CONNECTION defaults to `connection'."
                  (lambda (_vec) connection))
                 ((symbol-function 'tramp-rpc-protocol-encode-request-with-id)
                  (lambda (&rest _) '(101 . "request")))
-                ((symbol-function 'process-send-string) (lambda (&rest _) nil))
+                ((symbol-function 'process-send-string) #'ignore)
                 ((symbol-function 'tramp-rpc--invalidate-timed-out-connection)
                  (lambda (timed-out-process timed-out-vec _event)
                    (setq invalidated (list timed-out-process timed-out-vec))))
@@ -486,7 +486,7 @@ SPEC is (PROCESS BUFFER [CONNECTION]); CONNECTION defaults to `connection'."
                       ((symbol-function 'tramp-rpc-protocol-encode-request-with-id)
                        (lambda (&rest _) '(109 . "request")))
                       ((symbol-function 'process-send-string)
-                       (lambda (&rest _) nil))
+                       #'ignore)
                       ((symbol-function 'float-time) clock))
               (should-error
                (tramp-rpc--call-with-timeout vec "slow" nil 0 0)
@@ -685,7 +685,7 @@ The helper also verifies that the output payload in the notification is queued."
                 ((symbol-function 'tramp-rpc-protocol-encode-request-with-id)
                  (lambda (&rest _) '(301 . "request")))
                 ((symbol-function 'process-send-string)
-                 (lambda (&rest _) nil)))
+                 #'ignore))
         (should (eq 'done
                     (tramp-rpc-mock-test-request--assert-notification-survives-wait
                      vec process
@@ -706,7 +706,7 @@ The helper also verifies that the output payload in the notification is queued."
                 ((symbol-function 'tramp-rpc-protocol-encode-request-with-id)
                  (lambda (&rest _) '(302 . "batch")))
                 ((symbol-function 'process-send-string)
-                 (lambda (&rest _) nil)))
+                 #'ignore))
         (should (equal '(batch-result)
                        (tramp-rpc-mock-test-request--assert-notification-survives-wait
                         vec process
@@ -743,7 +743,7 @@ The helper also verifies that the output payload in the notification is queued."
                  (lambda (_vec) connection))
                 ((symbol-function 'tramp-rpc-protocol-encode-request-with-id)
                  (lambda (&rest _) '(102 . "batch")))
-                ((symbol-function 'process-send-string) (lambda (&rest _) nil))
+                ((symbol-function 'process-send-string) #'ignore)
                 ((symbol-function 'tramp-rpc--invalidate-timed-out-connection)
                  (lambda (timed-out-process timed-out-vec _event)
                    (setq invalidated (list timed-out-process timed-out-vec))))
@@ -766,7 +766,7 @@ The helper also verifies that the output payload in the notification is queued."
                  (lambda (_vec) connection))
                 ((symbol-function 'tramp-rpc-protocol-encode-request-with-id)
                  (lambda (&rest _) '(103 . "batch")))
-                ((symbol-function 'process-send-string) (lambda (&rest _) nil))
+                ((symbol-function 'process-send-string) #'ignore)
                 ((symbol-function 'float-time)
                  (lambda (&rest _)
                    (setq clock-calls (1+ clock-calls))
@@ -831,7 +831,7 @@ The helper also verifies that the output payload in the notification is queued."
                  (lambda (_vec) connection))
                 ((symbol-function 'tramp-rpc-protocol-encode-request-with-id)
                  (lambda (&rest _) '(105 . "quit")))
-                ((symbol-function 'process-send-string) (lambda (&rest _) nil))
+                ((symbol-function 'process-send-string) #'ignore)
                 ((symbol-function 'accept-process-output)
                  (lambda (&rest _) (signal 'quit nil))))
         (condition-case nil
@@ -867,9 +867,9 @@ The helper also verifies that the output payload in the notification is queued."
                  (lambda (_vec) connection))
                 ((symbol-function 'tramp-rpc-protocol-encode-request-with-id)
                  (lambda (&rest _) '(107 . "bail")))
-                ((symbol-function 'process-send-string) (lambda (&rest _) nil))
+                ((symbol-function 'process-send-string) #'ignore)
                 ((symbol-function 'tramp-rpc--process-accessible-p)
-                 (lambda (_process) nil)))
+                 #'ignore))
         (should (eq 'non-essential
                     (catch 'non-essential
                       (tramp-rpc--call-with-timeout vec "test" nil 30 0)
