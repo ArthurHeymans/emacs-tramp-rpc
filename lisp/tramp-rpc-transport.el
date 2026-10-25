@@ -603,6 +603,14 @@ by `with-environment-variables') are returned as an alist of
         (push (cons (match-string 1 elt) (match-string 2 elt)) env)))
     (nreverse env)))
 
+(defun tramp-rpc--process-directory (localname)
+  "Return the remote working directory for processes started in LOCALNAME.
+Unquote LOCALNAME, and map an empty one (as in \"/rpc:host:\") to \"~\":
+like tramp-sh, it denotes the remote home directory, and the server
+expands a leading \"~\" in process working directories."
+  (let ((localname (file-name-unquote localname)))
+    (if (string-empty-p localname) "~" localname)))
+
 (defun tramp-rpc--process-environment (vec localname &optional login-path)
   "Return the effective child environment for LOCALNAME on VEC.
 The configured remote PATH is the baseline.  When LOGIN-PATH is non-nil,

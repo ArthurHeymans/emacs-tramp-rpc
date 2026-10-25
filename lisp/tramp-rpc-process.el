@@ -902,8 +902,9 @@ Resolves program path and loads direnv environment from working directory."
     ;; buffer setup, stderr validation, and TRAMP file-name parsing.  The body
     ;; below is only the RPC-specific process creation path.
     (tramp-skeleton-make-process args nil t
-      ;; Unquote localname in case of file-name-quoted paths (e.g. /: prefix).
-      (setq localname (file-name-unquote localname))
+      ;; Unquote localname in case of file-name-quoted paths (e.g. /: prefix),
+      ;; and treat an empty one as the remote home directory.
+      (setq localname (tramp-rpc--process-directory localname))
       (let* ((sudo-command (and (car command)
                                 (string= (file-name-nondirectory (car command))
                                          "sudo")))
@@ -1103,8 +1104,15 @@ DIRENV-ENV is an optional alist of environment variables from direnv."
                                `(("TERM" . ,(or (getenv "TERM") "xterm-256color"))))
                        " "))
          ;; Build the remote command - cd to dir, export env, exec program
+         ;; Leave a leading "~" unquoted so the remote shell expands it.
          (remote-cmd (format "cd %s && %s exec %s %s"
-                             (tramp-shell-quote-argument localname)
+                             (if (string-match
+                                  (rx bos "~" (? (group "/" (* anychar))) eos)
+                                  localname)
+                                 (concat "~" (when (match-beginning 1)
+                                               (tramp-shell-quote-argument
+                                                (match-string 1 localname))))
+                               (tramp-shell-quote-argument localname))
                              env-exports
                               (tramp-shell-quote-argument program)
                               (mapconcat #'tramp-shell-quote-argument program-args " ")))

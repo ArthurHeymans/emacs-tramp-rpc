@@ -8503,6 +8503,35 @@ discard it for being unreadable."
       (should (equal (assoc "PATH" (alist-get 'env captured-params))
                      '("PATH" . "/home/user/.cargo/bin:/usr/bin:/bin"))))))
 
+(ert-deftest tramp-rpc-mock-test-process-directory ()
+  "Process working directories unquote names and map empty ones to home."
+  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
+  (should (equal (tramp-rpc--process-directory "") "~"))
+  (should (equal (tramp-rpc--process-directory "/work/") "/work/"))
+  (should (equal (tramp-rpc--process-directory "/:/work/") "/work/"))
+  (should (equal (tramp-rpc--process-directory "~/src") "~/src")))
+
+(ert-deftest tramp-rpc-mock-test-process-file-empty-localname-uses-home ()
+  "`process-file' from \"/rpc:host:\" runs in the remote home directory.
+An empty localname used to be sent as cwd \"\", which fails to spawn.
+TRAMP's container completion runs commands from such a directory."
+  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
+  (let ((default-directory "/rpc:user@host:")
+        (captured-params nil))
+    (cl-letf (((symbol-function 'tramp-rpc--process-environment)
+               #'ignore)
+              ((symbol-function 'tramp-rpc-magit--process-cache-lookup)
+               #'ignore)
+              ((symbol-function 'tramp-rpc--decode-output)
+               (lambda (output) output))
+              ((symbol-function 'tramp-rpc--call)
+               (lambda (_vec method params)
+                 (should (equal method "process.run"))
+                 (setq captured-params params)
+                 '((exit_code . 0) (stdout . "") (stderr . "")))))
+      (should (= (tramp-rpc-handle-process-file "pwd" nil nil nil) 0))
+      (should (equal (alist-get 'cwd captured-params) "~")))))
+
 (ert-deftest tramp-rpc-mock-test-process-file-invalidates-mutators-after-dispatch ()
   "Unwatched mutating commands invalidate connection caches afterwards."
   (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
