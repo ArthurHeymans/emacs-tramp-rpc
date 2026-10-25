@@ -2057,7 +2057,8 @@ async fn pty_read_removes_entry_after_terminal_eof() {
     let pid = map_get(&start, "pid").and_then(Value::as_u64).unwrap() as u32;
     let mut output = Vec::new();
     let mut exited = false;
-    for _ in 0..40 {
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+    while tokio::time::Instant::now() < deadline {
         let read = read_pty(Value::Map(vec![
             (Value::String("pid".into()), Value::Integer(pid.into())),
             (
@@ -2074,6 +2075,10 @@ async fn pty_read_removes_entry_after_terminal_eof() {
         if exited {
             break;
         }
+        // Terminal EOF clears `pending', so the read returns at once while
+        // waitpid may still report the child alive.  Sleep instead of
+        // consuming a poll budget faster than the child can be reaped.
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
     }
     assert!(exited);
     // Idle and terminal reads must return exactly the child's bytes:
