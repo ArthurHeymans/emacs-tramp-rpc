@@ -8724,6 +8724,35 @@ This matches tramp-sh and upstream `tramp-test28-process-file', which requires
       (should (equal (assoc "PYTHONUNBUFFERED" captured-env)
                      '("PYTHONUNBUFFERED" . "1"))))))
 
+(ert-deftest tramp-rpc-mock-test-sudo-password-probe-runs-command ()
+  "The sudo password probe runs a command instead of `sudo -v'.
+With sudo's default `verifypw=all', `sudo -n -v' fails unless every
+matching sudoers entry is NOPASSWD, although `sudo -n COMMAND' works."
+  :tags '(:sudo)
+  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
+  (let ((vec (tramp-dissect-file-name
+              "/rpc:alice@server|sudo:root@server:/root/"))
+        calls)
+    (cl-letf (((symbol-function 'tramp-rpc--call)
+               (lambda (vec method params)
+                 (push (list vec method params) calls)
+                 '((exit_code . 0) (stdout . "") (stderr . "")))))
+      (should-not (tramp-rpc--sudo-password-required-p vec))
+      (should (= (length calls) 1))
+      (pcase-let ((`(,auth-vec ,method ,params) (car calls)))
+        ;; The probe runs on the unprivileged connection.
+        (should (string= (tramp-file-name-method auth-vec) "rpc"))
+        (should (string= (tramp-file-name-user auth-vec) "alice"))
+        (should (string= method "process.run"))
+        (should (equal (alist-get 'cmd params) "sudo"))
+        (should (equal (append (alist-get 'args params) nil)
+                       '("-n" "true")))))
+    (cl-letf (((symbol-function 'tramp-rpc--call)
+               (lambda (&rest _)
+                 '((exit_code . 1) (stdout . "")
+                   (stderr . "sudo: a password is required\n")))))
+      (should (tramp-rpc--sudo-password-required-p vec)))))
+
 (ert-deftest tramp-rpc-mock-test-make-process-connection-type-nil-is-pipe ()
   "An explicit `:connection-type nil' must not fall back to global PTY mode."
   (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
