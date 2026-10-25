@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 # Run autoload tests for tramp-rpc
 #
 # These tests verify the autoload mechanism works correctly.
@@ -20,8 +20,11 @@ if [[ -d "$TRAMP_SOURCE/lisp" ]]; then
     # behavior.  Prefer the configured TRAMP checkout over the bundled Emacs
     # TRAMP, which can be too old for this project.
     EMACS_LOAD_PATH_ARGS=(-L "$TRAMP_SOURCE/lisp" "${EMACS_LOAD_PATH_ARGS[@]}")
+elif [[ -f "$TRAMP_SOURCE/tramp.el" ]]; then
+    # Flat checkout or ELPA package — .el files live directly in TRAMP_SOURCE.
+    EMACS_LOAD_PATH_ARGS=(-L "$TRAMP_SOURCE" "${EMACS_LOAD_PATH_ARGS[@]}")
 elif (( TRAMP_SOURCE_CONFIGURED )); then
-    echo "TRAMP_SOURCE does not contain a lisp/ directory: $TRAMP_SOURCE" >&2
+    echo "TRAMP_SOURCE does not contain a lisp/ directory or tramp.el: $TRAMP_SOURCE" >&2
     exit 1
 fi
 

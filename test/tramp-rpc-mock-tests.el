@@ -2983,7 +2983,7 @@ direct property test would miss it."
     (unwind-protect
         (progn
           (with-temp-file wrapper
-            (insert "#!/bin/bash\nargs=()\nfor arg in \"$@\"; do\n"
+            (insert "#!/usr/bin/env bash\nargs=()\nfor arg in \"$@\"; do\n"
                     "  if [[ $arg == */test/tramp-rpc-mock-tests.el ]]; then\n"
                     "    args+=(\"$RUNNER_TEST_FILE\")\n  else\n"
                     "    args+=(\"$arg\")\n  fi\ndone\n"

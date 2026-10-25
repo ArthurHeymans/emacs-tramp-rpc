@@ -284,6 +284,31 @@
         in
         (lib.genAttrs rustTargets mkTargetShell)
         // {
+          # Emacs plus the pinned Elisp dependencies (TRAMP, msgpack,
+          # package-lint) used by CI, without installing anything into
+          # ~/.emacs.d.  `nix develop .#elisp -c ./test/run-tests.sh --mock'
+          elisp =
+            let
+              deps = self.packages.${system}.ci-elisp-dependencies;
+            in
+            pkgs.mkShell {
+              packages = [ pkgs.emacs ];
+              shellHook = ''
+                elpa=${deps}/share/emacs/site-lisp/elpa
+                # Picked up by test/run-tests.sh.
+                export TRAMP_SOURCE="$(echo "$elpa"/tramp-[0-9]*)"
+                export MSGPACK_SOURCE="$(echo "$elpa"/msgpack-[0-9]*)"
+                # Plain `emacs -Q --batch' (byte-compile, ERT) sees the
+                # pinned packages before the built-in ones; the trailing
+                # colon keeps Emacs' default load-path.
+                EMACSLOADPATH="$(find -L "$elpa" -mindepth 1 -maxdepth 1 -type d | paste -sd: -):"
+                export EMACSLOADPATH
+                echo "TRAMP-RPC Elisp shell: $(emacs --version | head -1)"
+                echo "  TRAMP:   $TRAMP_SOURCE"
+                echo "  msgpack: $MSGPACK_SOURCE"
+              '';
+            };
+
           default = pkgs.mkShell {
             packages = [
               (mkRustToolchain rustTargets)
