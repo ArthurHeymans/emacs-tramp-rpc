@@ -2215,8 +2215,9 @@ DESTINATION controls where standard output and error are sent, as for
 `process-file'.
 ARGS contains the original function arguments."
   (with-parsed-tramp-file-name default-directory nil
-    ;; Unquote localname in case of file-name-quoted paths (e.g. /: prefix).
-    (setq localname (file-name-unquote localname))
+    ;; Unquote localname in case of file-name-quoted paths (e.g. /: prefix),
+    ;; and treat an empty one as the remote home directory.
+    (setq localname (tramp-rpc--process-directory localname))
     ;; Try serving from magit prefetch cache first (no RPC needed)
     (let* ((cache-output-p (and (null infile)
                                 (tramp-rpc--process-file-cache-output-p destination)))
