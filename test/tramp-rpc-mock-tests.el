@@ -7191,6 +7191,87 @@ A rejected sudo password must not be reused on the next attempt, otherwise
           (delete-process proc))
         (tramp-rpc--remove-connection vec)))))
 
+(ert-deftest tramp-rpc-mock-test-start-server-sudo-hop-without-user ()
+  "An rpc hop without a user leaves the SSH user to ssh's configuration.
+The local login name must not be passed as \"-l\" (issue #351)."
+  :tags '(:sudo)
+  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
+  (let ((vec (tramp-dissect-file-name "/rpc:server|sudo:root@server:/etc/"))
+        (orig-make-process (symbol-function 'make-process))
+        command proc)
+    (cl-letf (((symbol-function 'make-process)
+               (lambda (&rest plist)
+                 (setq command (plist-get plist :command))
+                 (setq proc (funcall orig-make-process
+                                     :name "tramp-rpc-mock-cat"
+                                     :buffer nil
+                                     :command '("cat")
+                                     :connection-type 'pipe
+                                     :noquery t))))
+              ((symbol-function 'tramp-rpc--call)
+               (lambda (_vec method _params)
+                 (should (equal method "system.info"))
+                 `((protocol_revision . ,tramp-rpc-protocol-revision)
+                   (uid . 0) (gid . 0) (home . "/root") (shell . "/bin/sh"))))
+              ((symbol-function 'tramp-set-connection-local-variables)
+               #'ignore))
+      (unwind-protect
+          (progn
+            (should (eq (tramp-rpc--detect-sudo-elevation vec) t))
+            (should (tramp-rpc--start-server-process
+                     vec "/tmp/tramp-rpc-server"))
+            (should (member "sudo" command))
+            (should-not (member "-l" command))
+            (should-not (member (user-login-name) command)))
+        (when (processp proc)
+          (delete-process proc))
+        (tramp-rpc--remove-connection vec)))))
+
+(ert-deftest tramp-rpc-mock-test-sudo-hop-without-user-login-vecs ()
+  "Sudo checks and deployment log in with the rpc hop's user, if any.
+Without one, they name no user, so ssh's configuration applies."
+  :tags '(:sudo)
+  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
+  (let ((vec (tramp-dissect-file-name "/rpc:server|sudo:root@server:/etc/")))
+    (should-not (tramp-file-name-user (tramp-rpc--sudo-auth-vec vec)))
+    (should-not (tramp-file-name-user (tramp-rpc-deploy--bootstrap-vec vec))))
+  (let ((vec (tramp-dissect-file-name
+              "/rpc:alice@server|sudo:root@server:/etc/")))
+    (should (equal (tramp-file-name-user (tramp-rpc--sudo-auth-vec vec))
+                   "alice"))
+    (should (equal (tramp-file-name-user (tramp-rpc-deploy--bootstrap-vec vec))
+                   "alice"))))
+
+(ert-deftest tramp-rpc-mock-test-sudo-ssh-user-from-ssh-config ()
+  "The sudo password user falls back to the user \"ssh -G\" selects."
+  :tags '(:sudo)
+  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
+  (let ((tramp-rpc-ssh-args '("-F" "/tmp/ssh_config"))
+        (tramp-rpc-ssh-options nil)
+        ssh-args)
+    (cl-letf (((symbol-function 'call-process)
+               (lambda (program _infile destination _display &rest args)
+                 (should (equal program "ssh"))
+                 (should (equal destination '(t nil)))
+                 (setq ssh-args args)
+                 (insert "hostname server.example\nuser remoteuser\nport 2222\n")
+                 0)))
+      (should (equal (tramp-rpc--sudo-ssh-user
+                      (tramp-dissect-file-name
+                       "/rpc:server#2222|sudo:root@server:/etc/"))
+                     "remoteuser"))
+      (should (equal (seq-take ssh-args 2) '("-F" "/tmp/ssh_config")))
+      (should (equal (last ssh-args 4) '("-p" "2222" "-G" "server")))
+      (setq ssh-args nil)
+      (should (equal (tramp-rpc--sudo-ssh-user
+                      (tramp-dissect-file-name
+                       "/rpc:alice@server|sudo:root@server:/etc/"))
+                     "alice"))
+      (should-not ssh-args))
+    (cl-letf (((symbol-function 'call-process) (lambda (&rest _) 255)))
+      (should-not (tramp-rpc--ssh-config-user
+                   (tramp-dissect-file-name "/rpc:server:/"))))))
+
 (ert-deftest tramp-rpc-mock-test-start-server-sudo-password-send-failure-cleans-up ()
   "A failed sudo password write tears down the unregistered transport."
   :tags '(:sudo)

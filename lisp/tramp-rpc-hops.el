@@ -164,12 +164,14 @@ misclassified as sudo-via-RPC."
   (tramp-rpc--same-host-rpc-hop vec))
 
 (defun tramp-rpc--detect-sudo-elevation (vec)
-  "Return the SSH user if VEC needs sudo elevation via RPC, or nil.
+  "Return non-nil if VEC needs sudo elevation via RPC.
 Detects privilege-elevation targets such as
-/rpc:user@host|sudo:root@host:/path.  Same-host rpc|rpc chains are not
-sudo elevation and return nil."
+/rpc:user@host|sudo:root@host:/path.  The value is the SSH user named in
+the rpc hop, or t when the hop names none: ssh then takes the user from
+its configuration.  Same-host rpc|rpc chains are not sudo elevation and
+return nil."
   (when-let* ((hop-vec (tramp-rpc--sudo-rpc-hop-vec vec)))
-    (or (tramp-file-name-user hop-vec) (user-login-name))))
+    (or (tramp-file-name-user hop-vec) t)))
 
 (defun tramp-rpc--ssh-detail-vec (vec)
   "Return the vec carrying SSH connection details for VEC.
@@ -202,7 +204,7 @@ avoids breakage if callers supply numeric defaults."
   (when-let* ((sudo-hop (tramp-rpc--sudo-rpc-hop-vec vec)))
     (make-tramp-file-name
      :method tramp-rpc-method
-     :user (or (tramp-file-name-user sudo-hop) (user-login-name))
+     :user (tramp-file-name-user sudo-hop)
      :domain (tramp-file-name-domain sudo-hop)
      :host (tramp-file-name-host sudo-hop)
      :port (tramp-file-name-port sudo-hop)

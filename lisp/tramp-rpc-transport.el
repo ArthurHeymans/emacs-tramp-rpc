@@ -984,11 +984,9 @@ For sudo-via-RPC paths, uses the SSH user and excludes the sudo
 hop so the socket is shared with the normal rpc connection."
   (let* ((sudo-hop (tramp-rpc--sudo-rpc-hop-vec vec))
          (host (tramp-file-name-host vec))
-         (user (or (and sudo-hop
-                         (or (tramp-file-name-user sudo-hop)
-                             (user-login-name)))
-                   (tramp-file-name-user vec)
-                   (user-login-name)))
+         ;; Only a socket key: an unnamed user stands for the local login
+         ;; name, as for plain rpc paths, so both share one socket.
+         (user (tramp-rpc--ssh-detail-user vec (user-login-name)))
          (port (or (tramp-rpc--port-to-string
                     (if sudo-hop
                         (tramp-file-name-port sudo-hop)
@@ -1021,6 +1019,28 @@ corresponding argument is omitted."
   (append (when user (list "-l" user))
           (when port (list "-p" port))
           (when proxyjump (list "-J" proxyjump))))
+
+(defun tramp-rpc--ssh-config-user (vec)
+  "Return the user ssh's configuration selects for VEC, or nil.
+Runs \"ssh -G\", which evaluates the configuration without connecting."
+  (let ((port (tramp-rpc--port-to-string (tramp-rpc--ssh-detail-port vec))))
+    (with-temp-buffer
+      (and (eq 0 (ignore-errors
+                   (apply #'call-process "ssh" nil '(t nil) nil
+                          (append tramp-rpc-ssh-args
+                                  (tramp-rpc--ssh-option-args)
+                                  (tramp-rpc--ssh-identity-args nil port nil)
+                                  (list "-G" (tramp-file-name-host vec))))))
+           (progn (goto-char (point-min))
+                  (re-search-forward (rx bol "user " (group (+ nonl)) eol)
+                                     nil t))
+           (match-string 1)))))
+
+(defun tramp-rpc--sudo-ssh-user (vec)
+  "Return the SSH user whose sudo password VEC needs.
+This is the user VEC's SSH connection names or, when it names none, the
+user ssh's configuration selects."
+  (or (tramp-rpc--ssh-detail-user vec) (tramp-rpc--ssh-config-user vec)))
 
 (defun tramp-rpc--controlmaster-active-p (vec)
   "Return non-nil if a ControlMaster connection is active for VEC."
@@ -1160,9 +1180,9 @@ BINARY-PATH is the remote localname of the server binary (may contain ~).
 For sudo-via-RPC paths, the server is started via sudo.  If SUDO-PASSWORD
 is non-nil, feed it to sudo -S before the RPC server starts reading stdin.
 Returns the connection plist.  Signals `remote-file-error' on failure."
-  (let* ((sudo-ssh-user (tramp-rpc--detect-sudo-elevation vec))
+  (let* ((sudo (tramp-rpc--detect-sudo-elevation vec))
          (host (tramp-file-name-host vec))
-         (user (or sudo-ssh-user (tramp-file-name-user vec)))
+         (user (tramp-rpc--ssh-detail-user vec))
          (port (tramp-rpc--port-to-string
                 (tramp-rpc--ssh-detail-port vec)))
          (proxyjump (tramp-rpc--hops-to-proxyjump vec))
@@ -1191,7 +1211,7 @@ Returns the connection plist.  Signals `remote-file-error' on failure."
                     ;; the RPC analogue of TRAMP's native sudo method: open an
                     ;; elevated long-lived backend connection, then run process
                     ;; operations inside that connection.
-                    (if sudo-ssh-user
+                    (if sudo
                         (append
                          (list host "sudo")
                          ;; Do not use an empty sudo prompt here.  OpenSSH
@@ -1389,14 +1409,15 @@ probe can then interleave with RPC startup and corrupt the protocol stream."
              ((file-error remote-file-error)
               (signal (car err) (cdr err)))))))))
   (let* ((tramp-rpc-deploy--plan (tramp-rpc-deploy-plan vec))
-         (sudo-ssh-user (tramp-rpc--detect-sudo-elevation vec))
+         (sudo (tramp-rpc--detect-sudo-elevation vec))
          ;; TRAMP's sudo method opens an elevated backend connection.  For the
          ;; RPC backend that means starting the server via sudo.  Prefer sudo
          ;; -n when a ticket is already valid; otherwise read the password with
          ;; TRAMP's auth machinery and feed it to sudo -S during server start.
-         (sudo-password (when (and sudo-ssh-user
+         (sudo-password (when (and sudo
                                    (tramp-rpc--sudo-password-required-p vec))
-                          (tramp-rpc--sudo-read-password vec sudo-ssh-user))))
+                          (tramp-rpc--sudo-read-password
+                           vec (tramp-rpc--sudo-ssh-user vec)))))
     (if (eq (tramp-rpc-deploy-plan-mode tramp-rpc-deploy--plan) 'never)
       ;; Never-deploy mode: use the configured path directly, no fallback.
       (let ((binary-path (tramp-rpc-deploy-ensure-binary vec)))
@@ -1440,11 +1461,12 @@ probe can then interleave with RPC startup and corrupt the protocol stream."
              ;; Re-prompt only when sudo explicitly rejected the supplied
              ;; password.  Missing-binary fallback keeps using the still-valid
              ;; credential.
-             (when (and sudo-ssh-user
+             (when (and sudo
                         (eq (car err) 'tramp-rpc-sudo-auth-rejected))
                (setq sudo-password
                      (when (tramp-rpc--sudo-password-required-p vec)
-                       (tramp-rpc--sudo-read-password vec sudo-ssh-user))))
+                       (tramp-rpc--sudo-read-password
+                        vec (tramp-rpc--sudo-ssh-user vec)))))
              (tramp-rpc--start-server-process
               vec binary-path sudo-password))
          (tramp-rpc--cleanup-bootstrap-connection vec)))))))

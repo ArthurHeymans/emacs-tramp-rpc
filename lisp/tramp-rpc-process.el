@@ -924,7 +924,7 @@ Resolves program path and loads direnv environment from working directory."
         ;; use sudo's stdin wrapper; a separate PTY preauth can miss tty-scoped
         ;; sudo timestamps and leave the pipe-mode command unauthenticated.
         (when pipe-sudo
-          (let ((ssh-user (or (tramp-rpc--ssh-detail-user v) (user-login-name))))
+          (let ((ssh-user (tramp-rpc--sudo-ssh-user v)))
             (if (tramp-rpc--sudo-password-required-p v)
                 (setq sudo-password (tramp-rpc--sudo-read-password v ssh-user)
                       ;; This RPC path invokes sudo directly, so unlike the SSH
