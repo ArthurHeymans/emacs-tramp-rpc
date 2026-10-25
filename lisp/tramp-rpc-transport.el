@@ -1588,7 +1588,7 @@ original user quit is always re-signalled."
   (let* ((auth-vec (or (tramp-rpc--sudo-auth-vec vec) vec))
          (result (tramp-rpc--call auth-vec "process.run"
                                   '((cmd . "sudo")
-                                    (args . ["-n" "-v"])
+                                    (args . ["-n" "true"])
                                     (cwd . "/"))))
          (exit-code (alist-get 'exit_code result)))
     (not (eq exit-code 0))))
