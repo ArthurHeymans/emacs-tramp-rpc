@@ -359,9 +359,7 @@ standard TRAMP can traverse them."
       ;; login and fails before sudo authentication can help.
       (make-tramp-file-name
        :method tramp-rpc-deploy-bootstrap-method
-       :user (or (and sudo-hop
-                      (or (tramp-file-name-user sudo-hop) (user-login-name)))
-                 (tramp-file-name-user vec))
+       :user (tramp-file-name-user (or sudo-hop vec))
        :domain (tramp-file-name-domain vec)
        :host (tramp-file-name-host vec)
        :port (if sudo-hop
