@@ -935,11 +935,10 @@ for the socket to appear before declaring the attempt dead."
       (sleep-for tramp-rpc--controlmaster-socket-grace-delay))
     (throw 'tramp-action 'process-died))
    (t
-    (with-tramp-suspended-timers
-      (unless (with-local-quit
-                (accept-process-output proc 0.05 nil t)
-                t)
-        (keyboard-quit)))
+    (unless (with-local-quit
+              (accept-process-output proc 0.05 nil 1)
+              t)
+      (keyboard-quit))
     nil)))
 
 (defconst tramp-rpc--controlmaster-actions
