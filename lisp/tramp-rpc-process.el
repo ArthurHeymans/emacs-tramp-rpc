@@ -902,6 +902,10 @@ Resolves program path and loads direnv environment from working directory."
     ;; buffer setup, stderr validation, and TRAMP file-name parsing.  The body
     ;; below is only the RPC-specific process creation path.
     (tramp-skeleton-make-process args nil t
+      ;; The skeleton checks the list, not its program.  RPC cannot create a
+      ;; commandless PTY, even when Emacs's shell quoting accepts nil.
+      (unless (stringp (car command))
+        (signal 'wrong-type-argument (list #'stringp (car command))))
       ;; Unquote localname in case of file-name-quoted paths (e.g. /: prefix).
       (setq localname (file-name-unquote localname))
       (let* ((sudo-command (and (car command)
