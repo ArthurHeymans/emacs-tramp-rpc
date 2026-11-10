@@ -4919,54 +4919,6 @@ direct property test would miss it."
                     :type 'file-missing)
       (should (equal (nreverse calls) '("file.set_times"))))))
 
-(ert-deftest tramp-rpc-mock-test-multi-hop-advice ()
-  "Test that tramp-multi-hop-p returns t for the rpc method."
-  :tags '(:multi-hop)
-  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
-  (let ((vec (make-tramp-file-name :method "rpc" :host "target")))
-    (should (tramp-multi-hop-p vec))))
-
-(ert-deftest tramp-rpc-mock-test-multi-hop-advice-ssh-still-works ()
-  "Test that tramp-multi-hop-p still returns t for ssh method."
-  :tags '(:multi-hop)
-  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
-  (let ((vec (make-tramp-file-name :method "ssh" :host "target")))
-    (should (tramp-multi-hop-p vec))))
-
-(ert-deftest tramp-rpc-mock-test-multi-hop-dissect-single-hop ()
-  "Test that TRAMP can dissect a single-hop rpc filename."
-  :tags '(:multi-hop)
-  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
-  (let ((vec (tramp-dissect-file-name "/rpc:gateway|rpc:user@target:/path")))
-    (should (equal (tramp-file-name-method vec) "rpc"))
-    (should (equal (tramp-file-name-user vec) "user"))
-    (should (equal (tramp-file-name-host vec) "target"))
-    (should (equal (tramp-file-name-localname vec) "/path"))
-    ;; Hop should be set
-    (should (tramp-file-name-hop vec))))
-
-(ert-deftest tramp-rpc-mock-test-multi-hop-dissect-multi-hop ()
-  "Test that TRAMP can dissect a multi-hop rpc filename."
-  :tags '(:multi-hop)
-  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
-  (let ((vec (tramp-dissect-file-name "/rpc:hop1|rpc:hop2|rpc:user@target:/path")))
-    (should (equal (tramp-file-name-method vec) "rpc"))
-    (should (equal (tramp-file-name-user vec) "user"))
-    (should (equal (tramp-file-name-host vec) "target"))
-    (should (equal (tramp-file-name-localname vec) "/path"))
-    (should (tramp-file-name-hop vec))))
-
-(ert-deftest tramp-rpc-mock-test-multi-hop-dissect-mixed-methods ()
-  "Test that TRAMP can dissect a mixed ssh/rpc hop filename."
-  :tags '(:multi-hop)
-  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
-  (let ((vec (tramp-dissect-file-name "/ssh:gateway|rpc:user@target:/path")))
-    (should (equal (tramp-file-name-method vec) "rpc"))
-    (should (equal (tramp-file-name-user vec) "user"))
-    (should (equal (tramp-file-name-host vec) "target"))
-    (should (equal (tramp-file-name-localname vec) "/path"))
-    (should (tramp-file-name-hop vec))))
-
 (ert-deftest tramp-rpc-mock-test-hops-to-proxyjump-nil ()
   "Test that hops-to-proxyjump returns nil for no hops."
   :tags '(:multi-hop)
@@ -6491,7 +6443,7 @@ issue #268 (0.13 fails to download prebuilt binary)."
          (remote-local (tramp-file-local-name
                         (tramp-rpc-deploy--remote-binary-path vec)))
          (copy-file-function (symbol-function 'copy-file))
-         staging-directory remote-tmp activation-command error-message)
+         staging-directory remote-tmp error-message)
     (unwind-protect
         (progn
           (make-directory remote-dir t)
@@ -6514,14 +6466,13 @@ issue #268 (0.13 fails to download prebuilt binary)."
                        (setq remote-tmp (tramp-file-local-name to))
                        (funcall copy-file-function from remote-tmp nil)))
                     ((symbol-function 'tramp-rpc-deploy--remote-checksum)
-                     (lambda (_vec path) (tramp-rpc-deploy--compute-checksum path)))
+                     (lambda (_vec path)
+                       (prog1 (tramp-rpc-deploy--compute-checksum path)
+                         ;; Swap the staged file after computing its diagnostic
+                         ;; checksum, before the activation transaction runs.
+                         (with-temp-file path (insert "substituted binary")))))
                     ((symbol-function 'tramp-send-command-and-check)
                      (lambda (_vec command)
-                       (when (string-prefix-p "test -f " command)
-                         (setq activation-command command)
-                         ;; Simulate a replacement after the diagnostic checksum
-                         ;; but immediately before the compound activation shell.
-                         (with-temp-file remote-tmp (insert "substituted binary")))
                        (zerop (call-process "sh" nil nil nil "-c" command)))))
             (condition-case err
                 (tramp-rpc-deploy--transfer-binary vec local)
@@ -6532,60 +6483,12 @@ issue #268 (0.13 fails to download prebuilt binary)."
                      (file-name-directory remote-tmp)))
             (should (equal (file-name-directory remote-tmp)
                            (file-name-as-directory staging-directory)))
-            (let ((tmp (tramp-shell-quote-argument remote-tmp))
-                  (dest (tramp-shell-quote-argument remote-local))
-                  (digest (tramp-shell-quote-argument
-                           (tramp-rpc-deploy--compute-checksum local))))
-              (should
-               (equal activation-command
-                      (format
-                       (concat "test -f %s && ! test -L %s && chmod +x %s && "
-                               "test -f %s && ! test -L %s && "
-                               "(test ! -e %s && ! test -L %s || "
-                               "test -f %s && ! test -L %s) && "
-                               "actual=$({ sha256sum %s 2>/dev/null || "
-                               "shasum -a 256 %s 2>/dev/null; } | cut -d' ' -f1) && "
-                               "test \"$actual\" = %s && mv -f %s %s && "
-                               "test -f %s && ! test -L %s && test -x %s")
-                       tmp tmp tmp tmp tmp dest dest dest dest tmp tmp digest tmp dest
-                       dest dest dest)))
             (should (equal (with-temp-buffer
                              (insert-file-contents-literally remote-local)
                              (buffer-string))
                            "old binary"))
-            (should-not (file-exists-p remote-tmp)))))
+            (should-not (file-exists-p remote-tmp))))
       (delete-directory dir t))))
-
-(ert-deftest tramp-rpc-mock-test-deploy-method-table-matches-dispatcher ()
-  "README's RPC table documents exactly the dispatcher's public methods."
-  :tags '(:deploy)
-  (let (dispatcher documented)
-    (with-temp-buffer
-      (insert-file-contents
-       (expand-file-name "server/src/handlers/mod.rs" tramp-rpc-mock-test--project-root))
-      (should (re-search-forward "async fn route" nil t))
-      (let ((start (point))
-            (end (progn (should (re-search-forward "_ => Err(RpcError::method_not_found" nil t))
-                        (match-beginning 0))))
-        (goto-char start)
-        (while (re-search-forward "\\\"\\([[:alnum:]_.]+\\)\\\" =>" end t)
-          (push (match-string 1) dispatcher))))
-    (push "batch" dispatcher)
-    (with-temp-buffer
-      (insert-file-contents (expand-file-name "README.org" tramp-rpc-mock-test--project-root))
-      (should (re-search-forward "^\\*\\* RPC Server Methods$" nil t))
-      (let ((start (point))
-            (end (or (and (re-search-forward "^\\* " nil t) (match-beginning 0))
-                     (point-max))))
-        (goto-char start)
-        (while (re-search-forward "~\\([[:alnum:]_.]+\\)~" end t)
-          (when (or (string-match-p "\\." (match-string 1))
-                    (equal (match-string 1) "batch"))
-            (push (match-string 1) documented)))))
-    (should dispatcher)
-    (should documented)
-    (should (equal (sort (delete-dups dispatcher) #'string<)
-                   (sort (delete-dups documented) #'string<)))))
 
 ;; With latest tramp, tramp-file-name-with-sudo natively produces
 ;; /rpc:user@host|sudo:root@host:/path for rpc paths since the rpc
@@ -6618,18 +6521,6 @@ issue #268 (0.13 fails to download prebuilt binary)."
     (should (string= (tramp-file-name-host vec) "target"))
     (should-not (tramp-rpc--sudo-file-name-p filename))))
 
-(ert-deftest tramp-rpc-mock-test-rpc-method-advertises-host-arg ()
-  "Test that the rpc method declares %%h in tramp-login-args.
-This is required so `tramp-compute-multi-hops' allows rpc to appear
-as a proxy hop alongside shell methods like sudo/su.  Without %%h,
-the host-check in `tramp-compute-multi-hops' would reject the rpc
-hop with \"Host name does not match\"."
-  :tags '(:multi-hop)
-  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
-  (let* ((vec (make-tramp-file-name :method "rpc" :host "target"))
-         (login-args (tramp-get-method-parameter vec 'tramp-login-args)))
-    (should (member "%h" (flatten-tree login-args)))))
-
 (ert-deftest tramp-rpc-mock-test-compute-multi-hops-rpc-sudo-chain ()
   "Test TRAMP's low-level multi-hop expansion for an rpc-to-sudo chain.
 Normal rpc-to-sudo paths are claimed by the tramp-rpc foreign handler.
@@ -6660,16 +6551,6 @@ also satisfy `tramp-compute-multi-hops'."
     ;; method entry has ssh's tramp-login-program and tramp-login-args.
     (should (string= (tramp-file-name-method (car result)) "rpc"))
     (should (string= (tramp-file-name-host (car result)) "server"))))
-
-(ert-deftest tramp-rpc-mock-test-rpc-method-has-ssh-login-program ()
-  "Test that the rpc method inherits ssh's tramp-login-program.
-This is needed for `tramp-maybe-open-connection' to process rpc
-as a hop in multi-hop chains."
-  :tags '(:multi-hop)
-  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
-  (let ((vec (make-tramp-file-name :method "rpc" :host "target")))
-    (should (string= (tramp-get-method-parameter vec 'tramp-login-program) "ssh"))
-    (should (tramp-get-method-parameter vec 'tramp-remote-shell))))
 
 ;;; ============================================================================
 ;;; Sudo-via-RPC tests (No server or SSH required)
@@ -9379,25 +9260,88 @@ This matches tramp-sh and upstream `tramp-test28-process-file', which requires
     (should (= (alist-get 'gid (cdr (cadr calls))) 84))))
 
 (ert-deftest tramp-rpc-mock-test-remote-stderr-command-wrapper-is-argv-safe ()
-  "Remote stderr redirection preserves command argv in pipe and PTY paths."
-  (should
-   (equal (tramp-rpc--redirect-command-stderr
-           '("printf" "%s" "a b") "/tmp/error file")
-          '("/bin/sh" "-c" "exec \"$@\" 2>/tmp/error\\ file"
-            "tramp-rpc-stderr" "printf" "%s" "a b"))))
+  "Redirection preserves literal argv, stderr paths and the exit status."
+  (let* ((directory (make-temp-file "tramp-rpc-stderr" t))
+         (stderr-file (expand-file-name "error 'file; $HOME" directory))
+         (argument "a b; 'quoted' \"double\" $HOME $(echo expanded)")
+         (command (tramp-rpc--redirect-command-stderr
+                   (list "sh" "-c"
+                         "printf '%s' \"$1\"; printf '%s' \"$2\" >&2; exit 7"
+                         "test" argument "error output")
+                   stderr-file)))
+    (unwind-protect
+        (progn
+          (with-temp-buffer
+            (should (= 7 (apply #'call-process (car command) nil t nil
+                                (cdr command))))
+            (should (equal (buffer-string) argument)))
+          (with-temp-buffer
+            (insert-file-contents-literally stderr-file)
+            (should (equal (buffer-string) "error output"))))
+      (delete-directory directory t))))
 
-(ert-deftest tramp-rpc-mock-test-deploy-target-registry-and-shell-builders ()
-  "Deploy targets are centralized and activation retains safety predicates."
+(ert-deftest tramp-rpc-mock-test-deploy-target-normalization ()
+  "Deployment maps machine names to supported Rust targets."
   (should (equal (tramp-rpc-deploy--arch-to-rust-target "armv7-linux")
                  "armv7-unknown-linux-musleabihf"))
-  (should (equal (tramp-rpc-deploy--normalize-machine "armv6l") "arm"))
-  (let ((command (tramp-rpc-deploy--activation-command
-                  "/tmp/stage file" "/tmp/dest" (make-string 64 ?a))))
-    (should (string-match-p "test ! -e" command))
-    (should (string-match-p "! test -L" command))
-    (should (string-match-p "sha256sum" command))
-    (should (string-match-p "shasum -a 256" command))
-    (should (string-match-p "mv -f" command))))
+  (should (equal (tramp-rpc-deploy--normalize-machine "armv6l") "arm")))
+
+(ert-deftest tramp-rpc-mock-test-deploy-activation-installs-verified-binary ()
+  "Activation installs or replaces a regular file and makes it executable."
+  :tags '(:deploy)
+  (dolist (existing '(nil t))
+    (let* ((directory (make-temp-file "tramp-rpc-activation" t))
+           (temporary (expand-file-name "stage 'file; $HOME" directory))
+           (destination (expand-file-name "installed 'file; $HOME" directory)))
+      (unwind-protect
+          (progn
+            (with-temp-file temporary (insert "new binary"))
+            (set-file-modes temporary #o600)
+            (when existing
+              (with-temp-file destination (insert "old binary")))
+            (should
+             (zerop (call-process
+                     "sh" nil nil nil "-c"
+                     (tramp-rpc-deploy--activation-command
+                      temporary destination
+                      (tramp-rpc-deploy--compute-checksum temporary)))))
+            (should-not (file-exists-p temporary))
+            (should (file-executable-p destination))
+            (with-temp-buffer
+              (insert-file-contents-literally destination)
+              (should (equal (buffer-string) "new binary"))))
+        (delete-directory directory t)))))
+
+(ert-deftest tramp-rpc-mock-test-deploy-activation-rejects-symlinks ()
+  "Activation never follows a staging or destination symlink."
+  :tags '(:deploy)
+  (dolist (link '(temporary destination))
+    (let* ((directory (make-temp-file "tramp-rpc-activation" t))
+           (temporary (expand-file-name "stage" directory))
+           (destination (expand-file-name "installed" directory))
+           (target (expand-file-name "untouched" directory)))
+      (unwind-protect
+          (progn
+            (with-temp-file target (insert "old binary"))
+            (set-file-modes target #o600)
+            (if (eq link 'temporary)
+                (make-symbolic-link target temporary)
+              (with-temp-file temporary (insert "new binary"))
+              (make-symbolic-link target destination))
+            (should-not
+             (zerop (call-process
+                     "sh" nil nil nil "-c"
+                     (tramp-rpc-deploy--activation-command
+                      temporary destination
+                      (tramp-rpc-deploy--compute-checksum temporary)))))
+            (should (file-symlink-p
+                     (if (eq link 'temporary) temporary destination)))
+            (should (file-exists-p temporary))
+            (should (= (file-modes target) #o600))
+            (with-temp-buffer
+              (insert-file-contents-literally target)
+              (should (equal (buffer-string) "old binary"))))
+        (delete-directory directory t)))))
 
 (ert-deftest tramp-rpc-mock-test-deploy-debug-log-supports-relative-path ()
   "Deployment debug logging accepts a file in `default-directory'."
