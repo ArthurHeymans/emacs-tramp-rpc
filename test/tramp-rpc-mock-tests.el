@@ -8724,6 +8724,23 @@ This matches tramp-sh and upstream `tramp-test28-process-file', which requires
       (should (equal (assoc "PYTHONUNBUFFERED" captured-env)
                      '("PYTHONUNBUFFERED" . "1"))))))
 
+(ert-deftest tramp-rpc-mock-test-async-process-rejects-invalid-program ()
+  "Invalid programs fail before connecting, in both pipe and PTY modes."
+  (let ((default-directory "/rpc:invalid-program:/tmp/"))
+    (cl-letf (((symbol-function 'tramp-rpc--ensure-connection)
+               (lambda (&rest _) (ert-fail "Invalid program attempted a connection"))))
+      (dolist (process-connection-type '(nil t))
+        (dolist (program '(nil 42 ["cat"]))
+          (with-temp-buffer
+            (should-error
+             (start-file-process "invalid-program" (current-buffer) program)
+             :type 'wrong-type-argument)
+            (should-error
+             (make-process :name "invalid-program" :buffer (current-buffer)
+                           :command (list program) :file-handler t
+                           :connection-type process-connection-type)
+             :type 'wrong-type-argument)))))))
+
 (ert-deftest tramp-rpc-mock-test-make-process-connection-type-nil-is-pipe ()
   "An explicit `:connection-type nil' must not fall back to global PTY mode."
   (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
