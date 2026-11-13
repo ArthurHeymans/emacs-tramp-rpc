@@ -1113,6 +1113,7 @@ This matches the behavior expected by `tramp-test28-process-file'."
          tramp-rpc-mock-test--minimum-tramp-version tramp-version))
 (require 'tramp-rpc)
 (declare-function tramp-rpc--handle-pty-exit "tramp-rpc-process" (local-process exit-code))
+(declare-function tramp-rpc--process-directory "tramp-rpc-transport" (localname))
 (declare-function tramp-rpc--ssh-config-user "tramp-rpc-transport" (vec))
 (declare-function tramp-rpc--sudo-ssh-user "tramp-rpc-transport" (vec))
 (declare-function tramp-rpc--queue-pty-delivery
@@ -8225,6 +8226,109 @@ discard it for being unreadable."
       (should (tramp-rpc--process-file-merge-output-p '(:file "/tmp/output")))
       (should (equal (assoc "PATH" (alist-get 'env captured-params))
                      '("PATH" . "/home/user/.cargo/bin:/usr/bin:/bin"))))))
+
+(ert-deftest tramp-rpc-mock-test-process-directory ()
+  "Process working directories unquote names and map empty ones to home."
+  (should (equal (tramp-rpc--process-directory "") "~"))
+  (should (equal (tramp-rpc--process-directory "/work/") "/work/"))
+  (should (equal (tramp-rpc--process-directory "/:/work/") "/work/"))
+  (should (equal (tramp-rpc--process-directory "~/src") "~/src")))
+
+(ert-deftest tramp-rpc-mock-test-process-file-empty-localname-uses-home ()
+  "`process-file' from \"/rpc:host:\" runs in the remote home directory.
+An empty localname used to be sent as cwd \"\", which fails to spawn.
+TRAMP's container completion runs commands from such a directory."
+  (let ((default-directory "/rpc:user@host:")
+        (captured-params nil))
+    (cl-letf (((symbol-function 'tramp-rpc--process-environment)
+               #'ignore)
+              ((symbol-function 'tramp-rpc-magit--process-cache-lookup)
+               #'ignore)
+              ((symbol-function 'tramp-rpc--decode-output)
+               (lambda (output) output))
+              ((symbol-function 'tramp-rpc--call)
+               (lambda (_vec method params)
+                 (should (equal method "process.run"))
+                 (setq captured-params params)
+                 '((exit_code . 0) (stdout . "") (stderr . "")))))
+      (should (= (tramp-rpc-handle-process-file "pwd" nil nil nil) 0))
+      (should (equal (alist-get 'cwd captured-params) "~")))))
+
+(ert-deftest tramp-rpc-mock-test-make-process-empty-localname-uses-home ()
+  "Pipe and RPC PTY processes use home for an empty remote localname."
+  (let ((default-directory "/rpc:user@host:")
+        (tramp-rpc-use-direct-ssh-pty nil)
+        started proc)
+    ;; Keep the raw localname at the skeleton boundary; resolving it here
+    ;; would hide the case under test behind a remote home-directory lookup.
+    (cl-letf (((symbol-function 'tramp-rpc-handle-expand-file-name)
+               (lambda (name &optional _dir) name))
+              ((symbol-function 'tramp-rpc--process-environment)
+               (lambda (_vec localname &optional _login-path)
+                 (should (equal localname "~"))
+                 nil))
+              ((symbol-function 'tramp-rpc--ensure-connection)
+               (lambda (_vec) (tramp-rpc--make-connection)))
+              ((symbol-function 'tramp-rpc--start-remote-process)
+               (lambda (_vec _program _args cwd _env &optional _connection)
+                 (setq started (list 'pipe cwd))
+                 4242))
+              ((symbol-function 'tramp-rpc--make-rpc-pty-process)
+               (lambda (_vec _name _buffer _command _coding _noquery
+                        _filter _sentinel cwd &optional _env)
+                 (setq started (list 'pty cwd))
+                 'pty-process)))
+      (dolist (connection-type '(pipe pty))
+        (unwind-protect
+            (progn
+              (setq proc (tramp-rpc-handle-make-process
+                          :name "empty-directory" :buffer nil
+                          :command '("pwd" "-P") :connection-type connection-type
+                          :noquery t))
+              (should (equal started (list connection-type "~"))))
+          (when (processp proc) (delete-process proc)))))))
+
+(ert-deftest tramp-rpc-mock-test-direct-ssh-pty-home-directory-quoting ()
+  "Direct SSH PTYs expand home without evaluating special path characters."
+  (let* ((home (file-truename (make-temp-file "tramp-rpc-pty-home-" t)))
+         (subdirectory "src with spaces;$HOME")
+         (process-environment (cons (concat "HOME=" home) process-environment))
+         (tramp-rpc-use-direct-ssh-pty t)
+         remote-command proc)
+    (unwind-protect
+        (progn
+          (make-directory (expand-file-name subdirectory home))
+          (cl-letf (((symbol-function 'tramp-rpc-handle-expand-file-name)
+                     (lambda (name &optional _dir) name))
+                    ((symbol-function 'tramp-rpc--process-environment) #'ignore)
+                    ((symbol-function 'start-process)
+                     (lambda (name buffer _program &rest args)
+                       (setq remote-command (car (last args)))
+                       (make-pipe-process :name name :buffer buffer :noquery t))))
+            (dolist (localname (list "" (concat "~/" subdirectory "/")))
+              (unwind-protect
+                  (progn
+                    (let ((default-directory (concat "/rpc:user@host:" localname)))
+                      (setq proc (tramp-rpc-handle-make-process
+                                  :name "home-directory-pty" :buffer nil
+                                  :command '("pwd" "-P") :connection-type 'pty
+                                  :noquery t)))
+                    ;; Execute the captured remote shell command locally with
+                    ;; a synthetic HOME, never opening an SSH connection.
+                    (with-temp-buffer
+                      (let ((default-directory temporary-file-directory))
+                        (should (= 0 (call-process
+                                      (executable-find "sh") nil t nil
+                                      "-c" remote-command))))
+                      (should (equal
+                               (string-trim-right (buffer-string))
+                               (if (string-empty-p localname)
+                                   home
+                                 (expand-file-name subdirectory home))))))
+                (when (processp proc)
+                  (remhash proc tramp-rpc--pty-processes)
+                  (delete-process proc))))))
+      (delete-directory home t))))
 
 (ert-deftest tramp-rpc-mock-test-process-file-invalidates-mutators-after-dispatch ()
   "Unwatched mutating commands invalidate connection caches afterwards."
