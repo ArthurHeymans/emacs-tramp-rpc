@@ -8201,7 +8201,7 @@ TRAMP's container completion runs commands from such a directory."
 
 (ert-deftest tramp-rpc-mock-test-direct-ssh-pty-home-directory-quoting ()
   "Direct SSH PTYs expand home without evaluating special path characters."
-  (let* ((home (make-temp-file "tramp-rpc-pty-home-" t))
+  (let* ((home (file-truename (make-temp-file "tramp-rpc-pty-home-" t)))
          (subdirectory "src with spaces;$HOME")
          (process-environment (cons (concat "HOME=" home) process-environment))
          (tramp-rpc-use-direct-ssh-pty t)
