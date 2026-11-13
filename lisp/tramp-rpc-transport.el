@@ -933,7 +933,13 @@ for the socket to appear before declaring the attempt dead."
       (when (file-exists-p tramp-rpc--controlmaster-socket-path)
         (throw 'tramp-action 'ok))
       (sleep-for tramp-rpc--controlmaster-socket-grace-delay))
-    (throw 'tramp-action 'process-died))))
+    (throw 'tramp-action 'process-died))
+   (t
+    (unless (with-local-quit
+              (accept-process-output proc 0.05 nil 1)
+              t)
+      (keyboard-quit))
+    nil)))
 
 (defconst tramp-rpc--controlmaster-actions
   '((tramp-password-prompt-regexp tramp-action-password)
@@ -1021,7 +1027,7 @@ corresponding argument is omitted."
           (when proxyjump (list "-J" proxyjump))))
 
 (defun tramp-rpc--ssh-config-user (vec)
-  "Return the user ssh's configuration selects for VEC, or nil.
+  "Return the configured SSH user for VEC, or nil.
 Runs \"ssh -G\", which evaluates the configuration without connecting."
   (let ((port (tramp-rpc--port-to-string (tramp-rpc--ssh-detail-port vec))))
     (with-temp-buffer
@@ -1038,8 +1044,8 @@ Runs \"ssh -G\", which evaluates the configuration without connecting."
 
 (defun tramp-rpc--sudo-ssh-user (vec)
   "Return the SSH user whose sudo password VEC needs.
-This is the user VEC's SSH connection names or, when it names none, the
-user ssh's configuration selects."
+Use the explicit SSH user when present; otherwise, consult the SSH
+configuration."
   (or (tramp-rpc--ssh-detail-user vec) (tramp-rpc--ssh-config-user vec)))
 
 (defun tramp-rpc--controlmaster-active-p (vec)

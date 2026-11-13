@@ -36,6 +36,16 @@ When testing updates to the rust server, always copy it to a temporary location 
 
 Always test changes to the code.
 
+## Test quality
+
+- Test observable behavior and regressions, not source text, generated-file
+  spelling, or the existence of definitions exercised by other tests.
+- For shell builders, execute the command against temporary local files and
+  assert outputs, exit status, and filesystem effects instead of command text.
+- Keep mocks at external boundaries.  Do not duplicate the implementation in
+  the expected result or add prerequisite skips for dependencies already required
+  by the suite.  Keep skips for genuinely optional platform capabilities.
+
 ## Test Example
 
 running all tests that start with `tramp-rpc-test` in tramp-rpc-tests.el

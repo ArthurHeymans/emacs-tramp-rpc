@@ -20,7 +20,6 @@
 (ert-deftest tramp-rpc-mock-test-access-predicates-use-kernel ()
   "Predicates ask the kernel, never consulting cached permissions or groups."
   :tags '(:permissions)
-  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
   (let ((remote-file-name-inhibit-cache t)
         (tramp-cache-data (make-hash-table :test 'equal))
         (filename "/rpc:mockhost:/testdir")
@@ -50,7 +49,6 @@
 (ert-deftest tramp-rpc-mock-test-access-errors-and-writable-parent ()
   "Writable predicates request the server-side parent check in one RPC."
   :tags '(:permissions)
-  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
   (let ((remote-file-name-inhibit-cache t)
         (tramp-cache-data (make-hash-table :test 'equal))
         (errno 2)
@@ -87,7 +85,6 @@
 (ert-deftest tramp-rpc-mock-test-access-response-validation ()
   "Malformed decisions and RPC errors are never cached as permission denials."
   :tags '(:permissions :cache)
-  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
   (let ((tramp-cache-data (make-hash-table :test 'equal))
         (remote-file-name-inhibit-cache nil)
         (filename "/rpc:mockhost:/invalid-decision")
@@ -104,7 +101,6 @@
 (ert-deftest tramp-rpc-mock-test-access-unsupported-check-is-not-cached ()
   "Unresolved kernel checks propagate; only resolved decisions are cached."
   :tags '(:permissions :cache)
-  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
   (let ((tramp-cache-data (make-hash-table :test 'equal))
         (remote-file-name-inhibit-cache nil)
         (filename "/rpc:mockhost:/unsupported-check"))
@@ -131,7 +127,6 @@
 (ert-deftest tramp-rpc-mock-test-access-predicate-cache-policy ()
   "Positive and negative decisions obey expiry, events and connection cleanup."
   :tags '(:permissions :cache)
-  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
   (let* ((filename "/rpc:mockhost:/access-cache")
          (vec (tramp-dissect-file-name filename))
          (tramp-cache-data (make-hash-table :test 'equal))
@@ -167,7 +162,6 @@
 (ert-deftest tramp-rpc-mock-test-access-cache-partitions-routes ()
   "Explicit and hidden hop routes never share access decisions."
   :tags '(:permissions :cache :multi-hop)
-  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
   (dolist (show-hops '(nil t))
     (let ((tramp-cache-data (make-hash-table :test 'equal))
           (tramp-show-ad-hoc-proxies show-hops)
@@ -212,7 +206,6 @@
 (ert-deftest tramp-rpc-mock-test-access-cache-rejects-invalid-routes ()
   "An invalid proxy route must not become a direct connection or cached answer."
   :tags '(:permissions :cache :multi-hop)
-  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
   (let ((tramp-cache-data (make-hash-table :test 'equal))
         (tramp-default-proxies-alist '(("^target$" nil "/rpc:target:"))))
     (cl-letf (((symbol-function 'tramp-connectable-p) #'always)
@@ -225,7 +218,6 @@
 (ert-deftest tramp-rpc-mock-test-access-cache-preserves-trailing-slash ()
   "A regular file and its directory-only spelling have independent answers."
   :tags '(:permissions :cache)
-  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
   (let ((tramp-cache-data (make-hash-table :test 'equal))
         (remote-file-name-inhibit-cache nil)
         (filename "/rpc:mockhost:/regular")
@@ -252,7 +244,6 @@
 (ert-deftest tramp-rpc-mock-test-access-file-is-fresh ()
   "`access-file' bypasses cached decisions and reports native error classes."
   :tags '(:permissions :cache)
-  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
   (let* ((filename "/rpc:mockhost:/access-fresh")
          (vec (tramp-dissect-file-name filename))
          (tramp-cache-data (make-hash-table :test 'equal))
@@ -288,7 +279,6 @@
 (ert-deftest tramp-rpc-mock-test-access-non-essential-and-timeout ()
   "Completion never connects; `access-file' keeps its timeout wrapper."
   :tags '(:permissions :non-essential)
-  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
   (let ((remote-file-name-inhibit-cache t)
         (non-essential t))
     (cl-letf (((symbol-function 'tramp-connectable-p) #'ignore)
@@ -309,7 +299,6 @@
 (ert-deftest tramp-rpc-mock-test-access-file-transport-timeout ()
   "The access timeout interrupts a real RPC wait and releases its pending ID."
   :tags '(:permissions :transport)
-  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
   (tramp-rpc-mock-test-request--with-connection (process buffer)
     (let ((remote-file-name-access-timeout 1))
       (cl-letf (((symbol-function 'tramp-connectable-p) #'always)
@@ -357,7 +346,6 @@
 (ert-deftest tramp-rpc-mock-test-server-access-matches-native-emacs ()
   "Kernel-backed access matches native Emacs, including links and directories."
   :tags '(:server :permissions)
-  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
   (skip-unless (tramp-rpc-mock-test--find-server))
   (unwind-protect
       (progn
@@ -424,7 +412,6 @@
   :tags '(:server :permissions :acl)
   ;; The runner supplies subordinate IDs and removes both DAC capabilities.
   (skip-unless (getenv "TRAMP_RPC_ACCESS_TEST_ACL"))
-  (should tramp-rpc-mock-test--tramp-rpc-loaded)
   (should (tramp-rpc-mock-test--find-server))
   (should (executable-find "setfacl"))
   (unwind-protect
