@@ -682,6 +682,20 @@ TRAMP-RPC includes a comprehensive test suite using Emacs ERT (Emacs Lisp Regres
 
 ** Running Tests
 
+*** Dependencies via Nix
+
+The ~elisp~ dev shell provides Emacs and the same pinned TRAMP, msgpack and
+package-lint versions CI uses, without installing anything into
+=~/.emacs.d=.  It sets ~TRAMP_SOURCE~ and ~MSGPACK_SOURCE~ for
+=test/run-tests.sh= and puts the packages on ~EMACSLOADPATH~ for plain
+~emacs -Q --batch~ commands such as byte-compiling:
+
+#+begin_src bash
+nix develop .#elisp -c ./test/run-tests.sh --mock
+nix develop .#elisp -c sh -c \
+  'rm -f lisp/*.elc && emacs -Q --batch --eval "(setq byte-compile-error-on-warn t)" -L lisp -f batch-byte-compile lisp/*.el'
+#+end_src
+
 *** Quick Protocol Tests (no dependencies)
 
 #+begin_src bash
