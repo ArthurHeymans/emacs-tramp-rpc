@@ -15,14 +15,18 @@ fi
 TRAMP_SOURCE="${TRAMP_SOURCE:-$HOME/src/tramp}"
 
 EMACS_LOAD_PATH_ARGS=(-L "$PROJECT_ROOT/lisp")
+EMACS_PACKAGE_ARGS=(--eval "(require 'package)" --eval "(package-initialize)")
 if [[ -d "$TRAMP_SOURCE/lisp" ]]; then
     # The sudo autoload tests exercise TRAMP >= 2.8 hidden ad-hoc proxy
     # behavior.  Prefer the configured TRAMP checkout over the bundled Emacs
     # TRAMP, which can be too old for this project.
     EMACS_LOAD_PATH_ARGS=(-L "$TRAMP_SOURCE/lisp" "${EMACS_LOAD_PATH_ARGS[@]}")
+    # Do not let installed TRAMP autoloads shadow the selected checkout.
+    EMACS_PACKAGE_ARGS=()
 elif [[ -f "$TRAMP_SOURCE/tramp.el" ]]; then
     # Flat checkout or ELPA package — .el files live directly in TRAMP_SOURCE.
     EMACS_LOAD_PATH_ARGS=(-L "$TRAMP_SOURCE" "${EMACS_LOAD_PATH_ARGS[@]}")
+    EMACS_PACKAGE_ARGS=()
 elif (( TRAMP_SOURCE_CONFIGURED )); then
     echo "TRAMP_SOURCE does not contain a lisp/ directory or tramp.el: $TRAMP_SOURCE" >&2
     exit 1
@@ -33,15 +37,11 @@ echo "Project root: $PROJECT_ROOT"
 echo "TRAMP source: $TRAMP_SOURCE"
 echo
 
-# Install msgpack if needed, then run tests
+# Without a checkout, discover installed TRAMP (needed on Emacs 30).
+# Never install packages or refresh archives in a test runner.
 emacs -Q --batch \
+    "${EMACS_PACKAGE_ARGS[@]}" \
     "${EMACS_LOAD_PATH_ARGS[@]}" \
-    --eval "(require 'package)" \
-    --eval "(add-to-list 'package-archives '(\"melpa\" . \"https://melpa.org/packages/\") t)" \
-    --eval "(package-initialize)" \
-    --eval "(unless (require 'msgpack nil t)
-              (package-refresh-contents)
-              (package-install 'msgpack))" \
     -l "$SCRIPT_DIR/tramp-rpc-autoload-tests.el" \
     -f ert-run-tests-batch-and-exit
 

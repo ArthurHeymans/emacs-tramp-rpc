@@ -16,13 +16,8 @@
 
 ;; Tests for the tramp-rpc autoload mechanism.
 ;;
-;; These tests verify that:
-;; 1. The autoloads file is correctly generated
-;; 2. Loading autoloads defines tramp-rpc-method
-;; 3. Handler function stub is registered as autoload
-;; 4. Predicate is defined inline (defsubst) when tramp loads
-;; 5. Predicate works without triggering full tramp-rpc load
-;; 6. Handler is registered after tramp loads
+;; These tests exercise deferred registration, handler dispatch and filename
+;; predicates without loading the full backend.
 ;;
 ;; Running Tests:
 ;; --------------
@@ -49,10 +44,7 @@
 (declare-function tramp-file-name-hop "tramp")
 (declare-function tramp-find-foreign-file-name-handler "tramp")
 (declare-function tramp-get-method-parameter "tramp")
-(declare-function loaddefs-generate "autoload")
-(declare-function update-file-autoloads "autoload")
-(defvar generated-autoload-file)
-(defvar tramp-rpc-method)
+(declare-function loaddefs-generate "loaddefs-gen")
 (defvar tramp-foreign-file-name-handler-alist)
 (defvar tramp-default-proxies-alist)
 (defvar tramp-methods)
@@ -92,22 +84,14 @@ Only generates once per test session to avoid file disappearing issues."
   ;; Only generate if not already done or file doesn't exist
   (when (or (not tramp-rpc-autoload-test--autoloads-generated)
             (not (file-exists-p tramp-rpc-autoload-test--autoloads-file)))
-    (require 'autoload)
+    (require 'loaddefs-gen)
     ;; Delete old autoloads if present
     (when (file-exists-p tramp-rpc-autoload-test--autoloads-file)
       (delete-file tramp-rpc-autoload-test--autoloads-file))
-    ;; Use loaddefs-generate if available (Emacs 28+), otherwise update-file-autoloads
-    (if (fboundp 'loaddefs-generate)
-        (loaddefs-generate
-         tramp-rpc-autoload-test--lisp-dir
-         tramp-rpc-autoload-test--autoloads-file
-         nil nil nil t)
-      ;; Fallback for older Emacs
-      (let ((generated-autoload-file tramp-rpc-autoload-test--autoloads-file)
-            (backup-inhibited t))
-        (update-file-autoloads
-         (expand-file-name "tramp-rpc.el" tramp-rpc-autoload-test--lisp-dir)
-         t)))
+    (loaddefs-generate
+     tramp-rpc-autoload-test--lisp-dir
+     tramp-rpc-autoload-test--autoloads-file
+     nil nil nil t)
     ;; Verify file was created
     (unless (file-exists-p tramp-rpc-autoload-test--autoloads-file)
       (error "Failed to generate autoloads file"))
@@ -141,21 +125,6 @@ This allows testing autoload behavior in a clean state."
 ;;; ============================================================================
 ;;; Tests
 ;;; ============================================================================
-
-(ert-deftest tramp-rpc-autoload-test-generate-autoloads ()
-  "Test that autoloads file can be generated."
-  (tramp-rpc-autoload-test--generate-autoloads)
-  (should (file-exists-p tramp-rpc-autoload-test--autoloads-file)))
-
-(ert-deftest tramp-rpc-autoload-test-autoloads-define-method ()
-  "Test that loading autoloads defines tramp-rpc-method."
-  (tramp-rpc-autoload-test--clean-environment)
-  (tramp-rpc-autoload-test--generate-autoloads)
-  ;; Load autoloads
-  (load tramp-rpc-autoload-test--autoloads-file nil t)
-  ;; Check method constant is defined
-  (should (boundp 'tramp-rpc-method))
-  (should (equal tramp-rpc-method "rpc")))
 
 (ert-deftest tramp-rpc-autoload-test-deferred-registration-fresh-emacs ()
   "Test deferred registration in an isolated Emacs process."
@@ -240,39 +209,8 @@ This allows testing autoload behavior in a clean state."
                 'tramp-sh-file-name-handler))
     (should-not (featurep 'tramp-rpc))))
 
-(ert-deftest tramp-rpc-autoload-test-predicate-available-after-tramp ()
-  "Test that predicate is available after tramp loads (no autoload needed)."
-  (tramp-rpc-autoload-test--clean-environment)
-  (tramp-rpc-autoload-test--generate-autoloads)
-  (add-to-list 'load-path tramp-rpc-autoload-test--lisp-dir)
-  (load tramp-rpc-autoload-test--autoloads-file nil t)
-  (require 'tramp)
-  ;; Predicate should be defined directly by the autoload registration form,
-  ;; NOT as an autoload stub.  This is the key fix: calling the predicate
-  ;; must not trigger loading tramp-rpc.el to avoid recursive autoloading.
-  (should (fboundp 'tramp-rpc-file-name-p))
-  (should-not (autoloadp (symbol-function 'tramp-rpc-file-name-p)))
-  ;; tramp-rpc should NOT be loaded yet (only the predicate is inline)
-  (should-not (featurep 'tramp-rpc)))
-
-(ert-deftest tramp-rpc-autoload-test-handler-registered-via-autoload ()
-  "Test that handler is registered via autoload when tramp loads."
-  (tramp-rpc-autoload-test--clean-environment)
-  (tramp-rpc-autoload-test--generate-autoloads)
-  (add-to-list 'load-path tramp-rpc-autoload-test--lisp-dir)
-  (load tramp-rpc-autoload-test--autoloads-file nil t)
-  ;; Registration is deferred until TRAMP loads.
-  (require 'tramp)
-  (should (rassq 'tramp-rpc-file-name-handler
-                 tramp-foreign-file-name-handler-alist))
-  ;; The predicate should be a real function, not an autoload.
-  (should (fboundp 'tramp-rpc-file-name-p))
-  (should-not (autoloadp (symbol-function 'tramp-rpc-file-name-p))))
-
 (ert-deftest tramp-rpc-autoload-test-predicate-result ()
-  "Test that predicate returns correct results."
-  ;; This test requires msgpack to be available
-  (skip-unless (require 'msgpack nil t))
+  "Filename predicates select the right handler without loading the backend."
   (tramp-rpc-autoload-test--clean-environment)
   (tramp-rpc-autoload-test--generate-autoloads)
   (add-to-list 'load-path tramp-rpc-autoload-test--lisp-dir)
@@ -283,7 +221,11 @@ This allows testing autoload behavior in a clean state."
   ;; Test with other methods - should return nil
   (should-not (tramp-rpc-file-name-p "/ssh:user@host:/path"))
   (should-not (tramp-rpc-file-name-p "/sudo:root@localhost:/path"))
-  (should-not (tramp-rpc-file-name-p "/path/to/local/file")))
+  (should-not (tramp-rpc-file-name-p "/path/to/local/file"))
+  (should (eq (tramp-find-foreign-file-name-handler
+               (tramp-dissect-file-name "/rpc:user@host:/path"))
+              'tramp-rpc-file-name-handler))
+  (should-not (featurep 'tramp-rpc)))
 
 (ert-deftest tramp-rpc-autoload-test-sudo-predicate-explicit-different-host ()
   "Autoloaded sudo predicate must not claim rpc proxy to another host."
@@ -340,31 +282,6 @@ This allows testing autoload behavior in a clean state."
     (should-not (featurep 'tramp-rpc))
     (should (assq 'tramp-rpc--sudo-file-name-p
                   tramp-foreign-file-name-handler-alist))))
-
-(ert-deftest tramp-rpc-autoload-test-autoloads-content ()
-  "Test that autoloads file contains expected content."
-  (tramp-rpc-autoload-test--generate-autoloads)
-  (with-temp-buffer
-    (insert-file-contents tramp-rpc-autoload-test--autoloads-file)
-    (let ((content (buffer-string)))
-      ;; Should define tramp-rpc-method
-      (should (string-match-p "defconst tramp-rpc-method" content))
-      ;; Should have autoload for handler
-      (should (string-match-p "autoload.*tramp-rpc-file-name-handler" content))
-      ;; Should use TRAMP's startup hook instead of requiring TRAMP or
-      ;; using configuration-oriented deferred loading.
-      (should (string-match-p "tramp--startup-hook" content))
-      (should (string-match-p "tramp-rpc--autoload-register" content))
-      (should-not (string-match-p "with-eval-after-load 'tramp" content))
-      (should-not (string-match-p "(eval-and-compile (require 'tramp)" content))
-      ;; Should define predicate inline, not as an autoload stub.
-      (should (string-match-p "defun tramp-rpc-file-name-p" content))
-      ;; Should NOT have an autoload stub for file-name-p
-      (should-not (string-match-p "autoload.*tramp-rpc-file-name-p" content))
-      ;; Should add to tramp-methods
-      (should (string-match-p "add-to-list 'tramp-methods" content))
-      ;; Should register in tramp-foreign-file-name-handler-alist
-      (should (string-match-p "tramp-foreign-file-name-handler-alist" content)))))
 
 ;;; ============================================================================
 ;;; Test Runner

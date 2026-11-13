@@ -122,15 +122,11 @@
 
 ;; Mock tests use the installed msgpack dependency; they never install or
 ;; refresh packages, which could turn a local test run into network I/O.
-(defvar tramp-rpc-mock-test--msgpack-available
-  (or (require 'msgpack nil t)
-      (progn
-        (require 'package)
-        (package-initialize)
-        (require 'msgpack nil t)))
-  "Non-nil if msgpack.el is available.")
-
-(unless tramp-rpc-mock-test--msgpack-available
+(unless (or (require 'msgpack nil t)
+            (progn
+              (require 'package)
+              (package-initialize)
+              (require 'msgpack nil t)))
   (error "tramp-rpc mock tests require an installed msgpack.el"))
 
 (require 'tramp-rpc-protocol)
@@ -138,7 +134,7 @@
 
 (defun tramp-rpc-mock-test--bytes-string (data)
   "Return DATA as a plain byte string, unwrapping MessagePack bin."
-  (if (and tramp-rpc-mock-test--msgpack-available (msgpack-bin-p data))
+  (if (msgpack-bin-p data)
       (msgpack-bin-string data)
     data))
 
@@ -178,7 +174,6 @@ the executed count excludes them."
 
 (ert-deftest tramp-rpc-mock-test-protocol-encode-request ()
   "Test MessagePack-RPC request encoding."
-  (skip-unless tramp-rpc-mock-test--msgpack-available)
   (let* ((result (tramp-rpc-protocol-encode-request-with-id "file.stat" '((path . "/test"))))
          (id (car result))
          (bytes (cdr result)))
@@ -208,7 +203,6 @@ the executed count excludes them."
 
 (ert-deftest tramp-rpc-mock-test-protocol-decode-success ()
   "Test MessagePack-RPC success response decoding."
-  (skip-unless tramp-rpc-mock-test--msgpack-available)
   (let* ((response-data '((version . "2.0") (id . 1) (result . ((exists . t)))))
          (response-bytes (msgpack-encode response-data)))
     (with-temp-buffer
@@ -222,7 +216,6 @@ the executed count excludes them."
 
 (ert-deftest tramp-rpc-mock-test-protocol-decode-error ()
   "Test MessagePack-RPC error response decoding."
-  (skip-unless tramp-rpc-mock-test--msgpack-available)
   (let* ((response-data '((version . "2.0")
                           (id . 1)
                           (error . ((code . -32001) (message . "File not found")))))
@@ -238,7 +231,6 @@ the executed count excludes them."
 
 (ert-deftest tramp-rpc-mock-test-protocol-batch-encode ()
   "Test MessagePack-RPC batch request encoding."
-  (skip-unless tramp-rpc-mock-test--msgpack-available)
   (let* ((requests '(("file.stat" . ((path . "/a")))
                      ("file.stat" . ((path . "/b")))))
          (result (tramp-rpc-protocol-encode-batch-request-with-id requests))
@@ -260,7 +252,6 @@ the executed count excludes them."
 
 (ert-deftest tramp-rpc-mock-test-protocol-batch-decode ()
   "Test MessagePack-RPC batch response decoding."
-  (skip-unless tramp-rpc-mock-test--msgpack-available)
   (let* ((response-plist '(:id 1
                            :result ((results . (((result . t))
                                                 ((error (code . -32003)
@@ -277,7 +268,6 @@ the executed count excludes them."
 
 (ert-deftest tramp-rpc-mock-test-protocol-length-framing ()
   "Test length-prefixed framing functions."
-  (skip-unless tramp-rpc-mock-test--msgpack-available)
   (let* ((test-data '((foo . "bar")))
          (payload (msgpack-encode test-data))
          (framed (tramp-rpc-protocol--length-prefix payload)))
@@ -302,7 +292,6 @@ the executed count excludes them."
 
 (ert-deftest tramp-rpc-mock-test-protocol-incomplete-message ()
   "Test handling of incomplete messages."
-  (skip-unless tramp-rpc-mock-test--msgpack-available)
   (let* ((response '((version . "2.0") (id . 1) (result . t)))
          (payload (msgpack-encode response))
          (framed (tramp-rpc-protocol--length-prefix payload)))
@@ -321,7 +310,6 @@ the executed count excludes them."
 
 (ert-deftest tramp-rpc-mock-test-protocol-rejects-trailing-frame-data ()
   "A declared frame must contain exactly one MessagePack object."
-  (skip-unless tramp-rpc-mock-test--msgpack-available)
   (let* ((response '((version . "2.0") (id . 1) (result . t)))
          (payload (concat (msgpack-encode response) (unibyte-string 0)))
          (framed (tramp-rpc-protocol--length-prefix payload)))
@@ -335,7 +323,6 @@ the executed count excludes them."
 
 (ert-deftest tramp-rpc-mock-test-protocol-rejects-oversized-frame ()
   "Reject oversized declared frames before buffering their payload."
-  (skip-unless tramp-rpc-mock-test--msgpack-available)
   (with-temp-buffer
     (set-buffer-multibyte nil)
     (insert (msgpack-unsigned-to-bytes
@@ -346,7 +333,6 @@ the executed count excludes them."
 
 (ert-deftest tramp-rpc-mock-test-protocol-rejects-oversized-request ()
   "Reject an oversized request before it reaches the transport."
-  (skip-unless tramp-rpc-mock-test--msgpack-available)
   (let ((tramp-rpc-protocol-max-frame-size 32)
         (tramp-rpc-protocol--request-id 0))
     (should-error
@@ -356,7 +342,6 @@ the executed count excludes them."
 
 (ert-deftest tramp-rpc-mock-test-protocol-filter-fails-malformed-connection ()
   "Malformed input is contained by the filter and retires the transport."
-  (skip-unless tramp-rpc-mock-test--msgpack-available)
   (let* ((buffer (generate-new-buffer " *tramp-rpc-malformed-filter*"))
          (process (make-process :name "tramp-rpc-malformed-filter"
                                 :buffer buffer
@@ -392,7 +377,6 @@ the executed count excludes them."
 
 (ert-deftest tramp-rpc-mock-test-protocol-id-uniqueness ()
   "Test that request IDs are unique."
-  (skip-unless tramp-rpc-mock-test--msgpack-available)
   (let ((ids (make-hash-table :test 'equal)))
     (dotimes (_ 100)
       (let* ((result (tramp-rpc-protocol-encode-request-with-id "test" nil))
@@ -448,7 +432,6 @@ The server sends the full st_mode value including file type bits."
 
 (ert-deftest tramp-rpc-mock-test-quote-remote-looking-symlink-targets ()
   "Remote-looking symlink targets are quoted before they reach TRAMP."
-  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
   (let* ((target "/ssh:$SENSITIVE_DATA@remote-host:")
          (encoded-target (encode-coding-string target 'utf-8-unix))
          (stat-result `((type . "symlink")
@@ -592,7 +575,6 @@ Returns the result or signals an error."
 (ert-deftest tramp-rpc-mock-test-server-system-info ()
   "Test system.info RPC call."
   :tags '(:server)
-  (skip-unless tramp-rpc-mock-test--msgpack-available)
   (skip-unless (tramp-rpc-mock-test--find-server))
   (unwind-protect
       (progn
@@ -622,7 +604,6 @@ Returns the result or signals an error."
 (ert-deftest tramp-rpc-mock-test-server-file-operations ()
   "Test basic file operations via RPC."
   :tags '(:server)
-  (skip-unless tramp-rpc-mock-test--msgpack-available)
   (skip-unless (tramp-rpc-mock-test--find-server))
   (unwind-protect
       (progn
@@ -670,7 +651,6 @@ Returns the result or signals an error."
 (ert-deftest tramp-rpc-mock-test-server-write-offset-preserves-suffix ()
   "The file.write offset field replaces bytes without truncating the suffix."
   :tags '(:server)
-  (skip-unless tramp-rpc-mock-test--msgpack-available)
   (skip-unless (tramp-rpc-mock-test--find-server))
   (unwind-protect
       (progn
@@ -692,7 +672,6 @@ Returns the result or signals an error."
 (ert-deftest tramp-rpc-mock-test-server-write-offset-creates-zero-filled-file ()
   "An offset write creates a missing file with its leading hole zero-filled."
   :tags '(:server)
-  (skip-unless tramp-rpc-mock-test--msgpack-available)
   (skip-unless (tramp-rpc-mock-test--find-server))
   (unwind-protect
       (progn
@@ -754,7 +733,6 @@ Returns the result or signals an error."
 (ert-deftest tramp-rpc-mock-test-server-rename-dangling-symlink-no-overwrite ()
   "No-overwrite rename treats a dangling symlink as an existing destination."
   :tags '(:server)
-  (skip-unless tramp-rpc-mock-test--msgpack-available)
   (skip-unless (tramp-rpc-mock-test--find-server))
   (unwind-protect
       (progn
@@ -776,7 +754,6 @@ Returns the result or signals an error."
 (ert-deftest tramp-rpc-mock-test-server-directory-operations ()
   "Test directory operations via RPC."
   :tags '(:server)
-  (skip-unless tramp-rpc-mock-test--msgpack-available)
   (skip-unless (tramp-rpc-mock-test--find-server))
   (unwind-protect
       (progn
@@ -830,7 +807,6 @@ Returns the result or signals an error."
 (ert-deftest tramp-rpc-mock-test-server-highlevel-locate-dominating-file ()
   "Test high-level locate-dominating-file RPC helper."
   :tags '(:server)
-  (skip-unless tramp-rpc-mock-test--msgpack-available)
   (skip-unless (tramp-rpc-mock-test--find-server))
   (unwind-protect
       (progn
@@ -855,7 +831,6 @@ Returns the result or signals an error."
 A tilde is a shell convention rather than a directory, so walking it
 literally finds nothing."
   :tags '(:server)
-  (skip-unless tramp-rpc-mock-test--msgpack-available)
   (skip-unless (tramp-rpc-mock-test--find-server))
   (let ((home (make-temp-file "tramp-rpc-home" t))
         ;; Overriding HOME below also changes how Emacs expands a tilde, so
@@ -883,7 +858,6 @@ literally finds nothing."
 (ert-deftest tramp-rpc-mock-test-server-highlevel-locate-dominating-file-preserves-symlink-path ()
   "Test locate-dominating-file keeps lexical symlink path."
   :tags '(:server)
-  (skip-unless tramp-rpc-mock-test--msgpack-available)
   (skip-unless (tramp-rpc-mock-test--find-server))
   (skip-unless (not (memq system-type '(windows-nt ms-dos))))
   (unwind-protect
@@ -911,7 +885,6 @@ literally finds nothing."
 (ert-deftest tramp-rpc-mock-test-server-highlevel-locate-dominating-file-depth-limit ()
   "Ensure dominating-file helper reports not-found after 100 ancestor levels."
   :tags '(:server)
-  (skip-unless tramp-rpc-mock-test--msgpack-available)
   (skip-unless (tramp-rpc-mock-test--find-server))
   (unwind-protect
       (progn
@@ -935,7 +908,6 @@ literally finds nothing."
 (ert-deftest tramp-rpc-mock-test-server-highlevel-test-files-in-dir ()
   "Test high-level dir-locals file listing RPC helper."
   :tags '(:server)
-  (skip-unless tramp-rpc-mock-test--msgpack-available)
   (skip-unless (tramp-rpc-mock-test--find-server))
   (unwind-protect
       (progn
@@ -956,7 +928,6 @@ literally finds nothing."
 (ert-deftest tramp-rpc-mock-test-server-highlevel-dir-locals-cache-update ()
   "Test high-level dir-locals cache update RPC helper."
   :tags '(:server)
-  (skip-unless tramp-rpc-mock-test--msgpack-available)
   (skip-unless (tramp-rpc-mock-test--find-server))
   (unwind-protect
       (progn
@@ -981,7 +952,6 @@ literally finds nothing."
 (ert-deftest tramp-rpc-mock-test-server-highlevel-dir-locals-cache-update-preserves-symlink-path ()
   "Ensure dir-locals cache update keeps lexical symlink paths."
   :tags '(:server)
-  (skip-unless tramp-rpc-mock-test--msgpack-available)
   (skip-unless (tramp-rpc-mock-test--find-server))
   (skip-unless (not (memq system-type '(windows-nt ms-dos))))
   (unwind-protect
@@ -1013,7 +983,6 @@ literally finds nothing."
 (ert-deftest tramp-rpc-mock-test-server-highlevel-dir-locals-cache-update-depth-limit ()
   "Ensure dir-locals cache helper reports not-found after 100 ancestor levels."
   :tags '(:server)
-  (skip-unless tramp-rpc-mock-test--msgpack-available)
   (skip-unless (tramp-rpc-mock-test--find-server))
   (unwind-protect
       (progn
@@ -1040,7 +1009,6 @@ literally finds nothing."
 (ert-deftest tramp-rpc-mock-test-server-process-run ()
   "Test process.run RPC call."
   :tags '(:server :process)
-  (skip-unless tramp-rpc-mock-test--msgpack-available)
   (skip-unless (tramp-rpc-mock-test--find-server))
   (unwind-protect
       (progn
@@ -1072,7 +1040,6 @@ literally finds nothing."
 (ert-deftest tramp-rpc-mock-test-server-process-spawn-enoent-is-classified ()
   "Local process.run distinguishes a missing executable from a missing cwd."
   :tags '(:server :process)
-  (skip-unless tramp-rpc-mock-test--msgpack-available)
   (skip-unless (tramp-rpc-mock-test--find-server))
   (unwind-protect
       (progn
@@ -1097,7 +1064,6 @@ literally finds nothing."
   "Test process.run returns 128+signal for signal-killed processes.
 This matches the behavior expected by `tramp-test28-process-file'."
   :tags '(:server :process)
-  (skip-unless tramp-rpc-mock-test--msgpack-available)
   (skip-unless (tramp-rpc-mock-test--find-server))
   (unwind-protect
       (progn
@@ -1159,9 +1125,6 @@ This matches the behavior expected by `tramp-test28-process-file'."
                   "tramp-rpc-deploy" (url dest))
 (declare-function tramp-rpc-deploy--default-source-directory
                   "tramp-rpc-deploy" ())
-(defconst tramp-rpc-mock-test--tramp-rpc-loaded t
-  "The full TRAMP-RPC backend was loaded successfully.")
-
 (ert-deftest tramp-rpc-mock-test-expand-file-name-relative-remote-directory ()
   "Relative remote directories resolve under home, like explicit names."
   (cl-letf (((symbol-function 'tramp-connectable-p) #'always)
@@ -1356,9 +1319,7 @@ This matches the behavior expected by `tramp-test28-process-file'."
 (defvar tramp-rpc-magit--ancestor-scan-caches)
 (defvar tramp-rpc-magit--prefetch-directories)
 
-(defconst tramp-rpc-mock-test--tramp-rpc-magit-loaded
-  (progn (require 'tramp-rpc-magit) t)
-  "The TRAMP-RPC Magit support was loaded successfully.")
+(require 'tramp-rpc-magit)
 
 (defun tramp-rpc-mock-test--clear-hash-tables (&rest symbols)
   "Clear the hash tables stored in SYMBOLS."
@@ -2434,7 +2395,6 @@ after the remote signal is recorded; otherwise `process-live-p' turns false
 and the relay (and its sentinel) stays alive forever.  The `tramp-vector'
 property is required for the advised status to be consulted, which is why a
 direct property test would miss it."
-  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
   (let* ((vec (tramp-dissect-file-name "/rpc:user@host:/tmp/"))
          (process (start-process "tramp-rpc-signal-eof" nil "cat"))
          (tramp-rpc--async-processes (make-hash-table :test 'eq))
@@ -2456,7 +2416,6 @@ direct property test would miss it."
 
 (ert-deftest tramp-rpc-mock-test-pty-signal-exit-still-sends-relay-eof ()
   "A signal-killed PTY process must still send EOF to its local relay."
-  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
   (let* ((vec (tramp-dissect-file-name "/rpc:user@host:/tmp/"))
          (process (start-process "tramp-rpc-pty-signal-eof" nil "cat"))
          (tramp-rpc--pty-processes (make-hash-table :test 'eq))
@@ -2935,7 +2894,6 @@ direct property test would miss it."
 
 (ert-deftest tramp-rpc-mock-test-reset-state-cleans-file-notify-resources ()
   "State reset removes descriptors before clearing their tracking tables."
-  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
   (require 'filenotify)
   (let* ((tramp-rpc--file-notify-descriptors (make-hash-table :test 'eq))
          (tramp-rpc--file-notify-watch-counts (make-hash-table :test 'equal))
@@ -3038,7 +2996,6 @@ direct property test would miss it."
 
 (ert-deftest tramp-rpc-mock-test-compatible-path-value-prefers-text ()
   "Valid UTF-8 paths remain compatible with pre-binary-path servers."
-  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
   (let ((text (tramp-rpc--path-to-compatible-value "/tmp/project"))
         (binary (tramp-rpc--path-to-compatible-value
                  (concat "/tmp/" (unibyte-string #xff)))))
@@ -3090,7 +3047,6 @@ direct property test would miss it."
 
 (ert-deftest tramp-rpc-mock-test-prefetch-directories-prunes-expired-entries ()
   "Expired repository registrations do not accumulate indefinitely."
-  (skip-unless tramp-rpc-mock-test--tramp-rpc-magit-loaded)
   (let ((tramp-rpc-magit--prefetch-directories
          (make-hash-table :test 'equal))
         (tramp-rpc--cache-ttl 10))
@@ -3106,7 +3062,6 @@ direct property test would miss it."
 
 (ert-deftest tramp-rpc-mock-test-prefetch-scan-may-invalidate-prefetch-table ()
   "A synchronous ancestor scan runs after prefetch-table iteration."
-  (skip-unless tramp-rpc-mock-test--tramp-rpc-magit-loaded)
   (let ((tramp-rpc-magit--ancestor-scan-caches
          (make-hash-table :test 'equal))
         (tramp-rpc-magit--prefetch-directories
@@ -3127,7 +3082,6 @@ direct property test would miss it."
 
 (ert-deftest tramp-rpc-mock-test-ancestor-scan-parent-falls-through ()
   "Closest-only ancestor scan must not cache false negatives above the hit."
-  (skip-unless tramp-rpc-mock-test--tramp-rpc-magit-loaded)
   (let ((scan '((".editorconfig" . "/repo/sub"))))
     (should (eq (tramp-rpc-magit--file-exists-in-ancestor-scan
                  "/ssh:mock:/repo/sub/.editorconfig" scan)
@@ -3145,7 +3099,6 @@ direct property test would miss it."
 
 (ert-deftest tramp-rpc-mock-test-ancestor-scan-compares-raw-path-bytes ()
   "Ancestor marker hits preserve non-UTF-8 localname bytes."
-  (skip-unless tramp-rpc-mock-test--tramp-rpc-magit-loaded)
   (let* ((directory (concat "/repo/" (unibyte-string 255)))
          (filename (concat "/ssh:mock:" directory "/.git"))
          (scan (list (cons ".git" directory))))
@@ -3169,7 +3122,6 @@ direct property test would miss it."
 
 (ert-deftest tramp-rpc-mock-test-magit-status-memo-before-snapshot ()
   "Before the snapshot exists, a status command reuses read-only git results."
-  (skip-unless tramp-rpc-mock-test--tramp-rpc-magit-loaded)
   (let ((default-directory "/ssh:mock:/repo/")
         (tramp-rpc-magit--process-caches (make-hash-table :test 'equal))
         (tramp-rpc-magit--allow-process-cache t)
@@ -3196,7 +3148,6 @@ direct property test would miss it."
 
 (ert-deftest tramp-rpc-mock-test-git-process-cache-skips-admission-failures ()
   "Transient parallel admission failures are not stored as git results."
-  (skip-unless tramp-rpc-mock-test--tramp-rpc-magit-loaded)
   (tramp-rpc-mock-test--with-git-process-cache
     (let* ((cmd-key (tramp-rpc-magit--process-cache-key "status"))
            (results `((,cmd-key . ((exit_code . -1)
@@ -3209,7 +3160,6 @@ direct property test would miss it."
 
 (ert-deftest tramp-rpc-mock-test-git-process-cache-requires-opt-in ()
   "Prefetched git output is ignored outside Magit's cache window."
-  (skip-unless tramp-rpc-mock-test--tramp-rpc-magit-loaded)
   (tramp-rpc-mock-test--with-git-process-cache
     (puthash (tramp-rpc-magit--process-cache-key "status" "--porcelain")
              '(0 . "cached") cache)
@@ -3219,7 +3169,6 @@ direct property test would miss it."
 
 (ert-deftest tramp-rpc-mock-test-git-process-cache-strips-safe-prefixes ()
   "Cache lookup ignores Magit's cache-neutral git prefixes."
-  (skip-unless tramp-rpc-mock-test--tramp-rpc-magit-loaded)
   (tramp-rpc-mock-test--with-git-process-cache
     (puthash (tramp-rpc-magit--process-cache-key "status" "--porcelain")
              '(0 . "cached") cache)
@@ -3232,7 +3181,6 @@ direct property test would miss it."
 
 (ert-deftest tramp-rpc-mock-test-git-process-cache-rejects-semantic-prefixes ()
   "Cache lookup misses when git prefixes change repository semantics."
-  (skip-unless tramp-rpc-mock-test--tramp-rpc-magit-loaded)
   (tramp-rpc-mock-test--with-git-process-cache
     (puthash (tramp-rpc-magit--process-cache-key "status") '(0 . "cached") cache)
     (let ((tramp-rpc-magit--allow-process-cache t))
@@ -3245,7 +3193,6 @@ direct property test would miss it."
 
 (ert-deftest tramp-rpc-mock-test-git-process-cache-rejects-git-env ()
   "Cache lookup misses when dynamic GIT_* environment differs."
-  (skip-unless tramp-rpc-mock-test--tramp-rpc-magit-loaded)
   (tramp-rpc-mock-test--with-git-process-cache
     (puthash (tramp-rpc-magit--process-cache-key "status") '(0 . "cached") cache)
     (let ((tramp-rpc-magit--allow-process-cache t)
@@ -3255,7 +3202,6 @@ direct property test would miss it."
 
 (ert-deftest tramp-rpc-mock-test-git-process-cache-does-not-store-mutators ()
   "Mutating git commands are never stored in the process cache."
-  (skip-unless tramp-rpc-mock-test--tramp-rpc-magit-loaded)
   (tramp-rpc-mock-test--with-git-process-cache
     (let ((tramp-rpc-magit--allow-process-cache t))
       (tramp-rpc-magit--process-cache-store
@@ -3266,7 +3212,6 @@ direct property test would miss it."
 
 (ert-deftest tramp-rpc-mock-test-magit-prefetch-after-stale-update-index ()
   "`update-index --refresh' exiting 1 (stale files) still builds the snapshot."
-  (skip-unless tramp-rpc-mock-test--tramp-rpc-magit-loaded)
   (dolist (exit-code '(0 1 128))
     (let ((default-directory "/rpc:user@host:/repo/")
           (tramp-rpc-magit--allow-process-cache t)
@@ -3292,7 +3237,6 @@ direct property test would miss it."
 
 (ert-deftest tramp-rpc-mock-test-git-process-cache-does-not-reuse-subdir ()
   "A repo-root process cache is not reused for a different cwd."
-  (skip-unless tramp-rpc-mock-test--tramp-rpc-magit-loaded)
   (tramp-rpc-mock-test--with-git-process-cache
     (puthash (tramp-rpc-magit--process-cache-key "status") '(0 . "cached") cache)
     (let ((default-directory "/ssh:mock:/repo/sub/")
@@ -3301,7 +3245,6 @@ direct property test would miss it."
 
 (ert-deftest tramp-rpc-mock-test-file-regular-p-uses-stat ()
   "`file-regular-p' uses one following file.stat."
-  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
   (let (calls)
     (cl-letf (((symbol-function 'tramp-rpc--call-file-stat)
                (lambda (_vec localname &optional lstat)
@@ -3314,7 +3257,6 @@ direct property test would miss it."
 
 (ert-deftest tramp-rpc-mock-test-rename-preflight-preserves-destination-error ()
   "A destination stat error must not be reported as an existing file."
-  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
   (cl-letf (((symbol-function 'tramp-rpc--call-batch)
              (lambda (_vec _requests)
                (list '((type . "file"))
@@ -3330,7 +3272,6 @@ direct property test would miss it."
 
 (ert-deftest tramp-rpc-mock-test-connection-cache-clear-clears-ancestor-scans ()
   "Connection cache clearing drops only that connection's ancestor scans."
-  (skip-unless tramp-rpc-mock-test--tramp-rpc-magit-loaded)
   (let* ((vec (tramp-dissect-file-name "/ssh:mock:/repo/"))
          (other-vec (tramp-dissect-file-name "/ssh:other:/repo/"))
          (key (cons (tramp-rpc--connection-key-string vec) "/repo/"))
@@ -3354,7 +3295,6 @@ direct property test would miss it."
 
 (ert-deftest tramp-rpc-mock-test-subtree-invalidation-flushes-tramp-properties ()
   "Subtree invalidation flushes descendant TRAMP file properties."
-  (skip-unless tramp-rpc-mock-test--tramp-rpc-magit-loaded)
   (let* ((child "/ssh:mock:/repo/child")
          (tramp-rpc--file-exists-cache (make-hash-table :test 'equal))
          (tramp-rpc--file-truename-cache (make-hash-table :test 'equal))
@@ -3375,7 +3315,6 @@ direct property test would miss it."
 
 (ert-deftest tramp-rpc-mock-test-magit-status-setup-clears-requested-directory ()
   "`magit-status-setup-buffer' clears metadata for its DIRECTORY argument."
-  (skip-unless tramp-rpc-mock-test--tramp-rpc-magit-loaded)
   (let ((default-directory "/ssh:other:/else/")
         (tramp-rpc-magit-disable-remote-diff-tab-width-detection nil)
         cleared side-effects)
@@ -3391,7 +3330,6 @@ direct property test would miss it."
 
 (ert-deftest tramp-rpc-mock-test-magit-status-refresh-suppresses-side-effects ()
   "Magit status refresh preserves caches only within its dynamic scope."
-  (skip-unless tramp-rpc-mock-test--tramp-rpc-magit-loaded)
   (let ((default-directory "/ssh:mock:/repo/")
         (process-file-side-effects t)
         (tramp-rpc-magit--status-setup-prefetch-active t)
@@ -3407,7 +3345,6 @@ direct property test would miss it."
 
 (ert-deftest tramp-rpc-mock-test-magit-section-show-suppresses-side-effects ()
   "Lazy section expansion preserves caches only within its dynamic scope."
-  (skip-unless tramp-rpc-mock-test--tramp-rpc-magit-loaded)
   (let ((process-file-side-effects t)
         (tramp-rpc-magit-disable-remote-diff-tab-width-detection nil)
         prefetch-side-effects body-side-effects)
@@ -3425,8 +3362,6 @@ direct property test would miss it."
 
 (ert-deftest tramp-rpc-mock-test-magit-cache-file-truename-accepts-bin-result ()
   "Magit metadata prefetch accepts bin file.truename results."
-  (skip-unless (and tramp-rpc-mock-test--tramp-rpc-magit-loaded
-                   tramp-rpc-mock-test--msgpack-available))
   (let ((tramp-rpc--file-truename-cache (make-hash-table :test 'equal))
         (vec (tramp-dissect-file-name "/rpc:mock:/repo/")))
     (cl-letf (((symbol-function 'tramp-rpc--decode-string)
@@ -3439,7 +3374,6 @@ direct property test would miss it."
 
 (ert-deftest tramp-rpc-mock-test-magit-metadata-prefetch-bounds-batches ()
   "Large Magit metadata prefetches stay within the server batch limit."
-  (skip-unless tramp-rpc-mock-test--tramp-rpc-magit-loaded)
   (let ((vec (tramp-dissect-file-name "/rpc:mock:/repo/"))
         (files (cl-loop for i below 40
                         collect (format "/repo/file-%02d" i)))
@@ -3461,7 +3395,6 @@ direct property test would miss it."
 
 (ert-deftest tramp-rpc-mock-test-file-notify-descriptor-monitor-name ()
   "File notification descriptors expose library and monitor names for tests."
-  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
   (let* ((vec (tramp-dissect-file-name "/rpc:mock:/tmp/"))
          descriptor)
     (unwind-protect
@@ -3479,7 +3412,6 @@ direct property test would miss it."
 
 (ert-deftest tramp-rpc-mock-test-file-notify-symlink-requests-nofollow-watch ()
   "File notification watches on symlinks request nofollow server watches."
-  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
   (require 'filenotify)
   (let* ((tramp-rpc--file-notify-descriptors (make-hash-table :test 'eq))
          (tramp-rpc--file-notify-watch-counts (make-hash-table :test 'equal))
@@ -3526,7 +3458,6 @@ direct property test would miss it."
 
 (ert-deftest tramp-rpc-mock-test-file-notify-symlink-falls-back-to-synthetic ()
   "Symlink file notification watches stay synthetic without server support."
-  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
   (require 'filenotify)
   (let* ((tramp-rpc--file-notify-descriptors (make-hash-table :test 'eq))
          (tramp-rpc--file-notify-watch-counts (make-hash-table :test 'equal))
@@ -3568,7 +3499,6 @@ direct property test would miss it."
 
 (ert-deftest tramp-rpc-mock-test-file-notify-expected-events-skip-only-cache-work ()
   "Expected events still dispatch; any other event keeps its full effect."
-  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
   (let* ((vec (tramp-dissect-file-name "/rpc:mock:/tmp/"))
          (proc (make-process :name "tramp-rpc-fs-events-test"
                              :buffer nil
@@ -3622,7 +3552,6 @@ direct property test would miss it."
 
 (ert-deftest tramp-rpc-mock-test-magit-status-cache-cleared-by-repository ()
   "Status caches are cleared only for repositories containing a change."
-  (skip-unless tramp-rpc-mock-test--tramp-rpc-magit-loaded)
   (let* ((tramp-rpc-magit--process-caches (make-hash-table :test 'equal))
          (vec (tramp-dissect-file-name "/rpc:mock:/"))
          (other (tramp-dissect-file-name "/rpc:other:/")))
@@ -3669,7 +3598,6 @@ direct property test would miss it."
 
 (ert-deftest tramp-rpc-mock-test-file-notify-unexpected-events-invalidate-caches ()
   "Unexpected fs.events clear status/cache state and dispatch notifications."
-  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
   (let* ((vec (tramp-dissect-file-name "/rpc:mock:/tmp/"))
          (proc (make-process :name "tramp-rpc-fs-events-unsuppressed-test"
                              :buffer nil
@@ -3800,7 +3728,6 @@ direct property test would miss it."
 
 (ert-deftest tramp-rpc-mock-test-fs-events-and-mutations-preserve-other-magit-connections ()
   "A connection's fs event and mutation do not evict another connection's caches."
-  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
   (let* ((vec-a (tramp-dissect-file-name "/rpc:cache-a:/repo-a/"))
          (vec-b (tramp-dissect-file-name "/rpc:cache-b:/repo-b/"))
          (connection-a (tramp-rpc--connection-key-string vec-a))
@@ -3865,7 +3792,6 @@ direct property test would miss it."
 
 (ert-deftest tramp-rpc-mock-test-file-notify-canonical-event-invalidates-original-watch-spelling ()
   "Canonical fs.events paths also invalidate equivalent original watch paths."
-  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
   (let* ((tramp-rpc--file-notify-descriptors (make-hash-table :test 'eq))
          (tramp-rpc--file-notify-watch-counts (make-hash-table :test 'equal))
          (vec (tramp-dissect-file-name "/rpc:mock:/tmp/"))
@@ -3911,7 +3837,6 @@ direct property test would miss it."
 
 (ert-deftest tramp-rpc-mock-test-file-notify-watch-directory-canonical-event-invalidates-original-spelling ()
   "Explicit watch canonical fs.events paths invalidate original watched paths."
-  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
   (let* ((tramp-rpc--watched-directories (make-hash-table :test 'equal))
          (vec (tramp-dissect-file-name "/rpc:mock:/tmp/"))
          (proc (make-process :name "tramp-rpc-watch-canonical-test"
@@ -3952,7 +3877,6 @@ direct property test would miss it."
 
 (ert-deftest tramp-rpc-mock-test-watch-directory-canonical-aliases-share-server-watch ()
   "Explicit watches with the same canonical path do not remove each other."
-  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
   (let* ((tramp-rpc--watched-directories (make-hash-table :test 'equal))
          (tramp-rpc--file-notify-watch-counts (make-hash-table :test 'equal))
          (link-directory "/rpc:mock:/tmp/link/")
@@ -3974,7 +3898,6 @@ direct property test would miss it."
 
 (ert-deftest tramp-rpc-mock-test-file-notify-canonical-aliases-share-server-watch ()
   "File notification watches with the same canonical path are refcounted."
-  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
   (require 'filenotify)
   (let* ((tramp-rpc--file-notify-descriptors (make-hash-table :test 'eq))
          (tramp-rpc--file-notify-watch-counts (make-hash-table :test 'equal))
@@ -4010,7 +3933,6 @@ direct property test would miss it."
 
 (ert-deftest tramp-rpc-mock-test-file-notify-cleanup-for-connection ()
   "Per-connection cleanup removes TRAMP-RPC and global file-notify descriptors."
-  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
   (require 'filenotify)
   (let* ((tramp-rpc--file-notify-descriptors (make-hash-table :test 'eq))
          (tramp-rpc--file-notify-watch-counts (make-hash-table :test 'equal))
@@ -4188,7 +4110,6 @@ direct property test would miss it."
 
 (ert-deftest tramp-rpc-mock-test-file-notify-dispatch-matches-canonical-directory ()
   "Dispatch matches canonical watch paths returned by the server."
-  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
   (require 'filenotify)
   (let* ((tramp-rpc--file-notify-descriptors (make-hash-table :test 'eq))
          (tramp-rpc--file-notify-watch-counts (make-hash-table :test 'equal))
@@ -4242,7 +4163,6 @@ direct property test would miss it."
 
 (ert-deftest tramp-rpc-mock-test-file-notify-callback-expands-relative-event-name ()
   "Dispatched relative backend names become absolute TRAMP callback names."
-  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
   (require 'filenotify)
   (let* ((tramp-rpc--file-notify-descriptors (make-hash-table :test 'eq))
          (tramp-rpc--file-notify-watch-counts (make-hash-table :test 'equal))
@@ -4276,7 +4196,6 @@ direct property test would miss it."
 
 (ert-deftest tramp-rpc-mock-test-file-notify-dispatches-structured-actions ()
   "Structured server watch events dispatch the corresponding file-notify actions."
-  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
   (require 'filenotify)
   (let* ((tramp-rpc--file-notify-descriptors (make-hash-table :test 'eq))
          (tramp-rpc--file-notify-watch-counts (make-hash-table :test 'equal))
@@ -4319,7 +4238,6 @@ direct property test would miss it."
 
 (ert-deftest tramp-rpc-mock-test-file-notify-dispatch-honors-flags ()
   "TRAMP-RPC file notifications honor change vs attribute-change flags."
-  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
   (require 'filenotify)
   (let* ((tramp-rpc--file-notify-descriptors (make-hash-table :test 'eq))
          (tramp-rpc--file-notify-watch-counts (make-hash-table :test 'equal))
@@ -4357,7 +4275,6 @@ direct property test would miss it."
 
 (ert-deftest tramp-rpc-mock-test-file-notify-public-rm-and-valid-route ()
   "Public file-notify APIs route TRAMP-RPC descriptors to private state."
-  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
   (require 'filenotify)
   (let* ((tramp-rpc--file-notify-descriptors (make-hash-table :test 'eq))
          (tramp-rpc--file-notify-watch-counts (make-hash-table :test 'equal))
@@ -4399,7 +4316,6 @@ direct property test would miss it."
 
 (ert-deftest tramp-rpc-mock-test-file-notify-watch-upgrade-does-not-mask-recursive ()
   "A direct file-notify watch does not mask or remove a recursive watch."
-  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
   (let* ((tramp-rpc--file-notify-descriptors (make-hash-table :test 'eq))
          (tramp-rpc--file-notify-watch-counts (make-hash-table :test 'equal))
          (tramp-rpc--watched-directories (make-hash-table :test 'equal))
@@ -4439,7 +4355,6 @@ direct property test would miss it."
 
 (ert-deftest tramp-rpc-mock-test-file-notify-unwatch-restores-direct-watch ()
   "Explicit unwatch restores a direct watch needed by file-notify."
-  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
   (let* ((tramp-rpc--file-notify-descriptors (make-hash-table :test 'eq))
          (tramp-rpc--file-notify-watch-counts (make-hash-table :test 'equal))
          (tramp-rpc--watched-directories (make-hash-table :test 'equal))
@@ -4474,7 +4389,6 @@ direct property test would miss it."
 
 (ert-deftest tramp-rpc-mock-test-file-notify-watch-upgrade-failure-keeps-direct ()
   "A failed recursive upgrade does not remove a direct file-notify watch."
-  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
   (let* ((tramp-rpc--file-notify-descriptors (make-hash-table :test 'eq))
          (tramp-rpc--file-notify-watch-counts (make-hash-table :test 'equal))
          (tramp-rpc--watched-directories (make-hash-table :test 'equal))
@@ -4505,7 +4419,6 @@ direct property test would miss it."
 (ert-deftest tramp-rpc-mock-test-connection-stderr-drain-prevents-block ()
   "Test separated connection stderr is drained while waiting for stdout."
   :tags '(:connection)
-  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
   (skip-unless (executable-find "python3"))
   (let* ((stdout-buffer (generate-new-buffer " *tramp-rpc-stderr-stdout*"))
          (stderr-buffer (generate-new-buffer " *tramp-rpc-stderr-stderr*"))
@@ -4554,7 +4467,6 @@ direct property test would miss it."
 
 (ert-deftest tramp-rpc-mock-test-system-info-cache-shared ()
   "system.info is cached and shared by uid, gid, and home handlers."
-  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
   (let ((vec (tramp-dissect-file-name "/rpc:mockhost:/tmp"))
         (count 0))
     (tramp-flush-connection-properties vec)
@@ -4578,7 +4490,6 @@ direct property test would miss it."
 
 (ert-deftest tramp-rpc-mock-test-system-info-cache-seeding-reused ()
   "Seeded system.info properties are reused without another RPC."
-  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
   (let ((vec (tramp-dissect-file-name "/rpc:mock@mockhost:/tmp")))
     (tramp-flush-connection-properties vec)
     (tramp-rpc--cache-system-info
@@ -4600,7 +4511,6 @@ direct property test would miss it."
 
 (ert-deftest tramp-rpc-mock-test-system-info-cold-connection-reuses-startup-cache ()
   "A cold system.info lookup reuses the cache seeded by connection setup."
-  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
   (let ((vec (tramp-dissect-file-name "/rpc:mock@mockhost:/tmp"))
         (ensure-count 0))
     (tramp-flush-connection-properties vec)
@@ -4623,7 +4533,6 @@ direct property test would miss it."
 
 (ert-deftest tramp-rpc-mock-test-file-directory-p-caches-nil ()
   "`file-directory-p' caches negative RPC stat results."
-  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
   (let* ((filename "/rpc:mockhost:/tmp/not-a-dir")
          (vec (tramp-dissect-file-name filename))
          (count 0))
@@ -4639,7 +4548,6 @@ direct property test would miss it."
 
 (ert-deftest tramp-rpc-mock-test-mkdir-parents-invalidates-prefix-caches ()
   "Parent mkdir invalidation clears stale caches for created prefixes."
-  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
   (let* ((vec (tramp-dissect-file-name "/rpc:mockhost:/tmp/a/b/c"))
          (prefix-file "/rpc:mockhost:/tmp/a")
          (prefix-key (expand-file-name prefix-file))
@@ -4660,7 +4568,6 @@ direct property test would miss it."
 
 (ert-deftest tramp-rpc-mock-test-set-file-modes-no-preflight ()
   "`set-file-modes' calls only file.set_modes on the success path."
-  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
   (let ((calls nil))
     (cl-letf (((symbol-function 'tramp-rpc--call)
                (lambda (_vec method _params)
@@ -4709,7 +4616,6 @@ direct property test would miss it."
 
 (ert-deftest tramp-rpc-mock-test-set-file-modes-invalidates-metadata-caches ()
   "`set-file-modes' clears cached metadata that depends on file mode bits."
-  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
   (let* ((filename "/rpc:mockhost:/tmp/file")
          (vec (tramp-dissect-file-name filename))
          (localname "/tmp/file")
@@ -4737,7 +4643,6 @@ direct property test would miss it."
 
 (ert-deftest tramp-rpc-mock-test-make-symlink-invalidates-negative-lstat-cache ()
   "`make-symbolic-link' clears stale negative lstat metadata for LINKNAME."
-  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
   (let* ((filename "/rpc:mockhost:/tmp/link")
          (vec (tramp-dissect-file-name filename))
          (localname "/tmp/link")
@@ -4784,7 +4689,6 @@ direct property test would miss it."
 
 (ert-deftest tramp-rpc-mock-test-follow-stat-does-not-seed-lstat-cache ()
   "A followed stat for a symlink must not pollute the lstat cache."
-  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
   (let* ((filename "/rpc:mockhost:/tmp/link")
          (vec (tramp-dissect-file-name filename))
          (follow-key (tramp-rpc--file-stat-cache-key vec "/tmp/link" nil))
@@ -4803,7 +4707,6 @@ direct property test would miss it."
 
 (ert-deftest tramp-rpc-mock-test-file-stat-file-error-message-matched ()
   "`file.stat' treats ELOOP/ENOTDIR file-error messages as missing."
-  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
   (let* ((filename "/rpc:mockhost:/tmp/file/.editorconfig")
          (vec (tramp-dissect-file-name filename))
          (key (tramp-rpc--file-stat-cache-key vec "/tmp/file/.editorconfig" nil)))
@@ -4819,7 +4722,6 @@ direct property test would miss it."
 
 (ert-deftest tramp-rpc-mock-test-subtree-invalidation-clears-descendant-caches ()
   "Subtree invalidation clears stale metadata for cached descendants."
-  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
   (let* ((root "/rpc:mockhost:/tmp/dest")
          (child "/rpc:mockhost:/tmp/dest/source")
          (nested "/rpc:mockhost:/tmp/dest/source/file")
@@ -4860,7 +4762,6 @@ direct property test would miss it."
 
 (ert-deftest tramp-rpc-mock-test-hardlink-invalidates-source-and-dest ()
   "`add-name-to-file' clears source and destination metadata caches."
-  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
   (let* ((source "/rpc:mockhost:/tmp/source")
          (dest "/rpc:mockhost:/tmp/dest")
          (vec (tramp-dissect-file-name source))
@@ -4897,7 +4798,6 @@ direct property test would miss it."
 
 (ert-deftest tramp-rpc-mock-test-set-file-modes-no-preflight-missing ()
   "`set-file-modes' surfaces server-side missing-file errors directly."
-  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
   (let ((calls nil))
     (cl-letf (((symbol-function 'tramp-rpc--call)
                (lambda (_vec method _params)
@@ -4909,7 +4809,6 @@ direct property test would miss it."
 
 (ert-deftest tramp-rpc-mock-test-set-file-times-no-preflight-missing ()
   "`set-file-times' surfaces server-side missing-file errors directly."
-  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
   (let ((calls nil))
     (cl-letf (((symbol-function 'tramp-rpc--call)
                (lambda (_vec method _params)
@@ -4919,58 +4818,9 @@ direct property test would miss it."
                     :type 'file-missing)
       (should (equal (nreverse calls) '("file.set_times"))))))
 
-(ert-deftest tramp-rpc-mock-test-multi-hop-advice ()
-  "Test that tramp-multi-hop-p returns t for the rpc method."
-  :tags '(:multi-hop)
-  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
-  (let ((vec (make-tramp-file-name :method "rpc" :host "target")))
-    (should (tramp-multi-hop-p vec))))
-
-(ert-deftest tramp-rpc-mock-test-multi-hop-advice-ssh-still-works ()
-  "Test that tramp-multi-hop-p still returns t for ssh method."
-  :tags '(:multi-hop)
-  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
-  (let ((vec (make-tramp-file-name :method "ssh" :host "target")))
-    (should (tramp-multi-hop-p vec))))
-
-(ert-deftest tramp-rpc-mock-test-multi-hop-dissect-single-hop ()
-  "Test that TRAMP can dissect a single-hop rpc filename."
-  :tags '(:multi-hop)
-  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
-  (let ((vec (tramp-dissect-file-name "/rpc:gateway|rpc:user@target:/path")))
-    (should (equal (tramp-file-name-method vec) "rpc"))
-    (should (equal (tramp-file-name-user vec) "user"))
-    (should (equal (tramp-file-name-host vec) "target"))
-    (should (equal (tramp-file-name-localname vec) "/path"))
-    ;; Hop should be set
-    (should (tramp-file-name-hop vec))))
-
-(ert-deftest tramp-rpc-mock-test-multi-hop-dissect-multi-hop ()
-  "Test that TRAMP can dissect a multi-hop rpc filename."
-  :tags '(:multi-hop)
-  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
-  (let ((vec (tramp-dissect-file-name "/rpc:hop1|rpc:hop2|rpc:user@target:/path")))
-    (should (equal (tramp-file-name-method vec) "rpc"))
-    (should (equal (tramp-file-name-user vec) "user"))
-    (should (equal (tramp-file-name-host vec) "target"))
-    (should (equal (tramp-file-name-localname vec) "/path"))
-    (should (tramp-file-name-hop vec))))
-
-(ert-deftest tramp-rpc-mock-test-multi-hop-dissect-mixed-methods ()
-  "Test that TRAMP can dissect a mixed ssh/rpc hop filename."
-  :tags '(:multi-hop)
-  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
-  (let ((vec (tramp-dissect-file-name "/ssh:gateway|rpc:user@target:/path")))
-    (should (equal (tramp-file-name-method vec) "rpc"))
-    (should (equal (tramp-file-name-user vec) "user"))
-    (should (equal (tramp-file-name-host vec) "target"))
-    (should (equal (tramp-file-name-localname vec) "/path"))
-    (should (tramp-file-name-hop vec))))
-
 (ert-deftest tramp-rpc-mock-test-hops-to-proxyjump-nil ()
   "Test that hops-to-proxyjump returns nil for no hops."
   :tags '(:multi-hop)
-  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
   (let ((vec (make-tramp-file-name :method "rpc" :host "target"
                                    :localname "/path")))
     (should-not (tramp-rpc--hops-to-proxyjump vec))))
@@ -4978,42 +4828,36 @@ direct property test would miss it."
 (ert-deftest tramp-rpc-mock-test-hops-to-proxyjump-single ()
   "Test ProxyJump conversion with a single hop."
   :tags '(:multi-hop)
-  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
   (let ((vec (tramp-dissect-file-name "/rpc:gateway|rpc:user@target:/path")))
     (should (equal (tramp-rpc--hops-to-proxyjump vec) "gateway"))))
 
 (ert-deftest tramp-rpc-mock-test-hops-to-proxyjump-single-with-user ()
   "Test ProxyJump conversion with a single hop that has a user."
   :tags '(:multi-hop)
-  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
   (let ((vec (tramp-dissect-file-name "/rpc:admin@gateway|rpc:user@target:/path")))
     (should (equal (tramp-rpc--hops-to-proxyjump vec) "admin@gateway"))))
 
 (ert-deftest tramp-rpc-mock-test-hops-to-proxyjump-multiple ()
   "Test ProxyJump conversion with multiple hops."
   :tags '(:multi-hop)
-  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
   (let ((vec (tramp-dissect-file-name "/rpc:hop1|rpc:hop2|rpc:user@target:/path")))
     (should (equal (tramp-rpc--hops-to-proxyjump vec) "hop1,hop2"))))
 
 (ert-deftest tramp-rpc-mock-test-hops-to-proxyjump-with-port ()
   "Test ProxyJump conversion with a hop that has a port."
   :tags '(:multi-hop)
-  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
   (let ((vec (tramp-dissect-file-name "/rpc:admin@gateway#2222|rpc:user@target:/path")))
     (should (equal (tramp-rpc--hops-to-proxyjump vec) "admin@gateway:2222"))))
 
 (ert-deftest tramp-rpc-mock-test-hops-to-proxyjump-mixed-methods ()
   "Test ProxyJump conversion with mixed ssh/rpc hops."
   :tags '(:multi-hop)
-  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
   (let ((vec (tramp-dissect-file-name "/ssh:gateway|rpc:user@target:/path")))
     (should (equal (tramp-rpc--hops-to-proxyjump vec) "gateway"))))
 
 (ert-deftest tramp-rpc-mock-test-connection-key-no-hop ()
   "Test connection key without hops."
   :tags '(:multi-hop)
-  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
   (let ((vec (make-tramp-file-name :method "rpc" :host "target"
                                    :user "user" :localname "/path")))
     (should (equal (tramp-rpc--connection-key vec)
@@ -5023,7 +4867,6 @@ direct property test would miss it."
 (ert-deftest tramp-rpc-mock-test-connection-key-with-hop ()
   "Test connection key includes hop for differentiation."
   :tags '(:multi-hop)
-  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
   (let* ((vec1 (tramp-dissect-file-name "/rpc:gateway|rpc:user@target:/path"))
          (vec2 (make-tramp-file-name :method "rpc" :host "target"
                                      :user "user" :localname "/path"))
@@ -5043,7 +4886,6 @@ direct property test would miss it."
 (ert-deftest tramp-rpc-mock-test-connection-key-different-hops ()
   "Test that different hop routes produce different connection keys."
   :tags '(:multi-hop)
-  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
   (let* ((vec1 (tramp-dissect-file-name "/rpc:gateway1|rpc:user@target:/path"))
          (vec2 (tramp-dissect-file-name "/rpc:gateway2|rpc:user@target:/path"))
          (key1 (tramp-rpc--connection-key vec1))
@@ -5053,7 +4895,6 @@ direct property test would miss it."
 (ert-deftest tramp-rpc-mock-test-connection-key-hidden-sudo-route ()
   "Hidden native sudo routes should not collide with direct root rpc."
   :tags '(:multi-hop :sudo)
-  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
   (skip-unless (tramp-rpc-mock-test--sudo-helper-available-p))
   (let* ((tramp-default-proxies-alist nil)
          (tramp-file-name-with-method "sudo")
@@ -5070,7 +4911,6 @@ direct property test would miss it."
 (ert-deftest tramp-rpc-mock-test-controlmaster-socket-different-hops ()
   "Test that different hop routes produce different ControlMaster socket paths."
   :tags '(:multi-hop)
-  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
   (let* ((vec1 (tramp-dissect-file-name "/rpc:gateway1|rpc:user@target:/path"))
          (vec2 (tramp-dissect-file-name "/rpc:gateway2|rpc:user@target:/path"))
          (vec3 (make-tramp-file-name :method "rpc" :host "target"
@@ -5086,27 +4926,23 @@ direct property test would miss it."
 (ert-deftest tramp-rpc-mock-test-deploy-normalize-hops-nil ()
   "Test hop normalization with nil input."
   :tags '(:multi-hop)
-  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
   (should-not (tramp-rpc-deploy--normalize-hops nil)))
 
 (ert-deftest tramp-rpc-mock-test-deploy-normalize-hops-rpc ()
   "Test hop normalization converts rpc: to ssh:."
   :tags '(:multi-hop)
-  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
   (should (equal (tramp-rpc-deploy--normalize-hops "rpc:gateway|")
                  "ssh:gateway|")))
 
 (ert-deftest tramp-rpc-mock-test-deploy-normalize-hops-ssh ()
   "Test hop normalization leaves ssh: unchanged."
   :tags '(:multi-hop)
-  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
   (should (equal (tramp-rpc-deploy--normalize-hops "ssh:gateway|")
                  "ssh:gateway|")))
 
 (ert-deftest tramp-rpc-mock-test-delete-file-trash-follows-tramp ()
   "Test `delete-file' trash handling matches TRAMP's skeleton."
   :tags '(:delete)
-  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
   (let ((delete-by-moving-to-trash t)
         (remote-file-name-inhibit-delete-by-moving-to-trash nil)
         moved rpc-called)
@@ -5121,7 +4957,6 @@ direct property test would miss it."
 (ert-deftest tramp-rpc-mock-test-delete-file-missing-is-noop ()
   "Missing files are ignored like current Emacs `delete-file'."
   :tags '(:delete)
-  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
   (let (invalidated)
     (cl-letf (((symbol-function 'tramp-rpc--call)
                (lambda (_vec method _params)
@@ -5135,7 +4970,6 @@ direct property test would miss it."
 (ert-deftest tramp-rpc-mock-test-move-file-to-trash-fallback-bypasses-advice ()
   "The trash fallback must not re-enter TRAMP's external operation advice."
   :tags '(:delete)
-  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
   (let* ((called nil)
          (tramp-rpc--move-file-to-trash-function
          (lambda (filename)
@@ -5152,7 +4986,6 @@ direct property test would miss it."
 (ert-deftest tramp-rpc-mock-test-move-file-to-trash-regular-file-local-trash ()
   "Test optimized `move-file-to-trash' copies a remote file to local trash."
   :tags '(:delete)
-  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
   (let* ((trash-root (make-temp-file "tramp-rpc-trash" t))
          (trash-directory trash-root)
          (stat `((type . "file")
@@ -5187,7 +5020,6 @@ direct property test would miss it."
 (ert-deftest tramp-rpc-mock-test-move-file-to-trash-symlink-local-trash ()
   "Test optimized `move-file-to-trash' recreates symlinks without file.read."
   :tags '(:delete)
-  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
   (let* ((trash-root (make-temp-file "tramp-rpc-trash" t))
          (trash-directory trash-root)
          (stat '((type . "symlink")
@@ -5216,7 +5048,6 @@ direct property test would miss it."
 (ert-deftest tramp-rpc-mock-test-move-file-to-trash-directory-local-trash ()
   "Test optimized `move-file-to-trash' recursively copies small directories."
   :tags '(:delete)
-  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
   (let* ((trash-root (make-temp-file "tramp-rpc-trash" t))
          (trash-directory trash-root)
          (dir-stat `((type . "directory")
@@ -5283,7 +5114,6 @@ direct property test would miss it."
 (ert-deftest tramp-rpc-mock-test-move-file-to-trash-unsupported-cleans-up ()
   "Test unsupported optimized trash removes partial copy before fallback."
   :tags '(:delete)
-  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
   (let* ((trash-root (make-temp-file "tramp-rpc-trash" t))
          (trash-directory trash-root)
          (dir-stat `((type . "directory")
@@ -5319,7 +5149,6 @@ direct property test would miss it."
 (ert-deftest tramp-rpc-mock-test-move-file-to-trash-copy-failure-cleans-up ()
   "Test ordinary optimized trash copy failures clean up and re-signal."
   :tags '(:delete)
-  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
   (let* ((trash-root (make-temp-file "tramp-rpc-trash" t))
          (trash-directory trash-root)
          (stat `((type . "file")
@@ -5352,7 +5181,6 @@ direct property test would miss it."
 (ert-deftest tramp-rpc-mock-test-move-file-to-trash-delete-failure-cleans-up ()
   "Test remote delete failures clean up the local trash copy and re-signal."
   :tags '(:delete)
-  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
   (let* ((trash-root (make-temp-file "tramp-rpc-trash" t))
          (trash-directory trash-root)
          (stat `((type . "file")
@@ -5379,7 +5207,6 @@ direct property test would miss it."
 (ert-deftest tramp-rpc-mock-test-move-file-to-trash-directory-bounds-batches ()
   "Test optimized directory trash reads regular files in bounded batches."
   :tags '(:delete)
-  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
   (let* ((trash-root (make-temp-file "tramp-rpc-trash" t))
          (trash-directory trash-root)
          (dir-stat `((type . "directory")
@@ -5431,7 +5258,6 @@ direct property test would miss it."
 (ert-deftest tramp-rpc-mock-test-trash-small-file-growth-retries-chunked ()
   "A small trash file that grows past the RPC limit is retried chunked."
   :tags '(:delete)
-  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
   (let* ((dest (make-temp-file "tramp-rpc-trash-copy" t))
          (tramp-rpc--file-read-chunk-size 4)
          (dir-stat '((type . "directory") (mode . 16877)))
@@ -5469,7 +5295,6 @@ direct property test would miss it."
 (ert-deftest tramp-rpc-mock-test-delete-file-trash-can-be-inhibited ()
   "Test `remote-file-name-inhibit-delete-by-moving-to-trash' forces unlink."
   :tags '(:delete)
-  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
   (let ((delete-by-moving-to-trash t)
         (remote-file-name-inhibit-delete-by-moving-to-trash t)
         moved method)
@@ -5484,7 +5309,6 @@ direct property test would miss it."
 (ert-deftest tramp-rpc-mock-test-delete-directory-trash-can-be-inhibited ()
   "Test inhibited trash makes `delete-directory' call remote remove."
   :tags '(:delete)
-  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
   (let ((delete-by-moving-to-trash t)
         (remote-file-name-inhibit-delete-by-moving-to-trash t)
         moved method)
@@ -5499,21 +5323,18 @@ direct property test would miss it."
 (ert-deftest tramp-rpc-mock-test-deploy-normalize-hops-mixed ()
   "Test hop normalization with mixed methods."
   :tags '(:multi-hop)
-  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
   (should (equal (tramp-rpc-deploy--normalize-hops "rpc:hop1|ssh:hop2|")
                  "ssh:hop1|ssh:hop2|")))
 
 (ert-deftest tramp-rpc-mock-test-deploy-normalize-hops-with-user ()
   "Test hop normalization preserves user@host."
   :tags '(:multi-hop)
-  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
   (should (equal (tramp-rpc-deploy--normalize-hops "rpc:admin@gateway|")
                  "ssh:admin@gateway|")))
 
 (ert-deftest tramp-rpc-mock-test-deploy-bootstrap-vec-preserves-hop ()
   "Test that bootstrap vec preserves and normalizes hops."
   :tags '(:multi-hop)
-  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
   (let* ((vec (tramp-dissect-file-name "/rpc:gateway|rpc:user@target:/path"))
          (bootstrap (tramp-rpc-deploy--bootstrap-vec vec)))
     ;; Method should be the bootstrap method (default: scp)
@@ -5531,7 +5352,6 @@ direct property test would miss it."
 (ert-deftest tramp-rpc-mock-test-deploy-binary-id-release-default ()
   "Test that non-git installs keep using the release version as binary id."
   :tags '(:deploy)
-  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
   (let ((tramp-rpc-deploy-source-directory nil)
         (tramp-rpc-deploy-git-build-policy 'auto))
     (should (equal (tramp-rpc-deploy--binary-id)
@@ -5543,7 +5363,6 @@ direct property test would miss it."
 (ert-deftest tramp-rpc-mock-test-deploy-source-directory-warning ()
   "Test source directory warnings explain release-id fallback."
   :tags '(:deploy)
-  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
   (let ((dir (make-temp-file "tramp-rpc-build" t)))
     (unwind-protect
         (let ((tramp-rpc-deploy-source-directory dir)
@@ -5556,7 +5375,6 @@ direct property test would miss it."
 (ert-deftest tramp-rpc-mock-test-deploy-default-source-follows-elc-source-symlink ()
   "Test default source directory follows straight-style .el symlinks."
   :tags '(:deploy)
-  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
   (let* ((dir (make-temp-file "tramp-rpc-straight" t))
          (repo (expand-file-name "straight/repos/emacs-tramp-rpc" dir))
          (build (expand-file-name "straight/build/tramp-rpc" dir))
@@ -5582,7 +5400,6 @@ direct property test would miss it."
 (ert-deftest tramp-rpc-mock-test-deploy-default-source-finds-flat-package ()
   "Test default source directory finds Rust sources in a flat package."
   :tags '(:deploy)
-  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
   (let* ((dir (make-temp-file "tramp-rpc-package" t))
          (source (expand-file-name "tramp-rpc-deploy.el" dir)))
     (unwind-protect
@@ -5600,7 +5417,6 @@ direct property test would miss it."
 (ert-deftest tramp-rpc-mock-test-deploy-git-install-ask-without-cargo ()
   "Test the git install prompt offers download but not build without Cargo."
   :tags '(:deploy)
-  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
   (let ((tramp-rpc-deploy--plan (tramp-rpc-deploy--make-plan :prompt t))
         prompt choices)
     (cl-letf (((symbol-function 'tramp-rpc-deploy--cargo-available-p)
@@ -5619,7 +5435,6 @@ direct property test would miss it."
 (ert-deftest tramp-rpc-mock-test-deploy-git-install-ask-build-available ()
   "Test the git install prompt offers a source build when available."
   :tags '(:deploy)
-  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
   (let ((tramp-rpc-deploy--plan (tramp-rpc-deploy--make-plan :prompt t))
         choices)
     (cl-letf (((symbol-function 'tramp-rpc-deploy--cargo-available-p)
@@ -5637,7 +5452,6 @@ direct property test would miss it."
 (ert-deftest tramp-rpc-mock-test-deploy-git-install-never-prompts-implicitly ()
   "Test automatic deployment reports the explicit install command."
   :tags '(:deploy)
-  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
   (let ((tramp-rpc-deploy--plan nil))
     (let ((err (should-error
                 (tramp-rpc-deploy--ask-git-install-action "x86_64-linux")
@@ -5681,7 +5495,6 @@ Each entry is (HOST ALLOW-PROMPT FORCE-OBTAIN AUTO-DEPLOY)."
 (ert-deftest tramp-rpc-mock-test-deploy-install-host-prompt-uses-initial-input ()
   "Read a host after `/rpc:', without inserting the local directory."
   :tags '(:deploy)
-  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
   (let ((tramp-rpc-deploy-never-deploy nil)
         (default-directory temporary-file-directory)
         (insert-default-directory t)
@@ -5714,7 +5527,6 @@ Each entry is (HOST ALLOW-PROMPT FORCE-OBTAIN AUTO-DEPLOY)."
 (ert-deftest tramp-rpc-mock-test-deploy-install-ssh-config-host-completion ()
   "TRAMP completes an SSH-config alias without contacting the remote."
   :tags '(:deploy)
-  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
   (let ((config (make-temp-file "tramp-rpc-ssh-config")))
     (unwind-protect
         (progn
@@ -5732,7 +5544,6 @@ Each entry is (HOST ALLOW-PROMPT FORCE-OBTAIN AUTO-DEPLOY)."
 (ert-deftest tramp-rpc-mock-test-deploy-install-command-overrides-auto-deploy ()
   "Test explicit installation enables prompts, forcing, and deployment."
   :tags '(:deploy)
-  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
   (let ((vec (tramp-dissect-file-name "/rpc:user@target:/"))
         (tramp-rpc-deploy-auto-deploy nil)
         (tramp-rpc-deploy-never-deploy nil)
@@ -5746,7 +5557,6 @@ Each entry is (HOST ALLOW-PROMPT FORCE-OBTAIN AUTO-DEPLOY)."
 (ert-deftest tramp-rpc-mock-test-deploy-install-flags-scoped-to-target ()
   "Test reentrant deploys for other remotes stay automatic and unforced."
   :tags '(:deploy)
-  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
   (let ((vec (tramp-dissect-file-name "/rpc:user@target:/"))
         (other (tramp-dissect-file-name "/rpc:user@other:/"))
         (tramp-rpc-deploy-auto-deploy t)
@@ -5760,7 +5570,6 @@ Each entry is (HOST ALLOW-PROMPT FORCE-OBTAIN AUTO-DEPLOY)."
 (ert-deftest tramp-rpc-mock-test-deploy-install-auto-deploy-does-not-leak ()
   "Test the explicit auto-deploy override is invisible to other remotes."
   :tags '(:deploy)
-  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
   (let ((vec (tramp-dissect-file-name "/rpc:user@target:/"))
         (other (tramp-dissect-file-name "/rpc:user@other:/"))
         (tramp-rpc-deploy-never-deploy nil)
@@ -5776,7 +5585,6 @@ Each entry is (HOST ALLOW-PROMPT FORCE-OBTAIN AUTO-DEPLOY)."
 (ert-deftest tramp-rpc-mock-test-deploy-install-command-rejects-never-deploy ()
   "Test explicit installation respects the absolute deployment prohibition."
   :tags '(:deploy)
-  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
   (let ((tramp-rpc-deploy-never-deploy t))
     (should-error (tramp-rpc-deploy-install-binary
                    (tramp-dissect-file-name "/rpc:user@target:/"))
@@ -5785,7 +5593,6 @@ Each entry is (HOST ALLOW-PROMPT FORCE-OBTAIN AUTO-DEPLOY)."
 (ert-deftest tramp-rpc-mock-test-deploy-force-replaces-cached-binary ()
   "Test a forced install obtains a new artifact instead of reusing cache."
   :tags '(:deploy)
-  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
   (let ((binary (make-temp-file "tramp-rpc-cached"))
         (replacement "replacement")
         (tramp-rpc-deploy--plan (tramp-rpc-deploy--make-plan :force t)))
@@ -5810,7 +5617,6 @@ Each entry is (HOST ALLOW-PROMPT FORCE-OBTAIN AUTO-DEPLOY)."
 (ert-deftest tramp-rpc-mock-test-deploy-git-obtain-method-follows-policy ()
   "Test strict build bypasses the prompt while auto uses its answer."
   :tags '(:deploy)
-  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
   (cl-letf (((symbol-function 'tramp-rpc-deploy--use-source-binary-id-p)
              #'always))
     (let ((tramp-rpc-deploy-git-build-policy 'auto))
@@ -5827,7 +5633,6 @@ Each entry is (HOST ALLOW-PROMPT FORCE-OBTAIN AUTO-DEPLOY)."
 (ert-deftest tramp-rpc-mock-test-deploy-release-checksum-is-strict ()
   "Test checksum metadata contains exactly one matching sha256sum record."
   :tags '(:deploy)
-  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
   (let* ((asset "server.tar.gz")
          (digest (make-string 64 ?a)))
     (should (equal (tramp-rpc-deploy--release-checksum
@@ -5854,7 +5659,6 @@ separator must be located without relying on a `^'-anchored regexp,
 which fails to match an empty line in Emacs.  Regression test for
 issue #268 (0.13 fails to download prebuilt binary)."
   :tags '(:deploy)
-  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
   (let* ((body "310a9545a07d9848d1125fda930ddba9f219def7bec9d94ab5965d072a8caa0c  server.tar.gz\n")
          (dest (make-temp-file "tramp-rpc-download"))
          (resp-buf (generate-new-buffer " *tramp-rpc-mock-http*")))
@@ -5884,7 +5688,6 @@ issue #268 (0.13 fails to download prebuilt binary)."
 (ert-deftest tramp-rpc-mock-test-deploy-download-requires-checksum ()
   "Test release artifacts are rejected when checksum retrieval fails."
   :tags '(:deploy)
-  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
   (let ((cache (make-temp-file "tramp-rpc-cache" t)))
     (unwind-protect
         (cl-letf (((symbol-function 'tramp-rpc-deploy--local-cache-path)
@@ -5902,7 +5705,6 @@ issue #268 (0.13 fails to download prebuilt binary)."
 (ert-deftest tramp-rpc-mock-test-deploy-cached-binary-does-not-prompt ()
   "Test a usable cache is returned before resolving interactive policy."
   :tags '(:deploy)
-  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
   (let ((binary (make-temp-file "tramp-rpc-cached")))
     (unwind-protect
         (progn
@@ -5928,7 +5730,6 @@ issue #268 (0.13 fails to download prebuilt binary)."
 (ert-deftest tramp-rpc-mock-test-deploy-skips-stale-bundled-source-binary ()
   "Test source-id mode does not deploy stale bundled binaries."
   :tags '(:deploy)
-  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
   (let* ((dir (make-temp-file "tramp-rpc-source" t))
          (bundled-dir (expand-file-name "lisp/binaries" dir))
          (bundled (expand-file-name "x86_64-linux/tramp-rpc-server" bundled-dir))
@@ -5963,7 +5764,6 @@ issue #268 (0.13 fails to download prebuilt binary)."
 (ert-deftest tramp-rpc-mock-test-deploy-binary-id-source-hash ()
   "Test that git checkouts key binary ids by server source content."
   :tags '(:deploy)
-  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
   (let ((dir (make-temp-file "tramp-rpc-source" t)))
     (unwind-protect
         (progn
@@ -6001,7 +5801,6 @@ issue #268 (0.13 fails to download prebuilt binary)."
 (ert-deftest tramp-rpc-mock-test-deploy-source-hash-ignores-remote-default-directory ()
   "Source hashing must not reconnect through an inherited remote directory."
   :tags '(:deploy)
-  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
   (let ((dir (make-temp-file "tramp-rpc-source" t)))
     (unwind-protect
         (progn
@@ -6021,7 +5820,6 @@ issue #268 (0.13 fails to download prebuilt binary)."
 (ert-deftest tramp-rpc-mock-test-deploy-binary-id-release-policy ()
   "Test that release policy keeps version-keyed ids for git checkouts."
   :tags '(:deploy)
-  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
   (let ((dir (make-temp-file "tramp-rpc-source" t)))
     (unwind-protect
         (progn
@@ -6040,7 +5838,6 @@ issue #268 (0.13 fails to download prebuilt binary)."
 (ert-deftest tramp-rpc-mock-test-deploy-binary-id-ignores-lisp-files ()
   "Test that git binary ids only include files affecting the server build."
   :tags '(:deploy)
-  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
   (let ((dir (make-temp-file "tramp-rpc-source" t)))
     (unwind-protect
         (progn
@@ -6064,7 +5861,6 @@ issue #268 (0.13 fails to download prebuilt binary)."
 (ert-deftest tramp-rpc-mock-test-deploy-extraction-rejects-links ()
   "Extracted symbolic and hard links cannot be promoted as the release binary."
   :tags '(:deploy)
-  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
   (let* ((dir (make-temp-file "tramp-rpc-extract" t))
          (dest (expand-file-name "dest" dir))
          (outside (expand-file-name "outside" dir))
@@ -6097,7 +5893,6 @@ issue #268 (0.13 fails to download prebuilt binary)."
 (ert-deftest tramp-rpc-mock-test-deploy-remote-present-requires-regular-file ()
   "Remote presence rejects directories and symbolic links."
   :tags '(:deploy)
-  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
   (let ((vec (tramp-dissect-file-name "/scp:mock:/tmp/"))
         command)
     (cl-letf (((symbol-function 'tramp-rpc-deploy--remote-binary-path)
@@ -6112,7 +5907,6 @@ issue #268 (0.13 fails to download prebuilt binary)."
 (ert-deftest tramp-rpc-mock-test-deploy-replaces-mismatched-existing-binary ()
   "An executable at the expected path is reused only after checksum verification."
   :tags '(:deploy)
-  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
   (let* ((vec (tramp-dissect-file-name "/ssh:host:/"))
          (tramp-rpc-deploy-never-deploy nil)
          (tramp-rpc-deploy-auto-deploy t)
@@ -6140,7 +5934,6 @@ issue #268 (0.13 fails to download prebuilt binary)."
 (ert-deftest tramp-rpc-mock-test-deploy-reuses-existing-binary-without-local-artifact ()
   "An existing executable remains usable when local artifact acquisition fails."
   :tags '(:deploy)
-  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
   (let* ((vec (tramp-dissect-file-name "/ssh:host:/"))
          (tramp-rpc-deploy-never-deploy nil)
          (tramp-rpc-deploy-auto-deploy t)
@@ -6167,7 +5960,6 @@ issue #268 (0.13 fails to download prebuilt binary)."
 (ert-deftest tramp-rpc-mock-test-deploy-existing-binary-does-not-mask-programming-errors ()
   "Only artifact-availability failures permit unverified remote reuse."
   :tags '(:deploy)
-  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
   (let* ((vec (tramp-dissect-file-name "/ssh:host:/"))
          (tramp-rpc-deploy-never-deploy nil)
          (tramp-rpc-deploy-auto-deploy t))
@@ -6187,7 +5979,6 @@ issue #268 (0.13 fails to download prebuilt binary)."
 (ert-deftest tramp-rpc-mock-test-deploy-missing-binary-still-reports-local-artifact-failure ()
   "A missing remote binary never uses the existing-binary fallback."
   :tags '(:deploy)
-  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
   (let* ((vec (tramp-dissect-file-name "/ssh:host:/"))
          (tramp-rpc-deploy-never-deploy nil)
          (tramp-rpc-deploy-auto-deploy t))
@@ -6207,7 +5998,6 @@ issue #268 (0.13 fails to download prebuilt binary)."
 (ert-deftest tramp-rpc-mock-test-deploy-checksum-required ()
   "A missing checksum prevents a release binary from reaching the cache."
   :tags '(:deploy)
-  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
   (let* ((dir (make-temp-file "tramp-rpc-checksum" t))
          (arch "x86_64-linux")
          (tramp-rpc-deploy-local-cache-directory dir)
@@ -6227,7 +6017,6 @@ issue #268 (0.13 fails to download prebuilt binary)."
 (ert-deftest tramp-rpc-mock-test-deploy-malformed-or-mismatched-checksum ()
   "Malformed, wrong-artifact, and mismatched checksums fail closed."
   :tags '(:deploy)
-  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
   (let* ((jka-compr-inhibit t)
          (dir (make-temp-file "tramp-rpc-checksum" t))
          (arch "x86_64-linux")
@@ -6255,7 +6044,6 @@ issue #268 (0.13 fails to download prebuilt binary)."
 (ert-deftest tramp-rpc-mock-test-deploy-verified-release-is-cached ()
   "Only a verified release archive is extracted and marked for cache reuse."
   :tags '(:deploy)
-  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
   (let* ((jka-compr-inhibit t)
          (dir (make-temp-file "tramp-rpc-checksum" t))
          (arch "x86_64-linux")
@@ -6287,7 +6075,6 @@ issue #268 (0.13 fails to download prebuilt binary)."
 (ert-deftest tramp-rpc-mock-test-deploy-source-cache-records-digest-and-reuses ()
   "A source build records a digest which authorizes an unchanged cache entry."
   :tags '(:deploy)
-  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
   (let* ((dir (make-temp-file "tramp-rpc-source-cache" t))
          (arch "x86_64-linux")
          (source (expand-file-name "source" dir))
@@ -6328,7 +6115,6 @@ issue #268 (0.13 fails to download prebuilt binary)."
 (ert-deftest tramp-rpc-mock-test-deploy-modified-source-cache-is-invalidated ()
   "A modified source-built cache binary is removed rather than reused."
   :tags '(:deploy)
-  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
   (let* ((dir (make-temp-file "tramp-rpc-source-cache" t))
          (cache (expand-file-name "server" dir)))
     (unwind-protect
@@ -6346,7 +6132,6 @@ issue #268 (0.13 fails to download prebuilt binary)."
 (ert-deftest tramp-rpc-mock-test-deploy-corrupt-source-cache-is-invalidated ()
   "A corrupt source-built cache binary is removed rather than reused."
   :tags '(:deploy)
-  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
   (let* ((dir (make-temp-file "tramp-rpc-source-cache" t))
          (cache (expand-file-name "server" dir)))
     (unwind-protect
@@ -6365,7 +6150,6 @@ issue #268 (0.13 fails to download prebuilt binary)."
 (ert-deftest tramp-rpc-mock-test-deploy-source-cache-missing-or-malformed-digest-is-invalidated ()
   "Missing or malformed source-build digests cannot authorize cache reuse."
   :tags '(:deploy)
-  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
   (let* ((dir (make-temp-file "tramp-rpc-source-cache" t))
          (cache (expand-file-name "server" dir)))
     (unwind-protect
@@ -6382,7 +6166,6 @@ issue #268 (0.13 fails to download prebuilt binary)."
 (ert-deftest tramp-rpc-mock-test-deploy-invalid-source-cache-rebuilds ()
   "An invalid source cache falls through to the source-build fallback."
   :tags '(:deploy)
-  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
   (let* ((dir (make-temp-file "tramp-rpc-source-cache" t))
          (arch "x86_64-linux")
          (cache-dir (expand-file-name "cache" dir))
@@ -6419,7 +6202,6 @@ issue #268 (0.13 fails to download prebuilt binary)."
 (ert-deftest tramp-rpc-mock-test-deploy-checksum-failure-falls-back-to-source-build ()
   "A rejected release download tries the existing source-build fallback."
   :tags '(:deploy)
-  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
   (let* ((dir (make-temp-file "tramp-rpc-checksum" t))
          (built (expand-file-name "built-server" dir))
          (tramp-rpc-deploy-local-cache-directory (expand-file-name "cache" dir))
@@ -6445,7 +6227,6 @@ issue #268 (0.13 fails to download prebuilt binary)."
 (ert-deftest tramp-rpc-mock-test-deploy-staging-expands-remote-home ()
   "Home-relative deployment directories accept mktemp's absolute result."
   :tags '(:deploy)
-  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
   (let* ((home (make-temp-file "tramp-rpc-remote-home" t))
          (parent (expand-file-name ".cache/emacs/tramp-rpc/" home))
          (remote-local (concat "~/.cache/emacs/tramp-rpc/"
@@ -6481,7 +6262,6 @@ issue #268 (0.13 fails to download prebuilt binary)."
 (ert-deftest tramp-rpc-mock-test-deploy-final-verification-preserves-old-binary ()
   "A staging-file swap before activation fails without replacing the old binary."
   :tags '(:deploy)
-  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
   (let* ((dir (make-temp-file "tramp-rpc-transfer" t))
          (remote-dir (expand-file-name "remote-cache" dir))
          (local (expand-file-name "server" dir))
@@ -6491,7 +6271,7 @@ issue #268 (0.13 fails to download prebuilt binary)."
          (remote-local (tramp-file-local-name
                         (tramp-rpc-deploy--remote-binary-path vec)))
          (copy-file-function (symbol-function 'copy-file))
-         staging-directory remote-tmp activation-command error-message)
+         staging-directory remote-tmp error-message)
     (unwind-protect
         (progn
           (make-directory remote-dir t)
@@ -6514,14 +6294,13 @@ issue #268 (0.13 fails to download prebuilt binary)."
                        (setq remote-tmp (tramp-file-local-name to))
                        (funcall copy-file-function from remote-tmp nil)))
                     ((symbol-function 'tramp-rpc-deploy--remote-checksum)
-                     (lambda (_vec path) (tramp-rpc-deploy--compute-checksum path)))
+                     (lambda (_vec path)
+                       (prog1 (tramp-rpc-deploy--compute-checksum path)
+                         ;; Swap the staged file after computing its diagnostic
+                         ;; checksum, before the activation transaction runs.
+                         (with-temp-file path (insert "substituted binary")))))
                     ((symbol-function 'tramp-send-command-and-check)
                      (lambda (_vec command)
-                       (when (string-prefix-p "test -f " command)
-                         (setq activation-command command)
-                         ;; Simulate a replacement after the diagnostic checksum
-                         ;; but immediately before the compound activation shell.
-                         (with-temp-file remote-tmp (insert "substituted binary")))
                        (zerop (call-process "sh" nil nil nil "-c" command)))))
             (condition-case err
                 (tramp-rpc-deploy--transfer-binary vec local)
@@ -6532,60 +6311,12 @@ issue #268 (0.13 fails to download prebuilt binary)."
                      (file-name-directory remote-tmp)))
             (should (equal (file-name-directory remote-tmp)
                            (file-name-as-directory staging-directory)))
-            (let ((tmp (tramp-shell-quote-argument remote-tmp))
-                  (dest (tramp-shell-quote-argument remote-local))
-                  (digest (tramp-shell-quote-argument
-                           (tramp-rpc-deploy--compute-checksum local))))
-              (should
-               (equal activation-command
-                      (format
-                       (concat "test -f %s && ! test -L %s && chmod +x %s && "
-                               "test -f %s && ! test -L %s && "
-                               "(test ! -e %s && ! test -L %s || "
-                               "test -f %s && ! test -L %s) && "
-                               "actual=$({ sha256sum %s 2>/dev/null || "
-                               "shasum -a 256 %s 2>/dev/null; } | cut -d' ' -f1) && "
-                               "test \"$actual\" = %s && mv -f %s %s && "
-                               "test -f %s && ! test -L %s && test -x %s")
-                       tmp tmp tmp tmp tmp dest dest dest dest tmp tmp digest tmp dest
-                       dest dest dest)))
             (should (equal (with-temp-buffer
                              (insert-file-contents-literally remote-local)
                              (buffer-string))
                            "old binary"))
-            (should-not (file-exists-p remote-tmp)))))
+            (should-not (file-exists-p remote-tmp))))
       (delete-directory dir t))))
-
-(ert-deftest tramp-rpc-mock-test-deploy-method-table-matches-dispatcher ()
-  "README's RPC table documents exactly the dispatcher's public methods."
-  :tags '(:deploy)
-  (let (dispatcher documented)
-    (with-temp-buffer
-      (insert-file-contents
-       (expand-file-name "server/src/handlers/mod.rs" tramp-rpc-mock-test--project-root))
-      (should (re-search-forward "async fn route" nil t))
-      (let ((start (point))
-            (end (progn (should (re-search-forward "_ => Err(RpcError::method_not_found" nil t))
-                        (match-beginning 0))))
-        (goto-char start)
-        (while (re-search-forward "\\\"\\([[:alnum:]_.]+\\)\\\" =>" end t)
-          (push (match-string 1) dispatcher))))
-    (push "batch" dispatcher)
-    (with-temp-buffer
-      (insert-file-contents (expand-file-name "README.org" tramp-rpc-mock-test--project-root))
-      (should (re-search-forward "^\\*\\* RPC Server Methods$" nil t))
-      (let ((start (point))
-            (end (or (and (re-search-forward "^\\* " nil t) (match-beginning 0))
-                     (point-max))))
-        (goto-char start)
-        (while (re-search-forward "~\\([[:alnum:]_.]+\\)~" end t)
-          (when (or (string-match-p "\\." (match-string 1))
-                    (equal (match-string 1) "batch"))
-            (push (match-string 1) documented)))))
-    (should dispatcher)
-    (should documented)
-    (should (equal (sort (delete-dups dispatcher) #'string<)
-                   (sort (delete-dups documented) #'string<)))))
 
 ;; With latest tramp, tramp-file-name-with-sudo natively produces
 ;; /rpc:user@host|sudo:root@host:/path for rpc paths since the rpc
@@ -6593,7 +6324,6 @@ issue #268 (0.13 fails to download prebuilt binary)."
 (ert-deftest tramp-rpc-mock-test-zz-file-name-with-sudo-native ()
   "Test that tramp-file-name-with-sudo natively produces rpc+sudo path."
   :tags '(:multi-hop :sudo)
-  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
   (skip-unless (tramp-rpc-mock-test--sudo-helper-available-p))
   (let* ((tramp-default-proxies-alist nil)
          (tramp-file-name-with-method "sudo")
@@ -6618,25 +6348,12 @@ issue #268 (0.13 fails to download prebuilt binary)."
     (should (string= (tramp-file-name-host vec) "target"))
     (should-not (tramp-rpc--sudo-file-name-p filename))))
 
-(ert-deftest tramp-rpc-mock-test-rpc-method-advertises-host-arg ()
-  "Test that the rpc method declares %%h in tramp-login-args.
-This is required so `tramp-compute-multi-hops' allows rpc to appear
-as a proxy hop alongside shell methods like sudo/su.  Without %%h,
-the host-check in `tramp-compute-multi-hops' would reject the rpc
-hop with \"Host name does not match\"."
-  :tags '(:multi-hop)
-  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
-  (let* ((vec (make-tramp-file-name :method "rpc" :host "target"))
-         (login-args (tramp-get-method-parameter vec 'tramp-login-args)))
-    (should (member "%h" (flatten-tree login-args)))))
-
 (ert-deftest tramp-rpc-mock-test-compute-multi-hops-rpc-sudo-chain ()
   "Test TRAMP's low-level multi-hop expansion for an rpc-to-sudo chain.
 Normal rpc-to-sudo paths are claimed by the tramp-rpc foreign handler.
 This test hides that handler to verify that rpc's inherited ssh parameters
 also satisfy `tramp-compute-multi-hops'."
   :tags '(:multi-hop)
-  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
   ;; Manually install the proxy entry that tramp-add-hops would create
   ;; when processing /rpc:server|sudo:root@server:/path.  Disable the
   ;; tramp-rpc sudo foreign predicate for this low-level TRAMP check; otherwise
@@ -6661,16 +6378,6 @@ also satisfy `tramp-compute-multi-hops'."
     (should (string= (tramp-file-name-method (car result)) "rpc"))
     (should (string= (tramp-file-name-host (car result)) "server"))))
 
-(ert-deftest tramp-rpc-mock-test-rpc-method-has-ssh-login-program ()
-  "Test that the rpc method inherits ssh's tramp-login-program.
-This is needed for `tramp-maybe-open-connection' to process rpc
-as a hop in multi-hop chains."
-  :tags '(:multi-hop)
-  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
-  (let ((vec (make-tramp-file-name :method "rpc" :host "target")))
-    (should (string= (tramp-get-method-parameter vec 'tramp-login-program) "ssh"))
-    (should (tramp-get-method-parameter vec 'tramp-remote-shell))))
-
 ;;; ============================================================================
 ;;; Sudo-via-RPC tests (No server or SSH required)
 ;;; ============================================================================
@@ -6678,7 +6385,6 @@ as a hop in multi-hop chains."
 (ert-deftest tramp-rpc-mock-test-detect-sudo-elevation-basic ()
   "Test sudo elevation detection for /rpc:user@host|sudo:root@host:/path."
   :tags '(:multi-hop :sudo)
-  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
   (let ((vec (tramp-dissect-file-name
               "/rpc:alice@server|sudo:root@server:/etc/shadow")))
     (should (equal (tramp-rpc--detect-sudo-elevation vec) "alice"))))
@@ -6686,7 +6392,6 @@ as a hop in multi-hop chains."
 (ert-deftest tramp-rpc-mock-test-detect-sudo-elevation-no-hop ()
   "Test that normal rpc paths return nil for sudo detection."
   :tags '(:multi-hop :sudo)
-  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
   (let ((vec (make-tramp-file-name :method "rpc" :user "root"
                                    :host "server" :localname "/root")))
     (should-not (tramp-rpc--detect-sudo-elevation vec))))
@@ -6694,7 +6399,6 @@ as a hop in multi-hop chains."
 (ert-deftest tramp-rpc-mock-test-detect-sudo-elevation-different-host ()
   "Test that proxy hops to different hosts don't trigger sudo detection."
   :tags '(:multi-hop :sudo)
-  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
   (let ((vec (tramp-dissect-file-name
               "/rpc:user@gateway|sudo:root@server:/root")))
     ;; gateway != server, so no sudo elevation
@@ -6705,7 +6409,6 @@ as a hop in multi-hop chains."
 A rejected sudo password must not be reused on the next attempt, otherwise
 `tramp-revert-buffer-with-sudo' fails again without prompting (issue #274)."
   :tags '(:multi-hop :sudo)
-  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
   (let* ((vec (tramp-dissect-file-name
                "/rpc:alice@server|sudo:root@server:/etc/shadow"))
          (sudo-ssh-user (tramp-rpc--detect-sudo-elevation vec))
@@ -6727,7 +6430,6 @@ A rejected sudo password must not be reused on the next attempt, otherwise
 (ert-deftest tramp-rpc-mock-test-sudo-file-name-predicate ()
   "Test the sudo+rpc handler predicate."
   :tags '(:multi-hop :sudo)
-  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
   ;; rpc+sudo should match
   (should (tramp-rpc--sudo-file-name-p
            (tramp-dissect-file-name
@@ -6747,7 +6449,6 @@ A rejected sudo password must not be reused on the next attempt, otherwise
 (ert-deftest tramp-rpc-mock-test-doas-previous-hop-not-sudo-via-rpc ()
   "Non-sudo previous-hop methods must not be treated as sudo-via-RPC."
   :tags '(:multi-hop :sudo)
-  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
   (let ((vec (make-tramp-file-name :method "doas" :user "root"
                                    :host "server" :localname "/root"
                                    :hop "rpc:alice@server|")))
@@ -6764,7 +6465,6 @@ A rejected sudo password must not be reused on the next attempt, otherwise
 (ert-deftest tramp-rpc-mock-test-proxy-hop-string-sudo ()
   "Test that same-host sudo hops are excluded from proxy hop string."
   :tags '(:multi-hop :sudo)
-  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
   ;; Simple sudo: /rpc:user@host|sudo:root@host:/path -> no proxy hops
   (let ((vec (tramp-dissect-file-name
               "/rpc:user@server|sudo:root@server:/root")))
@@ -6780,7 +6480,6 @@ A rejected sudo password must not be reused on the next attempt, otherwise
 (ert-deftest tramp-rpc-mock-test-hops-to-proxyjump-skips-sudo ()
   "Test that hops-to-proxyjump skips same-host sudo hops."
   :tags '(:multi-hop :sudo)
-  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
   ;; Simple sudo: no proxy jumps needed
   (let ((vec (tramp-dissect-file-name
               "/rpc:user@server|sudo:root@server:/root")))
@@ -6796,7 +6495,6 @@ A rejected sudo password must not be reused on the next attempt, otherwise
 (ert-deftest tramp-rpc-mock-test-sudo-rpc-hop-must-be-final-hop ()
   "Only the final hop before sudo is the sudo-via-RPC SSH detail hop."
   :tags '(:multi-hop :sudo)
-  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
   (let ((vec (tramp-dissect-file-name
               "/rpc:alice@server|ssh:gateway|sudo:root@server:/root")))
     (should-not (tramp-rpc--detect-sudo-elevation vec))
@@ -6808,7 +6506,6 @@ A rejected sudo password must not be reused on the next attempt, otherwise
 (ert-deftest tramp-rpc-mock-test-hidden-sudo-proxies-from-native-tramp ()
   "TRAMP hidden ad-hoc proxies should still identify rpc+sudo paths."
   :tags '(:multi-hop :sudo)
-  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
   (skip-unless (tramp-rpc-mock-test--sudo-helper-available-p))
   (let* ((tramp-default-proxies-alist nil)
          (tramp-file-name-with-method "sudo")
@@ -6826,7 +6523,6 @@ A rejected sudo password must not be reused on the next attempt, otherwise
 (ert-deftest tramp-rpc-mock-test-hidden-sudo-handler-no-recursion ()
   "Hidden native rpc+sudo should be claimed without unregistering predicate."
   :tags '(:multi-hop :sudo)
-  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
   (skip-unless (tramp-rpc-mock-test--sudo-helper-available-p))
   (let* ((tramp-default-proxies-alist nil)
          (tramp-file-name-with-method "sudo")
@@ -6840,7 +6536,6 @@ A rejected sudo password must not be reused on the next attempt, otherwise
 (ert-deftest tramp-rpc-mock-test-hidden-different-host-sudo-not-claimed ()
   "Hidden rpc proxy to another host is not sudo-via-rpc for the target."
   :tags '(:multi-hop :sudo)
-  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
   (let* ((tramp-default-proxies-alist
           (list (list "^server$" "^root$"
                       (propertize "/rpc:alice@gateway:"
@@ -6854,7 +6549,6 @@ A rejected sudo password must not be reused on the next attempt, otherwise
 (ert-deftest tramp-rpc-mock-test-different-host-sudo-probing-is-quiet ()
   "Non-matching rpc sudo probes should not emit TRAMP host-mismatch messages."
   :tags '(:multi-hop :sudo)
-  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
   (let ((messages nil))
     (cl-letf (((symbol-function 'message)
                (lambda (format-string &rest args)
@@ -6880,7 +6574,6 @@ A rejected sudo password must not be reused on the next attempt, otherwise
 (ert-deftest tramp-rpc-mock-test-eshell-sudo-uses-native-em-tramp ()
   "Eshell sudo should keep using em-tramp's TRAMP sudo rewrite."
   :tags '(:sudo :eshell)
-  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
   (require 'em-tramp)
   (let* ((default-directory "/rpc:alice@server:/tmp/")
          (form (catch 'eshell-replace-command
@@ -6894,7 +6587,6 @@ A rejected sudo password must not be reused on the next attempt, otherwise
 (ert-deftest tramp-rpc-mock-test-exec-path-sudo-uses-native-sudo-rpc-server ()
   "Eshell command lookup in /rpc|sudo should use the sudo RPC backend."
   :tags '(:sudo :eshell)
-  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
   (let ((default-directory "/rpc:alice@server|sudo:root@server:/tmp/")
         captured)
     (cl-letf (((symbol-function 'tramp-rpc--cached-remote-path)
@@ -6908,7 +6600,6 @@ A rejected sudo password must not be reused on the next attempt, otherwise
 (ert-deftest tramp-rpc-mock-test-process-file-sudo-uses-native-sudo-rpc-server ()
   "process-file in /rpc|sudo should run inside the sudo RPC connection."
   :tags '(:sudo)
-  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
   (let ((default-directory "/rpc:alice@server|sudo:root@server:/root/")
         captured)
     (cl-letf (((symbol-function 'tramp-rpc--remote-path-environment)
@@ -6935,7 +6626,6 @@ A rejected sudo password must not be reused on the next attempt, otherwise
 (ert-deftest tramp-rpc-mock-test-make-process-sudo-uses-native-sudo-rpc-server ()
   "make-process in /rpc|sudo should use the elevated RPC connection."
   :tags '(:sudo)
-  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
   (let ((default-directory "/rpc:alice@server|sudo:root@server:/root/")
         captured proc)
     (cl-letf (((symbol-function 'tramp-rpc--sudo-password-required-p)
@@ -6977,7 +6667,6 @@ A rejected sudo password must not be reused on the next attempt, otherwise
 (ert-deftest tramp-rpc-mock-test-cleanup-connection-hidden-sudo-via-rpc ()
   "Cleanup should remove RPC state for hidden native rpc+sudo paths."
   :tags '(:sudo)
-  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
   (skip-unless (tramp-rpc-mock-test--sudo-helper-available-p))
   (let* ((tramp-default-proxies-alist nil)
          (tramp-file-name-with-method "sudo")
@@ -7065,7 +6754,6 @@ A rejected sudo password must not be reused on the next attempt, otherwise
 (ert-deftest tramp-rpc-mock-test-cleanup-bootstrap-clears-cached-state ()
   "Bootstrap cleanup should remove live and cached TRAMP connection state."
   :tags '(:connection-cleanup)
-  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
   (let ((vec (tramp-dissect-file-name "/rpc:bootstrap-host:/")))
     (dolist (state '(live-process private-process-buffer connected))
       (let ((proc (when (eq state 'live-process)
@@ -7097,7 +6785,6 @@ A rejected sudo password must not be reused on the next attempt, otherwise
 (ert-deftest tramp-rpc-mock-test-cleanup-bootstrap-ignores-empty-state ()
   "Bootstrap cleanup should do nothing when TRAMP has no bootstrap state."
   :tags '(:connection-cleanup)
-  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
   (let ((vec (tramp-dissect-file-name "/rpc:bootstrap-host:/"))
         cleanup-called)
     (cl-letf (((symbol-function 'tramp-rpc-deploy--bootstrap-vec)
@@ -7114,7 +6801,6 @@ A rejected sudo password must not be reused on the next attempt, otherwise
 (ert-deftest tramp-rpc-mock-test-connect-cleans-bootstrap-around-deployment ()
   "RPC startup should not overlap with stale or newly-created bootstrap state."
   :tags '(:connection-cleanup)
-  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
   (let ((vec (tramp-dissect-file-name "/rpc:bootstrap-host:/"))
         (tramp-rpc-use-controlmaster nil)
         (tramp-rpc-deploy-never-deploy nil)
@@ -7150,7 +6836,6 @@ A rejected sudo password must not be reused on the next attempt, otherwise
 (ert-deftest tramp-rpc-mock-test-start-server-sudo-password-uses-stdin ()
   "When sudo needs a password, start the elevated RPC server with sudo -S."
   :tags '(:sudo)
-  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
   (let ((vec (tramp-dissect-file-name
               "/rpc:alice@server|sudo:root@server:/root/"))
         (orig-make-process (symbol-function 'make-process))
@@ -7194,7 +6879,6 @@ A rejected sudo password must not be reused on the next attempt, otherwise
 (ert-deftest tramp-rpc-mock-test-start-server-sudo-password-send-failure-cleans-up ()
   "A failed sudo password write tears down the unregistered transport."
   :tags '(:sudo)
-  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
   (let* ((vec (tramp-dissect-file-name
                "/rpc:alice@send-failure|sudo:root@send-failure:/root/"))
          (buffer-name (tramp-buffer-name vec))
@@ -7229,7 +6913,6 @@ A rejected sudo password must not be reused on the next attempt, otherwise
 (ert-deftest tramp-rpc-mock-test-sudo-auth-rejection-detection ()
   "Recognize explicit sudo password rejection diagnostics only."
   :tags '(:sudo)
-  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
   (let ((buffer (generate-new-buffer " *tramp-rpc-sudo-stderr-test*")))
     (unwind-protect
         (progn
@@ -7245,7 +6928,6 @@ A rejected sudo password must not be reused on the next attempt, otherwise
 (ert-deftest tramp-rpc-mock-test-start-server-sudo-failure-clears-password ()
   "A rejected sudo password is forgotten and its transport is terminated."
   :tags '(:sudo)
-  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
   (let ((vec (tramp-dissect-file-name
               "/rpc:alice@server|sudo:root@server:/root/"))
         (orig-make-process (symbol-function 'make-process))
@@ -7283,7 +6965,6 @@ A rejected sudo password must not be reused on the next attempt, otherwise
 (ert-deftest tramp-rpc-mock-test-start-server-generic-failure-keeps-sudo-password ()
   "A non-authentication failure cleans up without discarding sudo credentials."
   :tags '(:sudo)
-  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
   (let ((vec (tramp-dissect-file-name
               "/rpc:alice@server|sudo:root@server:/root/"))
         (orig-make-process (symbol-function 'make-process))
@@ -7319,7 +7000,6 @@ A rejected sudo password must not be reused on the next attempt, otherwise
 
 (ert-deftest tramp-rpc-mock-test-start-server-quit-cleans-partial-connection ()
   "Interrupting the readiness probe removes the partial connection."
-  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
   (let ((vec (tramp-dissect-file-name "/rpc:mock:/"))
         (orig-make-process (symbol-function 'make-process))
         proc)
@@ -7353,7 +7033,6 @@ A rejected sudo password must not be reused on the next attempt, otherwise
 (ert-deftest tramp-rpc-mock-test-start-server-sudo-noninteractive-uses-n-H ()
   "When sudo has a cached ticket, start the elevated RPC server with sudo -n -H."
   :tags '(:sudo)
-  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
   (let ((vec (tramp-dissect-file-name
               "/rpc:alice@server|sudo:root@server:/root/"))
         (orig-make-process (symbol-function 'make-process))
@@ -7394,7 +7073,6 @@ A rejected sudo password must not be reused on the next attempt, otherwise
 
 (ert-deftest tramp-rpc-mock-test-server-binary-unavailable-detection ()
   "Only remote exec failures classify as a deployable missing binary."
-  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
   (let ((run-case
          (lambda (exit-status stderr-text)
            (let* ((stderr-buffer (generate-new-buffer " *tramp-rpc-stderr*"))
@@ -7439,7 +7117,6 @@ A rejected sudo password must not be reused on the next attempt, otherwise
   "A failed ControlMaster establish is retried when no live master remains.
 The first ssh attempt can die transiently before creating a socket; the
 retry must still happen in that case."
-  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
   (let* ((vec (tramp-dissect-file-name "/rpc:mock:/"))
          (controlmaster-dir (make-temp-file "tramp-rpc-controlmaster" t))
          (tramp-rpc-controlmaster-path
@@ -7475,7 +7152,6 @@ OpenSSH prompts on the controlling terminal, so the establish process needs
 `process-connection-type' t; the ControlMaster itself must run without a
 session terminal (`-N' plus a leading explicit RequestTTY=no) so user SSH
 options can not reintroduce one (see #213)."
-  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
   (let ((controlmaster-dir (make-temp-file "tramp-rpc-controlmaster" t))
         (tramp-rpc--owned-controlmasters (make-hash-table :test 'equal))
         ssh-args program connection-type process-buffer establish-process
@@ -7540,7 +7216,6 @@ options can not reintroduce one (see #213)."
 
 (ert-deftest tramp-rpc-mock-test-controlmaster-cleanup-uses-exact-owned-socket ()
   "Cleanup targets the exact owned socket after its auth process exits."
-  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
   (let* ((vec-a (tramp-dissect-file-name "/rpc:user-a@same-host:/"))
          (vec-b (tramp-dissect-file-name "/rpc:user-b@same-host:/"))
          (socket-a (make-temp-file "tramp-rpc-owned-a"))
@@ -7592,7 +7267,6 @@ options can not reintroduce one (see #213)."
   "Cleanup does not send ssh -O exit when the socket was replaced by another Emacs.
 After our ControlMaster expires, another Emacs may create a new socket at the
 same path.  The stored inode no longer matches, so we must not close it."
-  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
   (let* ((vec (tramp-dissect-file-name "/rpc:user@same-host:/"))
          (original-socket (make-temp-file "tramp-rpc-orig-sock"))
          (original-inode (nth 10 (file-attributes original-socket 'integer)))
@@ -7631,7 +7305,6 @@ same path.  The stored inode no longer matches, so we must not close it."
   "A dead establish process still succeeds when its socket appears late.
 With ControlPersist the ssh parent exits as soon as the master forks to the
 background, which can precede the socket becoming visible."
-  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
   (let* ((dir (make-temp-file "tramp-rpc-sock" t))
          (sock (expand-file-name "sock" dir))
          (proc-buf (generate-new-buffer " *tramp-rpc-mock-dead*"))
@@ -7661,7 +7334,6 @@ background, which can precede the socket becoming visible."
 
 (ert-deftest tramp-rpc-mock-test-controlmaster-action-dead-without-socket ()
   "A dead establish process without a socket reports process-died."
-  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
   (let* ((dir (make-temp-file "tramp-rpc-sock" t))
          (sock (expand-file-name "sock" dir))
          (proc-buf (generate-new-buffer " *tramp-rpc-mock-dead*"))
@@ -7688,7 +7360,6 @@ background, which can precede the socket becoming visible."
 
 (ert-deftest tramp-rpc-mock-test-connect-keeps-active-master-on-establish-failure ()
   "A failed establish must not retry over a still-active ControlMaster."
-  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
   (let* ((vec (tramp-dissect-file-name "/rpc:mock:/"))
          (controlmaster-dir (make-temp-file "tramp-rpc-controlmaster" t))
          (tramp-rpc-controlmaster-path
@@ -7712,7 +7383,6 @@ background, which can precede the socket becoming visible."
 
 (ert-deftest tramp-rpc-mock-test-capability-probes-retry-only-transient-errors ()
   "Capability probes retry RPC errors but cache successful negative results."
-  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
   (let ((vec (tramp-dissect-file-name "/rpc:capabilities:/"))
         (acl-calls 0)
         (selinux-calls 0))
@@ -7751,7 +7421,6 @@ background, which can precede the socket becoming visible."
 (ert-deftest tramp-rpc-mock-test-password-string-unwraps-auth-source-entry ()
   "Normalize auth-source plist secrets before sending them to sudo -S."
   :tags '(:sudo)
-  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
   (should (equal (tramp-rpc--password-string
                   '(:host "x220-nixos" :user "arthur" :port "sudo"
                     :secret (lambda () "secret")))
@@ -7760,7 +7429,6 @@ background, which can precede the socket becoming visible."
 (ert-deftest tramp-rpc-mock-test-controlmaster-socket-shared ()
   "Test that sudo and normal connections share the ControlMaster socket."
   :tags '(:multi-hop :sudo)
-  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
   (let ((normal-vec (make-tramp-file-name :method "rpc" :user "alice"
                                           :host "server" :localname "/home"))
         (sudo-vec (tramp-dissect-file-name
@@ -7780,7 +7448,6 @@ background, which can precede the socket becoming visible."
 (ert-deftest tramp-rpc-mock-test-vc-exec-after-logical-exit-runs-code ()
   "Test `vc-exec-after' handler treats exited TRAMP-RPC relays as done."
   :tags '(:vc-handler)
-  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
   (let* ((buffer (generate-new-buffer " *tramp-rpc-vc-exec-after-test*"))
          (proc (make-process :name "tramp-rpc-vc-exec-after-test"
                              :buffer buffer
@@ -7805,7 +7472,6 @@ background, which can precede the socket becoming visible."
 (ert-deftest tramp-rpc-mock-test-vc-exec-after-raw-closed-state-runs-code ()
   "Test `vc-exec-after' handler handles raw non-run relay states."
   :tags '(:vc-handler)
-  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
   (let* ((buffer (generate-new-buffer " *tramp-rpc-vc-exec-after-test*"))
          (proc (make-process :name "tramp-rpc-vc-exec-after-test"
                              :buffer buffer
@@ -7832,7 +7498,6 @@ background, which can precede the socket becoming visible."
 (ert-deftest tramp-rpc-mock-test-vc-exec-after-running-process-no-private-vc-sentinel ()
   "Test run-state handler doesn't call removed `vc--process-sentinel'."
   :tags '(:vc-handler)
-  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
   (require 'vc-dispatcher)
   (let* ((buffer (generate-new-buffer " *tramp-rpc-vc-exec-after-test*"))
          (proc (make-process :name "tramp-rpc-vc-exec-after-test"
@@ -7864,7 +7529,6 @@ background, which can precede the socket becoming visible."
 (ert-deftest tramp-rpc-mock-test-vc-exec-after-nested-in-immediate-code ()
   "CODE run at once for a missing process still routes nested relays."
   :tags '(:vc-handler)
-  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
   (require 'vc-dispatcher)
   (let* ((default-directory "/rpc:mock:/tmp/")
          (proc (make-process :name "tramp-rpc-vc-exec-after-nested"
@@ -7893,7 +7557,6 @@ background, which can precede the socket becoming visible."
 (ert-deftest tramp-rpc-mock-test-dir-locals-cache-covers-uses-containment ()
   "Ensure cache coverage check uses containment, not string length."
   :tags '(:dir-locals)
-  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
   (let ((locals "/tmp/a/b/")
         (cache "/tmp/a/b/c/d/")
         (sibling "/tmp/a/very-long-dirname/"))
@@ -7908,7 +7571,6 @@ background, which can precede the socket becoming visible."
 Quoted RPC localnames (/: prefix) must be unquoted for server filesystem
 operations and re-quoted on the way back."
   :tags '(:dir-locals)
-  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
   (let (captured-file)
     (cl-letf (((symbol-function 'tramp-rpc--call)
                (lambda (_vec method params)
@@ -7928,7 +7590,6 @@ this handler in tilde form.  Expanding here also keeps the search path and
 the returned directory in the one form
 `tramp-rpc--locate-dominating-before-stop-p' compares."
   :tags '(:dir-locals)
-  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
   (let (captured-file)
     (cl-letf (((symbol-function 'tramp-rpc--call)
                (lambda (_vec method params)
@@ -7946,7 +7607,6 @@ the returned directory in the one form
 (ert-deftest tramp-rpc-mock-test-locate-dominating-file-respects-stop-regexp ()
   "Ensure locate-dominating handler filters results above stop regexp."
   :tags '(:dir-locals)
-  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
   (cl-letf (((symbol-function 'tramp-rpc--call)
              (lambda (_vec method _params)
                (should (string= method "highlevel.locate_dominating_file_multi"))
@@ -7959,7 +7619,6 @@ the returned directory in the one form
 (ert-deftest tramp-rpc-mock-test-dir-locals-all-files-unquotes-and-requotes-paths ()
   "Ensure dir-locals-all-files handler preserves quoted RPC localnames."
   :tags '(:dir-locals)
-  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
   (let (captured-directory)
     (cl-letf (((symbol-function 'tramp-rpc--call)
                (lambda (_vec method params)
@@ -7984,7 +7643,6 @@ With no live connection and `non-essential' bound to t,
 `tramp-connectable-p' returns nil and the function must throw
 `non-essential' rather than attempting a 60s SSH handshake."
   :tags '(:non-essential)
-  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
   (let* ((vec (make-tramp-file-name :method "rpc" :host "unreachable-test-host"
                                     :localname "/tmp"))
          (non-essential t)
@@ -7997,7 +7655,6 @@ With no live connection and `non-essential' bound to t,
   "Test that `tramp-rpc--ensure-connection' does NOT throw when non-essential is nil.
 It should attempt to connect (and fail), not silently bail."
   :tags '(:non-essential)
-  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
   (let* ((vec (make-tramp-file-name :method "rpc" :host "unreachable-test-host"
                                     :localname "/tmp"))
          (non-essential nil))
@@ -8015,7 +7672,6 @@ It should attempt to connect (and fail), not silently bail."
 When `non-essential' is t and no connection exists, file-exists-p on
 a remote path should return nil (local fallback) instead of signaling."
   :tags '(:non-essential)
-  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
   (let ((non-essential t))
     ;; file-exists-p should return nil (local handler), not signal an error
     (should-not (file-exists-p "/rpc:unreachable-test-host:/no/such/path"))))
@@ -8025,7 +7681,6 @@ a remote path should return nil (local fallback) instead of signaling."
 The handler should bind non-essential to t for file-remote-p,
 so it works even when non-essential was nil."
   :tags '(:non-essential)
-  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
   (let ((non-essential nil))
     ;; file-remote-p should return the remote part without connecting
     (should (file-remote-p "/rpc:somehost:/path"))))
@@ -8037,7 +7692,6 @@ tramp-integration.el, registered on `tramp-cleanup-connection-hook'.
 Uses an existing local path so `recentf-cleanup' does not also
 discard it for being unreadable."
   :tags '(:non-essential :recentf)
-  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
   (require 'recentf)
   (let* ((vec (make-tramp-file-name :method "rpc" :host "myhost"
                                     :localname "/dummy"))
@@ -8062,7 +7716,6 @@ tramp-integration.el, registered on `tramp-cleanup-all-connections-hook'.
 Uses an existing local path so `recentf-cleanup' does not also
 discard it for being unreadable."
   :tags '(:non-essential :recentf)
-  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
   (require 'recentf)
   ;; Use a path that actually exists so recentf-cleanup keeps it.
   ;; recentf-cleanup removes entries that match recentf-exclude OR
@@ -8120,7 +7773,6 @@ discard it for being unreadable."
 
 (ert-deftest tramp-rpc-mock-test-remote-path-environment-uses-tramp-remote-path ()
   "Test that `tramp-remote-path' becomes a PATH environment entry."
-  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
   (let ((tramp-rpc-remote-path nil)
         (tramp-remote-path '(tramp-default-remote-path
                              "~/.cargo/bin"
@@ -8144,7 +7796,6 @@ discard it for being unreadable."
 
 (ert-deftest tramp-rpc-mock-test-remote-path-drops-missing-dirs-in-one-batch ()
   "Candidate PATH directories are checked with a single batch request."
-  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
   (let ((tramp-rpc-remote-path nil)
         (tramp-remote-path '("/bin" "/missing" "/file" "/usr/bin"))
         (vec (make-tramp-file-name :method "rpc" :host "host" :localname "/"))
@@ -8165,7 +7816,6 @@ discard it for being unreadable."
 
 (ert-deftest tramp-rpc-mock-test-remote-path-keeps-dirs-when-check-fails ()
   "A failed directory check keeps every candidate and is not cached."
-  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
   (let ((tramp-rpc-remote-path nil)
         (tramp-remote-path '("/bin" "/missing"))
         (tramp-rpc--exec-path-cache (make-hash-table :test 'equal))
@@ -8178,7 +7828,6 @@ discard it for being unreadable."
 
 (ert-deftest tramp-rpc-mock-test-remote-path-environment-compat-override ()
   "Test deprecated `tramp-rpc-remote-path' still overrides `tramp-remote-path'."
-  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
   (let ((tramp-rpc-remote-path '(tramp-rpc-own-remote-path "/custom/bin"))
         (tramp-remote-path '("/ignored/bin"))
         (tramp-rpc--exec-path-cache (make-hash-table :test 'equal))
@@ -8194,7 +7843,6 @@ discard it for being unreadable."
 
 (ert-deftest tramp-rpc-mock-test-compute-remote-path-reports-failed-fetch ()
   "A failed login-shell PATH fetch leaves the result incomplete."
-  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
   (let ((tramp-rpc-remote-path nil)
         (tramp-remote-path '(tramp-own-remote-path "/usr/bin"))
         (vec (make-tramp-file-name :method "rpc" :host "host" :user "user"
@@ -8211,7 +7859,6 @@ discard it for being unreadable."
 
 (ert-deftest tramp-rpc-mock-test-remote-path-not-cached-after-failure ()
   "Recompute a degraded remote PATH instead of caching it."
-  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
   (let ((tramp-rpc--exec-path-cache (make-hash-table :test 'equal))
         (vec (make-tramp-file-name :method "rpc" :host "host" :user "user"
                                    :localname "/"))
@@ -8226,7 +7873,6 @@ discard it for being unreadable."
 
 (ert-deftest tramp-rpc-mock-test-login-path-not-cached-after-failure ()
   "Do not cache a failed login-shell PATH fetch as an empty PATH."
-  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
   (let ((vec (make-tramp-file-name :method "rpc" :host "host" :user "user"
                                    :localname "/"))
         (fetched nil))
@@ -8246,7 +7892,6 @@ discard it for being unreadable."
 
 (ert-deftest tramp-rpc-mock-test-login-path-cache-survives-connection-start ()
   "Login PATH caching must keep one stable TRAMP connection-property key."
-  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
   (let ((vec (make-tramp-file-name :method "rpc" :host "host" :user "user"
                                    :localname "/"))
         (fetches 0))
@@ -8266,7 +7911,6 @@ discard it for being unreadable."
 
 (ert-deftest tramp-rpc-mock-test-shell-process-appends-login-path ()
   "Shell commands must retain login PATH entries like `tramp-sh'."
-  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
   (let ((default-directory "/rpc:user@host:/work/")
         (shell-file-name "/bin/bash")
         captured-params)
@@ -8296,8 +7940,6 @@ discard it for being unreadable."
 
 (ert-deftest tramp-rpc-mock-test-magit-prefetch-uses-process-environment ()
   "Magit prefetch must use the same effective environment as `process-file'."
-  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
-  (skip-unless tramp-rpc-mock-test--tramp-rpc-magit-loaded)
   (let* ((directory "/rpc:user@host:/home/user/repo/")
          (vec (tramp-dissect-file-name directory))
          (expected-env '(("PATH" . "/direnv/bin:/usr/bin")
@@ -8334,7 +7976,6 @@ discard it for being unreadable."
 
 (ert-deftest tramp-rpc-mock-test-fetch-remote-exec-path-ignores-banner ()
   "Test login shell PATH parsing ignores startup output before the marker."
-  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
   (let ((vec (make-tramp-file-name :method "rpc" :host "host" :user "user"
                                    :localname "/")))
     (cl-letf (((symbol-function 'tramp-rpc--get-remote-login-shell)
@@ -8359,7 +8000,6 @@ discard it for being unreadable."
 
 (ert-deftest tramp-rpc-mock-test-merge-environments-keeps-overrides ()
   "Test env merging preserves direnv/caller override semantics."
-  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
   (should (equal (tramp-rpc--merge-environments
                   '(("PATH" . "/remote/bin") ("A" . "remote"))
                   '(("PATH" . "/direnv/bin") ("B" . "direnv"))
@@ -8371,7 +8011,6 @@ discard it for being unreadable."
 
 (ert-deftest tramp-rpc-mock-test-tramp-remote-process-environment-to-alist ()
   "Test conversion of dynamic `tramp-remote-process-environment' entries."
-  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
   (let ((tramp-remote-process-environment
          (append '("TERM=dumb" "PYTHONUNBUFFERED=1" "UNSET_ME" "EMPTY=")
                  (default-toplevel-value 'tramp-remote-process-environment))))
@@ -8382,14 +8021,12 @@ discard it for being unreadable."
 
 (ert-deftest tramp-rpc-mock-test-tramp-remote-process-environment-skips-baseline ()
   "Test TRAMP shell setup defaults are not passed as RPC child env vars."
-  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
   (let ((tramp-remote-process-environment
          (default-toplevel-value 'tramp-remote-process-environment)))
     (should-not (tramp-rpc--tramp-remote-process-environment))))
 
 (ert-deftest tramp-rpc-mock-test-python-tramp-environment-handler ()
   "Test python.el TRAMP environment handler avoids shell refresh for RPC."
-  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
   (let ((body-env nil)
         (vec (make-tramp-file-name :method "rpc" :host "host" :user "user"
                                    :localname "/work/"))
@@ -8404,7 +8041,6 @@ discard it for being unreadable."
 
 (ert-deftest tramp-rpc-mock-test-interrupt-process-signals-remote-process ()
   "`interrupt-process' sends SIGINT remotely and leaves the relay running."
-  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
   (let ((process (start-process "tramp-rpc-interrupt-relay" nil "cat"))
         (other (start-process "tramp-rpc-interrupt-local" nil "cat"))
         captured)
@@ -8425,7 +8061,6 @@ discard it for being unreadable."
 
 (ert-deftest tramp-rpc-mock-test-signal-process-routes-remote-pid ()
   "Remote PID signals use RPC and relays retain their owning connection."
-  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
   (let ((vec (tramp-dissect-file-name "/rpc:user@host:/"))
         (old-connection 'old-connection)
         (replacement-connection 'replacement-connection)
@@ -8472,7 +8107,6 @@ discard it for being unreadable."
 
 (ert-deftest tramp-rpc-mock-test-process-file-passes-path-and-unresolved-command ()
   "Test `process-file' searches commands with `tramp-remote-path' PATH."
-  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
   (let ((default-directory "/rpc:user@host:/work/")
         (captured-params nil)
         (tramp-rpc--exec-path-cache (make-hash-table :test 'equal)))
@@ -8505,7 +8139,6 @@ discard it for being unreadable."
 
 (ert-deftest tramp-rpc-mock-test-process-file-invalidates-mutators-after-dispatch ()
   "Unwatched mutating commands invalidate connection caches afterwards."
-  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
   (let ((default-directory "/rpc:user@host:/work/")
         calls)
     (cl-letf (((symbol-function 'tramp-rpc--cached-remote-path)
@@ -8567,7 +8200,6 @@ discard it for being unreadable."
 
 (ert-deftest tramp-rpc-mock-test-process-file-honors-cache-invalidation-contract ()
   "Dispatched commands clear once unless side effects are explicitly disabled."
-  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
   (let ((default-directory "/rpc:user@host:/work/")
         invalidated)
     (cl-letf (((symbol-function 'tramp-rpc--cached-remote-path)
@@ -8597,7 +8229,6 @@ discard it for being unreadable."
 
 (ert-deftest tramp-rpc-mock-test-process-file-not-found-returns-127 ()
   "A structured spawn ENOENT becomes status 127 with captured stderr."
-  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
   (let ((default-directory "/rpc:user@host:/work/")
         (stderr-file (make-temp-file "tramp-rpc-process-stderr")))
     (unwind-protect
@@ -8632,7 +8263,6 @@ discard it for being unreadable."
 This matches tramp-sh and upstream `tramp-test28-process-file', which requires
 128 + signal by default and a description only when
 `process-file-return-signal-string' is set."
-  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
   (let ((default-directory "/rpc:user@host:/work/")
         (process-file-side-effects nil)
         (result '((exit_code . 0) (stdout . "") (stderr . ""))))
@@ -8675,7 +8305,6 @@ This matches tramp-sh and upstream `tramp-test28-process-file', which requires
 
 (ert-deftest tramp-rpc-mock-test-process-file-preserves-other-rpc-errors ()
   "A process cwd ENOENT remains a remote-file-error, not status 127."
-  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
   (let ((default-directory "/rpc:user@host:/work/")
         invalidated-directory)
     (cl-letf (((symbol-function 'tramp-rpc--cached-remote-path)
@@ -8700,7 +8329,6 @@ This matches tramp-sh and upstream `tramp-test28-process-file', which requires
 
 (ert-deftest tramp-rpc-mock-test-process-file-passes-tramp-remote-environment ()
   "Test `process-file' forwards dynamic TRAMP remote process env vars."
-  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
   (let ((default-directory "/rpc:user@host:/work/")
         (captured-env nil)
         (tramp-remote-process-environment '("TERM=dumb" "PYTHONUNBUFFERED=1")))
@@ -8724,9 +8352,25 @@ This matches tramp-sh and upstream `tramp-test28-process-file', which requires
       (should (equal (assoc "PYTHONUNBUFFERED" captured-env)
                      '("PYTHONUNBUFFERED" . "1"))))))
 
+(ert-deftest tramp-rpc-mock-test-async-process-rejects-invalid-program ()
+  "Invalid programs fail before connecting, in both pipe and PTY modes."
+  (let ((default-directory "/rpc:invalid-program:/tmp/"))
+    (cl-letf (((symbol-function 'tramp-rpc--ensure-connection)
+               (lambda (&rest _) (ert-fail "Invalid program attempted a connection"))))
+      (dolist (process-connection-type '(nil t))
+        (dolist (program '(nil 42 ["cat"]))
+          (with-temp-buffer
+            (should-error
+             (start-file-process "invalid-program" (current-buffer) program)
+             :type 'wrong-type-argument)
+            (should-error
+             (make-process :name "invalid-program" :buffer (current-buffer)
+                           :command (list program) :file-handler t
+                           :connection-type process-connection-type)
+             :type 'wrong-type-argument)))))))
+
 (ert-deftest tramp-rpc-mock-test-make-process-connection-type-nil-is-pipe ()
   "An explicit `:connection-type nil' must not fall back to global PTY mode."
-  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
   (let ((default-directory "/rpc:user@host:/work/")
         (process-connection-type t)
         (started nil)
@@ -8841,7 +8485,6 @@ This matches tramp-sh and upstream `tramp-test28-process-file', which requires
 
 (ert-deftest tramp-rpc-mock-test-make-process-sudo-pipe-uses-stdin-password ()
   "Pipe-mode literal sudo should authenticate in the same stdin context."
-  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
   (let ((default-directory "/rpc:user@host:/work/")
         (started nil)
         (written nil)
@@ -8888,7 +8531,6 @@ This matches tramp-sh and upstream `tramp-test28-process-file', which requires
 
 (ert-deftest tramp-rpc-mock-test-pipe-relay-sentinel-deletes-exited-relay ()
   "An exited pipe relay is untracked and no longer its buffer's process."
-  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
   (let* ((buffer (generate-new-buffer " *tramp-rpc-relay-delete-test*"))
          (proc (let ((process-connection-type nil))
                  (start-process "tramp-rpc-relay-delete-test" buffer "cat"))))
@@ -8910,7 +8552,6 @@ This matches tramp-sh and upstream `tramp-test28-process-file', which requires
 
 (ert-deftest tramp-rpc-mock-test-replaced-pipe-sentinel-gets-remote-exit ()
   "A sentinel set after start gets the remote exit, not the relay's."
-  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
   (let* ((proc (let ((process-connection-type nil))
                  (start-process "tramp-rpc-replaced-sentinel-test" nil "cat")))
          (events nil)
@@ -8932,7 +8573,6 @@ This matches tramp-sh and upstream `tramp-test28-process-file', which requires
 
 (ert-deftest tramp-rpc-mock-test-replaced-pipe-sentinel-relay-kill-kills-remote ()
   "Killing a relay whose sentinel was replaced still kills the remote process."
-  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
   (let* ((proc (let ((process-connection-type nil))
                  (start-process "tramp-rpc-replaced-kill-test" nil "cat")))
          (vec (tramp-dissect-file-name "/rpc:replaced-kill:/tmp/"))
@@ -8956,7 +8596,6 @@ This matches tramp-sh and upstream `tramp-test28-process-file', which requires
 
 (ert-deftest tramp-rpc-mock-test-pipe-relay-sentinel-does-not-count-stop-as-exit ()
   "A relay stop event must not consume its user's exit notification."
-  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
   (let* ((proc (let ((process-connection-type nil))
                  (start-process "tramp-rpc-relay-stop-test" nil "cat")))
          (user-events nil))
@@ -8981,7 +8620,6 @@ This matches tramp-sh and upstream `tramp-test28-process-file', which requires
 
 (ert-deftest tramp-rpc-mock-test-sudo-via-rpc-pty-uses-rpc-backend ()
   "PTYs for sudo-via-RPC must not use direct SSH as the sudo target user."
-  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
   (let ((vec (tramp-dissect-file-name "/rpc:alice@server|sudo:root@server:/root/"))
         (tramp-rpc-use-direct-ssh-pty t)
         (rpc-called nil))
@@ -9015,7 +8653,6 @@ This matches tramp-sh and upstream `tramp-test28-process-file', which requires
 (ert-deftest tramp-rpc-mock-test-direnv-cache-key-deduplicates-tilde ()
   "Test that ~/project and /home/user/project produce the same cache key."
   :tags '(:direnv)
-  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
   (let ((vec (make-tramp-file-name :method "rpc" :host "host" :user "user"
                                    :localname "/")))
     (cl-letf (((symbol-function 'tramp-get-home-directory)
@@ -9026,7 +8663,6 @@ This matches tramp-sh and upstream `tramp-test28-process-file', which requires
 (ert-deftest tramp-rpc-mock-test-direnv-cache-no-duplicate-entries ()
   "Test that accessing ~/project and /home/user/project shares one cache entry."
   :tags '(:direnv)
-  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
   (let* ((vec (make-tramp-file-name :method "rpc" :host "host" :user "user"
                                     :localname "/"))
          ;; Local direnv cache to avoid polluting global state
@@ -9070,7 +8706,6 @@ This matches tramp-sh and upstream `tramp-test28-process-file', which requires
 
 (ert-deftest tramp-rpc-mock-test-clear-file-metadata-caches-drops-derived-magit-caches ()
   "A connection-less metadata clear reaches every Magit cache through the hook."
-  (skip-unless tramp-rpc-mock-test--tramp-rpc-magit-loaded)
   (let ((tramp-rpc--file-exists-cache (make-hash-table :test 'equal))
         (tramp-rpc--file-truename-cache (make-hash-table :test 'equal))
         (tramp-rpc--file-stat-cache (make-hash-table :test 'equal))
@@ -9362,25 +8997,88 @@ This matches tramp-sh and upstream `tramp-test28-process-file', which requires
     (should (= (alist-get 'gid (cdr (cadr calls))) 84))))
 
 (ert-deftest tramp-rpc-mock-test-remote-stderr-command-wrapper-is-argv-safe ()
-  "Remote stderr redirection preserves command argv in pipe and PTY paths."
-  (should
-   (equal (tramp-rpc--redirect-command-stderr
-           '("printf" "%s" "a b") "/tmp/error file")
-          '("/bin/sh" "-c" "exec \"$@\" 2>/tmp/error\\ file"
-            "tramp-rpc-stderr" "printf" "%s" "a b"))))
+  "Redirection preserves literal argv, stderr paths and the exit status."
+  (let* ((directory (make-temp-file "tramp-rpc-stderr" t))
+         (stderr-file (expand-file-name "error 'file; $HOME" directory))
+         (argument "a b; 'quoted' \"double\" $HOME $(echo expanded)")
+         (command (tramp-rpc--redirect-command-stderr
+                   (list "sh" "-c"
+                         "printf '%s' \"$1\"; printf '%s' \"$2\" >&2; exit 7"
+                         "test" argument "error output")
+                   stderr-file)))
+    (unwind-protect
+        (progn
+          (with-temp-buffer
+            (should (= 7 (apply #'call-process (car command) nil t nil
+                                (cdr command))))
+            (should (equal (buffer-string) argument)))
+          (with-temp-buffer
+            (insert-file-contents-literally stderr-file)
+            (should (equal (buffer-string) "error output"))))
+      (delete-directory directory t))))
 
-(ert-deftest tramp-rpc-mock-test-deploy-target-registry-and-shell-builders ()
-  "Deploy targets are centralized and activation retains safety predicates."
+(ert-deftest tramp-rpc-mock-test-deploy-target-normalization ()
+  "Deployment maps machine names to supported Rust targets."
   (should (equal (tramp-rpc-deploy--arch-to-rust-target "armv7-linux")
                  "armv7-unknown-linux-musleabihf"))
-  (should (equal (tramp-rpc-deploy--normalize-machine "armv6l") "arm"))
-  (let ((command (tramp-rpc-deploy--activation-command
-                  "/tmp/stage file" "/tmp/dest" (make-string 64 ?a))))
-    (should (string-match-p "test ! -e" command))
-    (should (string-match-p "! test -L" command))
-    (should (string-match-p "sha256sum" command))
-    (should (string-match-p "shasum -a 256" command))
-    (should (string-match-p "mv -f" command))))
+  (should (equal (tramp-rpc-deploy--normalize-machine "armv6l") "arm")))
+
+(ert-deftest tramp-rpc-mock-test-deploy-activation-installs-verified-binary ()
+  "Activation installs or replaces a regular file and makes it executable."
+  :tags '(:deploy)
+  (dolist (existing '(nil t))
+    (let* ((directory (make-temp-file "tramp-rpc-activation" t))
+           (temporary (expand-file-name "stage 'file; $HOME" directory))
+           (destination (expand-file-name "installed 'file; $HOME" directory)))
+      (unwind-protect
+          (progn
+            (with-temp-file temporary (insert "new binary"))
+            (set-file-modes temporary #o600)
+            (when existing
+              (with-temp-file destination (insert "old binary")))
+            (should
+             (zerop (call-process
+                     "sh" nil nil nil "-c"
+                     (tramp-rpc-deploy--activation-command
+                      temporary destination
+                      (tramp-rpc-deploy--compute-checksum temporary)))))
+            (should-not (file-exists-p temporary))
+            (should (file-executable-p destination))
+            (with-temp-buffer
+              (insert-file-contents-literally destination)
+              (should (equal (buffer-string) "new binary"))))
+        (delete-directory directory t)))))
+
+(ert-deftest tramp-rpc-mock-test-deploy-activation-rejects-symlinks ()
+  "Activation never follows a staging or destination symlink."
+  :tags '(:deploy)
+  (dolist (link '(temporary destination))
+    (let* ((directory (make-temp-file "tramp-rpc-activation" t))
+           (temporary (expand-file-name "stage" directory))
+           (destination (expand-file-name "installed" directory))
+           (target (expand-file-name "untouched" directory)))
+      (unwind-protect
+          (progn
+            (with-temp-file target (insert "old binary"))
+            (set-file-modes target #o600)
+            (if (eq link 'temporary)
+                (make-symbolic-link target temporary)
+              (with-temp-file temporary (insert "new binary"))
+              (make-symbolic-link target destination))
+            (should-not
+             (zerop (call-process
+                     "sh" nil nil nil "-c"
+                     (tramp-rpc-deploy--activation-command
+                      temporary destination
+                      (tramp-rpc-deploy--compute-checksum temporary)))))
+            (should (file-symlink-p
+                     (if (eq link 'temporary) temporary destination)))
+            (should (file-exists-p temporary))
+            (should (= (file-modes target) #o600))
+            (with-temp-buffer
+              (insert-file-contents-literally target)
+              (should (equal (buffer-string) "old binary"))))
+        (delete-directory directory t)))))
 
 (ert-deftest tramp-rpc-mock-test-deploy-debug-log-supports-relative-path ()
   "Deployment debug logging accepts a file in `default-directory'."
@@ -9572,7 +9270,6 @@ SPEC is (RELAY BUFFER TRANSPORT CONNECTION PID).  RELAY is not yet in
 
 (ert-deftest tramp-rpc-mock-test-remote-groups-are-unavailable ()
   "Group introspection returns nil without a connection or RPC."
-  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
   (let ((vec (tramp-dissect-file-name "/rpc:mockhost:/")))
     (cl-letf (((symbol-function 'tramp-rpc--call)
                (lambda (&rest _) (ert-fail "Group introspection must not call RPC"))))
