@@ -941,7 +941,13 @@ for the socket to appear before declaring the attempt dead."
       (when (file-exists-p tramp-rpc--controlmaster-socket-path)
         (throw 'tramp-action 'ok))
       (sleep-for tramp-rpc--controlmaster-socket-grace-delay))
-    (throw 'tramp-action 'process-died))))
+    (throw 'tramp-action 'process-died))
+   (t
+    (unless (with-local-quit
+              (accept-process-output proc 0.05 nil 1)
+              t)
+      (keyboard-quit))
+    nil)))
 
 (defconst tramp-rpc--controlmaster-actions
   '((tramp-password-prompt-regexp tramp-action-password)

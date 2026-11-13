@@ -4,7 +4,7 @@
 
 ;; Author: Arthur Heymans <arthur@aheymans.xyz>
 ;; Assisted-by: various LLMs
-;; Version: 0.15.0
+;; Version: 0.16.0
 ;; URL: https://github.com/ArthurHeymans/emacs-tramp-rpc
 ;; Keywords: comm, processes, files
 ;; Package-Requires: ((emacs "30.1") (msgpack "0.1.1") (tramp "2.8.1.4"))
@@ -254,6 +254,7 @@ This is called from `tramp-multi-hop-p-hook'."
 (declare-function tramp-rpc-multi-hop-p "tramp-rpc")
 (declare-function tramp-rpc-protocol-signal-description "tramp-rpc-protocol"
                   (signal &optional os))
+(declare-function tramp-rpc--process-directory "tramp-rpc-transport" (localname))
 
 
 ;; Helper modules register internal lifecycle callbacks when loaded.
