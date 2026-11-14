@@ -12,9 +12,9 @@ If building for a target other than linux, refer to that script for options.
 
 # Config settings
 
-The settings for this setup are located in `.config`
+The settings for this setup are located in `.config.local`
 
-@.config
+@.config.local
 
 This can include:
 
@@ -28,11 +28,11 @@ This can include:
 # Testing updates
 
 NEVER use emacsclient, unless the user specifically request this to reload the configuration.
-That will interfer with the users configuration
+That will interfere with the users configuration
 
 Always use `emacs -Q --batch --eval <lisp commands>`
 
-When testing updates to the rust server, always copy it to a temporary location and set `tramp-rpc-deploy-remote-directory` to the temporary path so that testing does not interfere with existing sessions. Use `scripts/build_all.sh` to rebuild the server binary. Then SCP it to a new location and set the variable.
+When testing updates to the rust server, always copy it to a temporary location and set `tramp-rpc-deploy-remote-directory` to the temporary path so that testing does not interfere with existing sessions. Use `scripts/build-all.sh` to rebuild the server binary. Then SCP it to a new location and set the variable.
 
 Always test changes to the code.
 

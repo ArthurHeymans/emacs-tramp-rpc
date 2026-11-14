@@ -34,6 +34,7 @@
 (require 'tramp-rpc-protocol)
 (require 'tramp-rpc-connection)
 (require 'tramp-rpc-transport)
+(require 'tramp-rpc-environment)
 
 
 ;; Silence byte-compiler warnings for variables defined in vterm

@@ -34,6 +34,7 @@
 (require 'tramp-rpc-protocol)
 (require 'tramp-rpc-connection)
 (require 'tramp-rpc-transport)
+(require 'tramp-rpc-environment)
 (require 'tramp-rpc-cache)
 
 ;; Functions from tramp-rpc.el

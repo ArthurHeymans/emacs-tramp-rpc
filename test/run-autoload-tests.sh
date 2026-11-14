@@ -23,13 +23,33 @@ if [[ -d "$TRAMP_SOURCE/lisp" ]]; then
     EMACS_LOAD_PATH_ARGS=(-L "$TRAMP_SOURCE/lisp" "${EMACS_LOAD_PATH_ARGS[@]}")
     # Do not let installed TRAMP autoloads shadow the selected checkout.
     EMACS_PACKAGE_ARGS=()
-elif [[ -f "$TRAMP_SOURCE/tramp.el" ]]; then
-    # Flat checkout or ELPA package — .el files live directly in TRAMP_SOURCE.
+elif [[ -f "$TRAMP_SOURCE/tramp.el" ||
+        -f "$TRAMP_SOURCE/tramp.elc" ||
+        -f "$TRAMP_SOURCE/tramp.el.gz" ]]; then
+    # Flat checkout, ELPA package, or bundled compiled/compressed library.
     EMACS_LOAD_PATH_ARGS=(-L "$TRAMP_SOURCE" "${EMACS_LOAD_PATH_ARGS[@]}")
     EMACS_PACKAGE_ARGS=()
 elif (( TRAMP_SOURCE_CONFIGURED )); then
-    echo "TRAMP_SOURCE does not contain a lisp/ directory or tramp.el: $TRAMP_SOURCE" >&2
+    echo "TRAMP_SOURCE does not contain a lisp/ directory or a TRAMP library: $TRAMP_SOURCE" >&2
     exit 1
+fi
+
+if [[ -n "${MSGPACK_SOURCE:-}" ]]; then
+    if [[ ! -f "$MSGPACK_SOURCE/msgpack.el" ]]; then
+        echo "MSGPACK_SOURCE does not contain msgpack.el: $MSGPACK_SOURCE" >&2
+        exit 1
+    fi
+    EMACS_LOAD_PATH_ARGS+=(-L "$MSGPACK_SOURCE")
+else
+    # Discover only msgpack, without activating installed packages or their
+    # autoloads: an installed TRAMP must not shadow the selected checkout.
+    EMACS_PACKAGE_ARGS+=(--eval "(unless (locate-library \"msgpack\")
+      (require 'package)
+      (package-load-all-descriptors)
+      (when-let* ((descriptor (cadr (assq 'msgpack package-alist))))
+        (setq load-path (append load-path (list (package-desc-dir descriptor)))))
+      (unless (locate-library \"msgpack\")
+        (error \"Autoload tests require msgpack; set MSGPACK_SOURCE to its source directory\")))")
 fi
 
 echo "Running tramp-rpc autoload tests..."
