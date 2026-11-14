@@ -522,7 +522,8 @@ Returns \"/bin/sh\" if the lookup fails."
 Invokes the login shell with `-l' to source shell configuration files.
 A marker separates shell startup output, MOTD text, or banners from the
 actual PATH line, matching the robustness of upstream TRAMP.
-Signals when VEC cannot be reached."
+Signals when VEC cannot be reached or the probe fails.  A successful empty
+PATH returns nil; callers may cache that result."
   (let* ((marker (md5 (format "tramp-rpc-path-%s" (float-time))))
          (shell (tramp-rpc--get-remote-login-shell vec))
          (result (tramp-rpc--call vec "process.run"
@@ -533,11 +534,12 @@ Signals when VEC cannot be reached."
          (exit-code (alist-get 'exit_code result))
          (stdout (tramp-rpc--decode-output
                   (alist-get 'stdout result))))
-    (when (and (eq exit-code 0) (> (length stdout) 0)
-               (string-match
-                (concat (regexp-quote marker) "\r?\n\\([^\r\n]+\\)")
-                stdout))
-      (split-string (string-trim (match-string 1 stdout)) ":" t))))
+    (unless (and (eq exit-code 0)
+                 (string-match
+                  (concat (regexp-quote marker) "\r?\n\\([^\r\n]*\\)\r?\n")
+                  stdout))
+      (signal 'remote-file-error '("Remote login PATH probe failed")))
+    (split-string (string-trim (match-string 1 stdout)) ":" t)))
 
 
 ;; ============================================================================

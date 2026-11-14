@@ -64,6 +64,9 @@
   sentinel-installed
   ;; Non-nil while a dead-connection probe of this generation runs.
   probing
+  ;; Incremented before route metadata is flushed, so pending system.info
+  ;; replies cannot undo an explicit reset on this same live connection.
+  (metadata-epoch 0)
   ;; Lazily allocated by tramp-rpc-environment.el.  Replacing this object
   ;; clears caches without letting in-flight probes refill the new state.
   environment)

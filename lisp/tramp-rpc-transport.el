@@ -303,7 +303,9 @@ ARGS contains the remaining arguments of the advised TRAMP property function."
      vec (tramp-rpc--route-property-name vec property))))
 
 (defun tramp-rpc--flush-owned-route-connection-properties (vec)
-  "Flush every route-dependent connection property owned for VEC."
+  "Flush VEC's owned route properties and invalidate pending metadata probes."
+  (when-let* ((connection (tramp-rpc--get-connection vec)))
+    (cl-incf (tramp-rpc-connection-metadata-epoch connection)))
   (dolist (property (append tramp-rpc--owned-route-connection-properties
                             tramp-rpc--generic-route-connection-properties
                             (when-let* ((user (tramp-file-name-user vec)))
@@ -1002,13 +1004,14 @@ Returns the connection plist.  Signals `remote-file-error' on failure."
           ;; connection-local system.info cache for later uid/gid/home/shell
           ;; lookups.  Tear down a failed transport before retrying.
           (let* ((connection (tramp-rpc--process-connection process))
+                 (metadata-epoch (tramp-rpc-connection-metadata-epoch connection))
                  (info (tramp-rpc--call vec "system.info" nil))
                  (revision (alist-get 'protocol_revision info)))
             (unless (equal revision tramp-rpc-protocol-revision)
               (signal 'tramp-rpc-incompatible-server
                       (list (format "Server on %s reports protocol revision %S; expected %d.  Rebuild and redeploy the matching server"
                                     host revision tramp-rpc-protocol-revision))))
-            (tramp-rpc--cache-system-info vec info connection))
+            (tramp-rpc--cache-system-info vec info connection metadata-epoch))
 
           ;; Set connection-local variables in the connection buffer.
           ;; Every TRAMP backend must call this after establishing the
@@ -1944,12 +1947,20 @@ An explicit non-t value marks degraded."
       (when (and cell (not (eq (cdr cell) t)))
         (setq tramp-rpc--watcher-degraded t)))))
 
-(defun tramp-rpc--cache-system-info (vec info &optional connection)
+(defun tramp-rpc--current-system-info-probe-p (vec connection metadata-epoch)
+  "Return non-nil if CONNECTION and METADATA-EPOCH still own VEC's metadata."
+  (and (eq connection (tramp-rpc--get-connection vec))
+       (= metadata-epoch (tramp-rpc-connection-metadata-epoch connection))))
+
+(defun tramp-rpc--cache-system-info (vec info &optional connection metadata-epoch)
   "Store system.info INFO for VEC and seed related TRAMP properties.
-When CONNECTION is supplied, publish only if it is still VEC's current
-generation.  A late reply must not overwrite a successor's properties."
-  (when (and info (or (null connection)
-                      (eq connection (tramp-rpc--get-connection vec))))
+When CONNECTION is supplied, it must still serve VEC.  METADATA-EPOCH,
+when supplied, also rejects replies predating a reset on that connection."
+  (when (and info
+             (or (null connection)
+                 (tramp-rpc--current-system-info-probe-p
+                  vec connection (or metadata-epoch
+                                     (tramp-rpc-connection-metadata-epoch connection)))))
     (tramp-rpc--note-watcher-availability info)
     (tramp-rpc--set-route-connection-property
      vec tramp-rpc--system-info-property info)
@@ -1985,19 +1996,20 @@ generation.  A late reply must not overwrite a successor's properties."
    vec tramp-rpc--system-info-property nil))
 
 (defun tramp-rpc--system-info (vec)
-  "Return cached system.info for VEC, fetching it at most once per connection."
+  "Return cached system.info for VEC, probing again after metadata resets."
   (or (tramp-rpc--cached-system-info vec)
       (let ((connection (tramp-rpc--ensure-connection vec)))
         ;; Startup already fetches system.info; avoid a second cold RPC.
         (or (tramp-rpc--cached-system-info vec)
-            (let ((info (tramp-rpc--call vec "system.info" nil connection)))
-              (if (eq connection (tramp-rpc--get-connection vec))
-                  (tramp-rpc--cache-system-info vec info connection)
+            (let* ((metadata-epoch (tramp-rpc-connection-metadata-epoch connection))
+                   (info (tramp-rpc--call vec "system.info" nil connection)))
+              (if (tramp-rpc--current-system-info-probe-p vec connection metadata-epoch)
+                  (tramp-rpc--cache-system-info vec info connection metadata-epoch)
                 ;; TRAMP callers also cache our return value.  Do not return
-                ;; stale metadata for them to publish on the successor.
+                ;; stale metadata after either replacement or an explicit reset.
                 (or (tramp-rpc--cached-system-info vec)
                     (signal 'remote-file-error
-                            '("RPC connection changed during system.info")))))))))
+                            '("RPC connection or metadata changed during system.info")))))))))
 
 (provide 'tramp-rpc-transport)
 ;;; tramp-rpc-transport.el ends here

@@ -38,6 +38,16 @@ if [[ -n "${MSGPACK_SOURCE:-}" ]]; then
         exit 1
     fi
     EMACS_LOAD_PATH_ARGS+=(-L "$MSGPACK_SOURCE")
+else
+    # Discover only msgpack, without activating installed packages or their
+    # autoloads: an installed TRAMP must not shadow the selected checkout.
+    EMACS_PACKAGE_ARGS+=(--eval "(unless (locate-library \"msgpack\")
+      (require 'package)
+      (package-load-all-descriptors)
+      (when-let* ((descriptor (cadr (assq 'msgpack package-alist))))
+        (setq load-path (append load-path (list (package-desc-dir descriptor)))))
+      (unless (locate-library \"msgpack\")
+        (error \"Autoload tests require msgpack; set MSGPACK_SOURCE to its source directory\")))")
 fi
 
 echo "Running tramp-rpc autoload tests..."
