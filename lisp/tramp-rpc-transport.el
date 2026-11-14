@@ -1996,7 +1996,8 @@ when supplied, also rejects replies predating a reset on that connection."
    vec tramp-rpc--system-info-property nil))
 
 (defun tramp-rpc--system-info (vec)
-  "Return cached system.info for VEC, probing again after metadata resets."
+  "Return cached system.info for VEC.
+Fetch fresh metadata after a cache reset."
   (or (tramp-rpc--cached-system-info vec)
       (let ((connection (tramp-rpc--ensure-connection vec)))
         ;; Startup already fetches system.info; avoid a second cold RPC.
