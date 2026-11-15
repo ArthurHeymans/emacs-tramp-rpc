@@ -853,6 +853,11 @@ sentinel is in place so a second call cannot wrap it twice."
            (when (memq (process-status proc) '(exit signal))
              (tramp-rpc--connection-transport-death proc vec event))))))))
 
+(defvar tramp-rpc--connecting-keys nil
+  "Connection keys this thread is currently establishing.
+Bound dynamically around `tramp-rpc--connect', so each thread sees
+only its own attempts.")
+
 (defun tramp-rpc--ensure-connection (vec)
   "Ensure we have an active RPC connection to VEC.
 Returns the connection plist.
@@ -881,8 +886,23 @@ completion) from blocking on unreachable hosts."
           ;; standard TRAMP backend in their maybe-open-connection functions.
           (unless (tramp-connectable-p vec)
             (throw 'non-essential 'non-essential))
+          ;; The lifecycle mutex is recursive, so it does not stop this
+          ;; thread from re-entering while it is still connecting to VEC.
+          ;; That happens when a timer runs during the connection setup,
+          ;; e.g. while TRAMP waits for ssh or deploy output.  A nested
+          ;; attempt would reuse and tear down the outer attempt's auth
+          ;; buffer, ControlMaster socket and deployment connection, so
+          ;; refuse it the way TRAMP refuses reentrant use of a busy
+          ;; connection.
+          (let ((key (tramp-rpc--connection-key vec)))
+            (when (member key tramp-rpc--connecting-keys)
+              (tramp-error vec 'remote-file-error
+                           "Forbidden reentrant call of Tramp")))
           ;; Need to establish connection.
-          (tramp-rpc--connect vec))))))
+          (let ((tramp-rpc--connecting-keys
+                 (cons (tramp-rpc--connection-key vec)
+                       tramp-rpc--connecting-keys)))
+            (tramp-rpc--connect vec)))))))
 
 (defun tramp-rpc--ensure-controlmaster-directory ()
   "Ensure the ControlMaster socket directory exists.
