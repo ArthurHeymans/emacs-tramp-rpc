@@ -8656,6 +8656,49 @@ This matches tramp-sh and upstream `tramp-test28-process-file', which requires
                            :connection-type process-connection-type)
              :type 'wrong-type-argument)))))))
 
+(defun tramp-rpc-mock-test--fake-sudo-call (vec method params)
+  "Answer a sudo password probe on VEC like a sudoers file would.
+METHOD and PARAMS are the RPC request.  The SSH user alice may run
+commands as root without a password but needs one for any other
+target user, and `sudo -v' needs one too (the default `verifypw=all')."
+  (should (equal method "process.run"))
+  (should (equal (alist-get 'cmd params) "sudo"))
+  (let* ((args (append (alist-get 'args params) nil))
+         (target (or (cadr (member "-u" args)) "root"))
+         (ok (and (equal (tramp-file-name-method vec) "rpc")
+                  (equal (tramp-file-name-user vec) "alice")
+                  (member "-n" args)
+                  (not (member "-v" args))
+                  (equal target "root"))))
+    `((exit_code . ,(if ok 0 1))
+      (stdout . "")
+      (stderr . ,(if ok "" "sudo: a password is required\n")))))
+
+(ert-deftest tramp-rpc-mock-test-sudo-password-probe-runs-command ()
+  "The sudo password probe runs a command instead of `sudo -v'.
+With sudo's default `verifypw=all', `sudo -n -v' fails unless every
+matching sudoers entry is NOPASSWD, although `sudo -n COMMAND' works."
+  :tags '(:sudo)
+  (cl-letf (((symbol-function 'tramp-rpc--call)
+             #'tramp-rpc-mock-test--fake-sudo-call))
+    (should-not (tramp-rpc--sudo-password-required-p
+                 (tramp-dissect-file-name
+                  "/rpc:alice@server|sudo:root@server:/root/")))
+    ;; A literal sudo on an ordinary RPC connection has no target user.
+    ;; Its SSH user must not be taken for one.
+    (should-not (tramp-rpc--sudo-password-required-p
+                 (tramp-dissect-file-name "/rpc:alice@server:/home/alice/")))))
+
+(ert-deftest tramp-rpc-mock-test-sudo-password-probe-uses-target-user ()
+  "The sudo password probe checks the target user the server runs as.
+Becoming root needs no password here, but becoming deploy does."
+  :tags '(:sudo)
+  (cl-letf (((symbol-function 'tramp-rpc--call)
+             #'tramp-rpc-mock-test--fake-sudo-call))
+    (should (tramp-rpc--sudo-password-required-p
+             (tramp-dissect-file-name
+              "/rpc:alice@server|sudo:deploy@server:/srv/")))))
+
 (ert-deftest tramp-rpc-mock-test-make-process-connection-type-nil-is-pipe ()
   "An explicit `:connection-type nil' must not fall back to global PTY mode."
   (let ((default-directory "/rpc:user@host:/work/")

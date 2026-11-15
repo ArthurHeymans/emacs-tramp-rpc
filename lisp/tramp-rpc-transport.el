@@ -1326,11 +1326,22 @@ original user quit is always re-signalled."
                        cleanup-error))))
 
 (defun tramp-rpc--sudo-password-required-p (vec)
-  "Return non-nil when sudo on VEC needs a password for non-PTY use."
+  "Return non-nil when sudo on VEC needs a password for non-PTY use.
+Probe by running a command rather than with `sudo -v': with the default
+`verifypw=all', -v requires authentication unless every matching sudoers
+entry is NOPASSWD, even when `sudo -n COMMAND' (how the elevated server is
+started) succeeds.  For sudo-via-RPC, probe as the same target user the
+server runs as, since sudoers may require a password for some targets
+only."
   (let* ((auth-vec (or (tramp-rpc--sudo-auth-vec vec) vec))
+         (target (and (tramp-rpc--detect-sudo-elevation vec)
+                      (tramp-file-name-user vec)))
          (result (tramp-rpc--call auth-vec "process.run"
-                                  '((cmd . "sudo")
-                                    (args . ["-n" "-v"])
+                                  `((cmd . "sudo")
+                                    (args . ,(vconcat '("-n")
+                                                      (and target
+                                                           (list "-u" target))
+                                                      '("true")))
                                     (cwd . "/"))))
          (exit-code (alist-get 'exit_code result)))
     (not (eq exit-code 0))))
