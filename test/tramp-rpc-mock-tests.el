@@ -7836,6 +7836,38 @@ It should attempt to connect (and fail), not silently bail."
        (tramp-rpc--ensure-connection vec)
        :type 'remote-file-error))))
 
+(ert-deftest tramp-rpc-mock-test-ensure-connection-refuses-reentrant-connect ()
+  "A nested connect to a host being connected to must not start.
+Timers can run while `tramp-rpc--connect' waits for ssh or deploy output.
+When such a timer needs the same host, the nested attempt must fail before
+it touches the outer attempt's state, while other hosts still connect."
+  :tags '(:non-essential)
+  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
+  (let* ((vec (make-tramp-file-name :method "rpc" :host "reentrant-test-host"
+                                    :localname "/tmp"))
+         (other (make-tramp-file-name :method "rpc" :host "other-test-host"
+                                      :localname "/tmp"))
+         (non-essential nil)
+         connected nested-error)
+    (cl-letf (((symbol-function 'tramp-rpc--connect)
+               (lambda (v)
+                 (push (tramp-file-name-host v) connected)
+                 (when (equal v vec)
+                   ;; What a timer firing during connection setup does.
+                   (setq nested-error
+                         (condition-case err
+                             (progn (tramp-rpc--ensure-connection vec) nil)
+                           (remote-file-error err)))
+                   (tramp-rpc--ensure-connection other))
+                 'connected)))
+      (should (eq (tramp-rpc--ensure-connection vec) 'connected))
+      (should (equal connected '("other-test-host" "reentrant-test-host")))
+      (should (equal (cadr nested-error) "Forbidden reentrant call of Tramp"))
+      ;; Once the outer attempt has finished, the host is connectable again.
+      (setq connected nil)
+      (should (eq (tramp-rpc--ensure-connection vec) 'connected))
+      (should (member "reentrant-test-host" connected)))))
+
 (ert-deftest tramp-rpc-mock-test-handler-catches-non-essential ()
   "Test that `tramp-rpc-file-name-handler' falls back for non-essential ops.
 When `non-essential' is t and no connection exists, file-exists-p on
