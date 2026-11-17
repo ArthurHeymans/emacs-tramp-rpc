@@ -742,16 +742,21 @@ pub async fn set_modes(params: Value) -> HandlerResult {
         #[serde(with = "path_or_bytes")]
         path: Vec<u8>,
         mode: u32,
+        /// If true, change a symlink itself instead of following it.  Required
+        /// so a client that forgets it cannot silently modify a link target.
+        nofollow: bool,
     }
 
     let params: Params = from_value(params).map_err(|e| RpcError::invalid_params(e.to_string()))?;
 
     let path = bytes_to_path(&params.path).await?;
     let path_str = path.to_string_lossy().into_owned();
+    let mode = params.mode;
+    let nofollow = params.nofollow;
 
-    let perms = std::fs::Permissions::from_mode(params.mode);
-    fs::set_permissions(&path, perms)
+    tokio::task::spawn_blocking(move || set_file_modes_sync(&path, mode, nofollow))
         .await
+        .map_err(|e| RpcError::internal_error(e.to_string()))?
         .map_err(|e| map_io_error(e, &path_str))?;
 
     Ok(Value::Boolean(true))
@@ -900,6 +905,65 @@ fn chown_id(id: i32, name: &str) -> Result<Option<u32>, RpcError> {
     }
 }
 
+/// Change the permission bits of PATH.
+///
+/// With NOFOLLOW, delegate to libc's `fchmodat(AT_SYMLINK_NOFOLLOW)`: it changes
+/// regular files without following a final symlink, and fails with EOPNOTSUPP
+/// for symlinks on Linux, where they have no mode bits.  This matches local
+/// Emacs.  rustix's raw-syscall `chmodat` rejects NOFOLLOW for every file on
+/// Linux, so it cannot be used here.
+#[cfg(unix)]
+fn set_file_modes_sync(path: &Path, mode: u32, nofollow: bool) -> std::io::Result<()> {
+    use nix::sys::stat::{FchmodatFlags, Mode, fchmodat};
+
+    let flag = if nofollow {
+        FchmodatFlags::NoFollowSymlink
+    } else {
+        FchmodatFlags::FollowSymlink
+    };
+    let mode = mode & 0o7777;
+    let result = fchmodat(
+        nix::fcntl::AT_FDCWD,
+        path,
+        Mode::from_bits_truncate(mode as libc::mode_t),
+        flag,
+    );
+    match result {
+        // glibc before 2.32 rejects NOFOLLOW for every file.
+        #[cfg(target_os = "linux")]
+        Err(nix::errno::Errno::EOPNOTSUPP) if nofollow => chmod_nofollow_via_proc(path, mode),
+        result => result.map_err(std::io::Error::from),
+    }
+}
+
+/// Change PATH's mode without following a final symlink, as newer libcs do.
+///
+/// The descriptor pins the file that was checked, so replacing PATH with a
+/// symlink afterwards cannot redirect the chmod to another file.
+#[cfg(target_os = "linux")]
+fn chmod_nofollow_via_proc(path: &Path, mode: u32) -> std::io::Result<()> {
+    use rustix::fs::{FileType, Mode, OFlags};
+    use std::os::fd::AsRawFd;
+
+    let fd = rustix::fs::open(
+        path,
+        OFlags::PATH | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::empty(),
+    )?;
+    if FileType::from_raw_mode(rustix::fs::fstat(&fd)?.st_mode) == FileType::Symlink {
+        return Err(std::io::Error::from_raw_os_error(libc::EOPNOTSUPP));
+    }
+    let proc_path = format!("/proc/self/fd/{}", fd.as_raw_fd());
+    rustix::fs::chmod(proc_path.as_str(), Mode::from_raw_mode(mode as _)).map_err(|error| {
+        // Without /proc there is no race-free way to apply the mode.
+        if error == rustix::io::Errno::NOENT {
+            std::io::Error::from_raw_os_error(libc::EOPNOTSUPP)
+        } else {
+            error.into()
+        }
+    })
+}
+
 #[cfg(unix)]
 fn set_file_times_sync_path_io(
     path: &Path,
@@ -949,6 +1013,95 @@ mod tests {
             chown_id(-2, "uid").unwrap_err().code,
             RpcError::INVALID_PARAMS
         );
+    }
+
+    async fn set_modes_at(path: &Path, mode: u32, nofollow: bool) -> HandlerResult {
+        set_modes(msgpack_map! {
+            "path" => path_value(path),
+            "mode" => mode,
+            "nofollow" => nofollow,
+        })
+        .await
+    }
+
+    #[tokio::test]
+    async fn set_modes_nofollow_changes_regular_files() {
+        let tmp = tempfile::tempdir().expect("create tempdir");
+        let path = tmp.path().join("file");
+        fs::write(&path, b"").await.unwrap();
+
+        set_modes_at(&path, 0o600, true)
+            .await
+            .expect("nofollow chmod of a regular file");
+
+        assert_eq!(fs::metadata(path).await.unwrap().mode() & 0o7777, 0o600);
+    }
+
+    #[tokio::test]
+    async fn set_modes_nofollow_leaves_symlink_target_alone() {
+        let tmp = tempfile::tempdir().expect("create tempdir");
+        let target = tmp.path().join("target");
+        let link = tmp.path().join("link");
+        fs::write(&target, b"").await.unwrap();
+        fs::set_permissions(&target, std::fs::Permissions::from_mode(0o644))
+            .await
+            .unwrap();
+        fs::symlink(&target, &link).await.unwrap();
+
+        // Linux cannot change a symlink's mode and reports an error; BSD and
+        // macOS change the link itself.  Either way the target must not change.
+        let _ = set_modes_at(&link, 0o600, true).await;
+
+        assert_eq!(fs::metadata(target).await.unwrap().mode() & 0o7777, 0o644);
+    }
+
+    #[tokio::test]
+    async fn set_modes_follows_symlinks_by_request() {
+        let tmp = tempfile::tempdir().expect("create tempdir");
+        let target = tmp.path().join("target");
+        let link = tmp.path().join("link");
+        fs::write(&target, b"").await.unwrap();
+        fs::symlink(&target, &link).await.unwrap();
+
+        set_modes_at(&link, 0o600, false)
+            .await
+            .expect("chmod through symlink");
+
+        assert_eq!(fs::metadata(target).await.unwrap().mode() & 0o7777, 0o600);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn chmod_nofollow_via_proc_changes_files_but_not_link_targets() {
+        let tmp = tempfile::tempdir().expect("create tempdir");
+        let target = tmp.path().join("target");
+        let link = tmp.path().join("link");
+        std::fs::write(&target, b"").unwrap();
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o644)).unwrap();
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+
+        let error = chmod_nofollow_via_proc(&link, 0o600).unwrap_err();
+        assert_eq!(error.raw_os_error(), Some(libc::EOPNOTSUPP));
+        assert_eq!(std::fs::metadata(&target).unwrap().mode() & 0o7777, 0o644);
+
+        chmod_nofollow_via_proc(&target, 0o600).expect("chmod regular file");
+        assert_eq!(std::fs::metadata(&target).unwrap().mode() & 0o7777, 0o600);
+    }
+
+    #[tokio::test]
+    async fn set_modes_requires_nofollow() {
+        let tmp = tempfile::tempdir().expect("create tempdir");
+        let path = tmp.path().join("file");
+        fs::write(&path, b"").await.unwrap();
+
+        let error = set_modes(msgpack_map! {
+            "path" => path_value(&path),
+            "mode" => 0o600u32,
+        })
+        .await
+        .unwrap_err();
+
+        assert_eq!(error.code, RpcError::INVALID_PARAMS);
     }
 
     #[tokio::test]

@@ -733,14 +733,18 @@ errors instead of probing first."
                  (display-warning 'tramp (error-message-string err))
                (signal (car err) (cdr err)))))))
 
-(defun tramp-rpc-handle-set-file-modes (filename mode &optional _flag)
+(defun tramp-rpc-handle-set-file-modes (filename mode &optional flag)
   "Like `set-file-modes' for TRAMP-RPC files.
 FILENAME is the file name being handled.
-MODE is the requested file mode."
+MODE is the requested file mode.
+FLAG equal to `nofollow' prevents following a symbolic link."
   (tramp-rpc--with-set-file-attributes-rpc filename
     (tramp-rpc--call v "file.set_modes"
                      (append (tramp-rpc--encode-path localname)
-                             `((mode . ,mode))))))
+                             `((mode . ,mode)
+                               (nofollow . ,(if (eq flag 'nofollow)
+                                                t
+                                              :msgpack-false)))))))
 
 (defun tramp-rpc-handle-set-file-times (filename &optional timestamp flag)
   "Like `set-file-times' for TRAMP-RPC files.
