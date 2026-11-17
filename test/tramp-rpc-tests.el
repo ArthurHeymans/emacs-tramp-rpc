@@ -674,6 +674,28 @@ The directory is deleted after BODY completes."
     (tramp-rpc-test--with-call-count-error 1 file-missing
       (set-file-modes missing #o644))))
 
+(ert-deftest tramp-rpc-test04-set-file-modes-nofollow ()
+  "`set-file-modes' with `nofollow' never changes a symlink's target."
+  (skip-unless (tramp-rpc-test-enabled))
+
+  (tramp-rpc-test--with-temp-file target ""
+    (let ((link (tramp-rpc-test--make-temp-name))
+          (remote-file-name-inhibit-cache t))
+      (unwind-protect
+          (progn
+            (make-symbolic-link (file-local-name target) link)
+            ;; Regular files are changed as usual.
+            (set-file-modes target #o644 'nofollow)
+            (should (= (file-modes target) #o644))
+            ;; Linux reports an error because symlinks have no mode bits;
+            ;; either way the target must be left alone (issue #369).
+            (ignore-errors (set-file-modes link #o600 'nofollow))
+            (should (= (file-modes target) #o644))
+            ;; Without `nofollow' the link is followed.
+            (set-file-modes link #o600)
+            (should (= (file-modes target) #o600)))
+        (ignore-errors (delete-file link))))))
+
 ;;; ============================================================================
 ;;; Test 05: File Content Operations
 ;;; ============================================================================

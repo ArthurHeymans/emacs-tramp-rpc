@@ -167,8 +167,8 @@ TRAMP-RPC exposes these method categories:
 | file.copy          | src, dest, preserve?    | boolean                            |
 | file.rename        | src, dest, overwrite?   | boolean                            |
 | file.delete        | path, force?            | boolean                            |
-| file.set_modes     | path, mode              | boolean                            |
-| file.set_times     | path, mtime             | boolean                            |
+| file.set_modes     | path, mode, nofollow    | boolean                            |
+| file.set_times     | path, mtime, nofollow?  | boolean                            |
 | file.make_symlink  | target, link_path       | boolean                            |
 | file.make_hardlink | src, dest               | boolean                            |
 | file.chown         | path, uid, gid          | boolean                            |
