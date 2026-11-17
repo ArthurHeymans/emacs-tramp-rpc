@@ -266,6 +266,8 @@ This is called from `tramp-multi-hop-p-hook'."
 (declare-function tramp-rpc-protocol-signal-description "tramp-rpc-protocol"
                   (signal &optional os))
 (declare-function tramp-rpc--process-directory "tramp-rpc-transport" (localname))
+(declare-function tramp-rpc--qsh-bulk-threshold "tramp-rpc-transport" (vec))
+(declare-function tramp-rpc--qsh-bulk-connection "tramp-rpc-transport" (vec primary))
 
 
 ;; Helper modules register internal lifecycle callbacks when loaded.
@@ -348,16 +350,30 @@ Concurrent appends are excluded; concurrent truncation can yield a short
 result.  An invalid snapshot signals when needed to plan further chunks.
 FORCE-UNCOMPRESSED is passed to `tramp-rpc--file-read-params'."
   (let* ((offset (or beg 0))
-         (chunk-size (tramp-rpc--read-chunk-size vec))
-         (requested (if end (min (- end offset) chunk-size) chunk-size)))
-    (when (< requested 0)
+         (length (and end (- end offset))))
+    (when (and length (< length 0))
       (signal 'args-out-of-range (list beg end)))
-    (if (= requested 0)
+    (if (eq length 0)
         ""
-      (let* ((params (tramp-rpc--file-read-params localname force-uncompressed))
+      (let* ((threshold (tramp-rpc--qsh-bulk-threshold vec))
+             (primary (and threshold (tramp-rpc--ensure-connection vec)))
+             (threshold (and primary (tramp-rpc-connection-qsh-master primary)
+                             threshold))
+             (chunk-size (tramp-rpc--read-chunk-size vec))
+             ;; Known large ranges use the bulk stream immediately.  For a
+             ;; whole file, cap the first read so small files need no extra
+             ;; round trip and a large reply never fills the primary stream.
+             (bulk (and threshold length (>= length threshold)
+                        (tramp-rpc--qsh-bulk-connection vec primary)))
+             (requested (cond (length (min length chunk-size))
+                              (threshold (min threshold chunk-size))
+                              (t chunk-size)))
+             (params (tramp-rpc--file-read-params localname force-uncompressed))
              (_ (push `(offset . ,offset) params))
              (_ (push `(length . ,requested) params))
-             (first-result (tramp-rpc--call vec "file.read" params))
+             (first-result (if primary
+                               (tramp-rpc--call vec "file.read" params (or bulk primary))
+                             (tramp-rpc--call vec "file.read" params)))
              (first (tramp-rpc--extract-file-read-content first-result))
              (received (length first)))
         ;; Keep the common one-chunk path to one RPC.  Only discover the total
@@ -375,6 +391,11 @@ FORCE-UNCOMPRESSED is passed to `tramp-rpc--file-read-params'."
                             (max 0 (- file-size offset)))))
                  (next-offset (+ offset received))
                  (remaining (max 0 (- total received)))
+                 (connection (or bulk
+                                 (and threshold (not length) (> remaining 0)
+                                      (>= total threshold)
+                                      (tramp-rpc--qsh-bulk-connection vec primary))
+                                 primary))
                  (pieces (list first))
                  done)
             (while (and (> remaining 0) (not done))
@@ -404,7 +425,9 @@ FORCE-UNCOMPRESSED is passed to `tramp-rpc--file-read-params'."
                        (push content pieces)
                        (when (< (length content) size)
                          (setq done t)))))
-                 (tramp-rpc--call-batch vec (nreverse requests))
+                 (if connection
+                     (tramp-rpc--call-batch-1 vec (nreverse requests) connection)
+                   (tramp-rpc--call-batch vec (nreverse requests)))
                  (nreverse sizes))))
             (apply #'concat (nreverse pieces))))))))
 
