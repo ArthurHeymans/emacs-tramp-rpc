@@ -45,8 +45,9 @@
 (require 'tramp-rpc-deploy)
 
 ;; Emitted inside the autoload form in tramp-rpc.el.
-(defvar tramp-rpc-method)
+(declare-function tramp-rpc-file-name-p "tramp-rpc")
 (declare-function tramp-rpc--sudo-file-name-p "tramp-rpc")
+(declare-function tramp-rpc--qsh-p "tramp-rpc-hops" (vec))
 (declare-function tramp-rpc-deploy-plan "tramp-rpc-deploy" (vec &optional explicit force))
 (declare-function tramp-rpc-protocol-batch-params "tramp-rpc-protocol" (requests))
 
@@ -240,7 +241,7 @@ Home-directory properties named ~USER are route-sensitive as well.")
 (defun tramp-rpc--generic-route-connection-property-p (vec property)
   "Return non-nil when PROPERTY on VEC needs route-aware TRAMP storage."
   (and (tramp-file-name-p vec)
-       (or (string= (tramp-file-name-method vec) tramp-rpc-method)
+       (or (tramp-rpc-file-name-p vec)
            ;; The sudo predicate consults TRAMP method/connection metadata.
            ;; Suppress this advice during that probe to avoid recursive
            ;; property qualification.
@@ -341,7 +342,9 @@ hop."
   (list :method (tramp-rpc--hop-component-string (tramp-file-name-method vec))
         :host (tramp-rpc--hop-component-string (tramp-file-name-host vec))
         :user (tramp-rpc--hop-component-string (tramp-file-name-user vec))
-        :port (or (tramp-rpc--port-to-string (tramp-file-name-port vec)) "22")
+        ;; For qsh only an omitted port can use the port in qsh's config.
+        :port (or (tramp-rpc--port-to-string (tramp-file-name-port vec))
+                  (unless (tramp-rpc--qsh-p vec) "22"))
         :route (mapcar (lambda (hop)
                          (tramp-rpc--connection-key-route-hop (cdr hop)))
                        (tramp-rpc--hop-pairs vec))))
@@ -701,7 +704,9 @@ needs host connectivity."
     (let ((sudo-hop (tramp-rpc--same-host-rpc-hop vec 'return-string))
           proxy-parts)
       (dolist (hop hop-pairs)
-        (let* ((hop-vec (cdr hop)))
+        (let ((hop-vec (cdr hop)))
+          (when (tramp-rpc--qsh-p hop-vec)
+            (tramp-user-error vec "The rpcqsh method cannot be used as a TRAMP hop"))
           ;; Skip only the rpc hop that represents sudo-via-RPC.
           (unless (and sudo-hop (tramp-rpc--same-hop-p (cdr hop) (cdr sudo-hop)))
             (push (concat
@@ -912,59 +917,61 @@ wrappers and dynamic loaders can print the same text for unrelated failures."
        (memq (process-exit-status process) '(126 127))))
 
 
+(defun tramp-rpc--ssh-server-command (vec binary-path sudo-password)
+  "Build the SSH command to run BINARY-PATH on VEC.
+Use SUDO-PASSWORD to decide whether an elevated server reads a password."
+  (let ((host (tramp-file-name-host vec)))
+    (append
+     (list "ssh")
+     tramp-rpc-ssh-args
+     (tramp-rpc--ssh-identity-args
+      (tramp-rpc--ssh-detail-user vec)
+      (tramp-rpc--port-to-string (tramp-rpc--ssh-detail-port vec))
+      (tramp-rpc--hops-to-proxyjump vec))
+     ;; Without a master, BatchMode would prevent password prompts.
+     (when tramp-rpc-use-controlmaster (list "-o" "BatchMode=yes"))
+     (list "-o" "StrictHostKeyChecking=accept-new")
+     (tramp-rpc--ssh-option-args)
+     (when tramp-rpc-use-controlmaster
+       (list "-o" "ControlMaster=auto"
+             "-o" (format "ControlPath=%s"
+                          (tramp-rpc--controlmaster-socket-path vec))
+             "-o" (format "ControlPersist=%s" tramp-rpc-controlmaster-persist)))
+     (if (tramp-rpc--detect-sudo-elevation vec)
+         (append
+          (list host "sudo")
+          ;; Use a nonempty prompt: OpenSSH drops empty command arguments.
+          (if sudo-password '("-k" "-S" "-p" "Password:") '("-n"))
+          ;; Use the target user's home, like TRAMP's sudo method.
+          (list "-u" (tramp-file-name-user vec) "-H" binary-path))
+       (list host binary-path)))))
+
+(defun tramp-rpc--qsh-server-command (vec binary-path)
+  "Build the noninteractive qsh command to run BINARY-PATH on VEC."
+  (append
+   ;; qsh has its own configuration and socket protocol.  Do not pass the
+   ;; OpenSSH options or use a master in this experimental backend.
+   '("qsh" "-T" "-o" "BatchMode=yes" "-o" "StrictHostKeyChecking=yes"
+     "-o" "ControlMaster=no" "-o" "ControlPath=none"
+     "-o" "Compression=no" "-o" "ClearAllForwardings=yes"
+     "-o" "PermitLocalCommand=no" "-o" "ForwardAgent=no")
+   (tramp-rpc--ssh-identity-args
+    (tramp-file-name-user vec)
+    (tramp-rpc--port-to-string (tramp-file-name-port vec)) nil)
+   (list "--" (tramp-file-name-host vec)
+         (concat "exec " (tramp-shell-quote-argument binary-path)))))
+
 (defun tramp-rpc--start-server-process (vec binary-path &optional sudo-password)
   "Start the RPC server on VEC at BINARY-PATH and verify it responds.
 BINARY-PATH is the remote localname of the server binary (may contain ~).
 For sudo-via-RPC paths, the server is started via sudo.  If SUDO-PASSWORD
 is non-nil, feed it to sudo -S before the RPC server starts reading stdin.
 Returns the connection plist.  Signals `remote-file-error' on failure."
-  (let* ((sudo (tramp-rpc--detect-sudo-elevation vec))
-         (host (tramp-file-name-host vec))
-         (user (tramp-rpc--ssh-detail-user vec))
-         (port (tramp-rpc--port-to-string
-                (tramp-rpc--ssh-detail-port vec)))
-         (proxyjump (tramp-rpc--hops-to-proxyjump vec))
-         ;; Build SSH command to run the RPC server
-         (ssh-args (append
-                    (list "ssh")
-                    ;; Raw SSH arguments (e.g., -v, -F config)
-                    tramp-rpc-ssh-args
-                    (tramp-rpc--ssh-identity-args user port proxyjump)
-                    ;; Only use BatchMode=yes when ControlMaster handles auth;
-                    ;; without it, BatchMode=yes prevents password prompts.
-                    (when tramp-rpc-use-controlmaster
-                      (list "-o" "BatchMode=yes"))
-                    (list "-o" "StrictHostKeyChecking=accept-new")
-                    ;; User-specified and default SSH options
-                    (tramp-rpc--ssh-option-args)
-                    ;; ControlMaster options for connection sharing
-                    ;; Use the expanded socket path to match what establish-controlmaster created
-                    (when tramp-rpc-use-controlmaster
-                      (list "-o" "ControlMaster=auto"
-                            "-o" (format "ControlPath=%s"
-                                         (tramp-rpc--controlmaster-socket-path vec))
-                            "-o" (format "ControlPersist=%s"
-                                         tramp-rpc-controlmaster-persist)))
-                    ;; For sudo elevation, wrap the binary in sudo.  This is
-                    ;; the RPC analogue of TRAMP's native sudo method: open an
-                    ;; elevated long-lived backend connection, then run process
-                    ;; operations inside that connection.
-                    (if sudo
-                        (append
-                         (list host "sudo")
-                         ;; Do not use an empty sudo prompt here.  OpenSSH
-                         ;; builds the remote command from argv and drops the
-                         ;; empty argument, making sudo parse "-u" as the
-                         ;; prompt string instead of the user option.
-                         (if sudo-password
-                             '("-k" "-S" "-p" "Password:")
-                           '("-n"))
-                         ;; Match TRAMP's sudo method: run with the target
-                         ;; user's home environment rather than preserving the
-                         ;; SSH user's HOME.
-                         (list "-u" (tramp-file-name-user vec) "-H"
-                               binary-path))
-                      (list host binary-path))))
+  (let* ((host (tramp-file-name-host vec))
+         (qsh (tramp-rpc--qsh-p vec))
+         (command (if qsh
+                      (tramp-rpc--qsh-server-command vec binary-path)
+                    (tramp-rpc--ssh-server-command vec binary-path sudo-password)))
          ;; Use TRAMP's standard naming so tramp-get-connection-process works
          (process-name (tramp-get-connection-name vec))
          (buffer-name (tramp-buffer-name vec))
@@ -998,7 +1005,7 @@ Returns the connection plist.  Signals `remote-file-error' on failure."
           (make-process
            :name process-name
            :buffer buffer
-           :command ssh-args
+           :command command
            :connection-type 'pipe
            :coding 'binary
            :noquery t
@@ -1062,7 +1069,12 @@ Returns the connection plist.  Signals `remote-file-error' on failure."
               (tramp-rpc--server-binary-unavailable-p process))
              (sudo-auth-rejected
               (and sudo-password
-                   (tramp-rpc--sudo-auth-rejected-p stderr-buffer))))
+                   (tramp-rpc--sudo-auth-rejected-p stderr-buffer)))
+             (qsh-stderr
+              (when (and qsh (eq (car start-error) 'remote-file-error))
+                (when-let* ((connection (tramp-rpc--process-connection process)))
+                  (tramp-rpc--drain-connection-stderr connection)
+                  (tramp-rpc--connection-stderr-tail connection)))))
          ;; Missing binaries and other transport failures also reach this
          ;; handler.  Forget the password only when sudo explicitly rejected
          ;; it, so the next attempt prompts for a fresh password.
@@ -1081,6 +1093,11 @@ Returns the connection plist.  Signals `remote-file-error' on failure."
                 (signal 'tramp-rpc-sudo-auth-rejected (cdr start-error)))
                (binary-unavailable
                 (signal 'tramp-rpc-server-unavailable (cdr start-error)))
+               (qsh-stderr
+                (signal 'remote-file-error
+                        (list (format "%s; qsh stderr: %s"
+                                      (error-message-string start-error)
+                                      (string-trim qsh-stderr)))))
                (t
                 (signal (car start-error) (cdr start-error)))))))))
 
@@ -1117,8 +1134,29 @@ probe can then interleave with RPC startup and corrupt the protocol stream."
       (tramp-cleanup-connection
        bootstrap-vec 'keep-debug 'keep-password 'keep-processes))))
 
+(defun tramp-rpc--connect-qsh (vec)
+  "Establish a direct qsh connection to VEC using a preinstalled server."
+  (when (tramp-rpc--hop-pairs vec)
+    (tramp-user-error vec "The rpcqsh method does not support TRAMP hops; use qsh configuration"))
+  (unless (executable-find "qsh")
+    (tramp-error vec 'remote-file-error "Install qsh and add it to `exec-path'"))
+  (let ((binary-path (tramp-rpc-deploy-plan-remote-localname
+                      (tramp-rpc-deploy-plan vec))))
+    (condition-case nil
+        (tramp-rpc--start-server-process vec binary-path)
+      (tramp-rpc-server-unavailable
+       (tramp-error vec 'remote-file-error
+                    "Cannot start %s via qsh; install it separately or set `tramp-rpc-deploy-remote-binary-path'"
+                    binary-path)))))
+
 (defun tramp-rpc--connect (vec)
   "Establish an RPC connection to VEC."
+  (if (tramp-rpc--qsh-p vec)
+      (tramp-rpc--connect-qsh vec)
+    (tramp-rpc--connect-ssh vec)))
+
+(defun tramp-rpc--connect-ssh (vec)
+  "Establish an RPC connection to VEC over OpenSSH."
   ;; Ensure ControlMaster directory exists
   (tramp-rpc--ensure-controlmaster-directory)
   ;; When ControlMaster is enabled, establish it first.
@@ -1226,27 +1264,29 @@ probe can then interleave with RPC startup and corrupt the protocol stream."
 A connection other than EXCEPT-PROCESS is considered to share the socket when
 its process is live and its ControlMaster socket path equals VEC's.  Tearing
 down VEC's ControlMaster in that case would disrupt the still-live connection."
-  (let ((socket-path (tramp-rpc--controlmaster-socket-path vec)))
-    (catch 'shared
-      (maphash
-       (lambda (_key conn)
-         (let ((other-process (tramp-rpc-connection-process conn))
-               (other-vec (tramp-rpc-connection-vec conn)))
-           (when (and other-process
-                      other-vec
-                      (not (eq other-process except-process))
-                      (process-live-p other-process)
-                      (equal socket-path
-                             (tramp-rpc--controlmaster-socket-path other-vec)))
-             (throw 'shared t))))
-       tramp-rpc--connections)
-      nil)))
+  (unless (tramp-rpc--qsh-p vec)
+    (let ((socket-path (tramp-rpc--controlmaster-socket-path vec)))
+      (catch 'shared
+        (maphash
+         (lambda (_key conn)
+           (let ((other-process (tramp-rpc-connection-process conn))
+                 (other-vec (tramp-rpc-connection-vec conn)))
+             (when (and other-process
+                        other-vec
+                        (not (eq other-process except-process))
+                        (process-live-p other-process)
+                        (not (tramp-rpc--qsh-p other-vec))
+                        (equal socket-path
+                               (tramp-rpc--controlmaster-socket-path other-vec)))
+               (throw 'shared t))))
+         tramp-rpc--connections)
+        nil))))
 
 (defun tramp-rpc--cleanup-controlmaster-unlocked (vec)
   "Clean up VEC's owned ControlMaster while holding its lifecycle mutex.
 A socket reused from another Emacs process is not owned here and must not
 receive `ssh -O exit', which would disconnect that other session."
-  (when tramp-rpc-use-controlmaster
+  (when (and tramp-rpc-use-controlmaster (not (tramp-rpc--qsh-p vec)))
     (let* ((host (tramp-file-name-host vec))
            (user (tramp-rpc--ssh-detail-user vec))
            (port (tramp-rpc--port-to-string

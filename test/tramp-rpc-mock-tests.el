@@ -4902,6 +4902,71 @@ registry."
                     :type 'file-missing)
       (should (equal (nreverse calls) '("file.set_times"))))))
 
+(ert-deftest tramp-rpc-mock-test-qsh-preinstalled-server-only ()
+  "A qsh target uses the configured binary without OpenSSH or deployment."
+  (let* ((vec (tramp-dissect-file-name "/rpcqsh:alice@target#4423:/"))
+         (tramp-rpc-deploy-remote-binary-path "/opt/rpc/bin/tramp-rpc-server")
+         (tramp-rpc-deploy-never-deploy nil)
+         (tramp-rpc-use-controlmaster t)
+         (tramp-default-proxies-alist nil)
+         started)
+    (cl-letf (((symbol-function 'executable-find)
+               (lambda (program &optional _remote)
+                 (should (equal program "qsh"))
+                 "/local/bin/qsh"))
+              ((symbol-function 'tramp-rpc--establish-controlmaster)
+               (lambda (&rest _) (ert-fail "OpenSSH master must not start")))
+              ((symbol-function 'tramp-rpc--start-server-process)
+               (lambda (target path &optional password)
+                 (setq started (list target path password))
+                 'connected)))
+      (should (eq (tramp-rpc--connect vec) 'connected))
+      (should (equal started (list vec tramp-rpc-deploy-remote-binary-path nil))))
+    (should-error (tramp-rpc-deploy-install-binary vec) :type 'user-error)
+    (should-error (tramp-rpc-deploy-remove-binary vec) :type 'user-error)))
+
+(ert-deftest tramp-rpc-mock-test-qsh-quotes-server-path ()
+  "A server path containing shell metacharacters is a literal filename."
+  (let* ((directory (make-temp-file "tramp-rpc-qsh-" t))
+         (binary (expand-file-name "rpc server '$USER'" directory))
+         (vec (tramp-dissect-file-name "/rpcqsh:alice@target#4423:/"))
+         (command (car (last (tramp-rpc--qsh-server-command vec binary)))))
+    (unwind-protect
+        (progn
+          (write-region "#!/bin/sh\nprintf 'rpc fixture\\n'\n" nil binary nil 'silent)
+          (set-file-modes binary #o700)
+          (with-temp-buffer
+            (should (zerop (call-process "sh" nil t nil "-c" command)))
+            (should (equal (buffer-string) "rpc fixture\n"))))
+      (delete-directory directory t))))
+
+(ert-deftest tramp-rpc-mock-test-qsh-configured-and-explicit-ports-do-not-share ()
+  "An omitted qsh port may come from configuration, not from the default."
+  (let ((vec (tramp-dissect-file-name "/rpcqsh:alice@target:/"))
+        (explicit (tramp-dissect-file-name "/rpcqsh:alice@target#4422:/")))
+    (should-not (equal (tramp-rpc--connection-key vec)
+                       (tramp-rpc--connection-key explicit)))))
+
+(ert-deftest tramp-rpc-mock-test-qsh-rejects-hidden-tramp-proxy ()
+  "Do not silently bypass a matching TRAMP proxy on a qsh target."
+  (let ((vec (tramp-dissect-file-name "/rpcqsh:alice@target:/"))
+        (tramp-default-proxies-alist '(("\\`target\\'" nil "/ssh:gateway:"))))
+    (cl-letf (((symbol-function 'tramp-rpc--start-server-process)
+               (lambda (&rest _) (ert-fail "Must not connect around the proxy"))))
+      (should-error (tramp-rpc--connect vec) :type 'user-error))))
+
+(ert-deftest tramp-rpc-mock-test-qsh-pty-stays-on-rpc-transport ()
+  "A qsh PTY never starts a direct SSH session."
+  (let ((vec (tramp-dissect-file-name "/rpcqsh:alice@target#4423:/"))
+        (tramp-rpc-use-direct-ssh-pty t))
+    (cl-letf (((symbol-function 'tramp-rpc--make-direct-ssh-pty-process)
+               (lambda (&rest _) (ert-fail "Must not use SSH for qsh PTYs")))
+              ((symbol-function 'tramp-rpc--make-rpc-pty-process)
+               (lambda (target &rest _) (should (eq target vec)) 'rpc-pty)))
+      (should (eq (tramp-rpc--make-pty-process
+                   vec "test" nil '("sh") 'binary t nil nil "/")
+                  'rpc-pty)))))
+
 (ert-deftest tramp-rpc-mock-test-hops-to-proxyjump-nil ()
   "Test that hops-to-proxyjump returns nil for no hops."
   :tags '(:multi-hop)

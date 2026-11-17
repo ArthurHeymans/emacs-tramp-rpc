@@ -43,6 +43,7 @@
 
 ;; Emitted inside the autoload form in tramp-rpc.el.
 (declare-function tramp-rpc-file-name-p "tramp-rpc")
+(declare-function tramp-rpc--qsh-p "tramp-rpc-hops" (vec))
 (declare-function tramp-rpc-protocol-signal-description "tramp-rpc-protocol"
                   (signal &optional os))
 (declare-function tramp-rpc--cached-system-info "tramp-rpc-transport" (vec))
@@ -1160,8 +1161,10 @@ PROCESS-ENV is the effective child environment alist built by
 
 When `tramp-rpc-use-direct-ssh-pty' is non-nil (the default), this uses
 a direct SSH connection for the PTY, providing much lower latency for
-interactive terminal use.  Otherwise, uses the RPC-based PTY implementation."
+interactive terminal use.  The `rpcqsh' and sudo-via-RPC paths always use
+an RPC-based PTY so the terminal stays on the selected transport."
   (if (and tramp-rpc-use-direct-ssh-pty
+           (not (tramp-rpc--qsh-p vec))
            ;; Sudo-via-RPC paths must not use the final sudo vec for direct SSH,
            ;; because that would attempt to SSH as root instead of using the rpc
            ;; hop's identity and elevated RPC server.
