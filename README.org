@@ -166,8 +166,24 @@ command's PATH, or set ~tramp-rpc-deploy-remote-binary-path~ to its absolute
 path. This method never deploys over SSH or falls back to OpenSSH. qsh can
 still select its own TLS/TCP transport if QUIC is unavailable. TRAMP hops,
 including sudo-via-RPC, are not supported. PTYs run over RPC rather than a
-direct SSH login. Each =rpcqsh= connection uses one RPC stream; it does not
-split bulk reads and metadata across QUIC streams. =/rpc:= is unchanged.
+direct SSH login. =/rpc:= is unchanged.
+
+*** Share the qsh connection across two RPC streams
+
+On Unix with a qsh build that supports connection sharing (tested with
+qsh 2.1.0), set a size threshold in bytes and reconnect:
+
+#+begin_src elisp
+(setq tramp-rpc-qsh-bulk-read-threshold (* 1024 1024)) ; 1 MiB
+#+end_src
+
+Metadata and process requests stay on the primary stream. A large byte
+range uses a second RPC stream on the same authenticated qsh connection.
+For whole-file reads, the first chunk on the primary is capped at the
+threshold; the rest of a large file moves to the second stream. Small files
+stay on the primary. The second server starts only when needed and is
+reused until it fails or the primary disconnects. Set the option back to
+~nil~ and reconnect to use one stream again.
 
 ** Multi-hop (~|~) file names
 

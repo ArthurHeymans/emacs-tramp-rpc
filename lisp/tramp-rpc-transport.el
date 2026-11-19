@@ -88,6 +88,26 @@ decoded parameters.  Notifications nobody handles are discarded.")
 (define-error 'tramp-rpc-incompatible-server
   "TRAMP-RPC server protocol is incompatible" 'remote-file-error)
 
+(defcustom tramp-rpc-qsh-bulk-read-threshold nil
+  "Minimum read size in bytes to use a second stream for `rpcqsh'.
+Nil keeps the original single-stream transport.  A positive integer enables
+an owned qsh master and a second, lazily started RPC stream for large reads.
+Reconnect after changing this setting.  This requires qsh connection sharing."
+  :type '(choice (const :tag "Single stream" nil) (integer :tag "Bytes"))
+  :group 'tramp-rpc)
+
+(cl-defstruct (tramp-rpc-qsh-master (:constructor tramp-rpc--make-qsh-master))
+  "An owned qsh master and the private directory containing its socket."
+  process buffer directory binary-path)
+
+(defun tramp-rpc--qsh-bulk-threshold (vec)
+  "Return the configured bulk threshold for VEC, or nil when disabled."
+  (when (and (tramp-rpc--qsh-p vec) tramp-rpc-qsh-bulk-read-threshold)
+    (unless (and (integerp tramp-rpc-qsh-bulk-read-threshold)
+                 (> tramp-rpc-qsh-bulk-read-threshold 0))
+      (user-error "`tramp-rpc-qsh-bulk-read-threshold' must be a positive integer"))
+    tramp-rpc-qsh-bulk-read-threshold))
+
 (defcustom tramp-rpc-call-timeout 30
   "Maximum seconds to wait for a synchronous RPC call to complete.
 The value must be a positive number."
@@ -500,6 +520,7 @@ instead of invoking the callbacks.  EVENT is the process event string."
                               vec process conn)
         ((error quit)
          (tramp-rpc--debug "transport terminate hook failed: %S" hook-error))))
+    (tramp-rpc--close-qsh-streams conn)
     (setf (tramp-rpc-connection-transport-cleaned conn) t
           (tramp-rpc-connection-transport-dead conn) t)
     ;; Wake synchronous callers after remote cleanup.  The injected errors
@@ -541,10 +562,13 @@ disconnect and unexpected transport death.  REMOTE-CLEANUP requests
 termination before local relay deletion when PROCESS is still live.  When
 DEFER-CALLBACKS is non-nil, callback invocation is left to the caller and
 this returns (ERROR-RESPONSE . CALLBACKS)."
-  (when-let* ((conn (tramp-rpc--claim-connection-generation
-                     process vec event reason)))
-    (tramp-rpc--finish-connection-generation-cleanup
-     process vec event conn remote-cleanup defer-callbacks)))
+  (let ((conn (tramp-rpc--process-connection process)))
+    (if (and conn (tramp-rpc-connection-qsh-parent conn))
+        (tramp-rpc--close-qsh-bulk conn)
+      (when-let* ((claimed (tramp-rpc--claim-connection-generation
+                            process vec event reason)))
+        (tramp-rpc--finish-connection-generation-cleanup
+         process vec event claimed remote-cleanup defer-callbacks)))))
 
 (defun tramp-rpc--connection-transport-death (process vec event)
   "Clean up unexpected death of PROCESS generation for VEC.
@@ -946,71 +970,70 @@ Use SUDO-PASSWORD to decide whether an elevated server reads a password."
           (list "-u" (tramp-file-name-user vec) "-H" binary-path))
        (list host binary-path)))))
 
-(defun tramp-rpc--qsh-server-command (vec binary-path)
-  "Build the noninteractive qsh command to run BINARY-PATH on VEC."
+(defun tramp-rpc--qsh-command (vec options)
+  "Build a qsh invocation for VEC with additional OPTIONS."
   (append
-   ;; qsh has its own configuration and socket protocol.  Do not pass the
-   ;; OpenSSH options or use a master in this experimental backend.
    '("qsh" "-T" "-o" "BatchMode=yes" "-o" "StrictHostKeyChecking=yes"
-     "-o" "ControlMaster=no" "-o" "ControlPath=none"
      "-o" "Compression=no" "-o" "ClearAllForwardings=yes"
-     "-o" "PermitLocalCommand=no" "-o" "ForwardAgent=no")
+     "-o" "PermitLocalCommand=no" "-o" "ForwardAgent=no"
+     "-o" "ForwardX11=no" "-o" "Tunnel=no" "-o" "ForkAfterAuthentication=no")
+   options
    (tramp-rpc--ssh-identity-args
     (tramp-file-name-user vec)
     (tramp-rpc--port-to-string (tramp-file-name-port vec)) nil)
-   (list "--" (tramp-file-name-host vec)
-         (concat "exec " (tramp-shell-quote-argument binary-path)))))
+   (list "--" (tramp-file-name-host vec))))
 
-(defun tramp-rpc--start-server-process (vec binary-path &optional sudo-password)
+(defun tramp-rpc--qsh-master-socket (master)
+  "Return the private socket path for MASTER."
+  (file-name-concat (tramp-rpc-qsh-master-directory master) "ctl"))
+
+(defun tramp-rpc--qsh-server-command (vec binary-path &optional master)
+  "Build the qsh command to run BINARY-PATH on VEC, optionally via MASTER."
+  (append
+   (tramp-rpc--qsh-command
+    vec (if master
+            ;; qsh first tries the socket.  Do not let it make a second
+            ;; network connection if the socket or the master is lost.
+            (list "-S" (tramp-rpc--qsh-master-socket master)
+                  "-o" "ControlMaster=no"
+                  "-o" "ProxyCommand=/bin/sh -c 'exit 1'")
+          '("-o" "ControlMaster=no" "-o" "ControlPath=none")))
+   (list (concat "exec " (tramp-shell-quote-argument binary-path)))))
+
+(defun tramp-rpc--make-rpc-transport (name buffer stderr command)
+  "Start COMMAND as a binary RPC pipe with NAME, BUFFER, and STDERR."
+  (with-current-buffer buffer
+    (buffer-disable-undo)
+    (erase-buffer)
+    (set-buffer-multibyte nil)
+    (set-marker (mark-marker) (point-min)))
+  (with-current-buffer stderr
+    (buffer-disable-undo)
+    (erase-buffer))
+  (make-process :name name :buffer buffer :command command
+                :connection-type 'pipe :coding 'binary :noquery t
+                :stderr stderr :filter #'tramp-rpc--connection-filter))
+
+(defun tramp-rpc--start-server-process
+    (vec binary-path &optional sudo-password qsh-master)
   "Start the RPC server on VEC at BINARY-PATH and verify it responds.
 BINARY-PATH is the remote localname of the server binary (may contain ~).
 For sudo-via-RPC paths, the server is started via sudo.  If SUDO-PASSWORD
 is non-nil, feed it to sudo -S before the RPC server starts reading stdin.
-Returns the connection plist.  Signals `remote-file-error' on failure."
-  (let* ((host (tramp-file-name-host vec))
-         (qsh (tramp-rpc--qsh-p vec))
+When QSH-MASTER is non-nil, attach the primary pipe to its connection.
+Returns the connection object.  Signals `remote-file-error' on failure."
+  (let* ((qsh (tramp-rpc--qsh-p vec))
          (command (if qsh
-                      (tramp-rpc--qsh-server-command vec binary-path)
+                      (tramp-rpc--qsh-server-command vec binary-path qsh-master)
                     (tramp-rpc--ssh-server-command vec binary-path sudo-password)))
          ;; Use TRAMP's standard naming so tramp-get-connection-process works
          (process-name (tramp-get-connection-name vec))
          (buffer-name (tramp-buffer-name vec))
          (buffer (get-buffer-create buffer-name))
          (stderr-buffer (get-buffer-create (concat buffer-name " stderr")))
-         process)
-
-    ;; Clear buffers.  The main buffer must be unibyte for binary MessagePack
-    ;; framing.  Keep SSH stderr in a separate buffer: OpenSSH diagnostics (for
-    ;; example ControlMaster mux messages) are not part of the RPC protocol, and
-    ;; if they are mixed into the stdout buffer the length-prefixed reader loses
-    ;; framing and every call waits for the full RPC timeout.
-    (with-current-buffer buffer
-      ;; This internal transport buffer is continuously appended to and
-      ;; drained by the process filter.  Recording those binary changes in an
-      ;; undo list wastes memory and can exceed `undo-outer-limit'.  Disable
-      ;; undo before clearing a reused buffer so that erase is not recorded.
-      (buffer-disable-undo)
-      (erase-buffer)
-      (set-buffer-multibyte nil)
-      (set-marker (mark-marker) (point-min)))
-    (with-current-buffer stderr-buffer
-      (buffer-disable-undo)
-      (erase-buffer))
-
-    ;; Start the process with pipe connection (not PTY).  PTYs have line
-    ;; buffering and ~4KB line length limits that break large MessagePack
-    ;; requests.  Use `make-process' rather than `start-process' so local SSH
-    ;; stderr can be separated from the binary stdout protocol stream.
-    (setq process
-          (make-process
-           :name process-name
-           :buffer buffer
-           :command command
-           :connection-type 'pipe
-           :coding 'binary
-           :noquery t
-           :stderr stderr-buffer
-           :filter #'tramp-rpc--connection-filter))
+         ;; Diagnostics must not be mixed with the framed stdout stream.
+         (process (tramp-rpc--make-rpc-transport
+                   process-name buffer stderr-buffer command)))
 
     (condition-case start-error
         (progn
@@ -1034,12 +1057,8 @@ Returns the connection plist.  Signals `remote-file-error' on failure."
           ;; lookups.  Tear down a failed transport before retrying.
           (let* ((connection (tramp-rpc--process-connection process))
                  (metadata-epoch (tramp-rpc-connection-metadata-epoch connection))
-                 (info (tramp-rpc--call vec "system.info" nil))
-                 (revision (alist-get 'protocol_revision info)))
-            (unless (equal revision tramp-rpc-protocol-revision)
-              (signal 'tramp-rpc-incompatible-server
-                      (list (format "Server on %s reports protocol revision %S; expected %d.  Rebuild and redeploy the matching server"
-                                    host revision tramp-rpc-protocol-revision))))
+                 (info (tramp-rpc--check-server-info
+                        vec (tramp-rpc--call vec "system.info" nil))))
             (tramp-rpc--cache-system-info vec info connection metadata-epoch))
 
           ;; Set connection-local variables in the connection buffer.
@@ -1101,6 +1120,16 @@ Returns the connection plist.  Signals `remote-file-error' on failure."
                (t
                 (signal (car start-error) (cdr start-error)))))))))
 
+(defun tramp-rpc--check-server-info (vec info)
+  "Return INFO if it has the expected RPC protocol revision for VEC."
+  (let ((revision (alist-get 'protocol_revision info)))
+    (unless (equal revision tramp-rpc-protocol-revision)
+      (signal 'tramp-rpc-incompatible-server
+              (list (format "Server on %s reports protocol revision %S; expected %d.  Rebuild and redeploy the matching server"
+                            (tramp-file-name-host vec) revision
+                            tramp-rpc-protocol-revision))))
+    info))
+
 (defun tramp-rpc--cleanup-failed-connection (vec)
   "Clean up a failed connection attempt for VEC.
 Kills the process if still alive and removes the connection entry."
@@ -1134,8 +1163,123 @@ probe can then interleave with RPC startup and corrupt the protocol stream."
       (tramp-cleanup-connection
        bootstrap-vec 'keep-debug 'keep-password 'keep-processes))))
 
+(defun tramp-rpc--close-qsh-master (master)
+  "Stop the foreground qsh MASTER and remove its private socket directory."
+  (let ((process (tramp-rpc-qsh-master-process master))
+        (buffer (tramp-rpc-qsh-master-buffer master)))
+    (when (process-live-p process)
+      (delete-process process))
+    (when (buffer-live-p buffer)
+      (kill-buffer buffer))
+    (condition-case err
+        (delete-directory (tramp-rpc-qsh-master-directory master) t)
+      (file-missing nil)
+      (file-error
+       (tramp-rpc--debug "Cannot remove qsh master directory: %S" err)))))
+
+(defun tramp-rpc--start-qsh-master (vec binary-path)
+  "Start a foreground qsh master for VEC serving BINARY-PATH sessions."
+  (when (eq system-type 'windows-nt)
+    (user-error "qsh stream sharing requires Unix-domain sockets"))
+  (let* ((deadline (+ (float-time) (tramp-rpc--configured-call-timeout)))
+         (directory (make-temp-file "rpcq-" t))
+         (buffer (generate-new-buffer " *tramp-rpc qsh master*"))
+         (master (tramp-rpc--make-qsh-master
+                  :directory directory :buffer buffer :binary-path binary-path))
+         (socket (tramp-rpc--qsh-master-socket master))
+         ready)
+    (unwind-protect
+        (let ((process
+               (make-process
+                :name "tramp-rpc qsh master" :buffer buffer :noquery t
+                :connection-type 'pipe :sentinel #'ignore
+                :command (tramp-rpc--qsh-command
+                          vec (list "-N" "-M" "-S" socket
+                                    "-o" "ControlPersist=no"
+                                    "-o" "PersistSession=no")))))
+          (setf (tramp-rpc-qsh-master-process master) process)
+          (while (and (process-live-p process) (not (file-exists-p socket))
+                      (< (float-time) deadline))
+            (accept-process-output process 0.02 nil t))
+          (unless (and (process-live-p process) (file-exists-p socket))
+            (tramp-error vec 'remote-file-error
+                         "qsh master did not open its control socket: %s"
+                         (with-current-buffer buffer
+                           (string-trim (buffer-substring-no-properties
+                                         (max (point-min) (- (point-max) 1024))
+                                         (point-max))))))
+          (setq ready t)
+          master)
+      (unless ready (tramp-rpc--close-qsh-master master)))))
+
+(defun tramp-rpc--close-qsh-bulk (bulk)
+  "Retire BULK without invalidating the primary generation or its caches."
+  (unless (tramp-rpc-connection-transport-cleaned bulk)
+    (setf (tramp-rpc-connection-transport-cleaned bulk) t
+          (tramp-rpc-connection-transport-dead bulk) t)
+    (let ((parent (tramp-rpc-connection-qsh-parent bulk))
+          (process (tramp-rpc-connection-process bulk)))
+      (when (eq bulk (tramp-rpc-connection-qsh-bulk parent))
+        (setf (tramp-rpc-connection-qsh-bulk parent) nil))
+      (when (process-live-p process)
+        (delete-process process))
+      (dolist (buffer (list (tramp-rpc-connection-buffer bulk)
+                            (tramp-rpc-connection-stderr-buffer bulk)))
+        (when (buffer-live-p buffer) (kill-buffer buffer))))))
+
+(defun tramp-rpc--close-qsh-streams (conn)
+  "Close the auxiliary stream and master owned by primary generation CONN."
+  (when-let* ((bulk (tramp-rpc-connection-qsh-bulk conn)))
+    (tramp-rpc--close-qsh-bulk bulk))
+  (when-let* ((master (tramp-rpc-connection-qsh-master conn)))
+    (setf (tramp-rpc-connection-qsh-master conn) nil)
+    (tramp-rpc--close-qsh-master master)))
+
+(defun tramp-rpc--start-qsh-bulk (primary master)
+  "Open an RPC stream for PRIMARY on MASTER's authenticated connection."
+  (let* ((vec (tramp-rpc-connection-vec primary))
+         (buffer (generate-new-buffer " *tramp-rpc qsh bulk*"))
+         (stderr (generate-new-buffer " *tramp-rpc qsh bulk stderr*"))
+         (bulk (tramp-rpc--make-connection :vec vec :buffer buffer
+                                           :stderr-buffer stderr
+                                           :qsh-parent primary))
+         ready)
+    (unwind-protect
+        (let ((process
+               (tramp-rpc--make-rpc-transport
+                "tramp-rpc qsh bulk" buffer stderr
+                (tramp-rpc--qsh-server-command
+                 vec (tramp-rpc-qsh-master-binary-path master) master))))
+          (setf (tramp-rpc-connection-process bulk) process
+                (tramp-rpc-connection-qsh-bulk primary) bulk)
+          (tramp-rpc--attach-connection bulk)
+          (tramp-rpc--install-connection-sentinel process vec)
+          ;; Check this server too, but never replace the primary's metadata.
+          (tramp-rpc--check-server-info
+           vec (tramp-rpc--call vec "system.info" nil bulk))
+          (setq ready t)
+          bulk)
+      (unless ready (tramp-rpc--close-qsh-bulk bulk)))))
+
+(defun tramp-rpc--qsh-bulk-connection (vec primary)
+  "Return a bulk stream for VEC on PRIMARY, never on a replacement generation."
+  (with-mutex (tramp-rpc--connection-lifecycle-mutex vec)
+    ;; The mutex is recursive: timers must not use a half-started stream.
+    (when-let* (((eq primary (tramp-rpc--get-connection vec)))
+                ((not (tramp-rpc-connection-qsh-bulk-opening primary)))
+                (master (tramp-rpc-connection-qsh-master primary)))
+      (let ((bulk (tramp-rpc-connection-qsh-bulk primary)))
+        (if (and bulk (process-live-p (tramp-rpc-connection-process bulk)))
+            bulk
+          (unless non-essential
+            (when bulk (tramp-rpc--close-qsh-bulk bulk))
+            (setf (tramp-rpc-connection-qsh-bulk-opening primary) t)
+            (unwind-protect
+                (tramp-rpc--start-qsh-bulk primary master)
+              (setf (tramp-rpc-connection-qsh-bulk-opening primary) nil))))))))
+
 (defun tramp-rpc--connect-qsh (vec)
-  "Establish a direct qsh connection to VEC using a preinstalled server."
+  "Establish a qsh connection to VEC using a preinstalled server."
   (when (tramp-rpc--hop-pairs vec)
     (tramp-user-error vec "The rpcqsh method does not support TRAMP hops; use qsh configuration"))
   (unless (executable-find "qsh")
@@ -1143,7 +1287,17 @@ probe can then interleave with RPC startup and corrupt the protocol stream."
   (let ((binary-path (tramp-rpc-deploy-plan-remote-localname
                       (tramp-rpc-deploy-plan vec))))
     (condition-case nil
-        (tramp-rpc--start-server-process vec binary-path)
+        (if (not (tramp-rpc--qsh-bulk-threshold vec))
+            (tramp-rpc--start-server-process vec binary-path)
+          (let ((master (tramp-rpc--start-qsh-master vec binary-path))
+                primary)
+            (unwind-protect
+                (progn
+                  (setq primary (tramp-rpc--start-server-process
+                                 vec binary-path nil master))
+                  (setf (tramp-rpc-connection-qsh-master primary) master)
+                  primary)
+              (unless primary (tramp-rpc--close-qsh-master master)))))
       (tramp-rpc-server-unavailable
        (tramp-error vec 'remote-file-error
                     "Cannot start %s via qsh; install it separately or set `tramp-rpc-deploy-remote-binary-path'"
@@ -1380,7 +1534,10 @@ the underlying SSH ControlMaster may be half-open after a network interruption."
 EVENT describes the interrupted operation.  Cleanup errors are logged so the
 original user quit is always re-signalled."
   (condition-case cleanup-error
-      (tramp-rpc--invalidate-timed-out-connection process vec event)
+      (let ((conn (tramp-rpc--process-connection process)))
+        (if (and conn (tramp-rpc-connection-qsh-parent conn))
+            (tramp-rpc--close-qsh-bulk conn)
+          (tramp-rpc--invalidate-timed-out-connection process vec event)))
     (error
      (tramp-rpc--debug "interrupted transport cleanup failed: %S"
                        cleanup-error))))
@@ -1511,24 +1668,21 @@ Uses length-prefixed binary framing: <4-byte BE length><msgpack payload>."
         (goto-char (point-min))
         (let ((tramp-rpc-protocol--message-target process))
           (while
-              (condition-case protocol-error
-                  (setq response
-                        (tramp-rpc-protocol-try-read-message buffer))
-                (error
-                 ;; A malformed or incorrectly framed response makes stream
-                 ;; reuse unsafe.  Fail the generation immediately instead of
-                 ;; allowing an error in the process filter to strand pending
-                 ;; callers.
-                 (let* ((vec (process-get process :tramp-rpc-vec))
-                        (event (format "RPC protocol error: %s"
-                                       (error-message-string protocol-error))))
-                   (tramp-rpc--debug "%s" event)
-                   (when vec
-                     (tramp-rpc--cleanup-connection-generation
-                      process vec event :protocol-error nil))
-                   (when (process-live-p process)
-                     (delete-process process)))
-                 nil))
+              (and (buffer-live-p buffer)
+                   (condition-case protocol-error
+                       (setq response (tramp-rpc-protocol-try-read-message buffer))
+                     (error
+                      ;; Bad framing makes the stream unsafe to reuse.
+                      (let* ((vec (process-get process :tramp-rpc-vec))
+                             (event (format "RPC protocol error: %s"
+                                            (error-message-string protocol-error))))
+                        (tramp-rpc--debug "%s" event)
+                        (when vec
+                          (tramp-rpc--cleanup-connection-generation
+                           process vec event :protocol-error nil))
+                        (when (process-live-p process)
+                          (delete-process process)))
+                      nil)))
                 ;; Replace buffer contents with remaining data.
                 (delete-region (point-min) (mark-marker))
                 (goto-char (point-min))
@@ -1652,7 +1806,11 @@ of hitting the full timeout again.  PROCESS is CONN's transport process.
 METHOD names the timed-out call for logging.  The probe itself times out
 on CONN, which must not start another probe, but a timeout on another
 generation probes that generation independently."
-  (unless (tramp-rpc-connection-probing conn)
+  (cond
+   ((tramp-rpc-connection-qsh-parent conn)
+    ;; One stalled byte stream needs no probe on the shared transport.
+    (tramp-rpc--close-qsh-bulk conn))
+   ((not (tramp-rpc-connection-probing conn))
     (tramp-rpc--debug "PROBE after timeout on method=%s" method)
     (condition-case _err
         (unwind-protect
@@ -1664,7 +1822,7 @@ generation probes that generation independently."
        (tramp-rpc--debug "PROBE failed; invalidating connection for method=%s" method)
        (tramp-rpc--invalidate-timed-out-connection
         process vec
-        (format "dead connection detected after RPC timeout (method=%s)\n" method))))))
+        (format "dead connection detected after RPC timeout (method=%s)\n" method)))))))
 
 (defun tramp-rpc--find-response-by-id (conn expected-id)
   "Check generation CONN's pending responses for EXPECTED-ID.
@@ -1758,7 +1916,7 @@ LABEL is used only for debug messages.  The returned plist contains
              (when-let* ((response (tramp-rpc--find-response-by-id conn id)))
                (puthash id response responses)
                (setq remaining (delete id remaining))))))
-      (with-current-buffer buffer
+      (when (buffer-live-p buffer)
         (collect)
         (while (and remaining
                     (< (float-time) deadline)
@@ -2083,6 +2241,19 @@ Fetch fresh metadata after a cache reset."
                 (or (tramp-rpc--cached-system-info vec)
                     (signal 'remote-file-error
                             '("RPC connection or metadata changed during system.info")))))))))
+
+(defun tramp-rpc--close-all-qsh-streams ()
+  "Remove qsh processes and private sockets when Emacs exits."
+  (dolist (conn (hash-table-values tramp-rpc--connections))
+    (tramp-rpc--close-qsh-streams conn)))
+
+(add-hook 'kill-emacs-hook #'tramp-rpc--close-all-qsh-streams)
+
+(defun tramp-rpc-transport-unload-function ()
+  "Remove the qsh exit hook and close any remaining qsh streams."
+  (remove-hook 'kill-emacs-hook #'tramp-rpc--close-all-qsh-streams)
+  (tramp-rpc--close-all-qsh-streams)
+  nil)
 
 (provide 'tramp-rpc-transport)
 ;;; tramp-rpc-transport.el ends here
