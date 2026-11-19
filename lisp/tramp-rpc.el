@@ -980,13 +980,18 @@ COUNT limits the number of returned entries."
   (let* ((directory (file-name-as-directory (expand-file-name directory)))
          result)
     (with-parsed-tramp-file-name directory nil
-      (setq result
-            (with-tramp-file-property v localname "directory-files"
-              (mapcar #'tramp-rpc--decode-filename
-                      (tramp-rpc--call v "dir.list"
-                                       (append (tramp-rpc--encode-path localname)
-                                               '((include_attrs . :msgpack-false)
-                                                 (include_hidden . t))))))))
+      ;; Dired uses this regexp to decide whether to ask for recursive
+      ;; deletion.  An out-of-band change can make a cached listing stale.
+      (let ((remote-file-name-inhibit-cache
+             (or (equal match directory-files-no-dot-files-regexp)
+                 remote-file-name-inhibit-cache)))
+        (setq result
+              (with-tramp-file-property v localname "directory-files"
+                (mapcar #'tramp-rpc--decode-filename
+                        (tramp-rpc--call v "dir.list"
+                                         (append (tramp-rpc--encode-path localname)
+                                                 '((include_attrs . :msgpack-false)
+                                                   (include_hidden . t)))))))))
     (when match
       (setq result (cl-remove-if-not
                     (lambda (name) (string-match-p match name))

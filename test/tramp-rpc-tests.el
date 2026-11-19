@@ -53,6 +53,7 @@
 (require 'ert)
 (require 'ert-x)
 (require 'cl-lib)
+(require 'dired)
 (require 'tramp)
 
 ;; Compute project root at load time (with fallback for eval after load)
@@ -1505,6 +1506,30 @@ This exercises copy-then-delete for cross-remote renames."
     (tramp-rpc-test--with-call-count 1
       (delete-directory dir t))
     (should-not (file-exists-p dir))))
+
+(ert-deftest tramp-rpc-test07-dired-delete-directory-after-external-change ()
+  "Dired asks before recursively deleting a formerly empty directory."
+  (skip-unless (tramp-rpc-test-enabled))
+
+  (tramp-rpc-test--with-temp-dir dir
+    (let ((remote-file-name-inhibit-cache nil)
+          (delete-by-moving-to-trash nil)
+          confirmed)
+      ;; Cache the empty listing, then simulate an out-of-band change that
+      ;; TRAMP-RPC has not seen.
+      (should (equal (directory-files dir) '("." "..")))
+      (let ((default-directory (file-name-as-directory dir))
+            (process-file-side-effects nil))
+        (should (eql 0 (process-file "sh" nil nil nil "-c"
+                                     "mkdir subdir && touch subdir/file"))))
+      (let ((default-directory (file-name-directory dir)))
+        (cl-letf (((symbol-function 'read-answer)
+                   (lambda (&rest _)
+                     (setq confirmed t)
+                     "yes")))
+          (dired-delete-file dir 'top)))
+      (should confirmed)
+      (should-not (file-exists-p dir)))))
 
 (ert-deftest tramp-rpc-test07-directory-files ()
   "Test `directory-files' for TRAMP RPC files."
