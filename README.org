@@ -151,6 +151,24 @@ On first connection, the server binary is automatically obtained and deployed:
 
 The binary is cached locally in =~/.emacs.d/tramp-rpc/= and deployed to =~/.cache/emacs/tramp-rpc/= on the remote host.
 
+** Experimental qsh transport
+
+Use =/rpcqsh:user@host:/path= to run RPC over [[https://github.com/VLOD-ZDOV/quic-ssh][qsh]] instead of OpenSSH.
+Install =qsh= locally and run =qshd= on the remote. Confirm the host key and
+verify key-based login with =qsh user@host true= first: Emacs will not prompt
+for a password, one-time code, or unknown host key. If =qshd= uses a
+non-default port, use =/rpcqsh:user@host#4423:/path= (the port is for
+=qshd=, not =sshd=). Configure aliases and identities in qsh's own config
+(=~/.config/qsh/config=); TRAMP's OpenSSH options do not apply.
+
+Install a matching =tramp-rpc-server= separately and put it on the remote
+command's PATH, or set ~tramp-rpc-deploy-remote-binary-path~ to its absolute
+path. This method never deploys over SSH or falls back to OpenSSH. qsh can
+still select its own TLS/TCP transport if QUIC is unavailable. TRAMP hops,
+including sudo-via-RPC, are not supported. PTYs run over RPC rather than a
+direct SSH login. Each =rpcqsh= connection uses one RPC stream; it does not
+split bulk reads and metadata across QUIC streams. =/rpc:= is unchanged.
+
 ** Multi-hop (~|~) file names
 
 TRAMP's ad-hoc multi-hop syntax works with the ~rpc~ method:

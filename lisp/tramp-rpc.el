@@ -64,7 +64,11 @@
 
 ;;;###autoload
 (defconst tramp-rpc-method "rpc"
-  "TRAMP method for RPC-based remote access.")
+  "TRAMP method for RPC-based remote access over SSH.")
+
+;;;###autoload
+(defconst tramp-rpc-qsh-method "rpcqsh"
+  "TRAMP method for RPC-based remote access over qsh.")
 
 (eval-when-compile
   ;; Compile the deferred registration against TRAMP's real declarations
@@ -84,6 +88,9 @@
                `(,tramp-rpc-method
                  ;; Placeholder; replaced with ssh's parameters below.
                  (tramp-login-args (("%h")))))
+  ;; This method is handled here, never as a shell hop.
+  (add-to-list 'tramp-methods `(,tramp-rpc-qsh-method
+                               (tramp-login-args (("%h")))))
 
   ;; Give the rpc method all ssh connection parameters so it can serve
   ;; as a hop in tramp-sh multi-hop chains.  This matters in two ways:
@@ -126,7 +133,9 @@
   (defun tramp-rpc-file-name-p (vec-or-filename)
     "Check if VEC-OR-FILENAME is handled by TRAMP-RPC."
     (when-let* ((vec (tramp-ensure-dissected-file-name vec-or-filename)))
-      (string= (tramp-file-name-method vec) tramp-rpc-method)))
+      (let ((method (tramp-file-name-method vec)))
+        (or (equal method tramp-rpc-method)
+            (equal method tramp-rpc-qsh-method)))))
 
   ;; Detect privilege elevation paths with rpc hops, e.g.
   ;; /rpc:user@host|sudo:root@host:/path.  These are handled by the
@@ -191,7 +200,8 @@
                '(tramp-rpc--sudo-file-name-p . tramp-rpc-file-name-handler))
 
   ;; Configure user and host name completion.
-  (tramp-set-completion-function "rpc" tramp-completion-function-alist-ssh)
+  (dolist (method (list tramp-rpc-method tramp-rpc-qsh-method))
+    (tramp-set-completion-function method tramp-completion-function-alist-ssh))
 
   ;; Allow the "rpc" method in multi-hop filename syntax.
   ;; TRAMP's `tramp-multi-hop-p' only returns t for tramp-sh methods,
@@ -2735,7 +2745,9 @@ pattern in `tramp-file-name-handler'."
   "Check if VEC-OR-FILENAME is handled by TRAMP-RPC.
 VEC-OR-FILENAME can be either a tramp-file-name struct or a filename string."
   (when-let* ((vec (tramp-ensure-dissected-file-name vec-or-filename)))
-    (string= (tramp-file-name-method vec) tramp-rpc-method)))
+    (let ((method (tramp-file-name-method vec)))
+      (or (equal method tramp-rpc-method)
+          (equal method tramp-rpc-qsh-method)))))
 
 ;; Re-register with the full defun now that the file is loaded.
 ;; (Already registered by the autoload code, but this ensures the
@@ -2943,7 +2955,8 @@ Removes advice and cleans up async processes."
   (remove-hook 'tramp-cleanup-all-connections-hook #'tramp-rpc-cleanup-all-connections)
   (remove-hook 'tramp-unload-hook #'tramp-rpc--unload-from-tramp)
   ;; Remove method registrations.
-  (setq tramp-methods (delete (assoc tramp-rpc-method tramp-methods) tramp-methods))
+  (dolist (method (list tramp-rpc-method tramp-rpc-qsh-method))
+    (setq tramp-methods (assoc-delete-all method tramp-methods)))
   (setq tramp-foreign-file-name-handler-alist
 	(delete (assoc 'tramp-rpc--sudo-file-name-p
 			tramp-foreign-file-name-handler-alist)

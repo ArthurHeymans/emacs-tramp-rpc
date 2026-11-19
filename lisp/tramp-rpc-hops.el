@@ -34,7 +34,14 @@
 (declare-function tramp-rpc-file-name-p "tramp-rpc")
 (declare-function tramp-rpc-multi-hop-p "tramp-rpc")
 (defvar tramp-rpc-method)
+(defvar tramp-rpc-qsh-method)
 (defvar tramp-rpc--sudo-file-name-p-in-progress)
+
+(defun tramp-rpc--qsh-p (vec)
+  "Return non-nil if VEC selects qsh as its transport."
+  (and (tramp-file-name-p vec)
+       (boundp 'tramp-rpc-qsh-method)
+       (equal (tramp-file-name-method vec) tramp-rpc-qsh-method)))
 
 (defun tramp-rpc--managed-file-name-p (vec-or-filename)
   "Return non-nil when VEC-OR-FILENAME is managed by TRAMP-RPC."

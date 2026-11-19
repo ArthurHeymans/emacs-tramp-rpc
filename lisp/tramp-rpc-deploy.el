@@ -32,6 +32,8 @@
 (require 'tramp-sh)
 (require 'url)
 
+(declare-function tramp-rpc--qsh-p "tramp-rpc-hops" (vec))
+
 ;; ============================================================================
 ;;; Customization
 ;; ============================================================================
@@ -146,8 +148,8 @@ connection-local variables."
 
 (defcustom tramp-rpc-deploy-remote-binary-path nil
   "Explicit path to the tramp-rpc-server binary on the remote host.
-When `tramp-rpc-deploy-never-deploy' is non-nil and this is set,
-this path is used directly as the command in the SSH invocation.
+Used directly as the remote command when `tramp-rpc-deploy-never-deploy'
+is non-nil or when connecting with the `rpcqsh' method.
 
 Examples:
   \"/usr/bin/tramp-rpc-server\"
@@ -216,15 +218,17 @@ fresh artifact.  Connection-local settings are resolved before policy."
   (let ((tramp-rpc-deploy--plan nil)
         (default-directory (tramp-make-tramp-file-name vec "/")))
     (with-connection-local-variables
-      (let* ((source (and (not tramp-rpc-deploy-never-deploy)
+      (let* ((never-deploy (or tramp-rpc-deploy-never-deploy
+                               (tramp-rpc--qsh-p vec)))
+             (source (and (not never-deploy)
                           (tramp-rpc-deploy--use-source-binary-id-p)))
              (hash (and source (tramp-rpc-deploy--source-tree-hash)))
-             (id (unless tramp-rpc-deploy-never-deploy
+             (id (unless never-deploy
                    (or (and hash (tramp-rpc-deploy--source-binary-id hash))
                        tramp-rpc-deploy-version))))
         (tramp-rpc-deploy--make-plan
          :target (tramp-rpc-deploy--target-key vec)
-         :mode (cond (tramp-rpc-deploy-never-deploy 'never)
+         :mode (cond (never-deploy 'never)
                      ((or explicit tramp-rpc-deploy-auto-deploy) 'auto)
                      (t 'manual))
          :prompt explicit :force (and explicit force)
@@ -233,7 +237,7 @@ fresh artifact.  Connection-local settings are resolved before policy."
          :git-build-policy tramp-rpc-deploy-git-build-policy
          :prefer-build tramp-rpc-deploy-prefer-build
          :remote-localname
-         (if tramp-rpc-deploy-never-deploy
+         (if never-deploy
              (or tramp-rpc-deploy-remote-binary-path tramp-rpc-deploy-binary-name)
            (concat (file-name-as-directory tramp-rpc-deploy-remote-directory)
                    (format "%s-%s" tramp-rpc-deploy-binary-name id))))))))
@@ -338,6 +342,11 @@ Preserves the trailing \"|\" that TRAMP uses in canonical hop format."
       tramp-postfix-hop-format)
      tramp-postfix-hop-format)))
 
+(defun tramp-rpc-deploy--check-bootstrap-method (vec)
+  "Reject VEC if it cannot be used for OpenSSH deployment."
+  (when (tramp-rpc--qsh-p vec)
+    (user-error "Deployment is not supported for rpcqsh; use a separate SSH name or install manually")))
+
 (defun tramp-rpc-deploy--bootstrap-vec (vec)
   "Convert VEC to use the bootstrap method for deployment operations.
 This converts the rpc method to a standard TRAMP method for deployment.
@@ -346,6 +355,7 @@ Methods like \"scp\" and \"rsync\" use out-of-band transfer for `copy-file',
 while \"ssh\" and \"sshx\" use inline encoding (base64 through the shell).
 Any \"rpc:\" hops in the hop chain are normalized to \"ssh:\" so that
 standard TRAMP can traverse them."
+  (tramp-rpc-deploy--check-bootstrap-method vec)
   (let ((method (tramp-file-name-method vec))
         (sudo-hop (and (fboundp 'tramp-rpc--sudo-rpc-hop-vec)
                        (tramp-rpc--sudo-rpc-hop-vec vec))))
@@ -1429,6 +1439,7 @@ ask again in `auto' mode.  Explicit installation overrides
                 (lambda () (goto-char (point-max)))
               (read-file-name "Remote TRAMP-RPC host: " nil nil nil "/rpc:"))))
          current-prefix-arg))
+  (tramp-rpc-deploy--check-bootstrap-method vec)
   (let ((plan (tramp-rpc-deploy-plan vec t force)))
     (when (eq (tramp-rpc-deploy-plan-mode plan) 'never)
       (user-error "Deployment is disabled by `tramp-rpc-deploy-never-deploy'"))

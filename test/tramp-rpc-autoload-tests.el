@@ -262,6 +262,11 @@ This allows testing autoload behavior in a clean state."
   (require 'tramp)
   ;; Test with rpc method - should return t
   (should (tramp-rpc-file-name-p "/rpc:user@host:/path"))
+  (let ((vec (tramp-dissect-file-name "/rpcqsh:user@host#4423:/path")))
+    (should (equal (tramp-file-name-port vec) "4423"))
+    (should (eq (tramp-find-foreign-file-name-handler vec)
+                'tramp-rpc-file-name-handler))
+    (should-not (tramp-multi-hop-p vec)))
   ;; Test with other methods - should return nil
   (should-not (tramp-rpc-file-name-p "/ssh:user@host:/path"))
   (should-not (tramp-rpc-file-name-p "/sudo:root@localhost:/path"))
