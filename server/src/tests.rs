@@ -1191,3 +1191,16 @@ fn test_exit_code_from_status_signals() {
         "SIGINT with core dump should still give 128+2=130"
     );
 }
+
+#[test]
+fn open_file_limit_is_raised_to_the_target() {
+    use rustix::process::{Resource, getrlimit};
+
+    raise_open_file_limit();
+    let limit = getrlimit(Resource::Nofile);
+    let expected = limit.maximum.map_or(OPEN_FILE_LIMIT_TARGET, |maximum| {
+        maximum.min(OPEN_FILE_LIMIT_TARGET)
+    });
+    // An unlimited soft limit is already above the target.
+    assert!(limit.current.is_none_or(|current| current >= expected));
+}
