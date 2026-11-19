@@ -75,6 +75,40 @@ const DEFERRED_REQUEST_LIMIT: usize = 64;
 const DEFERRED_BYTE_LIMIT: usize = 32 * 1024 * 1024;
 const ERROR_RESPONSE_CHANNEL_SIZE: usize = 16;
 const EOF_TASK_JOIN_WAIT: std::time::Duration = std::time::Duration::from_millis(500);
+/// Soft descriptor limit the server asks for at startup.  sshd starts it with
+/// the login session's limit, 256 on macOS, while a `commands.run_parallel`
+/// batch alone holds up to 64 children with two or three pipes each.  4096 is
+/// far above anything the server holds at once, so reaching it means a leak
+/// rather than load, and it is still a small share of the system table.
+/// Children inherit it, so it must also suit git.
+const OPEN_FILE_LIMIT_TARGET: u64 = 4096;
+
+/// Raise the soft open-file limit toward `OPEN_FILE_LIMIT_TARGET`.
+///
+/// sshd starts the server with the login session's limits, which nothing on
+/// the client side can influence.  The hard limit is respected.  Failure is
+/// ignored: stderr shares the SSH transport with the protocol, and a lower
+/// limit still serves small batches.
+fn raise_open_file_limit() {
+    use rustix::process::{Resource, Rlimit, getrlimit, setrlimit};
+
+    let limit = getrlimit(Resource::Nofile);
+    let Some(current) = limit.current else {
+        return;
+    };
+    let target = limit.maximum.map_or(OPEN_FILE_LIMIT_TARGET, |maximum| {
+        maximum.min(OPEN_FILE_LIMIT_TARGET)
+    });
+    if target > current {
+        let _ = setrlimit(
+            Resource::Nofile,
+            Rlimit {
+                current: Some(target),
+                maximum: limit.maximum,
+            },
+        );
+    }
+}
 
 #[cfg(test)]
 struct CleanupBarrier {
@@ -623,6 +657,7 @@ fn main() -> std::process::ExitCode {
 }
 
 async fn run_server() -> std::process::ExitCode {
+    raise_open_file_limit();
     let stdout: WriterHandle = Arc::new(FrameWriter::new(BufWriter::new(tokio::io::stdout())));
     handlers::process::init_notification_writer(Arc::clone(&stdout));
 
