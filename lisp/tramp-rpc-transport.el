@@ -1119,6 +1119,7 @@ probe can then interleave with RPC startup and corrupt the protocol stream."
 
 (defun tramp-rpc--connect (vec)
   "Establish an RPC connection to VEC."
+  (tramp-rpc--check-msgpack-version)
   ;; Ensure ControlMaster directory exists
   (tramp-rpc--ensure-controlmaster-directory)
   ;; When ControlMaster is enabled, establish it first.
