@@ -567,6 +567,9 @@ jobs:
           #   :unstable: not recommended by upstream Tramp
           #   tramp-test46-asynchronous-requests: upstream stress test is
           #     timing-sensitive with tramp-rpc's RPC process relay in CI.
+          # Emacs 31.1.90 cannot infer tar-mode after stripping .gz (fixed
+          # upstream in 5bf385dad6e5). Set the mode explicitly in this test
+          # process so the archive write-region test can still run.
           # Use the checkout's TRAMP, not the installed package's autoloads.
           # Mixing them leaves tramp-autoloads loaded after unload on Emacs 30.
           emacs -Q --batch \
@@ -576,6 +579,7 @@ jobs:
             --eval "(setq package-load-list '((tramp nil) all))" \
             --eval "(package-initialize)" \
             -l test/run-tramp-tests.el \
+            --eval '(when (equal emacs-version "31.1.90") (push (cons (rx ".tar.gz" eos) (function tar-mode)) auto-mode-alist))' \
             --eval "(tramp-rpc-test-run-tests-batch-and-exit '(and (not (tag :unstable)) (not tramp-test46-asynchronous-requests)) t)"
 
       - name: Clone Emacs 31 tests

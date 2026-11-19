@@ -1194,13 +1194,42 @@ fn test_exit_code_from_status_signals() {
 
 #[test]
 fn open_file_limit_is_raised_to_the_target() {
-    use rustix::process::{Resource, getrlimit};
+    use rustix::process::{Resource, getrlimit, setrlimit};
 
-    raise_open_file_limit();
-    let limit = getrlimit(Resource::Nofile);
-    let expected = limit.maximum.map_or(OPEN_FILE_LIMIT_TARGET, |maximum| {
-        maximum.min(OPEN_FILE_LIMIT_TARGET)
-    });
-    // An unlimited soft limit is already above the target.
-    assert!(limit.current.is_none_or(|current| current >= expected));
+    // Keep the process-wide limit changes away from other tests.
+    const CASE: &str = "TRAMP_RPC_TEST_NOFILE_CASE";
+    if let Ok(case) = std::env::var(CASE) {
+        let mut limit = getrlimit(Resource::Nofile);
+        let hard = limit.maximum.unwrap_or(u64::MAX);
+        let expected = match case.as_str() {
+            "capped" => {
+                let cap = hard.min(512);
+                limit.maximum = Some(cap);
+                cap
+            }
+            "target" if hard >= 4096 => 4096,
+            // This runner cannot exercise the full target, but still tests its hard cap.
+            "target" => return,
+            _ => panic!("unknown descriptor limit test case: {case}"),
+        };
+        limit.current = Some(256.min(expected / 2));
+        setrlimit(Resource::Nofile, limit).unwrap();
+
+        raise_open_file_limit();
+        let raised = getrlimit(Resource::Nofile);
+        assert_eq!(raised.current, Some(expected));
+        assert_eq!(raised.maximum, limit.maximum);
+        return;
+    }
+    for case in ["target", "capped"] {
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "tests::open_file_limit_is_raised_to_the_target"])
+            .env(CASE, case)
+            .status()
+            .unwrap();
+        assert!(
+            status.success(),
+            "{case} descriptor limit test failed: {status}"
+        );
+    }
 }
