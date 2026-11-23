@@ -27,6 +27,20 @@
 
 (declare-function tramp-message "tramp-message")
 
+;; Package-Requires cannot express this.  We need `msgpack.el' from July 2026 or
+;; later (no version release for the change yet).  The `msgpack-read' arity
+;; changed to be > 1.  `msgpack.el' reports version 0.1.1 in
+;; its header while MELPA assigns a date, so no single version string is
+;; satisfied by the 2026 revival.  The revival's reader takes keyword arguments
+;; and the old one takes none, which is a stable, archive-independent
+;; difference.
+(defun tramp-rpc--check-msgpack-version ()
+  "Signal a clear error unless the loaded msgpack.el accepts reader options."
+  (unless (eq (cdr (func-arity 'msgpack-read)) 'many)
+    (error "Tramp RPC needs msgpack.el from July 2026 or later.  The loaded \
+`msgpack-read' takes no arguments, so server responses cannot be decoded.  \
+Upgrade the msgpack package")))
+
 (defun tramp-rpc--add-external-operation (&rest args)
   "Call `tramp-add-external-operation' with ARGS when available."
   (when (fboundp 'tramp-add-external-operation)
