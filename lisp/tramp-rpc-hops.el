@@ -18,7 +18,7 @@
 ;; Pure analysis of a TRAMP vector's hop chain: which hops are rpc, which
 ;; hop the SSH connection actually targets, whether the final hop is a
 ;; sudo privilege elevation carried over an rpc hop, and how to spell the
-;; proxy chain for ssh.  It also reads and caches the sudo password.
+;; proxy chain for ssh.
 ;;
 ;; This sits below both the transport and the deployment modules, which
 ;; need the same answers about a vector.
@@ -120,6 +120,17 @@ and native sudo helper routes stored in `tramp-default-proxies-alist'."
         ((stringp value) (substring-no-properties value))
         (t (format "%s" value))))
 
+(defsubst tramp-rpc--port-to-string (port)
+  "Normalize PORT to a string, or return nil.
+PORT may be a number (from defaults), a string (from filename
+parsing via `tramp-dissect-file-name'), or nil (when unset).
+Upstream TRAMP always stores port as a string in the
+`tramp-file-name' struct, but defensive handling of numbers
+avoids breakage if callers supply numeric defaults."
+  (cond ((stringp port) port)
+        ((numberp port) (number-to-string port))
+        (t nil)))
+
 (defun tramp-rpc--same-hop-p (a b)
   "Return non-nil when tramp vecs A and B denote the same hop."
   (and (string= (tramp-rpc--hop-component-string
@@ -143,21 +154,81 @@ and native sudo helper routes stored in `tramp-default-proxies-alist'."
                 (tramp-rpc--hop-component-string
                  (tramp-file-name-port b)))))
 
+(cl-defstruct (tramp-rpc-route
+               (:constructor tramp-rpc--make-route)
+               (:copier nil))
+  "Parsed hop-chain and SSH target details for one TRAMP-RPC vector."
+  vec
+  hop-pairs
+  sudo-hop
+  proxy-hops
+  ssh-vec
+  host
+  ssh-user
+  ssh-port
+  proxy-hop-string
+  proxyjump)
+
+(defun tramp-rpc--format-proxy-hops-string (proxy-hops)
+  "Format PROXY-HOPS pairs into a TRAMP hop string with trailing delimiter."
+  (when proxy-hops
+    (concat (mapconcat #'car proxy-hops tramp-postfix-hop-format)
+            tramp-postfix-hop-format)))
+
+(defun tramp-rpc--format-proxyjump (proxy-hops)
+  "Format PROXY-HOPS pairs into an OpenSSH ProxyJump (-J) string."
+  (when proxy-hops
+    (mapconcat
+     (lambda (hop)
+       (let ((hop-vec (cdr hop)))
+         (concat
+          (when (tramp-file-name-user hop-vec)
+            (concat (tramp-file-name-user hop-vec) "@"))
+          (tramp-file-name-host hop-vec)
+          (when-let* ((port (tramp-rpc--port-to-string
+                             (tramp-file-name-port hop-vec))))
+            (concat ":" port)))))
+     proxy-hops
+     ",")))
+
+(defun tramp-rpc--analyze-route (vec)
+  "Analyze VEC's hop chain and return a `tramp-rpc-route' struct."
+  (let* ((hop-pairs (tramp-rpc--hop-pairs vec))
+         (target-host (tramp-file-name-host vec))
+         (last-hop (car (last hop-pairs)))
+         (sudo-hop
+          (when (and target-host
+                     last-hop
+                     (tramp-rpc--privilege-elevation-vec-p vec))
+            (let ((hop-vec (cdr last-hop)))
+              ;; Only the final hop before the privilege-elevation method
+              ;; carries the SSH connection details for that sudo target.
+              ;; Earlier same-host rpc hops are still real proxy hops and
+              ;; must not be stripped.
+              (when (and (string= (tramp-file-name-method hop-vec) "rpc")
+                         (string= (tramp-file-name-host hop-vec) target-host))
+                last-hop))))
+         (proxy-hops (if sudo-hop (butlast hop-pairs) hop-pairs))
+         (ssh-vec (if sudo-hop (cdr sudo-hop) vec)))
+    (tramp-rpc--make-route
+     :vec vec
+     :hop-pairs hop-pairs
+     :sudo-hop sudo-hop
+     :proxy-hops proxy-hops
+     :ssh-vec ssh-vec
+     :host target-host
+     :ssh-user (tramp-file-name-user ssh-vec)
+     :ssh-port (tramp-rpc--port-to-string (tramp-file-name-port ssh-vec))
+     :proxy-hop-string (tramp-rpc--format-proxy-hops-string proxy-hops)
+     :proxyjump (tramp-rpc--format-proxyjump proxy-hops))))
+
 (defun tramp-rpc--same-host-rpc-hop (vec &optional return-string)
   "Return VEC's matching same-host rpc hop for privilege elevation.
 When RETURN-STRING is non-nil, return (HOP-STRING . HOP-VEC).  Return
 nil for non-privilege targets, so same-host rpc|rpc chains are not
 misclassified as sudo-via-RPC."
-  (when-let* ((target-host (tramp-file-name-host vec)))
-    (when (tramp-rpc--privilege-elevation-vec-p vec)
-      (when-let* ((hop (car (last (tramp-rpc--hop-pairs vec))))
-                  (hop-vec (cdr hop)))
-        ;; Only the final hop before the privilege-elevation method carries the
-        ;; SSH connection details for that sudo target.  Earlier same-host rpc
-        ;; hops are still real proxy hops and must not be stripped.
-        (when (and (string= (tramp-file-name-method hop-vec) "rpc")
-                   (string= (tramp-file-name-host hop-vec) target-host))
-          (if return-string hop hop-vec))))))
+  (when-let* ((hop (tramp-rpc-route-sudo-hop (tramp-rpc--analyze-route vec))))
+    (if return-string hop (cdr hop))))
 
 (defun tramp-rpc--sudo-rpc-hop-vec (vec)
   "Return VEC's same-host rpc hop vec for sudo-via-RPC, or nil."
@@ -177,120 +248,62 @@ return nil."
   "Return the vec carrying SSH connection details for VEC.
 For sudo-via-RPC this is the matching same-host rpc hop.  Otherwise it
 is VEC itself."
-  (or (tramp-rpc--sudo-rpc-hop-vec vec) vec))
+  (tramp-rpc-route-ssh-vec (tramp-rpc--analyze-route vec)))
 
 (defun tramp-rpc--ssh-detail-user (vec &optional default)
   "Return the SSH user for VEC, using sudo-via-RPC hop details.
 DEFAULT is the fallback value."
-  (or (tramp-file-name-user (tramp-rpc--ssh-detail-vec vec)) default))
+  (or (tramp-rpc-route-ssh-user (tramp-rpc--analyze-route vec)) default))
 
 (defun tramp-rpc--ssh-detail-port (vec)
   "Return the SSH port for VEC, using sudo-via-RPC hop details."
   (tramp-file-name-port (tramp-rpc--ssh-detail-vec vec)))
 
-(defsubst tramp-rpc--port-to-string (port)
-  "Normalize PORT to a string, or return nil.
-PORT may be a number (from defaults), a string (from filename
-parsing via `tramp-dissect-file-name'), or nil (when unset).
-Upstream TRAMP always stores port as a string in the
-`tramp-file-name' struct, but defensive handling of numbers
-avoids breakage if callers supply numeric defaults."
-  (cond ((stringp port) port)
-        ((numberp port) (number-to-string port))
-        (t nil)))
-
 (defun tramp-rpc--sudo-auth-vec (vec)
   "Return the unprivileged rpc vector used to validate sudo for VEC."
-  (when-let* ((sudo-hop (tramp-rpc--sudo-rpc-hop-vec vec)))
-    (make-tramp-file-name
-     :method tramp-rpc-method
-     :user (tramp-file-name-user sudo-hop)
-     :domain (tramp-file-name-domain sudo-hop)
-     :host (tramp-file-name-host sudo-hop)
-     :port (tramp-file-name-port sudo-hop)
-     :localname (tramp-file-name-localname vec)
-     :hop (tramp-rpc--proxy-hop-string vec))))
-
-(defun tramp-rpc--password-string (password)
-  "Return PASSWORD as a string, unwrapping auth-source cache entries.
-Some Emacs/auth-source combinations can hand `password-read' callers a
-cached auth-source plist whose `:secret' is a function.  Normalize that
-shape before passing the value to `sudo -S'."
-  (while (and (listp password) (plist-member password :secret))
-    (setq password (plist-get password :secret)))
-  (while (functionp password)
-    (setq password (funcall password))
-    (while (and (listp password) (plist-member password :secret))
-      (setq password (plist-get password :secret))))
-  (unless (stringp password)
-    (error "Sudo password is not a string: %S" password))
-  password)
-
-(defun tramp-rpc--sudo-read-password (vec ssh-user)
-  "Read sudo password for SSH-USER on VEC using TRAMP auth machinery."
-  (let* ((host (tramp-file-name-host vec))
-         (port (tramp-rpc--port-to-string (tramp-rpc--ssh-detail-port vec)))
-         (buffer (get-buffer-create " *tramp-rpc-sudo-password*"))
-         (process (make-pipe-process
-                   :name "tramp-rpc-sudo-password"
-                   :buffer buffer
-                   :noquery t)))
-    (unwind-protect
-        (progn
-          (with-current-buffer buffer
-            (erase-buffer)
-            (insert "Password:"))
-          (process-put process 'tramp-vector vec)
-          (tramp-set-connection-property process "hop-vector" vec)
-          (tramp-set-connection-property
-           process "pw-vector"
-           (make-tramp-file-name
-            :method "sudo" :user ssh-user :host host :port port))
-          (tramp-rpc--password-string
-           (tramp-read-passwd
-            process
-            (format "Password for /sudo:%s%s: "
-                    (if ssh-user (concat ssh-user "@") "") host))))
-      (when (process-live-p process)
-        (delete-process process)))))
-
-(define-error 'tramp-rpc-sudo-auth-rejected
-  "Sudo authentication was rejected" 'remote-file-error)
-
-(defun tramp-rpc--sudo-auth-rejected-p (stderr-buffer)
-  "Return non-nil when STDERR-BUFFER confirms sudo authentication rejection."
-  (when (buffer-live-p stderr-buffer)
-    (with-current-buffer stderr-buffer
-      (let ((case-fold-search t))
-        (string-match-p
-         (rx (or "sorry, try again"
-                 (seq (+ digit) " incorrect password attempt")
-                 "authentication failure"))
-         (buffer-substring-no-properties (point-min) (point-max)))))))
-
-(defun tramp-rpc--clear-sudo-password (vec)
-  "Clear the cached sudo password for VEC.
-Called when sudo explicitly rejects a password so the next attempt prompts
-for a fresh password instead of silently reusing the rejected one."
-  (tramp-clear-passwd vec))
+  (let ((route (tramp-rpc--analyze-route vec)))
+    (when-let* ((sudo-hop (cdr (tramp-rpc-route-sudo-hop route))))
+      (make-tramp-file-name
+       :method tramp-rpc-method
+       :user (tramp-file-name-user sudo-hop)
+       :domain (tramp-file-name-domain sudo-hop)
+       :host (tramp-file-name-host sudo-hop)
+       :port (tramp-file-name-port sudo-hop)
+       :localname (tramp-file-name-localname vec)
+       :hop (tramp-rpc-route-proxy-hop-string route)))))
 
 (defun tramp-rpc--proxy-hop-string (vec)
   "Return VEC's hop string with its sudo rpc hop removed.
 For /rpc:gw|rpc:user@host|sudo:root@host:/path, returns \"rpc:gw|\".
 For non-sudo paths, returns the original hop string.  Returns nil if no
 proxy hops remain."
-  (when-let* ((hop-pairs (tramp-rpc--hop-pairs vec)))
-    (let ((sudo-hop (tramp-rpc--same-host-rpc-hop vec 'return-string))
-          (proxy-hops nil))
-      (dolist (hop hop-pairs)
-        ;; Drop only the rpc hop that represents privilege elevation.
-        ;; Same-host rpc|rpc chains are real hops and must be preserved.
-        (unless (and sudo-hop (tramp-rpc--same-hop-p (cdr hop) (cdr sudo-hop)))
-          (push (car hop) proxy-hops)))
-      (when proxy-hops
-        (concat (mapconcat #'identity (nreverse proxy-hops)
-                           tramp-postfix-hop-format)
-                tramp-postfix-hop-format)))))
+  (tramp-rpc-route-proxy-hop-string (tramp-rpc--analyze-route vec)))
+
+(defun tramp-rpc--hops-to-proxyjump (vec)
+  "Convert VEC's hop chain to an SSH ProxyJump (-J) string.
+Parses the TRAMP hop field (for example, `rpc:user@gateway|') and converts
+each hop to the SSH ProxyJump format (for example, `user@gateway').
+Returns nil if there are no hops.
+
+For sudo-via-RPC paths, the same-host rpc hop carrying the SSH details is
+not a ProxyJump; earlier same-host rpc hops are preserved.  Supports mixed
+methods: both `rpc:' and `ssh:' hops are accepted since ProxyJump only
+needs host connectivity."
+  (tramp-rpc-route-proxyjump (tramp-rpc--analyze-route vec)))
+
+(defun tramp-rpc--copy-proxies-alist ()
+  "Return a shallow copy of `tramp-default-proxies-alist' when it is a list.
+Preserves sentinel values such as `tramp-cache-undefined'."
+  (if (listp tramp-default-proxies-alist)
+      (copy-sequence tramp-default-proxies-alist)
+    tramp-default-proxies-alist))
+
+(defun tramp-rpc--expand-preserving-hops (filename &optional default-dir)
+  "Expand FILENAME relative to DEFAULT-DIR while preserving explicit proxy hops.
+Avoids mutating `tramp-default-proxies-alist'."
+  (let ((tramp-show-ad-hoc-proxies t)
+        (tramp-default-proxies-alist (tramp-rpc--copy-proxies-alist)))
+    (expand-file-name filename default-dir)))
 
 (provide 'tramp-rpc-hops)
 ;;; tramp-rpc-hops.el ends here

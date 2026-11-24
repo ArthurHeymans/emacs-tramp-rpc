@@ -42,8 +42,8 @@
          (expand-file-name "tramp-rpc-tests"
                            (file-name-directory (macroexp-file-name))))
 
-(defvar tramp-rpc--async-processes)
-(defvar tramp-rpc--pty-processes)
+(defvar tramp-rpc--managed-processes)
+(defvar tramp-rpc--pid-index)
 (defvar tramp-rpc--process-write-queues)
 (defvar tramp-rpc--early-process-notifications)
 (defvar tramp-rpc--process-starts)
@@ -511,22 +511,24 @@ delivers the remaining older pieces first and order is preserved."
   (let ((state
          (delq nil
                (list
-                (and (> (hash-table-count tramp-rpc--async-processes) 0)
-                     (format "async-processes %S"
-                             (tramp-rpc-chaos--tracked tramp-rpc--async-processes)))
-                (and (> (hash-table-count tramp-rpc--pty-processes) 0)
-                     (format "pty-processes %S"
-                             (tramp-rpc-chaos--tracked tramp-rpc--pty-processes)))
+                (and (> (hash-table-count tramp-rpc--managed-processes) 0)
+                     (format "managed-processes %S"
+                             (tramp-rpc-chaos--tracked tramp-rpc--managed-processes)))
+                (and (> (hash-table-count tramp-rpc--pid-index) 0)
+                     (format "pid-index %d"
+                             (hash-table-count tramp-rpc--pid-index)))
                 (and (> (hash-table-count tramp-rpc--process-write-queues) 0)
                      (format "write-queues %S"
                              (let (queues)
                                (maphash
                                 (lambda (_key queue)
-                                  (push (list :pid (plist-get queue :pid)
-                                              :owner (plist-get queue :owner-process)
-                                              :pending (length (plist-get queue :pending))
-                                              :writing (plist-get queue :writing)
-                                              :failure (plist-get queue :failure))
+                                  (push (list :pid (tramp-rpc-write-queue-pid queue)
+                                              :owner (tramp-rpc-write-queue-owner-process queue)
+                                              :pending (length
+                                                        (tramp-rpc--fifo-items
+                                                         (tramp-rpc-write-queue-pending queue)))
+                                              :writing (tramp-rpc-write-queue-writing queue)
+                                              :failure (tramp-rpc-write-queue-failure queue))
                                         queues))
                                 tramp-rpc--process-write-queues)
                                queues)))
@@ -579,8 +581,8 @@ Commands run in DIRECTORY."
                (lambda () (null (tramp-rpc-chaos--client-state))) 5)
         (push (format "client state left: %s" (tramp-rpc-chaos--client-state)) problems)
         ;; Report each leak once instead of in every following seed.
-        (clrhash tramp-rpc--async-processes)
-        (clrhash tramp-rpc--pty-processes)
+        (clrhash tramp-rpc--managed-processes)
+        (clrhash tramp-rpc--pid-index)
         (clrhash tramp-rpc--process-write-queues)
         (setq tramp-rpc--early-process-notifications nil))
       (let (leftovers)

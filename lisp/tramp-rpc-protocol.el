@@ -331,13 +331,6 @@ response plist.  Returns nil if no complete message yet."
                             `((method . ,(car req)) (params . ,(cdr req))))
                           requests)))))
 
-(defun tramp-rpc-protocol-encode-batch-request-with-id (requests)
-  "Encode a batch request containing multiple REQUESTS.
-REQUESTS is a list of (METHOD . PARAMS) cons cells.
-Returns a cons cell (ID . BYTES) for ID tracking."
-  (tramp-rpc-protocol-encode-request-with-id
-   "batch" (tramp-rpc-protocol-batch-params requests)))
-
 (defun tramp-rpc-protocol-decode-batch-response (response)
   "Decode a batch response into a list of individual results.
 RESPONSE is the decoded response plist from
@@ -412,19 +405,6 @@ the server, since the remote side does not understand it."
 (defun tramp-rpc--path-to-bin (path)
   "Return PATH as an explicit MessagePack bin value."
   (msgpack-bin-make (tramp-rpc--path-to-bytes path)))
-
-(defun tramp-rpc--path-to-compatible-value (path)
-  "Return PATH as text when UTF-8-compatible, otherwise MessagePack binary.
-Using text for ordinary paths preserves compatibility with older servers whose
-path parameters predate binary-path support."
-  (let* ((bytes (tramp-rpc--path-to-bytes path))
-         (decoded (decode-coding-string bytes 'utf-8-unix)))
-    (if (and (cl-every (lambda (char)
-                         (not (eq (char-charset char) 'eight-bit)))
-                       decoded)
-             (equal bytes (encode-coding-string decoded 'utf-8-unix)))
-        decoded
-      (msgpack-bin-make bytes))))
 
 (defun tramp-rpc--encode-path (path)
   "Encode PATH for transmission to path-or-bytes server parameters.

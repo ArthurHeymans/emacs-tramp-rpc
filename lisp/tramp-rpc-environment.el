@@ -40,6 +40,8 @@
 Use TRAMP's `tramp-own-remote-path' in `tramp-remote-path' instead.
 This symbol is still accepted for backward compatibility and is treated
 like `tramp-own-remote-path'.")
+(make-obsolete-variable 'tramp-rpc-own-remote-path
+                        'tramp-own-remote-path "0.2.0")
 
 (defcustom tramp-rpc-remote-path nil
   "Deprecated tramp-rpc-specific remote executable search path.
@@ -61,6 +63,7 @@ treated like `tramp-own-remote-path'."
                           (const :tag "Deprecated tramp-rpc private directories"
                                  tramp-rpc-own-remote-path))))
   :group 'tramp-rpc)
+(make-obsolete-variable 'tramp-rpc-remote-path 'tramp-remote-path "0.2.0")
 
 ;; ============================================================================
 ;; Direnv environment caching for process execution
@@ -152,27 +155,42 @@ See `tramp-rpc-direnv-essential-vars' for the list of variables."
       (let* ((connection (or connection (tramp-rpc--ensure-connection vec)))
              (environment (or environment
                               (tramp-rpc--environment-state connection)))
+             (cwd (tramp-rpc--direnv-cache-key vec directory))
              (result (tramp-rpc--call vec "process.run"
                                        `((cmd . "/bin/sh")
+                                         ;; A login profile may change
+                                         ;; directory before the command
+                                         ;; runs, so `cwd' alone is not
+                                         ;; enough: change into it again.
                                          (args . ["-l" "-c"
-                                                  ,(concat "cd " (tramp-shell-quote-argument directory)
-                                                           " && direnv export json 2>/dev/null")])
-                                         (cwd . "/"))
+                                                  ,(concat
+                                                    (when cwd
+                                                      (concat
+                                                       "cd "
+                                                       (tramp-shell-quote-argument cwd)
+                                                       " && "))
+                                                    "direnv export json 2>/dev/null")])
+                                         (cwd . ,(when cwd
+                                                   (tramp-rpc--path-to-bin cwd))))
                                        connection))
              (exit-code (alist-get 'exit_code result))
              (stdout (tramp-rpc--decode-output
                       (alist-get 'stdout result))))
         (if (and (eq exit-code 0)
                  (> (length stdout) 0))
-            ;; Parse JSON output into alist, filter to essential vars
+            ;; Parse JSON output with C json-parse-string into a string-keyed
+            ;; hash table (avoids interning arbitrary remote env var names).
             (condition-case err
-                (let* ((json-object-type 'alist)
-                       (json-key-type 'string)
-                       (full-env (json-read-from-string stdout)))
-                  ;; Filter to only essential variables
-                  (cl-loop for var in tramp-rpc-direnv-essential-vars
-                           for pair = (assoc var full-env)
-                           when pair collect pair))
+                (let ((full-env (json-parse-string stdout
+                                                   :object-type 'hash-table
+                                                   :null-object nil
+                                                   :false-object :false)))
+                  (when (hash-table-p full-env)
+                    ;; Filter to only essential variables with string values.
+                    (cl-loop for var in tramp-rpc-direnv-essential-vars
+                             for val = (gethash var full-env)
+                             when (stringp val)
+                             collect (cons var val))))
               (error
                (tramp-rpc--debug "direnv JSON parse failed: %S" err)
                nil))
@@ -237,15 +255,21 @@ Returns the (possibly augmented) alist."
 Duplicate variable names are removed before the alist is sent over RPC.
 This avoids relying on duplicate MessagePack map key ordering on the Rust
 server side."
-  (let (merged)
+  (let ((seen (make-hash-table :test 'equal))
+        merged)
     (dolist (env environments)
       (dolist (pair env)
         (when (and (consp pair)
                    (stringp (car pair))
                    (stringp (cdr pair)))
-          (setq merged
-                (tramp-rpc--environment-with merged (car pair) (cdr pair))))))
-    merged))
+          (let ((key (car pair))
+                (val (cdr pair)))
+            (if-let* ((cell (gethash key seen)))
+                (setcdr cell val)
+              (let ((cell (cons key val)))
+                (puthash key cell seen)
+                (push cell merged)))))))
+    (nreverse merged)))
 
 (defun tramp-rpc--cached-remote-path (vec)
   "Return cached remote PATH directories for VEC, computing them if needed.
@@ -255,7 +279,7 @@ Return incomplete results without caching them."
          (cached (tramp-rpc-environment-exec-path environment)))
     (if cached
         (car cached)
-      (let ((computed (tramp-rpc--compute-remote-path vec)))
+      (let ((computed (tramp-rpc--compute-remote-path vec environment)))
         (when (cdr computed)
           (setf (tramp-rpc-environment-exec-path environment) computed))
         (car computed)))))
@@ -287,12 +311,18 @@ A failed fetch is not cached."
 Configured `tramp-remote-path' entries keep precedence.  Append missing
 entries from the remote login shell PATH so shell commands behave like
 `tramp-sh', whose persistent login shell retains its own PATH."
-  (let ((path (copy-sequence (tramp-rpc--cached-remote-path vec))))
+  (let ((seen (make-hash-table :test 'equal))
+        path)
+    (dolist (entry (tramp-rpc--cached-remote-path vec))
+      (unless (gethash entry seen)
+        (puthash entry t seen)
+        (push entry path)))
     (dolist (entry (tramp-rpc--cached-login-path vec))
-      (unless (member entry path)
-        (setq path (append path (list entry)))))
+      (unless (gethash entry seen)
+        (puthash entry t seen)
+        (push entry path)))
     (when path
-      `(("PATH" . ,(mapconcat #'identity path ":"))))))
+      `(("PATH" . ,(mapconcat #'identity (nreverse path) ":"))))))
 
 (defvar tramp-remote-process-environment)
 
@@ -303,9 +333,9 @@ variable in Emacs process APIs, while tramp-rpc sends an explicit environment
 map to the remote server."
   (let (alist)
     (dolist (elt environment)
-      (when (and (stringp elt)
-                 (string-match "\\`\\([^=]+\\)=\\(.*\\)\\'" elt))
-        (push (cons (match-string 1 elt) (match-string 2 elt)) alist)))
+      (when-let* ((pos (and (stringp elt) (string-search "=" elt)))
+                  ((> pos 0)))
+        (push (cons (substring elt 0 pos) (substring elt (1+ pos))) alist)))
     (nreverse alist)))
 
 (defun tramp-rpc--tramp-remote-process-environment ()
@@ -345,10 +375,11 @@ by `with-environment-variables') are returned as an alist of
   (let ((toplevel (default-toplevel-value 'process-environment))
         (env nil))
     (dolist (elt process-environment)
-      (when (and (stringp elt)
-                 (not (member elt toplevel))
-                 (string-match "\\`\\([^=]+\\)=\\(.*\\)\\'" elt))
-        (push (cons (match-string 1 elt) (match-string 2 elt)) env)))
+      (when-let* ((pos (and (stringp elt)
+                            (not (member elt toplevel))
+                            (string-search "=" elt)))
+                  ((> pos 0)))
+        (push (cons (substring elt 0 pos) (substring elt (1+ pos))) env)))
     (nreverse env)))
 
 (defun tramp-rpc--process-environment (vec localname &optional login-path)
@@ -375,20 +406,28 @@ later and more specific values replace earlier ones."
 (defun tramp-rpc--effective-remote-path-spec (vec)
   "Return the remote PATH specification used by tramp-rpc on VEC.
 Connection-local values are honored, matching `tramp-get-remote-path'."
-  (condition-case nil
-      (with-current-buffer (tramp-get-connection-buffer vec)
-        (tramp-set-connection-local-variables vec)
-        (copy-tree (or tramp-rpc-remote-path tramp-remote-path)))
-    (error
-     (copy-tree (or tramp-rpc-remote-path tramp-remote-path)))))
+  (with-suppressed-warnings ((obsolete tramp-rpc-remote-path))
+    (condition-case nil
+        (let ((default-directory (tramp-make-tramp-file-name vec "/")))
+          (with-connection-local-variables
+           (copy-tree (or tramp-rpc-remote-path tramp-remote-path))))
+      (error
+       (copy-tree (or tramp-rpc-remote-path tramp-remote-path))))))
 
 (defun tramp-rpc--append-path-entries (entries result)
   "Append string ENTRIES to RESULT, preserving order and removing duplicates."
-  (dolist (dir entries result)
-    (when (and (stringp dir)
-               (not (string-empty-p dir))
-               (not (member dir result)))
-      (setq result (append result (list dir))))))
+  (let ((seen (make-hash-table :test 'equal))
+        acc)
+    (dolist (dir result)
+      (puthash dir t seen)
+      (push dir acc))
+    (dolist (dir entries)
+      (when (and (stringp dir)
+                 (not (string-empty-p dir))
+                 (not (gethash dir seen)))
+        (puthash dir t seen)
+        (push dir acc)))
+    (nreverse acc)))
 
 (defun tramp-rpc--expand-remote-path-entry (vec entry)
   "Expand one remote PATH ENTRY for VEC when necessary."
@@ -403,19 +442,28 @@ Connection-local values are honored, matching `tramp-get-remote-path'."
 
 (defun tramp-rpc--fetch-default-remote-path (vec)
   "Fetch the POSIX default PATH for VEC, falling back to /bin:/usr/bin.
-Signals when VEC cannot be reached."
-  (let* ((result (tramp-rpc--call vec "process.run"
-                                  `((cmd . "/bin/sh")
-                                    (args . ["-c" "getconf PATH 2>/dev/null"])
-                                    (cwd . "/"))))
-         (exit-code (alist-get 'exit_code result))
-         (stdout (tramp-rpc--decode-output
-                  (alist-get 'stdout result))))
-    (if (and (eq exit-code 0) (> (length stdout) 0))
-        (split-string (string-trim stdout) ":" t)
-      '("/bin" "/usr/bin"))))
+Prefers `default_path' from `system.info' (zero extra RTTs), falling back
+to `getconf PATH' when unavailable.  Signals when VEC cannot be reached."
+  (let* ((info (condition-case nil
+                   (tramp-rpc--system-info vec)
+                 (error nil)))
+         (default-path (and (listp info)
+                            (tramp-rpc--decode-string
+                             (alist-get 'default_path info)))))
+    (if (and (stringp default-path) (not (string-empty-p default-path)))
+        (split-string default-path ":" t)
+      (let* ((result (tramp-rpc--call vec "process.run"
+                                      `((cmd . "/bin/sh")
+                                        (args . ["-c" "getconf PATH 2>/dev/null"])
+                                        (cwd . "/"))))
+             (exit-code (alist-get 'exit_code result))
+             (stdout (tramp-rpc--decode-output
+                      (alist-get 'stdout result))))
+        (if (and (eq exit-code 0) (> (length stdout) 0))
+            (split-string (string-trim stdout) ":" t)
+          '("/bin" "/usr/bin"))))))
 
-(defun tramp-rpc--compute-remote-path (vec)
+(defun tramp-rpc--compute-remote-path (vec &optional environment)
   "Compute remote variable `exec-path' for VEC from `tramp-remote-path'.
 A non-nil deprecated `tramp-rpc-remote-path' overrides
 `tramp-remote-path'.  Supports the standard TRAMP placeholders
@@ -423,37 +471,59 @@ A non-nil deprecated `tramp-rpc-remote-path' overrides
 `tramp-rpc-own-remote-path' placeholder is treated like
 `tramp-own-remote-path'.  Duplicate, unsupported, and nonexistent
 entries are removed.
+When ENVIRONMENT is provided and `tramp-own-remote-path' fetches the login
+shell PATH, also populate ENVIRONMENT's `login-path' slot so subsequent
+shell commands do not probe it a second time.
 Return (DIRECTORIES . COMPLETE), with COMPLETE non-nil if every fetch
 succeeds."
   (let ((own-path nil)
+        (own-path-fetched nil)
         (default-path nil)
         (complete t)
-        (result nil))
-    (dolist (entry (tramp-rpc--effective-remote-path-spec vec))
-      (setq entry (tramp-rpc--expand-remote-path-entry vec entry))
-      (cond
-       ((eq entry 'tramp-default-remote-path)
-        (unless default-path
-          (setq default-path
+        (seen (make-hash-table :test 'equal))
+        (acc nil))
+    (cl-flet ((add-entries (entries)
+                (dolist (dir entries)
+                  (when (and (stringp dir)
+                             (not (string-empty-p dir))
+                             (not (gethash dir seen)))
+                    (puthash dir t seen)
+                    (push dir acc)))))
+      (dolist (entry (tramp-rpc--effective-remote-path-spec vec))
+        (setq entry (tramp-rpc--expand-remote-path-entry vec entry))
+        (cond
+         ((eq entry 'tramp-default-remote-path)
+          (unless default-path
+            (setq default-path
+                  (condition-case nil
+                      (tramp-rpc--fetch-default-remote-path vec)
+                    (error (setq complete nil) '("/bin" "/usr/bin")))))
+          (add-entries default-path))
+         ((memq entry '(tramp-own-remote-path tramp-rpc-own-remote-path))
+          (unless own-path-fetched
+            (setq own-path-fetched t)
+            (let ((cached (and environment
+                               (tramp-rpc-environment-login-path environment))))
+              (if cached
+                  (setq own-path (cdr cached))
                 (condition-case nil
-                    (tramp-rpc--fetch-default-remote-path vec)
-                  (error (setq complete nil) '("/bin" "/usr/bin")))))
-        (setq result (tramp-rpc--append-path-entries default-path result)))
-       ((memq entry '(tramp-own-remote-path tramp-rpc-own-remote-path))
-        (unless own-path
-          (setq own-path
-                (condition-case nil
-                    (or (tramp-rpc--fetch-remote-exec-path vec) '())
-                  (error (setq complete nil) '()))))
-        (setq result (tramp-rpc--append-path-entries own-path result)))
-       ((stringp entry)
-        (setq result (tramp-rpc--append-path-entries (list entry) result)))
-       (t
-        (tramp-rpc--debug "Ignoring unsupported remote PATH entry: %S" entry))))
+                    (progn
+                      (setq own-path (or (tramp-rpc--fetch-remote-exec-path vec) '()))
+                      (when environment
+                        (setf (tramp-rpc-environment-login-path environment)
+                              (cons t own-path))))
+                  (error
+                   (setq complete nil
+                         own-path '()))))))
+          (add-entries own-path))
+         ((stringp entry)
+          (add-entries (list entry)))
+         (t
+          (tramp-rpc--debug "Ignoring unsupported remote PATH entry: %S" entry)))))
     ;; Remove non-existing directories (matches tramp-sh behavior), checking
     ;; all candidates in one round trip.  If that fails, keep every
     ;; candidate and report the result as incomplete.
-    (let* ((candidates (seq-filter #'stringp result))
+    (let* ((candidates (nreverse acc))
            (directories
             (when candidates
               (condition-case nil

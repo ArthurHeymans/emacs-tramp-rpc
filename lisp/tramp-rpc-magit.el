@@ -33,13 +33,10 @@
 (require 'tramp-cache)
 (require 'tramp-rpc-protocol)
 (require 'tramp-rpc-connection)
+(require 'tramp-rpc-hops)
 (require 'tramp-rpc-transport)
 (require 'tramp-rpc-environment)
 (require 'tramp-rpc-cache)
-
-;; Functions from tramp-rpc.el
-(declare-function tramp-rpc-file-name-p "tramp-rpc")
-(declare-function tramp-rpc--managed-file-name-p "tramp-rpc-hops" (vec-or-filename))
 
 ;; Functions from magit-section.el.
 (autoload 'magit-section-show "magit-section")
@@ -140,17 +137,35 @@ one another's ancestor-discovery state.")
   (when (boundp 'tramp-rpc-magit--prefetch-directories)
     (clrhash tramp-rpc-magit--prefetch-directories)))
 
-(defun tramp-rpc-magit--clear-ancestor-caches-for-connection (vec)
-  "Clear ancestor caches belonging to the connection identified by VEC."
-  (let ((connection-key (tramp-rpc--connection-key-string vec)))
+(defun tramp-rpc-magit--clear-ancestor-caches-for-connection (vec &optional all-routes)
+  "Clear ancestor caches belonging to the connection identified by VEC.
+When ALL-ROUTES is non-nil, clear cached ancestor scans and prefetch
+directories for every proxy route reaching VEC's endpoint."
+  (let ((connection-key (unless all-routes
+                          (tramp-rpc--connection-key-string vec)))
+        (endpoint-prefix (and all-routes
+                              (tramp-rpc--connection-key-endpoint-prefix vec)))
+        (endpoint (and all-routes (tramp-rpc--vec-endpoint-identity vec))))
     (tramp-rpc--hash-remove-if
      (lambda (key _entry)
-       (and (consp key) (equal (car key) connection-key)))
+       (and (consp key)
+            (stringp (car key))
+            (if all-routes
+                (string-prefix-p endpoint-prefix (car key))
+              (equal (car key) connection-key))))
      tramp-rpc-magit--ancestor-scan-caches)
     (tramp-rpc--hash-remove-if
      (lambda (directory _timestamp)
-       (equal (tramp-rpc-magit--file-connection-key directory)
-              connection-key))
+       (if all-routes
+           (and (stringp directory)
+                (tramp-tramp-file-p directory)
+                (let ((tramp-default-proxies-alist tramp-cache-undefined))
+                  (ignore-errors
+                    (equal (tramp-rpc--vec-endpoint-identity
+                            (tramp-dissect-file-name directory))
+                           endpoint))))
+         (equal (tramp-rpc-magit--file-connection-key directory)
+                connection-key)))
      tramp-rpc-magit--prefetch-directories)))
 
 (defun tramp-rpc-magit--bound-table
@@ -231,8 +246,8 @@ Returns a cons cell (connection-key . directory) for hash table lookups."
   (cons (tramp-rpc--connection-key-string vec)
         (expand-file-name directory)))
 
-(defun tramp-rpc-magit--valid-process-cache (key)
-  "Return the non-expired process cache for KEY, or nil."
+(defun tramp-rpc-magit--valid-process-cache (key &optional vec)
+  "Return the non-expired process cache for KEY on VEC, or nil."
   (let* ((entry (gethash key tramp-rpc-magit--process-caches))
          ;; Older sessions may still contain the pre-TTL representation.
          (cache (if (hash-table-p entry)
@@ -243,7 +258,7 @@ Returns a cons cell (connection-key . directory) for hash table lookups."
     (cond
      ((not cache) nil)
      ((and time
-           (not (tramp-rpc-magit--process-cache-timestamp-valid-p time)))
+           (not (tramp-rpc-magit--process-cache-timestamp-valid-p time vec)))
       (remhash key tramp-rpc-magit--process-caches)
       nil)
      (t cache))))
@@ -254,16 +269,16 @@ Returns the cache hash table, or nil if none."
   (when (file-remote-p default-directory)
     (with-parsed-tramp-file-name default-directory nil
       (tramp-rpc-magit--valid-process-cache
-       (tramp-rpc-magit--get-cache-key v default-directory)))))
+       (tramp-rpc-magit--get-cache-key v default-directory) v))))
 
-(defun tramp-rpc-magit--process-cache-timestamp-valid-p (timestamp)
-  "Return non-nil when process cache TIMESTAMP is within its own TTL.
-When push notifications are unavailable, cap to
+(defun tramp-rpc-magit--process-cache-timestamp-valid-p (timestamp &optional vec)
+  "Return non-nil when process cache TIMESTAMP is within its own TTL for VEC.
+When push notifications are unavailable on VEC, cap to
 `tramp-rpc-watcher-unavailable-ttl' so unwatched changes surface promptly."
   (or (null tramp-rpc-magit-process-cache-ttl)
       (let ((ttl tramp-rpc-magit-process-cache-ttl))
-        (when (and (boundp 'tramp-rpc--watcher-degraded)
-                   tramp-rpc--watcher-degraded
+        (when (and vec
+                   (not (tramp-rpc--watcher-available-p vec))
                    (boundp 'tramp-rpc-watcher-unavailable-ttl))
           (setq ttl (min ttl tramp-rpc-watcher-unavailable-ttl)))
         (<= (- (float-time) timestamp) ttl))))
@@ -277,7 +292,8 @@ When push notifications are unavailable, cap to
      tramp-rpc-magit--process-caches tramp-rpc-magit--process-cache-max-size
      (lambda (entry)
        (and (listp entry) (plist-get entry :time)))
-     #'tramp-rpc-magit--process-cache-timestamp-valid-p)))
+     (lambda (ts)
+       (tramp-rpc-magit--process-cache-timestamp-valid-p ts vec)))))
 
 
 (defun tramp-rpc-magit--process-cache-key (&rest args)
@@ -450,7 +466,8 @@ The batch RPC supplies the same effective environment as `process-file'."
   `((key . ,(apply #'tramp-rpc-magit--process-cache-key args))
     (cmd . "git")
     (args . ,(vconcat (append tramp-rpc-magit--git-prefetch-prefix-args args)))
-    (cwd . ,directory)))
+    (cwd . ,(when directory
+              (tramp-rpc--path-to-bin directory)))))
 
 (defun tramp-rpc-magit--store-command-results (vec directory results &optional replace)
   "Merge commands.run_parallel RESULTS into DIRECTORY's process cache.
@@ -461,25 +478,27 @@ VEC is the TRAMP connection vector."
     (let* ((key (tramp-rpc-magit--get-cache-key vec directory))
            (cache (if replace
                       (make-hash-table :test 'equal)
-                    (or (tramp-rpc-magit--valid-process-cache key)
-                        (make-hash-table :test 'equal))))
-           (remote-prefix (file-remote-p directory)))
+                    (or (tramp-rpc-magit--valid-process-cache key vec)
+                        (make-hash-table :test 'equal)))))
       (dolist (entry results)
         (let* ((cmd-key (if (symbolp (car entry))
                             (symbol-name (car entry))
                           (car entry)))
                (data (cdr entry))
                (exit-code (alist-get 'exit_code data)))
-          ;; Older bounded-admission servers reported transient load this way.
-          ;; Keep accepting those responses, but never cache them as git results
-          ;; for the whole TTL.
-          (unless (eq (alist-get 'not_admitted data) t)
+          ;; Never cache timed-out, rejected, or failed-to-run commands as
+          ;; real git results for the whole TTL.
+          (when (and (integerp exit-code)
+                     (>= exit-code 0)
+                     (not (eq (alist-get 'timed_out data) t))
+                     (not (eq (alist-get 'not_admitted data) t)))
             (if (string-prefix-p "state_file:" cmd-key)
                 (let* ((remote-path (substring cmd-key (length "state_file:")))
-                       (tramp-path (concat remote-prefix remote-path)))
-                  (tramp-rpc--cache-put tramp-rpc--file-exists-cache
-                                        tramp-path
-                                        (= exit-code 0)))
+                       (tramp-path (tramp-rpc-magit--remote-path vec remote-path)))
+                  (tramp-rpc--cache-put
+                   tramp-rpc--file-exists-cache
+                   (tramp-rpc--file-cache-key vec tramp-path)
+                   (= exit-code 0)))
               (let* ((stdout-raw (alist-get 'stdout data))
                      (stdout (tramp-rpc--decode-output stdout-raw)))
                 (puthash cmd-key (cons exit-code stdout) cache))))))
@@ -556,8 +575,10 @@ whitespace."
     (delete-dups (nreverse files))))
 
 (defun tramp-rpc-magit--remote-path (vec localname)
-  "Return the TRAMP filename for LOCALNAME on VEC."
-  (tramp-make-tramp-file-name vec localname))
+  "Return the TRAMP filename for LOCALNAME on VEC, preserving explicit hops."
+  (let ((tramp-default-proxies-alist tramp-cache-undefined)
+        (tramp-show-ad-hoc-proxies t))
+    (tramp-make-tramp-file-name vec localname)))
 
 (defun tramp-rpc-magit--cache-file-stat (vec localname stat)
   "Populate TRAMP/file-exists caches for LOCALNAME from STAT.
@@ -577,19 +598,25 @@ VEC is the TRAMP connection vector."
         ;; whether following the symlink succeeds, so don't populate
         ;; `file-exists-p' or follow-stat from it.
         (unless symlink-p
-          (tramp-rpc--cache-put tramp-rpc--file-exists-cache filename (if stat t nil)))
+          (tramp-rpc--cache-put
+           tramp-rpc--file-exists-cache
+           (tramp-rpc--file-cache-key vec filename)
+           (if stat t nil)))
         (tramp-rpc--cache-file-stat-result vec ln stat t)
         (when stat
           (tramp-set-file-property
-           vec ln "file-attributes-nil"
+           vec ln (tramp-rpc--file-property-key vec ln "file-attributes-nil")
            (tramp-rpc--convert-file-attributes stat nil))
           (tramp-set-file-property
-           vec ln "file-attributes-integer"
+           vec ln (tramp-rpc--file-property-key vec ln "file-attributes-integer")
            (tramp-rpc--convert-file-attributes stat 'integer))
           (pcase (alist-get 'type stat)
-            ("directory" (tramp-set-file-property vec ln "file-directory-p" t))
+            ("directory"
+             (tramp-set-file-property
+              vec ln (tramp-rpc--file-property-key vec ln "file-directory-p") t))
             ((or "file" (pred null))
-             (tramp-set-file-property vec ln "file-directory-p" nil))))))))
+             (tramp-set-file-property
+              vec ln (tramp-rpc--file-property-key vec ln "file-directory-p") nil))))))))
 
 (defun tramp-rpc-magit--ref-short-names (cache)
   "Return short ref names from cached `for-each-ref' output in CACHE."
@@ -634,32 +661,41 @@ VEC is the TRAMP connection vector."
                               result)))
            (filename (tramp-rpc-magit--remote-path vec localname))
            (truename (tramp-rpc-magit--remote-path vec truename-local)))
-      (tramp-rpc--cache-put tramp-rpc--file-truename-cache filename truename))))
+      (tramp-rpc--cache-put
+       tramp-rpc--file-truename-cache
+       (tramp-rpc--file-cache-key vec filename)
+       truename))))
 
 (defun tramp-rpc-magit--prefetch-file-metadata (vec files)
   "Batch file.stat/file.truename for local FILES on VEC and cache them."
-  (let (items requests)
+  (let ((seen (make-hash-table :test 'equal))
+        items requests)
     (dolist (file files)
       (let ((local-file (directory-file-name file))
             (local-dir (directory-file-name (file-name-directory file))))
         (dolist (path (list local-file local-dir))
-          (when (and path (not (member (list 'stat path) items)))
-            (push (list 'stat path) items)
-            (push (cons "file.stat"
-                        (append (tramp-rpc--encode-path path) '((lstat . t))))
-                  requests)))
-        (unless (member (list 'truename local-file) items)
-          (push (list 'truename local-file) items)
-          (push (cons "file.truename" (tramp-rpc--encode-path local-file))
-                requests))))
+          (when path
+            (let ((stat-item (cons 'stat path)))
+              (unless (gethash stat-item seen)
+                (puthash stat-item t seen)
+                (push stat-item items)
+                (push (cons "file.stat"
+                            (append (tramp-rpc--encode-path path) '((lstat . t))))
+                      requests)))))
+        (let ((tn-item (cons 'truename local-file)))
+          (unless (gethash tn-item seen)
+            (puthash tn-item t seen)
+            (push tn-item items)
+            (push (cons "file.truename" (tramp-rpc--encode-path local-file))
+                  requests)))))
     (when requests
       (cl-mapc
        (lambda (item result)
          (unless (tramp-rpc--batch-error-p result)
            (pcase (car item)
-             ('stat (tramp-rpc-magit--cache-file-stat vec (cadr item) result))
+             ('stat (tramp-rpc-magit--cache-file-stat vec (cdr item) result))
              ('truename (tramp-rpc-magit--cache-file-truename
-                         vec (cadr item) result)))))
+                         vec (cdr item) result)))))
        (nreverse items)
        (tramp-rpc--call-batch vec (nreverse requests))))))
 
@@ -772,7 +808,7 @@ whose deferred body or `tab-width' painting can still inspect files."
               ((stringp file))
               (directory default-directory)
               ((file-remote-p directory))
-              ((tramp-rpc-file-name-p directory)))
+              ((tramp-rpc--managed-file-name-p directory)))
     (with-parsed-tramp-file-name directory nil
       (let* ((root-local (file-name-as-directory localname))
              (rel-file (if (file-name-absolute-p file)
@@ -934,7 +970,7 @@ Batch common git commands with commands.run_parallel, then fetch data that
 depends on those results and store eligible stdout in the `process-file'
 cache.  Also fetch ancestor markers."
   (when (and (file-remote-p directory)
-             (tramp-rpc-file-name-p directory))
+             (tramp-rpc--managed-file-name-p directory))
     ;; The git commands we run on the server rewrite .git/index, triggering
     ;; events that would clear the cache we're building.
     (let ((tramp-rpc--expected-fs-events
@@ -998,14 +1034,12 @@ cache.  Also fetch ancestor markers."
 VEC is the TRAMP connection vector.  TOPLEVEL is the local path
 of the git worktree root on the remote."
   (when toplevel
-    (let* ((key (format "%s:%s" (tramp-rpc--connection-key-string vec) toplevel))
-           (entry (gethash key tramp-rpc--watched-directories)))
-      (unless (tramp-rpc--watch-entry-recursive-p entry)
+    (let ((tramp-dir (tramp-make-tramp-file-name vec toplevel)))
+      (unless (tramp-rpc-watched-directory-p tramp-dir t)
         ;; Not yet watching this worktree recursively - start watching.
         (condition-case err
             (progn
-              (tramp-rpc-watch-directory
-               (tramp-make-tramp-file-name vec toplevel) t)
+              (tramp-rpc-watch-directory tramp-dir t)
               (tramp-rpc--debug "auto-watching git worktree %s" toplevel))
           (error
            (tramp-rpc--debug "failed to auto-watch %s: %s"
@@ -1026,10 +1060,10 @@ the closest ancestor containing that marker, or nil if not found.
 This is much faster than checking each ancestor individually because
 the server scans the entire tree in one operation."
   (when (and (file-remote-p directory)
-             (tramp-rpc-file-name-p directory))
+             (tramp-rpc--managed-file-name-p directory))
     (with-parsed-tramp-file-name directory nil
       (let ((result (tramp-rpc--call v "ancestors.scan"
-                                     `((directory . ,(tramp-rpc--path-to-compatible-value
+                                     `((directory . ,(tramp-rpc--path-to-bin
                                                       localname))
                                        (markers . ,(vconcat markers))
                                        (max_depth . ,(or max-depth 10))))))
@@ -1051,9 +1085,11 @@ the server scans the entire tree in one operation."
 (defun tramp-rpc-magit--ancestor-scan-for-directory (directory)
   "Return cached ancestor marker scan for DIRECTORY, fetching it if needed."
   (let* ((directory (file-name-as-directory (expand-file-name directory)))
+         (vec (and (file-remote-p directory)
+                   (tramp-dissect-file-name directory)))
          (key (tramp-rpc-magit--ancestor-scan-cache-key directory))
          (entry (gethash key tramp-rpc-magit--ancestor-scan-caches)))
-    (if (and entry (tramp-rpc--cache-entry-valid-p (car entry)))
+    (if (and entry (tramp-rpc--cache-entry-valid-p (car entry) vec))
         (cdr entry)
       (when entry
         (remhash key tramp-rpc-magit--ancestor-scan-caches))
@@ -1103,12 +1139,14 @@ the server scans the entire tree in one operation."
   "Check if FILENAME exists using cached ancestor data.
 Returns t, nil, or \\='not-cached if not in cache."
   (let* ((expanded (expand-file-name filename))
+         (vec (and (file-remote-p expanded)
+                   (tramp-dissect-file-name expanded)))
          (basename (file-name-nondirectory expanded))
          (file-dir (file-name-as-directory
                     (directory-file-name
                      (or (file-name-directory (tramp-file-local-name expanded))
                          (tramp-file-local-name expanded)))))
-         (connection-key (tramp-rpc-magit--file-connection-key expanded))
+         (connection-key (and vec (tramp-rpc--connection-key-string vec)))
          (answer 'not-cached))
     (when (member basename tramp-rpc-magit--ancestor-marker-names)
       ;; Reuse any dynamic scan whose root is below this candidate directory;
@@ -1116,7 +1154,7 @@ Returns t, nil, or \\='not-cached if not in cache."
       (maphash
        (lambda (key entry)
          (when (and (eq answer 'not-cached)
-                    (tramp-rpc--cache-entry-valid-p (car entry))
+                    (tramp-rpc--cache-entry-valid-p (car entry) vec)
                     (equal (car key) connection-key)
                     (tramp-rpc-magit--ancestor-cache-covers-p
                      (cdr key) file-dir))
@@ -1136,7 +1174,7 @@ Returns t, nil, or \\='not-cached if not in cache."
           (maphash
            (lambda (prefetch-directory timestamp)
              (when (and (not covering-prefetch)
-                        (tramp-rpc--cache-entry-valid-p timestamp)
+                        (tramp-rpc--cache-entry-valid-p timestamp vec)
                         (equal connection-key
                                (tramp-rpc-magit--file-connection-key
                                 prefetch-directory))
@@ -1237,7 +1275,8 @@ Ancestor scans are computed from marker-file metadata, so they go with it
 for VEC's connection.  A nil VEC means every cache is being cleared, so
 all Magit caches go, including prefetched status."
   (if vec
-      (tramp-rpc-magit--clear-ancestor-caches-for-connection vec)
+      (tramp-rpc-magit--clear-ancestor-caches-for-connection
+       vec tramp-rpc--cache-invalidation-all-routes)
     (tramp-rpc-magit--clear-cache)))
 
 ;; ============================================================================
@@ -1260,7 +1299,7 @@ all Magit caches go, including prefetched status."
   (when (and tramp-rpc-magit-optimize
              (derived-mode-p 'magit-status-mode)
              (file-remote-p default-directory)
-             (tramp-rpc-file-name-p default-directory)
+             (tramp-rpc--managed-file-name-p default-directory)
              (tramp-rpc-magit--section-slot section 'hidden)
              (memq (tramp-rpc-magit--section-slot section 'type)
                    tramp-rpc-magit--lazy-status-section-types)
@@ -1286,7 +1325,7 @@ SECTION is the Magit section being handled."
            (if (and tramp-rpc-magit-disable-remote-diff-tab-width-detection
                     (derived-mode-p 'magit-status-mode)
                     (file-remote-p default-directory)
-                    (tramp-rpc-file-name-p default-directory))
+                    (tramp-rpc--managed-file-name-p default-directory))
                nil
              (and (boundp 'magit-diff-adjust-tab-width)
                   magit-diff-adjust-tab-width))))
@@ -1318,7 +1357,7 @@ The git index rewrites of the refresh do not clear its caches.  ORIG-FUN is
          (magit-diff-adjust-tab-width
           (if (and tramp-rpc-magit-disable-remote-diff-tab-width-detection
                    (file-remote-p directory)
-                   (tramp-rpc-file-name-p directory))
+                   (tramp-rpc--managed-file-name-p directory))
               nil
             (and (boundp 'magit-diff-adjust-tab-width)
                  magit-diff-adjust-tab-width))))
@@ -1351,7 +1390,7 @@ The git index rewrites of the refresh do not clear its caches.  ORIG-FUN is
         (magit-diff-adjust-tab-width
          (if (and tramp-rpc-magit-disable-remote-diff-tab-width-detection
                   (file-remote-p default-directory)
-                  (tramp-rpc-file-name-p default-directory))
+                  (tramp-rpc--managed-file-name-p default-directory))
              nil
            (and (boundp 'magit-diff-adjust-tab-width)
                 magit-diff-adjust-tab-width))))
@@ -1474,12 +1513,16 @@ be available, and uses alien indexing for better performance."
   (setq tramp-rpc-magit--projectile-enabled nil)
   (message "tramp-rpc projectile optimizations disabled"))
 
-(defun tramp-rpc-magit-install-optional-handlers ()
-  "Install handlers for loaded Magit and Projectile packages."
-  (when (and (featurep 'magit) tramp-rpc-magit-optimize
+(defun tramp-rpc-magit-install-optional-handlers (&optional feature)
+  "Install handlers for loaded Magit and Projectile packages.
+When FEATURE is non-nil, only install handlers for that feature
+\(`magit' or `projectile')."
+  (when (and (or (null feature) (eq feature 'magit))
+             (featurep 'magit) tramp-rpc-magit-optimize
              (not tramp-rpc-magit--magit-enabled))
     (tramp-rpc-magit-enable))
-  (when (and (featurep 'projectile)
+  (when (and (or (null feature) (eq feature 'projectile))
+             (featurep 'projectile)
              (not tramp-rpc-magit--projectile-enabled))
     (tramp-rpc-projectile-enable)))
 

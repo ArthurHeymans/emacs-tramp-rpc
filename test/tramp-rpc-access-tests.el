@@ -311,7 +311,6 @@
                     :type 'file-error)))
           (should (string-match-p "Open: Timeout" (error-message-string err))))
         (should (process-live-p process))
-        (should-not (tramp-rpc-connection-pending-ids connection))
         (should (zerop (hash-table-count
                         (tramp-rpc-connection-pending-responses connection))))))))
 

@@ -12,8 +12,8 @@
       (tramp-rpc-mock-test-request--with-connection (transport buffer)
         (let* ((vec (tramp-rpc-mock-test-request--vec))
                (default-directory (tramp-make-tramp-file-name vec "/tmp/"))
-               (tramp-rpc--async-processes (make-hash-table :test 'eq))
-               (tramp-rpc--pty-processes (make-hash-table :test 'eq))
+               (tramp-rpc--managed-processes (make-hash-table :test 'eq))
+               (tramp-rpc--pid-index (make-hash-table :test 'equal))
                (current connection)
                (ensures 0)
                relay)
@@ -43,8 +43,7 @@
                 (should (= ensures 1))
                 (should (eq (tramp-rpc-remote-process-connection
                              (tramp-rpc--remote-process relay)) connection))
-                (let ((info (gethash relay (if pty tramp-rpc--pty-processes
-                                             tramp-rpc--async-processes))))
+                (let ((info (gethash relay tramp-rpc--managed-processes)))
                   (if dead
                       (progn (should-not info) (should-not (process-live-p relay)))
                     (should (eq (tramp-rpc--connection-transport
@@ -116,91 +115,113 @@
           (should-error (tramp-rpc-deploy--build-binary "x86_64-linux") :type 'remote-file-error))
       (delete-directory source t))))
 
-(ert-deftest tramp-rpc-mock-test-file-notify-legacy-server-never-acquires-nofollow ()
-  "A legacy server cannot safely release a symlink watch; use a synthetic one."
+(ert-deftest tramp-rpc-mock-test-file-notify-unsupported-nofollow-falls-back-to-synthetic ()
+  "When the server rejects nofollow_if_symlink for a symlink, fall back to a synthetic lease."
   (let ((tramp-rpc--file-notify-descriptors (make-hash-table :test 'eq))
-        (tramp-rpc--file-notify-watch-counts (make-hash-table :test 'equal))
-        (tramp-rpc--watched-directories (make-hash-table :test 'equal))
+        (tramp-rpc--watch-leases (make-hash-table :test 'equal))
+        removed
         descriptor)
     (unwind-protect
         (cl-letf (((symbol-function 'file-symlink-p) (lambda (_) "/target"))
-                  ((symbol-function 'tramp-rpc--system-info) (lambda (_) '((os . "linux"))))
                   ((symbol-function 'tramp-rpc--call)
-                   (lambda (&rest _) (ert-fail "Unsafe legacy watch RPC"))))
+                   (lambda (_vec method params)
+                     (cond
+                      ((equal method "watch.add")
+                       (should (eq (alist-get 'nofollow_if_symlink params) t))
+                       (signal 'remote-file-error '("nofollow unsupported")))
+                      ((equal method "watch.remove")
+                       (setq removed t))
+                      (t (ert-fail (format "Unexpected RPC %s" method)))))))
           (setq descriptor (tramp-rpc-handle-file-notify-add-watch
                             "/rpc:watch-test:/link" '(change) #'ignore))
-          (should (plist-get (car (hash-table-values tramp-rpc--file-notify-watch-counts))
-                             :synthetic))
-          (tramp-rpc-handle-file-notify-rm-watch descriptor))
+          (let ((lease (car (hash-table-values tramp-rpc--watch-leases))))
+            (should (tramp-rpc-watch-lease-notify-synthetic lease))
+            (should-not (tramp-rpc-watch-lease-notify-owned lease)))
+          (tramp-rpc-handle-file-notify-rm-watch descriptor)
+          (should-not removed)
+          (should (zerop (hash-table-count tramp-rpc--watch-leases))))
       (when descriptor (tramp-rpc--delete-file-notify-descriptor-process descriptor)))))
 
 (ert-deftest tramp-rpc-mock-test-explicit-unwatch-never-restores-synthetic-as-follow ()
   "A synthetic symlink descriptor must not keep a target-following watch alive."
   (let* ((directory "/rpc:watch-test:/link")
          (vec (tramp-dissect-file-name directory))
-         (key (format "%s:/link" (tramp-rpc--connection-key-string vec)))
-         (tramp-rpc--watched-directories (make-hash-table :test 'equal))
-         (tramp-rpc--file-notify-watch-counts (make-hash-table :test 'equal))
+         (key (tramp-rpc--watch-key vec "/link"))
+         (tramp-rpc--watch-leases (make-hash-table :test 'equal))
          calls)
-    (puthash key (list :directory directory :canonical-directory "/rpc:watch-test:/target")
-             tramp-rpc--watched-directories)
-    (puthash key (list :directory directory :canonical-directory "/rpc:watch-test:/target"
-                       :count 1 :synthetic "/target" :owned nil)
-             tramp-rpc--file-notify-watch-counts)
+    (puthash key (tramp-rpc--make-watch-lease
+                  :directory directory
+                  :canonical-directory "/rpc:watch-test:/target"
+                  :notify-canonical-directory "/rpc:watch-test:/target"
+                  :is-symlink t
+                  :explicit-p t
+                  :notify-count 1
+                  :notify-synthetic t
+                  :notify-owned nil)
+             tramp-rpc--watch-leases)
     (cl-letf (((symbol-function 'tramp-rpc--call)
                (lambda (_vec method params) (push (list method params) calls))))
       (tramp-rpc-unwatch-directory directory))
     (should (= (length calls) 1))
     (should (equal (caar calls) "watch.remove"))
     (should (eq (alist-get 'nofollow (cadar calls)) :msgpack-false))
-    (should-not (plist-get (gethash key tramp-rpc--file-notify-watch-counts) :owned))))
+    (let ((lease (gethash key tramp-rpc--watch-leases)))
+      (should lease)
+      (should-not (tramp-rpc-watch-lease-explicit-p lease))
+      (should-not (tramp-rpc-watch-lease-notify-owned lease)))))
 
 (ert-deftest tramp-rpc-mock-test-follow-watch-does-not-take-nofollow-ownership ()
   "A recursive target watch cannot adopt the symlink's independent registration."
   (let* ((directory "/rpc:watch-test:/link")
          (vec (tramp-dissect-file-name directory))
-         (key (format "%s:/link" (tramp-rpc--connection-key-string vec)))
+         (key (tramp-rpc--watch-key vec "/link"))
          (descriptor (make-pipe-process :name "nofollow-owner" :noquery t))
          (tramp-rpc--file-notify-descriptors (make-hash-table :test 'eq))
-         (tramp-rpc--file-notify-watch-counts (make-hash-table :test 'equal))
-         (tramp-rpc--watched-directories (make-hash-table :test 'equal))
-         (entry (list :directory directory :canonical-directory directory
-                      :count 1 :owned t :nofollow t))
+         (tramp-rpc--watch-leases (make-hash-table :test 'equal))
+         (lease (tramp-rpc--make-watch-lease
+                 :directory directory
+                 :notify-canonical-directory directory
+                 :is-symlink t
+                 :notify-count 1
+                 :notify-owned t
+                 :notify-nofollow t))
          calls)
     (unwind-protect
         (progn
-          (puthash key entry tramp-rpc--file-notify-watch-counts)
+          (puthash key lease tramp-rpc--watch-leases)
           (puthash descriptor (list :watch-key key) tramp-rpc--file-notify-descriptors)
           (cl-letf (((symbol-function 'tramp-rpc--call)
                      (lambda (_vec method params)
                        (push (list method params) calls)
                        '((path . "/target")))))
             (tramp-rpc-watch-directory directory t)
-            (should (plist-get entry :owned))
+            (should (tramp-rpc-watch-lease-notify-owned lease))
             (tramp-rpc-handle-file-notify-rm-watch descriptor)
-            (should (gethash key tramp-rpc--watched-directories))
+            (should (tramp-rpc-watch-lease-explicit-p
+                     (gethash key tramp-rpc--watch-leases)))
             (should (equal (caar calls) "watch.remove"))
             (should (eq (alist-get 'nofollow (cadar calls)) t))
-            (should (equal (alist-get 'path (cadar calls)) "/link"))))
+            (should (equal (tramp-rpc--binary-bytes (alist-get 'path (cadar calls)))
+                           "/link"))))
       (tramp-rpc--delete-file-notify-descriptor-process descriptor))))
 
 (ert-deftest tramp-rpc-mock-test-nofollow-aliases-release-every-acquisition ()
   "Each acquired nofollow spelling releases one server reference, not only the last."
   (let ((tramp-rpc--file-notify-descriptors (make-hash-table :test 'eq))
-        (tramp-rpc--file-notify-watch-counts (make-hash-table :test 'equal))
-        (tramp-rpc--watched-directories (make-hash-table :test 'equal))
+        (tramp-rpc--watch-leases (make-hash-table :test 'equal))
         (descriptors nil)
         (removals 0))
     (unwind-protect
-        (cl-letf (((symbol-function 'tramp-rpc--system-info)
-                   (lambda (_) '((watch_remove_nofollow . t))))
-                  ((symbol-function 'file-symlink-p) (lambda (_) "/target"))
-                  ((symbol-function 'tramp-rpc--call)
+        (cl-letf (((symbol-function 'tramp-rpc--call)
                    (lambda (_vec method params)
-                     (when (equal method "watch.remove")
+                     (cond
+                      ((equal method "watch.add")
+                       (should (eq (alist-get 'nofollow_if_symlink params) t))
+                       '((path . "/link") (is_symlink . t) (nofollow . t)))
+                      ((equal method "watch.remove")
                        (should (eq (alist-get 'nofollow params) t))
-                       (cl-incf removals))
-                     '((path . "/link")))))
+                       (cl-incf removals)
+                       t)))))
           (dolist (path '("/rpc:watch-test:/link" "/rpc:watch-test:/alias/link"))
             (push (tramp-rpc-handle-file-notify-add-watch path '(change) #'ignore)
                   descriptors))
@@ -235,7 +256,8 @@
     (tramp-rpc-mock-test-request--with-connection (transport buffer)
       (let* ((vec (tramp-rpc-mock-test-request--vec))
              (default-directory (tramp-make-tramp-file-name vec "/tmp/"))
-             (tramp-rpc--async-processes (make-hash-table :test 'eq))
+             (tramp-rpc--managed-processes (make-hash-table :test 'eq))
+             (tramp-rpc--pid-index (make-hash-table :test 'equal))
              (track (symbol-function 'tramp-rpc--track-managed-process))
              relay stderr-relay killed-on)
         (unwind-protect
@@ -271,7 +293,7 @@
               (should (eq killed-on connection))
               (should relay)
               (should (eq (not (null stderr-relay)) separate-stderr))
-              (should-not (gethash relay tramp-rpc--async-processes))
+              (should-not (gethash relay tramp-rpc--managed-processes))
               (dolist (proc (list relay stderr-relay))
                 (when proc (should-not (process-live-p proc)))))
           (dolist (proc (list relay stderr-relay))
@@ -295,7 +317,7 @@
                                   :buffer (plist-get args :buffer)
                                   :connection-type 'pipe :noquery t))))
                 ((symbol-function 'tramp-rpc--call)
-                 (lambda (_vec method _params)
+                 (lambda (_vec method _params &optional _connection)
                    (should (equal method "system.info"))
                    `((protocol_revision . ,revision) (version . "0.14.0"))))
                 ((symbol-function 'tramp-set-connection-local-variables)

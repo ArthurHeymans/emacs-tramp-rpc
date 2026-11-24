@@ -401,12 +401,12 @@ standard TRAMP can traverse them."
 (defun tramp-rpc-deploy--detect-remote-arch (vec)
   "Detect the architecture of remote host specified by VEC.
 Returns a string like \"x86_64-linux\" or \"aarch64-darwin\"."
-  (let* ((uname-m (string-trim
-                   (tramp-send-command-and-read
-                    vec "echo \\\"`uname -m`\\\"")))
-         (uname-s (string-trim
-                   (tramp-send-command-and-read
-                    vec "echo \\\"`uname -s`\\\"")))
+  (let* ((output (string-trim
+                  (tramp-send-command-and-read
+                   vec "echo \\\"`uname -m` `uname -s`\\\"")))
+         (parts (split-string output))
+         (uname-m (or (nth 0 parts) ""))
+         (uname-s (or (nth 1 parts) ""))
          (machine (tramp-rpc-deploy--normalize-machine uname-m))
          (os (downcase uname-s)))
     (format "%s-%s" machine os)))
@@ -645,7 +645,8 @@ Returns t on success, nil on failure."
                        (signal 'remote-file-error
                                (list (format "Download timed out after %d seconds"
                                              tramp-rpc-deploy-download-timeout))))
-          (let ((buffer (url-retrieve-synchronously url t t)))
+          (let ((buffer (url-retrieve-synchronously
+                         url t t tramp-rpc-deploy-download-timeout)))
             (unless buffer
               (signal 'remote-file-error (list "No HTTP response" url)))
             (unwind-protect
@@ -1100,20 +1101,26 @@ When EXECUTABLE is non-nil, require execute permission too."
 (defun tramp-rpc-deploy--activation-command (temporary destination checksum)
   "Build the atomic remote activation transaction.
 TEMPORARY and DESTINATION are remote local names.  CHECKSUM is the expected
-SHA256 digest."
+SHA256 digest.  Runs inside a subshell so failures return a non-zero status
+with a structured ERR: diagnostic line without terminating a persistent shell."
   (let ((tmp (tramp-shell-quote-argument temporary))
         (dest (tramp-shell-quote-argument destination))
-        (digest (tramp-shell-quote-argument checksum)))
+        (digest (tramp-shell-quote-argument checksum))
+        (tmp-reg (tramp-rpc-deploy--regular-nonsymlink-test temporary))
+        (dest-reg (tramp-rpc-deploy--regular-nonsymlink-test destination))
+        (dest-exec (tramp-rpc-deploy--regular-nonsymlink-test destination t)))
     (format
-     "%s && chmod +x %s && %s && (test ! -e %s && ! test -L %s || %s) && actual=$(%s) && test \"$actual\" = %s && mv -f %s %s && %s"
-     (tramp-rpc-deploy--regular-nonsymlink-test temporary)
+     "( test -s %s || { printf 'ERR:empty\\n'; exit 1; }; \
+%s && chmod +x %s && %s && (test ! -e %s && ! test -L %s || %s) || { printf 'ERR:activate\\n'; exit 1; }; \
+actual=$(%s); \
+if test -z \"$actual\"; then printf 'ERR:no-checksum\\n'; exit 1; fi; \
+if test \"$actual\" != %s; then printf 'ERR:checksum:%%s\\n' \"$actual\"; exit 1; fi; \
+mv -f %s %s && %s || { printf 'ERR:activate\\n'; exit 1; } )"
      tmp
-     (tramp-rpc-deploy--regular-nonsymlink-test temporary)
-     dest dest
-     (tramp-rpc-deploy--regular-nonsymlink-test destination)
+     tmp-reg tmp tmp-reg dest dest dest-reg
      (tramp-rpc-deploy--checksum-shell-fragment temporary)
-     digest tmp dest
-     (tramp-rpc-deploy--regular-nonsymlink-test destination t))))
+     digest
+     tmp dest dest-exec)))
 
 (defun tramp-rpc-deploy--remote-binary-exists-p (vec)
   "Check if a regular non-symlink executable binary exists on remote VEC."
@@ -1148,18 +1155,18 @@ Tries sha256sum first, then shasum -a 256 for macOS compatibility."
       (match-string 1))))
 
 (defun tramp-rpc-deploy--make-remote-staging-directory (vec remote-local)
-  "Create and return a private staging directory beside REMOTE-LOCAL on VEC."
-  (let ((parent (file-name-directory remote-local)))
-    ;; Ask the remote shell to resolve `~' (and any symlinked parent) before
-    ;; invoking mktemp.  The default deployment directory is home-relative, so
-    ;; comparing mktemp's absolute output with the unexpanded `~/' spelling
-    ;; would reject every automatic deployment.
+  "Create a private staging directory beside REMOTE-LOCAL on VEC.
+Ensure the parent directory exists first."
+  (let* ((parent (file-name-directory remote-local))
+         (quoted-parent (tramp-shell-quote-argument parent)))
+    ;; Ensure the parent directory exists and ask the remote shell to resolve
+    ;; `~' (and any symlinked parent) before invoking mktemp, all in one RTT.
     (tramp-send-command
      vec
-     (format "umask 077 && parent=$(cd %s && pwd -P) && \
+     (format "umask 077 && mkdir -p %s && parent=$(cd %s && pwd -P) && \
 directory=$(mktemp -d \"$parent/.tramp-rpc-transfer.XXXXXX\") && \
 printf '%%s\\n%%s\\n' \"$parent\" \"$directory\""
-             (tramp-shell-quote-argument parent)))
+             quoted-parent quoted-parent))
     (with-current-buffer (tramp-get-connection-buffer vec)
       (goto-char (point-min))
       (let ((resolved-parent
@@ -1193,6 +1200,26 @@ printf '%%s\\n%%s\\n' \"$parent\" \"$directory\""
     (and remote-checksum (string= local-checksum remote-checksum))))
 
 
+(defun tramp-rpc-deploy--activation-failure-message (vec local-checksum)
+  "Return a diagnostic message for VEC after activation failure.
+LOCAL-CHECKSUM is the expected SHA-256 hex digest."
+  (let ((output (when-let* ((buf (tramp-get-connection-buffer vec)))
+                  (when (buffer-live-p buf)
+                    (with-current-buffer buf
+                      (buffer-substring-no-properties (point-min) (point-max)))))))
+    (cond
+     ((and output (string-match-p "ERR:empty" output))
+      "Temp file not created or is empty after copy")
+     ((and output (string-match-p "ERR:no-checksum" output))
+      "Could not compute remote checksum (sha256sum/shasum not available?)")
+     ((and output (string-match "ERR:checksum:\\([a-fA-F0-9]+\\)" output))
+      (let ((actual (match-string 1 output)))
+        (format "Checksum mismatch (local: %s, remote: %s)"
+                (substring local-checksum 0 (min 12 (length local-checksum)))
+                (substring actual 0 (min 12 (length actual))))))
+     (t
+      "Remote activation failed; existing binary was preserved"))))
+
 (defun tramp-rpc-deploy--transfer-binary (vec local-path)
   "Transfer the binary at LOCAL-PATH to the remote host VEC.
 Uses TRAMP's `copy-file' with the bootstrap method for binary transfer.
@@ -1212,9 +1239,6 @@ to inline encoding (base64 through the shell), which can be fragile."
     (tramp-rpc-deploy--log "Local binary size: %d bytes, checksum: %s..."
                            (file-attribute-size (file-attributes local-path))
                            (substring local-checksum 0 16))
-
-    ;; Ensure remote directory exists
-    (tramp-rpc-deploy--ensure-remote-directory vec)
 
     (message "Transferring binary to %s:%s..." (tramp-file-name-host vec) remote-local)
 
@@ -1239,29 +1263,8 @@ to inline encoding (base64 through the shell), which can be fragile."
                   ;; to follow or replace a pre-planted pathname.
                   (copy-file local-path remote-tmp-path nil)
 
-                  (unless (tramp-send-command-and-check
-                           vec
-                           (format "test -s %s"
-                                   (tramp-shell-quote-argument remote-tmp-local)))
-                    (signal 'remote-file-error
-                            (list "Temp file not created or is empty after copy")))
-
-                  (let ((remote-checksum
-                         (tramp-rpc-deploy--remote-checksum vec remote-tmp-local)))
-                    (unless remote-checksum
-                      (signal
-                       'remote-file-error
-                       (list "Could not compute remote checksum (sha256sum/shasum not available?)")))
-                    (unless (string= local-checksum remote-checksum)
-                      (signal
-                       'remote-file-error
-                       (list (format "Checksum mismatch (local: %s, remote: %s)"
-                                     (substring local-checksum 0 12)
-                                     (substring remote-checksum 0 12))))))
-
-                  ;; Recheck the type and digest in the same remote shell
-                  ;; operation as activation.  This closes the interval between
-                  ;; the earlier diagnostic checksum and the atomic rename.
+                  ;; Verify size, regular-file type, SHA256 digest, and atomically
+                  ;; rename into place in a single remote shell transaction.
                   ;; The staging directory is a child of the deployment
                   ;; directory, so promotion remains a same-filesystem rename
                   ;; while concurrent deployments stay isolated.
@@ -1271,7 +1274,8 @@ to inline encoding (base64 through the shell), which can be fragile."
                        (tramp-rpc-deploy--activation-command
                         remote-tmp-local remote-local local-checksum))
                     (signal 'remote-file-error
-                            (list "Remote activation failed; existing binary was preserved")))
+                            (list (tramp-rpc-deploy--activation-failure-message
+                                   vec local-checksum))))
                   (setq success t)
                   (message "Transfer completed successfully"))
               (error
@@ -1496,16 +1500,28 @@ binary lookup, and remote installation target."
 (defun tramp-rpc-deploy-status ()
   "Show the status of tramp-rpc-server binaries."
   (interactive)
-  (let ((buf (get-buffer-create "*tramp-rpc-deploy-status*")))
+  (let* ((source (and (not tramp-rpc-deploy-never-deploy)
+                      (tramp-rpc-deploy--use-source-binary-id-p)))
+         (hash (and source (tramp-rpc-deploy--source-tree-hash)))
+         (binary-id (or (and hash (tramp-rpc-deploy--source-binary-id hash))
+                        tramp-rpc-deploy-version))
+         (tramp-rpc-deploy--plan
+          (tramp-rpc-deploy--make-plan
+           :binary-id binary-id
+           :source-hash hash
+           :source-directory tramp-rpc-deploy-source-directory
+           :git-build-policy tramp-rpc-deploy-git-build-policy
+           :prefer-build tramp-rpc-deploy-prefer-build))
+         (buf (get-buffer-create "*tramp-rpc-deploy-status*")))
     (with-current-buffer buf
       (erase-buffer)
       (insert "TRAMP-RPC Server Deployment Status\n")
       (insert "===================================\n\n")
       (insert (format "Version: %s\n" tramp-rpc-deploy-version))
-      (insert (format "Binary id: %s\n" (tramp-rpc-deploy--binary-id)))
+      (insert (format "Binary id: %s\n" binary-id))
       (insert (format "Git build policy: %s\n" tramp-rpc-deploy-git-build-policy))
       (insert (format "Git checkout with server sources: %s\n"
-                      (if (tramp-rpc-deploy--use-source-binary-id-p) "yes" "no")))
+                      (if source "yes" "no")))
       (when-let* ((warning (tramp-rpc-deploy--source-directory-warning)))
         (insert (format "WARNING: %s\n" warning)))
       (insert (format "Never deploy: %s\n" (if tramp-rpc-deploy-never-deploy "yes" "no")))

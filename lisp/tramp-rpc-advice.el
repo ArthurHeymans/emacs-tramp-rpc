@@ -39,13 +39,14 @@
 (require 'tramp-rpc-connection)
 (require 'tramp-rpc-hops)
 (require 'tramp-rpc-transport)
+(require 'tramp-rpc-cache)
 (require 'tramp-rpc-process)
 
-;; Functions from tramp-rpc.el
-(declare-function tramp-rpc-file-name-p "tramp-rpc")
+;; Functions from tramp-rpc-process.el
 (declare-function tramp-rpc--forget-managed-process "tramp-rpc-process" (process))
 
-;; Variables from tramp-rpc.el / tramp-rpc-process.el
+;; Variables from tramp-rpc-process.el
+(defvar tramp-rpc--bypass-next-relay-call)
 
 ;; Functions from vc-dispatcher.el (used by vc-exec-after handler)
 (declare-function vc-exec-after "vc-dispatcher")
@@ -105,7 +106,7 @@ PROCESS is the process being handled."
 ;; process object, and handler dispatch would run the native primitive under
 ;; `tramp-run-real-handler', whose inhibition leaks into filters and timers
 ;; run while a blocked write waits.  Internal relay plumbing bypasses the
-;; advice per call with `tramp-rpc--native-call'.
+;; advice per call via the one-shot `tramp-rpc--bypass-next-relay-call' token.
 
 (defun tramp-rpc--resolve-process (process)
   "Return the process object denoted by PROCESS, or nil."
@@ -147,9 +148,13 @@ PROCESS is the process being handled."
 
 (defun tramp-rpc--process-send-string-advice (orig-fun process string)
   "Send STRING to RPC-managed PROCESS, otherwise call ORIG-FUN."
-  (if-let* ((proc (tramp-rpc--managed-send-process process)))
-      (tramp-rpc--send-managed-process-string proc string "SEND-STRING")
-    (funcall orig-fun process string)))
+  (if (and tramp-rpc--bypass-next-relay-call
+           (eq process tramp-rpc--bypass-next-relay-call))
+      (let ((tramp-rpc--bypass-next-relay-call nil))
+        (funcall orig-fun process string))
+    (if-let* ((proc (tramp-rpc--managed-send-process process)))
+        (tramp-rpc--send-managed-process-string proc string "SEND-STRING")
+      (funcall orig-fun process string))))
 
 (defun tramp-rpc--process-send-region-advice (orig-fun process start end)
   "Send region START to END to RPC-managed PROCESS, otherwise call ORIG-FUN."
@@ -160,23 +165,27 @@ PROCESS is the process being handled."
 
 (defun tramp-rpc--process-send-eof-advice (orig-fun &optional process)
   "Close the remote stdin of RPC-managed PROCESS, otherwise call ORIG-FUN."
-  (if-let* ((proc (tramp-rpc--managed-send-process process)))
-      (let* ((remote (tramp-rpc--remote-process proc))
-             (pid (tramp-rpc-remote-process-pid remote))
-             (vec (tramp-rpc-remote-process-vec remote)))
-        ;; Short-lived processes (like git apply) may exit before the caller
-        ;; sends EOF, which is fine: stdin was already closed on exit.
-        (unless (or (tramp-rpc-remote-process-exited remote)
-                    (not (process-live-p proc)))
-          (if (tramp-rpc-remote-process-pty remote)
-              ;; PTY processes: send Ctrl-D (EOF character) via the PTY.
-              (tramp-rpc--call vec "process.write_pty"
-                               `((pid . ,pid)
-                                 (data . ,(msgpack-bin-make (string ?\C-d))))
-                               (tramp-rpc-remote-process-connection remote))
-            ;; Pipe processes: a queue failure must reach the caller.
-            (tramp-rpc--close-remote-stdin vec pid proc))))
-    (apply orig-fun (and process (list process)))))
+  (if (and tramp-rpc--bypass-next-relay-call
+           (eq process tramp-rpc--bypass-next-relay-call))
+      (let ((tramp-rpc--bypass-next-relay-call nil))
+        (apply orig-fun (and process (list process))))
+    (if-let* ((proc (tramp-rpc--managed-send-process process)))
+        (let* ((remote (tramp-rpc--remote-process proc))
+               (pid (tramp-rpc-remote-process-pid remote))
+               (vec (tramp-rpc-remote-process-vec remote)))
+          ;; Short-lived processes (like git apply) may exit before the caller
+          ;; sends EOF, which is fine: stdin was already closed on exit.
+          (unless (or (tramp-rpc-remote-process-exited remote)
+                      (not (process-live-p proc)))
+            (if (tramp-rpc-remote-process-pty remote)
+                ;; PTY processes: send Ctrl-D (EOF character) via the PTY.
+                (tramp-rpc--call vec "process.write_pty"
+                                 `((pid . ,pid)
+                                   (data . ,(msgpack-bin-make (string ?\C-d))))
+                                 (tramp-rpc-remote-process-connection remote))
+              ;; Pipe processes: a queue failure must reach the caller.
+              (tramp-rpc--close-remote-stdin vec pid proc))))
+      (apply orig-fun (and process (list process))))))
 
 (defun tramp-rpc-handle-signal-process (process sigcode &optional remote current-group)
   "Handler for `signal-process' of TRAMP-RPC processes.
@@ -368,8 +377,12 @@ OKSTATUS is as for `vc-exec-after'."
         (while (accept-process-output proc 0 nil t))
         (when (cond
                ((null okstatus) t)
-               ((processp okstatus) (zerop (process-exit-status okstatus))) ; Emacs 30
-               ((integerp okstatus) (<= (process-exit-status proc) okstatus))) ; Emacs 31+
+               ((processp okstatus) ; Emacs 30
+                (and (eq (process-status okstatus) 'exit)
+                     (zerop (process-exit-status okstatus))))
+               ((integerp okstatus) ; Emacs 31+
+                (and (eq (process-status proc) 'exit)
+                     (<= (process-exit-status proc) okstatus))))
           (if (functionp code) (funcall code) (eval code t))))
     (vc-set-mode-line-busy-indicator)
     (letrec ((fun (lambda (p _msg)
@@ -430,7 +443,7 @@ ORIG-FUN is the original advised function.
 VEC is the TRAMP connection vector.
 EXTRAENV is a list of extra environment bindings.
 BODYFUN performs the wrapped operation."
-  (if (tramp-rpc-file-name-p vec)
+  (if (tramp-rpc--managed-file-name-p vec)
       (tramp-rpc-handle-python-shell--tramp-with-environment
        vec extraenv bodyfun)
     (funcall orig-fun vec extraenv bodyfun)))
@@ -463,7 +476,7 @@ BODYFUN performs the wrapped operation."
   "Return CONTACT unwrapped for TRAMP-RPC, otherwise call ORIG-FUN.
 TRAMP-RPC uses pipes, not PTYs, and handles binary data correctly, so the
 shell wrapper is not needed.  ARGS are passed to ORIG-FUN."
-  (if (tramp-rpc-file-name-p default-directory)
+  (if (tramp-rpc--managed-file-name-p default-directory)
       contact
     (apply orig-fun contact args)))
 
@@ -562,11 +575,22 @@ handler for nested calls of the same operation, including callbacks run while
 it waits.  Advising a function that is not loaded yet takes effect when it
 is defined.")
 
+(defconst tramp-rpc--cache-sync-advice
+  '((tramp-flush-file-properties . tramp-rpc--sync-tramp-flush-file)
+    (tramp-flush-directory-properties . tramp-rpc--sync-tramp-flush-directory)
+    (tramp-flush-connection-properties . tramp-rpc--sync-tramp-flush-connection))
+  "TRAMP cache-flush functions advised `:after' to keep RPC caches coherent.")
+
+(defvar tramp-rpc--python-external-operation-installed nil
+  "Non-nil when Python's TRAMP external operation has been installed.")
+
 (defun tramp-rpc-handler-install ()
   "Install all process handler for tramp-rpc."
   (pcase-dolist (`(,function . ,advice) tramp-rpc--advice)
     ;; Outermost, so ownership is checked before any Tramp dispatch.
     (advice-add function :around advice '((depth . -10))))
+  (pcase-dolist (`(,function . ,advice) tramp-rpc--cache-sync-advice)
+    (advice-add function :after advice))
   ;; This must be before `tramp-signal-process'.  Since tramp.el is
   ;; required, this is guaranteed.
   (add-hook 'signal-process-functions #'tramp-rpc-handle-signal-process)
@@ -576,33 +600,39 @@ is defined.")
 (defun tramp-rpc-advice-install-optional-handlers ()
   "Install handlers for loaded optional integration packages."
   (when (featurep 'python)
-      (if (tramp-rpc--python-tramp-file-name-external-operation-p)
+    (if (tramp-rpc--python-tramp-file-name-external-operation-p)
+        (unless tramp-rpc--python-external-operation-installed
           (condition-case err
-              (tramp-rpc--add-external-operation
-               'python-shell--tramp-with-environment
-               #'tramp-rpc-handle-python-shell--tramp-with-environment
-               'tramp-rpc 'tramp-file-name)
+              (progn
+                (tramp-rpc--add-external-operation
+                 'python-shell--tramp-with-environment
+                 #'tramp-rpc-handle-python-shell--tramp-with-environment
+                 'tramp-rpc 'tramp-file-name)
+                (setq tramp-rpc--python-external-operation-installed t))
             (remote-file-error
-             (signal (car err) (cdr err))))
-        ;; Compatibility fallback for Tramp < 2.8.2.  Remove this advice
-        ;; path once tramp-rpc can require a Tramp release supporting
-        ;; `tramp-file-name' ARG-TYPE for external operations.
-        (unless (advice-member-p
-                 #'tramp-rpc-handle-python-shell--tramp-with-environment-compat
-                 'python-shell--tramp-with-environment)
-          (advice-add
-           'python-shell--tramp-with-environment
-           :around
-           #'tramp-rpc-handle-python-shell--tramp-with-environment-compat)))))
+             (signal (car err) (cdr err)))))
+      ;; Compatibility fallback for Tramp < 2.8.2.  Remove this advice
+      ;; path once tramp-rpc can require a Tramp release supporting
+      ;; `tramp-file-name' ARG-TYPE for external operations.
+      (unless (advice-member-p
+               #'tramp-rpc-handle-python-shell--tramp-with-environment-compat
+               'python-shell--tramp-with-environment)
+        (advice-add
+         'python-shell--tramp-with-environment
+         :around
+         #'tramp-rpc-handle-python-shell--tramp-with-environment-compat)))))
 
 (defun tramp-rpc-handler-remove ()
   "Remove all process handler installed by tramp-rpc."
   (pcase-dolist (`(,function . ,advice) tramp-rpc--advice)
     (advice-remove function advice))
+  (pcase-dolist (`(,function . ,advice) tramp-rpc--cache-sync-advice)
+    (advice-remove function advice))
   (remove-hook 'signal-process-functions #'tramp-rpc-handle-signal-process)
   (remove-hook 'interrupt-process-functions #'tramp-rpc-handle-interrupt-process)
   (tramp-rpc--remove-external-operation
    'python-shell--tramp-with-environment 'tramp-rpc)
+  (setq tramp-rpc--python-external-operation-installed nil)
   (when (fboundp 'python-shell--tramp-with-environment)
     (advice-remove
      'python-shell--tramp-with-environment

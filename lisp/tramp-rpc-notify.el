@@ -17,8 +17,9 @@
 
 ;; This file implements the `file-notify-add-watch', `file-notify-rm-watch'
 ;; and `file-notify-valid-p' handlers for TRAMP-RPC.  Descriptors are backed
-;; by the server watches managed in tramp-rpc-cache.el, and the server's
-;; fs.events notifications are dispatched to them from there.
+;; by the unified watch leases managed in tramp-rpc-cache.el, and server
+;; fs.events notifications are received via `tramp-rpc-fs-event-dispatch-functions'
+;; and `tramp-rpc-fs-rescan-functions'.
 
 ;;; Code:
 
@@ -31,12 +32,6 @@
 
 (defvar tramp-rpc--file-notify-descriptors (make-hash-table :test 'eq)
   "TRAMP-RPC file notification descriptors.")
-
-(defvar tramp-rpc--file-notify-watch-counts (make-hash-table :test 'equal)
-  "Reference counts for directories watched via file notifications.
-Keys are the same connection/path keys as `tramp-rpc--watched-directories'.")
-
-(defvar tramp-rpc-protocol--message-target)
 
 (declare-function file-notify--rm-descriptor "filenotify")
 (declare-function file-notify-rm-watch "filenotify")
@@ -117,59 +112,20 @@ LOCALNAME is the local file name."
     (when (process-live-p descriptor)
       (delete-process descriptor))))
 
-(defun tramp-rpc--canonical-directory-equal-p (a b)
-  "Return non-nil if canonical directory names A and B are equal."
-  (and (stringp a)
-       (stringp b)
-       (string= (directory-file-name a) (directory-file-name b))))
-
-(defun tramp-rpc--watch-entry-canonical-directory (entry)
-  "Return canonical directory recorded in watch ENTRY."
-  (or (plist-get entry :canonical-directory)
-      (plist-get entry :directory)))
-
-(defun tramp-rpc--canonical-watch-active-p (canonical-directory)
-  "Return non-nil if CANONICAL-DIRECTORY has a target-following owner.
-Synthetic and nofollow descriptors do not own that server registration."
-  (let (active)
-    (when (and (stringp canonical-directory)
-               (hash-table-p tramp-rpc--watched-directories))
-      (maphash
-       (lambda (_key entry)
-         (when (tramp-rpc--canonical-directory-equal-p
-                canonical-directory
-                (tramp-rpc--watch-entry-canonical-directory entry))
-           (setq active t)))
-       tramp-rpc--watched-directories))
-    (when (and (not active)
-               (stringp canonical-directory)
-               (hash-table-p tramp-rpc--file-notify-watch-counts))
-      (maphash
-       (lambda (_key entry)
-         (when (and (plist-get entry :count)
-                    (not (plist-get entry :synthetic))
-                    (not (plist-get entry :nofollow))
-                    (tramp-rpc--canonical-directory-equal-p
-                     canonical-directory
-                     (tramp-rpc--watch-entry-canonical-directory entry)))
-           (setq active t)))
-       tramp-rpc--file-notify-watch-counts))
-    active))
-
 (defun tramp-rpc--cleanup-file-notify-for-connection
     (&optional vec connection-process)
-  "Remove file notification state for VEC's CONNECTION-PROCESS.
-When VEC is nil, remove all state."
+  "Remove file notification descriptors for VEC's CONNECTION-PROCESS.
+When VEC is nil, remove all descriptors."
   (let* ((prefix (and vec (concat (tramp-rpc--connection-key-string vec) ":")))
-         (descriptors-to-remove nil)
-         (watch-keys-to-remove nil))
+         (descriptors-to-remove nil))
     (maphash
      (lambda (descriptor data)
        (let* ((watch-key (plist-get data :watch-key))
-              (entry (and watch-key
-                          (gethash watch-key tramp-rpc--file-notify-watch-counts)))
+              (lease (and watch-key
+                          (gethash watch-key tramp-rpc--watch-leases)))
               (owner (or (plist-get data :connection-process)
-                         (plist-get entry :connection-process))))
+                         (and lease
+                              (tramp-rpc-watch-lease-connection-process lease)))))
          (when (and (or (null prefix)
                         (and watch-key (string-prefix-p prefix watch-key)))
                     (or (null connection-process)
@@ -177,15 +133,6 @@ When VEC is nil, remove all state."
                         (eq connection-process owner)))
            (push descriptor descriptors-to-remove))))
      tramp-rpc--file-notify-descriptors)
-    (maphash
-     (lambda (watch-key data)
-       (when (and (or (null prefix) (string-prefix-p prefix watch-key))
-                  (or (null connection-process)
-                      (null (plist-get data :connection-process))
-                      (eq connection-process
-                          (plist-get data :connection-process))))
-         (push watch-key watch-keys-to-remove)))
-     tramp-rpc--file-notify-watch-counts)
     (dolist (descriptor descriptors-to-remove)
       ;; Remove private state before sending the public `stopped' event, so
       ;; callbacks observing `file-notify-valid-p' during cleanup see the
@@ -196,13 +143,31 @@ When VEC is nil, remove all state."
                  (gethash descriptor file-notify-descriptors))
         (require 'filenotify)
         (file-notify--rm-descriptor descriptor)))
-    (dolist (watch-key watch-keys-to-remove)
-      (remhash watch-key tramp-rpc--file-notify-watch-counts))
-    (when (or descriptors-to-remove watch-keys-to-remove)
+    ;; Clear file-notify state from any remaining watch leases for this
+    ;; connection (e.g., if called before or without watch cleanup).
+    (let (drop-keys)
+      (maphash
+       (lambda (key lease)
+         (let ((owner (tramp-rpc-watch-lease-connection-process lease)))
+           (when (and (> (tramp-rpc-watch-lease-notify-count lease) 0)
+                      (or (null prefix) (string-prefix-p prefix key))
+                      (or (null connection-process)
+                          (null owner)
+                          (eq connection-process owner)))
+             (setf (tramp-rpc-watch-lease-notify-count lease) 0
+                   (tramp-rpc-watch-lease-notify-owned lease) nil
+                   (tramp-rpc-watch-lease-notify-synthetic lease) nil
+                   (tramp-rpc-watch-lease-notify-nofollow lease) nil
+                   (tramp-rpc-watch-lease-notify-canonical-directory lease) nil)
+             (unless (tramp-rpc-watch-lease-explicit-p lease)
+               (push key drop-keys)))))
+       tramp-rpc--watch-leases)
+      (dolist (key drop-keys)
+        (remhash key tramp-rpc--watch-leases)))
+    (when descriptors-to-remove
       (tramp-rpc--debug
-       "Cleaned up %d file-notify descriptors and %d file-notify watches%s"
+       "Cleaned up %d file-notify descriptors%s"
        (length descriptors-to-remove)
-       (length watch-keys-to-remove)
        (if vec (format " for %s" prefix) "")))))
 
 (defun tramp-rpc--file-notify-relative-name (directory file)
@@ -245,34 +210,15 @@ the empty string."
     ("stopped" 'unmounted)
     (_ nil)))
 
-(defun tramp-rpc--file-notify-alias-paths (file-name)
-  "Return original watch spellings equivalent to canonical FILE-NAME."
-  (let (aliases)
-    (when (hash-table-p tramp-rpc--file-notify-descriptors)
-      (maphash
-       (lambda (_descriptor data)
-         (when-let* ((canonical-directory
-                      (tramp-rpc--file-notify-canonical-directory data))
-                     ((tramp-rpc--file-notify-relative-name
-                       canonical-directory file-name))
-                     (alias
-                      (tramp-rpc--file-notify-original-spelling
-                       data file-name))
-                     ((not (string= alias file-name))))
-           (cl-pushnew alias aliases :test #'string=)))
-       tramp-rpc--file-notify-descriptors))
-    aliases))
-
 (defun tramp-rpc--file-notify-canonical-directory (data)
   "Return the canonical directory associated with descriptor DATA."
   (let* ((watch-key (plist-get data :watch-key))
-         (watch-entry (and watch-key
-                           (gethash watch-key
-                                    tramp-rpc--file-notify-watch-counts))))
-    ;; Prefer the shared watch entry, because explicit unwatch can restore a
+         (lease (and watch-key
+                     (gethash watch-key tramp-rpc--watch-leases))))
+    ;; Prefer the shared watch lease, because explicit unwatch can restore a
     ;; file-notify-owned direct watch and learn a newer canonical path after
     ;; descriptors were created.
-    (or (plist-get watch-entry :canonical-directory)
+    (or (and lease (tramp-rpc--watch-lease-notify-directory lease))
         (plist-get data :canonical-directory))))
 
 (defun tramp-rpc--file-notify-original-spelling (data file-name)
@@ -297,7 +243,7 @@ already expanded TRAMP name can therefore produce doubled remote
 prefixes on some TRAMP versions.  Prefer the name relative to the
 original watched directory, falling back to the original spelling when
 we cannot derive one.
-DATA is the payload to send."
+DATA is the descriptor metadata plist."
   (let* ((display-file-name
           (tramp-rpc--file-notify-original-spelling data file-name))
          (directory (plist-get data :directory))
@@ -330,13 +276,14 @@ DATA is the payload to send."
     (when (hash-table-p tramp-rpc--file-notify-descriptors)
       (maphash
        (lambda (_descriptor data)
-         (let* ((watch-key (plist-get data :watch-key))
-                (entry (and watch-key
-                            (gethash watch-key
-                                     tramp-rpc--file-notify-watch-counts))))
-           (when (and (plist-get entry :synthetic)
-                      (tramp-rpc--file-notify-path-matches-p data file-name))
-             (setq matched t))))
+         (when (not matched)
+           (let* ((watch-key (plist-get data :watch-key))
+                  (lease (and watch-key
+                              (gethash watch-key tramp-rpc--watch-leases))))
+             (when (and lease
+                        (tramp-rpc-watch-lease-notify-synthetic lease)
+                        (tramp-rpc--file-notify-path-matches-p data file-name))
+               (setq matched t)))))
        tramp-rpc--file-notify-descriptors))
     matched))
 
@@ -418,97 +365,23 @@ FLAGS controls the requested operation."
   ;; ensure the corresponding remote directory is watched.
   (require 'filenotify)
   (with-parsed-tramp-file-name directory nil
-    (let* ((watch-key (format "%s:%s" (tramp-rpc--connection-key-string v)
-                              localname))
-           (entry (gethash watch-key tramp-rpc--file-notify-watch-counts))
-           (preexisting (gethash watch-key tramp-rpc--watched-directories))
-           ;; file-notify does not follow symlinks.  Ask the server for a
-           ;; nofollow symlink watch when needed, falling back to a synthetic
-           ;; client-side descriptor on platforms without nofollow support.
-           (symlink-watch
-            (condition-case err
-                (file-symlink-p directory)
-              (error
-               (tramp-rpc--debug "symlink watch probe failed for %s: %s"
-                                 directory (error-message-string err))
-               nil)))
+    (let* ((watch-key (tramp-rpc--watch-key v localname))
            ;; Finish local setup before acquiring or incrementing a watch.
            (descriptor (tramp-rpc--make-file-notify-descriptor
                         v directory localname))
            registered)
       (unwind-protect
-          (progn
-            (if entry
-                (plist-put entry :count (1+ (plist-get entry :count)))
-              ;; Non-recursive file-notify watches must not mask the recursive
-              ;; watches used by Magit and cache invalidation.
-              (let* ((synthetic nil)
-                     (result
-                      (cond
-                       (symlink-watch
-                        (if (or preexisting
-                                ;; Do not acquire a nofollow watch we cannot
-                                ;; release without removing a target watch.
-                                (not (eq t (alist-get 'watch_remove_nofollow
-                                                     (tramp-rpc--system-info v)))))
-                            (progn
-                              (setq synthetic symlink-watch)
-                              nil)
-                          (condition-case err
-                              (tramp-rpc--call
-                               v "watch.add"
-                               `((path . ,localname)
-                                 (recursive . :msgpack-false)
-                                 (nofollow . t)))
-                            (error
-                             (setq synthetic symlink-watch)
-                             (tramp-rpc--debug
-                              "nofollow file-notify watch unsupported for %s: %s"
-                              directory (error-message-string err))
-                             nil))))
-                       (preexisting nil)
-                       (t
-                        (tramp-rpc--call v "watch.add"
-                                         `((path . ,localname)
-                                           (recursive . :msgpack-false))))))
-                     (canonical-localname (and (listp result)
-                                               (alist-get 'path result)))
-                     (canonical-directory
-                      (cond
-                       ((and (stringp canonical-localname)
-                             (tramp-tramp-file-p canonical-localname))
-                        canonical-localname)
-                       ((stringp canonical-localname)
-                        (tramp-make-tramp-file-name v canonical-localname))
-                       ;; Without a watch.add response, use TRAMP's truename
-                       ;; path as a best-effort canonical match key.
-                       (preexisting
-                        (condition-case err
-                            (file-truename directory)
-                          (error
-                           (tramp-rpc--debug
-                            "watch truename probe failed for %s: %s"
-                            directory (error-message-string err))
-                           nil))))))
-                (puthash watch-key
-                         (list :count 1
-                               :owned (and (not preexisting) (not synthetic))
-                               :synthetic synthetic
-                               :nofollow (and symlink-watch (not synthetic) t)
-                               :directory directory
-                               :canonical-directory canonical-directory
-                               :connection-process (tramp-rpc--connection-transport (tramp-rpc--get-connection v)))
-                         tramp-rpc--file-notify-watch-counts)))
-            (let ((watch-entry (gethash watch-key tramp-rpc--file-notify-watch-counts)))
-              (puthash descriptor
-                       (list :directory directory
-                             :canonical-directory (plist-get watch-entry
-                                                             :canonical-directory)
-                             :flags flags
-                             :localname localname
-                             :watch-key watch-key
-                             :connection-process (tramp-rpc--connection-transport (tramp-rpc--get-connection v)))
-                       tramp-rpc--file-notify-descriptors))
+          (let ((lease (tramp-rpc--watch-acquire-notify v directory localname)))
+            (puthash descriptor
+                     (list :directory directory
+                           :canonical-directory
+                           (tramp-rpc--watch-lease-notify-directory lease)
+                           :flags flags
+                           :localname localname
+                           :watch-key watch-key
+                           :connection-process
+                           (tramp-rpc-watch-lease-connection-process lease))
+                     tramp-rpc--file-notify-descriptors)
             (setq registered t)
             descriptor)
         ;; Registration errors and quits must not leave an untracked process.
@@ -518,39 +391,7 @@ FLAGS controls the requested operation."
 (defun tramp-rpc-handle-file-notify-rm-watch (descriptor)
   "Like `file-notify-rm-watch' for TRAMP-RPC watch DESCRIPTOR."
   (when-let* ((data (gethash descriptor tramp-rpc--file-notify-descriptors)))
-    (let* ((watch-key (plist-get data :watch-key))
-           (entry (gethash watch-key tramp-rpc--file-notify-watch-counts))
-           (canonical-directory
-            (tramp-rpc--watch-entry-canonical-directory entry))
-           (count (and entry (plist-get entry :count))))
-      (cond
-       ((and count (> count 1))
-        (plist-put entry :count (1- count)))
-       (entry
-        (remhash watch-key tramp-rpc--file-notify-watch-counts)
-        (when (and (plist-get entry :owned)
-                   ;; Nofollow registrations are refcounted on the server;
-                   ;; every spelling that acquired one must release it.  Follow
-                   ;; watches are shared, so retain them for other owners.
-                   (or (plist-get entry :nofollow)
-                       (not (tramp-rpc--canonical-watch-active-p
-                             canonical-directory))))
-          ;; Removing a file notification should not make
-          ;; `file-notify-rm-watch' fail if the remote connection has already
-          ;; gone away.
-          (condition-case err
-              (with-parsed-tramp-file-name (plist-get entry :directory) nil
-                (tramp-rpc--call
-                 v "watch.remove"
-                 `((path . ,(if (stringp canonical-directory)
-                                (tramp-file-local-name canonical-directory)
-                              localname))
-                   (nofollow . ,(if (plist-get entry :nofollow)
-                                    t :msgpack-false)))))
-            (error
-             (tramp-rpc--debug "failed to remove file-notify watch %s: %s"
-                               (plist-get entry :directory)
-                               (error-message-string err))))))))
+    (tramp-rpc--watch-release-notify (plist-get data :watch-key))
     (remhash descriptor tramp-rpc--file-notify-descriptors)
     (tramp-rpc--delete-file-notify-descriptor-process descriptor)))
 
@@ -561,10 +402,14 @@ FLAGS controls the requested operation."
        (gethash descriptor tramp-rpc--file-notify-descriptors)
        t))
 
-;; Internal transport teardown must always release file-notify watches.
-;; This is backend lifecycle wiring, not an opt-in editor integration.
+;; Internal transport teardown and fs.events hooks.
+;; These are backend lifecycle wiring, not opt-in editor integrations.
 (add-hook 'tramp-rpc-transport-cleanup-functions
           #'tramp-rpc--cleanup-file-notify-for-connection t)
+(add-hook 'tramp-rpc-fs-event-dispatch-functions
+          #'tramp-rpc--file-notify-dispatch t)
+(add-hook 'tramp-rpc-fs-rescan-functions
+          #'tramp-rpc--file-notify-dispatch-rescan t)
 
 (provide 'tramp-rpc-notify)
 ;;; tramp-rpc-notify.el ends here
