@@ -291,6 +291,21 @@ methods: both `rpc:' and `ssh:' hops are accepted since ProxyJump only
 needs host connectivity."
   (tramp-rpc-route-proxyjump (tramp-rpc--analyze-route vec)))
 
+(defvar tramp-rpc--inhibit-add-hops nil
+  "Non-nil while `tramp-add-hops' must be suppressed.")
+
+(defun tramp-rpc--path-has-explicit-hop-p (path)
+  "Return non-nil when PATH (or `default-directory') carries an explicit hop."
+  (when (stringp path)
+    (let ((effective (if (file-name-absolute-p path) path default-directory)))
+      (and (stringp effective)
+           (tramp-tramp-file-p effective)
+           (string-search tramp-postfix-hop-format effective)
+           (let ((tramp-default-proxies-alist tramp-cache-undefined))
+             (ignore-errors
+               (and (tramp-file-name-hop (tramp-dissect-file-name effective))
+                    t)))))))
+
 (defun tramp-rpc--copy-proxies-alist ()
   "Return a shallow copy of `tramp-default-proxies-alist' when it is a list.
 Preserves sentinel values such as `tramp-cache-undefined'."
@@ -300,10 +315,44 @@ Preserves sentinel values such as `tramp-cache-undefined'."
 
 (defun tramp-rpc--expand-preserving-hops (filename &optional default-dir)
   "Expand FILENAME relative to DEFAULT-DIR while preserving explicit proxy hops.
-Avoids mutating `tramp-default-proxies-alist'."
+Avoids mutating `tramp-default-proxies-alist' via `tramp-add-hops'."
   (let ((tramp-show-ad-hoc-proxies t)
+        (tramp-rpc--inhibit-add-hops t)
         (tramp-default-proxies-alist (tramp-rpc--copy-proxies-alist)))
     (expand-file-name filename default-dir)))
+
+(defun tramp-rpc--materialize-route (filename &optional default-dir)
+  "Expand FILENAME relative to DEFAULT-DIR and make hidden proxy hops explicit.
+Preserves explicit hops without mutating `tramp-default-proxies-alist'.
+For a hopless TRAMP-RPC filename routed through hidden proxy rules, attaches
+the resolved hop chain explicitly so operations on another explicit route
+cannot redirect it."
+  (let* ((tramp-rpc--inhibit-add-hops t)
+         (tramp-default-proxies-alist (tramp-rpc--copy-proxies-alist))
+         (expanded (tramp-rpc--expand-preserving-hops filename default-dir))
+         (quoted-p (file-name-quoted-p expanded))
+         (unquoted (if quoted-p (file-name-unquote expanded) expanded)))
+    (if (not (tramp-tramp-file-p unquoted))
+        expanded
+      (let* ((vec (tramp-dissect-file-name unquoted))
+             (computed-hops (unless (tramp-file-name-hop vec)
+                              (tramp-rpc--computed-hop-pairs vec))))
+        (if (not computed-hops)
+            expanded
+          (let* ((materialized-vec
+                  (make-tramp-file-name
+                   :method (tramp-file-name-method vec)
+                   :user (tramp-file-name-user vec)
+                   :domain (tramp-file-name-domain vec)
+                   :host (tramp-file-name-host vec)
+                   :port (tramp-file-name-port vec)
+                   :localname (tramp-file-name-localname vec)
+                   :hop (tramp-rpc--format-proxy-hops-string computed-hops)))
+                 (result
+                  (let ((tramp-default-proxies-alist tramp-cache-undefined)
+                        (tramp-show-ad-hoc-proxies t))
+                    (tramp-make-tramp-file-name materialized-vec))))
+            (if quoted-p (file-name-quote result) result)))))))
 
 (provide 'tramp-rpc-hops)
 ;;; tramp-rpc-hops.el ends here

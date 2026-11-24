@@ -543,6 +543,467 @@ ARGS are passed to ORIG-FUN."
   (apply orig-fun args))
 
 ;; ============================================================================
+;; Route-preservation advice for multi-path file operations
+;; ============================================================================
+
+(defun tramp-rpc--matching-proxy-for-vec (vec proxies)
+  "Return (t . PROXY) for the first rule in PROXIES matching VEC, or nil."
+  (when (listp proxies)
+    (let ((host-port (or (tramp-file-name-host-port vec) ""))
+          (user-domain (or (tramp-file-name-user-domain vec) ""))
+          (choices proxies)
+          matched)
+      (while (and choices (not matched))
+        (let* ((item (pop choices))
+               (host-re (or (eval (nth 0 item) t) ""))
+               (user-re (or (eval (nth 1 item) t) "")))
+          (when (and (string-match-p host-re host-port)
+                     (string-match-p user-re user-domain))
+            (let ((proxy (eval (nth 2 item) t)))
+              (when (stringp proxy)
+                ;; Same expansion as `tramp-format-spec', which package-lint
+                ;; attributes to Emacs 31: keep "%" in USER%DOMAIN literal.
+                (setq proxy
+                      (format-spec
+                       (replace-regexp-in-string
+                        (rx "%" (group (= 2 alnum))) "%%\\1" proxy)
+                       (format-spec-make
+                        ?u (or (tramp-file-name-user vec) "")
+                        ?h (or (tramp-file-name-host vec) "")))))
+              (setq matched (cons t proxy))))))
+      matched)))
+
+(defun tramp-rpc--strip-conflicting-proxy-entries (vec proxies)
+  "Return a copy of PROXIES without entries matching VEC's explicit hop targets.
+Removing both conflicting rules and buried duplicates guarantees that
+`tramp-add-hops' prepends VEC's explicit hops at the head of the alist."
+  (if (not (listp proxies))
+      proxies
+    (let ((result (copy-sequence proxies))
+          (hops (tramp-file-name-hop vec))
+          (item vec))
+      (when hops
+        (dolist (proxy (reverse (split-string hops tramp-postfix-hop-regexp 'omit)))
+          (let* ((host-port (tramp-file-name-host-port item))
+                 (host-rx (and (stringp host-port)
+                               (rx bol (literal host-port) eol)))
+                 (user-domain (tramp-file-name-user-domain item))
+                 (user-rx (and (stringp user-domain)
+                               (rx bol (literal user-domain) eol)))
+                 (proxy-str
+                  (concat tramp-prefix-format proxy tramp-postfix-host-format)))
+            (setq result
+                  (cl-remove-if
+                   (lambda (entry)
+                     (and (consp entry)
+                          (equal host-rx (car entry))
+                          (equal user-rx (cadr entry))))
+                   result))
+            (setq item (tramp-dissect-file-name proxy-str)))))
+      result)))
+
+(defun tramp-rpc--native-effective-route (vec)
+  "Return canonical hop-vector list for native TRAMP VEC without side effects.
+Resolves VEC's explicit hops (if any) and `tramp-default-proxies-alist'
+without calling `tramp-compute-multi-hops' or `tramp-add-hops'.  Returns
+`cycle' when proxy resolution encounters a loop."
+  (when (and (tramp-file-name-p vec)
+             (listp tramp-default-proxies-alist)
+             (not (tramp-rpc--managed-file-name-p vec))
+             (tramp-sh-file-name-handler-p vec))
+    (let* ((proxies (if (and tramp-rpc--inhibit-add-hops
+                             (tramp-file-name-hop vec))
+                        (tramp-rpc--strip-conflicting-proxy-entries
+                         vec tramp-default-proxies-alist)
+                      (tramp-rpc--copy-proxies-alist)))
+           (target-alist (list (tramp-file-name-unify vec))))
+      (when-let* ((hops (tramp-file-name-hop vec)))
+        (let ((item vec))
+          (dolist (proxy (reverse (split-string hops tramp-postfix-hop-regexp 'omit)))
+            (let* ((host-port (tramp-file-name-host-port item))
+                   (host-rx (and (stringp host-port)
+                                 (rx bol (literal host-port) eol)))
+                   (user-domain (tramp-file-name-user-domain item))
+                   (user-rx (and (stringp user-domain)
+                                 (rx bol (literal user-domain) eol)))
+                   (proxy-str
+                    (concat tramp-prefix-format proxy tramp-postfix-host-format))
+                   (entry (list host-rx user-rx proxy-str)))
+              (when (and (not tramp-rpc--inhibit-add-hops)
+                         tramp-show-ad-hoc-proxies)
+                ;; Match native `tramp-add-hops': remove only entries whose
+                ;; proxy string differs, leaving an identical entry in place.
+                (setq proxies
+                      (cl-remove-if
+                       (lambda (e)
+                         (and (consp e)
+                              (equal host-rx (car e))
+                              (equal user-rx (cadr e))
+                              (not (equal proxy-str (caddr e)))))
+                       proxies)))
+              (unless (member entry proxies)
+                (push entry proxies))
+              (setq item (tramp-dissect-file-name proxy-str))))))
+      (let ((done nil))
+        (while (not done)
+          (let ((match (tramp-rpc--matching-proxy-for-vec
+                        (car target-alist) proxies)))
+            (if (or (null match) (null (cdr match)))
+                (setq done t)
+              (let ((proxy-vec (tramp-file-name-unify
+                                (tramp-dissect-file-name (cdr match)))))
+                (if (member proxy-vec target-alist)
+                    ;; Signal cycle to caller so any live session is torn down
+                    ;; and `tramp-compute-multi-hops' reports the error.
+                    (setq target-alist 'cycle done t)
+                  (push proxy-vec target-alist)))))))
+      target-alist)))
+
+(defvar tramp-rpc--tracked-native-routes (make-hash-table :test 'equal)
+  "Map unified native TRAMP connection keys to their effective hop route.
+Populated when a native `tramp-sh' connection opens or caches state so
+subsequent operations cannot reuse a live session or stale cache from a
+different route, even after the process exits.")
+
+(defvar tramp-rpc--ensuring-native-route nil
+  "Non-nil while `tramp-rpc--ensure-native-connection-route' is running.")
+
+(defvar tramp-rpc--skip-native-route-keys nil
+  "List of unified native TRAMP keys whose route checks are temporarily skipped.")
+
+(defvar tramp-rpc--captured-native-route nil
+  "Cons `(VEC . ROUTE)' capturing `tramp-compute-multi-hops' during connect.")
+
+(defconst tramp-rpc--non-session-native-ops
+  '(;; Comparisons need no connection by themselves; the lookups they make
+    ;; (`file-truename', `file-attributes') are aligned when they run, so a
+    ;; comparison across hosts never disconnects a session it does not use.
+    file-equal-p
+    file-in-directory-p
+    file-newer-than-file-p
+    directory-file-name
+    dired-uncache
+    expand-file-name
+    file-name-as-directory
+    file-name-directory
+    file-name-nondirectory
+    file-name-sans-versions
+    file-remote-p
+    find-backup-file-name
+    make-auto-save-file-name
+    make-lock-file-name
+    substitute-in-file-name
+    unhandled-file-name-directory)
+  "`tramp-sh' ops that need no route check of their own.
+They are syntactic, flush caches, or compare files through other
+operations that are checked when they run.  Tilde expansion inside
+`expand-file-name' still aligns routes via
+`tramp-rpc--get-home-directory-advice'.")
+
+(defun tramp-rpc--connection-property-is-default-p (key-name prop val)
+  "Return non-nil if PROP/VAL still matches `tramp-connection-properties'.
+KEY-NAME is the connection name matched against the configured rules.
+Emacs `puthash' with `:test equal' keeps the original key string (and its
+`tramp-default' text property) when a seeded property is later overwritten,
+so we also verify that VAL still equals the configured default."
+  (when (and (stringp prop)
+             (get-text-property 0 'tramp-default prop))
+    (let ((found nil))
+      (dolist (elt tramp-connection-properties)
+        (when (and (equal (nth 1 elt) prop)
+                   (string-match-p (or (nth 0 elt) "") key-name))
+          (setq found (cons t (nth 2 elt)))))
+      (and (consp found)
+           (equal val (cdr found))))))
+
+(defun tramp-rpc--native-connection-has-cache-p (key)
+  "Return non-nil if KEY has live cached entries in `tramp-cache-data'.
+Ignores empty hash tables created on lookup, transient process slots, and
+untouched default entries seeded from `tramp-connection-properties'."
+  (and (hash-table-p tramp-cache-data)
+       (catch 'tramp-rpc--found
+         (maphash
+          (lambda (cache-key table)
+            (when (and (tramp-file-name-p cache-key)
+                       (hash-table-p table)
+                       (> (hash-table-count table) 0)
+                       (tramp-file-name-equal-p cache-key key))
+              (if (tramp-file-name-localname cache-key)
+                  (throw 'tramp-rpc--found t)
+                (let ((key-name nil))
+                  (maphash
+                   (lambda (prop val)
+                     (unless (or (member prop '(" process-name" " process-buffer"))
+                                 (and (stringp prop)
+                                      (get-text-property 0 'tramp-default prop)
+                                      (tramp-rpc--connection-property-is-default-p
+                                       (or key-name
+                                           (setq key-name
+                                                 (let ((tramp-default-proxies-alist
+                                                        tramp-cache-undefined))
+                                                   (tramp-make-tramp-file-name
+                                                    cache-key 'noloc))))
+                                       prop val)))
+                       (throw 'tramp-rpc--found t)))
+                   table)))))
+          tramp-cache-data)
+         nil)))
+
+(defun tramp-rpc--forget-tracked-native-route (key)
+  "Forget any tracked native route for KEY once no live process or cache stays."
+  (when (and (tramp-file-name-p key)
+             (> (hash-table-count tramp-rpc--tracked-native-routes) 0))
+    (let ((unified (tramp-file-name-unify key)))
+      (when (and (gethash unified tramp-rpc--tracked-native-routes)
+                 (not (process-live-p (tramp-get-connection-process unified)))
+                 (not (tramp-rpc--native-connection-has-cache-p unified)))
+        (remhash unified tramp-rpc--tracked-native-routes)))))
+
+(defun tramp-rpc--ensure-native-connection-route (vec)
+  "Ensure any live native TRAMP session or cache for VEC matches its route.
+Returns VEC's desired canonical route when tracking applies, or nil.
+Cleans up a live session and cached properties whose route differs from
+VEC's requested route (or when the requested route is cyclic), and records
+matching routes so subsequent operations know which route the live process
+and caches belong to.  State without a recorded route never matches: the
+current proxy rules need not describe how an older session was opened.
+When `non-essential' is non-nil, a mismatch throws `non-essential' instead
+of disconnecting, so a probe takes TRAMP's fallback for such calls."
+  (when (and (not tramp-rpc--ensuring-native-route)
+             (or tramp-rpc--inhibit-add-hops
+                 (> (hash-table-count tramp-rpc--tracked-native-routes) 0))
+             (tramp-file-name-p vec)
+             (not (tramp-rpc--managed-file-name-p vec))
+             (tramp-sh-file-name-handler-p vec))
+    (let* ((tramp-rpc--ensuring-native-route t)
+           (key (tramp-file-name-unify vec)))
+      (unless (cl-member key tramp-rpc--skip-native-route-keys
+                         :test #'tramp-file-name-equal-p)
+        (let* ((proc (tramp-get-connection-process vec))
+               (live-p (process-live-p proc))
+               (proc-route (and live-p (process-get proc 'tramp-rpc-native-route)))
+               (tracked-route (gethash key tramp-rpc--tracked-native-routes))
+               (recorded-route (or proc-route tracked-route))
+               (has-hop (and (tramp-file-name-hop vec) t)))
+          (when (or (and tramp-rpc--inhibit-add-hops has-hop)
+                    recorded-route)
+            (let ((desired-route (tramp-rpc--native-effective-route vec)))
+              (when desired-route
+                (let ((current-route recorded-route))
+                  (if (and (consp desired-route)
+                           (equal current-route desired-route))
+                      (progn
+                        (when (and live-p (not proc-route))
+                          (process-put proc 'tramp-rpc-native-route desired-route))
+                        (when (and tramp-rpc--inhibit-add-hops has-hop)
+                          (puthash key desired-route tramp-rpc--tracked-native-routes)))
+                    (when (or live-p (tramp-rpc--native-connection-has-cache-p key))
+                      ;; A probe cannot reopen the requested route, so keep
+                      ;; the other route's session and caches intact.
+                      (when non-essential
+                        (throw 'non-essential 'non-essential))
+                      (let ((tramp-rpc--inhibit-add-hops t))
+                        (tramp-cleanup-connection
+                         vec 'keep-debug 'keep-password 'keep-processes))
+                      (when (process-live-p proc)
+                        (ignore-errors (delete-process proc))))
+                    (remhash key tramp-rpc--tracked-native-routes)
+                    (when (and tramp-rpc--inhibit-add-hops has-hop
+                               (consp desired-route))
+                      (puthash key desired-route tramp-rpc--tracked-native-routes)))))
+              (and (consp desired-route) desired-route))))))))
+
+(defun tramp-rpc--inhibit-add-hops-advice (orig-fun &rest args)
+  "Call ORIG-FUN with ARGS unless `tramp-add-hops' is suppressed.
+Suppression applies while inhibited or skipped for the connection of the
+file name vector in ARGS."
+  (let ((vec (car args)))
+    (unless (or tramp-rpc--inhibit-add-hops
+                (and tramp-rpc--skip-native-route-keys
+                     (tramp-file-name-p vec)
+                     (cl-member vec tramp-rpc--skip-native-route-keys
+                                :test #'tramp-file-name-equal-p)))
+      (apply orig-fun args))))
+
+(defun tramp-rpc--compute-multi-hops-advice (orig-fun vec)
+  "Allow native TRAMP `tramp-compute-multi-hops' to expand VEC's explicit hops.
+ORIG-FUN is the original `tramp-compute-multi-hops'.  While
+`tramp-rpc--inhibit-add-hops' is active, native TRAMP methods (such as
+`ssh' and `scpx') still rely on `tramp-add-hops' to build their hop chain.
+Run that expansion against an isolated temporary copy of
+`tramp-default-proxies-alist' stripped of conflicting entries for VEC's
+explicit hops so jump hosts are preserved without mutating or redirecting
+any other route."
+  (let ((result
+         (if (and tramp-rpc--inhibit-add-hops
+                  (tramp-file-name-p vec)
+                  (tramp-file-name-hop vec)
+                  (not (tramp-rpc--managed-file-name-p vec)))
+             (let ((tramp-rpc--inhibit-add-hops nil)
+                   (tramp-show-ad-hoc-proxies nil)
+                   (tramp-save-ad-hoc-proxies nil)
+                   (tramp-default-proxies-alist
+                    (tramp-rpc--strip-conflicting-proxy-entries
+                     vec tramp-default-proxies-alist)))
+               (funcall orig-fun vec))
+           (funcall orig-fun vec))))
+    (when (and (consp tramp-rpc--captured-native-route)
+               (tramp-file-name-p vec)
+               (tramp-file-name-equal-p vec (car tramp-rpc--captured-native-route))
+               (listp result)
+               result)
+      (setcdr tramp-rpc--captured-native-route
+              (mapcar #'tramp-file-name-unify result)))
+    result))
+
+(defun tramp-rpc--maybe-open-connection-advice (orig-fun vec)
+  "Align native TRAMP connections with VEC's effective hop route.
+ORIG-FUN is the original `tramp-maybe-open-connection'.  Records the
+computed route on every newly opened native process and in
+`tramp-rpc--tracked-native-routes' so repeated operations reuse the session
+while subsequent hopless, cyclic, or different-route operations cannot reuse
+a mismatched live session or stale cache after disconnect."
+  (let* ((native-p (and (tramp-file-name-p vec)
+                        (not (tramp-rpc--managed-file-name-p vec))
+                        (tramp-sh-file-name-handler-p vec)))
+         (old-proc (and native-p (tramp-get-connection-process vec)))
+         (desired-route (and native-p
+                             (tramp-rpc--ensure-native-connection-route vec)))
+         (tramp-rpc--captured-native-route (and native-p (cons vec nil))))
+    (unwind-protect
+        (funcall orig-fun vec)
+      (when native-p
+        (let* ((new-proc (tramp-get-connection-process vec))
+               (new-live-p (and (process-live-p new-proc)
+                                (not (eq new-proc old-proc))))
+               (key (tramp-file-name-unify vec))
+               (captured (cdr tramp-rpc--captured-native-route)))
+          (when (or new-live-p
+                    (and captured
+                         (tramp-rpc--native-connection-has-cache-p key)))
+            (let ((opened-route
+                   (or captured
+                       (and (consp desired-route) desired-route)
+                       (let ((eff (tramp-rpc--native-effective-route vec)))
+                         (and (consp eff) eff)))))
+              (when opened-route
+                (when new-live-p
+                  (process-put new-proc 'tramp-rpc-native-route opened-route))
+                (puthash key opened-route tramp-rpc--tracked-native-routes)))))))))
+
+(defun tramp-rpc--get-home-directory-advice (orig-fun vec &optional user)
+  "Align live native TRAMP sessions for VEC before ORIG-FUN resolves `~'.
+USER is passed to ORIG-FUN.  When `non-essential' is non-nil and VEC's
+session belongs to another route, return nil: the home directory is
+unknown, and neither that route's cache nor its session is touched.
+This can run outside TRAMP's dispatcher, which otherwise catches the
+`non-essential' throw."
+  (unless (eq (catch 'non-essential
+                (tramp-rpc--ensure-native-connection-route vec)
+                'aligned)
+              'non-essential)
+    (funcall orig-fun vec user)))
+
+(defun tramp-rpc--dissect-target-no-hops (target &optional allow-relative)
+  "Dissect remote filename or `tramp-file-name' TARGET without mutating proxies.
+When ALLOW-RELATIVE is non-nil, resolve relative TARGET against
+`default-directory'."
+  (cond
+   ((tramp-file-name-p target) target)
+   ((stringp target)
+    (let ((effective (if (or (not allow-relative)
+                             (file-name-absolute-p target))
+                         target
+                       default-directory)))
+      (when (stringp effective)
+        (let ((tramp-default-proxies-alist tramp-cache-undefined))
+          (let ((unquoted (if (file-name-quoted-p effective)
+                              (file-name-unquote effective)
+                            effective)))
+            (when (and (stringp unquoted)
+                       (tramp-tramp-file-p unquoted))
+              (ignore-errors (tramp-dissect-file-name unquoted))))))))))
+
+(defun tramp-rpc--ensure-native-route-for-target (target)
+  "Ensure native TRAMP route alignment for filename or `tramp-file-name' TARGET."
+  (when-let* ((vec (tramp-rpc--dissect-target-no-hops target 'allow-relative)))
+    (tramp-rpc--ensure-native-connection-route vec)))
+
+(defun tramp-rpc--sh-file-name-handler-advice (orig-fun operation &rest args)
+  "Align live native TRAMP sessions and caches, then call ORIG-FUN.
+OPERATION and ARGS are the `tramp-sh' file name handler arguments."
+  (let ((skip-keys tramp-rpc--skip-native-route-keys))
+    (when (and (not tramp-rpc--ensuring-native-route)
+               (not (memq operation tramp-rpc--non-session-native-ops)))
+      (let ((primary (unless (tramp-file-name-p (car args))
+                       (ignore-errors
+                         (apply #'tramp-file-name-for-operation
+                                operation args)))))
+        (when (eq operation 'make-symbolic-link)
+          ;; `tramp-skeleton-make-symbolic-link' calls `expand-file-name' on
+          ;; TARGET while flushing cache on LINKNAME's host.  Skip route
+          ;; checks and `tramp-add-hops' on TARGET's host when it differs from
+          ;; LINKNAME's host so a literal cross-host target (with `~' or
+          ;; explicit hops) cannot mutate proxies or kill an unrelated session.
+          (let* ((target (nth 0 args))
+                 (target-vec (and (stringp target)
+                                  (let ((non-essential t)
+                                        (tramp-default-proxies-alist
+                                         tramp-cache-undefined))
+                                    (and (not (file-name-quoted-p target))
+                                         (tramp-tramp-file-p target)
+                                         (ignore-errors
+                                           (tramp-dissect-file-name target))))))
+                 (primary-vec (tramp-rpc--dissect-target-no-hops
+                               primary 'allow-relative)))
+            (when (and target-vec
+                       (or (not primary-vec)
+                           (not (tramp-file-name-equal-p target-vec
+                                                         primary-vec))))
+              (push (tramp-file-name-unify target-vec) skip-keys))))
+        (when (or tramp-rpc--inhibit-add-hops
+                  (> (hash-table-count tramp-rpc--tracked-native-routes) 0))
+          (if (tramp-file-name-p (car args))
+              (tramp-rpc--ensure-native-connection-route (car args))
+            (tramp-rpc--ensure-native-route-for-target primary)
+            (when (memq operation
+                        '(copy-file rename-file copy-directory add-name-to-file))
+              (dolist (arg (list (nth 0 args) (nth 1 args)))
+                (when (and (stringp arg) (not (equal arg primary)))
+                  (tramp-rpc--ensure-native-route-for-target arg))))))))
+    (let ((tramp-rpc--skip-native-route-keys skip-keys))
+      (apply orig-fun operation args))))
+
+(defun tramp-rpc--path-managed-by-rpc-p (path)
+  "Return non-nil when PATH (or `default-directory') is managed by tramp-rpc."
+  (when (stringp path)
+    (let ((effective (if (file-name-absolute-p path) path default-directory)))
+      (and (stringp effective)
+           (tramp-tramp-file-p effective)
+           (tramp-rpc--managed-file-name-p effective)))))
+
+(defun tramp-rpc--preserve-two-path-routes-advice (orig-fun file1 file2 &rest rest)
+  "Preserve distinct explicit and hidden TRAMP-RPC proxy routes across ORIG-FUN.
+Emacs primitives such as `copy-file' expand FILE1 and FILE2 sequentially before
+invoking file-name handlers; without this guard, expanding an explicit-hop path
+invokes `tramp-add-hops' and can redirect the other path onto the wrong route.
+REST holds the remaining arguments of ORIG-FUN."
+  (if (or tramp-rpc--inhibit-add-hops
+          (not (and (stringp file1) (stringp file2)))
+          (not (or (tramp-rpc--path-has-explicit-hop-p file1)
+                   (tramp-rpc--path-has-explicit-hop-p file2)))
+          (not (or (tramp-rpc--path-managed-by-rpc-p file1)
+                   (tramp-rpc--path-managed-by-rpc-p file2))))
+      (apply orig-fun file1 file2 rest)
+    (let ((m1 (tramp-rpc--materialize-route file1))
+          (m2 (tramp-rpc--materialize-route file2)))
+      (let ((tramp-show-ad-hoc-proxies t)
+            (tramp-save-ad-hoc-proxies nil)
+            (tramp-rpc--inhibit-add-hops t)
+            (tramp-default-proxies-alist (tramp-rpc--copy-proxies-alist)))
+        (apply orig-fun m1 m2 rest)))))
+
+;; ============================================================================
 ;; Install and uninstall handler
 ;; ============================================================================
 
@@ -562,6 +1023,19 @@ ARGS are passed to ORIG-FUN."
     (vterm--window-adjust-process-window-size
      . tramp-rpc--vterm-window-adjust-advice)
     (eat--adjust-process-window-size . tramp-rpc--eat-window-adjust-advice)
+    ;; Route preservation across explicit/hidden proxy hops.
+    (tramp-add-hops . tramp-rpc--inhibit-add-hops-advice)
+    (tramp-compute-multi-hops . tramp-rpc--compute-multi-hops-advice)
+    (tramp-maybe-open-connection . tramp-rpc--maybe-open-connection-advice)
+    (tramp-get-home-directory . tramp-rpc--get-home-directory-advice)
+    (tramp-sh-file-name-handler . tramp-rpc--sh-file-name-handler-advice)
+    (copy-file . tramp-rpc--preserve-two-path-routes-advice)
+    (rename-file . tramp-rpc--preserve-two-path-routes-advice)
+    (copy-directory . tramp-rpc--preserve-two-path-routes-advice)
+    (add-name-to-file . tramp-rpc--preserve-two-path-routes-advice)
+    (file-newer-than-file-p . tramp-rpc--preserve-two-path-routes-advice)
+    (file-equal-p . tramp-rpc--preserve-two-path-routes-advice)
+    (file-in-directory-p . tramp-rpc--preserve-two-path-routes-advice)
     ;; Integrations, which wrap the original call for TRAMP-RPC files.
     (vc-call-backend . tramp-rpc--vc-call-backend-advice)
     (vc-exec-after . tramp-rpc--vc-exec-after-advice)
@@ -578,7 +1052,8 @@ is defined.")
 (defconst tramp-rpc--cache-sync-advice
   '((tramp-flush-file-properties . tramp-rpc--sync-tramp-flush-file)
     (tramp-flush-directory-properties . tramp-rpc--sync-tramp-flush-directory)
-    (tramp-flush-connection-properties . tramp-rpc--sync-tramp-flush-connection))
+    (tramp-flush-connection-properties . tramp-rpc--sync-tramp-flush-connection)
+    (tramp-flush-connection-properties . tramp-rpc--forget-tracked-native-route))
   "TRAMP cache-flush functions advised `:after' to keep RPC caches coherent.")
 
 (defvar tramp-rpc--python-external-operation-installed nil
@@ -628,6 +1103,7 @@ is defined.")
     (advice-remove function advice))
   (pcase-dolist (`(,function . ,advice) tramp-rpc--cache-sync-advice)
     (advice-remove function advice))
+  (clrhash tramp-rpc--tracked-native-routes)
   (remove-hook 'signal-process-functions #'tramp-rpc-handle-signal-process)
   (remove-hook 'interrupt-process-functions #'tramp-rpc-handle-interrupt-process)
   (tramp-rpc--remove-external-operation

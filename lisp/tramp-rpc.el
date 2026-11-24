@@ -678,11 +678,31 @@ STRING is prepended to any resulting error message."
            (signal (car err) (cons string (cdr err)))))))))
 
 (defmacro tramp-rpc--with-preserved-two-path-routes (path1 path2 &rest body)
-  "Bind PATH1 and PATH2 expanded with preserved proxy hops while evaluating BODY."
+  "Bind PATH1 and PATH2 with preserved routes while evaluating BODY.
+When either path carries an explicit proxy hop, materialize hidden proxy hops
+on the other path and suppress `tramp-add-hops' side effects across BODY."
   (declare (indent 2) (debug (symbolp symbolp body)))
-  `(let ((,path1 (tramp-rpc--expand-preserving-hops ,path1))
-         (,path2 (tramp-rpc--expand-preserving-hops ,path2)))
-     ,@body))
+  (let ((preserve-sym (make-symbol "preserve-routes")))
+    `(let* ((,preserve-sym
+             (or (tramp-rpc--path-has-explicit-hop-p ,path1)
+                 (tramp-rpc--path-has-explicit-hop-p ,path2)))
+            (,path1 (if ,preserve-sym
+                        (tramp-rpc--materialize-route ,path1)
+                      (tramp-rpc--expand-preserving-hops ,path1)))
+            (,path2 (if ,preserve-sym
+                        (tramp-rpc--materialize-route ,path2)
+                      (tramp-rpc--expand-preserving-hops ,path2)))
+            (tramp-show-ad-hoc-proxies
+             (or ,preserve-sym tramp-show-ad-hoc-proxies))
+            (tramp-save-ad-hoc-proxies
+             (if ,preserve-sym nil tramp-save-ad-hoc-proxies))
+            (tramp-rpc--inhibit-add-hops
+             (or ,preserve-sym tramp-rpc--inhibit-add-hops))
+            (tramp-default-proxies-alist
+             (if ,preserve-sym
+                 (tramp-rpc--copy-proxies-alist)
+               tramp-default-proxies-alist)))
+       ,@body)))
 
 (defun tramp-rpc--same-remote-p (file1 file2)
   "Return non-nil when FILE1 and FILE2 target the exact same TRAMP-RPC route.
@@ -692,6 +712,7 @@ fast path."
   (when (and (tramp-tramp-file-p file1)
              (tramp-tramp-file-p file2))
     (let* ((tramp-show-ad-hoc-proxies t)
+           (tramp-rpc--inhibit-add-hops t)
            (tramp-default-proxies-alist
             (tramp-rpc--copy-proxies-alist))
            (f1 (if (file-name-quoted-p file1) (file-name-unquote file1) file1))

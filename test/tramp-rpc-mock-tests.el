@@ -10064,6 +10064,54 @@ A PTY whose remote exit is recorded keeps draining its final output."
       (delete-directory project t)
       (delete-directory bin t))))
 
+(ert-deftest tramp-rpc-mock-test-same-remote-distinguishes-proxy-hops ()
+  "Single-host fast paths must not conflate distinct proxy routes."
+  (let ((tramp-default-proxies-alist nil)
+        (f1 "/ssh:hop-a|rpc:user@target:/tmp/src")
+        (f2 "/ssh:hop-b|rpc:user@target:/tmp/dst")
+        (d2 "/ssh:hop-b|rpc:user@target:/tmp/")
+        called-routes)
+    (should-not (tramp-rpc--same-remote-p f1 f2))
+    (should-not (tramp-rpc-handle-file-equal-p f1 f2))
+    (should-not (tramp-rpc-handle-file-in-directory-p f1 d2))
+    ;; Hard link across different proxy routes must be rejected.
+    (should-error (tramp-rpc-handle-add-name-to-file f1 f2)
+                  :type 'remote-file-error)
+    ;; `file-newer-than-file-p' must query both routes independently.
+    (cl-letf (((symbol-function 'tramp-rpc--call)
+               (lambda (vec method _params &optional _conn)
+                 (push (cons (tramp-rpc--connection-key vec) method) called-routes)
+                 (if (equal (plist-get (tramp-rpc--connection-key vec) :route)
+                            '(("ssh" "" "" "hop-a" "22")))
+                     '((type . "file") (nlinks . 1) (uid . 0) (gid . 0)
+                       (atime . 100) (mtime . 200) (ctime . 100)
+                       (size . 1) (mode . #o644) (inode . 1) (dev . 1))
+                   '((type . "file") (nlinks . 1) (uid . 0) (gid . 0)
+                     (atime . 100) (mtime . 100) (ctime . 100)
+                     (size . 1) (mode . #o644) (inode . 1) (dev . 1))))))
+      (should (tramp-rpc-handle-file-newer-than-file-p f1 f2))
+      (should (= (length (delete-dups (mapcar #'car called-routes))) 2)))
+    ;; `rename-file' across different proxy routes must never issue `file.rename'.
+    (let (rename-rpc-called copy-args deleted-src)
+      (cl-letf (((symbol-function 'tramp-rpc--call)
+                 (lambda (_vec method _params &optional _conn)
+                   (when (equal method "file.rename")
+                     (setq rename-rpc-called t))
+                   nil))
+                ((symbol-function 'file-directory-p) #'ignore)
+                ((symbol-function 'file-exists-p) #'ignore)
+                ((symbol-function 'copy-file)
+                 (lambda (src dst &rest _)
+                   (setq copy-args (list src dst))))
+                ((symbol-function 'delete-file)
+                 (lambda (src &optional _)
+                   (setq deleted-src src))))
+        (tramp-rpc-handle-rename-file f1 f2 t)
+        (should-not rename-rpc-called)
+        (should (equal copy-args (list f1 f2)))
+        (should (equal deleted-src f1))))
+    (should-not tramp-default-proxies-alist)))
+
 (ert-deftest tramp-rpc-mock-test-reentrant-call-does-not-inherit-pinned-connection ()
   "A nested RPC for host B while host A's pinned call waits uses host B."
   (let* ((vec-a (tramp-dissect-file-name "/rpc:host-a:/"))
@@ -10884,6 +10932,79 @@ connection deploys it, so the caller must ensure the binary and retry."
                      tramp-rpc-magit--prefetch-directories))
     (should (eq t (tramp-rpc-magit--file-exists-p other-git)))))
 
+(ert-deftest tramp-rpc-mock-test-cross-route-copy-preserves-destination-proxy ()
+  "Cross-route copies never hijack the destination proxy or mutate proxies alist."
+  :tags '(:cache :multi-hop)
+  (let* ((hop-a-route '(("ssh" "" "" "hop-a" "22")))
+         (hop-b-route '(("ssh" "" "" "hop-b" "22")))
+         (run-copy
+          (lambda (initial-proxies copy-fn src dst expected-dest-route)
+            (let ((tramp-default-proxies-alist (copy-tree initial-proxies))
+                  (tramp-show-ad-hoc-proxies nil)
+                  (remote-file-name-inhibit-cache t)
+                  calls)
+              (cl-letf (((symbol-function 'tramp-rpc--call)
+                         (lambda (vec method params &optional _conn)
+                           (let ((route (plist-get (tramp-rpc--connection-key vec) :route))
+                                 (path (tramp-rpc--decode-string (alist-get 'path params))))
+                             (push (list route method path) calls)
+                             (pcase method
+                               ("file.stat"
+                                (if (equal path "/src")
+                                    '((type . "file") (nlinks . 1) (uid . 0) (gid . 0)
+                                      (atime . 100) (mtime . 100) (ctime . 100)
+                                      (size . 5) (mode . #o644) (inode . 1) (dev . 1))
+                                  nil))
+                               ("file.access"
+                                '((errno . 2) (message . "No such file or directory")))
+                               ("file.truename"
+                                `((path . ,(or path "/src"))))
+                               ("file.read"
+                                `((content . ,(msgpack-bin-make "hello"))
+                                  (size . 5)))
+                               ("file.write"
+                                '((written . 5)))
+                               (_ nil))))))
+                (funcall copy-fn src dst t))
+              (should (equal tramp-default-proxies-alist initial-proxies))
+              (should-not (cl-some (lambda (c) (equal (nth 1 c) "file.copy")) calls))
+              (should (cl-some (lambda (c)
+                                 (and (equal (nth 0 c) hop-b-route)
+                                      (equal (nth 1 c) "file.read")))
+                               calls))
+              (should (cl-some (lambda (c)
+                                 (and (equal (nth 0 c) expected-dest-route)
+                                      (equal (nth 1 c) "file.write")))
+                               calls))))))
+    ;; 1. Direct handler call: explicit hop-b source -> hopless hop-a destination.
+    (funcall run-copy
+             '(("\\`target\\'" "\\`user\\'" "/ssh:hop-a:"))
+             #'tramp-rpc-handle-copy-file
+             "/ssh:hop-b|rpc:user@target:/src"
+             "/rpc:user@target:/dst"
+             hop-a-route)
+    ;; 2. Public `copy-file': explicit hop-b source -> hopless hop-a destination.
+    (funcall run-copy
+             '(("\\`target\\'" "\\`user\\'" "/ssh:hop-a:"))
+             #'copy-file
+             "/ssh:hop-b|rpc:user@target:/src"
+             "/rpc:user@target:/dst"
+             hop-a-route)
+    ;; 3. Public `copy-file': two distinct explicit hops with default settings.
+    (funcall run-copy
+             nil
+             #'copy-file
+             "/ssh:hop-b|rpc:user@target:/src"
+             "/ssh:hop-a|rpc:user@target:/dst"
+             hop-a-route)
+    ;; 4. Public `copy-file': explicit hop-b source -> direct hopless destination.
+    (funcall run-copy
+             nil
+             #'copy-file
+             "/ssh:hop-b|rpc:user@target:/src"
+             "/rpc:user@target:/dst"
+             nil)))
+
 (ert-deftest tramp-rpc-mock-test-hopless-flush-clears-magit-ancestors-under-cyclic-proxy ()
   "All-route Magit ancestor flush succeeds even when a cyclic proxy rule is installed."
   :tags '(:cache :magit)
@@ -10907,6 +11028,1005 @@ connection deploys it, so the caller must ensure the binary and retry."
     (should-not (gethash target-key tramp-rpc-magit--ancestor-scan-caches))
     (should-not (gethash (directory-file-name target-dir)
                          tramp-rpc-magit--prefetch-directories))))
+
+(ert-deftest tramp-rpc-mock-test-cross-route-copy-preserves-native-tramp-hops ()
+  "Native TRAMP `tramp-compute-multi-hops' preserves jump hosts during RPC copies."
+  :tags '(:multi-hop)
+  (let ((tramp-default-proxies-alist nil)
+        (tramp-show-ad-hoc-proxies nil)
+        (remote-file-name-inhibit-cache t))
+    ;; 1. Native `ssh' and `scpx' explicit jump hosts resolve full hop chains
+    ;; even while `tramp-rpc--inhibit-add-hops' is active, including when a
+    ;; conflicting rule sits ahead of the requested hop, without leaking
+    ;; entries into `tramp-default-proxies-alist'.
+    (let ((tramp-rpc--inhibit-add-hops t))
+      (dolist (spec '(("/ssh:gateway|ssh:user@native-target:/dst"
+                       ("gateway" "native-target"))
+                      ("/ssh:gateway|scpx:user@target:/tmp/server"
+                       ("gateway" "target"))))
+        (let ((hops (tramp-compute-multi-hops
+                     (tramp-dissect-file-name (car spec)))))
+          (should (equal (mapcar #'tramp-file-name-host hops) (cadr spec))))
+        (should-not tramp-default-proxies-alist)))
+    ;; 2. Public `copy-file' and direct `tramp-rpc-handle-copy-file' from RPC
+    ;; to multi-hop native `ssh' keep `gateway -> native-target' intact, even
+    ;; when `other-gateway' precedes `gateway' in `tramp-default-proxies-alist'.
+    (let ((conflicting-proxies nil))
+      (let ((tramp-default-proxies-alist nil)
+            (tramp-show-ad-hoc-proxies nil))
+        (tramp-add-hops
+         (tramp-dissect-file-name "/ssh:gateway|ssh:user@native-target:/dst"))
+        (tramp-add-hops
+         (tramp-dissect-file-name "/ssh:other-gateway|ssh:user@native-target:/dst"))
+        (setq conflicting-proxies (copy-tree tramp-default-proxies-alist)))
+      (dolist (initial-proxies (list nil conflicting-proxies))
+        (dolist (copy-fn (list #'copy-file #'tramp-rpc-handle-copy-file))
+          (let ((tramp-default-proxies-alist (copy-tree initial-proxies))
+                (orig-sh (symbol-function 'tramp-sh-file-name-handler))
+                native-hops)
+            (cl-letf (((symbol-function 'tramp-sh-file-name-handler)
+                       (lambda (op &rest args)
+                         (pcase op
+                           ('file-directory-p nil)
+                           ('file-exists-p nil)
+                           ('write-region
+                            (let ((vec (tramp-dissect-file-name (nth 2 args))))
+                              (setq native-hops
+                                    (mapcar #'tramp-file-name-host
+                                            (tramp-compute-multi-hops vec))))
+                            nil)
+                           (_ (apply orig-sh op args)))))
+                      ((symbol-function 'tramp-rpc--call)
+                       (lambda (_vec method params &optional _conn)
+                         (let ((path (tramp-rpc--decode-string (alist-get 'path params))))
+                           (pcase method
+                             ("file.stat"
+                              '((type . "file") (nlinks . 1) (uid . 0) (gid . 0)
+                                (atime . 100) (mtime . 100) (ctime . 100)
+                                (size . 5) (mode . #o644) (inode . 1) (dev . 1)))
+                             ("file.truename" `((path . ,(or path "/src"))))
+                             ("file.read"
+                              `((content . ,(msgpack-bin-make "hello")) (size . 5)))
+                             (_ nil))))))
+              (funcall copy-fn
+                       "/rpc:user@rpc-source:/src"
+                       "/ssh:gateway|ssh:user@native-target:/dst"
+                       t))
+            (should (equal native-hops '("gateway" "native-target")))
+            (should (equal tramp-default-proxies-alist initial-proxies))))))
+    ;; 3. A live direct native session (and cached `~' / file properties) for
+    ;; `/ssh:user@native-target:' must not hijack
+    ;; `/ssh:gateway|ssh:user@native-target:/dst' or `~/dst'.
+    (dolist (dest-path '("/ssh:gateway|ssh:user@native-target:/dst"
+                         "/ssh:gateway|ssh:user@native-target:~/dst"))
+      (dolist (copy-fn (list #'copy-file #'tramp-rpc-handle-copy-file))
+        (let* ((tramp-default-proxies-alist nil)
+               (tramp-show-ad-hoc-proxies nil)
+               (remote-file-name-inhibit-cache nil)
+               (direct-vec (tramp-dissect-file-name "/ssh:user@native-target:/dst"))
+               (pipe (make-pipe-process
+                      :name (tramp-get-connection-name direct-vec)
+                      :buffer (tramp-get-connection-buffer direct-vec)
+                      :noquery t))
+               (orig-compute (symbol-function 'tramp-compute-multi-hops))
+               sent-to-direct computed-hops)
+          (tramp-set-connection-property pipe "last-cmd-time" (current-time))
+          (tramp-set-connection-property direct-vec "~" "/stale-direct-home")
+          (tramp-set-file-property direct-vec "/dst" "file-directory-p" t)
+          (unwind-protect
+              (cl-letf (((symbol-function 'tramp-send-string)
+                         (lambda (_vec str)
+                           (push str sent-to-direct)
+                           (throw 'native-route-stop 'sent-direct)))
+                        ((symbol-function 'tramp-compute-multi-hops)
+                         (lambda (vec)
+                           (let ((hops (funcall orig-compute vec)))
+                             (when (and (equal (tramp-file-name-method vec) "ssh")
+                                        (equal (tramp-file-name-host vec) "native-target"))
+                               (setq computed-hops
+                                     (mapcar #'tramp-file-name-host hops))
+                               (throw 'native-route-stop 'computed-hops))
+                             hops)))
+                        ((symbol-function 'tramp-rpc--call)
+                         (lambda (_vec method params &optional _conn)
+                           (let ((path (tramp-rpc--decode-string (alist-get 'path params))))
+                             (pcase method
+                               ("file.stat"
+                                '((type . "file") (nlinks . 1) (uid . 0) (gid . 0)
+                                  (atime . 100) (mtime . 100) (ctime . 100)
+                                  (size . 5) (mode . #o644) (inode . 1) (dev . 1)))
+                               ("file.truename" `((path . ,(or path "/src"))))
+                               ("file.read"
+                                `((content . ,(msgpack-bin-make "hello")) (size . 5)))
+                               (_ nil))))))
+                (should (eq (catch 'native-route-stop
+                              (funcall copy-fn
+                                       "/rpc:user@rpc-source:/src"
+                                       dest-path
+                                       t))
+                            'computed-hops))
+                ;; Check before the cleanup below deletes a surviving pipe.
+                (should-not (process-live-p pipe)))
+            (when (process-live-p pipe) (delete-process pipe))
+            (when-let* ((buf (get-buffer (tramp-buffer-name direct-vec))))
+              (kill-buffer buf))
+            (tramp-flush-connection-properties direct-vec)
+            (tramp-flush-directory-properties direct-vec "/"))
+          (should-not sent-to-direct)
+          (should (equal computed-hops '("gateway" "native-target")))
+          (should-not tramp-default-proxies-alist))))
+    ;; 4. Repeated preserved copies reuse the live `gateway' session even with
+    ;; empty global `tramp-default-proxies-alist', whereas a subsequent hopless
+    ;; copy (or cached file predicate) tears down that `gateway' session and
+    ;; flushes its caches before computing a direct route.
+    (let* ((tramp-default-proxies-alist nil)
+           (tramp-show-ad-hoc-proxies nil)
+           (remote-file-name-inhibit-cache nil)
+           (gw-vec (tramp-dissect-file-name "/ssh:user@native-target:/dst"))
+           (orig-compute (symbol-function 'tramp-compute-multi-hops))
+           (gw-pipe nil)
+           (compute-log nil)
+           (sent-log nil))
+      (unwind-protect
+          (cl-letf (((symbol-function 'tramp-compute-multi-hops)
+                     (lambda (vec)
+                       (let ((hops (funcall orig-compute vec)))
+                         (when (and (equal (tramp-file-name-method vec) "ssh")
+                                    (equal (tramp-file-name-host vec) "native-target"))
+                           (push (mapcar #'tramp-file-name-host hops) compute-log))
+                         hops)))
+                    ((symbol-function 'tramp-start-process)
+                     (lambda (vec name buffer &rest _args)
+                       (let ((p (make-pipe-process :name name :buffer buffer :noquery t)))
+                         (process-put p 'tramp-vector vec)
+                         (tramp-set-connection-property p "last-cmd-time" (current-time))
+                         (setq gw-pipe p)
+                         (throw 'native-opened p))))
+                    ((symbol-function 'tramp-send-string)
+                     (lambda (_vec str)
+                       (push str sent-log)
+                       (throw 'native-reused 'reused)))
+                    ((symbol-function 'tramp-rpc--call)
+                     (lambda (_vec method params &optional _conn)
+                       (let ((path (tramp-rpc--decode-string (alist-get 'path params))))
+                         (pcase method
+                           ("file.stat"
+                            '((type . "file") (nlinks . 1) (uid . 0) (gid . 0)
+                              (atime . 100) (mtime . 100) (ctime . 100)
+                              (size . 5) (mode . #o644) (inode . 1) (dev . 1)))
+                           ("file.truename" `((path . ,(or path "/src"))))
+                           ("file.read"
+                            `((content . ,(msgpack-bin-make "hello")) (size . 5)))
+                           (_ nil))))))
+            ;; First copy opens a `gateway -> native-target' session.
+            (let ((opened (catch 'native-opened
+                            (copy-file "/rpc:user@rpc-source:/src"
+                                       "/ssh:gateway|ssh:user@native-target:/dst1"
+                                       t))))
+              (should (processp opened))
+              (should (process-live-p opened))
+              (should (equal compute-log '(("gateway" "native-target"))))
+              (should-not tramp-default-proxies-alist)
+              ;; Seed a cached file property on the live `gateway' session.
+              (tramp-set-file-property gw-vec "/dst3" "file-directory-p" t)
+              ;; Second preserved copy on the same `gateway' route reuses `opened'.
+              (setq compute-log nil sent-log nil)
+              (should (eq (catch 'native-reused
+                            (copy-file "/rpc:user@rpc-source:/src"
+                                       "/ssh:gateway|ssh:user@native-target:/dst2"
+                                       t))
+                          'reused))
+              (should (process-live-p opened))
+              (should-not compute-log)
+              (should sent-log)
+              ;; Third (hopless) copy must NOT reuse the `gateway' session or its
+              ;; cached `file-directory-p' for `/dst3'; it cleans up `opened' and
+              ;; computes a direct route.
+              (setq compute-log nil sent-log nil)
+              (let ((reopened (catch 'native-opened
+                                (copy-file "/rpc:user@rpc-source:/src"
+                                           "/ssh:user@native-target:/dst3"
+                                           t))))
+                (should (processp reopened))
+                (should-not (eq reopened opened))
+                (should-not (process-live-p opened))
+                (should-not sent-log)
+                (should (equal compute-log '(("native-target")))))))
+        (when (process-live-p gw-pipe) (delete-process gw-pipe))
+        (when-let* ((buf (get-buffer (tramp-buffer-name gw-vec))))
+          (kill-buffer buf))
+        (tramp-flush-connection-properties gw-vec)
+        (tramp-flush-directory-properties gw-vec "/")))
+    ;; 5. A broad `gateway' rule ahead of a buried exact `other-gateway' rule
+    ;; preserves a live session recorded on the `gateway' route instead of
+    ;; tearing it down.  An untracked session (for example, one opened before
+    ;; TRAMP-RPC loaded) is never inferred to match the current rules: it may
+    ;; be a direct session, so the copy reopens the requested route.
+    (dolist (case '((tracked . reused) (untracked . recomputed)))
+     (dolist (copy-fn (list #'copy-file #'tramp-rpc-handle-copy-file))
+      (let* ((initial-proxies
+              (list (list "native-target" nil "/ssh:gateway:")
+                    (list (rx bol "native-target" eol)
+                          (rx bol "user" eol)
+                          "/ssh:other-gateway:")))
+             (tramp-default-proxies-alist (copy-tree initial-proxies))
+             (tramp-show-ad-hoc-proxies nil)
+             (gw-vec (tramp-dissect-file-name "/ssh:user@native-target:/dst"))
+             (pipe (make-pipe-process
+                    :name (tramp-get-connection-name gw-vec)
+                    :buffer (tramp-get-connection-buffer gw-vec)
+                    :noquery t))
+             (orig-compute (symbol-function 'tramp-compute-multi-hops))
+             (recomputed nil)
+             (still-live nil))
+        (tramp-set-connection-property pipe "last-cmd-time" (current-time))
+        (when (eq (car case) 'tracked)
+          (process-put pipe 'tramp-rpc-native-route
+                       (mapcar #'tramp-file-name-unify
+                               (list (tramp-dissect-file-name "/ssh:gateway:")
+                                     gw-vec))))
+        (unwind-protect
+            (cl-letf (((symbol-function 'tramp-send-string)
+                       (lambda (_vec _str)
+                         (throw 'broad-rule-stop 'reused)))
+                      ((symbol-function 'tramp-compute-multi-hops)
+                       (lambda (vec)
+                         (when (and (equal (tramp-file-name-method vec) "ssh")
+                                    (equal (tramp-file-name-host vec) "native-target"))
+                           (setq recomputed t)
+                           (throw 'broad-rule-stop 'recomputed))
+                         (funcall orig-compute vec)))
+                      ((symbol-function 'tramp-rpc--call)
+                       (lambda (_vec method params &optional _conn)
+                         (let ((path (tramp-rpc--decode-string (alist-get 'path params))))
+                           (pcase method
+                             ("file.stat"
+                              '((type . "file") (nlinks . 1) (uid . 0) (gid . 0)
+                                (atime . 100) (mtime . 100) (ctime . 100)
+                                (size . 5) (mode . #o644) (inode . 1) (dev . 1)))
+                             ("file.truename" `((path . ,(or path "/src"))))
+                             ("file.read"
+                              `((content . ,(msgpack-bin-make "hello")) (size . 5)))
+                             (_ nil))))))
+              (should (eq (catch 'broad-rule-stop
+                            (funcall copy-fn
+                                     "/rpc:user@rpc-source:/src"
+                                     "/ssh:gateway|ssh:user@native-target:/dst"
+                                     t))
+                          (cdr case)))
+              (setq still-live (and (process-live-p pipe) t)))
+          (when (process-live-p pipe) (delete-process pipe))
+          (when-let* ((buf (get-buffer (tramp-buffer-name gw-vec))))
+            (kill-buffer buf))
+          (tramp-flush-connection-properties gw-vec))
+        (should (eq still-live (eq (car case) 'tracked)))
+        (should (eq recomputed (eq (car case) 'untracked)))
+        (should (equal tramp-default-proxies-alist initial-proxies)))))
+    ;; 6. Copying from multi-hop native `ssh' to direct hopless `rpc' on the
+    ;; same user@target preserves `gateway' for ssh without redirecting rpc.
+    (let ((orig-sh (symbol-function 'tramp-sh-file-name-handler))
+          native-hops
+          ;; Sentinel: stays `unwritten' unless `file.write' runs.
+          (rpc-write-route 'unwritten))
+      (cl-letf (((symbol-function 'tramp-sh-file-name-handler)
+                 (lambda (op &rest args)
+                   (pcase op
+                     ('file-directory-p nil)
+                     ('file-symlink-p nil)
+                     ('file-truename (car args))
+                     ('file-attributes
+                      (list nil 1 0 0 '(0 0) '(0 0) '(0 0) 5 "-rw-r--r--" t 1 1))
+                     ('insert-file-contents
+                      (let ((vec (tramp-dissect-file-name (car args))))
+                        (setq native-hops
+                              (mapcar #'tramp-file-name-host
+                                      (tramp-compute-multi-hops vec))))
+                      (insert "hello")
+                      (list (car args) 5))
+                     (_ (apply orig-sh op args)))))
+                ((symbol-function 'tramp-rpc--call)
+                 (lambda (vec method _params &optional _conn)
+                   (pcase method
+                     ("file.stat" nil)
+                     ("file.access"
+                      '((errno . 2) (message . "No such file or directory")))
+                     ("file.write"
+                      (setq rpc-write-route
+                            (plist-get (tramp-rpc--connection-key vec) :route))
+                      '((written . 5)))
+                     (_ nil)))))
+        (copy-file "/ssh:gateway|ssh:user@target:/src"
+                   "/rpc:user@target:/dst"
+                   t))
+      (should (equal native-hops '("gateway" "target")))
+      (should-not rpc-write-route)
+      (should-not tramp-default-proxies-alist))))
+
+(ert-deftest tramp-rpc-mock-test-native-route-tracking-edge-cases ()
+  "Regression tests for native route tracking across cache, lifecycle, and cycles."
+  :tags '(:multi-hop :cache)
+  (let ((rpc-stub
+         (lambda (_vec method params &optional _conn)
+           (let ((path (tramp-rpc--decode-string (alist-get 'path params))))
+             (pcase method
+               ("file.stat"
+                '((type . "file") (nlinks . 1) (uid . 0) (gid . 0)
+                  (atime . 100) (mtime . 100) (ctime . 100)
+                  (size . 5) (mode . #o644) (inode . 1) (dev . 1)))
+               ("file.truename" `((path . ,(or path "/src"))))
+               ("file.read"
+                `((content . ,(msgpack-bin-make "hello")) (size . 5)))
+               (_ nil))))))
+    ;; 1. A fresh preserved copy with empty or `tramp-connection-properties'-only
+    ;; cache tables must not call `tramp-cleanup-connection' or wipe `recentf-list'.
+    (dolist (copy-fn (list #'copy-file #'tramp-rpc-handle-copy-file))
+      (let* ((tramp-default-proxies-alist nil)
+             (tramp-show-ad-hoc-proxies nil)
+             (tramp-connection-properties
+              '(("/ssh:user@native-fresh:" "remote-shell" "/bin/sh")))
+             (tramp-cleanup-connection-hook tramp-cleanup-connection-hook)
+             (fresh-vec (tramp-dissect-file-name "/ssh:user@native-fresh:/dst"))
+             (recentf-entries '("/ssh:user@native-fresh:/notes.org" "/tmp/local.txt"))
+             (cleanup-count 0)
+             (orig-cleanup (symbol-function 'tramp-cleanup-connection)))
+        (add-hook 'tramp-cleanup-connection-hook
+                  (lambda (_vec) (setq recentf-entries nil)))
+        (tramp-flush-connection-properties fresh-vec)
+        (tramp-flush-directory-properties fresh-vec "/")
+        (unwind-protect
+            (cl-letf (((symbol-function 'tramp-cleanup-connection)
+                       (lambda (&rest args)
+                         (setq cleanup-count (1+ cleanup-count))
+                         (apply orig-cleanup args)))
+                      ((symbol-function 'tramp-start-process)
+                       (lambda (&rest _args) (throw 'fresh-stop 'connecting)))
+                      ((symbol-function 'tramp-rpc--call) rpc-stub))
+              (should (eq (catch 'fresh-stop
+                            (funcall copy-fn
+                                     "/rpc:user@rpc-source:/src"
+                                     "/ssh:gateway|ssh:user@native-fresh:/dst"
+                                     t))
+                          'connecting)))
+          (tramp-flush-connection-properties fresh-vec)
+          (tramp-flush-directory-properties fresh-vec "/")
+          (remhash (tramp-file-name-unify fresh-vec)
+                   tramp-rpc--tracked-native-routes))
+        (should (= cleanup-count 0))
+        (should (equal recentf-entries
+                       '("/ssh:user@native-fresh:/notes.org" "/tmp/local.txt")))))
+
+    ;; 2. Opening a direct session, registering an ad-hoc `gateway' rule via
+    ;; `expand-file-name' (without closing the direct session), then running a
+    ;; preserved copy must tear down the direct session and connect via `gateway'.
+    (dolist (copy-fn (list #'copy-file #'tramp-rpc-handle-copy-file))
+      (let* ((tramp-default-proxies-alist nil)
+             (tramp-show-ad-hoc-proxies nil)
+             (direct-vec (tramp-dissect-file-name "/ssh:user@native-direct:/dst"))
+             (orig-compute (symbol-function 'tramp-compute-multi-hops))
+             (direct-pipe nil)
+             (sent-to-direct nil)
+             (computed-hops nil))
+        (unwind-protect
+            (cl-letf (((symbol-function 'tramp-compute-multi-hops)
+                       (lambda (vec)
+                         (let ((hops (funcall orig-compute vec)))
+                           (when (and (equal (tramp-file-name-method vec) "ssh")
+                                      (equal (tramp-file-name-host vec) "native-direct"))
+                             (setq computed-hops
+                                   (mapcar #'tramp-file-name-host hops)))
+                           hops)))
+                      ((symbol-function 'tramp-start-process)
+                       (lambda (vec name buffer &rest _args)
+                         (let ((p (make-pipe-process :name name :buffer buffer :noquery t)))
+                           (process-put p 'tramp-vector vec)
+                           (tramp-set-connection-property p "last-cmd-time" (current-time))
+                           (throw 'open-step p))))
+                      ((symbol-function 'tramp-send-string)
+                       (lambda (_vec str)
+                         (push str sent-to-direct)
+                         (throw 'copy-step 'sent-direct)))
+                      ((symbol-function 'tramp-rpc--call) rpc-stub))
+              ;; Step A: Open direct session through `tramp-maybe-open-connection'.
+              (setq direct-pipe
+                    (catch 'open-step
+                      (tramp-maybe-open-connection direct-vec)))
+              (should (processp direct-pipe))
+              (should (process-live-p direct-pipe))
+              (should (equal computed-hops '("native-direct")))
+              ;; Step B: Native `expand-file-name' registers `gateway' without
+              ;; closing `direct-pipe'.
+              (expand-file-name "/ssh:gateway|ssh:user@native-direct:/dst")
+              (should tramp-default-proxies-alist)
+              (should (process-live-p direct-pipe))
+              ;; Step C: Preserved copy must tear down `direct-pipe' and open `gateway'.
+              (setq computed-hops nil)
+              (let ((gw-pipe
+                     (catch 'open-step
+                       (catch 'copy-step
+                         (funcall copy-fn
+                                  "/rpc:user@rpc-source:/src"
+                                  "/ssh:gateway|ssh:user@native-direct:/dst"
+                                  t)))))
+                (should (processp gw-pipe))
+                (should-not (eq gw-pipe direct-pipe))
+                (should-not (process-live-p direct-pipe))
+                (should-not sent-to-direct)
+                (should (equal computed-hops '("gateway" "native-direct")))
+                (when (process-live-p gw-pipe) (delete-process gw-pipe))))
+          (when (process-live-p direct-pipe) (delete-process direct-pipe))
+          (when-let* ((buf (get-buffer (tramp-buffer-name direct-vec))))
+            (kill-buffer buf))
+          (tramp-flush-connection-properties direct-vec)
+          (tramp-flush-directory-properties direct-vec "/")
+          (remhash (tramp-file-name-unify direct-vec)
+                   tramp-rpc--tracked-native-routes))))
+
+    ;; 3, 4, 5. Full completed RPC-to-native copies preserve the live `gateway'
+    ;; session past post-copy cache invalidation; hopless `file-user-uid' and
+    ;; `exec-path' tear it down instead of returning jump-host connection cache;
+    ;; cyclic proxy rules tear it down and signal a cycle error on `process-file'.
+    (dolist (copy-fn (list #'copy-file #'tramp-rpc-handle-copy-file))
+      (let* ((tramp-default-proxies-alist nil)
+             (tramp-show-ad-hoc-proxies nil)
+             (remote-file-name-inhibit-cache nil)
+             (base-vec (tramp-dissect-file-name "/ssh:user@native-full:/dst"))
+             (orig-compute (symbol-function 'tramp-compute-multi-hops))
+             (active-pipe nil)
+             (compute-log nil)
+             (write-procs nil))
+        (unwind-protect
+            (cl-letf (((symbol-function 'tramp-compute-multi-hops)
+                       (lambda (vec)
+                         (let ((hops (funcall orig-compute vec)))
+                           (when (and (equal (tramp-file-name-method vec) "ssh")
+                                      (equal (tramp-file-name-host vec) "native-full"))
+                             (push (mapcar #'tramp-file-name-host hops) compute-log))
+                           hops)))
+                      ((symbol-function 'tramp-start-process)
+                       (lambda (vec name buffer &rest _args)
+                         (let ((p (make-pipe-process :name name :buffer buffer :noquery t)))
+                           (process-put p 'tramp-vector vec)
+                           (tramp-set-connection-property p "last-cmd-time" (current-time))
+                           (setq active-pipe p)
+                           p)))
+                      ((symbol-function 'tramp-barf-if-no-shell-prompt) #'ignore)
+                      ((symbol-function 'tramp-send-string) #'ignore)
+                      ((symbol-function 'tramp-process-actions) #'ignore)
+                      ((symbol-function 'tramp-open-connection-setup-interactive-shell) #'ignore)
+                      ((symbol-function 'tramp-sh-handle-file-directory-p)
+                       (lambda (_filename) nil))
+                      ((symbol-function 'tramp-sh-handle-file-exists-p)
+                       (lambda (_filename) nil))
+                      ((symbol-function 'tramp-sh-handle-write-region)
+                       (lambda (_start _end filename &rest _args)
+                         (with-parsed-tramp-file-name filename v
+                           (tramp-maybe-open-connection v)
+                           (push (tramp-get-connection-process v) write-procs))
+                         nil))
+                      ((symbol-function 'tramp-rpc--call) rpc-stub))
+              ;; Complete two full copies (including post-copy invalidation).
+              (funcall copy-fn
+                       "/rpc:user@rpc-source:/src"
+                       "/ssh:gateway|ssh:user@native-full:/dst"
+                       t)
+              (let ((first-pipe active-pipe))
+                (should (processp first-pipe))
+                (should (process-live-p first-pipe))
+                (should (equal compute-log '(("gateway" "native-full"))))
+                (should-not tramp-default-proxies-alist)
+                ;; Second completed copy reuses `first-pipe' without reconnecting.
+                (setq compute-log nil)
+                (funcall copy-fn
+                         "/rpc:user@rpc-source:/src"
+                         "/ssh:gateway|ssh:user@native-full:/dst"
+                         t)
+                (should (eq active-pipe first-pipe))
+                (should (process-live-p first-pipe))
+                (should-not compute-log)
+                (should (equal write-procs (list first-pipe first-pipe)))
+
+                ;; Hopless `file-user-uid' must not return jump-host cached uid.
+                (tramp-set-connection-property base-vec "uid-integer" 9999)
+                (cl-letf (((symbol-function 'tramp-sh-handle-get-remote-uid)
+                           (lambda (vec _id-format)
+                             (tramp-maybe-open-connection vec)
+                             1000)))
+                  (let ((default-directory "/ssh:user@native-full:/"))
+                    (should (= (file-user-uid) 1000))))
+                (should-not (process-live-p first-pipe))
+                (should (equal compute-log '(("native-full"))))
+
+                ;; Re-establish live `gateway' session, then test hopless `exec-path'.
+                (setq compute-log nil)
+                (funcall copy-fn
+                         "/rpc:user@rpc-source:/src"
+                         "/ssh:gateway|ssh:user@native-full:/dst"
+                         t)
+                (let ((gw-pipe-2 active-pipe))
+                  (should (process-live-p gw-pipe-2))
+                  (tramp-set-connection-property gw-pipe-2 "remote-path" '("/gw-bin"))
+                  (setq compute-log nil)
+                  (let ((tramp-remote-path '(tramp-default-remote-path)))
+                    (cl-letf (((symbol-function 'tramp-send-command-and-read)
+                               (lambda (vec _cmd &rest _args)
+                                 (tramp-maybe-open-connection vec)
+                                 "/direct-bin"))
+                              ((symbol-function 'tramp-bundle-read-file-names)
+                               ;; Newer Tramp passes an optional EXPAND
+                               ;; argument and uses the returned names.
+                               (lambda (vec files &rest _)
+                                 (dolist (f files)
+                                   (tramp-set-file-property
+                                    vec f "file-directory-p" t))
+                                 files)))
+                      (let* ((default-directory "/ssh:user@native-full:/")
+                             (result (exec-path)))
+                        (should-not (member "/gw-bin" result))
+                        (should (member "/direct-bin" result)))))
+                  (should-not (process-live-p gw-pipe-2))
+                  (should (equal compute-log '(("native-full")))))
+
+                ;; Re-establish live `gateway' session, then install a cyclic
+                ;; proxy rule: hopless `process-file' must tear down the session
+                ;; and hit `tramp-compute-multi-hops' cycle rejection.
+                (setq compute-log nil)
+                (funcall copy-fn
+                         "/rpc:user@rpc-source:/src"
+                         "/ssh:gateway|ssh:user@native-full:/dst"
+                         t)
+                (let ((gw-pipe-3 active-pipe)
+                      (cycle-err nil))
+                  (should (process-live-p gw-pipe-3))
+                  (let ((tramp-default-proxies-alist
+                         '(("\\`native-full\\'" nil "/ssh:other:")
+                           ("\\`other\\'" nil "/ssh:user@native-full:")))
+                        (default-directory "/ssh:user@native-full:/"))
+                    (cl-letf (((symbol-function 'tramp-start-process)
+                               (lambda (&rest _args)
+                                 (ert-fail "cyclic route must not start a process")))
+                              ((symbol-function 'tramp-compute-multi-hops)
+                               (lambda (vec)
+                                 (condition-case err
+                                     (funcall orig-compute vec)
+                                   (error
+                                    (setq cycle-err (error-message-string err))
+                                    (signal (car err) (cdr err)))))))
+                      (let* ((tramp-rpc-mock-test--network-guard nil)
+                             (status (process-file "sh" nil nil nil "-c" "echo hi")))
+                        (should-not (equal status 0)))))
+                  (should (stringp cycle-err))
+                  (should (string-match-p "Cycle proxy definition" cycle-err))
+                  (should-not (process-live-p gw-pipe-3)))))
+          (when (process-live-p active-pipe) (delete-process active-pipe))
+          (when-let* ((buf (get-buffer (tramp-buffer-name base-vec))))
+            (kill-buffer buf))
+          (tramp-flush-connection-properties base-vec)
+          (tramp-flush-directory-properties base-vec "/")
+          (remhash (tramp-file-name-unify base-vec)
+                   tramp-rpc--tracked-native-routes))))))
+
+(defmacro tramp-rpc-mock-test--with-gateway-session (spec &rest body)
+  "Run BODY with a live native session recorded on a gateway route.
+SPEC is (VEC PIPE FILE): VEC and FILE name the hopless target, and PIPE is
+the session process, which BODY sees while it is live."
+  (declare (indent 1))
+  (let ((vec (nth 0 spec)) (pipe (nth 1 spec)) (file (nth 2 spec)))
+    `(let* ((tramp-default-proxies-alist nil)
+            (tramp-show-ad-hoc-proxies nil)
+            (remote-file-name-inhibit-cache nil)
+            (,file "/ssh:user@native-gateway-session:/probe")
+            (,vec (tramp-dissect-file-name ,file))
+            (key (tramp-file-name-unify ,vec))
+            (gateway-route
+             (mapcar #'tramp-file-name-unify
+                     (list (tramp-dissect-file-name "/ssh:gateway:") ,vec)))
+            (,pipe (make-pipe-process
+                    :name (tramp-get-connection-name ,vec)
+                    :buffer (tramp-get-connection-buffer ,vec)
+                    :noquery t)))
+       (tramp-set-connection-property ,pipe "last-cmd-time" (current-time))
+       (process-put ,pipe 'tramp-rpc-native-route gateway-route)
+       (puthash key gateway-route tramp-rpc--tracked-native-routes)
+       (unwind-protect
+           (cl-letf (((symbol-function 'tramp-send-string)
+                      (lambda (&rest _) (ert-fail "the gateway session was used")))
+                     ((symbol-function 'tramp-start-process)
+                      (lambda (&rest _) (ert-fail "a connection was opened"))))
+             ,@body)
+         (when (process-live-p ,pipe) (delete-process ,pipe))
+         (when-let* ((buf (get-buffer (tramp-buffer-name ,vec))))
+           (kill-buffer buf))
+         (tramp-flush-connection-properties ,vec)
+         (remhash key tramp-rpc--tracked-native-routes)))))
+
+(ert-deftest tramp-rpc-mock-test-cross-host-comparison-keeps-route-session ()
+  "Comparing files on different hosts does not disconnect a session."
+  :tags '(:multi-hop)
+  (tramp-rpc-mock-test--with-gateway-session (vec pipe file)
+    (ignore vec)
+    (should-not (file-equal-p file "/ssh:user@native-other-host:/probe"))
+    (should (process-live-p pipe))))
+
+(ert-deftest tramp-rpc-mock-test-non-essential-home-lookup-keeps-route-session ()
+  "A non-essential home lookup on another route returns nil instead of throwing."
+  :tags '(:multi-hop)
+  (tramp-rpc-mock-test--with-gateway-session (vec pipe file)
+    (ignore file)
+    (tramp-set-connection-property vec "~" "/gateway-home")
+    (let ((non-essential t))
+      (should-not (tramp-get-home-directory vec)))
+    (should (process-live-p pipe))
+    (should (equal (tramp-get-connection-property vec "~") "/gateway-home"))))
+
+(ert-deftest tramp-rpc-mock-test-non-essential-probe-keeps-other-route-session ()
+  "A non-essential probe keeps a live session on another route.
+The probe must not answer from that route's cache either; an essential
+call still switches routes."
+  :tags '(:multi-hop)
+  (let* ((tramp-default-proxies-alist nil)
+         (tramp-show-ad-hoc-proxies nil)
+         (remote-file-name-inhibit-cache nil)
+         (file "/ssh:user@native-probe:/probe")
+         (vec (tramp-dissect-file-name file))
+         (key (tramp-file-name-unify vec))
+         (gateway-route
+          (mapcar #'tramp-file-name-unify
+                  (list (tramp-dissect-file-name "/ssh:gateway:") vec)))
+         (pipe (make-pipe-process
+                :name (tramp-get-connection-name vec)
+                :buffer (tramp-get-connection-buffer vec)
+                :noquery t)))
+    (tramp-set-connection-property pipe "last-cmd-time" (current-time))
+    (process-put pipe 'tramp-rpc-native-route gateway-route)
+    (puthash key gateway-route tramp-rpc--tracked-native-routes)
+    (tramp-set-file-property vec "/probe" "file-exists-p" t)
+    (unwind-protect
+        (cl-letf (((symbol-function 'tramp-send-string)
+                   (lambda (_vec _str) (throw 'probe-stop 'sent)))
+                  ((symbol-function 'tramp-start-process)
+                   (lambda (&rest _args) (throw 'probe-stop 'reopened))))
+          (let ((non-essential t))
+            (should-not (catch 'probe-stop (file-exists-p file))))
+          (should (process-live-p pipe))
+          (should (tramp-get-file-property vec "/probe" "file-exists-p"))
+          (should (eq (catch 'probe-stop (file-exists-p file)) 'reopened))
+          (should-not (process-live-p pipe)))
+      (when (process-live-p pipe) (delete-process pipe))
+      (when-let* ((buf (get-buffer (tramp-buffer-name vec))))
+        (kill-buffer buf))
+      (tramp-flush-connection-properties vec)
+      (tramp-flush-directory-properties vec "/")
+      (remhash key tramp-rpc--tracked-native-routes))))
+
+(ert-deftest tramp-rpc-mock-test-native-route-tracking-round10-edge-cases ()
+  "Regression tests for Round 10 native route-tracking edge cases."
+  :tags '(:multi-hop :cache)
+  ;; 1. `file-name-case-insensitive-p' and `abbreviate-file-name' must not
+  ;; return cached data from a mismatched tracked `gateway' session.
+  (let* ((tramp-default-proxies-alist nil)
+         (tramp-show-ad-hoc-proxies nil)
+         (base-vec (tramp-dissect-file-name "/ssh:user@native-ci:/file"))
+         (gw-vec (tramp-dissect-file-name "/ssh:gateway|ssh:user@native-ci:/file"))
+         (gw-pipe nil))
+    (unwind-protect
+        (cl-letf (((symbol-function 'tramp-start-process)
+                   (lambda (vec name buffer &rest _args)
+                     (let ((p (make-pipe-process :name name :buffer buffer :noquery t)))
+                       (process-put p 'tramp-vector vec)
+                       (tramp-set-connection-property p "last-cmd-time" (current-time))
+                       (setq gw-pipe p)
+                       p)))
+                  ((symbol-function 'tramp-barf-if-no-shell-prompt) #'ignore)
+                  ((symbol-function 'tramp-send-string) #'ignore)
+                  ((symbol-function 'tramp-process-actions) #'ignore)
+                  ((symbol-function 'tramp-open-connection-setup-interactive-shell) #'ignore))
+          ;; Open a tracked gateway session under preserved mode.
+          (let ((tramp-rpc--inhibit-add-hops t))
+            (tramp-maybe-open-connection gw-vec))
+          (should (process-live-p gw-pipe))
+          (tramp-set-connection-property base-vec "case-insensitive" t)
+          (tramp-set-connection-property base-vec "~" "/gw-home")
+          ;; Hopless `file-name-case-insensitive-p' must flush gateway cache
+          ;; and tear down `gw-pipe' rather than returning `t'.
+          (cl-letf (((symbol-function 'tramp-handle-file-name-case-insensitive-p)
+                     (lambda (filename)
+                       (let ((v (tramp-dissect-file-name filename)))
+                         (tramp-get-connection-property v "case-insensitive" nil)))))
+            (should-not (file-name-case-insensitive-p "/ssh:user@native-ci:/file")))
+          (should-not (process-live-p gw-pipe))
+          ;; Re-open tracked gateway session and check `abbreviate-file-name'
+          ;; with disconnected cache (so `tramp-handle-abbreviate-file-name'
+          ;; reads `"~"' directly from connection properties).
+          (let ((tramp-rpc--inhibit-add-hops t))
+            (tramp-maybe-open-connection gw-vec))
+          (should (process-live-p gw-pipe))
+          (tramp-set-connection-property base-vec "~" "/gw-home")
+          (delete-process gw-pipe)
+          (should (equal (abbreviate-file-name "/ssh:user@native-ci:/gw-home/work")
+                         "/ssh:user@native-ci:/gw-home/work")))
+      (when (process-live-p gw-pipe) (delete-process gw-pipe))
+      (when-let* ((buf (get-buffer (tramp-buffer-name base-vec))))
+        (kill-buffer buf))
+      (tramp-flush-connection-properties base-vec)
+      (remhash (tramp-file-name-unify base-vec) tramp-rpc--tracked-native-routes)))
+
+  ;; 2. A direct session's cached UID remains tracked after the process exits,
+  ;; so a later preserved explicit-gateway lookup flushes the stale cache.
+  (let* ((tramp-default-proxies-alist nil)
+         (tramp-show-ad-hoc-proxies nil)
+         (direct-vec (tramp-dissect-file-name "/ssh:user@native-exited:/"))
+         (direct-pipe nil)
+         (remote-uid-called nil))
+    (unwind-protect
+        (cl-letf (((symbol-function 'tramp-start-process)
+                   (lambda (vec name buffer &rest _args)
+                     (let ((p (make-pipe-process :name name :buffer buffer :noquery t)))
+                       (process-put p 'tramp-vector vec)
+                       (tramp-set-connection-property p "last-cmd-time" (current-time))
+                       (setq direct-pipe p)
+                       p)))
+                  ((symbol-function 'tramp-barf-if-no-shell-prompt) #'ignore)
+                  ((symbol-function 'tramp-send-string) #'ignore)
+                  ((symbol-function 'tramp-process-actions) #'ignore)
+                  ((symbol-function 'tramp-open-connection-setup-interactive-shell) #'ignore)
+                  ((symbol-function 'tramp-sh-handle-get-remote-uid)
+                   (lambda (_vec _id-format)
+                     (setq remote-uid-called t)
+                     2000)))
+          (tramp-maybe-open-connection direct-vec)
+          (should (process-live-p direct-pipe))
+          (tramp-set-connection-property direct-vec "uid-integer" 1000)
+          (expand-file-name "/ssh:gateway|ssh:user@native-exited:/dst")
+          (should tramp-default-proxies-alist)
+          (delete-process direct-pipe)
+          (should-not (process-live-p direct-pipe))
+          ;; Preserved explicit-gateway `file-user-uid' must NOT return 1000.
+          (let ((tramp-rpc--inhibit-add-hops t)
+                (default-directory "/ssh:gateway|ssh:user@native-exited:/"))
+            (should (= (file-user-uid) 2000)))
+          (should remote-uid-called))
+      (when (process-live-p direct-pipe) (delete-process direct-pipe))
+      (when-let* ((buf (get-buffer (tramp-buffer-name direct-vec))))
+        (kill-buffer buf))
+      (tramp-flush-connection-properties direct-vec)
+      (remhash (tramp-file-name-unify direct-vec) tramp-rpc--tracked-native-routes)))
+
+  ;; 3. An overwritten `tramp-connection-properties' default still counts as
+  ;; live cached state (even though `puthash' retains the `tramp-default' key)
+  ;; and is invalidated on route switch to restore the configured default.
+  (let* ((tramp-default-proxies-alist nil)
+         (tramp-show-ad-hoc-proxies nil)
+         (tramp-connection-properties
+          '(("/ssh:user@native-defover:" "uid-integer" 1000)))
+         (base-vec (tramp-dissect-file-name "/ssh:user@native-defover:/"))
+         (gw-vec (tramp-dissect-file-name "/ssh:gateway|ssh:user@native-defover:/"))
+         (key (tramp-file-name-unify base-vec)))
+    (tramp-flush-connection-properties base-vec)
+    (unwind-protect
+        (progn
+          ;; Seed default from `tramp-connection-properties'.
+          (should (= (tramp-get-connection-property base-vec "uid-integer") 1000))
+          ;; Untouched default is not treated as session cache.
+          (should-not (tramp-rpc--native-connection-has-cache-p key))
+          ;; Overwrite with gateway value and track gateway route with no live proc.
+          (tramp-set-connection-property base-vec "uid-integer" 9999)
+          (should (tramp-rpc--native-connection-has-cache-p key))
+          (puthash key (tramp-rpc--native-effective-route gw-vec)
+                   tramp-rpc--tracked-native-routes)
+          ;; Hopless `file-user-uid' must flush the overwritten cache and
+          ;; return the configured default (1000), not 9999.
+          (let ((default-directory "/ssh:user@native-defover:/"))
+            (should (= (file-user-uid) 1000))))
+      (tramp-flush-connection-properties base-vec)
+      (remhash key tramp-rpc--tracked-native-routes)))
+
+  ;; 4. `make-symbolic-link' treats TARGET as literal link text when on another
+  ;; host — even with `~' or an explicit hop in TARGET, where
+  ;; `tramp-skeleton-make-symbolic-link' calls `expand-file-name' on TARGET —
+  ;; and must not mutate `tramp-default-proxies-alist' or tear down an
+  ;; unrelated session for TARGET's host.
+  (dolist (case '((nil "/ssh:user@review-native:~/target" t nil)
+                  (t "/ssh:alternate|ssh:user@review-native:~/target" t t)
+                  (t "/ftp:alternate|ssh:user@review-native:~/target" t t)
+                  (t "/ssh:alternate|ssh:user@review-native:~/target" nil nil)))
+    (let* ((tramp-default-proxies-alist nil)
+           (tramp-show-ad-hoc-proxies (nth 0 case))
+           (link-target (nth 1 case))
+           (open-gw (nth 2 case))
+           (register-gw (nth 3 case))
+           (native-vec (tramp-dissect-file-name "/ssh:user@review-native:/target"))
+           (gw-vec (tramp-dissect-file-name "/ssh:gateway|ssh:user@review-native:/target"))
+           (other-vec (tramp-dissect-file-name "/ssh:user@review-other:/link"))
+           (native-pipe nil)
+           (ln-cmds nil)
+           (saved-proxies nil))
+      (unwind-protect
+          (cl-letf (((symbol-function 'tramp-start-process)
+                     (lambda (vec name buffer &rest _args)
+                       (let ((p (make-pipe-process :name name :buffer buffer :noquery t)))
+                         (process-put p 'tramp-vector vec)
+                         (tramp-set-connection-property p "last-cmd-time" (current-time))
+                         (when (equal (tramp-file-name-host vec) "review-native")
+                           (setq native-pipe p))
+                         p)))
+                    ((symbol-function 'tramp-barf-if-no-shell-prompt) #'ignore)
+                    ((symbol-function 'tramp-send-string) #'ignore)
+                    ((symbol-function 'tramp-process-actions) #'ignore)
+                    ((symbol-function 'tramp-open-connection-setup-interactive-shell) #'ignore)
+                    ((symbol-function 'tramp-get-remote-ln) (lambda (_vec) "ln"))
+                    ((symbol-function 'tramp-sh-handle-file-exists-p) (lambda (_f) nil))
+                    ((symbol-function 'tramp-send-command-and-check)
+                     (lambda (vec cmd &rest _args)
+                       (push (cons (tramp-file-name-host vec) cmd) ln-cmds)
+                       t)))
+            (if open-gw
+                (progn
+                  (let ((tramp-rpc--inhibit-add-hops t))
+                    (tramp-maybe-open-connection gw-vec))
+                  (when register-gw
+                    (tramp-add-hops gw-vec))
+                  (should (process-live-p native-pipe)))
+              (clrhash tramp-rpc--tracked-native-routes))
+            (setq saved-proxies (copy-tree tramp-default-proxies-alist))
+            (tramp-set-connection-property native-vec "~" "/gw-home")
+            (make-symbolic-link link-target "/ssh:user@review-other:/link" t)
+            (should (= (length ln-cmds) 1))
+            (should (equal (caar ln-cmds) "review-other"))
+            (should (string-search
+                     (tramp-shell-quote-argument link-target)
+                     (cdar ln-cmds)))
+            (when open-gw
+              (should (process-live-p native-pipe)))
+            (should (equal tramp-default-proxies-alist saved-proxies)))
+        (when (process-live-p native-pipe) (delete-process native-pipe))
+        (when-let* ((buf (get-buffer (tramp-buffer-name native-vec))))
+          (kill-buffer buf))
+        (when-let* ((buf (get-buffer (tramp-buffer-name other-vec))))
+          (kill-buffer buf))
+        (tramp-flush-connection-properties native-vec)
+        (tramp-flush-connection-properties other-vec)
+        (remhash (tramp-file-name-unify native-vec) tramp-rpc--tracked-native-routes)
+        (remhash (tramp-file-name-unify other-vec) tramp-rpc--tracked-native-routes))))
+
+  ;; 5. Native `tramp-show-ad-hoc-proxies' t with an identical explicit-hop
+  ;; entry (seeded via native `tramp-add-hops') buried behind a broader rule
+  ;; leaves the live session and cached UID intact without reconnecting.
+  (let* ((tramp-show-ad-hoc-proxies t)
+         (tramp-default-proxies-alist nil)
+         (target-dir "/ssh:explicit|ssh:user@route-dst:/")
+         (base-vec (tramp-dissect-file-name target-dir))
+         (orig-compute (symbol-function 'tramp-compute-multi-hops))
+         (computed-route nil)
+         (start-count 0)
+         (live-pipe nil))
+    ;; Seed the exact entry spelling produced by native `tramp-add-hops',
+    ;; then bury it behind a broader rule matching `route-dst'.
+    (tramp-add-hops base-vec)
+    (push (list "route-dst" nil "/ssh:broad:") tramp-default-proxies-alist)
+    (unwind-protect
+        (cl-letf (((symbol-function 'tramp-compute-multi-hops)
+                   (lambda (vec)
+                     (let ((hops (funcall orig-compute vec)))
+                       (when (equal (tramp-file-name-host vec) "route-dst")
+                         (setq computed-route (mapcar #'tramp-file-name-host hops)))
+                       hops)))
+                  ((symbol-function 'tramp-start-process)
+                   (lambda (vec name buffer &rest _args)
+                     (setq start-count (1+ start-count))
+                     (when (> start-count 2)
+                       (ert-fail (format "Unexpected reconnect loop (starts=%d)" start-count)))
+                     (let ((p (make-pipe-process :name name :buffer buffer :noquery t)))
+                       (process-put p 'tramp-vector vec)
+                       (tramp-set-connection-property p "last-cmd-time" (current-time))
+                       (setq live-pipe p)
+                       p)))
+                  ((symbol-function 'tramp-barf-if-no-shell-prompt) #'ignore)
+                  ((symbol-function 'tramp-send-string) #'ignore)
+                  ((symbol-function 'tramp-process-actions) #'ignore)
+                  ((symbol-function 'tramp-open-connection-setup-interactive-shell) #'ignore)
+                  ((symbol-function 'tramp-sh-handle-file-exists-p)
+                   (lambda (filename)
+                     (with-parsed-tramp-file-name filename v
+                       (tramp-maybe-open-connection v)
+                       t))))
+          (should (file-exists-p (concat target-dir "x")))
+          (should (= start-count 1))
+          ;; Confirm native TRAMP really took the broader rule rather than
+          ;; prepending a duplicate explicit entry.
+          (should (equal computed-route '("broad" "route-dst")))
+          (should (process-live-p live-pipe))
+          (let ((first-pipe live-pipe))
+            (tramp-set-connection-property base-vec "uid-integer" 1000)
+            (dotimes (_ 5)
+              (should (file-exists-p (concat target-dir "x")))
+              (should (= start-count 1))
+              (let ((default-directory target-dir))
+                (should (= (file-user-uid) 1000)))
+              (should (= start-count 1)))
+            (should (eq live-pipe first-pipe))
+            (should (process-live-p first-pipe))))
+      (when (process-live-p live-pipe) (delete-process live-pipe))
+      (when-let* ((buf (get-buffer (tramp-buffer-name base-vec))))
+        (kill-buffer buf))
+      (tramp-flush-connection-properties base-vec)
+      (remhash (tramp-file-name-unify base-vec) tramp-rpc--tracked-native-routes))))
+
+(ert-deftest tramp-rpc-mock-test-file-in-directory-p-fallback-preserves-proxies-alist ()
+  "Direct `tramp-rpc-handle-file-in-directory-p' fallbacks preserve routes and proxies."
+  :tags '(:cache :multi-hop)
+  ;; Test both the batch-error fallback and the macOS case-insensitive fallback
+  ;; with: (a) empty proxies + explicit hops on both args, and (b) hidden proxy
+  ;; rule on directory matching explicit hop on filename.
+  (dolist (mode '(batch-error macos-case))
+    (dolist (route-case
+             '((nil "/ssh:hop-a|rpc:user@target:/repo/a"
+                    "/ssh:hop-a|rpc:user@target:/repo/")
+               ((("\\`target\\'" "\\`user\\'" "/ssh:hop-a:"))
+                "/ssh:hop-a|rpc:user@target:/repo/a"
+                "/rpc:user@target:/repo/")))
+      (let* ((initial-proxies (copy-tree (nth 0 route-case)))
+             (tramp-default-proxies-alist (copy-tree initial-proxies))
+             (tramp-show-ad-hoc-proxies nil)
+             (remote-file-name-inhibit-cache t)
+             (file-arg (nth 1 route-case))
+             (dir-arg (nth 2 route-case))
+             (orig-fallback (symbol-function 'tramp-handle-file-in-directory-p))
+             (fallback-calls 0))
+        (cl-letf (((symbol-function 'tramp-handle-file-in-directory-p)
+                   (lambda (f d)
+                     (setq fallback-calls (1+ fallback-calls))
+                     (funcall orig-fallback f d)))
+                  ((symbol-function 'tramp-rpc--cached-system-info)
+                   (lambda (_vec)
+                     (if (eq mode 'macos-case)
+                         '((os . "macos"))
+                       '((os . "linux")))))
+                  ((symbol-function 'tramp-rpc--call-batch)
+                   (lambda (_vec reqs)
+                     (if (= (length reqs) 2)
+                         ;; Called by `file-equal-p' inside the fallback.
+                         (mapcar
+                          (lambda (req)
+                            (let ((path (tramp-rpc--decode-string
+                                         (alist-get 'path (cdr req)))))
+                              (if (member path '("/repo" "/repo/" "/Repo" "/Repo/"))
+                                  '((type . "directory") (nlinks . 2) (uid . 0) (gid . 0)
+                                    (atime . 100) (mtime . 100) (ctime . 100)
+                                    (size . 4096) (mode . #o755) (inode . 1) (dev . 1))
+                                '((type . "file") (nlinks . 1) (uid . 0) (gid . 0)
+                                  (atime . 100) (mtime . 100) (ctime . 100)
+                                  (size . 1) (mode . #o644) (inode . 2) (dev . 1)))))
+                          reqs)
+                       (if (eq mode 'batch-error)
+                           '(((type . "directory"))
+                             (:error -32001 :message "truename error")
+                             ((path . "/repo")))
+                         ;; macOS case-insensitive mismatch: `/Repo/a' vs `/repo'
+                         '(((type . "directory"))
+                           ((path . "/Repo/a"))
+                           ((path . "/repo")))))))
+                  ((symbol-function 'tramp-rpc--call)
+                   (lambda (_vec method params &optional _conn)
+                     (let ((path (tramp-rpc--decode-string (alist-get 'path params))))
+                       (pcase method
+                         ("file.stat"
+                          (if (member path '("/repo" "/repo/" "/Repo" "/Repo/"))
+                              '((type . "directory") (nlinks . 2) (uid . 0) (gid . 0)
+                                (atime . 100) (mtime . 100) (ctime . 100)
+                                (size . 4096) (mode . #o755) (inode . 1) (dev . 1))
+                            '((type . "file") (nlinks . 1) (uid . 0) (gid . 0)
+                              (atime . 100) (mtime . 100) (ctime . 100)
+                              (size . 1) (mode . #o644) (inode . 2) (dev . 1))))
+                         ("file.truename"
+                          ;; On macOS, component-wise check compares normalized
+                          ;; truenames; return canonical `/repo' or `/repo/a'.
+                          `((path . ,(if (eq mode 'macos-case)
+                                         (downcase path)
+                                       path))))
+                         (_ nil))))))
+          (should (tramp-rpc-handle-file-in-directory-p file-arg dir-arg))
+          (should (= fallback-calls 1))
+          (should (equal tramp-default-proxies-alist initial-proxies)))))))
 
 ;;; ============================================================================
 ;;; Test Runner
