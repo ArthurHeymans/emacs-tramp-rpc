@@ -87,6 +87,12 @@ decoded parameters.  Notifications nobody handles are discarded.")
 (define-error 'tramp-rpc-incompatible-server
   "TRAMP-RPC server protocol is incompatible" 'remote-file-error)
 
+(define-error 'tramp-rpc-server-busy
+  "TRAMP-RPC server rejected the request before running it" 'remote-file-error)
+
+(defconst tramp-rpc--server-busy-retry-delay 0.02
+  "Seconds to wait before resending a request the server rejected as busy.")
+
 (defcustom tramp-rpc-call-timeout 30
   "Maximum seconds to wait for a synchronous RPC call to complete.
 The value must be a positive number."
@@ -1398,6 +1404,9 @@ only."
   "Signal RPC error CODE/OS-ERRNO and optional structured DATA for OPERATION.
 MESSAGE describes the error."
   (cond
+   ((eql code tramp-rpc-protocol-error-server-busy)
+    (signal 'tramp-rpc-server-busy
+            (tramp-rpc--error-args operation nil message filename data)))
    ((= code tramp-rpc-protocol-error-file-not-found)
     (signal 'file-missing
             (tramp-rpc--error-args operation "No such file" message filename data)))
@@ -1751,8 +1760,35 @@ LABEL is used only for debug messages.  The returned plist contains
 TOTAL-TIMEOUT is maximum seconds to wait.
 POLL-INTERVAL is seconds between `accept-process-output' checks.
 CONNECTION, when non-nil, is the captured connection generation to use.
+A request the server rejects as busy never ran, so it is sent again, on
+the same connection generation, until TOTAL-TIMEOUT expires.
 Returns the result or signals an error."
   (let* ((conn (or connection (tramp-rpc--ensure-connection vec)))
+         ;; The retry budget starts with the call, not the first rejection.
+         (deadline (time-add nil total-timeout))
+         (timeout total-timeout))
+    (catch 'tramp-rpc--call-done
+      (while t
+        (condition-case err
+            (throw 'tramp-rpc--call-done
+                   (tramp-rpc--call-with-timeout-once
+                    vec method params timeout poll-interval conn))
+          (tramp-rpc-server-busy
+           (setq timeout (- (float-time (time-subtract deadline nil))
+                            tramp-rpc--server-busy-retry-delay))
+           (when (<= timeout 0)
+             (signal (car err) (cdr err)))
+           (tramp-rpc--debug "BUSY method=%s; retrying" method)
+           (accept-process-output
+            (tramp-rpc-connection-process conn)
+            tramp-rpc--server-busy-retry-delay nil t)))))))
+
+(defun tramp-rpc--call-with-timeout-once
+    (vec method params total-timeout poll-interval connection)
+  "Send METHOD with PARAMS once on CONNECTION for VEC.
+TOTAL-TIMEOUT and POLL-INTERVAL are as for `tramp-rpc--call-with-timeout'.
+Returns the result or signals an error."
+  (let* ((conn connection)
          (process (tramp-rpc-connection-process conn))
          (id-and-request (let ((tramp-rpc-protocol--message-target process))
                            (tramp-rpc-protocol-encode-request-with-id

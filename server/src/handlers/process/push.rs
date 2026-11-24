@@ -4,6 +4,7 @@
 
 use crate::WriterHandle;
 use crate::msgpack_map;
+use crate::output::encode_framed;
 use crate::protocol::{Notification, RpcError, exit_fields};
 use rmpv::Value;
 use std::process::ExitStatus;
@@ -12,8 +13,9 @@ use std::sync::{Arc, OnceLock};
 use tokio::sync::Notify;
 use tokio::task::JoinHandle;
 
-use super::pipe::{get_process_map, read_output, terminate_pipe_process};
-use super::pty::{get_pty_process_map, read_pty_now, terminate_pty_process, wait_for_pty_readable};
+use super::pipe::{read_output_into, terminate_pipe_process};
+use super::pty::{read_pty_into, terminate_pty_process, wait_for_pty_readable};
+use super::{ProcessBackend, registry};
 
 const PUSH_READ_MAX_BYTES: usize = 65_536;
 const PUSH_READ_TIMEOUT_MS: u64 = 200;
@@ -45,10 +47,10 @@ pub(super) async fn send_process_notification(method: &str, params: Value) -> Re
         .cloned()
         .ok_or_else(|| RpcError::internal_error("Process notification writer not initialized"))?;
     let notification = Notification::new(method, params);
-    let bytes = rmp_serde::to_vec_named(&notification)
+    let framed = encode_framed(&notification)
         .map_err(|e| RpcError::internal_error(format!("Failed to encode notification: {e}")))?;
     writer
-        .write_frame(&bytes)
+        .write_prefixed_frame(&framed)
         .await
         .map_err(|e| RpcError::internal_error(format!("Failed to write notification: {e}")))
 }
@@ -74,21 +76,31 @@ async fn wait_for_idle_push(stop: &AtomicBool, wake: &Notify) -> bool {
 }
 
 fn spawn_pipe_push(pid: u32, stop: Arc<AtomicBool>, wake: Arc<Notify>) -> JoinHandle<()> {
-    // A pipe read is deliberately allowed to finish after stop is requested:
-    // cancelling it after it consumed bytes could lose output.
+    // Reuse read scratch buffers across iterations to avoid allocating
+    // 2 * 64 KiB on every idle read cycle, and pass `wake` so stop returns
+    // promptly instead of waiting out the full 200 ms timeout.
     tokio::spawn(async move {
+        let mut stdout_buf = vec![0u8; PUSH_READ_MAX_BYTES];
+        let mut stderr_buf = vec![0u8; PUSH_READ_MAX_BYTES];
+
         while !stop.load(Ordering::Acquire) {
-            let Ok(result) = read_output(pid, PUSH_READ_MAX_BYTES, PUSH_READ_TIMEOUT_MS).await
+            let Ok(result) = read_output_into(
+                pid,
+                &mut stdout_buf,
+                &mut stderr_buf,
+                PUSH_READ_TIMEOUT_MS,
+                Some(&wake),
+            )
+            .await
             else {
                 // The client treats the exit as final, so the child must not
                 // outlive it.
-                let shared = get_process_map()
+                let shared = registry()
                     .lock()
-                    .await
                     .get(&pid)
                     .map(|managed| Arc::clone(&managed.shared_exit_status));
                 let _ = terminate_pipe_process(pid, libc::SIGKILL, false).await;
-                get_process_map().lock().await.remove(&pid);
+                registry().lock().remove(&pid);
                 let status = shared.and_then(|status| *status.lock().expect("shared exit status"));
                 send_exit_notification(pid, status).await;
                 break;
@@ -103,7 +115,7 @@ fn spawn_pipe_push(pid: u32, stop: Arc<AtomicBool>, wake: Arc<Notify>) -> JoinHa
                         Value::Binary(data)
                     }
                 };
-                let _ = send_process_notification(
+                if send_process_notification(
                     "process.output",
                     msgpack_map! {
                         "pid" => pid,
@@ -111,7 +123,13 @@ fn spawn_pipe_push(pid: u32, stop: Arc<AtomicBool>, wake: Arc<Notify>) -> JoinHa
                         "stderr" => bytes_or_nil(result.stderr)
                     },
                 )
-                .await;
+                .await
+                .is_err()
+                {
+                    // Transport stdout is gone; stop pushing rather than
+                    // spinning on broken-pipe writes.
+                    break;
+                }
                 tokio::task::yield_now().await;
             }
 
@@ -128,38 +146,70 @@ fn spawn_pipe_push(pid: u32, stop: Arc<AtomicBool>, wake: Arc<Notify>) -> JoinHa
 
 fn spawn_pty_push(pid: u32, stop: Arc<AtomicBool>, wake: Arc<Notify>) -> JoinHandle<()> {
     tokio::spawn(async move {
+        let mut buf = vec![0u8; PUSH_READ_MAX_BYTES];
+        // Set when readiness was reported but the read has not yet found data.
+        let mut woke_readable = false;
+
         while !stop.load(Ordering::Acquire) {
-            let Ok(result) = read_pty_now(pid, PUSH_READ_MAX_BYTES).await else {
+            let Ok(result) = read_pty_into(pid, &mut buf).await else {
                 // The client treats the exit as final, so the child must not
                 // outlive it.
-                let shared = get_pty_process_map()
+                let shared = registry()
                     .lock()
-                    .await
                     .get(&pid)
                     .map(|managed| Arc::clone(&managed.shared_exit_status));
                 let _ = terminate_pty_process(pid, libc::SIGKILL, true, true).await;
-                get_pty_process_map().lock().await.remove(&pid);
+                registry().lock().remove(&pid);
                 let status = shared.and_then(|status| *status.lock().expect("shared exit status"));
                 send_exit_notification(pid, status).await;
                 break;
             };
             if result.pending {
-                tokio::select! {
-                    _ = wake.notified() => break,
-                    _ = wait_for_pty_readable(pid) => {}
+                // After a slave close Tokio keeps the master's read-closed
+                // readiness, which `WouldBlock` does not clear.  A reopened
+                // but silent slave would then report readiness at once on
+                // every wait, so back off when a wake yielded no data.
+                if std::mem::take(&mut woke_readable) {
+                    if !wait_for_idle_push(&stop, &wake).await {
+                        break;
+                    }
+                    continue;
                 }
-                continue;
+                let wait_outcome = tokio::select! {
+                    _ = wake.notified() => break,
+                    outcome = wait_for_pty_readable(pid) => outcome,
+                };
+                match wait_outcome {
+                    Ok(true) => {
+                        woke_readable = true;
+                        continue;
+                    }
+                    // Entry disappeared while waiting; stop immediately instead
+                    // of tight-spinning.
+                    Ok(false) => break,
+                    Err(_) => {
+                        if !wait_for_idle_push(&stop, &wake).await {
+                            break;
+                        }
+                        continue;
+                    }
+                }
             }
-            let idle = result.output.is_empty();
+            woke_readable = false;
+            let idle = result.bytes_read == 0;
             if !idle {
-                let _ = send_process_notification(
+                if send_process_notification(
                     "process.output",
                     msgpack_map! {
                         "pid" => pid,
-                        "stdout" => Value::Binary(result.output)
+                        "stdout" => Value::Binary(buf[..result.bytes_read].to_vec())
                     },
                 )
-                .await;
+                .await
+                .is_err()
+                {
+                    break;
+                }
                 tokio::task::yield_now().await;
             }
             if result.exited {
@@ -193,18 +243,18 @@ pub(super) fn new_pty_push(pid: u32) -> OutputPush {
 /// PID never precedes the response that announces it.  PIDs come from one
 /// counter shared by pipe and PTY processes.
 pub async fn start_output_push(pid: u32) {
-    if let Some(managed) = get_process_map().lock().await.get_mut(&pid) {
-        if !managed.terminating && managed.output_push.is_none() {
-            managed.output_push = Some(new_pipe_push(pid));
-        }
+    let mut processes = registry().lock();
+    let Some(managed) = processes.get_mut(&pid) else {
+        return;
+    };
+    if managed.terminating || managed.output_push.is_some() {
         return;
     }
-    if let Some(managed) = get_pty_process_map().lock().await.get_mut(&pid)
-        && !managed.terminating
-        && managed.output_push.is_none()
-    {
-        managed.output_push = Some(new_pty_push(pid));
-    }
+    let push = match managed.backend {
+        ProcessBackend::Pipe(_) => new_pipe_push(pid),
+        ProcessBackend::Pty(_) => new_pty_push(pid),
+    };
+    managed.output_push = Some(push);
 }
 
 #[cfg(test)]

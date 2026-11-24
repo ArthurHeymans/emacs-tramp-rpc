@@ -3,21 +3,19 @@
 //! File I/O operations
 
 use crate::msgpack_map;
-use crate::protocol::{RpcError, from_value};
+use crate::protocol::{RpcError, RpcPath, from_value};
 use flate2::Compression;
 use flate2::write::ZlibEncoder;
+use flate2::{Decompress, FlushDecompress, Status};
 use rmpv::Value;
 use serde::Deserialize;
-use std::io::{SeekFrom, Write};
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
-use tokio::fs::{self, File, OpenOptions};
-use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
+use tokio::fs;
 
 use super::HandlerResult;
-use super::file::{bytes_to_path, map_io_error};
-
-use crate::protocol::path_or_bytes;
+use super::file::{file_attributes_from_metadata, map_io_error};
 
 pub(crate) const MAX_FILE_READ_CHUNK_BYTES: usize = 16 * 1024 * 1024;
 
@@ -25,17 +23,20 @@ pub(crate) const MAX_FILE_READ_CHUNK_BYTES: usize = 16 * 1024 * 1024;
 pub async fn read(params: Value) -> HandlerResult {
     #[derive(Deserialize)]
     struct Params {
-        #[serde(with = "path_or_bytes")]
-        path: Vec<u8>,
+        path: RpcPath,
         /// Byte offset to start reading from
         #[serde(default)]
         offset: Option<u64>,
         /// Maximum number of bytes to read (default: entire file)
         #[serde(default)]
         length: Option<usize>,
-        /// When true, zlib-compress payload bytes before sending.
+        /// When true, zlib-compress payload bytes before sending (if smaller).
         #[serde(default)]
         compress: bool,
+        /// When true, include `stat` (fstat attributes), `writable` (effective
+        /// W_OK check or nil if unsupported), and `is_symlink` in the response.
+        #[serde(default)]
+        include_meta: bool,
     }
 
     let params: Params = from_value(params).map_err(|e| RpcError::invalid_params(e.to_string()))?;
@@ -49,77 +50,97 @@ pub async fn read(params: Value) -> HandlerResult {
         )));
     }
 
-    let path = bytes_to_path(&params.path).await?;
-    let path_str = path.to_string_lossy().into_owned();
+    super::run_blocking("File read", move || {
+        let path = params.path.resolve_sync();
+        let path_str = path.to_string_lossy().into_owned();
 
-    let mut file = File::open(&path)
-        .await
-        .map_err(|e| map_io_error(e, &path_str))?;
+        let mut file = std::fs::File::open(&path).map_err(|e| map_io_error(e, &path_str))?;
 
-    // fstat on the open fd: lets chunked clients learn the total size from the
-    // first chunk response instead of spending a separate file.stat RPC.
-    let metadata = file
-        .metadata()
-        .await
-        .map_err(|e| map_io_error(e, &path_str))?;
-    let file_size = metadata.len();
+        // fstat on the open fd: lets chunked clients learn the total size from
+        // the first chunk response instead of spending a separate file.stat RPC.
+        let metadata = file.metadata().map_err(|e| map_io_error(e, &path_str))?;
+        if metadata.is_dir() {
+            return Err(map_io_error(
+                std::io::Error::from_raw_os_error(libc::EISDIR),
+                &path_str,
+            ));
+        }
+        let file_size = metadata.len();
 
-    // Seek to offset if specified
-    if let Some(offset) = params.offset {
-        file.seek(SeekFrom::Start(offset))
-            .await
-            .map_err(|e| map_io_error(e, &path_str))?;
-    }
+        let offset = params.offset.unwrap_or(0);
+        if let Some(offset) = params.offset {
+            file.seek(SeekFrom::Start(offset))
+                .map_err(|e| map_io_error(e, &path_str))?;
+        }
 
-    // Read the content.
-    let content = if let Some(length) = params.length {
-        // Read up to LENGTH bytes in a single pass. `take` keeps reads bounded.
-        let mut buf = Vec::with_capacity(length);
-        let mut reader = file.take(length as u64);
-        reader
-            .read_to_end(&mut buf)
-            .await
-            .map_err(|e| map_io_error(e, &path_str))?;
-        buf
-    } else {
-        read_default_bounded(
-            &mut file,
-            file_size.saturating_sub(params.offset.unwrap_or(0)),
-            &path_str,
-        )
-        .await?
-    };
+        let remaining = file_size.saturating_sub(offset);
+        let content = if let Some(length) = params.length {
+            // Cap initial capacity by remaining file size so a large requested
+            // chunk length on a small file does not eagerly allocate 16 MiB.
+            let initial_cap = length.min(remaining as usize);
+            let mut buf = Vec::with_capacity(initial_cap);
+            file.take(length as u64)
+                .read_to_end(&mut buf)
+                .map_err(|e| map_io_error(e, &path_str))?;
+            buf
+        } else {
+            read_default_bounded_sync(&mut file, remaining, &path_str)?
+        };
 
-    // Return binary content directly (no base64!). Compression is opt-in.
-    let size = content.len();
-    if params.compress {
-        let mut encoder = ZlibEncoder::new(Vec::new(), Compression::fast());
-        encoder
-            .write_all(&content)
-            .map_err(|e| RpcError::internal_error(format!("zlib write failed: {e}")))?;
-        let compressed = encoder
-            .finish()
-            .map_err(|e| RpcError::internal_error(format!("zlib finish failed: {e}")))?;
-        Ok(msgpack_map! {
-            "content" => Value::Binary(compressed),
-            "size" => size,
-            "file_size" => file_size,
-            "compressed" => true,
-            "compression" => "zlib"
-        })
-    } else {
-        Ok(msgpack_map! {
-            "content" => Value::Binary(content),
-            "size" => size,
-            "file_size" => file_size,
-            "compressed" => false,
-            "compression" => Value::Nil
-        })
-    }
+        let size = content.len();
+        let (payload, compressed, compression) = if params.compress {
+            let mut encoder = ZlibEncoder::new(Vec::new(), Compression::fast());
+            encoder
+                .write_all(&content)
+                .map_err(|e| RpcError::internal_error(format!("zlib write failed: {e}")))?;
+            let encoded = encoder
+                .finish()
+                .map_err(|e| RpcError::internal_error(format!("zlib finish failed: {e}")))?;
+            if encoded.len() < content.len() {
+                (encoded, true, Value::String("zlib".into()))
+            } else {
+                (content, false, Value::Nil)
+            }
+        } else {
+            (content, false, Value::Nil)
+        };
+
+        let mut fields = vec![
+            (Value::String("content".into()), Value::Binary(payload)),
+            (Value::String("size".into()), Value::from(size)),
+            (Value::String("file_size".into()), Value::from(file_size)),
+            (
+                Value::String("compressed".into()),
+                Value::Boolean(compressed),
+            ),
+            (Value::String("compression".into()), compression),
+        ];
+
+        if params.include_meta {
+            let is_symlink = std::fs::symlink_metadata(&path)
+                .map(|m| m.file_type().is_symlink())
+                .unwrap_or(false);
+            let stat = file_attributes_from_metadata(&metadata, None).into_value();
+            let writable = match crate::access::check(&path, rustix::fs::Access::WRITE_OK) {
+                Ok(()) => Value::Boolean(true),
+                Err(crate::access::Error::Filesystem(_)) => Value::Boolean(false),
+                Err(crate::access::Error::Unsupported(_)) => Value::Nil,
+            };
+            fields.push((Value::String("stat".into()), stat));
+            fields.push((Value::String("writable".into()), writable));
+            fields.push((
+                Value::String("is_symlink".into()),
+                Value::Boolean(is_symlink),
+            ));
+        }
+
+        Ok(Value::Map(fields))
+    })
+    .await
 }
 
-async fn read_default_bounded(
-    file: &mut File,
+fn read_default_bounded_sync(
+    file: &mut std::fs::File,
     expected_len: u64,
     path: &str,
 ) -> Result<Vec<u8>, RpcError> {
@@ -132,7 +153,6 @@ async fn read_default_bounded(
     let mut buf = Vec::with_capacity(expected_len as usize);
     file.take(MAX_FILE_READ_CHUNK_BYTES as u64 + 1)
         .read_to_end(&mut buf)
-        .await
         .map_err(|e| map_io_error(e, path))?;
     if buf.len() > MAX_FILE_READ_CHUNK_BYTES {
         return Err(RpcError::invalid_params(format!(
@@ -142,12 +162,71 @@ async fn read_default_bounded(
     Ok(buf)
 }
 
+/// Decode a zlib stream that must reach its end marker before any file is
+/// opened: a truncated or empty payload must not truncate the destination.
+fn inflate_complete_zlib(input: &[u8], limit: usize) -> Result<Vec<u8>, RpcError> {
+    let mut inflater = Decompress::new(true);
+    let mut decoded = Vec::with_capacity(input.len().saturating_mul(4).max(64).min(limit + 1));
+    loop {
+        if decoded.len() > limit {
+            return Err(RpcError::invalid_params(
+                "decompressed write payload exceeds maximum frame size",
+            ));
+        }
+        if decoded.len() == decoded.capacity() {
+            decoded.reserve((decoded.capacity()).min(limit + 1 - decoded.len()).max(1));
+        }
+        let before = (inflater.total_in(), inflater.total_out());
+        let consumed = inflater.total_in() as usize;
+        let status = inflater
+            .decompress_vec(&input[consumed..], &mut decoded, FlushDecompress::None)
+            .map_err(|e| RpcError::invalid_params(format!("zlib decode failed: {e}")))?;
+        match status {
+            Status::StreamEnd if decoded.len() <= limit => return Ok(decoded),
+            Status::StreamEnd => {}
+            Status::Ok | Status::BufError => {
+                // Output space remained, yet nothing moved: the input ended
+                // before the stream did.
+                if (inflater.total_in(), inflater.total_out()) == before
+                    && decoded.len() < decoded.capacity()
+                {
+                    return Err(RpcError::invalid_params(
+                        "zlib decode failed: incomplete stream",
+                    ));
+                }
+            }
+        }
+    }
+}
+
+/// Re-apply FILE's own owner after a write, as TRAMP's `write-region` does
+/// through `tramp-set-file-uid-gid`.  Ownership does not change, but watchers
+/// observe the attribute change that file-notify clients, including Emacs's
+/// filenotify tests, expect from `write-region` on a remote file.  An
+/// unchanged owner of -1 would not notify, so the actual ids are passed.
+/// Setuid and setgid files are skipped because chown clears those bits.
+/// Failures are ignored: the write itself has succeeded.
+fn reassert_ownership(file: &std::fs::File) {
+    let Ok(stat) = rustix::fs::fstat(file) else {
+        return;
+    };
+    if rustix::fs::Mode::from_raw_mode(stat.st_mode)
+        .intersects(rustix::fs::Mode::SUID | rustix::fs::Mode::SGID)
+    {
+        return;
+    }
+    let _ = rustix::fs::fchown(
+        file,
+        Some(rustix::fs::Uid::from_raw(stat.st_uid)),
+        Some(rustix::fs::Gid::from_raw(stat.st_gid)),
+    );
+}
+
 /// Write file contents
 pub async fn write(params: Value) -> HandlerResult {
     #[derive(Deserialize)]
     struct Params {
-        #[serde(with = "path_or_bytes")]
-        path: Vec<u8>,
+        path: RpcPath,
         /// Content to write as binary
         #[serde(with = "serde_bytes")]
         content: Vec<u8>,
@@ -160,69 +239,89 @@ pub async fn write(params: Value) -> HandlerResult {
         /// Byte offset to start writing at (only if not appending)
         #[serde(default)]
         offset: Option<u64>,
+        /// Fail with EEXIST if the destination already exists (`O_CREAT | O_EXCL`).
+        #[serde(default)]
+        mustbenew: bool,
+        /// When true, `content` is zlib-compressed and decompressed before writing.
+        #[serde(default)]
+        compress: bool,
+        /// When true, return post-write `fstat` attributes as `"stat"`.
+        #[serde(default)]
+        return_stat: bool,
     }
 
     let params: Params = from_value(params).map_err(|e| RpcError::invalid_params(e.to_string()))?;
 
-    let path = bytes_to_path(&params.path).await?;
-    let path_str = path.to_string_lossy().into_owned();
+    super::run_blocking("File write", move || {
+        let path = params.path.resolve_sync();
+        let path_str = path.to_string_lossy().into_owned();
 
-    // Content is already binary, no decoding needed!
-    let content = params.content;
+        let content = if params.compress {
+            inflate_complete_zlib(&params.content, crate::MAX_FRAME_SIZE)?
+        } else {
+            params.content
+        };
 
-    let mut options = OpenOptions::new();
-    if params.append {
-        options.append(true).create(true);
-    } else if params.offset.is_some() {
-        // Seeking past EOF then writing is the sparse, zero-filled behavior
-        // Emacs expects for an integer `write-region' offset.
-        options.write(true).create(true);
-    } else {
-        options.write(true).create(true).truncate(true);
-    }
+        let mut options = std::fs::OpenOptions::new();
+        if params.mustbenew {
+            options.write(true).create_new(true);
+            if params.append {
+                options.append(true);
+            }
+        } else if params.append {
+            options.append(true).create(true);
+        } else if params.offset.is_some() {
+            // Seeking past EOF then writing is the sparse, zero-filled behavior
+            // Emacs expects for an integer `write-region' offset.
+            options.write(true).create(true);
+        } else {
+            options.write(true).create(true).truncate(true);
+        }
 
-    let mut file = options
-        .open(&path)
-        .await
-        .map_err(|e| map_io_error(e, &path_str))?;
-
-    // Seek to offset if specified
-    if let Some(offset) = params.offset {
-        file.seek(SeekFrom::Start(offset))
-            .await
+        let mut file = options
+            .open(&path)
             .map_err(|e| map_io_error(e, &path_str))?;
-    }
 
-    // Write the content
-    file.write_all(&content)
-        .await
-        .map_err(|e| map_io_error(e, &path_str))?;
-    // Do not report success until Tokio has completed the pending file writes.
-    file.flush().await.map_err(|e| map_io_error(e, &path_str))?;
+        if let Some(offset) = params.offset {
+            file.seek(SeekFrom::Start(offset))
+                .map_err(|e| map_io_error(e, &path_str))?;
+        }
 
-    // Preserve the existing file.write contract for external clients.  The
-    // Emacs client does not pass MODE; callers that do request it explicitly
-    // receive a post-write chmod.
-    if let Some(mode) = params.mode {
-        let perms = std::fs::Permissions::from_mode(mode);
-        file.set_permissions(perms)
-            .await
+        file.write_all(&content)
             .map_err(|e| map_io_error(e, &path_str))?;
-    }
+        file.flush().map_err(|e| map_io_error(e, &path_str))?;
+        reassert_ownership(&file);
 
-    Ok(msgpack_map! {
-        "written" => content.len()
+        // Preserve the existing file.write contract for external clients.  The
+        // Emacs client does not pass MODE; callers that do request it explicitly
+        // receive a post-write chmod.
+        if let Some(mode) = params.mode {
+            let perms = std::fs::Permissions::from_mode(mode);
+            file.set_permissions(perms)
+                .map_err(|e| map_io_error(e, &path_str))?;
+        }
+
+        let mut fields = vec![(Value::String("written".into()), Value::from(content.len()))];
+        if params.return_stat
+            && let Ok(metadata) = file.metadata()
+        {
+            fields.push((
+                Value::String("stat".into()),
+                file_attributes_from_metadata(&metadata, None).into_value(),
+            ));
+        }
+
+        Ok(Value::Map(fields))
     })
+    .await
 }
 
 /// Copy a file or directory.
 pub async fn copy(params: Value) -> HandlerResult {
     #[derive(Deserialize)]
     struct Params {
-        #[serde(with = "path_or_bytes")]
-        src: Vec<u8>,
-        #[serde(with = "path_or_bytes")]
-        dest: Vec<u8>,
+        src: RpcPath,
+        dest: RpcPath,
         /// Public protocol alias for preserving both permissions and timestamps.
         #[serde(default)]
         preserve: bool,
@@ -256,45 +355,40 @@ pub async fn copy(params: Value) -> HandlerResult {
         merge_existing_directories: params.merge_existing_directories,
     };
 
-    let src_path = bytes_to_path(&params.src).await?;
-    let mut dest_path = bytes_to_path(&params.dest).await?;
+    super::run_blocking("File copy", move || {
+        let src_path = params.src.resolve_sync();
+        let mut dest_path = params.dest.resolve_sync();
 
-    // If destination is a directory, append the source filename
-    if !params.exact_dest
-        && fs::metadata(&dest_path)
-            .await
-            .map(|meta| meta.is_dir())
-            .unwrap_or(false)
-        && let Some(filename) = src_path.file_name()
-    {
-        dest_path.push(filename);
-    }
+        // If destination is a directory, append the source filename
+        if !params.exact_dest
+            && std::fs::metadata(&dest_path)
+                .map(|meta| meta.is_dir())
+                .unwrap_or(false)
+            && let Some(filename) = src_path.file_name()
+        {
+            dest_path.push(filename);
+        }
 
-    let src_str = src_path.to_string_lossy().into_owned();
+        let src_str = src_path.to_string_lossy().into_owned();
+        let src_metadata = std::fs::metadata(&src_path).map_err(|e| map_io_error(e, &src_str))?;
 
-    let src_metadata = fs::metadata(&src_path)
-        .await
-        .map_err(|e| map_io_error(e, &src_str))?;
+        let bytes_copied = if src_metadata.is_dir() {
+            reject_recursive_self_copy_sync(&src_path, &dest_path)
+                .map_err(|e| map_io_error(e, &src_str))?;
+            copy_dir_recursive_sync(&src_path, &dest_path, options, true)
+                .map_err(|e| map_io_error(e, &src_str))?
+        } else {
+            // Follow a source symlink, but refuse nonregular files and create
+            // no-overwrite destinations exclusively.
+            copy_regular_file_sync(&src_path, &dest_path, options)
+                .map_err(|e| map_io_error(e, &src_str))?
+        };
 
-    let bytes_copied = if src_metadata.is_dir() {
-        reject_recursive_self_copy(&src_path, &dest_path)
-            .await
-            .map_err(|e| map_io_error(e, &src_str))?;
-        // Recursive directory copy
-        copy_dir_recursive(&src_path, &dest_path, options, true)
-            .await
-            .map_err(|e| map_io_error(e, &src_str))?
-    } else {
-        // Follow a source symlink, but refuse nonregular files and create
-        // no-overwrite destinations exclusively.
-        copy_regular_file(&src_path, &dest_path, options)
-            .await
-            .map_err(|e| map_io_error(e, &src_str))?
-    };
-
-    Ok(msgpack_map! {
-        "copied" => bytes_copied
+        Ok(msgpack_map! {
+            "copied" => bytes_copied
+        })
     })
+    .await
 }
 
 #[derive(Clone, Copy)]
@@ -309,53 +403,50 @@ fn default_true() -> bool {
     true
 }
 
-/// Recursively copy a directory and its contents.
-async fn copy_dir_recursive(
+/// Recursively copy a directory and its contents synchronously within a single
+/// blocking worker task.
+fn copy_dir_recursive_sync(
     src: &Path,
     dest: &Path,
     options: CopyOptions,
     allow_existing_dest_dir: bool,
 ) -> std::io::Result<u64> {
-    ensure_directory_destination(dest, allow_existing_dest_dir).await?;
+    ensure_directory_destination_sync(dest, allow_existing_dest_dir)?;
 
     let mut total: u64 = 0;
-    let mut entries = fs::read_dir(src).await?;
-
-    while let Some(entry) = entries.next_entry().await? {
+    for entry in std::fs::read_dir(src)? {
+        let entry = entry?;
         let entry_path = entry.path();
         let dest_child = dest.join(entry.file_name());
-        let file_type = entry.file_type().await?;
+        let file_type = entry.file_type()?;
 
         if file_type.is_dir() {
-            total += Box::pin(copy_dir_recursive(
+            total += copy_dir_recursive_sync(
                 &entry_path,
                 &dest_child,
                 options,
                 options.merge_existing_directories,
-            ))
-            .await?;
+            )?;
         } else if file_type.is_symlink() {
-            // Preserve symlinks as symlinks
-            let link_target = fs::read_link(&entry_path).await?;
-            prepare_symlink_destination(&dest_child, options.overwrite).await?;
-            tokio::fs::symlink(&link_target, &dest_child).await?;
+            let link_target = std::fs::read_link(&entry_path)?;
+            prepare_symlink_destination_sync(&dest_child, options.overwrite)?;
+            std::os::unix::fs::symlink(&link_target, &dest_child)?;
         } else {
-            total += copy_regular_file(&entry_path, &dest_child, options).await?;
+            total += copy_regular_file_sync(&entry_path, &dest_child, options)?;
         }
     }
 
-    let src_meta = fs::metadata(src).await?;
-    apply_copied_metadata(&src_meta, dest, options).await?;
+    let src_meta = std::fs::metadata(src)?;
+    apply_copied_metadata_sync(&src_meta, dest, options)?;
 
     Ok(total)
 }
 
-async fn ensure_directory_destination(path: &Path, allow_existing: bool) -> std::io::Result<()> {
-    match fs::symlink_metadata(path).await {
+fn ensure_directory_destination_sync(path: &Path, allow_existing: bool) -> std::io::Result<()> {
+    match std::fs::symlink_metadata(path) {
         Ok(_) => {
             if allow_existing
-                && fs::metadata(path)
-                    .await
+                && std::fs::metadata(path)
                     .map(|meta| meta.is_dir())
                     .unwrap_or(false)
             {
@@ -364,14 +455,14 @@ async fn ensure_directory_destination(path: &Path, allow_existing: bool) -> std:
                 Err(already_exists(path))
             }
         }
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => fs::create_dir_all(path).await,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => std::fs::create_dir_all(path),
         Err(e) => Err(e),
     }
 }
 
-async fn reject_recursive_self_copy(src: &Path, dest: &Path) -> std::io::Result<()> {
-    let src = fs::canonicalize(src).await?;
-    let dest = canonicalize_existing_ancestor(dest).await?;
+fn reject_recursive_self_copy_sync(src: &Path, dest: &Path) -> std::io::Result<()> {
+    let src = std::fs::canonicalize(src)?;
+    let dest = canonicalize_existing_ancestor_sync(dest)?;
 
     if dest.starts_with(&src) {
         Err(std::io::Error::new(
@@ -387,13 +478,13 @@ async fn reject_recursive_self_copy(src: &Path, dest: &Path) -> std::io::Result<
     }
 }
 
-async fn canonicalize_existing_ancestor(path: &Path) -> std::io::Result<PathBuf> {
+fn canonicalize_existing_ancestor_sync(path: &Path) -> std::io::Result<PathBuf> {
     let mut ancestor = path.to_path_buf();
     let mut suffix = PathBuf::new();
 
     loop {
-        match fs::symlink_metadata(&ancestor).await {
-            Ok(_) => return Ok(fs::canonicalize(&ancestor).await?.join(suffix)),
+        match std::fs::symlink_metadata(&ancestor) {
+            Ok(_) => return Ok(std::fs::canonicalize(&ancestor)?.join(suffix)),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                 let Some(name) = ancestor.file_name() else {
                     return Err(e);
@@ -414,36 +505,30 @@ async fn canonicalize_existing_ancestor(path: &Path) -> std::io::Result<PathBuf>
 /// but refuses devices, FIFOs and aliases of the source before truncating.
 /// Errors leave partial output: unlinking DEST could delete a concurrent
 /// replacement.  Neither data writes nor metadata updates reopen a pathname.
-async fn copy_regular_file(src: &Path, dest: &Path, options: CopyOptions) -> std::io::Result<u64> {
-    let src = src.to_path_buf();
-    let dest = dest.to_path_buf();
-    tokio::task::spawn_blocking(move || {
-        use std::os::unix::fs::OpenOptionsExt;
+fn copy_regular_file_sync(src: &Path, dest: &Path, options: CopyOptions) -> std::io::Result<u64> {
+    use std::os::unix::fs::OpenOptionsExt;
 
-        // Nonblocking open prevents a FIFO with no writer pinning this worker.
-        let mut source = std::fs::OpenOptions::new()
-            .read(true)
-            .custom_flags(libc::O_NONBLOCK | libc::O_NOCTTY)
-            .open(&src)?;
-        let metadata = source.metadata()?;
-        if !metadata.is_file() {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                format!("Not a regular file: {}", src.display()),
-            ));
-        }
-        let mut target = open_copy_destination(&dest, &metadata, options.overwrite)?;
-        // Apply access permissions before any private source bytes are visible.
-        target.set_permissions(std::fs::Permissions::from_mode(
-            metadata.permissions().mode() & 0o777,
-        ))?;
-        let copied = std::io::copy(&mut source, &mut target)?;
-        // Writes can clear setuid/setgid bits; restore the full mode afterward.
-        apply_copied_metadata_fd(&metadata, &target, options)?;
-        Ok(copied)
-    })
-    .await
-    .map_err(std::io::Error::other)?
+    // Nonblocking open prevents a FIFO with no writer pinning this worker.
+    let mut source = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NONBLOCK | libc::O_NOCTTY)
+        .open(src)?;
+    let metadata = source.metadata()?;
+    if !metadata.is_file() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("Not a regular file: {}", src.display()),
+        ));
+    }
+    let mut target = open_copy_destination(dest, &metadata, options.overwrite)?;
+    // Apply access permissions before any private source bytes are visible.
+    target.set_permissions(std::fs::Permissions::from_mode(
+        metadata.permissions().mode() & 0o777,
+    ))?;
+    let copied = std::io::copy(&mut source, &mut target)?;
+    // Writes can clear setuid/setgid bits; restore the full mode afterward.
+    apply_copied_metadata_fd(&metadata, &target, options)?;
+    Ok(copied)
 }
 
 fn open_copy_destination(
@@ -490,8 +575,8 @@ fn open_copy_destination(
     }
 }
 
-async fn prepare_symlink_destination(path: &Path, overwrite: bool) -> std::io::Result<()> {
-    match fs::symlink_metadata(path).await {
+fn prepare_symlink_destination_sync(path: &Path, overwrite: bool) -> std::io::Result<()> {
+    match std::fs::symlink_metadata(path) {
         Ok(meta) => {
             if !overwrite {
                 return Err(already_exists(path));
@@ -499,7 +584,7 @@ async fn prepare_symlink_destination(path: &Path, overwrite: bool) -> std::io::R
             if meta.is_dir() && !meta.file_type().is_symlink() {
                 return Err(already_exists(path));
             }
-            remove_path_for_overwrite(path).await
+            remove_path_for_overwrite_sync(path)
         }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(e) => Err(e),
@@ -513,13 +598,13 @@ fn already_exists(path: &Path) -> std::io::Error {
     )
 }
 
-async fn apply_copied_metadata(
+fn apply_copied_metadata_sync(
     src_meta: &std::fs::Metadata,
     dest: &Path,
     options: CopyOptions,
 ) -> std::io::Result<()> {
     if options.preserve_permissions {
-        fs::set_permissions(dest, src_meta.permissions()).await?;
+        std::fs::set_permissions(dest, src_meta.permissions())?;
     }
 
     if options.preserve_times {
@@ -531,12 +616,7 @@ async fn apply_copied_metadata(
             let atime_nsec = src_meta.atime_nsec();
             let mtime = src_meta.mtime();
             let mtime_nsec = src_meta.mtime_nsec();
-            let dest = dest.to_path_buf();
-            tokio::task::spawn_blocking(move || {
-                set_file_times_sync_path_io(&dest, atime, atime_nsec, mtime, mtime_nsec, false)
-            })
-            .await
-            .map_err(std::io::Error::other)??;
+            set_file_times_sync_path_io(dest, atime, atime_nsec, mtime, mtime_nsec, false)?;
         }
     }
 
@@ -583,12 +663,12 @@ fn apply_copied_metadata_fd(
     Ok(())
 }
 
-async fn remove_path_for_overwrite(path: &Path) -> std::io::Result<()> {
-    let meta = fs::symlink_metadata(path).await?;
+fn remove_path_for_overwrite_sync(path: &Path) -> std::io::Result<()> {
+    let meta = std::fs::symlink_metadata(path)?;
     if meta.is_dir() && !meta.file_type().is_symlink() {
-        fs::remove_dir_all(path).await
+        std::fs::remove_dir_all(path)
     } else {
-        fs::remove_file(path).await
+        std::fs::remove_file(path)
     }
 }
 
@@ -675,10 +755,8 @@ async fn rename_no_overwrite(src: &Path, dest: &Path) -> std::io::Result<()> {
 pub async fn rename(params: Value) -> HandlerResult {
     #[derive(Deserialize)]
     struct Params {
-        #[serde(with = "path_or_bytes")]
-        src: Vec<u8>,
-        #[serde(with = "path_or_bytes")]
-        dest: Vec<u8>,
+        src: RpcPath,
+        dest: RpcPath,
         /// Overwrite destination if it exists
         #[serde(default)]
         overwrite: bool,
@@ -686,8 +764,8 @@ pub async fn rename(params: Value) -> HandlerResult {
 
     let params: Params = from_value(params).map_err(|e| RpcError::invalid_params(e.to_string()))?;
 
-    let src = bytes_to_path(&params.src).await?;
-    let dest = bytes_to_path(&params.dest).await?;
+    let src = params.src.resolve().await?;
+    let dest = params.dest.resolve().await?;
     let dest_str = dest.to_string_lossy().into_owned();
     let src_str = src.to_string_lossy().into_owned();
 
@@ -714,8 +792,7 @@ pub async fn rename(params: Value) -> HandlerResult {
 pub async fn delete(params: Value) -> HandlerResult {
     #[derive(Deserialize)]
     struct Params {
-        #[serde(with = "path_or_bytes")]
-        path: Vec<u8>,
+        path: RpcPath,
         /// If true, don't error if file doesn't exist
         #[serde(default)]
         force: bool,
@@ -723,7 +800,7 @@ pub async fn delete(params: Value) -> HandlerResult {
 
     let params: Params = from_value(params).map_err(|e| RpcError::invalid_params(e.to_string()))?;
 
-    let path = bytes_to_path(&params.path).await?;
+    let path = params.path.resolve().await?;
     let path_str = path.to_string_lossy().into_owned();
 
     match fs::remove_file(&path).await {
@@ -739,8 +816,7 @@ pub async fn delete(params: Value) -> HandlerResult {
 pub async fn set_modes(params: Value) -> HandlerResult {
     #[derive(Deserialize)]
     struct Params {
-        #[serde(with = "path_or_bytes")]
-        path: Vec<u8>,
+        path: RpcPath,
         mode: u32,
         /// If true, change a symlink itself instead of following it.  Required
         /// so a client that forgets it cannot silently modify a link target.
@@ -749,15 +825,15 @@ pub async fn set_modes(params: Value) -> HandlerResult {
 
     let params: Params = from_value(params).map_err(|e| RpcError::invalid_params(e.to_string()))?;
 
-    let path = bytes_to_path(&params.path).await?;
+    let path = params.path.resolve().await?;
     let path_str = path.to_string_lossy().into_owned();
     let mode = params.mode;
     let nofollow = params.nofollow;
 
-    tokio::task::spawn_blocking(move || set_file_modes_sync(&path, mode, nofollow))
-        .await
-        .map_err(|e| RpcError::internal_error(e.to_string()))?
-        .map_err(|e| map_io_error(e, &path_str))?;
+    super::run_blocking("Set file modes", move || {
+        set_file_modes_sync(&path, mode, nofollow).map_err(|e| map_io_error(e, &path_str))
+    })
+    .await?;
 
     Ok(Value::Boolean(true))
 }
@@ -766,13 +842,18 @@ pub async fn set_modes(params: Value) -> HandlerResult {
 pub async fn set_times(params: Value) -> HandlerResult {
     #[derive(Deserialize)]
     struct Params {
-        #[serde(with = "path_or_bytes")]
-        path: Vec<u8>,
+        path: RpcPath,
         /// Modification time (seconds since epoch)
         mtime: i64,
+        /// Modification time nanoseconds (0..1_000_000_000, default 0)
+        #[serde(default)]
+        mtime_nsec: i64,
         /// Access time (seconds since epoch, defaults to mtime)
         #[serde(default)]
         atime: Option<i64>,
+        /// Access time nanoseconds (defaults to mtime_nsec when atime is omitted, else 0)
+        #[serde(default)]
+        atime_nsec: Option<i64>,
         /// If true, update a symlink itself instead of following it.
         #[serde(default)]
         nofollow: bool,
@@ -780,19 +861,30 @@ pub async fn set_times(params: Value) -> HandlerResult {
 
     let params: Params = from_value(params).map_err(|e| RpcError::invalid_params(e.to_string()))?;
 
-    let path = bytes_to_path(&params.path).await?;
+    let path = params.path.resolve().await?;
     let path_str = path.to_string_lossy().into_owned();
-    let atime = params.atime.unwrap_or(params.mtime);
     let mtime = params.mtime;
+    let mtime_nsec = params.mtime_nsec;
+    let (atime, atime_nsec) = match params.atime {
+        Some(atime) => (atime, params.atime_nsec.unwrap_or(0)),
+        None => (mtime, params.atime_nsec.unwrap_or(mtime_nsec)),
+    };
+    // `utimensat' reads UTIME_NOW and UTIME_OMIT from the nanosecond field;
+    // out-of-range values must not reach it as control values.
+    for (name, nsec) in [("mtime_nsec", mtime_nsec), ("atime_nsec", atime_nsec)] {
+        if !(0..1_000_000_000).contains(&nsec) {
+            return Err(RpcError::invalid_params(format!(
+                "{name} must be in 0..1000000000, got {nsec}"
+            )));
+        }
+    }
     let nofollow = params.nofollow;
 
-    // Use spawn_blocking for the libc syscall
-    tokio::task::spawn_blocking(move || {
-        set_file_times_sync_path_io(&path, atime, 0, mtime, 0, nofollow)
+    super::run_blocking("Set file times", move || {
+        set_file_times_sync_path_io(&path, atime, atime_nsec, mtime, mtime_nsec, nofollow)
+            .map_err(|e| map_io_error(e, &path_str))
     })
-    .await
-    .map_err(|e| RpcError::internal_error(e.to_string()))?
-    .map_err(|e| map_io_error(e, &path_str))?;
+    .await?;
 
     Ok(Value::Boolean(true))
 }
@@ -801,16 +893,14 @@ pub async fn set_times(params: Value) -> HandlerResult {
 pub async fn make_symlink(params: Value) -> HandlerResult {
     #[derive(Deserialize)]
     struct Params {
-        #[serde(with = "path_or_bytes")]
-        target: Vec<u8>,
-        #[serde(with = "path_or_bytes")]
-        link_path: Vec<u8>,
+        target: RpcPath,
+        link_path: RpcPath,
     }
 
     let params: Params = from_value(params).map_err(|e| RpcError::invalid_params(e.to_string()))?;
 
-    let target = bytes_to_path(&params.target).await?;
-    let link_path = bytes_to_path(&params.link_path).await?;
+    let target = params.target.resolve().await?;
+    let link_path = params.link_path.resolve().await?;
     let link_path_str = link_path.to_string_lossy().into_owned();
 
     #[cfg(unix)]
@@ -839,17 +929,15 @@ pub async fn make_hardlink(params: Value) -> HandlerResult {
     #[derive(Deserialize)]
     struct Params {
         /// The existing file to link to
-        #[serde(with = "path_or_bytes")]
-        src: Vec<u8>,
+        src: RpcPath,
         /// The new hard link path
-        #[serde(with = "path_or_bytes")]
-        dest: Vec<u8>,
+        dest: RpcPath,
     }
 
     let params: Params = from_value(params).map_err(|e| RpcError::invalid_params(e.to_string()))?;
 
-    let src = bytes_to_path(&params.src).await?;
-    let dest = bytes_to_path(&params.dest).await?;
+    let src = params.src.resolve().await?;
+    let dest = params.dest.resolve().await?;
     let dest_str = dest.to_string_lossy().into_owned();
 
     fs::hard_link(&src, &dest)
@@ -863,8 +951,7 @@ pub async fn make_hardlink(params: Value) -> HandlerResult {
 pub async fn chown(params: Value) -> HandlerResult {
     #[derive(Deserialize)]
     struct Params {
-        #[serde(with = "path_or_bytes")]
-        path: Vec<u8>,
+        path: RpcPath,
         /// New user ID (-1 to leave unchanged)
         uid: i32,
         /// New group ID (-1 to leave unchanged)
@@ -873,20 +960,18 @@ pub async fn chown(params: Value) -> HandlerResult {
 
     let params: Params = from_value(params).map_err(|e| RpcError::invalid_params(e.to_string()))?;
 
-    let path = bytes_to_path(&params.path).await?;
+    let path = params.path.resolve().await?;
     let uid = chown_id(params.uid, "uid")?;
     let gid = chown_id(params.gid, "gid")?;
 
-    // Use spawn_blocking for the chown syscall
-    tokio::task::spawn_blocking(move || {
-        use nix::unistd::{Gid, Uid, chown};
+    super::run_blocking("File chown", move || {
+        use rustix::process::{Gid, Uid};
 
         let owner = uid.map(Uid::from_raw);
         let group = gid.map(Gid::from_raw);
-        chown(&path, owner, group).map_err(|error| RpcError::io_error(error.into()))
+        rustix::fs::chown(&path, owner, group).map_err(|error| RpcError::io_error(error.into()))
     })
-    .await
-    .map_err(|e| RpcError::internal_error(e.to_string()))??;
+    .await?;
 
     Ok(Value::Boolean(true))
 }
@@ -1183,7 +1268,7 @@ mod tests {
     #[tokio::test]
     async fn rename_fallback_preserves_destination_when_source_removal_fails() {
         // Root can unlink in a read-only directory, so it cannot exercise this.
-        if nix::unistd::geteuid().is_root() {
+        if rustix::process::geteuid().is_root() {
             return;
         }
         let tmp = tempfile::tempdir().expect("create tempdir");
@@ -1374,19 +1459,16 @@ mod tests {
         assert_eq!(error.code, RpcError::INVALID_PARAMS);
     }
 
-    #[tokio::test]
-    async fn default_read_rejects_file_that_grows_after_metadata() {
+    #[test]
+    fn default_read_rejects_file_that_grows_after_metadata() {
         let tmp = tempfile::tempdir().expect("create tempdir");
         let path = tmp.path().join("file");
-        fs::write(&path, b"x").await.unwrap();
-        let mut file = File::open(&path).await.unwrap();
-        let expected_len = file.metadata().await.unwrap().len();
-        fs::write(&path, vec![b'x'; MAX_FILE_READ_CHUNK_BYTES + 1])
-            .await
-            .unwrap();
+        std::fs::write(&path, b"x").unwrap();
+        let mut file = std::fs::File::open(&path).unwrap();
+        let expected_len = file.metadata().unwrap().len();
+        std::fs::write(&path, vec![b'x'; MAX_FILE_READ_CHUNK_BYTES + 1]).unwrap();
 
-        let error = read_default_bounded(&mut file, expected_len, &path.to_string_lossy())
-            .await
+        let error = read_default_bounded_sync(&mut file, expected_len, &path.to_string_lossy())
             .expect_err("grown file must remain bounded");
 
         assert_eq!(error.code, RpcError::INVALID_PARAMS);
@@ -1651,13 +1733,13 @@ mod tests {
         assert_eq!(fs::read(&target).await.unwrap(), b"new");
     }
 
-    #[tokio::test]
-    async fn atomic_copy_never_truncates_a_rejected_destination() {
+    #[test]
+    fn atomic_copy_never_truncates_a_rejected_destination() {
         let tmp = tempfile::tempdir().expect("create tempdir");
         let src = tmp.path().join("src.txt");
         let dest = tmp.path().join("dest.txt");
-        fs::write(&src, b"new").await.unwrap();
-        fs::write(&dest, b"old").await.unwrap();
+        std::fs::write(&src, b"new").unwrap();
+        std::fs::write(&dest, b"old").unwrap();
 
         let options = CopyOptions {
             preserve_permissions: false,
@@ -1665,19 +1747,18 @@ mod tests {
             overwrite: false,
             merge_existing_directories: false,
         };
-        let error = copy_regular_file(&src, &dest, options)
-            .await
+        let error = copy_regular_file_sync(&src, &dest, options)
             .expect_err("an existing destination must be refused");
         assert_eq!(error.kind(), std::io::ErrorKind::AlreadyExists);
         // The refusal must not have truncated the destination first.
-        assert_eq!(fs::read(&dest).await.unwrap(), b"old");
+        assert_eq!(std::fs::read(&dest).unwrap(), b"old");
 
         let options = CopyOptions {
             overwrite: true,
             ..options
         };
-        assert_eq!(copy_regular_file(&src, &dest, options).await.unwrap(), 3);
-        assert_eq!(fs::read(&dest).await.unwrap(), b"new");
+        assert_eq!(copy_regular_file_sync(&src, &dest, options).unwrap(), 3);
+        assert_eq!(std::fs::read(&dest).unwrap(), b"new");
 
         assert_eq!(std::fs::read_dir(tmp.path()).unwrap().count(), 2);
     }
@@ -1858,5 +1939,243 @@ mod tests {
         fs::set_permissions(copied.join("child"), writable)
             .await
             .unwrap();
+    }
+
+    #[tokio::test]
+    async fn read_include_meta_and_skip_incompressible() {
+        let tmp = tempfile::tempdir().expect("create tempdir");
+        let path = tmp.path().join("tiny");
+        fs::write(&path, b"hi").await.unwrap();
+
+        let result = read(msgpack_map! {
+            "path" => path_value(&path),
+            "compress" => true,
+            "include_meta" => true,
+        })
+        .await
+        .expect("read with meta and compress");
+
+        let map = result.as_map().unwrap();
+        let field = |name: &str| {
+            map.iter()
+                .find(|(k, _)| k.as_str() == Some(name))
+                .map(|(_, v)| v)
+        };
+        // "hi" (2 bytes) expands under zlib, so server must send it uncompressed.
+        assert_eq!(field("compressed").and_then(Value::as_bool), Some(false));
+        assert_eq!(field("content").and_then(Value::as_slice), Some(&b"hi"[..]));
+        assert_eq!(field("is_symlink").and_then(Value::as_bool), Some(false));
+        assert_eq!(field("writable").and_then(Value::as_bool), Some(true));
+        let stat = field("stat").and_then(Value::as_map).expect("stat map");
+        let size = stat
+            .iter()
+            .find(|(k, _)| k.as_str() == Some("size"))
+            .and_then(|(_, v)| v.as_u64());
+        assert_eq!(size, Some(2));
+    }
+
+    #[test]
+    fn inflate_complete_zlib_enforces_decoded_size_limit() {
+        let payload = b"0123456789".repeat(100);
+        let mut encoder = ZlibEncoder::new(Vec::new(), Compression::fast());
+        encoder.write_all(&payload).unwrap();
+        let compressed = encoder.finish().unwrap();
+
+        assert_eq!(
+            inflate_complete_zlib(&compressed, payload.len()).unwrap(),
+            payload
+        );
+        let error = inflate_complete_zlib(&compressed, payload.len() - 1).unwrap_err();
+        assert!(error.message.contains("exceeds maximum frame size"));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn write_reports_attribute_change_without_changing_owner() {
+        use rustix::fs::inotify;
+        use std::os::unix::fs::MetadataExt;
+
+        let tmp = tempfile::tempdir().expect("create tempdir");
+        let path = tmp.path().join("file");
+        fs::write(&path, b"before").await.unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o640)).unwrap();
+        let before = std::fs::metadata(&path).unwrap();
+        let watch = inotify::init(inotify::CreateFlags::NONBLOCK | inotify::CreateFlags::CLOEXEC)
+            .expect("inotify");
+        inotify::add_watch(&watch, &path, inotify::WatchFlags::ATTRIB).expect("watch file");
+
+        write(msgpack_map! {
+            "path" => path_value(&path),
+            "content" => Value::Binary(b"after".to_vec()),
+        })
+        .await
+        .expect("overwrite");
+
+        let mut buf = [std::mem::MaybeUninit::<u8>::uninit(); 1024];
+        let mut reader = inotify::Reader::new(&watch, &mut buf);
+        let event = reader.next().expect("write raises an inotify event");
+        assert!(event.events().contains(inotify::ReadFlags::ATTRIB));
+        let after = std::fs::metadata(&path).unwrap();
+        assert_eq!((after.uid(), after.gid()), (before.uid(), before.gid()));
+        assert_eq!(after.permissions().mode() & 0o7777, 0o640);
+        assert_eq!(fs::read(&path).await.unwrap(), b"after");
+    }
+
+    #[tokio::test]
+    async fn write_rejects_incomplete_zlib_stream_without_truncating() {
+        let tmp = tempfile::tempdir().expect("create tempdir");
+        let path = tmp.path().join("file");
+        fs::write(&path, b"original").await.unwrap();
+
+        let mut encoder = ZlibEncoder::new(Vec::new(), Compression::fast());
+        encoder.write_all(&b"replacement ".repeat(50)).unwrap();
+        let complete = encoder.finish().unwrap();
+        for content in [Vec::new(), complete[..complete.len() / 2].to_vec()] {
+            let error = write(msgpack_map! {
+                "path" => path_value(&path),
+                "content" => Value::Binary(content),
+                "compress" => true,
+            })
+            .await
+            .expect_err("an incomplete zlib stream must be rejected");
+            assert_eq!(error.code, RpcError::INVALID_PARAMS);
+            assert_eq!(fs::read(&path).await.unwrap(), b"original");
+        }
+
+        // A complete stream that decodes to zero bytes still truncates.
+        let empty = ZlibEncoder::new(Vec::new(), Compression::fast())
+            .finish()
+            .unwrap();
+        write(msgpack_map! {
+            "path" => path_value(&path),
+            "content" => Value::Binary(empty),
+            "compress" => true,
+        })
+        .await
+        .expect("write an empty decoded payload");
+        assert_eq!(fs::read(&path).await.unwrap(), b"");
+    }
+
+    #[tokio::test]
+    async fn write_mustbenew_compress_and_return_stat() {
+        let tmp = tempfile::tempdir().expect("create tempdir");
+        let path = tmp.path().join("newfile");
+
+        let payload = b"hello world ".repeat(100);
+        let mut encoder = ZlibEncoder::new(Vec::new(), Compression::fast());
+        encoder.write_all(&payload).unwrap();
+        let compressed = encoder.finish().unwrap();
+
+        let res = write(msgpack_map! {
+            "path" => path_value(&path),
+            "content" => Value::Binary(compressed.clone()),
+            "mustbenew" => true,
+            "compress" => true,
+            "return_stat" => true,
+        })
+        .await
+        .expect("mustbenew compressed write");
+
+        assert_eq!(fs::read(&path).await.unwrap(), payload);
+        let map = res.as_map().unwrap();
+        let written = map
+            .iter()
+            .find(|(k, _)| k.as_str() == Some("written"))
+            .and_then(|(_, v)| v.as_u64());
+        assert_eq!(written, Some(payload.len() as u64));
+        let stat = map
+            .iter()
+            .find(|(k, _)| k.as_str() == Some("stat"))
+            .and_then(|(_, v)| v.as_map())
+            .expect("return_stat map");
+        let size = stat
+            .iter()
+            .find(|(k, _)| k.as_str() == Some("size"))
+            .and_then(|(_, v)| v.as_u64());
+        assert_eq!(size, Some(payload.len() as u64));
+
+        // Second mustbenew write must fail with EEXIST / already_exists.
+        let err = write(msgpack_map! {
+            "path" => path_value(&path),
+            "content" => Value::Binary(b"other".to_vec()),
+            "mustbenew" => true,
+        })
+        .await
+        .expect_err("mustbenew must fail on existing file");
+        let kind = err
+            .data
+            .as_ref()
+            .and_then(Value::as_map)
+            .and_then(|m| m.iter().find(|(k, _)| k.as_str() == Some("error_kind")))
+            .and_then(|(_, v)| v.as_str());
+        assert_eq!(kind, Some("already_exists"));
+        assert_eq!(fs::read(&path).await.unwrap(), payload);
+    }
+
+    #[tokio::test]
+    async fn set_times_preserves_subsecond_nanoseconds() {
+        let tmp = tempfile::tempdir().expect("create tempdir");
+        let path = tmp.path().join("ts");
+        fs::write(&path, b"x").await.unwrap();
+
+        set_times(msgpack_map! {
+            "path" => path_value(&path),
+            "mtime" => 1_700_000_000i64,
+            "mtime_nsec" => 123_456_789i64,
+        })
+        .await
+        .expect("set_times with nsec");
+
+        let meta = fs::metadata(&path).await.unwrap();
+        assert_eq!(meta.mtime(), 1_700_000_000);
+        // Allow coarse filesystem timer granularity (some FS truncate to ms/us),
+        // but on Linux tmpfs/ext4 nanosecond precision is exact.
+        assert!(meta.mtime_nsec() > 0);
+    }
+
+    #[tokio::test]
+    async fn set_times_rejects_out_of_range_nanoseconds() {
+        let tmp = tempfile::tempdir().expect("create tempdir");
+        let path = tmp.path().join("ts");
+        fs::write(&path, b"x").await.unwrap();
+        set_times(msgpack_map! {"path" => path_value(&path), "mtime" => 1_000i64})
+            .await
+            .expect("set a known time");
+
+        // 1073741823 is UTIME_NOW on Linux.
+        for (key, nsec) in [
+            ("mtime_nsec", 1_073_741_823i64),
+            ("atime_nsec", 1_000_000_000i64),
+            ("mtime_nsec", -1i64),
+        ] {
+            let error = set_times(msgpack_map! {
+                "path" => path_value(&path),
+                "mtime" => 1_700_000_000i64,
+                key => nsec,
+            })
+            .await
+            .expect_err("out-of-range nanoseconds must be rejected");
+            assert_eq!(error.code, RpcError::INVALID_PARAMS);
+        }
+        assert_eq!(fs::metadata(&path).await.unwrap().mtime(), 1_000);
+    }
+
+    #[tokio::test]
+    async fn read_zero_length_directory_fails_with_eisdir() {
+        let tmp = tempfile::tempdir().expect("create tempdir");
+        let err = read(msgpack_map! {
+            "path" => path_value(tmp.path()),
+            "offset" => 0u64,
+            "length" => 0u64,
+        })
+        .await
+        .expect_err("zero-length read of a directory must fail");
+        let errno = err
+            .data
+            .as_ref()
+            .and_then(Value::as_map)
+            .and_then(|m| m.iter().find(|(k, _)| k.as_str() == Some("os_errno")))
+            .and_then(|(_, v)| v.as_i64());
+        assert_eq!(errno, Some(i64::from(libc::EISDIR)));
     }
 }

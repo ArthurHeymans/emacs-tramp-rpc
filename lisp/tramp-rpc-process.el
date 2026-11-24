@@ -484,6 +484,17 @@ its queue is gone and must not be created again."
                      (puthash queue-key (tramp-rpc--process-write-queue-fail
                                          q :connection-replaced)
                               tramp-rpc--process-write-queues))
+                    ((eql (tramp-rpc-protocol-error-code response)
+                          tramp-rpc-protocol-error-server-busy)
+                     ;; Admission rejected the write before it reached the
+                     ;; child.  Send it again first, keeping `:writing' set
+                     ;; so later writes stay queued behind it.
+                     (setq q (plist-put q :pending
+                                        (cons item (plist-get q :pending))))
+                     (setq q (plist-put q :current nil))
+                     (puthash queue-key q tramp-rpc--process-write-queues)
+                     (run-at-time tramp-rpc--server-busy-retry-delay nil
+                                  #'tramp-rpc--process-write-queue queue-key))
                     ((plist-get response :error)
                      (puthash queue-key (tramp-rpc--process-write-queue-fail
                                          q :rpc-error (plist-get response :error))

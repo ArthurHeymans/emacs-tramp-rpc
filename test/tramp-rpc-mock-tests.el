@@ -1460,6 +1460,47 @@ Unknown type at load time."
       (kill-buffer buffer)
       (clrhash tramp-rpc--process-write-queues)))))
 
+(ert-deftest tramp-rpc-mock-test-process-write-queue-resends-busy-rejection ()
+  "A write rejected as busy is sent again, ahead of later writes."
+  (let* ((vec (tramp-dissect-file-name "/rpc:queue-busy:/tmp/"))
+         (buffer (generate-new-buffer " *tramp-rpc-queue-busy*"))
+         (connection (start-process "tramp-rpc-queue-busy" buffer "sleep" "10"))
+         (conn (tramp-rpc--make-connection :process connection))
+         (tramp-rpc--connections (make-hash-table :test 'equal))
+         (tramp-rpc--server-busy-retry-delay 0)
+         callbacks requests)
+    (unwind-protect
+        (progn
+          (puthash (tramp-rpc--connection-key vec) conn tramp-rpc--connections)
+          (cl-letf (((symbol-function 'tramp-rpc--ensure-connection)
+                     (lambda (_vec) conn))
+                    ((symbol-function 'tramp-rpc--call-async)
+                     (lambda (_vec _method params callback &optional _connection)
+                       (setq requests (append requests
+                                              (list (alist-get 'data params))))
+                       (setq callbacks (append callbacks (list callback))))))
+            (tramp-rpc--write-remote-process vec 1 "one")
+            (tramp-rpc--write-remote-process vec 1 "two")
+            (funcall (pop callbacks)
+                     `(:error (:code ,tramp-rpc-protocol-error-server-busy
+                               :message "Server deferred request queue is full")))
+            (should (= (length requests) 1))
+            (with-timeout (5 (ert-fail "busy write was not sent again"))
+              (while (< (length requests) 2)
+                (accept-process-output nil 0.01)))
+            (funcall (pop callbacks) '(:result t))
+            (funcall (pop callbacks) '(:result t))
+            (should (equal requests (mapcar #'msgpack-bin-make '("one" "one" "two"))))
+            (let ((queue (gethash (tramp-rpc--process-write-queue-key
+                                   vec 1 connection)
+                                  tramp-rpc--process-write-queues)))
+              (should-not (plist-get queue :failure))
+              (should-not (plist-get queue :pending))
+              (should-not (plist-get queue :writing)))))
+      (when (process-live-p connection) (delete-process connection))
+      (kill-buffer buffer)
+      (clrhash tramp-rpc--process-write-queues))))
+
 (ert-deftest tramp-rpc-mock-test-process-write-queue-callback-after-cleanup ()
   "A late write callback cannot recreate a cleaned queue."
   (let* ((vec (tramp-dissect-file-name "/rpc:queue-cleanup:/tmp/"))

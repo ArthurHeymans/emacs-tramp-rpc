@@ -100,7 +100,7 @@ expensive expressions such as buffer sizes or `prin1' of large values."
 (defvar tramp-rpc-protocol--message-target nil
   "TRAMP vector or process used for level-6 protocol debug messages.")
 
-(defconst tramp-rpc-protocol-revision 3
+(defconst tramp-rpc-protocol-revision 4
   "Required RPC contract revision, independent of the package version.
 Bump together with the server's PROTOCOL_REVISION for incompatible changes.")
 
@@ -285,18 +285,23 @@ Returns the integer errno, or nil if not an IO error with errno."
 (defconst tramp-rpc-protocol-error-permission-denied -32002)
 (defconst tramp-rpc-protocol-error-io -32003)
 (defconst tramp-rpc-protocol-error-process -32004)
+(defconst tramp-rpc-protocol-error-server-busy -32005
+  "Admission rejected the request before it ran; it may be sent again.")
 
 ;; ============================================================================
 ;; Length-prefixed framing support
 ;; ============================================================================
 
 (defun tramp-rpc-protocol-read-length (buffer)
-  "Read the 4-byte big-endian length from BUFFER.
+  "Read the 4-byte big-endian length from BUFFER without allocating strings.
 Returns the length as an integer, or nil if the BUFFER is too short."
   (with-current-buffer buffer
-    (when (>= (point-max) (+ (mark-marker) 4))
-      (msgpack-bytes-to-unsigned
-       (buffer-substring (mark-marker) (+ (mark-marker) 4))))))
+    (let ((pos (marker-position (mark-marker))))
+      (when (>= (point-max) (+ pos 4))
+        (logior (ash (char-after pos) 24)
+                (ash (char-after (+ pos 1)) 16)
+                (ash (char-after (+ pos 2)) 8)
+                (char-after (+ pos 3)))))))
 
 (defun tramp-rpc-protocol-try-read-message (buffer)
   "Try to read a complete message from BUFFER.

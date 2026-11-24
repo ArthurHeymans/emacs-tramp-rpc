@@ -88,6 +88,76 @@ SPEC is (PROCESS BUFFER [CONNECTION]); CONNECTION defaults to `connection'."
         (should (zerop (hash-table-count
                         (tramp-rpc-connection-pending-responses connection))))))))
 
+;; A busy rejection means the request never ran, so the synchronous caller
+;; resends it on the same generation instead of failing.
+(defmacro tramp-rpc-mock-test-request--with-replies (replies sent &rest body)
+  "Run BODY answering each sent request with the next of REPLIES.
+Request frames are collected in SENT, oldest first."
+  (declare (indent 2))
+  `(let ((next-id 200))
+     (cl-letf (((symbol-function 'tramp-rpc--ensure-connection)
+                (lambda (_vec) connection))
+               ((symbol-function 'tramp-rpc-protocol-encode-request-with-id)
+                (lambda (&rest _)
+                  (setq next-id (1+ next-id))
+                  (cons next-id (format "request-%d" next-id))))
+               ((symbol-function 'tramp-rpc--send-request-frame)
+                (lambda (_conn _vec request _event)
+                  (setq ,sent (append ,sent (list request)))))
+               ((symbol-function 'tramp-rpc--wait-for-response-ids)
+                (lambda (_conn ids &rest _)
+                  (let ((responses (make-hash-table :test 'eql)))
+                    (puthash (car ids) (append (list :id (car ids))
+                                               (if (cdr ,replies)
+                                                   (pop ,replies)
+                                                 (car ,replies)))
+                             responses)
+                    (list :responses responses :elapsed 0 :process-live t)))))
+       ,@body)))
+
+(ert-deftest tramp-rpc-mock-test-request-busy-rejection-is-resent ()
+  "A request rejected as busy is sent again and its later result returned."
+  (tramp-rpc-mock-test-request--with-connection (process buffer)
+    (let ((vec (tramp-rpc-mock-test-request--vec))
+          (replies (list `(:error (:code ,tramp-rpc-protocol-error-server-busy
+                                   :message "Server deferred request queue is full"))
+                         '(:result written)))
+          sent)
+      (tramp-rpc-mock-test-request--with-replies replies sent
+        (should (eq (tramp-rpc--call-with-timeout
+                     vec "process.write_pty" nil 5 0.01)
+                    'written))
+        (should (equal sent '("request-201" "request-202")))))))
+
+(ert-deftest tramp-rpc-mock-test-request-busy-retry-budget-starts-with-call ()
+  "A busy reply arriving after the call's timeout is not resent."
+  (tramp-rpc-mock-test-request--with-connection (process buffer)
+    (let ((vec (tramp-rpc-mock-test-request--vec))
+          (replies (list `(:error (:code ,tramp-rpc-protocol-error-server-busy
+                                   :message "Server deferred request queue is full"))))
+          sent)
+      (tramp-rpc-mock-test-request--with-replies replies sent
+        (let ((wait (symbol-function 'tramp-rpc--wait-for-response-ids)))
+          (cl-letf (((symbol-function 'tramp-rpc--wait-for-response-ids)
+                     (lambda (&rest args)
+                       (sleep-for 0.2)
+                       (apply wait args))))
+            (should-error (tramp-rpc--call-with-timeout vec "system.info" nil 0.1 0.01)
+                          :type 'tramp-rpc-server-busy)))
+        (should (equal sent '("request-201")))))))
+
+(ert-deftest tramp-rpc-mock-test-request-busy-rejection-stops-at-timeout ()
+  "A server that stays busy fails the call once its timeout is spent."
+  (tramp-rpc-mock-test-request--with-connection (process buffer)
+    (let ((vec (tramp-rpc-mock-test-request--vec))
+          (replies (list `(:error (:code ,tramp-rpc-protocol-error-server-busy
+                                   :message "Server deferred request queue is full"))))
+          sent)
+      (tramp-rpc-mock-test-request--with-replies replies sent
+        (should-error (tramp-rpc--call-with-timeout vec "system.info" nil 0.1 0.01)
+                      :type 'tramp-rpc-server-busy)
+        (should (> (length sent) 1))))))
+
 (ert-deftest tramp-rpc-mock-test-request-id-less-error-retires-generation ()
   "An uncorrelated error fails all callers rather than guessing a request ID."
   (dolist (synchronous '(nil t))

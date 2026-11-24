@@ -2,9 +2,25 @@
 
 //! Serialized framing and connection-wide output failure.
 
+use serde::Serialize;
 use std::io;
 use tokio::io::{AsyncWrite, AsyncWriteExt};
 use tokio::sync::{Mutex, watch};
+
+/// Encode a serializable RPC message into a single buffer containing its
+/// 4-byte big-endian length prefix followed by the MessagePack payload.
+/// Writing this buffer in a single `write_all` avoids splitting frames across
+/// multiple syscalls.
+pub fn encode_framed<T: Serialize>(value: &T) -> io::Result<Vec<u8>> {
+    let mut buf = Vec::with_capacity(256);
+    buf.extend_from_slice(&[0u8; 4]);
+    rmp_serde::encode::write_named(&mut buf, value).map_err(io::Error::other)?;
+    let payload_len = buf.len() - 4;
+    let length = u32::try_from(payload_len)
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "Frame length exceeds u32"))?;
+    buf[..4].copy_from_slice(&length.to_be_bytes());
+    Ok(buf)
+}
 
 pub struct FrameWriter<W> {
     writer: Mutex<W>,
@@ -29,6 +45,29 @@ impl<W> FrameWriter<W> {
 }
 
 impl<W: AsyncWrite + Unpin> FrameWriter<W> {
+    /// Write a buffer that already starts with its 4-byte big-endian length
+    /// prefix (as produced by [`encode_framed`]).  The lock covers the entire
+    /// frame, including its flush.
+    pub async fn write_prefixed_frame(&self, framed_bytes: &[u8]) -> io::Result<()> {
+        debug_assert!(framed_bytes.len() >= 4);
+        let mut closed = self.failure();
+        let result = tokio::select! {
+            biased;
+            _ = closed.wait_for(|failed| *failed) => {
+                Err(io::Error::new(io::ErrorKind::BrokenPipe, "RPC output closed"))
+            }
+            result = async {
+                let mut writer = self.writer.lock().await;
+                writer.write_all(framed_bytes).await?;
+                writer.flush().await
+            } => result,
+        };
+        if result.is_err() {
+            self.close();
+        }
+        result
+    }
+
     /// The lock covers the entire frame, including its flush.  Closing the
     /// writer interrupts blocked writes and lock waiters; any partial frame
     /// belongs to a permanently closed stream.
@@ -138,5 +177,20 @@ mod tests {
         assert!(*failure.borrow());
         assert!(writer.write_frame(b"another frame").await.is_err());
         assert_eq!(writer.writer.lock().await.calls, 2);
+    }
+
+    #[tokio::test]
+    async fn encode_framed_writes_length_prefix_and_payload_together() {
+        let (write, mut read) = tokio::io::duplex(128);
+        let writer = FrameWriter::new(write);
+        let framed = encode_framed(&"hello").unwrap();
+        writer.write_prefixed_frame(&framed).await.unwrap();
+        drop(writer);
+        let mut bytes = Vec::new();
+        read.read_to_end(&mut bytes).await.unwrap();
+        let len = u32::from_be_bytes(bytes[..4].try_into().unwrap()) as usize;
+        assert_eq!(len, bytes.len() - 4);
+        let decoded: String = rmp_serde::from_slice(&bytes[4..]).unwrap();
+        assert_eq!(decoded, "hello");
     }
 }

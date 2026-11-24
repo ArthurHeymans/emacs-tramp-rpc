@@ -237,27 +237,30 @@ mod tests {
                 let single = crate::handlers::dispatch(Request {
                     version: "2.0".into(),
                     id: RequestId::Number(1),
-                    method: "file.access".into(),
+                    method: crate::protocol::Method::FileAccess,
                     params: params.clone(),
                 })
-                .await;
+                .await
+                .response;
                 assert!(single.result.is_none());
                 let error = single.error.unwrap();
                 assert_eq!(error.code, RpcError::IO_ERROR);
-                let data: HashMap<String, i32> = from_value(error.data.unwrap()).unwrap();
-                assert_eq!(data["os_errno"], errno);
+                let data: HashMap<String, Value> = from_value(error.data.unwrap()).unwrap();
+                assert_eq!(data["os_errno"].as_i64(), Some(i64::from(errno)));
+                assert_eq!(data["error_kind"].as_str(), Some("unsupported"));
 
                 let batch = crate::handlers::dispatch(Request {
                     version: "2.0".into(),
                     id: RequestId::Number(2),
-                    method: "batch".into(),
+                    method: crate::protocol::Method::Batch,
                     params: crate::msgpack_map! {
                         "requests" => Value::Array(vec![crate::msgpack_map! {
                             "method" => "file.access", "params" => params,
                         }]),
                     },
                 })
-                .await;
+                .await
+                .response;
                 assert!(batch.error.is_none());
                 let result: HashMap<String, Vec<HashMap<String, Value>>> =
                     from_value(batch.result.unwrap()).unwrap();
@@ -265,8 +268,9 @@ mod tests {
                 assert!(!entry.contains_key("result"));
                 let error: HashMap<String, Value> = from_value(entry["error"].clone()).unwrap();
                 assert_eq!(error["code"].as_i64(), Some(i64::from(RpcError::IO_ERROR)));
-                let data: HashMap<String, i32> = from_value(error["data"].clone()).unwrap();
-                assert_eq!(data["os_errno"], errno);
+                let data: HashMap<String, Value> = from_value(error["data"].clone()).unwrap();
+                assert_eq!(data["os_errno"].as_i64(), Some(i64::from(errno)));
+                assert_eq!(data["error_kind"].as_str(), Some("unsupported"));
             });
     }
 
