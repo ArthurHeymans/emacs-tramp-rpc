@@ -44,14 +44,17 @@
   buffer
   ;; Buffer receiving the transport's standard error, or nil.
   stderr-buffer
+  ;; Pipe process feeding STDERR-BUFFER for this exact generation, or nil.
+  stderr-process
   ;; TRAMP vector this generation serves.
   vec
-  ;; Synchronous request IDs awaiting a response, newest first.
-  (pending-ids nil)
-  ;; Request ID -> response plist, for synchronous waiters.
+  ;; Request ID -> 'pending (awaiting reply) or response plist, for sync waiters.
   (pending-responses (make-hash-table :test 'eql))
   ;; Request ID -> callback, for asynchronous calls.
   (async-callbacks (make-hash-table :test 'eql))
+  ;; Non-nil while startup handshake is running (keeps stderr-buffer alive for
+  ;; startup error inspection until `tramp-rpc--start-server-process' finishes).
+  starting
   ;; Lifecycle bookkeeping set by connection cleanup.
   cleanup-started
   cleanup-reason
@@ -67,6 +70,12 @@
   ;; Incremented before route metadata is flushed, so pending system.info
   ;; replies cannot undo an explicit reset on this same live connection.
   (metadata-epoch 0)
+  ;; Cached system.info response alist for this generation.
+  system-info
+  ;; Non-nil when server-side filesystem watcher push notifications are active.
+  (watcher-available t)
+  ;; Cached SHA-1 route hash for this connection's key.
+  route-hash
   ;; Lazily allocated by tramp-rpc-environment.el.  Replacing this object
   ;; clears caches without letting in-flight probes refill the new state.
   environment)

@@ -2,17 +2,18 @@
 
 //! File metadata operations
 
-use crate::protocol::{FileAttributes, FileType, RpcError, from_value};
+use crate::protocol::{FileAttributes, FileType, RpcError, RpcPath, from_value};
 use rmpv::Value;
 use serde::Deserialize;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
+use std::ffi::{OsStr, OsString};
 use std::io::Read;
+use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{FileTypeExt, MetadataExt};
-use std::path::Path;
+use std::path::{Component, Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::Mutex;
+use std::sync::{Arc, LazyLock, Mutex, RwLock};
 use std::time::{Duration, Instant};
-use tokio::fs;
 
 use super::HandlerResult;
 
@@ -20,9 +21,7 @@ use super::HandlerResult;
 pub async fn stat(params: Value) -> HandlerResult {
     #[derive(Deserialize)]
     struct Params {
-        /// Path as string (UTF-8) or bytes (non-UTF8)
-        #[serde(with = "path_or_bytes")]
-        path: Vec<u8>,
+        path: RpcPath,
         /// If true, don't follow symlinks
         #[serde(default)]
         lstat: bool,
@@ -30,9 +29,9 @@ pub async fn stat(params: Value) -> HandlerResult {
 
     let params: Params = from_value(params).map_err(|e| RpcError::invalid_params(e.to_string()))?;
 
-    let path = bytes_to_path(&params.path).await?;
-    match get_file_attributes(path.as_path(), params.lstat).await {
-        Ok(attrs) => Ok(attrs.to_value()),
+    let path = params.path.resolve().await?;
+    match get_file_attributes(path, params.lstat).await {
+        Ok(attrs) => Ok(attrs.into_value()),
         Err(e) if e.code == RpcError::FILE_NOT_FOUND => Ok(Value::Nil),
         Err(e) => Err(e),
     }
@@ -43,8 +42,7 @@ pub async fn stat(params: Value) -> HandlerResult {
 pub async fn access(params: Value) -> HandlerResult {
     #[derive(Deserialize)]
     struct Params {
-        #[serde(with = "path_or_bytes")]
-        path: Vec<u8>,
+        path: RpcPath,
         /// Any combination of r/w/x; empty checks existence only.
         mode: String,
         /// For write-only checks, retry ENOENT against the immediate parent.
@@ -75,8 +73,8 @@ pub async fn access(params: Value) -> HandlerResult {
             "Parent fallback requires write-only access mode",
         ));
     }
-    let path = bytes_to_path(&params.path).await?;
-    tokio::task::spawn_blocking(move || {
+    let path = params.path.resolve().await?;
+    super::run_blocking("Access", move || {
         let result = crate::access::check(&path, mode);
         let result = match result {
             Err(crate::access::Error::Filesystem(rustix::io::Errno::NOENT))
@@ -95,9 +93,12 @@ pub async fn access(params: Value) -> HandlerResult {
         let (errno, message) = match result {
             Ok(()) => (0, None),
             Err(crate::access::Error::Unsupported(error)) => {
+                // Keep the errno for diagnostics, but an EPERM here means the
+                // check could not run, not that access was denied.
                 return Err(RpcError::io_error(std::io::Error::from_raw_os_error(
                     error.raw_os_error(),
-                )));
+                ))
+                .with_error_kind("unsupported"));
             }
             Err(crate::access::Error::Filesystem(error)) => {
                 (error.raw_os_error(), Some(error.to_string()))
@@ -110,7 +111,6 @@ pub async fn access(params: Value) -> HandlerResult {
         Ok(Value::Map(result))
     })
     .await
-    .map_err(|error| RpcError::internal_error(format!("Access task join error: {error}")))?
 }
 
 /// Keep trailing separators and dot components, like Emacs file-name-directory.
@@ -124,26 +124,117 @@ fn access_parent(path: &Path) -> Option<&Path> {
     }
 }
 
-/// Get the true name of a file (resolve symlinks)
+/// Maximum number of symlink hops before reporting ELOOP, matching Emacs's
+/// `file-truename` counter limit.
+const MAX_SYMLINK_HOPS: usize = 100;
+
+/// Resolve symlinks in `path` (including symlinked parent directories of
+/// non-existent files and dangling symlinks), matching Emacs `file-truename`.
+pub(crate) fn resolve_truename_sync(path: &Path) -> std::io::Result<PathBuf> {
+    // Fast path for existing paths: kernel/libc canonicalize resolves everything
+    // in a single pass.  Its ELOOP limit (40 links with glibc) is lower than
+    // MAX_SYMLINK_HOPS, so the walker below decides whether a chain loops.
+    if let Ok(canonical) = std::fs::canonicalize(path) {
+        return Ok(canonical);
+    }
+
+    let mut current = if path.is_absolute() {
+        PathBuf::from("/")
+    } else {
+        std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/"))
+    };
+
+    let mut pending: VecDeque<OsString> = VecDeque::new();
+    for component in path.components() {
+        match component {
+            Component::RootDir | Component::CurDir => {}
+            Component::ParentDir => pending.push_back(OsString::from("..")),
+            Component::Normal(part) => pending.push_back(part.to_os_string()),
+            Component::Prefix(_) => {}
+        }
+    }
+
+    let mut hops: usize = 0;
+    let mut missing = false;
+
+    while let Some(part) = pending.pop_front() {
+        if part == "." {
+            continue;
+        }
+        if part == ".." {
+            current.pop();
+            // Popping back out of a non-existent suffix may land on an
+            // existing directory again.
+            missing = false;
+            continue;
+        }
+
+        let candidate = current.join(&part);
+        if missing {
+            current = candidate;
+            continue;
+        }
+
+        match std::fs::symlink_metadata(&candidate) {
+            Ok(meta) if meta.file_type().is_symlink() => {
+                hops += 1;
+                if hops > MAX_SYMLINK_HOPS {
+                    return Err(std::io::Error::from_raw_os_error(libc::ELOOP));
+                }
+                let target = std::fs::read_link(&candidate)?;
+                if target.is_absolute() {
+                    current = PathBuf::from("/");
+                }
+                // Prepend target components in order before remaining pending parts.
+                let mut target_parts = Vec::new();
+                for component in target.components() {
+                    match component {
+                        Component::RootDir | Component::CurDir => {}
+                        Component::ParentDir => target_parts.push(OsString::from("..")),
+                        Component::Normal(name) => target_parts.push(name.to_os_string()),
+                        Component::Prefix(_) => {}
+                    }
+                }
+                for target_part in target_parts.into_iter().rev() {
+                    pending.push_front(target_part);
+                }
+            }
+            Ok(_) => {
+                current = candidate;
+            }
+            Err(err) if err.raw_os_error() == Some(libc::ELOOP) => {
+                return Err(err);
+            }
+            Err(_) => {
+                // Missing component, ENOTDIR, or EACCES: stop chasing symlinks
+                // below this point and append remaining components verbatim,
+                // matching Emacs's `file-truename`.
+                current = candidate;
+                missing = true;
+            }
+        }
+    }
+
+    Ok(current)
+}
+
+/// Get the true name of a file (resolve symlinks, including symlinked ancestors
+/// of non-existent files and dangling symlinks).
 pub async fn truename(params: Value) -> HandlerResult {
     #[derive(Deserialize)]
     struct Params {
-        #[serde(with = "path_or_bytes")]
-        path: Vec<u8>,
+        path: RpcPath,
     }
 
     let params: Params = from_value(params).map_err(|e| RpcError::invalid_params(e.to_string()))?;
-
-    let path = bytes_to_path(&params.path).await?;
+    let path = params.path.resolve().await?;
     let path_str = path.to_string_lossy().into_owned();
 
-    // Use tokio's async canonicalize
-    let canonical = fs::canonicalize(&path)
-        .await
-        .map_err(|e| map_io_error(e, &path_str))?;
+    let canonical = super::run_blocking("Truename", move || {
+        resolve_truename_sync(&path).map_err(|e| map_io_error(e, &path_str))
+    })
+    .await?;
 
-    // Return path as binary (MessagePack handles encoding)
-    use std::os::unix::ffi::OsStrExt;
     let bytes = canonical.as_os_str().as_bytes();
     Ok(Value::Binary(bytes.to_vec()))
 }
@@ -152,36 +243,19 @@ pub async fn truename(params: Value) -> HandlerResult {
 // Helper functions
 // ============================================================================
 
-pub async fn get_file_attributes(path: &Path, lstat: bool) -> Result<FileAttributes, RpcError> {
-    let metadata = if lstat {
-        fs::symlink_metadata(path).await
-    } else {
-        fs::metadata(path).await
-    }
-    .map_err(|e| map_io_error(e, &path.to_string_lossy()))?;
-
+/// Build `FileAttributes` synchronously from an already-fetched `Metadata`
+/// (e.g. from `fstat` on an open file descriptor) plus optional symlink target.
+pub(crate) fn file_attributes_from_metadata(
+    metadata: &std::fs::Metadata,
+    link_target: Option<Vec<u8>>,
+) -> FileAttributes {
     let file_type = file_type_from_metadata_ft(&metadata.file_type());
-
-    let link_target = if file_type == FileType::Symlink {
-        fs::read_link(path)
-            .await
-            .ok()
-            .map(|p| p.as_os_str().as_bytes().to_vec())
-    } else {
-        None
-    };
-
     let uid = metadata.uid();
     let gid = metadata.gid();
+    let uname = get_user_name(uid).map(|s| s.to_string());
+    let gname = get_group_name(gid).map(|s| s.to_string());
 
-    // Name resolution can block (libc NSS + getent subprocess): run it on a
-    // dedicated blocking thread so Tokio worker threads are not stalled.
-    let (uname, gname) =
-        tokio::task::spawn_blocking(move || (get_user_name(uid), get_group_name(gid)))
-            .await
-            .unwrap_or((None, None));
-
-    Ok(FileAttributes {
+    FileAttributes {
         file_type,
         nlinks: metadata.nlink(),
         uid,
@@ -189,14 +263,42 @@ pub async fn get_file_attributes(path: &Path, lstat: bool) -> Result<FileAttribu
         uname,
         gname,
         atime: metadata.atime(),
+        atime_nsec: metadata.atime_nsec(),
         mtime: metadata.mtime(),
+        mtime_nsec: metadata.mtime_nsec(),
         ctime: metadata.ctime(),
+        ctime_nsec: metadata.ctime_nsec(),
         size: metadata.len(),
         mode: metadata.mode(),
         inode: metadata.ino(),
         dev: metadata.dev(),
         link_target,
+    }
+}
+
+/// Collect file attributes in a single `spawn_blocking` call (metadata +
+/// readlink + NSS resolution), avoiding multiple threadpool hops.
+pub async fn get_file_attributes(path: PathBuf, lstat: bool) -> Result<FileAttributes, RpcError> {
+    super::run_blocking("Stat", move || {
+        let metadata = if lstat {
+            std::fs::symlink_metadata(&path)
+        } else {
+            std::fs::metadata(&path)
+        }
+        .map_err(|e| map_io_error(e, &path.to_string_lossy()))?;
+
+        let file_type = file_type_from_metadata_ft(&metadata.file_type());
+        let link_target = if file_type == FileType::Symlink {
+            std::fs::read_link(&path)
+                .ok()
+                .map(|p| p.as_os_str().as_bytes().to_vec())
+        } else {
+            None
+        };
+
+        Ok(file_attributes_from_metadata(&metadata, link_target))
     })
+    .await
 }
 
 pub(crate) fn file_type_from_metadata_ft(ft: &std::fs::FileType) -> FileType {
@@ -226,26 +328,29 @@ enum NssKind {
     Group,
 }
 
+/// Maximum entries retained in each NSS cache before eviction.
+const MAX_NSS_CACHE_ENTRIES: usize = 4096;
+
 /// Cache of uid -> resolved name. A cached `None` records a *definitive*
 /// miss (the uid is absent from all NSS databases). Transient failures
 /// (timeout, backend unavailable) are not cached so a later lookup can
 /// succeed once the directory service recovers.
-static USER_NAMES: std::sync::LazyLock<Mutex<HashMap<u32, Option<String>>>> =
-    std::sync::LazyLock::new(|| Mutex::new(HashMap::new()));
+static USER_NAMES: LazyLock<RwLock<HashMap<u32, Option<Arc<str>>>>> =
+    LazyLock::new(|| RwLock::new(HashMap::new()));
 
 /// Cache of gid -> resolved name. Same caching semantics as `USER_NAMES`.
-static GROUP_NAMES: std::sync::LazyLock<Mutex<HashMap<u32, Option<String>>>> =
-    std::sync::LazyLock::new(|| Mutex::new(HashMap::new()));
+static GROUP_NAMES: LazyLock<RwLock<HashMap<u32, Option<Arc<str>>>>> =
+    LazyLock::new(|| RwLock::new(HashMap::new()));
 
 /// Short negative cache for transient NSS failures (LDAP/SSSD outage).
 /// Without this, every directory entry with the same uid/gid retries libc +
 /// `getent` (~2s each), turning one listing into a per-entry retry storm.
 /// Entries expire after `TRANSIENT_NSS_TTL` so recovery is still prompt.
 const TRANSIENT_NSS_TTL: Duration = Duration::from_secs(10);
-static TRANSIENT_USER_FAILURES: std::sync::LazyLock<Mutex<HashMap<u32, Instant>>> =
-    std::sync::LazyLock::new(|| Mutex::new(HashMap::new()));
-static TRANSIENT_GROUP_FAILURES: std::sync::LazyLock<Mutex<HashMap<u32, Instant>>> =
-    std::sync::LazyLock::new(|| Mutex::new(HashMap::new()));
+static TRANSIENT_USER_FAILURES: LazyLock<Mutex<HashMap<u32, Instant>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+static TRANSIENT_GROUP_FAILURES: LazyLock<Mutex<HashMap<u32, Instant>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
 
 fn transient_failure_recent(cache: &Mutex<HashMap<u32, Instant>>, id: u32) -> bool {
     let mut cache = cache.lock().unwrap_or_else(|e| e.into_inner());
@@ -284,14 +389,11 @@ const GETENT_POLL_INTERVAL: Duration = Duration::from_millis(10);
 /// Bounds `reader.join()` in case an orphaned process inherited the pipe write-end.
 const GETENT_READER_TIMEOUT: Duration = Duration::from_millis(500);
 
+/// Maximum stdout bytes buffered from `getent` (we only need the name field
+/// before the first ':'; any remaining member list is drained without storing).
+const GETENT_MAX_CAPTURE_BYTES: usize = 4096;
+
 /// Join the reader thread with a bounded timeout.
-///
-/// After `child.kill()` + `child.wait()` the direct child's write-end of the
-/// pipe is closed, but an orphaned subprocess that inherited the fd would keep
-/// `read_to_end` (and therefore `join`) blocked forever.  We poll
-/// `is_finished` for up to `GETENT_READER_TIMEOUT`; if it doesn't complete we
-/// leak the thread (it will eventually unblock once the orphan exits or the
-/// pipe is otherwise closed).
 fn bounded_join_reader(reader: std::thread::JoinHandle<Vec<u8>>) {
     let deadline = Instant::now() + GETENT_READER_TIMEOUT;
     loop {
@@ -309,16 +411,9 @@ fn bounded_join_reader(reader: std::thread::JoinHandle<Vec<u8>>) {
 /// Resolve a uid/gid to a name via the `getent` command, used only as a
 /// fallback when the reentrant libc lookup fails.
 ///
-/// Returns a tri-state:
-/// - `Ok(Some(name))`: id resolved successfully.
-/// - `Ok(None)`: id is definitively absent (getent exited non-zero cleanly).
-/// - `Err(())`: transient failure (spawn error, timeout, I/O error); the
-///   caller must *not* cache this result so a later lookup can succeed once
-///   the directory service recovers.
-///
-/// Stdout is drained on a dedicated thread so the child can never block
-/// when its output exceeds the pipe buffer (e.g. `getent group` with many
-/// members). The deadline kills the child if it does not exit in time.
+/// Buffers at most `GETENT_MAX_CAPTURE_BYTES` while draining any remaining
+/// stdout so large LDAP group lines never cause unbounded memory allocation
+/// or spurious SIGPIPE failures.
 fn getent_name(database: &str, id: u32) -> Result<Option<String>, ()> {
     let mut child = Command::new("getent")
         .arg(database)
@@ -329,12 +424,20 @@ fn getent_name(database: &str, id: u32) -> Result<Option<String>, ()> {
         .spawn()
         .map_err(|_| ())?;
 
-    // Drain stdout on a separate thread so the child is never blocked
-    // writing when its output exceeds the pipe buffer.
     let mut stdout = child.stdout.take().ok_or(())?;
     let reader = std::thread::spawn(move || {
         let mut buf = Vec::new();
-        stdout.read_to_end(&mut buf).ok();
+        let _ = (&mut stdout)
+            .take(GETENT_MAX_CAPTURE_BYTES as u64)
+            .read_to_end(&mut buf);
+        // Drain any remaining bytes into a fixed stack buffer so `getent`
+        // cannot block on the pipe or fail with SIGPIPE on huge group lines.
+        let mut discard = [0u8; 4096];
+        while let Ok(n) = stdout.read(&mut discard) {
+            if n == 0 {
+                break;
+            }
+        }
         buf
     });
 
@@ -344,11 +447,10 @@ fn getent_name(database: &str, id: u32) -> Result<Option<String>, ()> {
             Ok(Some(status)) => break status,
             Ok(None) => {
                 if Instant::now() >= deadline {
-                    // Deadline expired: terminate the child and give up.
                     let _ = child.kill();
                     let _ = child.wait();
                     bounded_join_reader(reader);
-                    return Err(()); // transient: timeout
+                    return Err(());
                 }
                 std::thread::sleep(GETENT_POLL_INTERVAL);
             }
@@ -356,7 +458,7 @@ fn getent_name(database: &str, id: u32) -> Result<Option<String>, ()> {
                 let _ = child.kill();
                 let _ = child.wait();
                 bounded_join_reader(reader);
-                return Err(()); // transient: I/O error on try_wait
+                return Err(());
             }
         }
     };
@@ -367,11 +469,20 @@ fn getent_name(database: &str, id: u32) -> Result<Option<String>, ()> {
         return Ok(None); // definitive: id does not exist in any NSS database
     }
 
-    let line = std::str::from_utf8(&buf)
-        .ok()
-        .and_then(|s| s.lines().next())
-        .ok_or(())?;
-    let name = line.split(':').next().ok_or(())?;
+    parse_getent_name(&buf)
+}
+
+/// Extract the name field from captured `getent` output.  The capture may end
+/// inside a multibyte character of a long member list, so only the bytes
+/// before the first ':' are decoded.  A capture without a complete name
+/// field is an error.
+fn parse_getent_name(buf: &[u8]) -> Result<Option<String>, ()> {
+    let end = buf.iter().position(|&byte| byte == b':').ok_or(())?;
+    let name = &buf[..end];
+    if name.contains(&b'\n') {
+        return Err(());
+    }
+    let name = std::str::from_utf8(name).map_err(|_| ())?;
     if name.is_empty() {
         Ok(None)
     } else {
@@ -381,9 +492,6 @@ fn getent_name(database: &str, id: u32) -> Result<Option<String>, ()> {
 
 /// Reentrant passwd/group lookup by id through nix, which retries with a
 /// growing buffer on `ERANGE` so large LDAP/SSSD records still resolve.
-///
-/// Returns `Ok(Some(name))` on a hit, `Ok(None)` when libc reports a miss and
-/// `Err(errno)` when the backend failed (unavailable, timeout, ...).
 fn nss_name_by_id(kind: NssKind, id: u32) -> nix::Result<Option<String>> {
     match kind {
         NssKind::User => nix::unistd::User::from_uid(nix::unistd::Uid::from_raw(id))
@@ -393,27 +501,20 @@ fn nss_name_by_id(kind: NssKind, id: u32) -> nix::Result<Option<String>> {
     }
 }
 
-/// Shared NSS name resolution for both uid and gid.
-///
-/// Uses `getpwuid_r` or `getgrgid_r` (selected by `kind`) through nix, falls
-/// back to `getent` on libc misses and errors, caches definitive results
-/// indefinitely, and caches transient failures (timeout, backend
-/// unavailable) for `TRANSIENT_NSS_TTL` so one listing under outage does not
-/// retry per entry.
+/// Shared NSS name resolution for both uid and gid using a concurrent read-heavy
+/// `RwLock` cache returning `Arc<str>`.
 fn resolve_nss_name(
-    cache: &'static Mutex<HashMap<u32, Option<String>>>,
+    cache: &'static RwLock<HashMap<u32, Option<Arc<str>>>>,
     kind: NssKind,
     id: u32,
-) -> Option<String> {
-    // Fast path: check cache under lock, release immediately.
+) -> Option<Arc<str>> {
+    // Fast path: shared read lock.
     {
-        let c = cache.lock().unwrap_or_else(|e| e.into_inner());
+        let c = cache.read().unwrap_or_else(|e| e.into_inner());
         if let Some(result) = c.get(&id) {
             return result.clone();
         }
     }
-    // Short negative cache for transient outage: fail fast without hitting
-    // libc/getent again within the TTL window.
     let transient_cache = match kind {
         NssKind::User => &*TRANSIENT_USER_FAILURES,
         NssKind::Group => &*TRANSIENT_GROUP_FAILURES,
@@ -429,20 +530,18 @@ fn resolve_nss_name(
 
     let name_result: Result<Option<String>, ()> = match nss_name_by_id(kind, id) {
         Ok(Some(name)) => Ok(Some(name)),
-        // Some NSS stacks can report a libc miss here while `getent` still
-        // resolves through another backend; libc errors (backend unavailable,
-        // etc.) take the same fallback.
         Ok(None) | Err(_) => getent_name(database, id),
     };
 
-    // Cache definitive results indefinitely; cache transient failures for
-    // TRANSIENT_NSS_TTL so a later lookup can succeed once the service
-    // recovers, without retrying per directory entry during an outage.
     match name_result {
         Ok(name) => {
-            let mut c = cache.lock().unwrap_or_else(|e| e.into_inner());
-            c.insert(id, name.clone());
-            name
+            let shared: Option<Arc<str>> = name.map(Arc::from);
+            let mut c = cache.write().unwrap_or_else(|e| e.into_inner());
+            if c.len() >= MAX_NSS_CACHE_ENTRIES {
+                c.clear();
+            }
+            c.insert(id, shared.clone());
+            shared
         }
         Err(()) => {
             record_transient_failure(transient_cache, id);
@@ -451,19 +550,15 @@ fn resolve_nss_name(
     }
 }
 
-pub fn get_user_name(uid: u32) -> Option<String> {
+pub fn get_user_name(uid: u32) -> Option<Arc<str>> {
     resolve_nss_name(&USER_NAMES, NssKind::User, uid)
 }
 
-pub fn get_group_name(gid: u32) -> Option<String> {
+pub fn get_group_name(gid: u32) -> Option<Arc<str>> {
     resolve_nss_name(&GROUP_NAMES, NssKind::Group, gid)
 }
 
 /// Resolve the login shell for `uid` via getpwuid_r.
-///
-/// nix retries with a growing buffer on `ERANGE`, so passwd records larger
-/// than the initial sysconf hint (large LDAP/SSSD entries) still resolve
-/// instead of being reported as absent.
 pub(crate) fn get_user_login_shell(uid: u32) -> Option<String> {
     nix::unistd::User::from_uid(nix::unistd::Uid::from_raw(uid))
         .ok()
@@ -472,30 +567,26 @@ pub(crate) fn get_user_login_shell(uid: u32) -> Option<String> {
 }
 
 /// Cache of user name -> resolved home directory.
-///
-/// Only successful lookups are cached.  In particular, arbitrary nonexistent
-/// user names must not grow this process-lifetime map without bound.
-static USER_HOMES: std::sync::LazyLock<Mutex<HashMap<String, Vec<u8>>>> =
-    std::sync::LazyLock::new(|| Mutex::new(HashMap::new()));
+/// Only successful lookups are cached.
+static USER_HOMES: LazyLock<RwLock<HashMap<String, Arc<[u8]>>>> =
+    LazyLock::new(|| RwLock::new(HashMap::new()));
 
 /// Resolve the home directory for a user name via getpwnam_r.
-///
-/// Used for `~user` tilde expansion.  Results are cached because the lookup
-/// can hit slow NSS backends.  Failed lookups stay uncached so transient
-/// directory-service failures can be retried without retaining arbitrary
-/// nonexistent user names forever.
 pub(crate) fn get_user_home_dir(user: &str) -> Option<Vec<u8>> {
     {
-        let cache = USER_HOMES.lock().unwrap_or_else(|e| e.into_inner());
+        let cache = USER_HOMES.read().unwrap_or_else(|e| e.into_inner());
         if let Some(home) = cache.get(user) {
-            return Some(home.clone());
+            return Some(home.to_vec());
         }
     }
 
     let resolved = getpwnam_home_dir_uncached(user);
     if let Some(home) = resolved.as_ref() {
-        let mut cache = USER_HOMES.lock().unwrap_or_else(|e| e.into_inner());
-        cache.insert(user.to_owned(), home.clone());
+        let mut cache = USER_HOMES.write().unwrap_or_else(|e| e.into_inner());
+        if cache.len() >= MAX_NSS_CACHE_ENTRIES {
+            cache.clear();
+        }
+        cache.insert(user.to_owned(), Arc::from(home.as_slice()));
     }
     resolved
 }
@@ -516,27 +607,31 @@ pub fn map_io_error(err: std::io::Error, path: &str) -> RpcError {
         ErrorKind::PermissionDenied => RpcError::permission_denied(path),
         ErrorKind::AlreadyExists => {
             let mut rpc_error = RpcError::io_error(err);
-            if rpc_error.data.is_none() {
-                rpc_error.data = Some(Value::Map(vec![(
+            let mut fields = match rpc_error.data.take() {
+                Some(Value::Map(fields)) => fields,
+                _ => Vec::new(),
+            };
+            if !fields.iter().any(|(k, _)| k.as_str() == Some("error_kind")) {
+                fields.push((
+                    Value::String("error_kind".into()),
+                    Value::String("already_exists".into()),
+                ));
+            }
+            if !fields.iter().any(|(k, _)| k.as_str() == Some("os_errno")) {
+                fields.push((
                     Value::String("os_errno".into()),
                     Value::Integer(libc::EEXIST.into()),
-                )]));
+                ));
             }
+            rpc_error.data = Some(Value::Map(fields));
             rpc_error
         }
         _ => RpcError::io_error(err),
     }
 }
 
-use std::ffi::OsStr;
-use std::os::unix::ffi::OsStrExt;
-use std::path::PathBuf;
-
 /// Convert raw bytes to a PathBuf without blocking a Tokio worker on NSS.
 pub async fn bytes_to_path(bytes: &[u8]) -> Result<PathBuf, RpcError> {
-    // Tilde expansion operates on the raw bytes so non-UTF-8 path components
-    // never pass through a lossy string conversion.  Only `~user` expansion
-    // can reach NSS, so ordinary paths and `$HOME` expansion remain immediate.
     let expanded = if bytes
         .strip_prefix(b"~")
         .is_some_and(|rest| !rest.is_empty() && !rest.starts_with(b"/"))
@@ -556,8 +651,6 @@ pub async fn bytes_to_path(bytes: &[u8]) -> Result<PathBuf, RpcError> {
         None => PathBuf::from(OsStr::from_bytes(bytes)),
     })
 }
-
-use crate::protocol::path_or_bytes;
 
 #[cfg(test)]
 mod tests {
@@ -614,8 +707,6 @@ mod tests {
         assert_eq!(access_errno(result), Some(libc::ELOOP.into()));
     }
 
-    // APFS rejects non-UTF-8 filenames; exercise byte-named files on Linux
-    // without preventing macOS from running the portable path/error checks.
     #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn test_access_non_utf8_path() {
@@ -656,7 +747,7 @@ mod tests {
             access_errno(access(writable_params(&file.join("child"))).await.unwrap()),
             Some(libc::ENOTDIR.into())
         );
-        if !nix::unistd::geteuid().is_root() {
+        if !rustix::process::geteuid().is_root() {
             use std::os::unix::fs::PermissionsExt;
             std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o444)).unwrap();
             assert_eq!(
@@ -710,12 +801,75 @@ mod tests {
         assert_eq!(error.code, RpcError::INVALID_PARAMS);
     }
 
-    /// Verify get_user_name resolves the current process uid.
-    /// This must succeed on any system -- the running user always has
-    /// a passwd entry (local or NSS/LDAP).
+    #[test]
+    fn test_resolve_truename_missing_under_symlink_and_dangling() {
+        let temp = tempfile::tempdir().unwrap();
+        let canonical_root = std::fs::canonicalize(temp.path()).unwrap();
+        let real_dir = canonical_root.join("real");
+        std::fs::create_dir(&real_dir).unwrap();
+        let link_dir = canonical_root.join("linkdir");
+        std::os::unix::fs::symlink(&real_dir, &link_dir).unwrap();
+
+        // Missing file under symlinked parent directory resolves parent symlink.
+        let resolved = resolve_truename_sync(&link_dir.join("missing/sub")).unwrap();
+        assert_eq!(resolved, real_dir.join("missing/sub"));
+
+        // Dangling symlink under symlinked parent resolves both links.
+        let dangling = real_dir.join("dangling");
+        std::os::unix::fs::symlink("target-missing", &dangling).unwrap();
+        let resolved_dangling = resolve_truename_sync(&link_dir.join("dangling")).unwrap();
+        assert_eq!(resolved_dangling, real_dir.join("target-missing"));
+
+        // Cyclic symlink returns ELOOP.
+        let loop_a = canonical_root.join("loop_a");
+        let loop_b = canonical_root.join("loop_b");
+        std::os::unix::fs::symlink(&loop_b, &loop_a).unwrap();
+        std::os::unix::fs::symlink(&loop_a, &loop_b).unwrap();
+        let err = resolve_truename_sync(&loop_a).unwrap_err();
+        assert_eq!(err.raw_os_error(), Some(libc::ELOOP));
+    }
+
+    #[test]
+    fn test_parse_getent_name_ignores_truncated_member_list() {
+        // The capture limit cuts a two-byte character in the member list.
+        let mut capture = "staff:x:50:".as_bytes().to_vec();
+        while capture.len() <= GETENT_MAX_CAPTURE_BYTES {
+            capture.extend_from_slice("é".as_bytes());
+        }
+        capture.truncate(GETENT_MAX_CAPTURE_BYTES);
+        assert!(std::str::from_utf8(&capture).is_err());
+        assert_eq!(parse_getent_name(&capture), Ok(Some("staff".to_string())));
+
+        assert_eq!(
+            parse_getent_name(b"gr\xc3\xbcn:x:1:\n"),
+            Ok(Some("grün".into()))
+        );
+        assert_eq!(parse_getent_name(b":x:1:\n"), Ok(None));
+        assert_eq!(parse_getent_name(b"no-separator"), Err(()));
+        assert_eq!(parse_getent_name(b"bad\xff:x:1:\n"), Err(()));
+    }
+
+    #[test]
+    fn test_resolve_truename_follows_finite_chain_past_libc_limit() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(temp.path()).unwrap();
+        let target = root.join("target");
+        std::fs::write(&target, b"x").unwrap();
+        // Longer than the 40 links libc `realpath' follows, shorter than the
+        // MAX_SYMLINK_HOPS that Emacs `file-truename' allows.
+        let mut previous = target.clone();
+        for index in 0..60 {
+            let link = root.join(format!("link-{index}"));
+            std::os::unix::fs::symlink(&previous, &link).unwrap();
+            previous = link;
+        }
+
+        assert_eq!(resolve_truename_sync(&previous).unwrap(), target);
+    }
+
     #[test]
     fn test_get_user_name_current_uid() {
-        let uid = nix::unistd::getuid().as_raw();
+        let uid = rustix::process::getuid().as_raw();
         let name = get_user_name(uid);
         assert!(
             name.is_some(),
@@ -727,10 +881,9 @@ mod tests {
         );
     }
 
-    /// Verify get_group_name resolves the current process gid.
     #[test]
     fn test_get_group_name_current_gid() {
-        let gid = nix::unistd::getgid().as_raw();
+        let gid = rustix::process::getgid().as_raw();
         let name = get_group_name(gid);
         assert!(
             name.is_some(),
@@ -742,10 +895,6 @@ mod tests {
         );
     }
 
-    /// A uid that almost certainly has no passwd entry should return
-    /// None rather than panicking or looping forever.
-    /// Note: 0xFFFF_FFFE (-2 signed) is macOS's `nobody`, so we use
-    /// 0x7FFF_FFFE which is unused on both Linux and macOS.
     #[test]
     fn test_get_user_name_unknown_uid() {
         let name = get_user_name(0x7FFF_FFFE);
@@ -755,7 +904,6 @@ mod tests {
         );
     }
 
-    /// A gid that almost certainly has no group entry should return None.
     #[test]
     fn test_get_group_name_unknown_gid() {
         let name = get_group_name(0x7FFF_FFFE);
@@ -765,14 +913,12 @@ mod tests {
         );
     }
 
-    /// Verify root (uid 0) resolves to "root".
     #[test]
     fn test_get_user_name_root() {
         let name = get_user_name(0);
         assert_eq!(name.as_deref(), Some("root"));
     }
 
-    /// Verify gid 0 resolves (usually "root" or "wheel").
     #[test]
     fn test_get_group_name_root() {
         let name = get_group_name(0);
@@ -790,8 +936,6 @@ mod tests {
         assert_eq!(path, expected);
     }
 
-    /// Repeated separators after "~/" must survive: the suffix begins with
-    /// "/" and must not replace the HOME prefix.
     #[tokio::test]
     async fn test_expand_tilde_preserves_repeated_separators() {
         let Some(home) = std::env::var_os("HOME") else {
@@ -803,38 +947,30 @@ mod tests {
         assert_eq!(path, PathBuf::from(expected));
     }
 
-    /// Repeated lookups should hit the cache and return the same value.
     #[test]
     fn test_user_name_caching() {
-        let uid = nix::unistd::getuid().as_raw();
+        let uid = rustix::process::getuid().as_raw();
         let first = get_user_name(uid);
         let second = get_user_name(uid);
         assert_eq!(first, second, "cached lookup should match initial lookup");
     }
 
-    /// Repeated group lookups should hit the cache.
     #[test]
     fn test_group_name_caching() {
-        let gid = nix::unistd::getgid().as_raw();
+        let gid = rustix::process::getgid().as_raw();
         let first = get_group_name(gid);
         let second = get_group_name(gid);
         assert_eq!(first, second, "cached lookup should match initial lookup");
     }
 
-    /// Failed user-home lookups must not grow the process-lifetime cache.
     #[test]
     fn test_user_home_misses_are_not_cached() {
         let user = format!("tramp-rpc-missing-user-{}", std::process::id());
         assert_eq!(get_user_home_dir(&user), None);
-        let cache = USER_HOMES.lock().unwrap_or_else(|e| e.into_inner());
+        let cache = USER_HOMES.read().unwrap_or_else(|e| e.into_inner());
         assert!(!cache.contains_key(&user));
     }
 
-    /// Independent oracle for the nix passwd/group mapping: the `getent`
-    /// binary resolves through the same NSS stack but shares no code with
-    /// our wrappers, so a mixed-up field (name, dir, shell) or a spurious
-    /// libc miss shows up as a mismatch.  Returns the colon-separated record
-    /// fields, or None when `getent` is unavailable or the key is absent.
     fn getent_fields(database: &str, key: &str) -> Option<Vec<String>> {
         let output = Command::new("getent")
             .arg(database)
@@ -855,15 +991,11 @@ mod tests {
         )
     }
 
-    /// The uid, login shell and `~user` lookups must agree field for field
-    /// with `getent passwd`.  The direct libc lookup is checked as well,
-    /// since `get_user_name` would otherwise hide a libc miss behind its own
-    /// `getent` fallback.
     #[test]
     fn test_passwd_lookups_match_getent() {
-        let uid = nix::unistd::getuid().as_raw();
+        let uid = rustix::process::getuid().as_raw();
         let Some(fields) = getent_fields("passwd", &uid.to_string()) else {
-            return; // no getent on this platform, or no passwd entry
+            return;
         };
         let (name, dir, shell) = (&fields[0], &fields[5], &fields[6]);
         assert_eq!(nss_name_by_id(NssKind::User, uid), Ok(Some(name.clone())));
@@ -872,28 +1004,24 @@ mod tests {
         assert_eq!(get_user_home_dir(name), Some(dir.as_bytes().to_vec()));
     }
 
-    /// The gid lookup must agree with `getent group`, directly and cached.
     #[test]
     fn test_group_lookup_matches_getent() {
-        let gid = nix::unistd::getgid().as_raw();
+        let gid = rustix::process::getgid().as_raw();
         let Some(fields) = getent_fields("group", &gid.to_string()) else {
-            return; // no getent on this platform, or no group entry
+            return;
         };
         let name = &fields[0];
         assert_eq!(nss_name_by_id(NssKind::Group, gid), Ok(Some(name.clone())));
         assert_eq!(get_group_name(gid).as_deref(), Some(name.as_str()));
     }
 
-    /// Verify that file.stat via the RPC handler returns uname/gname for
-    /// a file owned by the current user (e.g. /tmp which is world-writable,
-    /// so we create a temp file to be certain of ownership).
     #[tokio::test]
     async fn test_stat_returns_user_group_names() {
         use std::io::Write;
         let mut tmp = tempfile::NamedTempFile::new().expect("create tempfile");
         write!(tmp, "test").unwrap();
 
-        let path = tmp.path();
+        let path = tmp.path().to_path_buf();
         let attrs = get_file_attributes(path, false)
             .await
             .expect("stat should succeed");
@@ -909,7 +1037,7 @@ mod tests {
             attrs.gid
         );
 
-        let expected_uid = nix::unistd::getuid().as_raw();
+        let expected_uid = rustix::process::getuid().as_raw();
         assert_eq!(attrs.uid, expected_uid);
         assert_eq!(
             attrs.uname.as_deref(),

@@ -15,10 +15,10 @@
 ;;; Code:
 
 (require 'cl-lib)
+(require 'tramp-rpc-hops)
 (require 'tramp-rpc-transport)
 (require 'tramp-rpc-environment)
 
-(declare-function tramp-rpc-file-name-p "tramp-rpc")
 (declare-function majutsu-jj--executable "ext:majutsu-jj" ())
 (declare-function majutsu-process-jj-arguments "ext:majutsu-jj" (args))
 (declare-function majutsu-process-environment "ext:majutsu-process" (&optional args))
@@ -49,7 +49,7 @@ while rendering that refresh, never across refreshes."
 (defun tramp-rpc-majutsu--rpc-p ()
   "Return non-nil when optimizations apply to `default-directory'."
   (and tramp-rpc-majutsu-optimize
-       (tramp-rpc-file-name-p default-directory)))
+       (tramp-rpc--managed-file-name-p default-directory)))
 
 (defun tramp-rpc-majutsu--batching-p ()
   "Return non-nil when Majutsu captures query stderr in a buffer.
@@ -70,8 +70,9 @@ result cannot fill, so prefetching would only add round trips."
 
 (defun tramp-rpc-majutsu--entry (key program args)
   "Build a batch entry for KEY, PROGRAM and ARGS in the current workspace."
-  `((key . ,key) (cmd . ,program) (args . ,(vconcat args))
-    (cwd . ,(file-remote-p default-directory 'localname))))
+  (let ((cwd (file-remote-p default-directory 'localname)))
+    `((key . ,key) (cmd . ,program) (args . ,(vconcat args))
+      (cwd . ,(when cwd (tramp-rpc--path-to-bin cwd))))))
 
 (defun tramp-rpc-majutsu--result (results key)
   "Find KEY in decoded batch RESULTS."

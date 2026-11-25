@@ -101,10 +101,149 @@ fn test_individually_oversized_request_is_not_deferred() {
     let mut deferred = VecDeque::new();
 
     let response = enqueue_deferred(&mut deferred, request, DEFERRED_BYTE_LIMIT + 1)
-        .expect_err("an individually oversized request must be rejected");
+        .expect_err("a request larger than the deferred byte budget must be rejected");
 
     assert!(deferred.is_empty());
     assert!(matches!(response.id, Some(RequestId::Number(1))));
+    // It can still run once active work releases the byte budget.
+    assert_eq!(response.error.unwrap().code, RpcError::SERVER_BUSY);
+}
+
+#[tokio::test]
+async fn test_control_request_runs_when_deferred_queue_is_full() {
+    let mut deferred = VecDeque::new();
+    let admissions = Admissions::default();
+    let _write_permits = admissions
+        .try_acquire_many(TaskClass::ProcessWrite, PROCESS_WRITE_TASK_LIMIT)
+        .expect("occupy all process write slots");
+    let _general_permits = admissions
+        .try_acquire_many(TaskClass::General, GENERAL_TASK_LIMIT)
+        .expect("occupy all general slots");
+
+    // Fill the deferred queue to the exact byte budget with one write request.
+    let fill = decode_request(&make_request("process.write", Value::Nil)).unwrap();
+    enqueue_deferred(&mut deferred, fill, DEFERRED_BYTE_LIMIT).expect("exact byte limit fits");
+
+    let (errors_tx, mut errors_rx) = mpsc::channel(4);
+    let mut tasks = JoinSet::new();
+    let writer = Arc::new(FrameWriter::new(tokio::io::sink()));
+
+    // A further non-Control request is rejected instead of stalling the reader.
+    accept_frame(
+        make_request("process.write", Value::Nil),
+        &mut deferred,
+        &admissions,
+        &mut None,
+        &mut tasks,
+        &writer,
+        &errors_tx,
+    )
+    .await;
+    let err_resp = errors_rx
+        .try_recv()
+        .expect("excess deferred request must be rejected");
+    // The rejected request never started, so it is reported as retryable.
+    assert_eq!(err_resp.error.unwrap().code, RpcError::SERVER_BUSY);
+
+    // A Control request (`system.ping`) still starts immediately despite the
+    // saturated deferred queue and occupied general/write permits.
+    accept_frame(
+        make_request("system.ping", Value::Nil),
+        &mut deferred,
+        &admissions,
+        &mut None,
+        &mut tasks,
+        &writer,
+        &errors_tx,
+    )
+    .await;
+    assert_eq!(tasks.len(), 1, "Control request must spawn immediately");
+    while tasks.join_next().await.is_some() {}
+}
+
+#[tokio::test]
+async fn test_control_request_admits_free_slot_before_queue_capacity_check() {
+    let mut deferred = VecDeque::new();
+    let admissions = Admissions::default();
+    let _general = admissions
+        .try_acquire_many(TaskClass::General, GENERAL_TASK_LIMIT)
+        .expect("occupy all general slots");
+    let control = admissions
+        .try_acquire_many(TaskClass::Control, CONTROL_TASK_LIMIT)
+        .expect("occupy all control slots");
+    // An older Control request waits; general work fills the rest of the queue.
+    enqueue_deferred(
+        &mut deferred,
+        decode_request(&make_request_with_id(1, "system.ping", Value::Nil)).unwrap(),
+        0,
+    )
+    .unwrap();
+    for id in 2..=DEFERRED_REQUEST_LIMIT as i64 {
+        enqueue_deferred(
+            &mut deferred,
+            decode_request(&make_request_with_id(id, "system.info", Value::Nil)).unwrap(),
+            0,
+        )
+        .unwrap();
+    }
+    // A Control task finishes before the reader runs another admission pass.
+    drop(control);
+
+    let (errors_tx, mut errors_rx) = mpsc::channel(4);
+    let mut tasks = JoinSet::new();
+    let writer = Arc::new(FrameWriter::new(tokio::io::sink()));
+    accept_frame(
+        make_request_with_id(100, "system.ping", Value::Nil),
+        &mut deferred,
+        &admissions,
+        &mut None,
+        &mut tasks,
+        &writer,
+        &errors_tx,
+    )
+    .await;
+
+    assert!(
+        errors_rx.try_recv().is_err(),
+        "a Control request with a free slot must not be rejected"
+    );
+    assert_eq!(tasks.len(), 2, "both Control requests must start");
+    assert!(
+        deferred
+            .iter()
+            .all(|queued| task_class(&queued.method) == TaskClass::General)
+    );
+    while tasks.join_next().await.is_some() {}
+}
+
+#[tokio::test]
+async fn test_oversized_control_frame_is_rejected() {
+    let admissions = Admissions::default();
+    let (errors_tx, mut errors_rx) = mpsc::channel(4);
+    let mut tasks = JoinSet::new();
+    let writer = Arc::new(FrameWriter::new(tokio::io::sink()));
+    let big_id = "x".repeat(MAX_CONTROL_FRAME_SIZE);
+    let payload = rmp_serde::to_vec_named(&Value::Map(vec![
+        (Value::from("version"), Value::from("2.0")),
+        (Value::from("id"), Value::from(big_id.as_str())),
+        (Value::from("method"), Value::from("system.ping")),
+    ]))
+    .unwrap();
+    accept_frame(
+        payload,
+        &mut VecDeque::new(),
+        &admissions,
+        &mut None,
+        &mut tasks,
+        &writer,
+        &errors_tx,
+    )
+    .await;
+
+    assert!(tasks.is_empty(), "an oversized Control frame must not run");
+    let response = errors_rx
+        .try_recv()
+        .expect("oversized Control frame is answered");
     assert_eq!(response.error.unwrap().code, RpcError::INVALID_REQUEST);
 }
 
@@ -115,14 +254,14 @@ fn test_batches_reserve_shared_general_admission() {
     for _ in 0..GENERAL_TASK_LIMIT / handlers::BATCH_CONCURRENCY {
         permits.push(
             admissions
-                .try_acquire_many(TaskClass::General, request_permit_count("batch"))
+                .try_acquire_many(TaskClass::General, request_permit_count(&Method::Batch))
                 .expect("batch reservation should fit"),
         );
     }
     assert_eq!(admissions.general.available_permits(), 0);
     assert!(
         admissions
-            .try_acquire_many(TaskClass::General, request_permit_count("batch"))
+            .try_acquire_many(TaskClass::General, request_permit_count(&Method::Batch))
             .is_none()
     );
     assert!(admissions.try_acquire(TaskClass::General).is_none());
@@ -147,31 +286,31 @@ async fn test_blocked_batch_uses_idle_permits_without_unbounded_bypass() {
         DeferredRequest::for_test(Request {
             version: "2.0".into(),
             id: RequestId::Number(1),
-            method: "batch".into(),
+            method: Method::Batch,
             params: Value::Nil,
         }),
         DeferredRequest::for_test(Request {
             version: "2.0".into(),
             id: RequestId::Number(2),
-            method: "system.info".into(),
+            method: Method::SystemInfo,
             params: Value::Nil,
         }),
         DeferredRequest::for_test(Request {
             version: "2.0".into(),
             id: RequestId::Number(3),
-            method: "system.info".into(),
+            method: Method::SystemInfo,
             params: Value::Nil,
         }),
         DeferredRequest::for_test(Request {
             version: "2.0".into(),
             id: RequestId::Number(4),
-            method: "system.info".into(),
+            method: Method::SystemInfo,
             params: Value::Nil,
         }),
         DeferredRequest::for_test(Request {
             version: "2.0".into(),
             id: RequestId::Number(5),
-            method: "system.info".into(),
+            method: Method::SystemInfo,
             params: Value::Nil,
         }),
     ]);
@@ -190,7 +329,7 @@ async fn test_blocked_batch_uses_idle_permits_without_unbounded_bypass() {
     assert_eq!(tasks.len(), 3);
     assert_eq!(bypass_budget, Some(0));
     assert_eq!(deferred.len(), 2);
-    assert_eq!(deferred[0].method, "batch");
+    assert_eq!(deferred[0].method, Method::Batch);
     assert!(matches!(&deferred[1].id, RequestId::Number(5)));
     tasks.abort_all();
 }
@@ -207,7 +346,7 @@ async fn test_new_general_requests_share_bounded_batch_bypass_budget() {
     let mut deferred = VecDeque::from([DeferredRequest::for_test(Request {
         version: "2.0".into(),
         id: RequestId::Number(1),
-        method: "batch".into(),
+        method: Method::Batch,
         params: Value::Nil,
     })]);
     let writer = Arc::new(FrameWriter::new(tokio::io::sink()));
@@ -229,6 +368,7 @@ async fn test_new_general_requests_share_bounded_batch_bypass_budget() {
             make_request_with_id(id, "system.info", Value::Nil),
             &mut deferred,
             &admissions,
+            &mut bypass_budget,
             &mut tasks,
             &writer,
             &errors,
@@ -246,27 +386,31 @@ async fn test_new_general_requests_share_bounded_batch_bypass_budget() {
     assert_eq!(tasks.len(), 3);
     assert_eq!(bypass_budget, Some(0));
     assert_eq!(deferred.len(), 2);
-    assert_eq!(deferred[0].method, "batch");
+    assert_eq!(deferred[0].method, Method::Batch);
     assert!(matches!(&deferred[1].id, RequestId::Number(5)));
     tasks.abort_all();
 }
 
 #[test]
 fn test_blocked_process_writes_use_dedicated_admission() {
-    for method in ["process.write", "process.write_pty"] {
+    for method in [Method::ProcessWrite, Method::ProcessWritePty] {
         let admissions = Admissions::default();
         let _writes = admissions
-            .try_acquire_many(task_class(method), PROCESS_WRITE_TASK_LIMIT)
+            .try_acquire_many(task_class(&method), PROCESS_WRITE_TASK_LIMIT)
             .expect("reserve every write permit");
 
-        assert_eq!(task_class(method), TaskClass::ProcessWrite);
+        assert_eq!(task_class(&method), TaskClass::ProcessWrite);
         assert!(admissions.try_acquire(TaskClass::General).is_some());
         assert!(
             admissions
-                .try_acquire(task_class("process.signal"))
+                .try_acquire(task_class(&Method::ProcessSignal))
                 .is_some()
         );
-        assert!(admissions.try_acquire(task_class("system.ping")).is_some());
+        assert!(
+            admissions
+                .try_acquire(task_class(&Method::SystemPing))
+                .is_some()
+        );
     }
 }
 
@@ -276,16 +420,18 @@ async fn test_connection_probe_responds_with_general_slots_occupied() {
     let _general = admissions
         .try_acquire_many(TaskClass::General, GENERAL_TASK_LIMIT)
         .expect("reserve every general permit");
-    assert_eq!(task_class("system.ping"), TaskClass::Control);
-    let _probe = admissions.try_acquire(task_class("system.ping")).unwrap();
+    assert_eq!(task_class(&Method::SystemPing), TaskClass::Control);
+    let _probe = admissions
+        .try_acquire(task_class(&Method::SystemPing))
+        .unwrap();
     let request = protocol::Request {
         version: "2.0".into(),
         id: RequestId::Number(1),
-        method: "system.ping".into(),
+        method: Method::SystemPing,
         params: Value::Nil,
     };
     assert_eq!(
-        handlers::dispatch(request).await.result,
+        handlers::dispatch(request).await.response.result,
         Some(Value::Boolean(true))
     );
 }
@@ -331,6 +477,33 @@ async fn test_every_malformed_frame_is_answered() {
         .await
         .expect("connection task should not panic")
         .expect("connection cleanup should succeed");
+}
+
+/// A peer that stops reading output must not keep the connection from
+/// observing input EOF: queuing an error response is bounded, after which
+/// the transport closes and cleanup runs.
+#[tokio::test]
+async fn test_connection_tears_down_when_peer_stops_reading_errors() {
+    let _test_lock = handlers::process::test_process_map_lock().await;
+    let (mut client, server_reader) = tokio::io::duplex(64 * 1024);
+    // The client never reads this side, so error responses back up.
+    let (server_writer, _unread_output) = tokio::io::duplex(64);
+    let connection = tokio::spawn(run_connection(
+        server_reader,
+        Arc::new(FrameWriter::new(server_writer)),
+        None,
+    ));
+
+    for _ in 0..ERROR_RESPONSE_CHANNEL_SIZE * 4 {
+        client.write_all(&frame(&[0xc1])).await.unwrap();
+    }
+    drop(client);
+
+    let result = tokio::time::timeout(std::time::Duration::from_secs(10), connection)
+        .await
+        .expect("connection must finish although the peer never reads")
+        .expect("connection task should not panic");
+    assert!(result.is_err(), "undeliverable responses close the output");
 }
 
 fn frame(payload: &[u8]) -> Vec<u8> {
@@ -600,6 +773,22 @@ async fn test_commands_run_parallel_uses_batch_environment_for_lookup() {
         .permissions();
     permissions.set_mode(0o755);
     std::fs::set_permissions(&program, permissions).expect("make command executable");
+    // A child forked by a concurrent test inherits the write descriptor until
+    // it execs, and executing the script meanwhile fails with ETXTBSY.  One
+    // successful exec proves no such child remains; none can appear later.
+    for attempt in 0.. {
+        match std::process::Command::new(&program).output() {
+            Err(error)
+                if error.kind() == std::io::ErrorKind::ExecutableFileBusy && attempt < 200 =>
+            {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+            result => {
+                result.expect("run command directly");
+                break;
+            }
+        }
+    }
 
     let command = Value::Map(vec![
         (Value::String("key".into()), Value::String("probe".into())),
@@ -845,11 +1034,11 @@ async fn test_output_failure_reaps_children_without_input_eof() {
     assert!(result.is_err());
     assert!(handlers::process::test_managed_maps_empty().await);
     assert!(matches!(
-        nix::sys::wait::waitpid(
-            nix::unistd::Pid::from_raw(managed_pids[0]),
-            Some(nix::sys::wait::WaitPidFlag::WNOHANG)
+        rustix::process::waitpid(
+            rustix::process::Pid::from_raw(managed_pids[0]),
+            rustix::process::WaitOptions::NOHANG,
         ),
-        Err(nix::errno::Errno::ECHILD)
+        Err(rustix::io::Errno::CHILD)
     ));
     drop(client);
 }
@@ -886,11 +1075,11 @@ async fn test_connection_eof_unblocks_output_and_reaps_children() {
     assert!(notification.await.unwrap().is_err());
     assert!(handlers::process::test_managed_maps_empty().await);
     assert!(matches!(
-        nix::sys::wait::waitpid(
-            nix::unistd::Pid::from_raw(child_pid),
-            Some(nix::sys::wait::WaitPidFlag::WNOHANG)
+        rustix::process::waitpid(
+            rustix::process::Pid::from_raw(child_pid),
+            rustix::process::WaitOptions::NOHANG,
         ),
-        Err(nix::errno::Errno::ECHILD)
+        Err(rustix::io::Errno::CHILD)
     ));
 }
 
@@ -937,11 +1126,11 @@ async fn test_connection_eof_second_cleanup_catches_late_registration() {
         .expect("connection cleanup should succeed");
     assert!(handlers::process::test_managed_maps_empty().await);
     assert!(matches!(
-        nix::sys::wait::waitpid(
-            nix::unistd::Pid::from_raw(os_pid),
-            Some(nix::sys::wait::WaitPidFlag::WNOHANG)
+        rustix::process::waitpid(
+            rustix::process::Pid::from_raw(os_pid),
+            rustix::process::WaitOptions::NOHANG,
         ),
-        Err(nix::errno::Errno::ECHILD)
+        Err(rustix::io::Errno::CHILD)
     ));
 }
 
@@ -1022,11 +1211,11 @@ async fn test_connection_eof_sigkills_blocked_pipe_and_pty_requests() {
     assert!(handlers::process::test_managed_maps_empty().await);
     for os_pid in managed_pids {
         assert!(matches!(
-            nix::sys::wait::waitpid(
-                nix::unistd::Pid::from_raw(os_pid),
-                Some(nix::sys::wait::WaitPidFlag::WNOHANG)
+            rustix::process::waitpid(
+                rustix::process::Pid::from_raw(os_pid),
+                rustix::process::WaitOptions::NOHANG,
             ),
-            Err(nix::errno::Errno::ECHILD)
+            Err(rustix::io::Errno::CHILD)
         ));
     }
 }

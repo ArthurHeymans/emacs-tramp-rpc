@@ -26,8 +26,37 @@ fn test_manager() -> WatchManager {
     let (input, _rx) = test_input_channel(1);
     WatchManager {
         watcher: Mutex::new(FilteredWatcher::new(|_: notify::Result<Event>| {}).unwrap()),
-        watched_paths: Mutex::new(HashMap::new()),
-        symlink_watcher: Mutex::new(NofollowSymlinkWatcher::new(input).ok()),
+        symlink_watcher: Mutex::new(None),
+        input,
+        runtime: tokio::runtime::Handle::try_current().ok(),
+    }
+}
+
+#[test]
+fn test_recursive_watch_covers_directory_created_before_publish() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().canonicalize().unwrap();
+    for upgrade in [false, true] {
+        let top = root.join(if upgrade { "upgraded" } else { "fresh" });
+        let sub = top.join("sub");
+        fs::create_dir_all(&sub).unwrap();
+        let manager = test_manager();
+        if upgrade {
+            manager.watch(&top, false).unwrap();
+        }
+        // Created after the walk passed `sub', before the watches exist.
+        let late = sub.join("late");
+        let created = late.clone();
+        set_after_recursive_walk_hook(move || fs::create_dir(&created).unwrap());
+
+        manager.watch(&top, true).unwrap();
+
+        let watcher = lock_or_recover(&manager.watcher);
+        assert!(
+            watcher.recursive_roots[&top].contains(&late),
+            "upgrade={upgrade}: directory created before publish is unwatched"
+        );
+        assert_eq!(watcher.path_watch_counts.get(&late), Some(&1));
     }
 }
 
@@ -182,53 +211,51 @@ fn test_watch_event_mapping_basic_actions() {
 }
 
 #[cfg(target_os = "linux")]
-#[test]
-fn test_nofollow_symlink_watch_reports_link_attribute_change() {
+#[tokio::test]
+async fn test_nofollow_symlink_watch_reports_link_attribute_change() {
     let temp = tempfile::tempdir().unwrap();
-    let target = temp.path().join("target");
-    let link = temp.path().join("link");
+    // The watcher publishes the path with a canonical parent; TMPDIR may be
+    // reached through a symlink.
+    let root = fs::canonicalize(temp.path()).unwrap();
+    let target = root.join("target");
+    let link = root.join("link");
     fs::write(&target, "target").unwrap();
     std::os::unix::fs::symlink(&target, &link).unwrap();
 
     let (input, mut rx) = test_input_channel(16);
-    let mut watcher = NofollowSymlinkWatcher::new(input).unwrap();
+    let mut watcher =
+        NofollowSymlinkWatcher::new(input, Some(&tokio::runtime::Handle::current())).unwrap();
     assert_eq!(watcher.watch(&link).unwrap(), link);
 
     fs::write(&target, "changed").unwrap();
-    std::thread::sleep(Duration::from_millis(200));
+    tokio::time::sleep(Duration::from_millis(100)).await;
     assert!(
         rx.try_recv().is_err(),
         "target changes must not be reported"
     );
 
     set_symlink_mtime(&link, 1);
-    let deadline = Instant::now() + Duration::from_secs(2);
-    let mut found = false;
-    while Instant::now() < deadline {
-        match rx.try_recv() {
-            Ok(WatchInput::Direct(events)) => {
-                found |= events.iter().any(|event| {
-                    event.action == "attribute-changed" && event.path.as_ref() == Some(&link)
-                });
-                if found {
-                    break;
-                }
-            }
-            Ok(WatchInput::Notify(_)) => {}
-            Err(_) => std::thread::sleep(Duration::from_millis(25)),
-        }
-    }
-
+    let event = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+        .await
+        .expect("timed out waiting for symlink metadata event")
+        .expect("channel should remain open");
+    let found = match event {
+        WatchInput::Direct(events) => events
+            .iter()
+            .any(|event| event.action == "attribute-changed" && event.path.as_ref() == Some(&link)),
+        WatchInput::Notify(_) => false,
+    };
     assert!(found, "symlink metadata changes should be reported");
 }
 
 #[cfg(target_os = "linux")]
-#[test]
-fn test_unwatch_removes_nofollow_and_regular_registrations() {
+#[tokio::test]
+async fn test_unwatch_removes_nofollow_and_regular_registrations() {
     let manager = test_manager();
-    if lock_or_recover(&manager.symlink_watcher).is_none() {
-        return;
-    }
+    assert!(
+        lock_or_recover(&manager.symlink_watcher).is_none(),
+        "symlink watcher should be initialized lazily"
+    );
     let temp = tempfile::tempdir().unwrap();
     let target = temp.path().join("target");
     let link = temp.path().join("link");
@@ -257,8 +284,8 @@ fn test_unwatch_removes_nofollow_and_regular_registrations() {
 }
 
 #[cfg(target_os = "linux")]
-#[test]
-fn test_precise_unwatch_preserves_the_other_backend() {
+#[tokio::test]
+async fn test_precise_unwatch_preserves_the_other_backend() {
     let manager = test_manager();
     let temp = tempfile::tempdir().unwrap();
     let target = temp.path().join("target");
@@ -392,17 +419,32 @@ fn test_fs_events_notification_envelope() {
 }
 
 fn refresh_for_event(manager: &WatchManager, event: &Event) {
-    let roots = manager.recursive_roots_for_event(event);
+    let mut batch = PendingBatch::default();
+    collect_input(WatchInput::Notify(event.clone()), &mut batch);
     tokio::runtime::Runtime::new()
         .unwrap()
-        .block_on(manager.refresh_recursive_roots(roots));
+        .block_on(manager.resolve_and_refresh_recursive_roots(
+            batch.need_rescan_all,
+            batch.refresh_candidates,
+            batch.ignore_paths,
+        ));
 }
 
 #[cfg(target_os = "linux")]
-fn refresh_and_rearm(manager: &WatchManager, roots: HashSet<PathBuf>, suspects: HashSet<PathBuf>) {
+fn refresh_and_rearm_events(manager: &WatchManager, events: &[Event]) {
+    let mut batch = PendingBatch::default();
+    for event in events {
+        collect_input(WatchInput::Notify(event.clone()), &mut batch);
+    }
     tokio::runtime::Runtime::new().unwrap().block_on(async {
-        manager.refresh_recursive_roots(roots).await;
-        manager.rearm_suspect_paths(suspects).await;
+        manager
+            .resolve_and_refresh_recursive_roots(
+                batch.need_rescan_all,
+                batch.refresh_candidates,
+                batch.ignore_paths,
+            )
+            .await;
+        manager.rearm_suspect_paths(batch.suspect_paths).await;
     });
 }
 
@@ -859,6 +901,7 @@ fn test_coalesced_delete_recreate_within_window_rewatches_for_real_events() {
     fs::create_dir_all(&nested).unwrap();
 
     let (tx, rx) = std_mpsc::channel();
+    let (input, _rx_input) = test_input_channel(1);
     let manager = WatchManager {
         watcher: Mutex::new(
             FilteredWatcher::new(move |event: notify::Result<Event>| {
@@ -868,8 +911,9 @@ fn test_coalesced_delete_recreate_within_window_rewatches_for_real_events() {
             })
             .unwrap(),
         ),
-        watched_paths: Mutex::new(HashMap::new()),
         symlink_watcher: Mutex::new(None),
+        input,
+        runtime: None,
     };
     manager.watch(&root, true).unwrap();
 
@@ -882,13 +926,7 @@ fn test_coalesced_delete_recreate_within_window_rewatches_for_real_events() {
     // Drive debounce_loop's post-window refresh for coalesced Remove+Create.
     let remove_event = Event::new(EventKind::Remove(RemoveKind::Folder)).add_path(sub.clone());
     let create_event = Event::new(EventKind::Create(CreateKind::Folder)).add_path(sub.clone());
-    let mut roots: HashSet<PathBuf> = HashSet::new();
-    let mut suspects: HashSet<PathBuf> = HashSet::new();
-    for event in [&remove_event, &create_event] {
-        roots.extend(manager.recursive_roots_for_event(event));
-        suspects.extend(inode_replacing_paths(event));
-    }
-    refresh_and_rearm(&manager, roots, suspects);
+    refresh_and_rearm_events(&manager, &[remove_event, create_event]);
 
     {
         let watcher = lock_or_recover(&manager.watcher);
@@ -925,6 +963,7 @@ fn test_coalesced_rename_into_place_within_window_rewatches_for_real_events() {
     fs::create_dir(&staging).unwrap();
 
     let (tx, rx) = std_mpsc::channel();
+    let (input, _rx_input) = test_input_channel(1);
     let manager = WatchManager {
         watcher: Mutex::new(
             FilteredWatcher::new(move |event: notify::Result<Event>| {
@@ -934,8 +973,9 @@ fn test_coalesced_rename_into_place_within_window_rewatches_for_real_events() {
             })
             .unwrap(),
         ),
-        watched_paths: Mutex::new(HashMap::new()),
         symlink_watcher: Mutex::new(None),
+        input,
+        runtime: None,
     };
     manager.watch(&root, true).unwrap();
 
@@ -947,11 +987,7 @@ fn test_coalesced_rename_into_place_within_window_rewatches_for_real_events() {
     // Drive debounce_loop's post-window refresh for rename-into-place.
     let rename_event =
         Event::new(EventKind::Modify(ModifyKind::Name(RenameMode::To))).add_path(sub.clone());
-    let mut roots: HashSet<PathBuf> = HashSet::new();
-    let mut suspects: HashSet<PathBuf> = HashSet::new();
-    roots.extend(manager.recursive_roots_for_event(&rename_event));
-    suspects.extend(inode_replacing_paths(&rename_event));
-    refresh_and_rearm(&manager, roots, suspects);
+    refresh_and_rearm_events(&manager, &[rename_event]);
 
     {
         let watcher = lock_or_recover(&manager.watcher);
@@ -1047,4 +1083,194 @@ fn test_recursive_unwatch_preserves_overlapping_recursive_watch() {
 
     watcher.unwatch(&sub).unwrap();
     assert!(!watcher.path_watch_counts.contains_key(&sub));
+}
+
+#[test]
+fn test_refresh_candidates_are_stat_once_across_nested_roots() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().canonicalize().unwrap();
+    let outer = root.join("outer");
+    let inner = outer.join("inner");
+    let known = inner.join("known");
+    fs::create_dir_all(&known).unwrap();
+
+    let mut watcher = FilteredWatcher::new(|_: notify::Result<Event>| {}).unwrap();
+    for path in [&root, &outer, &inner] {
+        watcher.watch(path, RecursiveMode::Recursive).unwrap();
+    }
+
+    // Regular files created under all three roots, plus one new directory.
+    let new_dir = inner.join("new-dir");
+    fs::create_dir(&new_dir).unwrap();
+    let mut candidates: HashSet<PathBuf> = (0..50)
+        .map(|index| {
+            let file = inner.join(format!("file-{index}"));
+            fs::write(&file, b"x").unwrap();
+            file
+        })
+        .collect();
+    candidates.insert(new_dir.clone());
+
+    let classified = watcher.classify_refresh_candidates(&candidates);
+    assert!(classified.matched_roots.is_empty());
+    assert_eq!(classified.pending_roots.len(), 3);
+    // One entry per distinct path, not one per (root, path) pair.
+    assert_eq!(classified.to_stat.len(), candidates.len());
+
+    let mut matched = classified.matched_roots;
+    match_new_directories(&mut matched, &classified.pending_roots, classified.to_stat);
+    let expected: HashSet<PathBuf> = [root.clone(), outer.clone(), inner.clone()].into();
+    assert_eq!(matched, expected);
+
+    // Files alone match nothing; a known directory (e.g. deleted) matches
+    // every root holding it without a stat.
+    let files: HashSet<PathBuf> = [inner.join("file-0")].into();
+    let classified = watcher.classify_refresh_candidates(&files);
+    let mut matched = classified.matched_roots;
+    match_new_directories(&mut matched, &classified.pending_roots, classified.to_stat);
+    assert!(matched.is_empty());
+    fs::remove_dir(&known).unwrap();
+    let classified = watcher.classify_refresh_candidates(&[known].into());
+    assert_eq!(classified.matched_roots, expected);
+    assert!(classified.to_stat.is_empty());
+}
+
+#[test]
+fn test_refresh_best_effort_skips_transient_missing_subdir() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().canonicalize().unwrap();
+    let existing = root.join("existing");
+    let vanished = root.join("vanished");
+
+    let mut watcher = FilteredWatcher::new(|_: notify::Result<Event>| {}).unwrap();
+    watcher.watch(&root, RecursiveMode::Recursive).unwrap();
+    // Created after registration, so only the refresh can add its watch; a
+    // refresh that stops at `vanished' or rolls back would leave it unwatched.
+    fs::create_dir(&existing).unwrap();
+    assert!(!watcher.path_watch_counts.contains_key(&existing));
+
+    let next: HashSet<PathBuf> = [root.clone(), existing.clone(), vanished.clone()]
+        .into_iter()
+        .collect();
+    watcher.refresh_recursive_dirs_best_effort(&root, next);
+
+    assert!(watcher.recursive_roots[&root].contains(&existing));
+    assert!(!watcher.recursive_roots[&root].contains(&vanished));
+    assert_eq!(watcher.path_watch_counts.get(&existing), Some(&1));
+    assert!(!watcher.path_watch_counts.contains_key(&vanished));
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn test_nofollow_unwatch_cleans_up_after_symlink_deletion() {
+    let temp = tempfile::tempdir().unwrap();
+    let target = temp.path().join("target");
+    let link = temp.path().join("link");
+    fs::write(&target, "hi").unwrap();
+    std::os::unix::fs::symlink(&target, &link).unwrap();
+
+    let (input, _rx) = test_input_channel(16);
+    let mut watcher =
+        NofollowSymlinkWatcher::new(input, Some(&tokio::runtime::Handle::current())).unwrap();
+    watcher.watch(&link).unwrap();
+    fs::remove_file(&link).unwrap();
+
+    // Unwatching a deleted symlink must either succeed (cleaning up on EINVAL)
+    // or report watch_not_found if IN_IGNORED was already processed, and in
+    // both cases leave zero leaked entries in `watches`.
+    let _ = watcher.unwatch(&link);
+    assert!(!watcher.contains(&link));
+    assert!(watcher.watches.is_empty());
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn test_nofollow_parent_aliases_share_watch() {
+    let temp = tempfile::tempdir().unwrap();
+    let real_parent = temp.path().canonicalize().unwrap().join("real");
+    let alias_parent = temp.path().canonicalize().unwrap().join("alias");
+    fs::create_dir(&real_parent).unwrap();
+    std::os::unix::fs::symlink(&real_parent, &alias_parent).unwrap();
+
+    let target = real_parent.join("target");
+    let real_link = real_parent.join("link");
+    let alias_link = alias_parent.join("link");
+    fs::write(&target, "hi").unwrap();
+    std::os::unix::fs::symlink(&target, &real_link).unwrap();
+
+    let (input, _rx) = test_input_channel(16);
+    let mut watcher =
+        NofollowSymlinkWatcher::new(input, Some(&tokio::runtime::Handle::current())).unwrap();
+    let first = watcher.watch(&real_link).unwrap();
+    let second = watcher.watch(&alias_link).unwrap();
+    assert_eq!(first, second);
+    assert_eq!(watcher.watches.len(), 1);
+    assert_eq!(watcher.watches[&first].count, 2);
+
+    // Unwatching one spelling decrements the refcount and keeps the kernel watch alive.
+    watcher.unwatch(&alias_link).unwrap();
+    assert!(watcher.contains(&real_link));
+    assert_eq!(watcher.watches[&first].count, 1);
+
+    watcher.unwatch(&real_link).unwrap();
+    assert!(!watcher.contains(&real_link));
+    assert!(watcher.watches.is_empty());
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn test_nofollow_removal_uses_spelling_recorded_at_registration() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().canonicalize().unwrap();
+    let (dir_a, dir_b) = (root.join("a"), root.join("b"));
+    let alias = root.join("alias");
+    for dir in [&dir_a, &dir_b] {
+        fs::create_dir(dir).unwrap();
+        fs::write(dir.join("target"), "hi").unwrap();
+        std::os::unix::fs::symlink(dir.join("target"), dir.join("link")).unwrap();
+    }
+    std::os::unix::fs::symlink(&dir_a, &alias).unwrap();
+
+    let (input, _rx) = test_input_channel(16);
+    let mut watcher =
+        NofollowSymlinkWatcher::new(input, Some(&tokio::runtime::Handle::current())).unwrap();
+    assert_eq!(
+        watcher.watch(&alias.join("link")).unwrap(),
+        dir_a.join("link")
+    );
+    watcher.watch(&dir_b.join("link")).unwrap();
+
+    // Retarget the alias; removal by the registered spelling must still
+    // release the watch it created, not the one it resolves to now.
+    fs::remove_file(&alias).unwrap();
+    std::os::unix::fs::symlink(&dir_b, &alias).unwrap();
+    watcher.unwatch(&alias.join("link")).unwrap();
+
+    assert!(!watcher.watches.contains_key(&dir_a.join("link")));
+    assert!(watcher.watches.contains_key(&dir_b.join("link")));
+    assert!(watcher.aliases.is_empty());
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn test_nofollow_overflow_emits_rescan() {
+    let (input, mut rx) = test_input_channel(16);
+    let wd_to_paths = Mutex::new(HashMap::new());
+    let ignored_entries = Mutex::new(Vec::new());
+
+    handle_nofollow_raw_event(
+        -1,
+        inotify::ReadFlags::QUEUE_OVERFLOW,
+        &wd_to_paths,
+        &ignored_entries,
+        &input,
+    );
+
+    match rx.try_recv() {
+        Ok(WatchInput::Direct(events)) => {
+            assert_eq!(events.len(), 1);
+            assert_eq!(events[0].action, "rescan");
+        }
+        other => panic!("expected rescan Direct event, got {other:?}"),
+    }
 }

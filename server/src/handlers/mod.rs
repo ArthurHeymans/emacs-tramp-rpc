@@ -10,42 +10,78 @@ pub mod process;
 pub mod system;
 
 use crate::msgpack_map;
-use crate::protocol::{Request, Response, RpcError, from_value};
+use crate::protocol::{
+    DispatchOutcome, Method, PostSendAction, Request, Response, RpcError, encoded_msgpack_len,
+    from_value,
+};
 use futures::{StreamExt, TryStreamExt};
 use rmpv::Value;
 
-/// Dispatch a request to the appropriate handler
-pub async fn dispatch(request: Request) -> Response {
-    // Handle batch separately (it needs special handling and can't recurse)
-    if request.method == "batch" {
-        let id = request.id.clone();
-        let result = batch_execute(request.params).await;
-        let response = match result {
-            Ok(value) => Response::success(id.clone(), value),
-            Err(error) => Response::error(Some(id.clone()), error),
-        };
-        return match validate_batch_response_size(&response, crate::MAX_FRAME_SIZE) {
-            Ok(()) => response,
-            Err(error) => Response::error(Some(id), error),
-        };
-    }
+pub type HandlerResult = Result<Value, RpcError>;
 
-    // All other methods go through dispatch_inner
-    dispatch_inner(request).await
+/// Run a synchronous filesystem or OS operation on Tokio's blocking pool,
+/// mapping join failures into an `RpcError::internal_error`.
+pub(crate) async fn run_blocking<T, F>(label: &'static str, f: F) -> Result<T, RpcError>
+where
+    F: FnOnce() -> Result<T, RpcError> + Send + 'static,
+    T: Send + 'static,
+{
+    tokio::task::spawn_blocking(f)
+        .await
+        .map_err(|e| RpcError::internal_error(format!("{label} task join error: {e}")))?
 }
 
-/// Work that must follow RESPONSE to METHOD on the wire: a started process
-/// only begins pushing notifications after its PID has been announced.
-pub async fn after_response(method: &str, response: &Response) {
-    if matches!(method, "process.start" | "process.start_pty")
-        && let Some(pid) = response
-            .result
-            .as_ref()
-            .and_then(Value::as_map)
-            .and_then(|map| map.iter().find(|(key, _)| key.as_str() == Some("pid")))
-            .and_then(|(_, pid)| pid.as_u64())
-    {
-        process::start_output_push(pid as u32).await;
+/// Dispatch a request to the appropriate handler.
+pub async fn dispatch(request: Request) -> DispatchOutcome {
+    let Request {
+        id, method, params, ..
+    } = request;
+
+    match method {
+        // Handle batch separately (it needs special handling and can't recurse)
+        Method::Batch => {
+            let result = batch_execute(params).await;
+            let response = match result {
+                Ok(value) => Response::success(id.clone(), value),
+                Err(error) => Response::error(Some(id.clone()), error),
+            };
+            let response = match validate_batch_response_size(&response, crate::MAX_FRAME_SIZE) {
+                Ok(()) => response,
+                Err(error) => Response::error(Some(id), error),
+            };
+            DispatchOutcome::new(response)
+        }
+        // Process-start methods arm server-pushed notifications only after the
+        // start response has been written to stdout.
+        Method::ProcessStart => match process::start_outcome(params).await {
+            Ok((value, pid)) => DispatchOutcome::with_post_send(
+                Response::success(id, value),
+                PostSendAction::StartOutputPush(pid),
+            ),
+            Err(error) => DispatchOutcome::new(Response::error(Some(id), error)),
+        },
+        Method::ProcessStartPty => match process::start_pty_outcome(params).await {
+            Ok((value, pid)) => DispatchOutcome::with_post_send(
+                Response::success(id, value),
+                PostSendAction::StartOutputPush(pid),
+            ),
+            Err(error) => DispatchOutcome::new(Response::error(Some(id), error)),
+        },
+        other => {
+            let response = match route(other, params).await {
+                Ok(value) => Response::success(id, value),
+                Err(error) => Response::error(Some(id), error),
+            };
+            DispatchOutcome::new(response)
+        }
+    }
+}
+
+/// Execute a typed post-send side effect after the response has been written on
+/// the wire (e.g., arming output push for a newly started managed process).
+pub async fn run_post_send(action: PostSendAction) {
+    match action {
+        PostSendAction::StartOutputPush(pid) => process::start_output_push(pid).await,
     }
 }
 
@@ -53,8 +89,6 @@ pub async fn after_response(method: &str, response: &Response) {
 pub async fn cleanup_managed_processes() -> Result<(), RpcError> {
     process::cleanup_managed_processes().await
 }
-
-pub type HandlerResult = Result<Value, RpcError>;
 
 /// Maximum entries accepted by one batch request.  This remains well above
 /// the existing 10-stat benchmark while bounding per-request work.
@@ -75,11 +109,9 @@ fn validate_batch_response_size(
     response: &Response,
     max_frame_size: usize,
 ) -> Result<(), RpcError> {
-    let encoded_size = rmp_serde::to_vec_named(response)
-        .map_err(|error| {
-            RpcError::internal_error(format!("Failed to encode batch response: {error}"))
-        })?
-        .len();
+    let encoded_size = encoded_msgpack_len(response).map_err(|error| {
+        RpcError::internal_error(format!("Failed to encode batch response: {error}"))
+    })?;
     if encoded_size > max_frame_size {
         return Err(RpcError::internal_error(
             "Batch response exceeds maximum frame size",
@@ -101,7 +133,7 @@ async fn batch_execute(params: Value) -> HandlerResult {
 
     #[derive(serde::Deserialize)]
     struct BatchRequest {
-        method: String,
+        method: Method,
         #[serde(default = "default_params")]
         params: Value,
     }
@@ -120,13 +152,15 @@ async fn batch_execute(params: Value) -> HandlerResult {
         // synthetic Request/Response pair.
         // A started process pushes output only after its top-level
         // response; inside a batch it would stay silent forever.
-        let routed = if matches!(req.method.as_str(), "process.start" | "process.start_pty") {
-            Err(RpcError::invalid_params(format!(
-                "{} must be sent as its own request",
-                req.method
-            )))
-        } else {
-            route(req.method, req.params).await
+        let routed = match req.method {
+            Method::ProcessStart => Err(RpcError::invalid_params(
+                "process.start must be sent as its own request",
+            )),
+            Method::ProcessStartPty => Err(RpcError::invalid_params(
+                "process.start_pty must be sent as its own request",
+            )),
+            Method::Batch => Err(RpcError::method_not_found("batch")),
+            method => route(method, req.params).await,
         };
         let result = match routed {
             Ok(value) => msgpack_map! { "result" => value },
@@ -154,11 +188,9 @@ async fn batch_execute(params: Value) -> HandlerResult {
     .try_fold(
         (Vec::new(), 0usize),
         |(mut results, size), result| async move {
-            let result_size = rmp_serde::to_vec_named(&result)
-                .map_err(|error| {
-                    RpcError::internal_error(format!("Failed to encode batch entry: {error}"))
-                })?
-                .len();
+            let result_size = encoded_msgpack_len(&result).map_err(|error| {
+                RpcError::internal_error(format!("Failed to encode batch entry: {error}"))
+            })?;
             let size = size
                 .checked_add(result_size)
                 .ok_or_else(|| RpcError::internal_error("Batch response size overflow"))?;
@@ -177,81 +209,71 @@ async fn batch_execute(params: Value) -> HandlerResult {
     Ok(msgpack_map! { "results" => Value::Array(results) })
 }
 
-/// Dispatch a single request to its handler and wrap the outcome in a
-/// response for its request id.
-async fn dispatch_inner(request: Request) -> Response {
-    let Request {
-        id, method, params, ..
-    } = request;
-    match route(method, params).await {
-        Ok(value) => Response::success(id, value),
-        Err(error) => Response::error(Some(id), error),
-    }
-}
-
 /// Route a method to its handler.  Shared by single requests and batch
 /// subrequests.
-async fn route(method: String, params: Value) -> HandlerResult {
-    match method.as_str() {
+async fn route(method: Method, params: Value) -> HandlerResult {
+    match method {
         // File metadata operations
-        "file.stat" => file::stat(params).await,
-        "file.access" => file::access(params).await,
-        "file.truename" => file::truename(params).await,
+        Method::FileStat => file::stat(params).await,
+        Method::FileAccess => file::access(params).await,
+        Method::FileTruename => file::truename(params).await,
 
         // Directory operations
-        "dir.list" => dir::list(params).await,
-        "dir.create" => dir::create(params).await,
-        "dir.remove" => dir::remove(params).await,
+        Method::DirList => dir::list(params).await,
+        Method::DirCreate => dir::create(params).await,
+        Method::DirRemove => dir::remove(params).await,
 
         // File I/O operations
-        "file.read" => io::read(params).await,
-        "file.write" => io::write(params).await,
-        "file.copy" => io::copy(params).await,
-        "file.rename" => io::rename(params).await,
-        "file.delete" => io::delete(params).await,
-        "file.set_modes" => io::set_modes(params).await,
-        "file.set_times" => io::set_times(params).await,
-        "file.make_symlink" => io::make_symlink(params).await,
-        "file.make_hardlink" => io::make_hardlink(params).await,
-        "file.chown" => io::chown(params).await,
+        Method::FileRead => io::read(params).await,
+        Method::FileWrite => io::write(params).await,
+        Method::FileCopy => io::copy(params).await,
+        Method::FileRename => io::rename(params).await,
+        Method::FileDelete => io::delete(params).await,
+        Method::FileSetModes => io::set_modes(params).await,
+        Method::FileSetTimes => io::set_times(params).await,
+        Method::FileMakeSymlink => io::make_symlink(params).await,
+        Method::FileMakeHardlink => io::make_hardlink(params).await,
+        Method::FileChown => io::chown(params).await,
 
         // Process operations
-        "process.run" => process::run(params).await,
-        "process.start" => process::start(params).await,
-        "process.write" => process::write(params).await,
-        "process.close_stdin" => process::close_stdin(params).await,
-        "process.kill" => process::kill(params).await,
-        "process.signal" => process::signal_pid(params).await,
+        Method::ProcessRun => process::run(params).await,
+        Method::ProcessStart => process::start(params).await,
+        Method::ProcessWrite => process::write(params).await,
+        Method::ProcessCloseStdin => process::close_stdin(params).await,
+        Method::ProcessKill => process::kill(params).await,
+        Method::ProcessSignal => process::signal_pid(params).await,
 
         // PTY (pseudo-terminal) process operations
-        "process.start_pty" => process::start_pty(params).await,
-        "process.write_pty" => process::write_pty(params).await,
-        "process.resize_pty" => process::resize_pty(params).await,
-        "process.kill_pty" => process::kill_pty(params).await,
-        "process.close_pty" => process::close_pty(params).await,
+        Method::ProcessStartPty => process::start_pty(params).await,
+        Method::ProcessWritePty => process::write_pty(params).await,
+        Method::ProcessResizePty => process::resize_pty(params).await,
+        Method::ProcessKillPty => process::kill_pty(params).await,
+        Method::ProcessClosePty => process::close_pty(params).await,
 
         // System info and a lightweight, reserved-slot connection probe.
-        "system.ping" => Ok(Value::Boolean(true)),
-        "system.info" => system::system_info().await,
-        "system.statvfs" => system::system_statvfs(params).await,
+        Method::SystemPing => Ok(Value::Boolean(true)),
+        Method::SystemInfo => system::system_info().await,
+        Method::SystemStatvfs => system::system_statvfs(params).await,
+        Method::SystemUserHome => system::system_user_home(params).await,
 
         // Parallel command execution and ancestor scanning
-        "commands.run_parallel" => commands::run_parallel(params).await,
-        "ancestors.scan" => commands::ancestors_scan(params).await,
-        "highlevel.test_files_in_dir" => commands::highlevel_test_files_in_dir(params).await,
-        "highlevel.locate_dominating_file_multi" => {
+        Method::CommandsRunParallel => commands::run_parallel(params).await,
+        Method::AncestorsScan => commands::ancestors_scan(params).await,
+        Method::HighlevelTestFilesInDir => commands::highlevel_test_files_in_dir(params).await,
+        Method::HighlevelLocateDominatingFileMulti => {
             commands::highlevel_locate_dominating_file_multi(params).await
         }
-        "highlevel.dir_locals_find_file_cache_update" => {
+        Method::HighlevelDirLocalsFindFileCacheUpdate => {
             commands::highlevel_dir_locals_find_file_cache_update(params).await
         }
 
         // Filesystem watch operations (for cache invalidation)
-        "watch.add" => crate::watcher::handle_add(params).await,
-        "watch.remove" => crate::watcher::handle_remove(params).await,
+        Method::WatchAdd => crate::watcher::handle_add(params).await,
+        Method::WatchRemove => crate::watcher::handle_remove(params).await,
 
-        // Note: "batch" is NOT allowed in batch (no recursion)
-        _ => Err(RpcError::method_not_found(&method)),
+        // Note: "batch" is handled at top level only (no recursion)
+        Method::Batch => Err(RpcError::method_not_found("batch")),
+        Method::Unknown(name) => Err(RpcError::method_not_found(&name)),
     }
 }
 
@@ -394,8 +416,8 @@ mod tests {
             "results" => Value::Array(vec![Value::Binary(vec![0; 64])]),
         };
         let response = Response::success(crate::protocol::RequestId::Number(99), result.clone());
-        let inner_size = rmp_serde::to_vec_named(&result).unwrap().len();
-        let frame_size = rmp_serde::to_vec_named(&response).unwrap().len();
+        let inner_size = encoded_msgpack_len(&result).unwrap();
+        let frame_size = encoded_msgpack_len(&response).unwrap();
         assert!(frame_size > inner_size);
         let frame_error = validate_batch_response_size(&response, inner_size)
             .expect_err("response envelope must count toward the frame limit");
@@ -416,7 +438,7 @@ mod tests {
                 "path" => Value::Binary(path.as_os_str().as_bytes().to_vec()),
                 "mode" => "r",
             };
-            expected.push(route("file.access".into(), params.clone()).await.unwrap());
+            expected.push(route(Method::FileAccess, params.clone()).await.unwrap());
             requests.push(msgpack_map! { "method" => "file.access", "params" => params });
         }
         let params = msgpack_map! {
@@ -424,7 +446,7 @@ mod tests {
             "mode" => "w",
             "check_parent_if_missing" => true,
         };
-        expected.push(route("file.access".into(), params.clone()).await.unwrap());
+        expected.push(route(Method::FileAccess, params.clone()).await.unwrap());
         requests.push(msgpack_map! { "method" => "file.access", "params" => params });
         let batch = batch_execute(msgpack_map! { "requests" => Value::Array(requests) })
             .await

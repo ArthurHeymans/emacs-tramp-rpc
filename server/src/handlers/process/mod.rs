@@ -3,9 +3,9 @@
 //! Process execution operations
 //!
 //! `pipe` holds the pipe-backed handlers (`process.run`, `process.start`, ...),
-//! `pty` the pseudo-terminal handlers.  This module owns the state and helpers
-//! shared by both: process-group signalling, signal name parsing, and the
-//! connection-teardown cleanup pass.
+//! `pty` the pseudo-terminal handlers.  This module owns the unified process
+//! registry and helpers shared by both: process-group signalling, signal name
+//! parsing, and the connection-teardown cleanup pass.
 
 mod pipe;
 mod pty;
@@ -13,38 +13,146 @@ mod push;
 #[cfg(test)]
 mod tests;
 
-pub(crate) use pipe::{ChildError, ChildSpec, run_child};
+pub(crate) use pipe::{ChildError, ChildSpec, run_child, start_outcome};
 pub use pipe::{close_stdin, kill, run, signal_pid, start, write};
+pub(crate) use pty::start_pty_outcome;
 pub use pty::{close_pty, kill_pty, resize_pty, start_pty, write_pty};
 pub use push::{init_notification_writer, start_output_push};
 
 use crate::protocol::RpcError;
 use nix::sys::signal::Signal;
-#[cfg(test)]
-use nix::sys::wait::{WaitPidFlag, waitpid};
-#[cfg(test)]
-use nix::unistd::Pid;
 use rustix::fs::{OFlags, fcntl_getfl, fcntl_setfl};
 use rustix::io::{FdFlags, fcntl_dupfd_cloexec, fcntl_getfd, fcntl_setfd};
 use rustix::process::{Pid as RustixPid, Signal as RustixSignal};
 #[cfg(any(target_os = "linux", target_os = "android"))]
 use rustix_libc_wrappers::process::SignalExt;
 use serde::Deserialize;
+use std::collections::HashMap;
 use std::io::ErrorKind;
 use std::os::fd::{AsFd, OwnedFd};
+use std::process::ExitStatus;
 #[cfg(test)]
-use std::sync::{Mutex as StdMutex, OnceLock};
-use tokio::process::Command;
-#[cfg(test)]
+use std::sync::OnceLock;
+use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::{Arc, LazyLock, Mutex as StdMutex};
+use tokio::io::unix::AsyncFd;
+use tokio::process::{Child, ChildStderr, ChildStdin, ChildStdout, Command};
 use tokio::sync::Mutex;
 
-use pipe::{get_process_map, terminate_pipe_process};
-use pty::{get_pty_process_map, terminate_pty_process};
-use push::stop_output_push;
+use pipe::terminate_pipe_process;
+use pty::{PtyIoState, terminate_pty_process};
+use push::{OutputPush, stop_output_push};
 
 /// Upper bound for one test-only `read`/`read_pty` request.
 #[cfg(test)]
 const MAX_PROCESS_READ_BYTES: usize = 1024 * 1024;
+
+// ============================================================================
+// Unified Process Registry
+// ============================================================================
+
+struct PipeBackend {
+    child: Child,
+    stdin: Arc<Mutex<Option<ChildStdin>>>,
+    stdout: Arc<Mutex<Option<ChildStdout>>>,
+    stderr: Arc<Mutex<Option<ChildStderr>>>,
+}
+
+struct PtyBackend {
+    async_fd: Arc<AsyncFd<OwnedFd>>,
+    io: Arc<PtyIoState>,
+}
+
+enum ProcessBackend {
+    Pipe(PipeBackend),
+    Pty(PtyBackend),
+}
+
+struct ManagedProcess {
+    child_pid: u32,
+    lifecycle: Arc<Mutex<()>>,
+    exit_status: Option<ExitStatus>,
+    // Retain an observed terminal status for a read that captured streams/fd
+    // before explicit SIGKILL removed its registry entry.
+    shared_exit_status: Arc<StdMutex<Option<ExitStatus>>>,
+    output_push: Option<OutputPush>,
+    terminating: bool,
+    backend: ProcessBackend,
+}
+
+impl ManagedProcess {
+    pub(super) fn as_pipe(&self) -> Option<&PipeBackend> {
+        match &self.backend {
+            ProcessBackend::Pipe(pipe) => Some(pipe),
+            ProcessBackend::Pty(_) => None,
+        }
+    }
+
+    pub(super) fn as_pipe_mut(&mut self) -> Option<&mut PipeBackend> {
+        match &mut self.backend {
+            ProcessBackend::Pipe(pipe) => Some(pipe),
+            ProcessBackend::Pty(_) => None,
+        }
+    }
+
+    pub(super) fn as_pty(&self) -> Option<&PtyBackend> {
+        match &self.backend {
+            ProcessBackend::Pty(pty) => Some(pty),
+            ProcessBackend::Pipe(_) => None,
+        }
+    }
+
+    #[cfg(test)]
+    pub(super) fn as_pty_mut(&mut self) -> Option<&mut PtyBackend> {
+        match &mut self.backend {
+            ProcessBackend::Pty(pty) => Some(pty),
+            ProcessBackend::Pipe(_) => None,
+        }
+    }
+
+    pub(super) fn is_pipe(&self) -> bool {
+        matches!(self.backend, ProcessBackend::Pipe(_))
+    }
+
+    pub(super) fn is_pty(&self) -> bool {
+        matches!(self.backend, ProcessBackend::Pty(_))
+    }
+}
+
+/// Process-wide registry of managed async pipe and PTY processes.
+///
+/// The map lock is a `std::sync::Mutex` because map operations are strictly
+/// non-blocking O(1) lookups/insertions/removals and are never held across
+/// `.await` points.
+struct ProcessRegistry {
+    next_pid: AtomicU32,
+    processes: StdMutex<HashMap<u32, ManagedProcess>>,
+}
+
+impl ProcessRegistry {
+    fn new() -> Self {
+        Self {
+            next_pid: AtomicU32::new(1),
+            processes: StdMutex::new(HashMap::new()),
+        }
+    }
+
+    fn next_pid(&self) -> u32 {
+        self.next_pid.fetch_add(1, Ordering::Relaxed)
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<u32, ManagedProcess>> {
+        self.processes
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+}
+
+static PROCESS_REGISTRY: LazyLock<ProcessRegistry> = LazyLock::new(ProcessRegistry::new);
+
+fn registry() -> &'static ProcessRegistry {
+    &PROCESS_REGISTRY
+}
 
 /// A child that exits or closes stdin before consuming all input is normal
 /// shell behavior (`head`, `grep -q', a failing filter).  `tramp-sh' runs
@@ -104,7 +212,9 @@ pub(crate) async fn wait_for_process_exit(pid: i32) {
     for _ in 0..100 {
         // Reap direct children ourselves when Tokio's best-effort drop reaper
         // has not done so yet.
-        let _ = waitpid(Pid::from_raw(pid), Some(WaitPidFlag::WNOHANG));
+        if let Some(rpid) = RustixPid::from_raw(pid) {
+            let _ = rustix::process::waitpid(Some(rpid), rustix::process::WaitOptions::NOHANG);
+        }
         if !process_is_running(pid) {
             return;
         }
@@ -144,25 +254,16 @@ pub(crate) async fn test_process_map_lock() -> tokio::sync::MutexGuard<'static, 
 
 #[cfg(test)]
 pub(crate) async fn test_managed_maps_empty() -> bool {
-    get_process_map().lock().await.is_empty() && get_pty_process_map().lock().await.is_empty()
+    registry().lock().is_empty()
 }
 
 #[cfg(test)]
 pub(crate) async fn test_managed_os_pids() -> Vec<i32> {
-    let mut pids: Vec<_> = get_process_map()
+    registry()
         .lock()
-        .await
         .values()
         .map(|managed| managed.child_pid as i32)
-        .collect();
-    pids.extend(
-        get_pty_process_map()
-            .lock()
-            .await
-            .values()
-            .map(|managed| managed.child_pid.as_raw()),
-    );
-    pids
+        .collect()
 }
 
 #[cfg(test)]
@@ -370,42 +471,36 @@ fn dup_cloexec<Fd: AsFd>(fd: Fd) -> Result<OwnedFd, std::io::Error> {
 pub async fn cleanup_managed_processes() -> Result<(), RpcError> {
     // The notification transport is already gone.  Stop output consumers before
     // terminating children so no detached task retains stream or descriptor state.
-    let mut pushes = Vec::new();
-    {
-        let mut processes = get_process_map().lock().await;
-        for managed in processes.values_mut() {
-            managed.terminating = true;
-            pushes.extend(managed.output_push.take());
-        }
-    }
-    {
-        let mut processes = get_pty_process_map().lock().await;
-        for managed in processes.values_mut() {
-            managed.terminating = true;
-            pushes.extend(managed.output_push.take());
-        }
-    }
+    let pushes: Vec<OutputPush> = {
+        let mut processes = registry().lock();
+        processes
+            .values_mut()
+            .filter_map(|managed| {
+                managed.terminating = true;
+                managed.output_push.take()
+            })
+            .collect()
+    };
     futures::future::join_all(pushes.into_iter().map(stop_output_push)).await;
 
-    let pipe_pids: Vec<(u32, u32)> = {
-        let processes = get_process_map().lock().await;
-        processes
-            .iter()
-            .map(|(pid, managed)| (*pid, managed.child_pid))
-            .collect()
-    };
-    let pty_pids: Vec<(u32, u32)> = {
-        let processes = get_pty_process_map().lock().await;
-        processes
-            .iter()
-            .map(|(pid, managed)| (*pid, managed.child_pid.as_raw() as u32))
-            .collect()
+    let (pipe_pids, pty_pids): (Vec<u32>, Vec<u32>) = {
+        let processes = registry().lock();
+        let mut pipes = Vec::new();
+        let mut ptys = Vec::new();
+        for (&pid, managed) in processes.iter() {
+            if managed.is_pipe() {
+                pipes.push(pid);
+            } else {
+                ptys.push(pid);
+            }
+        }
+        (pipes, ptys)
     };
 
-    let pipe_reaps = pipe_pids.into_iter().map(|(pid, _)| async move {
-        (pid, terminate_pipe_process(pid, libc::SIGTERM, true).await)
-    });
-    let pty_reaps = pty_pids.into_iter().map(|(pid, _)| async move {
+    let pipe_reaps = pipe_pids
+        .into_iter()
+        .map(|pid| async move { (pid, terminate_pipe_process(pid, libc::SIGTERM, true).await) });
+    let pty_reaps = pty_pids.into_iter().map(|pid| async move {
         (
             pid,
             terminate_pty_process(pid, libc::SIGTERM, true, true).await,
@@ -420,7 +515,7 @@ pub async fn cleanup_managed_processes() -> Result<(), RpcError> {
     // Failed entries stay registered for the final cleanup pass to retry.
     let mut failures = Vec::new();
     {
-        let mut processes = get_process_map().lock().await;
+        let mut processes = registry().lock();
         for (pid, result) in pipe_results {
             match result {
                 Ok(_) => {

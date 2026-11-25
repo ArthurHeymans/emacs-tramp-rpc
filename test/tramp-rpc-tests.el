@@ -255,7 +255,8 @@ Returns BODY's result."
 
 (ert-deftest tramp-rpc-test-call-count-wrappers-accept-connection ()
   "Call-count wrappers preserve the captured connection argument."
-  (let ((connection '(:process test-connection)))
+  (let ((connection '(:process test-connection))
+        (pending-batches nil))
     (cl-letf (((symbol-function 'tramp-rpc--ensure-connection)
                (lambda (_vec) connection))
               ((symbol-function 'tramp-rpc--call-with-timeout)
@@ -266,7 +267,27 @@ Returns BODY's result."
                   ((equal method "batch")
                    `((results . ,(make-vector (length (alist-get 'requests params))
                                              '((result . ok))))))
-                  (t 'ok)))))
+                  (t 'ok))))
+              ((symbol-function 'tramp-rpc--send-requests)
+               (lambda (_vec requests &optional passed-connection)
+                 (should (eq passed-connection connection))
+                 (setq pending-batches nil)
+                 (let ((idx 0)
+                       ids)
+                   (dolist (req requests)
+                     (cl-incf idx)
+                     (push idx ids)
+                     (push (cons idx
+                                 (list :result
+                                       `((results . ,(make-vector
+                                                      (length (alist-get 'requests (cdr req)))
+                                                      '((result . ok)))))))
+                           pending-batches))
+                   (nreverse ids))))
+              ((symbol-function 'tramp-rpc--receive-responses)
+               (lambda (_vec ids _timeout &optional passed-connection)
+                 (should (eq passed-connection connection))
+                 (mapcar (lambda (id) (assq id pending-batches)) ids))))
       (should (eq (tramp-rpc-test--with-call-count 1
                     (tramp-rpc--call 'vec "ok" nil connection))
                   'ok))
@@ -968,11 +989,11 @@ signal `file-already-exists'.  With trailing slash (via
           (write-region "top" nil (expand-file-name "top.txt" src))
           (write-region "child" nil (expand-file-name "child.txt" nested))
           ;; `copy-directory' itself calls `file-in-directory-p' before the
-          ;; file-name handler dispatches, so the end-to-end count includes
-          ;; that generic TRAMP safety check plus the backend's batch stat and
-          ;; single recursive `file.copy' RPC.  The important property is that
-          ;; this stays constant regardless of tree size.
-          (tramp-rpc-test--with-call-count 7
+          ;; file-name handler dispatches; the backend answers that safety
+          ;; check with one batch.  Its own batch stat and single recursive
+          ;; `file.copy' RPC complete the count.  The important property is
+          ;; that this stays constant regardless of tree size.
+          (tramp-rpc-test--with-call-count 3
             (copy-directory src dest))
           (should (file-exists-p (expand-file-name "top.txt" dest)))
           (should (file-exists-p (expand-file-name "nested/child.txt" dest)))
@@ -996,7 +1017,7 @@ signal `file-already-exists'.  With trailing slash (via
           (make-directory src)
           (write-region "payload" nil (expand-file-name "payload.txt" src))
           (make-directory dest-parent)
-          (tramp-rpc-test--with-call-count 7
+          (tramp-rpc-test--with-call-count 3
             (copy-directory src (file-name-as-directory dest-parent)))
           (should (file-exists-p (expand-file-name "payload.txt" expected-dest)))
           (should (equal "payload"
@@ -1020,7 +1041,7 @@ signal `file-already-exists'.  With trailing slash (via
           (write-region "top" nil (expand-file-name "top.txt" src))
           (write-region "child" nil (expand-file-name "child.txt" nested))
           (make-directory dest)
-          (tramp-rpc-test--with-call-count 7
+          (tramp-rpc-test--with-call-count 3
             (copy-directory src (file-name-as-directory dest) nil nil t))
           (should (file-exists-p (expand-file-name "top.txt" dest)))
           (should (file-exists-p (expand-file-name "nested/child.txt" dest)))
@@ -1082,7 +1103,7 @@ signal `file-already-exists'.  With trailing slash (via
           (write-region "new" nil (expand-file-name "payload.txt" src))
           (make-directory expected-dest t)
           (write-region "old" nil (expand-file-name "payload.txt" expected-dest))
-          (tramp-rpc-test--with-call-count 7
+          (tramp-rpc-test--with-call-count 3
             (copy-directory src (file-name-as-directory dest-parent)))
           (should-not (file-exists-p (expand-file-name
                                       (file-name-nondirectory src)
@@ -1211,7 +1232,7 @@ signal `file-already-exists'.  With trailing slash (via
           (condition-case nil
               (make-symbolic-link real-target expected-link)
             (file-error (ert-skip "Symlinks not supported")))
-          (tramp-rpc-test--with-call-count 7
+          (tramp-rpc-test--with-call-count 3
             (copy-directory src (file-name-as-directory dest-parent)))
           (should (file-symlink-p expected-link))
           (should (equal "payload"
@@ -2018,7 +2039,8 @@ This matches the upstream `tramp-test28-process-file' test."
          (default-process-coding-system '(utf-8-unix . utf-8-unix))
          (transport (make-pipe-process :name "coding-pair-transport" :noquery t))
          (connection (tramp-rpc--make-connection :process transport))
-         (tramp-rpc--async-processes (make-hash-table :test 'eq))
+         (tramp-rpc--managed-processes (make-hash-table :test 'eq))
+         (tramp-rpc--pid-index (make-hash-table :test 'equal))
          proc)
     (cl-letf (((symbol-function 'tramp-rpc--ensure-connection)
                (lambda (_vec) connection))
@@ -2126,7 +2148,7 @@ This matches the upstream `tramp-test28-process-file' test."
           (set-process-filter stderr
                               (lambda (_process string)
                                 (setq stderr-output (concat stderr-output string))))
-          (puthash stdout (tramp-rpc-test--remote-state stdout :stderr-process stderr) tramp-rpc--async-processes)
+          (puthash stdout (tramp-rpc-test--remote-state stdout :stderr-process stderr) tramp-rpc--managed-processes)
           (tramp-rpc--deliver-process-output
            stdout (encode-coding-string "sortie\n" 'binary)
            (encode-coding-string "erreur\n" 'binary) t)
@@ -2140,7 +2162,7 @@ This matches the upstream `tramp-test28-process-file' test."
           (should (equal stderr-output "erreur\n"))
           (should (equal (process-coding-system stdout)
                          '(utf-8-unix . latin-1-unix))))
-      (remhash stdout tramp-rpc--async-processes)
+      (tramp-rpc--unindex-managed-process stdout)
       (delete-process stdout)
       (delete-process stderr))))
 
@@ -2158,15 +2180,14 @@ This matches the upstream `tramp-test28-process-file' test."
           (set-process-filter process
                               (lambda (_process string)
                                 (setq output (concat output string))))
-          (tramp-rpc-test--remote-state process :pty t)
-          (puthash process (tramp-rpc-test--remote-state process :pending-output nil :pending-exit nil :delivery-timer nil) tramp-rpc--pty-processes)
+          (puthash process (tramp-rpc-test--remote-state process :pty t :pending-output nil :pending-exit nil :delivery-timer nil) tramp-rpc--managed-processes)
           (tramp-rpc--queue-pty-delivery process (substring bytes 0 1))
           (tramp-rpc--queue-pty-delivery process (concat (substring bytes 1) "\n"))
           (tramp-rpc-test--wait-for
            (lambda () (equal output "é\n")) "complete PTY coding output"
            process)
           (should (equal output "é\n")))
-      (remhash process tramp-rpc--pty-processes)
+      (tramp-rpc--unindex-managed-process process)
       (delete-process process))))
 
 (ert-deftest tramp-rpc-test13g-pty-final-output-flushes-before-exit ()
@@ -2182,18 +2203,17 @@ This matches the upstream `tramp-test28-process-file' test."
            (lambda (_process string)
              (setq output (concat output string))))
           (set-process-sentinel process #'tramp-rpc--pty-sentinel)
-          (tramp-rpc-test--remote-state process :pty t)
           (tramp-rpc-test--remote-state process :user-sentinel
                        (lambda (_process event)
                          (push event sentinel-events)))
-          (puthash process (tramp-rpc-test--remote-state process :pending-output nil :pending-exit nil :delivery-timer nil) tramp-rpc--pty-processes)
+          (puthash process (tramp-rpc-test--remote-state process :pty t :pending-output nil :pending-exit nil :delivery-timer nil) tramp-rpc--managed-processes)
           (tramp-rpc--queue-pty-delivery process "final output\n" 0 t)
           (while (process-live-p process)
             (accept-process-output process 0.1 nil t))
           (should (equal output "final output\n"))
           (should (equal sentinel-events '("finished\n")))
-          (should-not (gethash process tramp-rpc--pty-processes)))
-      (remhash process tramp-rpc--pty-processes)
+          (should-not (gethash process tramp-rpc--managed-processes)))
+      (tramp-rpc--unindex-managed-process process)
       (when (processp process)
         (ignore-errors (delete-process process))))))
 
@@ -2328,7 +2348,7 @@ This matches the upstream `tramp-test28-process-file' test."
           (should (process-live-p proc))
           (process-send-string proc "printf 'RPC_SHELL_USABLE\\n'\n")
           (await-marker "RPC_SHELL_USABLE")
-          (should (gethash proc tramp-rpc--pty-processes)))
+          (should (gethash proc tramp-rpc--managed-processes)))
       (ignore-errors (delete-process proc))
       (kill-buffer buffer))))
 
@@ -2352,8 +2372,7 @@ This matches the upstream `tramp-test28-process-file' test."
               (while (null events)
                 (accept-process-output nil 0.05)))
             (should (equal events '("exited abnormally with code 3\n")))
-            (should-not (gethash proc tramp-rpc--async-processes))
-            (should-not (gethash proc tramp-rpc--pty-processes)))
+            (should-not (gethash proc tramp-rpc--managed-processes)))
         (ignore-errors (delete-process proc))))))
 
 (ert-deftest tramp-rpc-test14-kill-process-with-late-sentinel ()

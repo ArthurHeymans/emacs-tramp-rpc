@@ -17,13 +17,13 @@ mod output;
 mod protocol;
 mod watcher;
 
-use output::FrameWriter;
-use protocol::{Request, RequestId, Response, RpcError};
+use output::{FrameWriter, encode_framed};
+use protocol::{Method, Request, RequestId, Response, RpcError};
 use rmpv::Value;
 use std::collections::VecDeque;
 use std::io::Cursor;
 use std::sync::{Arc, LazyLock};
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, BufWriter};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, BufReader, BufWriter};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc};
 use tokio::task::JoinSet;
 
@@ -34,8 +34,10 @@ use tokio::task::JoinSet;
 /// active params; permits are held for the task lifetime alongside slot
 /// permits.  Deferred (queued) params are bounded separately by
 /// `DEFERRED_BYTE_LIMIT`; see below.
+const ACTIVE_PARAM_BYTES_LIMIT: usize = 128 * 1024 * 1024;
+
 static ACTIVE_PARAM_BYTES: LazyLock<Arc<Semaphore>> =
-    LazyLock::new(|| Arc::new(Semaphore::new(128 * 1024 * 1024)));
+    LazyLock::new(|| Arc::new(Semaphore::new(ACTIVE_PARAM_BYTES_LIMIT)));
 
 fn try_acquire_param_bytes(size: usize) -> Option<OwnedSemaphorePermit> {
     let permits = u32::try_from(size).ok()?;
@@ -50,30 +52,32 @@ const FRAME_CHANNEL_SIZE: usize = 2;
 const GENERAL_TASK_LIMIT: usize = 16;
 const CONTROL_TASK_LIMIT: usize = 4;
 const PROCESS_WRITE_TASK_LIMIT: usize = 16;
-/// How many decoded-but-not-yet-started requests are buffered before the
-/// connection stops reading frames.  Past this point the bounded frame
-/// channel and the OS pipe throttle the client, which is the only
-/// backpressure signal it can actually act on -- a synthetic "too busy"
-/// error would just surface as a spurious `remote-file-error' in the middle
-/// of an ordinary file operation.
+/// Maximum number of decoded-but-not-yet-started requests retained in the
+/// deferred queue.  Excess non-Control frames are rejected so the reader loop
+/// keeps draining stdin and Control requests (`process.kill`, `close_stdin`,
+/// `system.ping`) are never starved behind a full backlog.
 const DEFERRED_REQUEST_LIMIT: usize = 64;
-/// Byte budget for decoded-but-not-yet-started requests.  The deferred queue
-/// retains full request params (including `process.run' stdin blobs), so a
-/// count-only bound can retain ~64 x 100MiB ~= 6.4GiB.  Ordinary traffic
-/// (KB-sized requests) stays governed by the count limit; large frames hit
-/// this byte limit first and apply backpressure via the bounded frame channel
-/// and OS pipe.
-///
-/// Bound note: the check runs before receiving the next frame, so the queue
-/// can overshoot by one frame plus up to FRAME_CHANNEL_SIZE in-flight frames.
-/// Worst queued ~= LIMIT + 3 x MAX_FRAME.  With 32MiB this is ~332MiB, far
-/// below the unbounded 6.4GiB.  Active params are separately bounded by
-/// ACTIVE_PARAM_BYTES (128MiB); active response buffers remain per-request
-/// bounded (MAX_RESPONSE_OUTPUT_BYTES each, 16 max) and require the trusted
-/// client to request 16 concurrent large outputs — mitigated by per-command
-/// timeouts and the per-batch shared output budget.
+/// Byte budget for decoded-but-not-yet-started requests.  Individual or
+/// aggregate frames that would exceed this budget are rejected instead of
+/// stalling the reader loop and starving Control requests.
 const DEFERRED_BYTE_LIMIT: usize = 32 * 1024 * 1024;
+// Every valid frame fits the active budget once it is idle, so a frame too
+// large to defer is retryable rather than invalid.
+const _: () = assert!(MAX_FRAME_SIZE <= ACTIVE_PARAM_BYTES_LIMIT);
 const ERROR_RESPONSE_CHANNEL_SIZE: usize = 16;
+/// How long the frame reader and admission path wait to queue an error
+/// response.  A peer that stops reading output must not keep them from
+/// observing input EOF or admitting Control requests; past this bound the
+/// transport is closed instead.
+#[cfg(not(test))]
+const ERROR_RESPONSE_SEND_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+#[cfg(test)]
+const ERROR_RESPONSE_SEND_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(200);
+/// Control requests skip the shared param-byte budget so they stay reachable
+/// when general work exhausts it.  Their params are a pid, a signal or
+/// nothing, so this per-frame cap, with `CONTROL_TASK_LIMIT`, reserves a
+/// small fixed byte budget for Control work instead.
+const MAX_CONTROL_FRAME_SIZE: usize = 64 * 1024;
 const EOF_TASK_JOIN_WAIT: std::time::Duration = std::time::Duration::from_millis(500);
 /// Soft descriptor limit the server asks for at startup.  sshd starts it with
 /// the login session's limit, 256 on macOS, while a `commands.run_parallel`
@@ -138,15 +142,18 @@ async fn read_frames<R>(
         // Answer and drain oversized frames so that a following frame remains
         // aligned and the client is not left waiting on its own timeout.
         if len > max_frame_size {
-            if errors
-                .send(Response::error(
+            // Stopping here closes the frame channel, which tears down the
+            // connection like input EOF.
+            if !queue_error_response(
+                &errors,
+                Response::error(
                     None,
                     RpcError::invalid_request(format!(
                         "Request frame exceeds {max_frame_size} byte limit"
                     )),
-                ))
-                .await
-                .is_err()
+                ),
+            )
+            .await
             {
                 return;
             }
@@ -170,6 +177,15 @@ async fn read_frames<R>(
             break;
         }
     }
+}
+
+/// Queue RESPONSE for the error writer, waiting at most
+/// `ERROR_RESPONSE_SEND_TIMEOUT`.  Returns false when it could not be queued.
+async fn queue_error_response(errors: &mpsc::Sender<Response>, response: Response) -> bool {
+    matches!(
+        tokio::time::timeout(ERROR_RESPONSE_SEND_TIMEOUT, errors.send(response)).await,
+        Ok(Ok(()))
+    )
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -220,29 +236,22 @@ impl Default for Admissions {
     }
 }
 
-fn task_class(method: &str) -> TaskClass {
+fn task_class(method: &Method) -> TaskClass {
     // Keep lifecycle operations and connection probes available while
     // long-running general requests consume their slots.
-    match method {
-        "system.ping"
-        | "process.kill"
-        | "process.signal"
-        | "process.close_stdin"
-        | "process.kill_pty"
-        | "process.close_pty" => TaskClass::Control,
+    if method.is_control() {
+        TaskClass::Control
+    } else if method.is_process_write() {
         // Pipe and PTY writes can remain blocked until the program reads input.
         // Neither may consume the general or lifecycle-operation slots.
-        "process.write" | "process.write_pty" => TaskClass::ProcessWrite,
-        _ => TaskClass::General,
+        TaskClass::ProcessWrite
+    } else {
+        TaskClass::General
     }
 }
 
-fn request_permit_count(method: &str) -> usize {
-    if method == "batch" {
-        handlers::BATCH_CONCURRENCY
-    } else {
-        1
-    }
+fn request_permit_count(method: &Method) -> usize {
+    method.permit_count()
 }
 
 /// A decoded request retained in the deferred queue, with its wire size.
@@ -287,12 +296,27 @@ fn enqueue_deferred(
     request: Request,
     frame_size: usize,
 ) -> Result<(), Box<Response>> {
+    // Reject frames that individually exceed or would overflow the deferred
+    // queue bounds so the reader loop never stalls and Control-class frames
+    // (such as process.kill or close_stdin) remain reachable to unblock active
+    // tasks holding slot or byte permits.
+    // Such a frame cannot wait in the queue, but it fits the active budget
+    // once other work finishes, so the client may send it again.
     if frame_size > DEFERRED_BYTE_LIMIT {
         return Err(Box::new(Response::error(
             Some(request.id),
-            RpcError::invalid_request(format!(
+            RpcError::server_busy(format!(
                 "Request frame exceeds {DEFERRED_BYTE_LIMIT} byte deferred limit"
             )),
+        )));
+    }
+    if deferred.len() >= DEFERRED_REQUEST_LIMIT
+        || deferred_bytes(deferred).saturating_add(frame_size) > DEFERRED_BYTE_LIMIT
+    {
+        // The request never started, so the client may send it again.
+        return Err(Box::new(Response::error(
+            Some(request.id),
+            RpcError::server_busy("Server deferred request queue is full"),
         )));
     }
     deferred.push_back(DeferredRequest::new(request, frame_size));
@@ -303,22 +327,22 @@ async fn write_response<W>(writer: &Arc<FrameWriter<W>>, response: &Response) ->
 where
     W: AsyncWrite + Unpin,
 {
-    let mut msgpack_bytes = rmp_serde::to_vec_named(response).map_err(std::io::Error::other)?;
-    if msgpack_bytes.len() > MAX_FRAME_SIZE {
+    let mut framed = encode_framed(response).map_err(std::io::Error::other)?;
+    if framed.len().saturating_sub(4) > MAX_FRAME_SIZE {
         let oversized = Response::error(
             response.id.clone(),
             RpcError::internal_error("Response exceeds maximum frame size"),
         );
-        msgpack_bytes = rmp_serde::to_vec_named(&oversized).map_err(std::io::Error::other)?;
+        framed = encode_framed(&oversized).map_err(std::io::Error::other)?;
     }
-    writer.write_frame(&msgpack_bytes).await
+    writer.write_prefixed_frame(&framed).await
 }
 
 fn spawn_request<W>(
     tasks: &mut JoinSet<()>,
     request: Request,
     permit: OwnedSemaphorePermit,
-    byte_permit: OwnedSemaphorePermit,
+    byte_permit: Option<OwnedSemaphorePermit>,
     writer: &Arc<FrameWriter<W>>,
 ) where
     W: AsyncWrite + Unpin + Send + 'static,
@@ -330,14 +354,16 @@ fn spawn_request<W>(
         let _permit = permit;
         let _byte_permit = byte_permit;
         #[cfg(test)]
-        let panic_after_response = request.method == "test.panic";
-        let method = request.method.clone();
-        let response = handlers::dispatch(request).await;
-        if write_response(&writer, &response).await.is_err() {
+        let panic_after_response =
+            matches!(&request.method, Method::Unknown(m) if m == "test.panic");
+        let outcome = handlers::dispatch(request).await;
+        if write_response(&writer, &outcome.response).await.is_err() {
             writer.close();
             return;
         }
-        handlers::after_response(&method, &response).await;
+        if let Some(post_send) = outcome.post_send {
+            handlers::run_post_send(post_send).await;
+        }
         #[cfg(test)]
         if panic_after_response {
             panic!("test request task panic");
@@ -390,24 +416,25 @@ where
             &admissions,
             &mut general_bypass_budget,
         );
-        // Stop pulling frames while the backlog is full by count or bytes.
-        // The bounded frame channel then stops draining the pipe, which is
-        // the throttle the client can actually observe.
-        let accepting = deferred.len() < DEFERRED_REQUEST_LIMIT
-            && deferred_bytes(&deferred) < DEFERRED_BYTE_LIMIT;
-
-        if tasks.is_empty() && !accepting {
-            break;
-        }
+        // Always keep pulling frames so Control-class requests (`process.kill`,
+        // `process.close_stdin`, `system.ping`) can still reach their reserved
+        // slots even when the deferred queue is saturated by blocked work.
+        // Excess non-Control frames are rejected inside `enqueue_deferred`.
         tokio::select! {
             // Replies and notifications share this failure signal.  A broken
             // output stream tears down the connection even if stdin stays open.
             _ = output_failure.changed() => break,
             Some(_) = tasks.join_next(), if !tasks.is_empty() => {}
-            payload = frames.recv(), if accepting => match payload {
+            payload = frames.recv() => match payload {
                 Some(payload) => {
                     accept_frame(
-                        payload, &mut deferred, &admissions, &mut tasks, &writer, &errors,
+                        payload,
+                        &mut deferred,
+                        &admissions,
+                        &mut general_bypass_budget,
+                        &mut tasks,
+                        &writer,
+                        &errors,
                     ).await;
                 }
                 None => break,
@@ -504,17 +531,23 @@ impl AdmissionPass {
     }
 }
 
-/// Acquire both the slot permit and the param-byte permit for one request, or
-/// neither.  A slot without byte budget is released again and treated like
-/// slot exhaustion so backpressure applies.
+/// Acquire both the slot permit and (for non-Control work) the param-byte
+/// permit for one request, or neither.  Control requests (`process.kill`,
+/// `close_stdin`, `system.ping`) have tiny fixed params and may be needed to
+/// unblock tasks holding byte permits, so they are never gated on
+/// `ACTIVE_PARAM_BYTES`.
 fn try_start(
     admissions: &Admissions,
     class: TaskClass,
     permit_count: usize,
     frame_size: usize,
-) -> Option<(OwnedSemaphorePermit, OwnedSemaphorePermit)> {
+) -> Option<(OwnedSemaphorePermit, Option<OwnedSemaphorePermit>)> {
     let permit = admissions.try_acquire_many(class, permit_count)?;
-    let byte_permit = try_acquire_param_bytes(frame_size)?;
+    let byte_permit = if class == TaskClass::Control {
+        None
+    } else {
+        Some(try_acquire_param_bytes(frame_size)?)
+    };
     Some((permit, byte_permit))
 }
 
@@ -589,12 +622,20 @@ async fn accept_frame<W>(
     payload: Vec<u8>,
     deferred: &mut VecDeque<DeferredRequest>,
     admissions: &Admissions,
+    general_bypass_budget: &mut Option<usize>,
     tasks: &mut JoinSet<()>,
     writer: &Arc<FrameWriter<W>>,
     errors: &mpsc::Sender<Response>,
 ) where
     W: AsyncWrite + Unpin + Send + 'static,
 {
+    // An error response the writer cannot take within the bound means the
+    // peer stopped reading; close the transport so cleanup runs.
+    let reject = |response: Box<Response>| async move {
+        if !queue_error_response(errors, *response).await {
+            writer.close();
+        }
+    };
     // Decode and validate before spawning.  The frame Vec is freed after
     // decode, but retained params (e.g. stdin blobs) keep ~payload.len()
     // bytes alive, so track the wire size for byte-bounded backpressure.
@@ -602,20 +643,38 @@ async fn accept_frame<W>(
     let request = match decode_request(&payload) {
         Ok(request) => request,
         Err(response) => {
-            let _ = errors.send(*response).await;
+            reject(response).await;
             return;
         }
     };
+    let class = task_class(&request.method);
+    if class == TaskClass::Control && frame_size > MAX_CONTROL_FRAME_SIZE {
+        reject(Box::new(Response::error(
+            Some(request.id),
+            RpcError::invalid_request(format!(
+                "Control request frame exceeds {MAX_CONTROL_FRAME_SIZE} byte limit"
+            )),
+        )))
+        .await;
+        return;
+    }
     // Never let a newly arrived request bypass an older deferred request in
     // the same class.  Otherwise a stream of one-permit requests can consume
     // each newly freed slot before an older batch can reserve all its permits.
-    let class = task_class(&request.method);
-    if deferred
-        .iter()
-        .any(|queued| task_class(&queued.method) == class)
-    {
+    let class_queued = |deferred: &VecDeque<DeferredRequest>| {
+        deferred
+            .iter()
+            .any(|queued| task_class(&queued.method) == class)
+    };
+    if class_queued(deferred) {
+        // A task may have finished since the last admission pass.  Start
+        // what fits now, so a request that would find a free slot is never
+        // rejected for queue capacity behind an older one that could start.
+        start_admissible(deferred, tasks, writer, admissions, general_bypass_budget);
+    }
+    if class_queued(deferred) {
         if let Err(response) = enqueue_deferred(deferred, request, frame_size) {
-            let _ = errors.send(*response).await;
+            reject(response).await;
         }
         return;
     }
@@ -631,20 +690,21 @@ async fn accept_frame<W>(
         frame_size,
     ) {
         Some((permit, byte_permit)) => spawn_request(tasks, request, permit, byte_permit, writer),
-        // Queue rather than reject when the request fits the deferred byte
-        // limit.  An individual frame larger than the entire queue budget can
-        // never become admissible there, so reject it instead of deadlocking
-        // the connection around an unstartable request.
         None => {
             if let Err(response) = enqueue_deferred(deferred, request, frame_size) {
-                let _ = errors.send(*response).await;
+                reject(response).await;
             }
         }
     }
 }
 
 fn main() -> std::process::ExitCode {
+    // Cap Tokio worker threads: this server is single-client over one SSH
+    // pipe, so spawning 64-128 worker threads on big build machines wastes
+    // RSS and epoll slots without helping latency.
+    let workers = std::thread::available_parallelism().map_or(2, |n| n.get().min(4));
     let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(workers)
         .enable_all()
         .build()
         .expect("create RPC runtime");
@@ -674,7 +734,7 @@ async fn run_server() -> std::process::ExitCode {
     }
 
     match run_connection(
-        tokio::io::stdin(),
+        BufReader::new(tokio::io::stdin()),
         stdout,
         #[cfg(test)]
         None,
@@ -738,7 +798,7 @@ fn request_id_from_value(value: &Value) -> Option<RequestId> {
 #[cfg(test)]
 async fn process_request(payload: &[u8]) -> Response {
     match decode_request(payload) {
-        Ok(request) => handlers::dispatch(request).await,
+        Ok(request) => handlers::dispatch(request).await.response,
         Err(response) => *response,
     }
 }
