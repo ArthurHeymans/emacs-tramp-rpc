@@ -581,11 +581,28 @@ instead of invoking the callbacks.  EVENT is the process event string."
               (kill-buffer-query-functions nil))
           (when (or (null buf-proc) (eq buf-proc process))
             (kill-buffer main-buf))))
+      ;; A successor started while this generation still held TRAMP's buffer
+      ;; name, for example from a cleanup callback, got a private name.
+      (tramp-rpc--adopt-tramp-buffer-name vec)
       (tramp-rpc--kill-stderr-buffer
        (tramp-rpc-connection-stderr-buffer conn)
        (tramp-rpc-connection-stderr-process conn)))
     (when defer-callbacks
       (cons error-response callbacks))))
+
+(defun tramp-rpc--adopt-tramp-buffer-name (vec)
+  "Give VEC's current transport buffer TRAMP's connection buffer name.
+TRAMP finds a connection's process only through that name
+\(`tramp-get-process', used for example by `unlock-file').  Nothing
+happens while another buffer still has the name."
+  (when-let* ((conn (tramp-rpc--get-connection vec))
+              (buffer (tramp-rpc-connection-buffer conn))
+              ((buffer-live-p buffer))
+              (name (tramp-buffer-name vec))
+              ((not (equal (buffer-name buffer) name)))
+              ((not (get-buffer name))))
+    (with-current-buffer buffer
+      (rename-buffer name))))
 
 (defun tramp-rpc--cleanup-connection-generation
     (process vec event reason &optional remote-cleanup defer-callbacks)

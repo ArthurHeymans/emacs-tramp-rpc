@@ -366,56 +366,78 @@ calling `tramp-flush-*' (used when already reacting to a TRAMP cache flush)."
   "Invalidate cache entries for DIRECTORY and all cached descendants.
 When NO-TRAMP-FLUSH (or `tramp-rpc--in-cache-invalidation') is non-nil, skip
 calling `tramp-flush-*'."
-  (let* ((tramp-default-proxies-alist
-          (tramp-rpc--copy-proxies-alist))
-         (tramp-show-ad-hoc-proxies t)
-         (parsed-vec
-          (when (tramp-tramp-file-p directory)
-            (tramp-dissect-file-name
-             (if (file-name-quoted-p directory)
-                 (file-name-unquote directory)
-               directory))))
-         (route-tag (tramp-rpc--vec-route-tag parsed-vec))
-         (expanded-dirs
-          (delete-dups
-           (mapcar #'file-name-as-directory
-                   (tramp-rpc--expand-cache-spellings directory))))
-         (skip-tramp-flush (or no-tramp-flush tramp-rpc--in-cache-invalidation)))
-    (let ((tramp-rpc--in-cache-invalidation skip-tramp-flush))
-      (tramp-rpc--invalidate-cache-for-path
-       (directory-file-name (car expanded-dirs))))
-    (let ((tramp-rpc--in-cache-invalidation t))
-      (cl-labels ((matches-key-p (key)
-                    (let ((path (tramp-rpc--file-cache-key-path key)))
-                      (and (equal (tramp-rpc--file-cache-key-route key) route-tag)
-                           (stringp path)
-                           (cl-some (lambda (dir) (string-prefix-p dir path))
-                                    expanded-dirs))))
-                  (flush-tramp-properties (candidate)
-                    (when (and (not skip-tramp-flush)
-                               (stringp candidate)
-                               (tramp-tramp-file-p candidate))
-                      (with-parsed-tramp-file-name candidate nil
-                        (tramp-flush-file-properties v localname)
-                        (tramp-flush-directory-properties v localname))))
-                  (drop-key-prefix (cache)
-                    (tramp-rpc--hash-remove-if
-                     (lambda (key _value) (matches-key-p key))
-                     cache
-                     (lambda (key _value)
-                       (flush-tramp-properties
-                        (tramp-rpc--file-cache-key-path key)))))
-                  (drop-stat-prefix ()
-                    (tramp-rpc--hash-remove-if
-                     (lambda (key _value)
-                       (and (consp key) (matches-key-p (car key))))
-                     tramp-rpc--file-stat-cache
-                     (lambda (key _value)
-                       (flush-tramp-properties
-                        (tramp-rpc--file-cache-key-path (car key)))))))
-        (drop-key-prefix tramp-rpc--file-exists-cache)
-        (drop-key-prefix tramp-rpc--file-truename-cache)
-        (drop-stat-prefix)))))
+  (tramp-rpc--invalidate-cache-for-subtrees (list directory) no-tramp-flush))
+
+(defun tramp-rpc--invalidate-cache-for-subtrees (directories &optional no-tramp-flush)
+  "Invalidate cache entries for each of DIRECTORIES and their descendants.
+Each cache is scanned once however many DIRECTORIES there are: a cached
+key matches when one of its ancestor directories is among them.
+NO-TRAMP-FLUSH is as for `tramp-rpc--invalidate-cache-for-subtree'."
+  (let ((prefixes (make-hash-table :test 'equal))
+        (skip-tramp-flush (or no-tramp-flush tramp-rpc--in-cache-invalidation)))
+    (dolist (directory directories)
+      (let* ((tramp-default-proxies-alist
+              (tramp-rpc--copy-proxies-alist))
+             (tramp-show-ad-hoc-proxies t)
+             (parsed-vec
+              (when (tramp-tramp-file-p directory)
+                (tramp-dissect-file-name
+                 (if (file-name-quoted-p directory)
+                     (file-name-unquote directory)
+                   directory))))
+             (route-tag (tramp-rpc--vec-route-tag parsed-vec))
+             (expanded-dirs
+              (delete-dups
+               (mapcar #'file-name-as-directory
+                       (tramp-rpc--expand-cache-spellings directory)))))
+        (let ((tramp-rpc--in-cache-invalidation skip-tramp-flush))
+          (tramp-rpc--invalidate-cache-for-path
+           (directory-file-name (car expanded-dirs))))
+        (dolist (dir expanded-dirs)
+          (puthash (cons route-tag dir) t prefixes))))
+    (when (> (hash-table-count prefixes) 0)
+      (let ((tramp-rpc--in-cache-invalidation t))
+        (cl-labels ((matches-key-p (key)
+                      (let ((path (tramp-rpc--file-cache-key-path key))
+                            (route (tramp-rpc--file-cache-key-route key))
+                            dir hit)
+                        (when (stringp path)
+                          ;; PATH spelled as a directory matches itself.
+                          (setq dir (if (directory-name-p path)
+                                        path
+                                      (file-name-directory path)))
+                          (while (and dir (not hit))
+                            (if (gethash (cons route dir) prefixes)
+                                (setq hit t)
+                              (let ((parent (file-name-directory
+                                             (directory-file-name dir))))
+                                (setq dir (unless (equal parent dir) parent))))))
+                        hit))
+                    (flush-tramp-properties (candidate)
+                      (when (and (not skip-tramp-flush)
+                                 (stringp candidate)
+                                 (tramp-tramp-file-p candidate))
+                        (with-parsed-tramp-file-name candidate nil
+                          (tramp-flush-file-properties v localname)
+                          (tramp-flush-directory-properties v localname))))
+                    (drop-key-prefix (cache)
+                      (tramp-rpc--hash-remove-if
+                       (lambda (key _value) (matches-key-p key))
+                       cache
+                       (lambda (key _value)
+                         (flush-tramp-properties
+                          (tramp-rpc--file-cache-key-path key)))))
+                    (drop-stat-prefix ()
+                      (tramp-rpc--hash-remove-if
+                       (lambda (key _value)
+                         (and (consp key) (matches-key-p (car key))))
+                       tramp-rpc--file-stat-cache
+                       (lambda (key _value)
+                         (flush-tramp-properties
+                          (tramp-rpc--file-cache-key-path (car key)))))))
+          (drop-key-prefix tramp-rpc--file-exists-cache)
+          (drop-key-prefix tramp-rpc--file-truename-cache)
+          (drop-stat-prefix))))))
 
 (defun tramp-rpc-clear-file-exists-cache ()
   "Clear the `file-exists-p' cache."
@@ -753,11 +775,13 @@ DIRECTORY itself returns the empty string.  Descendants can contain slashes."
 
 (defun tramp-rpc--invalidate-event-path (path &optional subtree)
   "Invalidate caches for PATH and equivalent original watch spellings.
-When SUBTREE is non-nil, invalidate cached descendants as well."
-  (dolist (candidate (cons path (tramp-rpc--watch-alias-paths path)))
+When SUBTREE is non-nil, return those spellings instead, for one batched
+`tramp-rpc--invalidate-cache-for-subtrees' over all events."
+  (let ((candidates (cons path (tramp-rpc--watch-alias-paths path))))
     (if subtree
-        (tramp-rpc--invalidate-cache-for-subtree candidate)
-      (tramp-rpc--invalidate-cache-for-path candidate))))
+        candidates
+      (mapc #'tramp-rpc--invalidate-cache-for-path candidates)
+      nil)))
 
 (defun tramp-rpc--handle-fs-events (process params)
   "Handle an fs.events notification from PROCESS with PARAMS."
@@ -797,43 +821,58 @@ When SUBTREE is non-nil, invalidate cached descendants as well."
                   (when-let* ((path (tramp-rpc--fs-event-path vec event 'path))
                               (path1 (tramp-rpc--fs-event-path vec event 'path1)))
                     (push (cons path path1) renamed-pairs)))))
-            (dolist (event events)
-              (let* ((action (alist-get 'action event))
-                     (path (tramp-rpc--fs-event-path vec event 'path))
-                     (path1 (tramp-rpc--fs-event-path vec event 'path1))
-                     (cookie (alist-get 'cookie event))
-                     (duplicate-tracked-rename
-                      (and (member action '("renamed-from" "renamed-to"))
-                           path
-                           (cl-some
-                            (lambda (pair)
-                              (string= path (if (string= action "renamed-from")
-                                                (car pair)
-                                              (cdr pair))))
-                            renamed-pairs))))
-                (when (and (stringp action) (not duplicate-tracked-rename))
-                  (if (string= action "rescan")
-                      (progn
-                        ;; A rescan means concrete paths were dropped, including
-                        ;; unexpected changes no operation invalidates itself.
-                        (tramp-rpc--clear-file-caches-for-connection vec)
-                        ;; Public file-notify consumers still need a conservative
-                        ;; event for the dropped paths.
-                        (run-hook-with-args 'tramp-rpc-fs-rescan-functions process))
-                    (when path
+            ;; Invalidate for the whole batch before dispatching any event,
+            ;; so consumers never see a stale descendant, and sweep the
+            ;; caches for all removed subtrees at once.
+            (let (dispatch subtrees)
+              (dolist (event events)
+                (let* ((action (alist-get 'action event))
+                       (path (tramp-rpc--fs-event-path vec event 'path))
+                       (path1 (tramp-rpc--fs-event-path vec event 'path1))
+                       (duplicate-tracked-rename
+                        (and (member action '("renamed-from" "renamed-to"))
+                             path
+                             (cl-some
+                              (lambda (pair)
+                                (string= path (if (string= action "renamed-from")
+                                                  (car pair)
+                                                (cdr pair))))
+                              renamed-pairs))))
+                  (when (and (stringp action) (not duplicate-tracked-rename))
+                    (cond
+                     ((string= action "rescan")
+                      ;; A rescan means concrete paths were dropped, including
+                      ;; unexpected changes no operation invalidates itself.
+                      (tramp-rpc--clear-file-caches-for-connection vec)
+                      (push event dispatch))
+                     (path
                       ;; Expected events skip only cache work; file-notify
                       ;; consumers still see every event.
                       (unless (expected-p event)
                         ;; Deleting or renaming a directory can orphan cached
                         ;; descendants, so drop subtrees for removal/rename paths.
-                        (let ((subtree (member action
-                                               '("deleted" "renamed" "renamed-from"))))
-                          (tramp-rpc--invalidate-event-path path subtree))
-                        (when path1
-                          (tramp-rpc--invalidate-event-path
-                           path1 (string= action "renamed"))))
-                      (run-hook-with-args 'tramp-rpc-fs-event-dispatch-functions
-                                          action path path1 cookie))))))))))))
+                        (setq subtrees
+                              (nconc (tramp-rpc--invalidate-event-path
+                                      path (member action '("deleted" "renamed"
+                                                            "renamed-from")))
+                                     (and path1
+                                          (tramp-rpc--invalidate-event-path
+                                           path1 (string= action "renamed")))
+                                     subtrees)))
+                      (push event dispatch))))))
+              (when subtrees
+                (tramp-rpc--invalidate-cache-for-subtrees (delete-dups subtrees)))
+              (dolist (event (nreverse dispatch))
+                (let ((action (alist-get 'action event)))
+                  (if (string= action "rescan")
+                      ;; Public file-notify consumers still need a conservative
+                      ;; event for the dropped paths.
+                      (run-hook-with-args 'tramp-rpc-fs-rescan-functions process)
+                    (run-hook-with-args 'tramp-rpc-fs-event-dispatch-functions
+                                        action
+                                        (tramp-rpc--fs-event-path vec event 'path)
+                                        (tramp-rpc--fs-event-path vec event 'path1)
+                                        (alist-get 'cookie event))))))))))))
 
 (defun tramp-rpc-watch-directory (directory &optional recursive)
   "Start watching DIRECTORY for filesystem change events.
@@ -841,25 +880,28 @@ When RECURSIVE is non-nil, watch subdirectories too."
   (interactive "DDirectory to watch: ")
   (with-parsed-tramp-file-name directory nil
     (let* ((watch-key (tramp-rpc--watch-key v localname))
-           (lease (gethash watch-key tramp-rpc--watch-leases))
+           (lease-before (gethash watch-key tramp-rpc--watch-leases))
            (upgrade-notify-owned
             (and recursive
-                 lease
-                 (not (tramp-rpc-watch-lease-recursive-p lease))
-                 (tramp-rpc-watch-lease-notify-owned lease)
-                 (not (tramp-rpc-watch-lease-notify-nofollow lease))))
+                 lease-before
+                 (not (tramp-rpc-watch-lease-recursive-p lease-before))
+                 (tramp-rpc-watch-lease-notify-owned lease-before)
+                 (not (tramp-rpc-watch-lease-notify-nofollow lease-before))))
            (result (tramp-rpc--call
                     v "watch.add"
                     `((path . ,(tramp-rpc--path-to-bin localname))
                       (recursive . ,(if (or recursive upgrade-notify-owned)
                                         t :msgpack-false)))))
+           ;; Another owner may have registered while `watch.add' waited:
+           ;; merge into its lease instead of replacing it.
+           (lease (gethash watch-key tramp-rpc--watch-leases))
            (canonical-directory (tramp-rpc--watch-canonical-directory v result))
-           (is-symlink (and (listp result)
-                            (eq t (alist-get 'is_symlink result))))
+           (symlink-field (and (listp result) (assq 'is_symlink result)))
+           (is-symlink (eq t (cdr symlink-field)))
            (transport (tramp-rpc--connection-transport (tramp-rpc--get-connection v))))
       (if lease
           (progn
-            (when upgrade-notify-owned
+            (when (and upgrade-notify-owned (eq lease lease-before))
               (setf (tramp-rpc-watch-lease-notify-owned lease) nil))
             (setf (tramp-rpc-watch-lease-explicit-p lease) t
                   (tramp-rpc-watch-lease-recursive-p lease)
@@ -868,8 +910,12 @@ When RECURSIVE is non-nil, watch subdirectories too."
                   (tramp-rpc-watch-lease-canonical-directory lease)
                   (or canonical-directory
                       (tramp-rpc-watch-lease-canonical-directory lease))
+                  ;; The reply describes the path now; keep the old flag only
+                  ;; when the server did not report it.
                   (tramp-rpc-watch-lease-is-symlink lease)
-                  (or is-symlink (tramp-rpc-watch-lease-is-symlink lease))
+                  (if symlink-field
+                      is-symlink
+                    (tramp-rpc-watch-lease-is-symlink lease))
                   (tramp-rpc-watch-lease-connection-process lease) transport)
             ;; A follow watch shares canonical resolution with a follow-notify
             ;; lease, but never alters an independent nofollow or synthetic
@@ -1000,8 +1046,33 @@ piggybacking on an existing lease).  Returns the `tramp-rpc-watch-lease'."
                  :notify-owned (not synthetic)
                  :notify-synthetic synthetic
                  :notify-nofollow nofollow)))
-          (puthash watch-key new-lease tramp-rpc--watch-leases)
-          new-lease))))))
+          (let ((existing (gethash watch-key tramp-rpc--watch-leases)))
+            (cond
+             ;; Nothing registered while `watch.add' waited.
+             ((null existing)
+              (puthash watch-key new-lease tramp-rpc--watch-leases)
+              new-lease)
+             ;; Another file-notify owner registered meanwhile: share its
+             ;; registration.  Only nofollow registrations are refcounted
+             ;; by the server, so only those need this duplicate released.
+             ((> (tramp-rpc-watch-lease-notify-count existing) 0)
+              (cl-incf (tramp-rpc-watch-lease-notify-count existing))
+              (when nofollow
+                (tramp-rpc--call
+                 vec "watch.remove"
+                 `((path . ,(tramp-rpc--path-to-bin localname))
+                   (nofollow . t))))
+              existing)
+             ;; An explicit watch registered meanwhile: add this caller's
+             ;; ownership to its lease, keeping the explicit state.
+             (t
+              (setf (tramp-rpc-watch-lease-notify-count existing) 1
+                    (tramp-rpc-watch-lease-notify-owned existing) (not synthetic)
+                    (tramp-rpc-watch-lease-notify-synthetic existing) synthetic
+                    (tramp-rpc-watch-lease-notify-nofollow existing) nofollow
+                    (tramp-rpc-watch-lease-notify-canonical-directory existing)
+                    canonical-directory)
+              existing)))))))))
 
 (defun tramp-rpc--watch-release-notify (watch-key)
   "Release one `file-notify' reference on WATCH-KEY."

@@ -3651,6 +3651,84 @@ registry."
         (remhash descriptor tramp-rpc--file-notify-descriptors)
         (tramp-rpc--delete-file-notify-descriptor-process descriptor)))))
 
+(defmacro tramp-rpc-mock-test--with-watch-stub (spec &rest body)
+  "Run BODY with `watch.add' answered by REPLY, running NESTED once inside it.
+SPEC is (REPLY NESTED CALLS): NESTED, when non-nil, is a function called
+during the first `watch.add', as a second caller would; CALLS collects
+the methods called."
+  (declare (indent 1))
+  `(let ((tramp-rpc--watch-leases (make-hash-table :test 'equal))
+         (nested ,(nth 1 spec)))
+     (cl-letf (((symbol-function 'tramp-rpc--call)
+                (lambda (_vec method _params &optional _conn)
+                  (push method ,(nth 2 spec))
+                  (when (equal method "watch.add")
+                    (when-let* ((f nested))
+                      (setq nested nil)
+                      (funcall f))
+                    ,(nth 0 spec)))))
+       ,@body)))
+
+(ert-deftest tramp-rpc-mock-test-watch-registrations-during-wait-merge ()
+  "Explicit and file-notify registrations racing one `watch.add' merge."
+  (let* ((directory "/rpc:mock:/tmp/raced")
+         (vec (tramp-dissect-file-name directory))
+         (key (tramp-rpc--watch-key vec "/tmp/raced"))
+         calls)
+    ;; A file-notify owner registers while the explicit call waits.
+    (tramp-rpc-mock-test--with-watch-stub
+        ('((path . "/tmp/raced"))
+         (lambda () (tramp-rpc--watch-acquire-notify vec directory "/tmp/raced"))
+         calls)
+      (tramp-rpc-watch-directory directory t)
+      (let ((lease (gethash key tramp-rpc--watch-leases)))
+        (should (tramp-rpc-watch-lease-explicit-p lease))
+        (should (tramp-rpc-watch-lease-recursive-p lease))
+        (should (= (tramp-rpc-watch-lease-notify-count lease) 1))))
+    ;; An explicit owner registers while the file-notify call waits.
+    (tramp-rpc-mock-test--with-watch-stub
+        ('((path . "/tmp/raced"))
+         (lambda () (tramp-rpc-watch-directory directory t))
+         calls)
+      (tramp-rpc--watch-acquire-notify vec directory "/tmp/raced")
+      (let ((lease (gethash key tramp-rpc--watch-leases)))
+        (should (tramp-rpc-watch-lease-explicit-p lease))
+        (should (tramp-rpc-watch-lease-recursive-p lease))
+        (should (= (tramp-rpc-watch-lease-notify-count lease) 1))
+        (should (tramp-rpc-watch-lease-notify-owned lease))))
+    ;; Two file-notify owners: a shared follow watch is not removed.
+    (setq calls nil)
+    (tramp-rpc-mock-test--with-watch-stub
+        ('((path . "/tmp/raced"))
+         (lambda () (tramp-rpc--watch-acquire-notify vec directory "/tmp/raced"))
+         calls)
+      (tramp-rpc--watch-acquire-notify vec directory "/tmp/raced")
+      (should (= (tramp-rpc-watch-lease-notify-count
+                  (gethash key tramp-rpc--watch-leases))
+                 2))
+      (should-not (member "watch.remove" calls)))))
+
+(ert-deftest tramp-rpc-mock-test-explicit-watch-updates-symlink-flag ()
+  "A `watch.add' reply that reports `is_symlink' replaces the recorded flag."
+  (let* ((directory "/rpc:mock:/tmp/was-link")
+         (vec (tramp-dissect-file-name directory))
+         (key (tramp-rpc--watch-key vec "/tmp/was-link"))
+         (reply '((path . "/tmp/was-link") (is_symlink . t)))
+         calls)
+    (tramp-rpc-mock-test--with-watch-stub (reply nil calls)
+      (tramp-rpc-watch-directory directory)
+      (should (tramp-rpc-watch-lease-is-symlink (gethash key tramp-rpc--watch-leases)))
+      ;; The link was replaced by a directory.
+      (setq reply '((path . "/tmp/was-link") (is_symlink . :msgpack-false)))
+      (tramp-rpc-watch-directory directory)
+      (should-not (tramp-rpc-watch-lease-is-symlink
+                   (gethash key tramp-rpc--watch-leases)))
+      ;; A reply without the field keeps the recorded flag.
+      (setf (tramp-rpc-watch-lease-is-symlink (gethash key tramp-rpc--watch-leases)) t)
+      (setq reply '((path . "/tmp/was-link")))
+      (tramp-rpc-watch-directory directory)
+      (should (tramp-rpc-watch-lease-is-symlink (gethash key tramp-rpc--watch-leases))))))
+
 (ert-deftest tramp-rpc-mock-test-file-notify-symlink-falls-back-to-synthetic ()
   "Symlink file notification watches stay synthetic without server support."
   (require 'filenotify)
@@ -3769,6 +3847,63 @@ registry."
             (should (equal cleared-paths '(("/rpc:mock:/tmp/repo/file"))))
             (should (equal invalidations '("/rpc:mock:/tmp/repo/file")))
             (should (= (length dispatches) 3))))
+      (when (process-live-p proc)
+        (delete-process proc)))))
+
+(ert-deftest tramp-rpc-mock-test-fs-event-deletes-sweep-each-cache-once ()
+  "One event batch drops every deleted subtree with one sweep per cache."
+  (let* ((vec (tramp-dissect-file-name "/rpc:mock:/tmp/"))
+         (proc (make-process :name "tramp-rpc-fs-delete-sweep"
+                             :buffer nil :command '("cat")
+                             :connection-type 'pipe :noquery t))
+         (tramp-rpc--file-exists-cache (make-hash-table :test 'equal))
+         (tramp-rpc--file-truename-cache (make-hash-table :test 'equal))
+         (tramp-rpc--file-stat-cache (make-hash-table :test 'equal))
+         (tramp-rpc--connections (make-hash-table :test 'equal))
+         (tramp-rpc--expected-fs-events nil)
+         (orig-remove-if (symbol-function 'tramp-rpc--hash-remove-if))
+         (sweeps 0)
+         dispatches)
+    (unwind-protect
+        (progn
+          (process-put proc :tramp-rpc-vec vec)
+          (puthash (tramp-rpc--connection-key vec)
+                   (tramp-rpc--make-connection :process proc)
+                   tramp-rpc--connections)
+          (dotimes (i 20)
+            (tramp-rpc--cache-put tramp-rpc--file-exists-cache
+                                  (format "/rpc:mock:/tmp/gone%d/child" i) t))
+          (tramp-rpc--cache-put tramp-rpc--file-exists-cache
+                                "/rpc:mock:/tmp/kept/child" t)
+          (cl-letf (((symbol-function 'tramp-rpc--hash-remove-if)
+                     (lambda (&rest args)
+                       (when (memq (nth 1 args)
+                                   (list tramp-rpc--file-exists-cache
+                                         tramp-rpc--file-truename-cache
+                                         tramp-rpc--file-stat-cache))
+                         (cl-incf sweeps))
+                       (apply orig-remove-if args)))
+                    ((symbol-function 'tramp-rpc--file-notify-dispatch)
+                     (lambda (action path &optional _path1 _cookie)
+                       (push (list action path) dispatches))))
+            (tramp-rpc--handle-notification
+             proc "fs.events"
+             `((events . ,(cl-loop for i below 20
+                                   collect `((action . "deleted")
+                                             (path . ,(format "/tmp/gone%d" i))))))))
+          ;; Three caches, each scanned once for all twenty deletions.
+          (should (= sweeps 3))
+          (dotimes (i 20)
+            (should (eq (tramp-rpc--cache-lookup
+                         tramp-rpc--file-exists-cache
+                         (format "/rpc:mock:/tmp/gone%d/child" i))
+                        'not-cached)))
+          (should (eq (tramp-rpc--cache-lookup tramp-rpc--file-exists-cache
+                                               "/rpc:mock:/tmp/kept/child")
+                      t))
+          (should (equal (car (last dispatches))
+                         '("deleted" "/rpc:mock:/tmp/gone0")))
+          (should (= (length dispatches) 20)))
       (when (process-live-p proc)
         (delete-process proc)))))
 
@@ -10415,6 +10550,36 @@ A PTY whose remote exit is recorded keeps draining its final output."
     (should-not (tramp-rpc-connection-environment conn))
     (should (> (tramp-rpc-connection-metadata-epoch conn) 0))
     (should-not tramp-default-proxies-alist)))
+
+(ert-deftest tramp-rpc-mock-test-successor-takes-tramp-buffer-from-retired-generation ()
+  "A successor started before its predecessor was retired becomes findable.
+TRAMP looks a connection's process up by `tramp-buffer-name'; once the
+retired generation releases that name, the live successor takes it."
+  (let* ((vec (tramp-dissect-file-name "/rpc:user@successor-buffer:/"))
+         (name (tramp-buffer-name vec))
+         (old-buf (get-buffer-create name))
+         ;; Created while the old generation still owned the name.
+         (new-buf (generate-new-buffer name))
+         (old-proc (make-pipe-process :name "old-gen" :buffer old-buf :noquery t))
+         (new-proc (make-pipe-process :name "new-gen" :buffer new-buf :noquery t))
+         (old-conn (tramp-rpc--make-connection :vec vec :process old-proc :buffer old-buf))
+         (new-conn (tramp-rpc--make-connection :vec vec :process new-proc :buffer new-buf))
+         (tramp-rpc--connections (make-hash-table :test 'equal)))
+    (unwind-protect
+        (progn
+          (tramp-rpc--attach-connection old-conn)
+          (tramp-rpc--attach-connection new-conn)
+          (puthash (tramp-rpc--connection-key vec) new-conn tramp-rpc--connections)
+          (should-not (eq (tramp-get-process vec) new-proc))
+          (tramp-rpc--finish-connection-generation-cleanup
+           old-proc vec "finished\n" old-conn)
+          (should-not (buffer-live-p old-buf))
+          (should (eq (tramp-get-process vec) new-proc))
+          (should (equal (buffer-name new-buf) name)))
+      (dolist (p (list old-proc new-proc))
+        (when (process-live-p p) (delete-process p)))
+      (dolist (b (list old-buf new-buf))
+        (when (buffer-live-p b) (kill-buffer b))))))
 
 (ert-deftest tramp-rpc-mock-test-retired-generation-does-not-kill-successor-stderr ()
   "Cleaning up a retired generation kills its main/stderr buffers without touching a successor."
