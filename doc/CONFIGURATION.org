@@ -1,0 +1,137 @@
+#+TITLE: TRAMP-RPC Configuration, Deployment & Troubleshooting
+#+AUTHOR: Arthur Heymans <arthur@aheymans.xyz>
+#+OPTIONS: toc:2
+
+Detailed user guide covering configuration options, binary deployment, multi-hop routing, and troubleshooting.
+
+* Configuration
+
+TRAMP-RPC works out of the box with no configuration. Common options:
+
+#+begin_src elisp
+;; Integrations & performance (all enabled by default)
+(setq tramp-rpc-magit-optimize t)
+(setq tramp-rpc-majutsu-optimize t)
+(setq tramp-rpc-use-direnv t)
+
+;; Prefer building from source over downloading for release installs (default: nil)
+(setq tramp-rpc-deploy-prefer-build nil)
+
+;; Git checkout policy (default: auto):
+;; - auto: reuse source-keyed artifacts; use M-x tramp-rpc-deploy-install-binary
+;;   when missing (or C-u to replace an existing one)
+;; - build: strictly build from source, using a build-only binary identity
+;; - release: use release-version binaries and paths
+(setq tramp-rpc-deploy-git-build-policy 'auto)
+
+;; Local binary cache directory (default: ~/.emacs.d/tramp-rpc/)
+(setq tramp-rpc-deploy-local-cache-directory "~/.cache/emacs/tramp-rpc-binaries")
+
+;; Remote installation directory (default: ~/.cache/emacs/tramp-rpc)
+(setq tramp-rpc-deploy-remote-directory "~/.local/bin/tramp-rpc")
+
+;; Disable automatic deployment (default: t)
+(setq tramp-rpc-deploy-auto-deploy nil)
+
+;; Use a fork for release downloads
+(setq tramp-rpc-deploy-github-repo "myuser/my-fork")
+
+;; Download timeout in seconds (default: 120)
+(setq tramp-rpc-deploy-download-timeout 60)
+#+end_src
+
+** Customizing Nix Cross-Compiled Server Targets
+
+The Nix flake builds server binaries for =x86_64-linux= and =aarch64-linux= by default. Override =archs= to cross-compile for additional targets:
+
+#+begin_src nix
+programs.emacs.extraPackages = epkgs: [
+  (epkgs.tramp-rpc.override {
+    archs = [
+      pkgs.pkgsCross.riscv64-musl
+      (import nixpkgs {
+        inherit system;
+        crossSystem = lib.systems.elaborate {
+          config = "armv6l-unknown-linux-musleabihf";
+        };
+      })
+    ];
+  })
+];
+#+end_src
+
+* Multi-hop (=|=) Routing
+
+- *SSH config & =ProxyJump=*: Host aliases and =ProxyJump= routes in =~/.ssh/config= work directly with =/rpc:user@final-host:/path= without adding a TRAMP hop.
+- *Privilege escalation (=sudo=)*: =/rpc:user@host|sudo:root@host:/path= stays RPC-accelerated by starting the RPC server under =sudo=.
+- *RPC-to-RPC chains*: Remain RPC-backed at the final target; intermediate =rpc= hops provide SSH routing.
+- *Shell-method chains*: Chains ending in shell-based methods such as =su= or =docker= (e.g. =/rpc:host|su::/path= or =/rpc:host|docker:container:/path=) fall back to TRAMP's regular shell handler through the SSH hop.
+- *Proxies*: Hidden routes in ~tramp-default-proxies-alist~ apply to ordinary =rpc= targets as in upstream TRAMP. Invalid proxy configurations signal an error rather than connecting directly.
+
+* Binary Deployment
+
+On first connection, the server binary (~850 KB static Rust binary) is cached locally in =~/.emacs.d/tramp-rpc/= and deployed to =~/.cache/emacs/tramp-rpc/= on the remote host:
+
+1. *Release/package installs*: download a checksum-verified binary from [[https://github.com/ArthurHeymans/emacs-tramp-rpc/releases][GitHub Releases]], falling back to building locally if Rust 1.88+ is installed.
+2. *Git checkout installs*: reuse a fresh source build or source-tree-keyed cache. Automatic file operations do not prompt when a binary is missing; run ~M-x tramp-rpc-deploy-install-binary~ and enter the *complete* TRAMP name (e.g. =/rpc:user@host:/=) to download a release binary or build locally with Cargo. Pass ~C-u~ to replace an existing binary.
+
+** Deployment Commands
+
+| Command                                | Description                                                            |
+|----------------------------------------+------------------------------------------------------------------------|
+| ~M-x tramp-rpc-deploy-status~          | Show version, local arch, Cargo status, cached binaries, and binary ID |
+| ~M-x tramp-rpc-deploy-install-binary~  | Obtain and deploy a missing git-checkout binary (~C-u~ to replace)     |
+| ~M-x tramp-rpc-deploy-clear-cache~     | Clear local binary cache                                               |
+| ~M-x tramp-rpc-deploy-remove-binary~   | Remove deployed binary from a remote host                              |
+
+** Supported Prebuilt Platforms
+
+| OS                    | Architectures                                              |
+|-----------------------+------------------------------------------------------------|
+| Linux (static musl)   | =x86_64=, =aarch64=, =i686=, =armv7=, =armv5te=, =arm= (ARMv6) |
+| macOS                 | =x86_64=, =aarch64= (Apple Silicon)                        |
+
+** Manual / Offline Binary Installation
+
+For air-gapped or firewalled environments, download the archive from [[https://github.com/ArthurHeymans/emacs-tramp-rpc/releases][GitHub Releases]], extract it, and place the binary on the remote host at:
+
+#+begin_example
+~/.cache/emacs/tramp-rpc/tramp-rpc-server-VERSION
+#+end_example
+
+Run ~M-x tramp-rpc-deploy-status~ to see the exact binary ID expected by your installation.
+
+** Fallback & Protocol Matching Policy
+
+- When the expected remote binary already exists and is executable, TRAMP-RPC reuses it if no trusted local artifact can be obtained (e.g. offline with no Cargo). This never covers a missing remote binary.
+- Whenever a trusted local artifact is available, SHA256 digests are compared; with ~tramp-rpc-deploy-auto-deploy~ enabled, mismatches are replaced atomically. With auto-deploy disabled, a verified mismatch signals an error.
+- At startup, the client checks exact equality of ~protocol_revision~ from ~system.info~. There is no backward-compatible negotiation: rebuild or redeploy the server binary matching your installed Elisp.
+
+* Troubleshooting
+
+** Exit code 127 on connect
+
+Usually means the RPC server binary is missing on the remote host (common on a git checkout). Run ~M-x tramp-rpc-deploy-install-binary~ with the complete TRAMP path (for example =/rpc:user@host:/=).
+
+** Connection / bootstrap failures
+
+Deployment transfers the binary over standard SSH (=scpx= by default). Verify non-interactive SSH succeeds:
+
+#+begin_src bash
+ssh -o BatchMode=yes user@host echo success
+#+end_src
+
+** Download failures (firewalls / proxies)
+
+1. Install Rust 1.88+ so TRAMP-RPC can build locally (=tramp-rpc-deploy-prefer-build=).
+2. Download the release archive manually and place it in =~/.emacs.d/tramp-rpc/=, or pre-deploy it to =~/.cache/emacs/tramp-rpc/= on the remote.
+
+** ~diff-hl~ issues in remote Dired buffers
+
+#+begin_src elisp
+(setq diff-hl-disable-on-remote t)
+#+end_src
+
+** Inspecting deployment state
+
+Run ~M-x tramp-rpc-deploy-status~ to check the active version, architecture, Cargo availability, cached binaries, download URLs, and expected binary ID.

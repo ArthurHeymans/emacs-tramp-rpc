@@ -1,0 +1,143 @@
+#+TITLE: TRAMP-RPC Development & Internals
+#+AUTHOR: Arthur Heymans <arthur@aheymans.xyz>
+#+OPTIONS: toc:2
+
+Developer reference for TRAMP-RPC: Elisp module layering, building from source, testing, and low-level compatibility semantics.
+
+For protocol design, RPC method tables, and full benchmark results, see [[file:TECHNICAL_COMPARISON.org][Technical Comparison]].
+
+* Building from Source
+
+** Using Nix (recommended)
+
+#+begin_src bash
+# Build for current platform
+nix build
+
+# Cross-compile for specific target
+nix build .#tramp-rpc-server-x86_64-linux
+nix build .#tramp-rpc-server-aarch64-linux
+
+# Development shell with Rust & build tools
+nix develop
+#+end_src
+
+** Using Cargo
+
+Requires Rust 1.88 or later.
+
+#+begin_src bash
+cd server
+cargo build --release
+#+end_src
+
+The binary is emitted at =target/release/tramp-rpc-server=.
+
+** Cross-compilation with Cargo
+
+#+begin_src bash
+rustup target add aarch64-unknown-linux-gnu
+cargo build --release --target aarch64-unknown-linux-gnu
+#+end_src
+
+* Elisp Module Architecture
+
+The Emacs Lisp client is strictly layered; each module only =require=s modules below it. When a lower layer needs to notify an upper layer, it runs a hook registered at load time.
+
+| Module                     | Purpose                                               |
+|----------------------------+-------------------------------------------------------|
+| ~tramp-rpc.el~             | TRAMP file handlers and registration                  |
+| ~tramp-rpc-magit.el~       | Magit/Projectile parallel prefetch & process cache    |
+| ~tramp-rpc-majutsu.el~     | Majutsu refresh-local query batching & root memo      |
+| ~tramp-rpc-advice.el~      | Advice for process I/O, VC, and Eglot integration     |
+| ~tramp-rpc-process.el~     | Async pipe processes & RPC PTY support                |
+| ~tramp-rpc-notify.el~      | Public ~file-notify~ descriptors on server watches    |
+| ~tramp-rpc-cache.el~       | TTL metadata caches & filesystem watch invalidation   |
+| ~tramp-rpc-environment.el~ | Remote environment (PATH, login shell, direnv)        |
+| ~tramp-rpc-transport.el~   | SSH/ControlMaster, connection generations, RPC calls  |
+| ~tramp-rpc-deploy.el~      | Binary deployment & version management                |
+| ~tramp-rpc-hops.el~        | Hop-chain analysis and sudo elevation                 |
+| ~tramp-rpc-connection.el~  | Per-generation ~tramp-rpc-connection~ struct          |
+| ~tramp-rpc-protocol.el~    | MessagePack-RPC framing, value helpers, debug logging |
+
+** Key Design Invariants
+
+- *Connection generations (~tramp-rpc-connection.el~, ~tramp-rpc-transport.el~)*: Each SSH transport generation owns its process, response buffer, pending IDs, buffered responses, async callbacks, and environment cache. A replacement connection starts a fresh generation and cannot observe old state. Upper layers hook into ~tramp-rpc-connection-invalidate-functions~, ~tramp-rpc-transport-terminate-functions~, ~tramp-rpc-transport-cleanup-functions~, and ~tramp-rpc-notification-functions~.
+- *Strict protocol matching*: At startup, the client checks exact equality of ~protocol_revision~ from ~system.info~. Older or mismatched servers are rejected immediately; there is no backward-compatible negotiation.
+- *Cache & watch hooks (~tramp-rpc-cache.el~)*: Derived caches (such as Magit's ancestor scans and prefetched status) subscribe via ~tramp-rpc-cache-invalidate-functions~ and ~tramp-rpc-fs-events-functions~.
+- *Majutsu batching (~tramp-rpc-majutsu.el~)*: Snapshots the working copy via ~jj op log~ to pin log/workspace/conflict queries to a single operation ID via ~commands.run_parallel~, while running status unpinned. Requires Majutsu's in-memory stderr-buffer support; mutations, editors, signing, and custom repo/op/log args bypass batching.
+
+* Compatibility & Semantics Notes
+
+** Access Predicates & Permissions
+
+- Access predicates cache answers directly from the remote kernel (~faccessat2(AT_EACCESS)~ on Linux) rather than reconstructing permissions from mode bits or supplementary group lists.
+- Entries are keyed by connection route and trailing slash and obey ~remote-file-name-inhibit-cache~ and watch invalidation.
+- ~access-file~ always performs a fresh read check and raises native Emacs error classes.
+- Writable checks on missing targets test write/search permission on the immediate parent in the same RPC after an ~ENOENT~ lookup.
+- ~file-accessible-directory-p~ checks directory searchability (matching native Emacs). New login group memberships require reconnecting the RPC server.
+
+** File Operations
+
+- *Copy*: Uses open file descriptors for both data and metadata. No-overwrite creates the destination exclusively with private permissions. Overwrite follows an existing destination symlink, but rejects dangling links, devices, FIFOs, and aliases of the source before truncating. Copy errors leave partial output rather than risk unlinking a concurrently replaced pathname.
+- *Rename*: Non-overwriting renames use the filesystem's atomic no-replace operation, falling back to an exclusive hard link + source unlink for non-directories. If source removal fails, the destination is retained. Filesystems without either operation fail explicitly.
+
+** Processes & PTYs
+
+- ~interrupt-process~ on an RPC PTY honors ~CURRENT-GROUP~: non-nil targets the foreground job; ~lambda~ does nothing when the shell owns the terminal. Signaling a foreground job does not retire the shell or discard its output.
+- RPC PTYs disable kernel ~ECHO~, ~ECHONL~, and ~ONLCR~; terminal consumers such as ~comint~ and ~eat~ perform local echo and line handling.
+- RPC PTY writes wait for remote write acknowledgement (blocking up to the RPC timeout if the remote stops reading). Pipe writes are queued by default; set ~tramp-rpc-synchronous-pipe-writes~ non-nil to make them synchronous.
+- ~C-g~ while waiting for a synchronous, batch, or pipelined RPC abandons only that wait; the connection, other pending requests, and remote processes remain alive and late replies are discarded by ID. Quitting mid-write still retires the connection to avoid torn frames.
+
+** Generating RPC Method Docs
+
+[[file:RPC_METHODS.org][doc/RPC_METHODS.org]] is generated and verified directly by Rust (=server/src/docgen.rs=, compiled only under =#[cfg(test)]=):
+
+#+begin_src bash
+# Regenerate after changing RPC methods or their params
+UPDATE_RPC_DOCS=1 cargo test rpc_methods_doc_is_up_to_date
+
+# Verified automatically during normal `cargo test`
+cargo test rpc_methods_doc_is_up_to_date
+#+end_src
+
+* Testing
+
+** Pinned Dependencies via Nix
+
+The ~elisp~ dev shell provides Emacs and the pinned TRAMP, ~msgpack~, and ~package-lint~ versions used by CI:
+
+#+begin_src bash
+nix develop .#elisp -c ./test/run-tests.sh --mock
+nix develop .#elisp -c sh -c \
+  'rm -f lisp/*.elc && emacs -Q --batch --eval "(setq byte-compile-error-on-warn t)" -L lisp -f batch-byte-compile lisp/*.el'
+#+end_src
+
+** Running Test Suites
+
+#+begin_src bash
+# Pure-Elisp protocol tests (no server or SSH needed)
+./test/run-tests.sh --protocol
+
+# Mock + direct server integration tests (no SSH needed)
+./test/run-tests.sh --mock
+
+# Full remote suite over SSH
+TRAMP_RPC_TEST_HOST=your-remote-host ./test/run-tests.sh --remote
+#+end_src
+
+** Kernel Access & ACL Tests
+
+Compare native Emacs access predicates and ~access-file~ against an isolated server copy (Linux or macOS):
+
+#+begin_src bash
+TRAMP_RPC_ACCESS_TEST_SERVER=/path/to/isolated/tramp-rpc-server \
+  emacs -Q --batch -L lisp -l test/run-access-tests.el
+#+end_src
+
+On Linux, also verify real named-user/group ACL grants, masks, directory search, missing-target writability, and cache invalidation (requires ~unshare~, ~newuidmap~, ~newgidmap~, ~setpriv~, ~setfacl~, and an ACL-capable filesystem):
+
+#+begin_src bash
+TRAMP_RPC_ACCESS_TEST_SERVER=/path/to/rebuilt/tramp-rpc-server \
+  test/run-access-acl-tests.sh
+#+end_src

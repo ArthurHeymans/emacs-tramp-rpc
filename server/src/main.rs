@@ -804,4 +804,6 @@ async fn process_request(payload: &[u8]) -> Response {
 }
 
 #[cfg(test)]
+mod docgen;
+#[cfg(test)]
 mod tests;

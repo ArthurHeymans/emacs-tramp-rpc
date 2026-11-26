@@ -1,0 +1,87 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 860 344" width="860" height="344" role="img" aria-label="Round-trip collapse: sequential TRAMP SSH waterfall vs TRAMP-RPC batching and push invalidation">
+  <defs>
+    <style>
+      .sans { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif; }
+      .mono { font-family: ui-monospace, SFMono-Regular, 'SF Mono', Menlo, Consolas, monospace; }
+      .lane-title { font-size: 13px; font-weight: 700; letter-spacing: 0.04em; text-transform: uppercase; }
+      .lbl { font-size: 11px; font-weight: 600; }
+      .sub { font-size: 10.5px; fill: #59636e; }
+      .metric { font-size: 11.5px; font-weight: 700; }
+    </style>
+  </defs>
+
+  <!-- ==================== TOP: SEQUENTIAL SHELL TRAMP ==================== -->
+  <rect x="8" y="8" width="844" height="148" rx="12" fill="#f6f8fa" stroke="#d0d7de" stroke-width="1"/>
+  <rect x="8" y="8" width="5" height="148" rx="2.5" fill="#cf4a3e"/>
+
+  <text x="28" y="34" class="sans lane-title" fill="#cf4a3e">Traditional TRAMP — Sequential Round-Trips</text>
+  <rect x="614" y="19" width="222" height="22" rx="11" fill="#fde8e6"/>
+  <text x="725" y="33.5" text-anchor="middle" class="sans lbl" fill="#a83228">10× stat = 270.5 ms (10 RTTs)</text>
+
+  <!-- Timeline axis -->
+  <line x1="28" y1="126" x2="832" y2="126" stroke="#d8dee4" stroke-width="1"/>
+  <text x="28" y="143" class="sans sub">t = 0</text>
+  <text x="832" y="143" text-anchor="end" class="sans sub">Time (N × network RTT + N × shell forks) →</text>
+
+  <!-- Sequential blocks -->
+  <rect x="28" y="56" width="114" height="54" rx="7" fill="#fff5f4" stroke="#f2c6c1" stroke-width="1"/>
+  <text x="85" y="79" text-anchor="middle" class="mono lbl" fill="#1f2328">stat #1</text>
+  <text x="85" y="97" text-anchor="middle" class="sans sub">RTT + fork</text>
+
+  <rect x="150" y="56" width="114" height="54" rx="7" fill="#fff5f4" stroke="#f2c6c1" stroke-width="1"/>
+  <text x="207" y="79" text-anchor="middle" class="mono lbl" fill="#1f2328">stat #2</text>
+  <text x="207" y="97" text-anchor="middle" class="sans sub">RTT + fork</text>
+
+  <rect x="272" y="56" width="114" height="54" rx="7" fill="#fff5f4" stroke="#f2c6c1" stroke-width="1"/>
+  <text x="329" y="79" text-anchor="middle" class="mono lbl" fill="#1f2328">stat #3</text>
+  <text x="329" y="97" text-anchor="middle" class="sans sub">RTT + fork</text>
+
+  <rect x="394" y="56" width="114" height="54" rx="7" fill="#fff5f4" stroke="#f2c6c1" stroke-width="1"/>
+  <text x="451" y="79" text-anchor="middle" class="mono lbl" fill="#1f2328">git cmd #1</text>
+  <text x="451" y="97" text-anchor="middle" class="sans sub">RTT + fork</text>
+
+  <rect x="516" y="56" width="114" height="54" rx="7" fill="#fff5f4" stroke="#f2c6c1" stroke-width="1"/>
+  <text x="573" y="79" text-anchor="middle" class="mono lbl" fill="#1f2328">git cmd #2</text>
+  <text x="573" y="97" text-anchor="middle" class="sans sub">RTT + fork</text>
+
+  <rect x="638" y="56" width="194" height="54" rx="7" fill="#fff5f4" stroke="#f2c6c1" stroke-width="1" stroke-dasharray="4 3"/>
+  <text x="735" y="79" text-anchor="middle" class="sans lbl" fill="#a83228">... repeats N times</text>
+  <text x="735" y="97" text-anchor="middle" class="sans sub">Emacs blocks on every hop</text>
+
+  <!-- ==================== BOTTOM: TRAMP-RPC ==================== -->
+  <rect x="8" y="172" width="844" height="164" rx="12" fill="#f6f8fa" stroke="#a7e3cc" stroke-width="1.2"/>
+  <rect x="8" y="172" width="5" height="164" rx="2.5" fill="#0d9468"/>
+
+  <text x="28" y="198" class="sans lane-title" fill="#0d9468">TRAMP-RPC — Single-RTT Batching, Parallel Prefetch &amp; Push Cache</text>
+  <rect x="614" y="183" width="222" height="22" rx="11" fill="#d1fae5"/>
+  <text x="725" y="197.5" text-anchor="middle" class="sans lbl" fill="#065f46">10× stat = 3.9 ms (69.0× faster)</text>
+
+  <!-- Phase 1: Single batched RTT -->
+  <rect x="28" y="218" width="256" height="94" rx="9" fill="#eefbf5" stroke="#0d9468" stroke-width="1.3"/>
+  <text x="42" y="239" class="sans lbl" fill="#0d9468">1. Single Round-Trip (batch / parallel)</text>
+  <!-- Stacked parallel bars inside with high-contrast fills -->
+  <rect x="42" y="248" width="228" height="15" rx="4" fill="#059669"/>
+  <text x="50" y="259" class="mono" font-size="9.5" font-weight="600" fill="#ffffff">batch: 10× file.stat (concurrent)</text>
+  <rect x="42" y="267" width="228" height="15" rx="4" fill="#0d9488"/>
+  <text x="50" y="278" class="mono" font-size="9.5" font-weight="600" fill="#ffffff">run_parallel: 60+ Magit git cmds</text>
+  <rect x="42" y="286" width="228" height="15" rx="4" fill="#047857"/>
+  <text x="50" y="297" class="mono" font-size="9.5" font-weight="600" fill="#ffffff">ancestors.scan: VC/project root</text>
+
+  <!-- Phase 2: Instant local cache hits -->
+  <rect x="298" y="218" width="272" height="94" rx="9" fill="#eff6ff" stroke="#bfdbfe" stroke-width="1.1"/>
+  <text x="312" y="239" class="sans lbl" fill="#1d4ed8">2. Subsequent Lookups = 0 RTT</text>
+  <text x="312" y="260" class="sans sub">Metadata &amp; prefetched VC results served</text>
+  <text x="312" y="276" class="sans sub">directly from Emacs memory.</text>
+  <rect x="312" y="286" width="176" height="18" rx="4" fill="#ffffff" stroke="#bfdbfe" stroke-width="0.8"/>
+  <text x="400" y="298.5" text-anchor="middle" class="mono" font-size="9.5" fill="#1d4ed8">sub-millisecond local hit</text>
+
+  <!-- Phase 3: Server-pushed invalidation -->
+  <rect x="584" y="218" width="248" height="94" rx="9" fill="#ffffff" stroke="#d0d7de" stroke-width="1"/>
+  <text x="598" y="239" class="sans lbl" fill="#1f2328">3. Live Push Invalidation</text>
+  <text x="598" y="260" class="sans sub">Remote inotify / kqueue watches</text>
+  <text x="598" y="276" class="sans sub">push fs.events on file changes —</text>
+  <text x="598" y="292" class="sans sub">fresh caches with zero polling.</text>
+
+  <!-- Bottom note -->
+  <text x="28" y="326" class="sans sub">Done in 1 RTT — over higher-RTT WiFi/VPN/WAN links, collapsing N round-trips matters even more.</text>
+</svg>
