@@ -1,0 +1,136 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 860 404" width="860" height="404" role="img" aria-label="Architecture comparison: Traditional TRAMP vs TRAMP-RPC">
+  <defs>
+    <style>
+      .sans { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif; }
+      .mono { font-family: ui-monospace, SFMono-Regular, 'SF Mono', Menlo, Consolas, monospace; }
+      .title { font-size: 13px; font-weight: 700; letter-spacing: 0.04em; text-transform: uppercase; }
+      .node-title { font-size: 13.5px; font-weight: 600; fill: #1f2328; }
+      .node-sub { font-size: 11px; fill: #59636e; }
+      .pill-text { font-size: 10.5px; font-weight: 600; }
+      .wire-label { font-size: 10.5px; font-weight: 600; }
+      .wire-sub { font-size: 10px; fill: #59636e; }
+    </style>
+    <marker id="arr-old" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+      <path d="M1,1.5 L8.5,5 L1,8.5 Z" fill="#cf4a3e"/>
+    </marker>
+    <marker id="arr-rpc" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+      <path d="M1,1.5 L8.5,5 L1,8.5 Z" fill="#0d9468"/>
+    </marker>
+    <marker id="arr-muted" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+      <path d="M1,1.5 L8.5,5 L1,8.5 Z" fill="#6e7781"/>
+    </marker>
+    <marker id="arr-blue" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+      <path d="M1,1.5 L8.5,5 L1,8.5 Z" fill="#2563eb"/>
+    </marker>
+  </defs>
+
+  <!-- ==================== TOP PANEL: TRADITIONAL TRAMP ==================== -->
+  <rect x="8" y="8" width="844" height="162" rx="12" fill="#f6f8fa" stroke="#d0d7de" stroke-width="1"/>
+  <!-- Accent left stripe -->
+  <rect x="8" y="8" width="5" height="162" rx="2.5" fill="#cf4a3e"/>
+
+  <!-- Header row -->
+  <text x="28" y="34" class="sans title" fill="#cf4a3e">Traditional TRAMP (tramp-sh)</text>
+  <!-- Pills on top right -->
+  <rect x="520" y="19" width="96" height="22" rx="11" fill="#fde8e6"/>
+  <text x="568" y="33.5" text-anchor="middle" class="sans pill-text" fill="#a83228">Shell quoting</text>
+  <rect x="624" y="19" width="94" height="22" rx="11" fill="#fde8e6"/>
+  <text x="671" y="33.5" text-anchor="middle" class="sans pill-text" fill="#a83228">Regex parsing</text>
+  <rect x="726" y="19" width="110" height="22" rx="11" fill="#fde8e6"/>
+  <text x="781" y="33.5" text-anchor="middle" class="sans pill-text" fill="#a83228">1 op / round-trip</text>
+
+  <!-- Nodes: Emacs -> SSH -> /bin/sh -> Fork CLI -> Parse stdout -->
+  <!-- Emacs box -->
+  <rect x="28" y="60" width="120" height="72" rx="8" fill="#ffffff" stroke="#c8d1da" stroke-width="1"/>
+  <text x="88" y="90" text-anchor="middle" class="sans node-title">Emacs</text>
+  <text x="88" y="109" text-anchor="middle" class="mono node-sub">/ssh:host:path</text>
+
+  <!-- Wire 1 -->
+  <line x1="152" y1="96" x2="238" y2="96" stroke="#cf4a3e" stroke-width="1.8" marker-end="url(#arr-old)" marker-start="url(#arr-old)"/>
+  <text x="195" y="85" text-anchor="middle" class="sans wire-label" fill="#cf4a3e">SSH text</text>
+  <text x="195" y="114" text-anchor="middle" class="sans wire-sub">prompt sync</text>
+
+  <!-- Remote Host dashed frame -->
+  <rect x="246" y="50" width="590" height="106" rx="10" fill="#fff5f4" stroke="#f2c6c1" stroke-width="1" stroke-dasharray="4 3"/>
+  <text x="260" y="66" class="sans" font-size="10" font-weight="600" fill="#a83228">REMOTE HOST</text>
+
+  <!-- /bin/sh -->
+  <rect x="260" y="75" width="118" height="66" rx="8" fill="#ffffff" stroke="#f2c6c1" stroke-width="1"/>
+  <text x="319" y="102" text-anchor="middle" class="mono node-title">/bin/sh</text>
+  <text x="319" y="121" text-anchor="middle" class="sans node-sub">shell escape &amp; eval</text>
+
+  <line x1="380" y1="108" x2="412" y2="108" stroke="#6e7781" stroke-width="1.5" marker-end="url(#arr-muted)"/>
+
+  <!-- Fork CLI tools -->
+  <rect x="418" y="75" width="182" height="66" rx="8" fill="#ffffff" stroke="#f2c6c1" stroke-width="1"/>
+  <text x="509" y="101" text-anchor="middle" class="sans node-title">Spawn external tools</text>
+  <text x="509" y="121" text-anchor="middle" class="mono node-sub">stat · ls · test · base64</text>
+
+  <line x1="602" y1="108" x2="634" y2="108" stroke="#6e7781" stroke-width="1.5" marker-end="url(#arr-muted)"/>
+
+  <!-- Parse text -->
+  <rect x="640" y="75" width="182" height="66" rx="8" fill="#ffffff" stroke="#f2c6c1" stroke-width="1"/>
+  <text x="731" y="101" text-anchor="middle" class="sans node-title">Text stdout → regex</text>
+  <text x="731" y="121" text-anchor="middle" class="sans node-sub">wait for prompt, repeat</text>
+
+  <!-- ==================== BOTTOM PANEL: TRAMP-RPC ==================== -->
+  <rect x="8" y="186" width="844" height="210" rx="12" fill="#f6f8fa" stroke="#a7e3cc" stroke-width="1.2"/>
+  <rect x="8" y="186" width="5" height="210" rx="2.5" fill="#0d9468"/>
+
+  <!-- Header row -->
+  <text x="28" y="213" class="sans title" fill="#0d9468">TRAMP-RPC (/rpc:)</text>
+  <!-- Pills -->
+  <rect x="478" y="198" width="112" height="22" rx="11" fill="#d1fae5"/>
+  <text x="534" y="212.5" text-anchor="middle" class="sans pill-text" fill="#065f46">MessagePack bin</text>
+  <rect x="598" y="198" width="108" height="22" rx="11" fill="#d1fae5"/>
+  <text x="652" y="212.5" text-anchor="middle" class="sans pill-text" fill="#065f46">Direct syscalls</text>
+  <rect x="714" y="198" width="122" height="22" rx="11" fill="#d1fae5"/>
+  <text x="775" y="212.5" text-anchor="middle" class="sans pill-text" fill="#065f46">Batch + Push I/O</text>
+
+  <!-- Emacs box -->
+  <rect x="28" y="256" width="120" height="96" rx="8" fill="#ffffff" stroke="#bfdbfe" stroke-width="1.2"/>
+  <text x="88" y="286" text-anchor="middle" class="sans node-title">Emacs</text>
+  <text x="88" y="305" text-anchor="middle" class="mono node-sub">/rpc:host:path</text>
+  <rect x="42" y="317" width="92" height="22" rx="6" fill="#eff6ff" stroke="#bfdbfe" stroke-width="0.8"/>
+  <text x="88" y="331.5" text-anchor="middle" class="sans" font-size="10" font-weight="600" fill="#1d4ed8">Metadata Cache</text>
+
+  <!-- Wire 2: Binary RPC -->
+  <line x1="154" y1="294" x2="238" y2="294" stroke="#0d9468" stroke-width="2.2" marker-end="url(#arr-rpc)" marker-start="url(#arr-rpc)"/>
+  <text x="196" y="271" text-anchor="middle" class="sans wire-label" fill="#0d9468">MessagePack</text>
+  <text x="196" y="284" text-anchor="middle" class="sans wire-sub">4-byte framed</text>
+  <text x="196" y="310" text-anchor="middle" class="sans wire-sub">SSH ControlMaster</text>
+
+  <!-- Push wire below -->
+  <line x1="238" y1="333" x2="154" y2="333" stroke="#2563eb" stroke-width="1.5" stroke-dasharray="4 3" marker-end="url(#arr-blue)"/>
+  <text x="196" y="348" text-anchor="middle" class="sans" font-size="9.5" font-weight="600" fill="#2563eb">push: fs &amp; proc</text>
+
+  <!-- Remote Host dashed frame -->
+  <rect x="246" y="232" width="590" height="150" rx="10" fill="#eefbf5" stroke="#a7e3cc" stroke-width="1" stroke-dasharray="4 3"/>
+  <text x="260" y="249" class="sans" font-size="10" font-weight="600" fill="#065f46">REMOTE HOST — NO SHELL REQUIRED</text>
+
+  <!-- tramp-rpc-server box -->
+  <rect x="260" y="260" width="194" height="106" rx="9" fill="#ffffff" stroke="#0d9468" stroke-width="1.4"/>
+  <text x="357" y="289" text-anchor="middle" class="mono node-title">tramp-rpc-server</text>
+  <text x="357" y="308" text-anchor="middle" class="sans node-sub">~850 KB static Rust binary</text>
+  <text x="357" y="325" text-anchor="middle" class="sans node-sub">Tokio async runtime</text>
+  <rect x="283" y="336" width="148" height="20" rx="5" fill="#d1fae5"/>
+  <text x="357" y="349.5" text-anchor="middle" class="sans" font-size="10" font-weight="600" fill="#065f46">Auto-deployed on connect</text>
+
+  <!-- Branching arrows to 3 capabilities -->
+  <path d="M454,286 L478,286 L478,275 L498,275" fill="none" stroke="#0d9468" stroke-width="1.5" marker-end="url(#arr-rpc)"/>
+  <path d="M454,313 L498,313" fill="none" stroke="#0d9468" stroke-width="1.5" marker-end="url(#arr-rpc)"/>
+  <path d="M454,340 L478,340 L478,351 L498,351" fill="none" stroke="#0d9468" stroke-width="1.5" marker-end="url(#arr-rpc)"/>
+
+  <!-- 3 stacked capability cards -->
+  <rect x="504" y="259" width="318" height="32" rx="7" fill="#ffffff" stroke="#a7e3cc" stroke-width="1"/>
+  <text x="518" y="279" class="sans" font-size="12" font-weight="600" fill="#1f2328">Direct Syscalls</text>
+  <text x="810" y="279" text-anchor="end" class="mono" font-size="10.5" fill="#59636e">stat · read · faccessat2</text>
+
+  <rect x="504" y="297" width="318" height="32" rx="7" fill="#ffffff" stroke="#a7e3cc" stroke-width="1"/>
+  <text x="518" y="317" class="sans" font-size="12" font-weight="600" fill="#1f2328">Batch &amp; Parallel</text>
+  <text x="810" y="317" text-anchor="end" class="mono" font-size="10.5" fill="#59636e">batch · run_parallel</text>
+
+  <rect x="504" y="335" width="318" height="32" rx="7" fill="#ffffff" stroke="#a7e3cc" stroke-width="1"/>
+  <text x="518" y="355" class="sans" font-size="12" font-weight="600" fill="#1f2328">Live Push Streams</text>
+  <text x="810" y="355" text-anchor="end" class="mono" font-size="10.5" fill="#59636e">inotify/kqueue · PTY/proc</text>
+</svg>

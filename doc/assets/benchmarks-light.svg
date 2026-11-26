@@ -1,0 +1,211 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 860 582" width="860" height="582" role="img" aria-label="Measured latency benchmarks comparing TRAMP-RPC against TRAMP SSH">
+  <defs>
+    <style>
+      .sans { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif; }
+      .mono { font-family: ui-monospace, SFMono-Regular, 'SF Mono', Menlo, Consolas, monospace; }
+      .chart-title { font-size: 14px; font-weight: 700; fill: #1f2328; }
+      .chart-sub { font-size: 11px; fill: #59636e; }
+      .row-name { font-size: 12.5px; font-weight: 600; }
+      .bar-val { font-size: 10.5px; font-weight: 600; }
+      .speedup-val { font-size: 11.5px; font-weight: 700; }
+      .legend { font-size: 11px; font-weight: 600; fill: #59636e; }
+    </style>
+  </defs>
+
+  <rect x="8" y="8" width="844" height="566" rx="12" fill="#f6f8fa" stroke="#d0d7de" stroke-width="1"/>
+
+  <!-- Header -->
+  <text x="28" y="34" class="sans chart-title">Median Latency: TRAMP-RPC vs. TRAMP SSH</text>
+  <text x="28" y="52" class="sans chart-sub">Normalized per operation (SSH = 100%, shorter is faster) · LAN (~1 ms RTT, Linux → Linux, 9 runs)</text>
+
+  <!-- Legend -->
+  <rect x="572" y="23" width="12" height="12" rx="3" fill="#10b981"/>
+  <text x="590" y="33" class="sans legend">TRAMP-RPC</text>
+  <rect x="678" y="23" width="12" height="12" rx="3" fill="#d4847a" opacity="0.85"/>
+  <text x="696" y="33" class="sans legend">TRAMP SSH</text>
+  <text x="832" y="52" text-anchor="end" class="sans chart-sub">Speedup</text>
+
+  <line x1="24" y1="64" x2="836" y2="64" stroke="#d0d7de" stroke-width="1"/>
+
+  
+  
+  <text x="28" y="99" class="sans row-name" fill="#1f2328">10× file stat (batched)</text>
+
+  <!-- Track + RPC bar (top) -->
+  <rect x="248" y="81" width="422" height="12" rx="4" fill="#eaeef2"/>
+  <rect x="248" y="81" width="8" height="12" rx="4" fill="#10b981"/>
+  <text x="264" y="91" class="mono bar-val" fill="#0d9468">3.9 ms</text>
+
+  <!-- SSH bar (bottom) -->
+  <rect x="248" y="97" width="422" height="12" rx="4" fill="#d4847a" opacity="0.85"/>
+  <text x="748" y="107" text-anchor="end" class="mono bar-val" fill="#59636e">270.5 ms</text>
+
+  <!-- Speedup pill -->
+  <rect x="764" y="83" width="68" height="24" rx="12" fill="#d1fae5"/>
+  <text x="798" y="99" text-anchor="middle" class="mono speedup-val" fill="#065f46">69.0×</text>
+
+  <line x1="24" y1="116" x2="836" y2="116" stroke="#e5e9ee" stroke-width="1"/>
+  <text x="28" y="141" class="sans row-name" fill="#1f2328">Connection setup</text>
+
+  <!-- Track + RPC bar (top) -->
+  <rect x="248" y="123" width="422" height="12" rx="4" fill="#eaeef2"/>
+  <rect x="248" y="123" width="12" height="12" rx="4" fill="#10b981"/>
+  <text x="268" y="133" class="mono bar-val" fill="#0d9468">35.9 ms</text>
+
+  <!-- SSH bar (bottom) -->
+  <rect x="248" y="139" width="422" height="12" rx="4" fill="#d4847a" opacity="0.85"/>
+  <text x="748" y="149" text-anchor="end" class="mono bar-val" fill="#59636e">1,280 ms</text>
+
+  <!-- Speedup pill -->
+  <rect x="764" y="125" width="68" height="24" rx="12" fill="#d1fae5"/>
+  <text x="798" y="141" text-anchor="middle" class="mono speedup-val" fill="#065f46">35.8×</text>
+
+  <line x1="24" y1="158" x2="836" y2="158" stroke="#e5e9ee" stroke-width="1"/>
+  <text x="28" y="183" class="sans row-name" fill="#1f2328">dir-locals-find-file (12d)</text>
+
+  <!-- Track + RPC bar (top) -->
+  <rect x="248" y="165" width="422" height="12" rx="4" fill="#eaeef2"/>
+  <rect x="248" y="165" width="13" height="12" rx="4" fill="#10b981"/>
+  <text x="269" y="175" class="mono bar-val" fill="#0d9468">3.7 ms</text>
+
+  <!-- SSH bar (bottom) -->
+  <rect x="248" y="181" width="422" height="12" rx="4" fill="#d4847a" opacity="0.85"/>
+  <text x="748" y="191" text-anchor="end" class="mono bar-val" fill="#59636e">115.1 ms</text>
+
+  <!-- Speedup pill -->
+  <rect x="764" y="167" width="68" height="24" rx="12" fill="#d1fae5"/>
+  <text x="798" y="183" text-anchor="middle" class="mono speedup-val" fill="#065f46">31.3×</text>
+
+  <line x1="24" y1="200" x2="836" y2="200" stroke="#e5e9ee" stroke-width="1"/>
+  <text x="28" y="225" class="sans row-name" fill="#1f2328">directory-files</text>
+
+  <!-- Track + RPC bar (top) -->
+  <rect x="248" y="207" width="422" height="12" rx="4" fill="#eaeef2"/>
+  <rect x="248" y="207" width="32" height="12" rx="4" fill="#10b981"/>
+  <text x="288" y="217" class="mono bar-val" fill="#0d9468">2.9 ms</text>
+
+  <!-- SSH bar (bottom) -->
+  <rect x="248" y="223" width="422" height="12" rx="4" fill="#d4847a" opacity="0.85"/>
+  <text x="748" y="233" text-anchor="end" class="mono bar-val" fill="#59636e">39.2 ms</text>
+
+  <!-- Speedup pill -->
+  <rect x="764" y="209" width="68" height="24" rx="12" fill="#d1fae5"/>
+  <text x="798" y="225" text-anchor="middle" class="mono speedup-val" fill="#065f46">13.3×</text>
+
+  <line x1="24" y1="242" x2="836" y2="242" stroke="#e5e9ee" stroke-width="1"/>
+  <text x="28" y="267" class="sans row-name" fill="#1f2328">copy-file</text>
+
+  <!-- Track + RPC bar (top) -->
+  <rect x="248" y="249" width="422" height="12" rx="4" fill="#eaeef2"/>
+  <rect x="248" y="249" width="41" height="12" rx="4" fill="#10b981"/>
+  <text x="297" y="259" class="mono bar-val" fill="#0d9468">19.1 ms</text>
+
+  <!-- SSH bar (bottom) -->
+  <rect x="248" y="265" width="422" height="12" rx="4" fill="#d4847a" opacity="0.85"/>
+  <text x="748" y="275" text-anchor="end" class="mono bar-val" fill="#59636e">196.9 ms</text>
+
+  <!-- Speedup pill -->
+  <rect x="764" y="251" width="68" height="24" rx="12" fill="#d1fae5"/>
+  <text x="798" y="267" text-anchor="middle" class="mono speedup-val" fill="#065f46">10.3×</text>
+
+  <line x1="24" y1="284" x2="836" y2="284" stroke="#e5e9ee" stroke-width="1"/>
+  <text x="28" y="309" class="sans row-name" fill="#1f2328">dir-files-attrs (Dired)</text>
+
+  <!-- Track + RPC bar (top) -->
+  <rect x="248" y="291" width="422" height="12" rx="4" fill="#eaeef2"/>
+  <rect x="248" y="291" width="43" height="12" rx="4" fill="#10b981"/>
+  <text x="299" y="301" class="mono bar-val" fill="#0d9468">7.9 ms</text>
+
+  <!-- SSH bar (bottom) -->
+  <rect x="248" y="307" width="422" height="12" rx="4" fill="#d4847a" opacity="0.85"/>
+  <text x="748" y="317" text-anchor="end" class="mono bar-val" fill="#59636e">77.4 ms</text>
+
+  <!-- Speedup pill -->
+  <rect x="764" y="293" width="68" height="24" rx="12" fill="#d1fae5"/>
+  <text x="798" y="309" text-anchor="middle" class="mono speedup-val" fill="#065f46">9.8×</text>
+
+  <line x1="24" y1="326" x2="836" y2="326" stroke="#e5e9ee" stroke-width="1"/>
+  <text x="28" y="351" class="sans row-name" fill="#1f2328">file-exists-p</text>
+
+  <!-- Track + RPC bar (top) -->
+  <rect x="248" y="333" width="422" height="12" rx="4" fill="#eaeef2"/>
+  <rect x="248" y="333" width="43" height="12" rx="4" fill="#10b981"/>
+  <text x="299" y="343" class="mono bar-val" fill="#0d9468">4.1 ms</text>
+
+  <!-- SSH bar (bottom) -->
+  <rect x="248" y="349" width="422" height="12" rx="4" fill="#d4847a" opacity="0.85"/>
+  <text x="748" y="359" text-anchor="end" class="mono bar-val" fill="#59636e">39.7 ms</text>
+
+  <!-- Speedup pill -->
+  <rect x="764" y="335" width="68" height="24" rx="12" fill="#d1fae5"/>
+  <text x="798" y="351" text-anchor="middle" class="mono speedup-val" fill="#065f46">9.8×</text>
+
+  <line x1="24" y1="368" x2="836" y2="368" stroke="#e5e9ee" stroke-width="1"/>
+  <text x="28" y="393" class="sans row-name" fill="#1f2328">locate-dominating-file (12d)</text>
+
+  <!-- Track + RPC bar (top) -->
+  <rect x="248" y="375" width="422" height="12" rx="4" fill="#eaeef2"/>
+  <rect x="248" y="375" width="46" height="12" rx="4" fill="#10b981"/>
+  <text x="302" y="385" class="mono bar-val" fill="#0d9468">7.2 ms</text>
+
+  <!-- SSH bar (bottom) -->
+  <rect x="248" y="391" width="422" height="12" rx="4" fill="#d4847a" opacity="0.85"/>
+  <text x="748" y="401" text-anchor="end" class="mono bar-val" fill="#59636e">65.9 ms</text>
+
+  <!-- Speedup pill -->
+  <rect x="764" y="377" width="68" height="24" rx="12" fill="#d1fae5"/>
+  <text x="798" y="393" text-anchor="middle" class="mono speedup-val" fill="#065f46">9.1×</text>
+
+  <line x1="24" y1="410" x2="836" y2="410" stroke="#e5e9ee" stroke-width="1"/>
+  <text x="28" y="435" class="sans row-name" fill="#1f2328">file-read</text>
+
+  <!-- Track + RPC bar (top) -->
+  <rect x="248" y="417" width="422" height="12" rx="4" fill="#eaeef2"/>
+  <rect x="248" y="417" width="60" height="12" rx="4" fill="#10b981"/>
+  <text x="316" y="427" class="mono bar-val" fill="#0d9468">2.9 ms</text>
+
+  <!-- SSH bar (bottom) -->
+  <rect x="248" y="433" width="422" height="12" rx="4" fill="#d4847a" opacity="0.85"/>
+  <text x="748" y="443" text-anchor="end" class="mono bar-val" fill="#59636e">20.3 ms</text>
+
+  <!-- Speedup pill -->
+  <rect x="764" y="419" width="68" height="24" rx="12" fill="#d1fae5"/>
+  <text x="798" y="435" text-anchor="middle" class="mono speedup-val" fill="#065f46">7.0×</text>
+
+  <line x1="24" y1="452" x2="836" y2="452" stroke="#e5e9ee" stroke-width="1"/>
+  <text x="28" y="477" class="sans row-name" fill="#1f2328">file-write</text>
+
+  <!-- Track + RPC bar (top) -->
+  <rect x="248" y="459" width="422" height="12" rx="4" fill="#eaeef2"/>
+  <rect x="248" y="459" width="70" height="12" rx="4" fill="#10b981"/>
+  <text x="326" y="469" class="mono bar-val" fill="#0d9468">36.9 ms</text>
+
+  <!-- SSH bar (bottom) -->
+  <rect x="248" y="475" width="422" height="12" rx="4" fill="#d4847a" opacity="0.85"/>
+  <text x="748" y="485" text-anchor="end" class="mono bar-val" fill="#59636e">222.4 ms</text>
+
+  <!-- Speedup pill -->
+  <rect x="764" y="461" width="68" height="24" rx="12" fill="#d1fae5"/>
+  <text x="798" y="477" text-anchor="middle" class="mono speedup-val" fill="#065f46">6.0×</text>
+
+  <line x1="24" y1="494" x2="836" y2="494" stroke="#e5e9ee" stroke-width="1"/>
+  <text x="28" y="519" class="sans row-name" fill="#1f2328">file-attributes</text>
+
+  <!-- Track + RPC bar (top) -->
+  <rect x="248" y="501" width="422" height="12" rx="4" fill="#eaeef2"/>
+  <rect x="248" y="501" width="74" height="12" rx="4" fill="#10b981"/>
+  <text x="330" y="511" class="mono bar-val" fill="#0d9468">3.5 ms</text>
+
+  <!-- SSH bar (bottom) -->
+  <rect x="248" y="517" width="422" height="12" rx="4" fill="#d4847a" opacity="0.85"/>
+  <text x="748" y="527" text-anchor="end" class="mono bar-val" fill="#59636e">19.9 ms</text>
+
+  <!-- Speedup pill -->
+  <rect x="764" y="503" width="68" height="24" rx="12" fill="#d1fae5"/>
+  <text x="798" y="519" text-anchor="middle" class="mono speedup-val" fill="#065f46">5.7×</text>
+
+
+  <!-- Footer with RTT caveat -->
+  <line x1="24" y1="540" x2="836" y2="540" stroke="#e5e9ee" stroke-width="1"/>
+  <text x="28" y="561" class="sans chart-sub">Measured at ~1 ms RTT. Actual timings depend on network RTT — multi-RTT ops gain even more on higher-latency WiFi/VPN/WAN links.</text>
+</svg>

@@ -1,6 +1,7 @@
 # TRAMP RPC
 
-for details about the project see @README.org
+for details about the project see @README.org, @doc/DEVELOPMENT.org, @doc/RPC_METHODS.org, and @doc/TECHNICAL_COMPARISON.org
+When adding, removing, or changing RPC methods or their params in `server/src/`, update `server/src/docgen.rs` and regenerate `doc/RPC_METHODS.org` with `UPDATE_RPC_DOCS=1 cargo test rpc_methods_doc_is_up_to_date`.
 
 # Backwards compatibility
 Elisp code needs to match the respective rust server. There is no backwards compatibility.
